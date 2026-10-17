@@ -1,0 +1,27 @@
+{
+  "craftsman-git-guard": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/git-guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "craftsman-stop-gate": {
+    "enabled": true,
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/craftsman-stop-gate.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
