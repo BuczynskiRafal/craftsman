@@ -41,7 +41,26 @@ Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i 
 
 ---
 
-## Etap 0 — Dynamiczny Router i Orkiestracja Subagentów
+## Etap 0 — Dynamiczny Router, Hard-Loop State i Orkiestracja Subagentów
+
+0. **Zainicjalizuj stan Hybrydowego Hard-Loopa (`craftsman_state.json`):**
+   Na samym początku wywołania `/craftsman` utwórz (przez `write_to_file` z `UserFacing: false` lub skrypt `~/.gemini/config/scripts/craftsman-stop-gate.py`) plik `<artifactDirectoryPath>/craftsman_state.json`:
+   ```json
+   {
+     "active": true,
+     "mode": "craftsman",
+     "stage": "implement",
+     "awaiting_user": false,
+     "gates": {
+       "simplified": false,
+       "reviewed": false,
+       "verified": false
+     },
+     "forced_continuations": 0,
+     "max_continuations": 3
+   }
+   ```
+   *(Jeśli w trakcie Etapu 0 musisz zatrzymać się i zadać pytanie użytkownikowi przez `ask_question` lub czekać na akceptację planu, ustaw `"awaiting_user": true` przed zakończeniem tury, a po odpowiedzi użytkownika przywróć `"awaiting_user": false`).*
 
 1. **Sprawdź kontekst startowy:**
    Uruchom `git status --short` oraz `git diff --stat` (względem `HEAD` lub `@{upstream}...HEAD`).
@@ -102,6 +121,9 @@ Przeczytaj zasady [`/verify`](file:///Users/rafalbuczynski/.gemini/config/skills
 2. Uruchomienie testów automatycznych (`pytest` / odpowiednik w projekcie),
 3. **Przebieg End-to-End w runtime** na realistycznych danych wejściowych i warunkach brzegowych.
 Jeśli weryfikacja wykaże błąd, napraw go i powtórz Krok 1.5 (do 3 iteracji), aż uzyskasz `✅ VERIFIED`.
+
+### Krok 1.6: Zamknięcie Bramki Hard-Loop (`craftsman_state.json`)
+Po przejściu Kroków 1.1–1.5 zaktualizuj `<artifactDirectoryPath>/craftsman_state.json` (ustawiając `gates.simplified = true`, `gates.reviewed = true`, `gates.verified = true`, `active = false`, `stage = "completed"`), co odblokowuje systemowy hook `Stop` (`craftsman-stop-gate`).
 
 ---
 

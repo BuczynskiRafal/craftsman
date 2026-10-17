@@ -11,12 +11,14 @@ Słowo `ultrathink` oznacza żądanie najgłębszej możliwej analizy inżyniers
    - **Złożoność obliczeniowa i pamięciowa:** koszt czasowy i pamięciowy na ścieżkach krytycznych (*hot paths*),
    - **Porównanie wariantów (Trade-offs):** rozważ co najmniej 2 podejścia architektoniczne i uzasadnij wybór najlepszego na właściwym poziomie abstrakcji (*Altitude*).
 
-## 2. Protokół `ultracode` (Orkiestracja wieloagentowa i pełna pętla weryfikacji)
+## 2. Protokół `ultracode` (Orkiestracja wieloagentowa i pełna pętla weryfikacji Hard-Loop)
 Słowo `ultracode` oznacza optymalizację pod kątem najbardziej wyczerpującego, bezbłędnego i zweryfikowanego rozwiązania — koszt tokenów i czas nie są ograniczeniem (z zachowaniem higieny dysku: używaj subagentów w pamięci przez `invoke_subagent`, nie twórz setek plików tymczasowych na dysku).
+0. **Faza 0 — Aktywacja Bramki Hard-Loop (`craftsman_state.json`):** Na starcie utwórz plik `<artifactDirectoryPath>/craftsman_state.json` z `{"active": true, "mode": "ultracode", "stage": "implement", "awaiting_user": false, "gates": {"simplified": false, "reviewed": false, "verified": false}, "forced_continuations": 0, "max_continuations": 3}`.
 1. **Faza 1 — Rozpoznanie (`research` subagents):** Dla każdego nietrywialnego zadania uruchom równoległe subagenty `research` (`invoke_subagent`), aby dokładnie zmapować istniejące wzorce w codebase, wywołujących (*call sites*) i potencjalne pułapki.
 2. **Faza 2 — Implementacja o wysokiej precyzji:** Wdróż rozwiązanie zgodnie ze standardami projektu i zasadami czystego kodu.
 3. **Faza 3 — Obowiązkowa Trójca Jakości przed oddaniem wyniku:**
    Po zakończeniu zmian w kodzie (zanim zgłosisz gotowość użytkownikowi) wykonaj kolejno procedury:
    - **`/simplify`** — sprawdź zmiany pod kątem *Reuse*, *Simplification*, *Efficiency* i *Altitude* oraz wyczyść kod,
    - **`/code-review`** — przeskanuj diff pod kątem błędów poprawności (*Angles A–E*) i napraw wykryte problemy (`CONFIRMED` / `PLAUSIBLE`),
-   - **`/verify`** — uruchom zmieniony przepływ end-to-end (testy + realne wywołanie runtime), aby potwierdzić, że zmiana faktycznie działa.
+   - **`/verify`** — uruchom zmieniony przepływ end-to-end (testy + realne wywołanie runtime), aby potwierdzić, że zmiana faktycznie działa,
+   - **Zamknięcie Bramki Hard-Loop:** zaktualizuj `<artifactDirectoryPath>/craftsman_state.json` ustawiając wszystkie flagi w `gates` na `true` oraz `"active": false`.
