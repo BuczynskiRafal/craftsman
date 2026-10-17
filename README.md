@@ -23,13 +23,13 @@ cd ~/.gemini/craftsman
 
 ```mermaid
 flowchart TD
-    User(["Użytkownik: /craftsman [zadanie]"]) --> Triage["Stage 0: Triage & Klasyfikacja (Typ A–E)"]
+    User(["Użytkownik: /craftsman [zadanie]"]) --> Triage["Stage 0: Triage i Klasyfikacja (Typ A-E)"]
 
-    Triage -->|Typ A: Greenfield / Feature| Arch["Stage 1A: /feature-dev\n(Eksploracja -> Pytania -> 2-3 Architektury)"]
-    Triage -->|Typ B: Legacy / Refactor| Mod["Stage 1B: /modernize\n(Karta Reguł Given/When/Then -> Characterization Tests)"]
-    Triage -->|Typ C: Masowa migracja| Batch["Stage 1C: /batch\n(Podział na 5-30 Work Units -> Równoległe subagenty)"]
-    Triage -->|Typ D: Performance / Hot-path| Perf["Stage 1D: /extreme_optimizer + /leetcode-style-code-reviewer\n(Baseline benchmark -> Profilowanie -> Dowód izomorfizmu)"]
-    Triage -->|Typ E: Bugfix / Hardening| Bug["Stage 1E: Root-Cause Analysis\n(Reprodukcja błędu -> Test regresyjny)"]
+    Triage -->|"Typ A: Greenfield / Feature"| Arch["Stage 1A: /feature-dev (Eksploracja -> Pytania -> Architektura)"]
+    Triage -->|"Typ B: Legacy / Refactor"| Mod["Stage 1B: /modernize (Karta Reguł Given/When/Then -> Testy)"]
+    Triage -->|"Typ C: Masowa migracja"| Batch["Stage 1C: /batch (Podział na 5-30 Work Units -> Subagenty)"]
+    Triage -->|"Typ D: Performance / Hot-path"| Perf["Stage 1D: /extreme_optimizer (Benchmark -> Profilowanie -> Izomorfizm)"]
+    Triage -->|"Typ E: Bugfix / Hardening"| Bug["Stage 1E: Root-Cause Analysis (Reprodukcja -> Test regresyjny)"]
 
     Arch --> Impl["Stage 2: Implementacja"]
     Mod --> Impl
@@ -37,11 +37,11 @@ flowchart TD
     Perf --> Impl
     Bug --> Impl
 
-    Impl --> Simplify["Stage 3.1: /simplify\n(Reuse, Simplification, Efficiency, Altitude)"]
-    Simplify --> Review["Stage 3.2: /code-review + /audit\n(Kąty A-E + specjalistyczne audyty domeny)"]
-    Review --> Verify["Stage 3.3: /verify\n(Realne uruchomienie w runtime: CLI/API/skrypt/GUI)"]
-    Verify -->|Wykryto błędy (max 2 iteracje)| Impl
-    Verify -->|PASS| Commit["Stage 4: /high-level-commit-message\n(Raport + propozycja commita Conventional Commits)"]
+    Impl --> Simplify["Stage 3.1: /simplify (Reuse, Simplification, Efficiency, Altitude)"]
+    Simplify --> Review["Stage 3.2: /code-review + /audit (Kąty A-E + audyty specjalistyczne)"]
+    Review --> Verify["Stage 3.3: /verify (Realne uruchomienie w runtime: CLI / API / GUI)"]
+    Verify -->|"Wykryto błędy (max 2 iteracje)"| Impl
+    Verify -->|"PASS"| Commit["Stage 4: /high-level-commit-message (Raport + propozycja commita)"]
 ```
 
 ---
