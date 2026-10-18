@@ -114,7 +114,7 @@ Always output a suggested branch name that mirrors the commit type and subject.
 feat(model): add learnable slow tau and per-neuron gating to LNN
 ```
 
-🌿 Branch: `feat/model-learnable-slow-tau`
+Branch: `feat/model-learnable-slow-tau`
 
 ### Scoped fix
 
@@ -122,7 +122,7 @@ feat(model): add learnable slow tau and per-neuron gating to LNN
 fix(pipeline): resolve missing value imputation for predictor columns
 ```
 
-🌿 Branch: `fix/pipeline-missing-imputation`
+Branch: `fix/pipeline-missing-imputation`
 
 ### Multi-theme change (subject + body)
 
@@ -134,7 +134,7 @@ feat(model): extend LNN architecture and harden data pipeline
 - Refactor SWMM simulation runner with resume-from-checkpoint capability
 ```
 
-🌿 Branch: `feat/model-extend-architecture`
+Branch: `feat/model-extend-architecture`
 
 ### Breaking change
 
@@ -145,7 +145,7 @@ BREAKING CHANGE: model config keys have been reorganized; existing
 config files must be updated to the new schema.
 ```
 
-🌿 Branch: `feat/config-restructure-schema`
+Branch: `feat/config-restructure-schema`
 
 ## Example Requests
 

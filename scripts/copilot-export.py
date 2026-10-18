@@ -30,6 +30,18 @@ def default_claude_dir() -> Path:
     return Path.home() / ".claude"
 
 
+def extract_skill_name(skill_md: str, fallback_name: str) -> str:
+    match = FRONTMATTER_RE.match(skill_md)
+    if not match:
+        return fallback_name
+    for line in match.group(1).splitlines():
+        if line.startswith("name:"):
+            val = line.split(":", 1)[1].strip().strip("\"'")
+            if val:
+                return val
+    return fallback_name
+
+
 def extract_description_and_body(skill_md: str, fallback_name: str) -> tuple[str, str]:
     match = FRONTMATTER_RE.match(skill_md)
     if not match:
@@ -109,20 +121,21 @@ def render_agents_md(repo_dir: Path) -> str:
     skills_dir = repo_dir / "skills"
 
     lines: list[str] = [
-        "# AGENTS.md — Craftsman Agentic Engineering Standard",
+        "# AGENTS.md — Craftsman Adaptive Closed-Loop Engineering Standard",
         "",
-        "This repository follows the **Craftsman** 3-Gear Hybrid Quality Loop (`Author != Reviewer`).",
+        "This repository uses **Craftsman**, an invocation-steerable 3-Gear Hybrid Hard-Loop engineering harness.",
         "",
         "## 3-Gear Quality Loop (`Quick` vs `Standard` vs `Deep`)",
-        "- **Gear 1 (`quick` / Soft-Loop):** Changes `<= 40` lines across `<= 2` files -> inline `/simplify` + `/verify`.",
-        "- **Gear 2 (`standard` / Hybrid Hard-Loop):** Changes `> 40` lines or `> 2` files -> spawn an independent reviewer subagent to run `/simplify` -> `/code-review` -> `/verify` on the full cumulative diff.",
-        "- **Gear 3 (`deep` / Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode` -> deep architectural reasoning + independent reviewer subagent running `/audit all`.",
+        "- **Gear 1 (`quick` / Soft-Loop):** Changes `<= 40` lines across `<= 2` files -> inline `/simplify` + `/code-review` + `/verify`.",
+        "- **Gear 2 (`standard` / Hybrid Hard-Loop):** Changes `> 40` lines or `> 2` files -> spawn an isolated auditor subagent to run `/simplify` -> `/code-review` -> `/verify` on the full cumulative diff.",
+        "- **Gear 3 (`deep` / Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode` -> deep architectural reasoning + isolated auditor subagent running `/audit all`.",
         "",
         "## Available Skills",
     ]
     for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
-        skill_name = skill_path.parent.name
-        desc, _ = extract_description_and_body(skill_path.read_text(encoding="utf-8"), skill_name)
+        raw_md = skill_path.read_text(encoding="utf-8")
+        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
+        desc, _ = extract_description_and_body(raw_md, skill_name)
         lines.append(f"- **`/{skill_name}`**: {desc}")
 
     lines.append("")
@@ -142,8 +155,9 @@ def _export_skill_files(
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
-        skill_name = skill_path.parent.name
-        rendered = renderer(skill_name, skill_path.read_text(encoding="utf-8"))
+        raw_md = skill_path.read_text(encoding="utf-8")
+        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
+        rendered = renderer(skill_name, raw_md)
         (out_dir / f"{skill_name}{suffix}").write_text(rendered, encoding="utf-8")
         count += 1
     return count
