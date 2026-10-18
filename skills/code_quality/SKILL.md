@@ -122,7 +122,7 @@ A highly cohesive class has methods that all operate on the same core state towa
 
 ## 6. Complexity & Nesting
 
-- **Cyclomatic Complexity:** 1–5 clean ✅ | 6–10 moderate | 11+ `[REFACTOR]`.
+- **Cyclomatic Complexity:** 1–5 clean (`PASS`) | 6–10 moderate (`WARNING`) | 11+ `[REFACTOR]`.
 - **Nesting Depth:** > 3 levels of indentation → flatten with early returns / guard clauses or helper extraction.
 - **Size Guidelines:**
 
@@ -172,11 +172,11 @@ A highly cohesive class has methods that all operate on the same core state towa
 ## Structural Metrics
 | Metric | Value | Status |
 | :--- | :--- | :---: |
-| Duplication (blocks > 5 lines) | X instances | ✅/⚠️/❌ |
-| Largest Class | X lines (`ClassName`) | ✅/⚠️/❌ |
-| Longest Function | X lines (`func_name`) | ✅/⚠️/❌ |
-| Max Nesting Depth | X levels | ✅/⚠️/❌ |
-| God Objects (> 500 lines) | X classes | ✅/⚠️/❌ |
+| Duplication (blocks > 5 lines) | X instances | PASS / WARNING / FAIL |
+| Largest Class | X lines (`ClassName`) | PASS / WARNING / FAIL |
+| Longest Function | X lines (`func_name`) | PASS / WARNING / FAIL |
+| Max Nesting Depth | X levels | PASS / WARNING / FAIL |
+| God Objects (> 500 lines) | X classes | PASS / WARNING / FAIL |
 
 ## Findings
 

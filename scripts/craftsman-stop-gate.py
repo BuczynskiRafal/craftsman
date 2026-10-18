@@ -6,11 +6,11 @@ Supports both Google Antigravity and Claude Code lifecycle hooks:
   automatically (`--tier auto`) when the cumulative git diff (`base_sha..working_tree`)
   is <= 40 lines across <= 2 files. Allows inline verification without spawning a subagent.
 - Gear 2 (`standard` / Hybrid Hard-Loop): Activated automatically when the cumulative diff
-  exceeds 40 lines or 2 files (or when `--tier standard` is set). Enforces Zero-Trust
-  verification in `transcript.jsonl` that an independent subagent (`Craftsman Quality Gate
+  exceeds 40 lines or 2 files (or when `--tier standard` is set). Enforces deterministic
+  verification in `transcript.jsonl` that an isolated subagent (`Craftsman Quality Gate
   Auditor`) was invoked via `invoke_subagent`.
 - Gear 3 (`deep` / Full-Audit Hard-Loop): Activated via `--tier deep` (`/craftsman --deep`
-  or keyword `ultracode`). Always requires the independent Quality Gate Auditor subagent
+  or keyword `ultracode`). Always requires the isolated Quality Gate Auditor subagent
   regardless of diff size.
 """
 
@@ -117,7 +117,7 @@ def compute_cumulative_diff_stats(cwd: str | None, base_sha: str | None) -> tupl
 
 
 def requires_subagent_for_state(state: dict[str, Any], fallback_cwd: str | None = None) -> bool:
-    """Determine whether the current task requires an independent Quality Gate subagent."""
+    """Determine whether the current task requires an isolated Quality Gate subagent."""
     tier = str(state.get("tier") or "auto").strip().lower()
     mode = str(state.get("mode") or "craftsman").strip().lower()
 
@@ -301,6 +301,8 @@ def detect_untracked_craftsman_trigger(
                     tier = "deep"
                 elif "--quick" in lower or "--soft" in lower:
                     tier = "quick"
+                elif "--standard" in lower:
+                    tier = "standard"
                 else:
                     tier = "auto"
                 found = (step_idx, tier)
@@ -480,9 +482,9 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
             f"[CRAFTSMAN HARD-LOOP GATE ({forced + 1}/{max_cont})] "
             f"Cannot finish the task before completing the Stage 1 Quality Gate. "
             f"Missing requirements: [{missing_str}]. "
-            f"Creator != Reviewer Rule: Do NOT perform the review solely inline in the main thread! "
+            f"Hybrid Hard-Loop Context Isolation: Do NOT perform the review solely inline in the main thread! "
             f"You must invoke 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') "
-            f"so an independent subagent reads and executes /simplify, /code-review, and /verify "
+            f"so an isolated subagent reads and executes /simplify, /code-review, and /verify "
             f"on the ENTIRE cumulative diff since the start of the task (git diff {base_sha}), and then "
             f"run craftsman-stop-gate.py --state-file {state_file} --complete.",
         )
@@ -490,7 +492,7 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         "continue",
         f"[CRAFTSMAN SOFT-LOOP GATE ({forced + 1}/{max_cont})] "
         f"Missing verification steps for Quick Mode: [{missing_str}]. "
-        f"Execute /simplify and /verify and close the gate via "
+        f"Execute /simplify, /code-review, and /verify and close the gate via "
         f"craftsman-stop-gate.py --state-file {state_file} --complete.",
     )
 
@@ -572,7 +574,7 @@ def run_cli(argv: list[str]) -> int:
             if not has_quality_gate_subagent_in_entries(entries, since_step):
                 sys.stderr.write(
                     "[CRAFTSMAN HARD-LOOP REJECTED] Cannot close the gate (--complete): "
-                    "no independent subagent call 'invoke_subagent' (TypeName: 'self', "
+                    "no isolated subagent call 'invoke_subagent' (TypeName: 'self', "
                     "Role: 'Craftsman Quality Gate Auditor') was found in transcript.jsonl since the start step! "
                     "For changes exceeding the Quick Mode threshold (>40 lines or >2 files), you must first "
                     "spawn the subagent via invoke_subagent to execute /simplify, /code-review, and /verify.\n"

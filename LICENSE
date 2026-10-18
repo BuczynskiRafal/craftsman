@@ -34,6 +34,6 @@ This license covers all files in the Craftsman repository, including:
 4. Behavioral and integration test suites (`tests/test_hooks.py`).
 
 All prompt templates, state-machine scripts, and architectural specifications in this
-repository are original implementations authored for the Craftsman framework, inspired
-by multi-agent separation-of-concerns patterns (Creator != Reviewer) and specification-
-driven software modernization practices across the AI engineering ecosystem.
+repository are original implementations authored for the Craftsman framework, combining
+curated open-ecosystem engineering workflow patterns with an invocation-steerable
+3-Gear Hybrid Hard-Loop state machine and deterministic Git lifecycle guardrails.

@@ -53,8 +53,8 @@ Once the user approves the plan:
 ```markdown
 | # | Work Unit | Files | Status | Verification |
 | :-: | :--- | :--- | :---: | :--- |
-| 1 | `<unit 1 title>` | `<files>` | ✅ Done / ❌ Failed | `<test result>` |
-| 2 | `<unit 2 title>` | `<files>` | ✅ Done / ❌ Failed | `<test result>` |
+| 1 | `<unit 1 title>` | `<files>` | Done / Failed | `<test result>` |
+| 2 | `<unit 2 title>` | `<files>` | Done / Failed | `<test result>` |
 ```
 
 2. Run a final repository-wide verification (`git status`, `git diff --stat`, full test suite / linter) to confirm cross-unit consistency.
