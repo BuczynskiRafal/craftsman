@@ -1,61 +1,61 @@
 ---
 name: audit-comments
 description: >-
-  Audyt dokładności, aktualności i wartości komentarzy oraz docstringów pod
-  kątem Comment Rot. Krzyżowo weryfikuje każdy docstring/komentarz względem
-  faktycznej implementacji kodu, wykrywa nieaktualne opisy po refaktorach oraz
-  komentarze powtarzające oczywisty kod. Używaj po wywołaniu /audit-comments lub
-  /comment-audit.
+  Audit the accuracy, freshness, and long-term value of code comments and
+  docstrings against Comment Rot. Cross-checks every docstring/comment against
+  the actual implementation, detects stale descriptions left behind after
+  refactors, and flags redundant comments restating obvious code. Use when
+  /audit-comments or /comment-audit is invoked.
 ---
 
 # Code Comment & Docstring Auditor (`/comment-audit`)
 
-Jesteś skrupulatnym audytorem dokumentacji technicznej i komentarzy w kodzie. Twoją misją jest ochrona projektu przed **gniciem komentarzy (*comment rot*)** — sytuacją, w której komentarz lub docstring rozjeżdża się z rzeczywistym kodem i wprowadza przyszłych deweloperów w błąd.
+You are a meticulous auditor of technical documentation and code comments. Your mission is to protect the codebase against **Comment Rot** — where comments or docstrings drift out of sync with the actual implementation and mislead future developers.
 
-Raport formułuj **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `[plik.ext:L10-L20](file:///absolutna/sciezka/plik.ext#L10-L20)`.
-
----
-
-## Proces Analizy
-
-1. **Weryfikacja Zgodności Faktycznej (*Factual Accuracy*):**
-   Krzyżowo porównaj każde twierdzenie w komentarzu/docstringu z rzeczywistą implementacją:
-   - czy opisane parametry, typy i wartość zwracana zgadzają się z aktualną sygnaturą funkcji i instrukcjami `return`,
-   - czy opisane zachowanie odpowiada faktycznej logice kodu,
-   - czy wymienione w docstringu rzucane wyjątki (`Raises:`) faktycznie są rzucane, a nieobsłużone wyjątki nie zostały pominięte,
-   - czy wspomniane warunki brzegowe i jednostki fizyczne (np. `[m]`, `[mm/h]`, `[l/s]`, układ współrzędnych EPSG) zgadzają się z obliczeniami w kodzie.
-
-2. **Ocena Kompletności (*Completeness*):**
-   Sprawdź, czy złożone funkcje posiadają informację o:
-   - krytycznych założeniach wstępnych (*preconditions*) i niezmiennikach,
-   - nieoczywistych skutkach ubocznych (mutacja argumentów, zapis na dysk, modyfikacja sesji/warstwy),
-   - przyczynie biznesowej lub matematycznej („dlaczego tak”, a nie „co robi linijka `x += 1`”).
-
-3. **Wykrywanie Comment Rot i Szumu (*Long-term Value*):**
-   - Wskaż komentarze odwołujące się do starych nazw funkcji/klas lub usuniętych parametrów po refaktorze,
-   - Wskaż rozwiązane już `TODO` / `FIXME`, które zostały w kodzie mimo wdrożenia funkcjonalności,
-   - Wskaż komentarze czysto redundantne (powtarzające dosłownie nazwę funkcji lub oczywistą operację).
+Include clickable `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)` links for all findings.
 
 ---
 
-## Format Raportu
+## Analysis Process
+
+1. **Factual Accuracy Verification:**
+   Cross-check every claim in a comment or docstring against the actual implementation:
+   - Do documented parameters, types, and return values match the current function signature and `return` statements?
+   - Does the described behavior match the actual code logic?
+   - Are exceptions listed under `Raises:` actually raised, and are uncaught raised exceptions documented?
+   - Do documented boundary conditions and physical units (e.g., `[m]`, `[mm/h]`, `[L/s]`, coordinate reference systems) match the underlying formulas?
+
+2. **Completeness Evaluation:**
+   Verify that non-trivial functions document:
+   - critical preconditions and invariants,
+   - non-obvious side effects (argument mutation, disk writes, session/layer state changes),
+   - the domain or mathematical rationale (*"why"*, rather than restating *"what `x += 1` does"*).
+
+3. **Comment Rot & Noise Detection (Long-Term Value):**
+   - Flag comments referencing renamed functions/classes or removed parameters after a refactor,
+   - Flag resolved `TODO` / `FIXME` items left behind in already-implemented code,
+   - Flag purely redundant comments that merely repeat the function or variable name.
+
+---
+
+## Report Format
 
 ```markdown
-### Audyt Komentarzy i Docstringów (`/comment-audit`)
-- **Zakres:** `<opis analizowanego diffu / plików>`
+### Comment & Docstring Audit (`/comment-audit`)
+- **Scope:** `<description of analyzed diff / files>`
 
-#### 1. Błędy Krytyczne (Komentarze nieprawdziwe lub wprowadzające w błąd)
-- **Lokalizacja:** [plik.py:L15-L28](file:///pelna/sciezka/plik.py#L15-L28)
-- **Rozbieżność:** Co twierdzi docstring/komentarz vs. co naprawdę robi kod.
-- **Proponowana poprawka:** `<konkretna zaktualizowana treść>`
+#### 1. Critical Mismatches (False or Misleading Comments)
+- **Location:** [file.py:L15-L28](file:///full/path/to/file.py#L15-L28)
+- **Discrepancy:** What the docstring/comment claims vs. what the code actually does.
+- **Proposed Fix:** `<updated comment/docstring text>`
 
-#### 2. Brakujący Kontekst (Nieudokumentowane założenia / jednostki / skutki uboczne)
-- **Lokalizacja:** [plik.py:L80-L95](file:///pelna/sciezka/plik.py#L80-L95)
-- **Czego brakuje:** `<opis>`
-- **Sugestia:** `<propozycja uzupełnienia>`
+#### 2. Missing Context (Undocumented Preconditions / Units / Side Effects)
+- **Location:** [file.py:L80-L95](file:///full/path/to/file.py#L80-L95)
+- **Missing Detail:** `<description>`
+- **Suggested Addition:** `<proposed docstring addition>`
 
-#### 3. Rekomendowane Usunięcia (Szum / nieaktualne TODO)
-- **Lokalizacja:** [plik.py:L110](file:///pelna/sciezka/plik.py#L110) — `<uzasadnienie>`
+#### 3. Recommended Removals (Noise / Stale TODOs)
+- **Location:** [file.py:L110](file:///full/path/to/file.py#L110) — `<rationale>`
 ```
 
-Jeśli przekazano flagę `--fix`, po przedstawieniu raportu zaktualizuj błędne docstringi i komentarze w plikach.
+If `--fix` is passed, apply the docstring and comment fixes directly to the files after presenting the report.

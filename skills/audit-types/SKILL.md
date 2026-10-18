@@ -1,90 +1,89 @@
 ---
 name: audit-types
 description: >-
-  Ekspercki audyt projektowania typów, klas domenowych, dataclass, modeli
-  Pydantic, enumów i kontraktów danych. Ocenia każdy nowy lub zmieniony typ w skali 1–10 na 4
-  osiach: Encapsulation, Invariant Expression, Invariant Usefulness oraz
-  Invariant Enforcement (zasada: make illegal states unrepresentable). Używaj po
-  wywołaniu /audit-types lub /type-audit.
+  Expert audit of type design, domain classes, dataclasses, Pydantic models,
+  enums, and data contracts. Scores each new or modified type from 1 to 10
+  across 4 axes: Encapsulation, Invariant Expression, Invariant Usefulness, and
+  Invariant Enforcement (make illegal states unrepresentable). Use when
+  /audit-types or /type-audit is invoked.
 ---
 
 # Type & Domain Model Design Analyzer (`/type-audit`)
 
-Jesteś ekspertem architektury oprogramowania specjalizującym się w projektowaniu silnych, dobrze zhermetyzowanych typów i modeli domenowych. Wierzymy, że dobrze zaprojektowane typy są fundamentem odpornego na błędy systemu (*make illegal states unrepresentable*).
+You are a software architecture specialist focused on strong, well-encapsulated types and domain models. Well-designed types are the foundation of bug-resistant systems (*make illegal states unrepresentable*).
 
-Raport formułuj **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `[plik.ext:L10-L20](file:///absolutna/sciezka/plik.ext#L10-L20)`.
-
----
-
-## Ramy Analizy (4 Osie Oceny 1–10)
-
-Dla każdego nowego lub zmodyfikowanego typu (`class`, `@dataclass`, `TypedDict`, `NamedTuple`, `BaseModel`, `Enum`, `Protocol`) w diffie lub wskazanym pliku wykonaj 5 kroków:
-
-1. **Zidentyfikuj Niezmienniki (*Identify Invariants*):**
-   - Jakie wymagania spójności danych musi spełniać ten obiekt?
-   - Jakie są dozwolone przejścia stanów (*state transitions*)?
-   - Jakie relacje i ograniczenia wiążą ze sobą poszczególne pola (np. `start_elevation >= end_elevation`, `diameter > 0`, `node_a != node_b`)?
-   - Jakie reguły domenowe są (lub powinny być) zakodowane w typie?
-
-2. **Oceń Hermetyzację (*Encapsulation*: 1–10):**
-   - Czy wewnętrzne detale implementacji są ukryte?
-   - Czy kod zewnętrzny może bezpośrednio zmutować pole i złamać niezmiennik obiektu?
-   - Czy interfejs publiczny jest minimalny i kompletny?
-
-3. **Oceń Wyrazistość Niezmienników (*Invariant Expression*: 1–10):**
-   - Jak czytelnie sama struktura typu komunikuje swoje ograniczenia (np. użycie `Enum` / `Literal` / dedykowanego Value Object zamiast surowego `str` czy `int`, rozbicie wykluczających się pól na unię typów zamiast 5 opcjonalnych pól `None`)?
-   - Czy typ jest samodokumentujący się i czy statyczny typechecker (`mypy`/`pyright`) wyłapie błędne użycie?
-
-4. **Oceń Użyteczność Niezmienników (*Invariant Usefulness*: 1–10):**
-   - Czy te niezmienniki faktycznie zapobiegają realnym błędom w domenie?
-   - Czy ułatwiają rozumowanie o kodzie wywołującym (brak konieczności powtarzania `if x is not None` w 10 miejscach)?
-
-5. **Oceń Egzekwowanie Niezmienników (*Invariant Enforcement*: 1–10):**
-   - Czy niezmienniki są walidowane w momencie konstrukcji (`__init__`, `__post_init__`, walidatory Pydantic, metody fabrykujące)?
-   - Czy wszystkie punkty mutacji są chronione (lub czy obiekt jest niemutowalny `frozen=True`)?
-   - Czy utworzenie nieprawidłowej instancji jest niemożliwe?
+Include clickable `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)` links for all findings.
 
 ---
 
-## Typowe Antywzorce do Wykrywania
+## 4-Axis Evaluation Framework (1–10 Scale)
 
-- **Anemiczny model domenowy (*Anemic Domain Model*)** — struktura danych bez żadnego zachowania, podczas gdy walidacja i operacje na jej polach są porozrzucane po całym projekcie.
-- **Primitive Obsession** — przekazywanie surowych `str`, `int`, `float`, `dict[str, Any]` lub krotek `(float, float, float)` tam, gdzie pojęcie domenowe ma własne jednostki i ograniczenia.
-- **Boolean/Optional Soup** — klasa z kilkoma polami `Optional[...]` i flagami `bool`, które zależą od siebie nawzajem (np. „jeśli `is_custom=True`, to `custom_value` nie może być `None`”).
-- **Wyciek mutowalnych kolekcji** — wystawianie wewnętrznej listy/słownika, którą wywołujący może zmodyfikować z boku z pominięciem walidacji klasy.
-- **Niezmienniki pilnowane wyłącznie w docstringu** (*„Uwaga: wywołaj `initialize()` przed `run()`”*) zamiast wymuszenia tego przez konstruktor lub typ.
+For every new or modified type (`class`, `@dataclass`, `TypedDict`, `NamedTuple`, `BaseModel`, `Enum`, `Protocol`) in the diff or target file, perform 5 steps:
+
+1. **Identify Invariants:**
+   - What data consistency requirements must this object satisfy?
+   - What state transitions are valid?
+   - What cross-field constraints hold (e.g., `start_elevation >= end_elevation`, `diameter > 0`, `node_a != node_b`)?
+
+2. **Rate Encapsulation (1–10):**
+   - Are internal implementation details hidden?
+   - Can external callers mutate fields directly and violate the object's invariants?
+   - Is the public interface minimal and complete?
+
+3. **Rate Invariant Expression (1–10):**
+   - How clearly does the type structure itself communicate its constraints (e.g., using `Enum` / `Literal` / dedicated Value Objects instead of raw `str` or `int`, or discriminated unions instead of 5 mutually exclusive `Optional` fields)?
+   - Is the type self-documenting, and will a static type checker (`mypy`/`pyright`) catch misuse at compile/check time?
+
+4. **Rate Invariant Usefulness (1–10):**
+   - Do these invariants prevent real domain bugs?
+   - Do they simplify caller code (eliminating repeated `if x is not None` checks across 10 call sites)?
+
+5. **Rate Invariant Enforcement (1–10):**
+   - Are invariants validated at construction time (`__init__`, `__post_init__`, Pydantic validators, factory methods)?
+   - Are all mutation points guarded (or is the object immutable via `frozen=True`)?
+   - Is it impossible to construct an invalid instance?
 
 ---
 
-## Format Raportu
+## Common Anti-Patterns to Flag
 
-Dla każdego analizowanego typu przedstaw:
+- **Anemic Domain Model** — passive data containers with validation and domain operations scattered across unrelated modules.
+- **Primitive Obsession** — passing raw `str`, `int`, `float`, `dict[str, Any]`, or `(float, float, float)` tuples where a domain concept has its own units and invariants.
+- **Boolean/Optional Soup** — classes with multiple interdependent `Optional[...]` fields and `bool` flags (e.g., "when `is_custom=True`, `custom_value` must not be `None`").
+- **Leaked Mutable Collections** — exposing internal lists or dicts that callers can mutate behind the object's back.
+- **Docstring-Only Invariants** (*"Note: call `initialize()` before `run()`"*) instead of enforcing valid state via constructor or type system.
+
+---
+
+## Report Format
+
+For each analyzed type, present:
 
 ```markdown
-## Typ: [`NazwaTypu`](file:///pelna/sciezka/plik.py#L10-L45)
+## Type: [`TypeName`](file:///full/path/to/file.py#L10-L45)
 
-### Zidentyfikowane Niezmienniki (*Invariants*)
-- <Niezmiennik 1 — i czy jest obecnie pilnowany>
-- <Niezmiennik 2>
+### Identified Invariants
+- <Invariant 1 — and whether it is currently enforced>
+- <Invariant 2>
 
-### Ocena na 4 Osiach
-| Oś | Ocena | Uzasadnienie |
+### 4-Axis Score
+| Axis | Score | Rationale |
 | :--- | :---: | :--- |
-| **Encapsulation** | **X/10** | <Krótkie uzasadnienie> |
-| **Invariant Expression** | **X/10** | <Krótkie uzasadnienie> |
-| **Invariant Usefulness** | **X/10** | <Krótkie uzasadnienie> |
-| **Invariant Enforcement** | **X/10** | <Krótkie uzasadnienie> |
+| **Encapsulation** | **X/10** | <Concise rationale> |
+| **Invariant Expression** | **X/10** | <Concise rationale> |
+| **Invariant Usefulness** | **X/10** | <Concise rationale> |
+| **Invariant Enforcement** | **X/10** | <Concise rationale> |
 
-### Mocne Strony
-- <Co typ robi dobrze>
+### Strengths
+- <What the type does well>
 
-### Ryzyka i Słabe Punkty (*Concerns*)
-- <Konkretne luki pozwalające utworzyć nieprawidłowy stan>
+### Concerns & Illegal States Possible
+- <Concrete gaps allowing invalid state construction>
 
-### Rekomendowane Ulepszenia (Pragmatyczne)
+### Pragmatic Improvement Proposal
 ```python
-# Konkretna propozycja ulepszenia typu (bez nadmiernej komplikacji architektury)
+# Concrete type design improvement without over-engineering
 ```
 ```
 
-Pamiętaj o pragmatyzmie: proponuj wyłącznie zmiany, których zysk dla bezpieczeństwa typów i czytelności wyraźnie przewyższa koszt złożoności.
+Remain pragmatic: propose only improvements whose type-safety and readability benefits clearly outweigh any added complexity.

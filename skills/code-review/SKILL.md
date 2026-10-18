@@ -1,182 +1,178 @@
 ---
 name: code-review
 description: >-
-  Przegląd kodu (Code Review) bieżącego diffu git, gałęzi, wskazanych plików lub
-  Pull Requesta z GitHuba/GitLaba. Wykrywa błędy poprawności (Angles A–E),
-  problemy z reużyciem, uproszczeniem, wydajnością, poziomem abstrakcji (Altitude)
-  oraz naruszenia reguł projektu (GEMINI.md, AGENTS.md, CLAUDE.md), a następnie
-  weryfikuje znaleziska (CONFIRMED / PLAUSIBLE / REFUTED). Obsługuje poziomy
-  dokładności (low, medium, high, xhigh, max) oraz flagi (--fix, --comment,
-  --parallel). Używaj po wywołaniu /code-review, /review lub gdy użytkownik prosi
-  o code review zmian albo PR.
+  Multi-angle Code Review for local git diffs, branches, specific files, or
+  GitHub/GitLab Pull Requests. Detects correctness defects (Angles A–E), reuse,
+  simplification, efficiency, abstraction altitude issues, and project convention
+  violations (GEMINI.md, AGENTS.md, CLAUDE.md), then verifies findings
+  (CONFIRMED / PLAUSIBLE / REFUTED). Supports effort levels (low, medium, high,
+  xhigh, max) and flags (--fix, --comment, --parallel). Use when /code-review or
+  /review is invoked.
 ---
 
 # Code Review (`/code-review`)
 
-Przeprowadzasz wielokątowy przegląd kodu obejmujący lokalne zmiany (git diff), gałęzie oraz zdalne Pull Requesty.
+You perform rigorous, multi-angle code reviews across local diffs, branches, and remote Pull Requests.
 
-Raporty i wyjaśnienia formułuj **po polsku**, zachowując oryginalne angielskie terminy techniczne (`CONFIRMED`, `PLAUSIBLE`, `REFUTED`, `off-by-one`, `falsy-zero`, `call site`, `invariant`, `guard clause`, `hot path`, `altitude` itd.). Wszystkie odwołania do plików i symboli w raporcie muszą być klikalnymi linkami Markdown w formacie `[nazwa_pliku.ext:L10-L20](file:///absolutna/sciezka/do/pliku.ext#L10-L20)`.
-
----
-
-## Parsowanie argumentów i poziomów dokładności (`effort`)
-
-Przeanalizuj argumenty przekazane po `/code-review`:
-
-1. **Poziom dokładności (`effort`)** — domyślnie **`medium`**:
-   - `low` — szybki przegląd w 1 przebiegu tylko po hunkach diffu (bez czytania całych plików, bez subagentów, pomija pliki testów/fixtures, max **4–8** najważniejszych błędów runtime).
-   - `medium` *(domyślny)* — przegląd nastawiony na **precyzję (*precision*)**: zgłaszaj wyłącznie problemy, na które maintainer faktycznie zareaguje. 8 kątów analitycznych (Angles A–C + Reuse, Simplification, Efficiency, Altitude, Conventions), weryfikacja, limit do **8** znalezisk.
-   - `high` — przegląd nastawiony na **wykrywalność (*recall*)**: wyłapanie każdego realnego błędu jest ważniejsze niż unikanie false-positive'ów. Pełne kąty analityczne + weryfikacja *recall-biased*, limit do **10** znalezisk.
-   - `xhigh` / `max` / `ultra` — **maksymalna wykrywalność (*maximum recall*)**: wszystkie 10 kątów (Angles A–E + 4 kąty jakości + Conventions) + weryfikacja + dodatkowa **Faza 3 (Sweep for gaps)**, limit do **15** znalezisk.
-2. **Flagi opcjonalne**:
-   - `--fix` — po wygenerowaniu i zweryfikowaniu listy znalezisk od razu zaaplikuj poprawki w drzewie roboczym.
-   - `--comment` — jeśli celem jest GitHub PR lub GitLab MR, opublikuj wynik przeglądu jako komentarz na PR/MR (`gh` / `glab`).
-   - `--parallel` — wymuś wieloagentowy fan-out przez narzędzie `invoke_subagent` nawet dla mniejszego diffu.
-   - `--inline` — wymuś wykonanie wszystkich kątów w bieżącym kontekście bez uruchamiania subagentów.
-3. **Cel przeglądu (`<target>`)**:
-   - Numer lub URL Pull Requesta (np. `#42`, `42`, URL GitHuba/GitLaba) → tryb przeglądu PR.
-   - Nazwa gałęzi, zakres commitów lub ścieżka pliku/katalogu → przegląd wskazanego zakresu.
-   - Brak celu → lokalny diff w repozytorium.
+All file and symbol references in your report must use clickable Markdown links `[filename.ext:L10-L20](file:///absolute/path/to/filename.ext#L10-L20)`.
 
 ---
 
-## Tryb orkiestracji (Adaptacyjny: Inline vs. Subagenty)
+## Argument Parsing & Effort Levels (`effort`)
 
-Dobierz strategię wykonania automatycznie na podstawie rozmiaru diffu i wybranego poziomu:
+Parse arguments passed after `/code-review`:
 
-- **Tryb Single-Pass Inline (w bieżącym kontekście, bez subagentów):**
-  Stosuj, gdy poziom to `low`, przekazano `--inline`, narzędzie `invoke_subagent` jest niedostępne **lub** łączny diff ma **mniej niż ~200 zmienionych linii** przy poziomie `medium`. Przejdź przez wszystkie wymagane kąty sekwencyjnie w jednym przebiegu — nie pomijaj żadnego kąta.
-- **Tryb Multi-Agent Fan-Out (`invoke_subagent`):**
-  Stosuj, gdy poziom to `high` / `xhigh` / `max`, przekazano `--parallel`, przeglądasz duży PR **lub** diff przekracza **~200 zmienionych linii**. Uruchom równoległe subagenty typu `research` (`Model: "inherit"`) w jednym wywołaniu `invoke_subagent`. Skaluj liczbę subagentów szukających do rozmiaru diffu wzorem: `min(8, max(2, ceil(liczba_linii_diffu / 150)))`, rozdzielając między nie kąty analityczne z Fazy 1.
+1. **Effort Level (`effort`)** — defaults to **`medium`**:
+   - `low` — fast single-pass review over diff hunks only (no full-file reads, no subagents, skips test/fixture files, max **4–8** top runtime defects).
+   - `medium` *(default)* — **precision-focused** review: report only issues a maintainer would act on. 8 analytical angles (Angles A–C + Reuse, Simplification, Efficiency, Altitude, Conventions), verification pass, up to **8** findings.
+   - `high` — **recall-focused** review: catching every real bug is more important than avoiding borderline findings. All analytical angles + recall-biased verification, up to **10** findings.
+   - `xhigh` / `max` / `ultra` — **maximum recall**: all 10 angles (Angles A–E + 4 quality angles + Conventions) + verification + **Phase 3 (Sweep for gaps)**, up to **15** findings.
+2. **Optional Flags**:
+   - `--fix` — immediately apply verified fixes to the working tree after generating findings.
+   - `--comment` — if the target is a GitHub PR or GitLab MR, publish the review as a comment via `gh` / `glab`.
+   - `--parallel` — force multi-agent fan-out via `invoke_subagent` even on smaller diffs.
+   - `--inline` — force single-pass execution in the current context without spawning subagents.
+3. **Target (`<target>`)**:
+   - PR number or URL (e.g., `#42`, `42`, GitHub/GitLab URL) → PR review mode.
+   - Branch name, commit range, or file/directory path → scoped review.
+   - No target → local git diff in the repository.
 
 ---
 
-## Phase 0 — Pobranie diffu i reguł projektu
+## Adaptive Orchestration Mode (Inline vs. Subagents)
 
-1. **Pobranie zakresu zmian:**
-   - **Lokalny diff (domyślnie):** uruchom `git diff @{upstream}...HEAD` (lub `git diff main...HEAD` / `git diff HEAD~1`, jeśli brak upstreamu). Jeśli w drzewie roboczym są niezatwierdzone zmiany lub diff względem gałęzi jest pusty, uruchom również `git diff HEAD` i włącz zmiany robocze (staged + unstaged) do zakresu przeglądu.
-   - **GitHub PR (gdy podano numer/URL PR):** użyj `gh pr view <pr> --json state,isDraft,title,body,author,headRefOid` oraz `gh pr diff <pr>`. Jeśli PR jest zamknięty lub jest draftem (o ile użytkownik nie poprosił jawnie o przegląd draftu), poinformuj o tym i przerwij.
-2. **Odkrycie reguł projektu (Conventions):**
-   - Znajdź pliki z regułami obowiązującymi dla zmienianych plików: `GEMINI.md`, `AGENTS.md`, `.agents/rules/*.md`, `CLAUDE.md` oraz `CLAUDE.local.md` w katalogu głównym repozytorium oraz w katalogach nadrzędnych zmienionych plików.
+Select execution strategy based on diff size and effort level:
+
+- **Single-Pass Inline Mode (in current context, no subagents):**
+  Use when effort is `low`, `--inline` is passed, `invoke_subagent` is unavailable, **or** the total diff has **fewer than ~200 changed lines** at `medium` effort. Walk through every required angle sequentially without skipping.
+- **Multi-Agent Fan-Out Mode (`invoke_subagent`):**
+  Use when effort is `high` / `xhigh` / `max`, `--parallel` is passed, reviewing a large PR, **or** the diff exceeds **~200 changed lines**. Launch parallel `research` subagents (`Model: "inherit"`) in a single `invoke_subagent` call, scaling the count as `min(8, max(2, ceil(diff_lines / 150)))` and partitioning Phase 1 angles across them.
 
 ---
 
-## Phase 1 — Wyszukiwanie kandydatów (10 kątów analitycznych)
+## Phase 0 — Acquire Diff & Project Rules
 
-Przeanalizuj diff pod kątem poniższych kątów. Każdy znaleziony kandydat musi zawierać: `file`, `line`, jednozdaniowe `summary` oraz konkretny `failure_scenario` (lub konkretny koszt utrzymaniowy/wydajnościowy).
+1. **Acquire Change Scope:**
+   - **Local diff (default):** run `git diff @{upstream}...HEAD` (or `git diff main...HEAD` / `git diff HEAD~1` if no upstream exists). If uncommitted working tree changes exist or the branch diff is empty, also run `git diff HEAD` and include staged + unstaged working tree changes.
+   - **GitHub PR (when PR number/URL is passed):** run `gh pr view <pr> --json state,isDraft,title,body,author,headRefOid` and `gh pr diff <pr>`.
+2. **Discover Project Conventions:**
+   - Locate `GEMINI.md`, `AGENTS.md`, `.agents/rules/*.md`, `CLAUDE.md`, and `CLAUDE.local.md` in the repository root and parent directories of modified files.
 
-> **Ważne:** Przekaż dalej każdego kandydata, dla którego potrafisz nazwać konkretny scenariusz awarii — przedwczesne odrzucanie niepewnych kandydatów w Fazie 1 pomija krok weryfikacji i jest główną przyczyną przeoczonych błędów.
+---
 
-### Kąty poprawności (*Correctness Angles*)
+## Phase 1 — Candidate Discovery (10 Analytical Angles)
+
+Analyze the diff across the angles below. Every candidate finding must include: `file`, `line`, a one-sentence `summary`, and a concrete `failure_scenario` (or concrete maintenance/performance cost).
+
+> **Important:** Forward every candidate for which you can articulate a concrete failure scenario — prematurely filtering uncertain candidates in Phase 1 bypasses Phase 2 verification and is the primary cause of missed bugs.
+
+### Correctness Angles
 
 #### Angle A — Line-by-line diff scan
-Przeczytaj każdy hunk w diffie linia po linii. Następnie **przeczytaj całą otaczającą funkcję** (`view_file`) dla każdego hunku — błędy w niezmienionych liniach dotkniętej funkcji wchodzą w zakres przeglądu (PR ponownie je eksponuje lub nie naprawia ich). Dla każdej linii zadaj pytanie: *jakie dane wejściowe, stan, timing lub platforma sprawiają, że ta linia zadziała błędnie?*
-Szukaj w szczególności:
-- odwróconych lub błędnych warunków logicznych,
-- błędów brzegowych (*off-by-one*),
-- dereferencji `None` / `null` / `undefined`,
-- brakującego `await`,
-- sprawdzeń typu *falsy-zero* (np. `if not val:` gdy `0`, `0.0` lub `""` jest poprawną wartością),
-- użycia złej zmiennej po copy-paste,
-- połkniętych wyjątków w `except` / `catch`, które powinny zostać propagowane,
-- nieeskejpowanych znaków specjalnych w wyrażeniach regularnych.
+Read every hunk in the diff line by line. Then **read the entire enclosing function** (`view_file`) for each hunk — bugs in unchanged lines of a touched function are in scope if the diff re-exposes or fails to fix them. Ask for every line: *what input, state, timing, or platform makes this line fail?*
+Look specifically for:
+- inverted or flawed boolean conditions,
+- off-by-one boundary errors,
+- `None` / `null` / `undefined` dereferences,
+- missing `await`,
+- falsy-zero checks (e.g., `if not val:` when `0`, `0.0`, or `""` is a valid domain value),
+- wrong variable used after copy-paste,
+- swallowed exceptions in `except` / `catch` that should propagate,
+- unescaped metacharacters in regular expressions.
 
 #### Angle B — Removed-behavior auditor
-Dla każdej linii, którą diff **USUWA lub zastępuje**, nazwij niezmiennik (*invariant*) albo zachowanie, którego ta linia pilnowała, a następnie przeszukaj nowy kod, aby sprawdzić, gdzie ten niezmiennik jest odtworzony. Jeśli nie jest odtworzony, zgłoś kandydata: usunięty guard, porzucona ścieżka obsługi błędu, zawężona walidacja, usunięty test pokrywający realny przypadek.
+For every line the diff **DELETES or replaces**, state the invariant or behavior that line enforced, then search the new code to verify where that invariant is preserved. If it is not restored, report a candidate: dropped guard clause, abandoned error path, narrowed validation, or deleted test case covering a real scenario.
 
 #### Angle C — Cross-file tracer
-Dla każdej funkcji/metody zmienionej w diffie znajdź wszystkie miejsca jej wywołania (`grep_search`) i sprawdź, czy zmiana nie psuje żadnego *call site'u*: nowy warunek wstępny (*precondition*), zmieniony kształt lub typ zwracanej wartości, nowy rzucany wyjątek, zależność od kolejności wywołań. Sprawdź również funkcje wywoływane (*callees*) oraz komentarze w zmodyfikowanych plikach — czy zmiany są zgodne z gwarancjami opisanymi w komentarzach/docstringach.
+For every function/method modified in the diff, find all call sites (`grep_search`) and verify no caller is broken: new precondition, changed return shape/type, newly raised exception, or ordering dependency. Also inspect callees and docstrings/comments in touched files to ensure the implementation still upholds documented guarantees.
 
-#### Angle D — Language-pitfall specialist *(wymagany w `high` / `xhigh` / `max` oraz przy widocznych pułapkach językowych)*
-Przeskanuj diff pod kątem klasycznych pułapek danego języka i frameworka:
-- **Python:** domyślne argumenty mutowalne (`def f(x=[])`), *late-binding closures* w pętlach/comprehension, modyfikacja słownika/listy podczas iteracji, brak zamknięcia zasobów/uchwytów, porównania `== None` zamiast `is None`, mutacja współdzielonych atrybutów klasy.
-- **JS/TS:** *falsy-zero*, koercja `==`, zmienna pętli przechwycona w domknięciu, nieobsłużone odrzucenie Promise.
-- **Go / Rust / C++:** zapis do `nil` mapy, przechwycenie zmiennej pętli, wyścigi danych, niebezpieczne rzutowania / UB.
-- **Ogólne:** SQL / command / path injection, dryf stref czasowych (naive vs. aware datetime / DST), porównywanie liczb zmiennoprzecinkowych przez `==`.
+#### Angle D — Language-pitfall specialist *(required in `high` / `xhigh` / `max` and whenever language pitfalls appear)*
+Scan the diff for classic language and framework pitfalls:
+- **Python:** mutable default arguments (`def f(x=[])`), late-binding closures in loops/comprehensions, mutating a dict/list during iteration, unclosed file/subprocess handles, `== None` instead of `is None`, mutating shared class attributes.
+- **JS/TS:** falsy-zero, `==` coercion, loop variable captured in closure, unhandled Promise rejection.
+- **Go / Rust / C++:** writing to `nil` map, loop variable capture, data races, unsafe casts / UB.
+- **General:** SQL / command / path injection, timezone drift (naive vs. aware datetime / DST), floating-point `==` comparison.
 
-#### Angle E — Wrapper/proxy correctness *(gdy diff dodaje lub modyfikuje wrapper, dekorator, cache, proxy lub adapter)*
-Sprawdź, czy każda metoda wrappera deleguje wywołanie do opakowanej instancji (`delegate`), a nie z powrotem przez globalny rejestr lub sesję (co prowadziłoby do ponownego wejścia w cache lub nieskończonej rekurencji). Sprawdź też, czy wrapper przekazuje wszystkie metody i właściwości, których wywołujący faktycznie używają.
+#### Angle E — Wrapper/proxy correctness *(when the diff adds or modifies a wrapper, decorator, cache, proxy, or adapter)*
+Verify every wrapper method delegates to the wrapped instance (`delegate`) rather than routing back through a global registry or session (which causes cache re-entry or infinite recursion), and forwards all methods/properties callers rely on.
 
 ---
 
-### Kąty jakości, architektury i konwencji (*Cleanup, Altitude & Conventions Angles*)
+### Cleanup, Altitude & Conventions Angles
 
-*(Błędy poprawności z Angles A–E mają zawsze wyższy priorytet niż poniższe kąty, jeśli trzeba ograniczyć liczbę wyników do limitu).*
+*(Correctness defects from Angles A–E always take priority over these angles when capping findings).*
 
 #### Reuse
-Wskaż nowy kod, który reimplementuje funkcjonalność już obecną w repozytorium — przeszukaj (`grep_search`) moduły współdzielone/narzędziowe oraz sąsiednie pliki i podaj nazwę istniejącego helpera, którego należy użyć.
+Flag new code that reimplements functionality already present in the repository — search (`grep_search`) shared utilities and neighboring files and name the existing helper to call.
 
 #### Simplification
-Wskaż zbędną złożoność dodaną przez diff: nadmiarowy lub wyliczalny stan, copy-paste z niewielką wariacją, głębokie zagnieżdżenia, pozostawiony martwy kod. Wskaż prostszą postać wykonującą to samo zadanie.
+Flag unnecessary complexity introduced by the diff: redundant/derivable state, copy-paste with minor variation, deep nesting, dead code.
 
 #### Efficiency
-Wskaż marnowaną pracę wprowadzoną przez diff: powtarzane obliczenia lub wielokrotne I/O, niezależne operacje wykonywane sekwencyjnie, operacje blokujące dodane do ścieżki startowej lub *hot path*. Zgłaszaj też długo żyjące obiekty zbudowane z domknięć (*closures*), które utrzymują przy życiu cały otaczający scope z dużymi strukturami (wyciek pamięci) — wskaż tańszą alternatywę (np. klasę/strukturę kopiującą tylko potrzebne pola).
+Flag wasted work introduced by the diff: repeated computation or redundant I/O, sequential execution of independent operations, blocking calls on startup or hot paths, or long-lived closures retaining large surrounding scopes.
 
 #### Altitude
-Sprawdź, czy każda zmiana naprawia przyczynę źródłową (*root cause*) na odpowiedniej głębokości architektury, zamiast łatać symptom kruchym obejściem (*bandaid*). Doklejanie przypadków szczególnych na wspólnej infrastrukturze to znak, że naprawa jest zbyt płytka — wskaż prostszą, bardziej ogólną zmianę w mechanizmie bazowym.
+Check whether each change fixes the root cause at the right architectural depth rather than applying a shallow bandaid (`if/else` special cases on shared infrastructure).
 
 #### Conventions (`GEMINI.md` / `AGENTS.md` / `CLAUDE.md`)
-Sprawdź diff pod kątem wyraźnych naruszeń reguł zapisanych w plikach reguł projektu. Zgłoś naruszenie **wyłącznie wtedy**, gdy potrafisz zacytować dokładną regułę i dokładną linię kodu, która ją łamie — żadnych subiektywnych preferencji stylowych ani domysłów.
+Flag clear violations of project rules only when you can cite both the exact rule and the exact offending line — zero subjective style nitpicks.
 
 ---
 
-## Phase 2 — Weryfikacja i odsiew (`CONFIRMED` / `PLAUSIBLE` / `REFUTED`)
+## Phase 2 — Verification & Filtering (`CONFIRMED` / `PLAUSIBLE` / `REFUTED`)
 
-1. **Deduplikacja:** Połącz kandydatów wskazujących na tę samą linię lub ten sam mechanizm błędu, zachowując wpis z najbardziej konkretnym scenariuszem awarii.
-2. **Weryfikacja każdego kandydata** (przez subagenta weryfikującego w trybie *Multi-Agent* lub przez rygorystyczne sprawdzenie kodu źródłowego w trybie *Inline*). Przypisz każdemu kandydatowi dokładnie jeden status (oraz ocenę pewności `0–100`):
-   - **`CONFIRMED` (90–100 pkt):** Potrafisz podać konkretne dane wejściowe/stan wyzwalający problem oraz błędny wynik lub crash. Zacytuj dokładną linię kodu.
-   - **`PLAUSIBLE` (75–89 pkt):** Mechanizm błędu jest realny, a wyzwalacz zależy od realistycznego stanu runtime: wyścigi współbieżności, `None`/`undefined` na rzadkiej, ale osiągalnej ścieżce (obsługa błędów, zimny cache, brakujące pole opcjonalne), *falsy-zero*, *off-by-one* na brzegu niechronionym przez kod, utracony anchor w regexie/allowliście. Napisz, co potwierdziłoby błąd.
-   - **`REFUTED` (< 75 pkt — ODRZUĆ):** Twierdzenie jest faktycznie nieprawdziwe (kod robi co innego), matematycznie/typowo niemożliwe (udowodnione przez typ, stałą lub niezmiennik), już zabezpieczone guardem w tym diffie lub otaczającym kodzie, dotyczy linii niezmodyfikowanych i niezwiązanych z diffem (*pre-existing issue*) albo jest czysto stylistycznym nitpickiem bez obserwowalnego wpływu.
-3. **Filtrowanie:**
-   - Odrzuć wszystkie znaleziska ze statusem **`REFUTED`**.
-   - Zachowaj **`CONFIRMED`** oraz **`PLAUSIBLE`**, sortując je od najwyższej wagi (najpierw błędy poprawności `correctness`, potem `efficiency` / `altitude` / `reuse` / `simplification` / `conventions`).
-
----
-
-## Phase 3 — Sweep for gaps *(tylko dla poziomów `high`, `xhigh`, `max`)*
-
-Mając zweryfikowaną listę znalezisk, wykonaj jeszcze jeden przebieg po diffie i otaczających funkcjach jako świeży recenzent, szukając **wyłącznie** defektów, których nie ma jeszcze na liście. Skup się na tym, co pierwszy przebieg najczęściej pomija:
-- przeniesiony lub wyekstrahowany kod, który zgubił guarda lub anchora,
-- pułapki drugiego rzędu (wartość domyślna w `dataclass` ewaluowana raz, niedeterminizm `hash()`, zawężenie zakresu locka, metody predykatowe ze skutkami ubocznymi),
-- asymetria `setup` / `teardown` w testach,
-- przypadkowo odwrócone wartości domyślne konfiguracji lub flag.
+1. **Deduplicate:** Merge candidates pointing to the same line or defect mechanism, keeping the most specific failure scenario.
+2. **Verify every candidate** (via a verifier subagent in *Multi-Agent* mode or rigorous source inspection in *Inline* mode). Assign each candidate one status and a confidence score (`0–100`):
+   - **`CONFIRMED` (90–100 pts):** You can name the exact triggering input/state and the resulting wrong output or crash. Cite the exact line.
+   - **`PLAUSIBLE` (75–89 pts):** The defect mechanism is real and depends on a realistic runtime state: concurrency race, `None`/`undefined` on a rare but reachable path, falsy-zero, unguarded boundary off-by-one, or missing regex anchor. State what would confirm it.
+   - **`REFUTED` (< 75 pts — DISCARD):** Factually false, impossible by type/invariant, already guarded in the diff or surrounding code, pre-existing on untouched lines, or a pure style nitpick with no observable impact.
+3. **Filter:**
+   - Discard all **`REFUTED`** candidates.
+   - Keep **`CONFIRMED`** and **`PLAUSIBLE`**, sorted by severity (`correctness` first, then `efficiency` / `altitude` / `reuse` / `simplification` / `conventions`).
 
 ---
 
-## Format raportu końcowego
+## Phase 3 — Sweep for Gaps *(only for `high`, `xhigh`, `max`)*
 
-Przedstaw wynik w przejrzystej strukturze po polsku:
+With the verified findings list in hand, perform one additional pass over the diff and enclosing functions as a fresh reviewer looking **exclusively** for defects not yet listed:
+- moved or extracted code that lost a guard clause or anchor,
+- second-order pitfalls (`dataclass` default evaluated once, `hash()` non-determinism, narrowed lock scope, predicate methods with side effects),
+- test `setup` / `teardown` asymmetry,
+- accidentally inverted default flags or configuration values.
+
+---
+
+## Final Report Format
 
 ```markdown
-### Code Review — Podsumowanie
-- **Zakres:** `<opis badanego diffu / PR / plików>`
-- **Tryb:** `<effort: low|medium|high|max>` (`<Single-Pass Inline | Multi-Agent Fan-Out>`)
-- **Wynik:** Znaleziono **X** problemów (`Y CONFIRMED`, `Z PLAUSIBLE`)
+### Code Review — Summary
+- **Scope:** `<description of reviewed diff / PR / files>`
+- **Mode:** `<effort: low|medium|high|max>` (`<Single-Pass Inline | Multi-Agent Fan-Out>`)
+- **Result:** Found **X** issues (`Y CONFIRMED`, `Z PLAUSIBLE`)
 
 ---
 
-### Znaleziska
+### Findings
 
-#### 1. `[CONFIRMED | 95/100]` `[<kategoria>]` <Jednozdaniowe podsumowanie problemu>
-- **Lokalizacja:** [plik.py:L42-L48](file:///pelna/sciezka/plik.py#L42-L48)
-- **Failure scenario / Koszt:** <Konkretne dane wejściowe lub stan → błędny wynik/crash (lub cytat złamanej reguły z GEMINI.md/CLAUDE.md)>
-- **Proponowana poprawka:**
-  ```<język>
-  <konkretny kod naprawiający problem>
+#### 1. `[CONFIRMED | 95/100]` `[<category>]` <One-sentence summary of the issue>
+- **Location:** [file.py:L42-L48](file:///full/path/to/file.py#L42-L48)
+- **Failure Scenario / Cost:** <Concrete input/state -> wrong output/crash (or cited rule violation)>
+- **Proposed Fix:**
+  ```<language>
+  <concrete code fix>
   ```
 ```
 
-Jeśli po weryfikacji nie znaleziono żadnych problemów spełniających kryteria, napisz krótko:
-> **Brak problemów (`0 CONFIRMED / PLAUSIBLE`).** Sprawdzono diff pod kątem poprawności (Angles A–E), jakości (Reuse, Simplification, Efficiency, Altitude) oraz zgodności z regułami projektu.
+If zero issues survive verification, state concisely:
+> **No issues found (`0 CONFIRMED / PLAUSIBLE`).** Checked the diff across correctness (Angles A–E), code quality (Reuse, Simplification, Efficiency, Altitude), and project conventions.
 
 ---
 
-## Akcje po przeglądzie (`--fix` oraz `--comment`)
+## Post-Review Actions (`--fix` and `--comment`)
 
-1. **Gdy przekazano flagę `--fix`:**
-   - Po wypisaniu raportu od razu zaaplikuj poprawki w drzewie roboczym używając narzędzi edycji plików (`replace_file_content`).
-   - Pomiń poprawki, które zmieniłyby zamierzone zachowanie biznesowe lub wymagałyby głębokiej przebudowy poza zakresem diffu (odnotuj powód pominięcia).
-   - Na końcu wypisz krótkie podsumowanie: co zostało naprawione, a co pominięto.
-2. **Gdy przekazano flagę `--comment`:**
-   - **Dla GitHub PR:** opublikuj zwięzły komentarz podsumowujący przez `gh pr comment <pr> --body "..."` lub komentarze inline przez `gh api repos/{owner}/{repo}/pulls/{pr}/comments`. W linkach do kodu na GitHubie używaj pełnego 40-znakowego SHA1 commita (`https://github.com/owner/repo/blob/<pelne-sha1>/sciezka/plik.ext#L10-L15`). **Pamiętaj o globalnej regule użytkownika: NIGDY nie dodawaj stopki AI attribution (`Generated with...`, `Co-authored-by:` itp.).**
-   - **Dla GitLab MR:** opublikuj notatkę przez `glab mr note <mr> -m "..."`.
+1. **When `--fix` is passed:**
+   - Immediately apply verified fixes to the working tree using `replace_file_content`.
+   - Skip fixes that would alter intended business behavior or require invasive out-of-scope refactoring (note the reason).
+2. **When `--comment` is passed:**
+   - **GitHub PR:** publish a concise review comment via `gh pr comment <pr> --body "..."` or inline comments via `gh api repos/{owner}/{repo}/pulls/{pr}/comments`. Use full 40-character commit SHAs in GitHub blob links. **Never include any AI attribution trailers (`Generated with...`, `Co-authored-by:`, etc.).**
+   - **GitLab MR:** publish a note via `glab mr note <mr> -m "..."`.

@@ -1,26 +1,38 @@
-# Deep Engineering Protocols (`ultrathink` & `ultracode`)
+# Keyword Triggers: `ultrathink` & `ultracode`
 
-Whenever the user includes the keyword **`ultrathink`** or **`ultracode`** anywhere in their message, immediately activate the corresponding engineering protocol for the current task:
+Whenever the user's request (`<USER_REQUEST>`) contains either of the following keywords (case-insensitive), immediately activate the corresponding engineering rigor mode:
 
-## 1. Protocol `ultrathink` (Deep Architecture & Algorithmic Reasoning)
-The keyword `ultrathink` demands maximum analytical rigor before making a design decision or writing code:
-1. **No Shortcuts:** Do not jump straight into generating surface-level code.
-2. **Explicit Problem Decomposition:** Before writing implementation code, concisely lay out:
-   - **Assumptions & Invariants:** what must hold true before and after the operation,
-   - **Edge Cases & Failure Modes:** empty inputs, boundary values (`0`, `None`, `NaN`), concurrency, I/O failures, invalid states,
-   - **Time & Space Complexity:** computational and memory cost on critical hot paths,
-   - **Architectural Trade-offs:** compare at least 2 viable approaches and justify the chosen abstraction level (*Altitude*).
+---
 
-## 2. Protocol `ultracode` (Deep Hard-Loop Multi-Agent Execution — Gear 3)
-The keyword `ultracode` activates **Gear 3 (`Deep` Hard-Loop)** — optimizing for exhaustive correctness, security, and runtime verification:
-0. **Phase 0 — Arm Hard-Loop (`craftsman_state.json`):** Initialize the session gate in `deep` mode:
-   `~/.gemini/config/scripts/craftsman-stop-gate.py --state-file "<artifactDirectoryPath>/craftsman_state.json" --init --mode ultracode --tier deep --cwd "<repo_dir>"`
-1. **Phase 1 — Discovery (`research` subagents):** For non-trivial tasks, launch parallel `research` subagents (`invoke_subagent`) to map existing codebase patterns, call sites, and edge cases.
-2. **Phase 2 — High-Precision Implementation:** Implement the solution following `ultrathink` invariants and clean architecture principles.
-3. **Phase 3 — Mandatory Independent Quality Gate Subagent (`Creator != Reviewer`):**
-   Do not self-certify your own code inline. Spawn an independent subagent via `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`) on the full cumulative diff (`git diff <base_sha>`) to read and execute:
-   - **`/simplify`** — clean up code across *Reuse*, *Simplification*, *Efficiency*, and *Altitude*,
-   - **`/code-review`** + **`/audit all`** — run full correctness and specialist audits (*errors*, *types*, *tests*, *security*, *perf*) and fix all `CONFIRMED` / `PLAUSIBLE` findings directly,
-   - **`/verify`** — run unit tests and end-to-end runtime verification.
-4. **Phase 4 — Close Hard-Loop Gate:** Only after receiving the report from `Craftsman Quality Gate Auditor`, run:
-   `~/.gemini/config/scripts/craftsman-stop-gate.py --state-file "<artifactDirectoryPath>/craftsman_state.json" --complete`
+## 1. Keyword: `ultrathink` (Deep Architectural Reasoning)
+When `ultrathink` is present in the prompt, **before writing a single line of code or proposing an edit**, you MUST include an explicit **`### 🧠 Deep Reasoning & Architecture Analysis`** section covering:
+1. **Deconstruction & Invariants**: Identify hidden assumptions, edge cases, concurrency/state hazards, and domain invariants that must be preserved.
+2. **Complexity & Resource Trade-offs**: Explicitly evaluate time ($O(\dots)$) and memory ($O(\dots)$) complexity, I/O bottlenecks, and failure modes.
+3. **Counterfactual Architecture Comparison**: Compare at least **2 distinct approaches** (e.g., pragmatic minimal change vs. clean structural refactor) with concrete pros/cons before selecting the winning design.
+4. **Failure-Mode Pre-Mortem**: List the top 3 ways the chosen solution could fail in production and how your implementation prevents them.
+
+---
+
+## 2. Keyword: `ultracode` (Gear 3 Deep Hard-Loop + Independent Quality Gate Subagent)
+When `ultracode` is present in the prompt, execute the full **Gear 3 (`deep`) Hard-Loop** pipeline (`Creator != Reviewer`):
+1. **Initialize Gear 3 (`deep`) Hard-Loop State**:
+   Run:
+   ```bash
+   python3 ~/.gemini/config/scripts/craftsman-stop-gate.py --state-file <appDataDir>/brain/<conversation-id>/craftsman_state.json --init --mode ultracode --tier deep --cwd "$(pwd)"
+   ```
+   *(If waiting on `ask_question`, pass `--await-user`, then `--resume` once the user responds).*
+2. **Parallel Subagent Exploration**:
+   For non-trivial codebase questions, launch 2–3 `research` subagents (`invoke_subagent` with `Model: "inherit"`) in parallel to map all callers, types, and existing patterns before editing.
+3. **Production-Grade Implementation**:
+   - Strictly enforce type safety (*make illegal states unrepresentable*), explicit error handling (zero silent failures or bare `except:`), and DRY/SOLID principles.
+4. **Mandatory Independent Quality Gate Subagent (`Creator != Reviewer`)**:
+   - **Never perform the review solely inline in the main thread!** Before finishing your response, spawn an independent subagent via **`invoke_subagent`** (`TypeName: "self"`, `Model: "inherit"`, `Role: "Craftsman Quality Gate Auditor"`), passing the repository path and `base_sha` from `craftsman_state.json`.
+   - The subagent must execute in a fresh context across the entire cumulative diff (`git diff <base_sha>`):
+     1. **`/simplify`** (Reuse, Simplification, Efficiency, Altitude) and apply simplifications directly,
+     2. **`/code-review`** + **`/audit all`** (`/audit-errors`, `/audit-tests`, `/audit-types`, `/audit-comments`, `/audit-security`) and fix all `CONFIRMED` / `PLAUSIBLE` findings,
+     3. **`/verify`** (unit tests + real end-to-end runtime verification).
+   - Once the subagent reports back, close the Hard-Loop gate:
+     ```bash
+     python3 ~/.gemini/config/scripts/craftsman-stop-gate.py --state-file <appDataDir>/brain/<conversation-id>/craftsman_state.json --complete
+     ```
+     *(The script inspects `transcript.jsonl` and rejects `--complete` if `invoke_subagent` was not called).*

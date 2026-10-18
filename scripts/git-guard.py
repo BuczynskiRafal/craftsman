@@ -446,9 +446,9 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
         if is_ai_attribution_check_target(tokens) and has_ai_attribution(segment, tokens, effective_cwd):
             return (
                 "deny",
-                "[CRAFTSMAN GIT-GUARD] Zablokowano (Global Rule #2 — Zero AI Attribution): "
-                "Commity, tagi oraz Pull Requesty nie mogą zawierać 'Co-authored-by:' ani "
-                "żadnych stopek przypisujących autorstwo AI.",
+                "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #2 — Zero AI Attribution): "
+                "Commits, tags, and Pull Requests must not contain 'Co-authored-by:' or "
+                "any AI attribution trailers.",
             )
 
     # 2. Check Rule #1: No unconfirmed push to main / master
@@ -464,16 +464,16 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
         if is_force:
             return (
                 "force_ask",
-                "[CRAFTSMAN GIT-GUARD] Wykryto 'git push --force' na chronioną gałąź (main/master). "
-                "Wymagane bezpośrednie potwierdzenie użytkownika.",
+                "[CRAFTSMAN GIT-GUARD] Detected 'git push --force' targeting a protected branch (main/master). "
+                "Explicit user confirmation is required.",
             )
 
         transcript_path = resolve_transcript_path(payload)
         if transcript_path is None:
             return (
                 "force_ask",
-                "[CRAFTSMAN GIT-GUARD] Wykryto 'git push' na gałąź main/master (Global Rule #1). "
-                "Potwierdź wykonanie operacji.",
+                "[CRAFTSMAN GIT-GUARD] Detected 'git push' targeting main/master (Global Rule #1). "
+                "Please confirm this operation.",
             )
 
         if was_ask_question_called_since_last_push(transcript_path, effective_cwd):
@@ -481,10 +481,10 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
 
         return (
             "deny",
-            "[CRAFTSMAN GIT-GUARD] Zablokowano (Global Rule #1 — No Unconfirmed Push to main/master): "
-            "Przed wykonaniem 'git push' na gałąź main/master musisz najpierw zapytać użytkownika "
-            "o zgodę za pomocą narzędzia 'ask_question' (oferując wybór między bezpośrednim pushem "
-            "na main a wypchnięciem na nową gałąź funkcjonalną pod PR).",
+            "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #1 — No Unconfirmed Push to main/master): "
+            "Before executing 'git push' to main/master, you must first ask the user for "
+            "confirmation via the 'ask_question' tool (offering a choice between pushing directly "
+            "to main vs. pushing to a new feature branch for a Pull Request).",
         )
 
     return "allow", None
@@ -528,9 +528,9 @@ def run_native_commit_msg_hook(msg_file_str: str) -> int:
     )
     if has_ai_attribution(active_lines):
         sys.stderr.write(
-            "\n[CRAFTSMAN GIT-HOOK] Zablokowano commit (Global Rule #2 — Zero AI Attribution):\n"
-            "Wiadomość commita nie może zawierać 'Co-authored-by:' ani żadnych stopek\n"
-            "przypisujących autorstwo AI (Claude, Gemini, Antigravity, Copilot itp.).\n\n"
+            "\n[CRAFTSMAN GIT-HOOK] Commit blocked (Global Rule #2 — Zero AI Attribution):\n"
+            "Commit messages must not contain 'Co-authored-by:' or any AI attribution\n"
+            "trailers (Claude, Gemini, Antigravity, Copilot, etc.).\n\n"
         )
         return 1
     return 0
@@ -561,20 +561,20 @@ def run_native_pre_push_hook() -> int:
         try:
             with open("/dev/tty", "r+", encoding="utf-8") as tty:
                 tty.write(
-                    "[CRAFTSMAN GIT-HOOK] Wykryto 'git push' na chronioną gałąź (main/master). "
-                    "Kontynuować? [y/N]: "
+                    "[CRAFTSMAN GIT-HOOK] Detected 'git push' targeting a protected branch (main/master). "
+                    "Continue? [y/N]: "
                 )
                 tty.flush()
                 answer = tty.readline().strip().lower()
-                if answer in ("y", "yes", "t", "tak"):
+                if answer in ("y", "yes"):
                     return 0
         except OSError:
             pass
 
     sys.stderr.write(
-        "\n[CRAFTSMAN GIT-HOOK] Zablokowano bezpośredni 'git push' na gałąź main/master (Global Rule #1).\n"
-        "- Najpierw zapytaj użytkownika o zgodę (wybór między nową gałęzią pod PR a bezpośrednim pushem na main).\n"
-        "- Po uzyskaniu jawnej zgody użytkownika wykonaj: CRAFTSMAN_ALLOW_MAIN_PUSH=1 git push ...\n\n"
+        "\n[CRAFTSMAN GIT-HOOK] Blocked direct 'git push' to main/master (Global Rule #1).\n"
+        "- First ask the user for confirmation (offering a choice between a feature branch for a PR vs. direct push to main).\n"
+        "- Once explicitly approved by the user, run: CRAFTSMAN_ALLOW_MAIN_PUSH=1 git push ...\n\n"
     )
     return 1
 

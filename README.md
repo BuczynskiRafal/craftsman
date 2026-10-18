@@ -4,16 +4,16 @@
 [![Version](https://img.shields.io/badge/version-2.0.0-emerald.svg)](plugin.json)
 [![Platforms](https://img.shields.io/badge/platforms-Claude_Code_%7C_Codex_%7C_Copilot_%7C_Cursor_%7C_Antigravity-purple.svg)](#multi-platform-installation)
 
-**Craftsman** is a universal, zero-trust **Agentic Software Engineering & Quality Gate Framework** (`Twórca ≠ Recenzent` / *Creator ≠ Reviewer*). It equips AI coding agents (**Claude Code**, **OpenAI Codex CLI**, **GitHub Copilot**, **Cursor**, and **Google Antigravity**) with 17 structured engineering workflows, a **3-Gear Adaptive Quality Loop** (Soft-Loop vs. Hybrid Hard-Loop), and deterministic OS-level Git/Lifecycle guardrails.
+**Craftsman** is a universal, zero-trust **Agentic Software Engineering & Quality Gate Framework** (*Creator != Reviewer*). It equips AI coding agents (**Claude Code**, **OpenAI Codex CLI**, **GitHub Copilot**, **Cursor**, and **Google Antigravity**) with 17 structured engineering workflows, a **3-Gear Adaptive Quality Loop** (Soft-Loop vs. Hybrid Hard-Loop), and deterministic OS-level Git and lifecycle guardrails.
 
 ---
 
 ## ✨ Why Craftsman?
 
-1. **Creator ≠ Reviewer (`Twórca ≠ Recenzent`) Verified at Runtime:**
+1. **Creator != Reviewer Verified at Runtime:**
    AI agents suffer from confirmation bias when reviewing code they just wrote in the same context window. For non-trivial changes, Craftsman's `Stop` hook scans `transcript.jsonl` and physically blocks task completion until the primary agent spawns a fresh, independent **`Craftsman Quality Gate Auditor` subagent** to execute `/simplify` -> `/code-review` -> `/verify` on the full cumulative diff (`base_sha..HEAD`).
 2. **3-Gear Automatic Gearbox (`Quick` vs `Standard` vs `Deep`):**
-   No brute-force overhead on 5-line fixes. Craftsman automatically measures the cumulative git diff (`git diff --numstat <base_sha>`) and selects the optimal verification depth:
+   No brute-force overhead on 5-line fixes. Craftsman automatically measures the cumulative git diff (`git diff --numstat <base_sha>` plus untracked files) and selects the optimal verification depth:
    - **Gear 1 — `Quick` (Soft-Loop):** `<= 40` changed lines across `<= 2` files (or `/craftsman --quick`). Runs fast inline `/simplify` + `/verify` with **zero subagent overhead**.
    - **Gear 2 — `Standard` (Hybrid Hard-Loop):** `> 40` changed lines or `> 2` files. Requires an independent `Craftsman Quality Gate Auditor` subagent verified in `transcript.jsonl`.
    - **Gear 3 — `Deep` (Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode`. Activates pre-implementation `ultrathink` architecture analysis + independent subagent running all 5 specialized `/audit` suites.
@@ -61,7 +61,7 @@ flowchart TD
     Batch --> Gearbox
 
     Gearbox -->|"Gear 1: Quick (<=40 lines & <=2 files\nor --quick)"| SoftLoop["Inline Soft-Loop:\n/simplify + /verify (0 subagents)"]
-    Gearbox -->|"Gear 2: Standard (>40 lines or >2 files)\nGear 3: Deep (--deep / ultracode)"| Subagent["Independent Subagent (Twórca != Recenzent):\ninvoke_subagent (Craftsman Quality Gate Auditor)"]
+    Gearbox -->|"Gear 2: Standard (>40 lines or >2 files)\nGear 3: Deep (--deep / ultracode)"| Subagent["Independent Subagent (Creator != Reviewer):\ninvoke_subagent (Craftsman Quality Gate Auditor)"]
 
     Subagent --> Simplify["Step 1: /simplify on cumulative diff (base_sha..HEAD)"]
     Simplify --> Review["Step 2: /code-review + /audit-* + Auto-Fix (Angles A-E)"]
@@ -135,4 +135,4 @@ flowchart TD
 ## 🙏 Acknowledgments & License
 
 - **License:** Released under the [MIT License](LICENSE) (`Copyright (c) 2026 Rafał Buczyński`).
-- **Architectural Inspiration:** Informed by multi-agent separation-of-concerns patterns (*Creator ≠ Reviewer*), lifecycle hook state machines, and structured specification-driven modernization practices from the AI software engineering ecosystem.
+- **Architectural Inspiration:** Informed by multi-agent separation-of-concerns patterns (*Creator != Reviewer*), lifecycle hook state machines, and structured specification-driven modernization practices from the AI software engineering ecosystem.
