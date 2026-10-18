@@ -562,8 +562,177 @@ class StopGateHookTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_3_gear_gearbox_quick_vs_auto_diff_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "dev@example.com"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Dev"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            f1 = repo_dir / "app.py"
+            f1.write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "commit", "--no-verify", "-m", "initial"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
 
-class NativeGitHooksAndCopilotExportTests(unittest.TestCase):
+            artifact_dir = Path(tmpdir) / "brain"
+            logs_dir = artifact_dir / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            transcript = logs_dir / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "/craftsman small tweak"})
+                + "\n",
+                encoding="utf-8",
+            )
+            state_file = artifact_dir / "craftsman_state.json"
+
+            # Initialize in auto tier pointing to repo_dir
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--init",
+                    "--cwd",
+                    str(repo_dir),
+                ],
+                check=True,
+            )
+
+            # Case 1: Small change (2 lines in 1 file <= 40 lines & <= 2 files) -> Gear 1 (Quick Soft-Loop)
+            # Allows --complete WITHOUT invoke_subagent in transcript!
+            f1.write_text("x = 2\ny = 3\n", encoding="utf-8")
+            small_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(small_complete.returncode, 0, small_complete.stderr)
+
+            # Re-init and make a large change (50 lines in 1 file > 40 lines) -> Gear 2 (Standard Hard-Loop)
+            # Rejects --complete without invoke_subagent!
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--init",
+                    "--cwd",
+                    str(repo_dir),
+                ],
+                check=True,
+            )
+            f1.write_text("\n".join(f"line_{i} = {i}" for i in range(55)) + "\n", encoding="utf-8")
+            large_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(large_complete.returncode, 1)
+            self.assertIn("invoke_subagent", large_complete.stderr)
+
+            # Explicit --tier quick overrides diff size and allows inline completion
+            quick_override = subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--tier",
+                    "quick",
+                    "--complete",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(quick_override.returncode, 0, quick_override.stderr)
+
+            # Untracked files (>2 files) also trigger Gear 2 (Standard Hard-Loop)
+            f1.write_text("x = 1\n", encoding="utf-8")
+            for idx in range(3):
+                (repo_dir / f"untracked_{idx}.py").write_text("a = 1\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--init",
+                    "--cwd",
+                    str(repo_dir),
+                ],
+                check=True,
+            )
+            untracked_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(untracked_complete.returncode, 1)
+
+            # Claude Code 'Task' subagent tool call satisfies Gear 2 Hard-Loop
+            with transcript.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "step_index": 2,
+                            "type": "PLANNER_RESPONSE",
+                            "tool_calls": [
+                                {
+                                    "name": "Task",
+                                    "input": {
+                                        "description": "Craftsman Quality Gate Auditor",
+                                        "prompt": "Run /simplify, /code-review, and /verify",
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                    + "\n"
+                )
+            claude_task_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(claude_task_complete.returncode, 0, claude_task_complete.stderr)
+
+
+class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
+    def test_claude_code_bash_payload_is_enforced_by_git_guard(self) -> None:
+        res = run_hook(
+            GIT_GUARD,
+            {
+                "tool_name": "Bash",
+                "tool_input": {
+                    "command": 'git commit -m "feat: x\n\nCo-authored-by: Claude <noreply@anthropic.com>"'
+                },
+            },
+        )
+        self.assertEqual(res["decision"], "deny")
+        self.assertIn("Global Rule #2", res.get("reason", ""))
+
     def test_native_commit_msg_hook_blocks_ai_trailers_and_ignores_comments(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             msg_file = Path(tmpdir) / "COMMIT_EDITMSG"
@@ -636,11 +805,12 @@ class NativeGitHooksAndCopilotExportTests(unittest.TestCase):
         )
         self.assertEqual(allowed_proc.returncode, 0)
 
-    def test_copilot_export_generates_user_and_workspace_files(self) -> None:
+    def test_multi_platform_export_generates_copilot_claude_codex_and_cursor_files(self) -> None:
         exporter = REPO_ROOT / "scripts" / "copilot-export.py"
         with tempfile.TemporaryDirectory() as tmpdir:
             user_prompts = Path(tmpdir) / "user_prompts"
             workspace = Path(tmpdir) / "ws"
+            claude_dir = Path(tmpdir) / "claude"
             subprocess.run(
                 [
                     sys.executable,
@@ -651,14 +821,22 @@ class NativeGitHooksAndCopilotExportTests(unittest.TestCase):
                     str(user_prompts),
                     "--workspace",
                     str(workspace),
+                    "--claude-dir",
+                    str(claude_dir),
+                    "--agents-workspace",
+                    str(workspace),
                 ],
                 check=True,
             )
             self.assertTrue((user_prompts / "craftsman.prompt.md").is_file())
             self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
-            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 20)
+            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 17)
             self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
-            self.assertEqual(len(list((workspace / ".github" / "prompts").glob("*.prompt.md"))), 20)
+            self.assertEqual(len(list((workspace / ".github" / "prompts").glob("*.prompt.md"))), 17)
+            self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), 17)
+            self.assertTrue((claude_dir / "rules" / "craftsman-rules.md").is_file())
+            self.assertTrue((workspace / "AGENTS.md").is_file())
+            self.assertTrue((workspace / ".cursor" / "rules" / "craftsman.mdc").is_file())
 
 
 if __name__ == "__main__":

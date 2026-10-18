@@ -1,24 +1,26 @@
-# Tryby Głębokiej Pracy Inżynierskiej (`ultrathink` & `ultracode`)
+# Deep Engineering Protocols (`ultrathink` & `ultracode`)
 
-Gdy użytkownik użyje w swojej wiadomości (w dowolnym miejscu zdania) słowa-klucza **`ultrathink`** lub **`ultracode`**, bezwzględnie aktywuj odpowiedni protokół pracy w bieżącej turze:
+Whenever the user includes the keyword **`ultrathink`** or **`ultracode`** anywhere in their message, immediately activate the corresponding engineering protocol for the current task:
 
-## 1. Protokół `ultrathink` (Maksymalna głębia rozumowania i architektury)
-Słowo `ultrathink` oznacza żądanie najgłębszej możliwej analizy inżynierskiej przed podjęciem decyzji lub napisaniem kodu.
-1. **Zakaz dróg na skróty:** Nie generuj od razu powierzchownego rozwiązania ani pierwszego lepszego kodu.
-2. **Jawna dekonstrukcja problemu:** Zanim przejdziesz do implementacji, rozpisz zwięźle:
-   - **Założenia i niezmienniki (*Invariants*):** co musi pozostać prawdziwe przed i po wykonaniu operacji,
-   - **Przypadki brzegowe i awarie (*Edge Cases & Failure Modes*):** puste dane, wartości graniczne (`0`, `None`, `NaN`), współbieżność, błędy I/O, nieprawidłowe stany,
-   - **Złożoność obliczeniowa i pamięciowa:** koszt czasowy i pamięciowy na ścieżkach krytycznych (*hot paths*),
-   - **Porównanie wariantów (Trade-offs):** rozważ co najmniej 2 podejścia architektoniczne i uzasadnij wybór najlepszego na właściwym poziomie abstrakcji (*Altitude*).
+## 1. Protocol `ultrathink` (Deep Architecture & Algorithmic Reasoning)
+The keyword `ultrathink` demands maximum analytical rigor before making a design decision or writing code:
+1. **No Shortcuts:** Do not jump straight into generating surface-level code.
+2. **Explicit Problem Decomposition:** Before writing implementation code, concisely lay out:
+   - **Assumptions & Invariants:** what must hold true before and after the operation,
+   - **Edge Cases & Failure Modes:** empty inputs, boundary values (`0`, `None`, `NaN`), concurrency, I/O failures, invalid states,
+   - **Time & Space Complexity:** computational and memory cost on critical hot paths,
+   - **Architectural Trade-offs:** compare at least 2 viable approaches and justify the chosen abstraction level (*Altitude*).
 
-## 2. Protokół `ultracode` (Orkiestracja wieloagentowa i pełna pętla weryfikacji Hard-Loop)
-Słowo `ultracode` oznacza optymalizację pod kątem najbardziej wyczerpującego, bezbłędnego i zweryfikowanego rozwiązania — koszt tokenów i czas nie są ograniczeniem (z zachowaniem higieny dysku: używaj subagentów w pamięci przez `invoke_subagent`, nie twórz setek plików tymczasowych na dysku).
-0. **Faza 0 — Aktywacja Bramki Hard-Loop (`craftsman_state.json`):** Na starcie uruchom `~/.gemini/config/scripts/craftsman-stop-gate.py --state-file "<artifactDirectoryPath>/craftsman_state.json" --init --mode ultracode --cwd "<repo_dir>"`.
-1. **Faza 1 — Rozpoznanie (`research` subagents):** Dla każdego nietrywialnego zadania uruchom równoległe subagenty `research` (`invoke_subagent`), aby dokładnie zmapować istniejące wzorce w codebase, wywołujących (*call sites*) i potencjalne pułapki.
-2. **Faza 2 — Implementacja o wysokiej precyzji:** Wdróż rozwiązanie zgodnie ze standardami projektu i zasadami czystego kodu.
-3. **Faza 3 — Obowiązkowy Niezależny Subagent Bramki Jakości (`Twórca ≠ Recenzent`):**
-   Po zakończeniu zmian w kodzie **nie oceniaj własnego kodu inline**. Powołaj niezależnego subagenta przez `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`), który na całym skumulowanym diffie (`git diff <base_sha>`) wczyta przez `view_file` i wykona kolejno:
-   - **[`/simplify`](file:///Users/rafalbuczynski/.gemini/config/skills/simplify/SKILL.md)** — wyczyszczenie kodu pod kątem *Reuse*, *Simplification*, *Efficiency* i *Altitude*,
-   - **[`/code-review`](file:///Users/rafalbuczynski/.gemini/config/skills/code-review/SKILL.md)** + adekwatne **`/audit-*`** — przegląd *Angles A–E* i natychmiastowa naprawa wszystkich znalezisk (`CONFIRMED` / `PLAUSIBLE`),
-   - **[`/verify`](file:///Users/rafalbuczynski/.gemini/config/skills/verify/SKILL.md)** — uruchomienie testów i realnego przepływu End-to-End w runtime.
-4. **Faza 4 — Zamknięcie Bramki Hard-Loop:** Dopiero po odebraniu raportu od subagenta `Craftsman Quality Gate Auditor` uruchom `~/.gemini/config/scripts/craftsman-stop-gate.py --state-file "<artifactDirectoryPath>/craftsman_state.json" --complete`.
+## 2. Protocol `ultracode` (Deep Hard-Loop Multi-Agent Execution — Gear 3)
+The keyword `ultracode` activates **Gear 3 (`Deep` Hard-Loop)** — optimizing for exhaustive correctness, security, and runtime verification:
+0. **Phase 0 — Arm Hard-Loop (`craftsman_state.json`):** Initialize the session gate in `deep` mode:
+   `~/.gemini/config/scripts/craftsman-stop-gate.py --state-file "<artifactDirectoryPath>/craftsman_state.json" --init --mode ultracode --tier deep --cwd "<repo_dir>"`
+1. **Phase 1 — Discovery (`research` subagents):** For non-trivial tasks, launch parallel `research` subagents (`invoke_subagent`) to map existing codebase patterns, call sites, and edge cases.
+2. **Phase 2 — High-Precision Implementation:** Implement the solution following `ultrathink` invariants and clean architecture principles.
+3. **Phase 3 — Mandatory Independent Quality Gate Subagent (`Creator != Reviewer`):**
+   Do not self-certify your own code inline. Spawn an independent subagent via `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`) on the full cumulative diff (`git diff <base_sha>`) to read and execute:
+   - **`/simplify`** — clean up code across *Reuse*, *Simplification*, *Efficiency*, and *Altitude*,
+   - **`/code-review`** + **`/audit all`** — run full correctness and specialist audits (*errors*, *types*, *tests*, *security*, *perf*) and fix all `CONFIRMED` / `PLAUSIBLE` findings directly,
+   - **`/verify`** — run unit tests and end-to-end runtime verification.
+4. **Phase 4 — Close Hard-Loop Gate:** Only after receiving the report from `Craftsman Quality Gate Auditor`, run:
+   `~/.gemini/config/scripts/craftsman-stop-gate.py --state-file "<artifactDirectoryPath>/craftsman_state.json" --complete`

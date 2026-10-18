@@ -11,38 +11,49 @@ PLUGINS_DIR="${CONFIG_DIR}/plugins"
 
 MODE="copy"
 INSTALL_ANTIGRAVITY=true
+INSTALL_CLAUDE_USER=false
 INSTALL_COPILOT_USER=false
 COPILOT_WORKSPACE=""
+AGENTS_WORKSPACE=""
 INSTALL_GIT_HOOKS=false
 
 usage() {
   cat <<EOF
 Usage: ./install.sh [options]
 
-Antigravity Options:
-  --copy                        (Default) Copy skills, rules, hooks.json, and scripts into ~/.gemini/config/
-  --symlink                     Symlink skills, rules, hooks.json, and scripts into ~/.gemini/config/
-  --plugin                      Install as a toggleable Antigravity plugin in ~/.gemini/config/plugins/craftsman
-
-GitHub Copilot & Universal Git Hook Options:
-  --copilot                     Export all 20 skills (*.prompt.md) and global rules (*.instructions.md)
+Universal Multi-Platform Options:
+  --all                         Install everywhere: Antigravity + Claude Code + GitHub Copilot + Git Hooks
+  --claude                      Export 17 slash commands (*.md) and rules into ~/.claude/ (Claude Code)
+  --copilot                     Export 17 skills (*.prompt.md) and rules (*.instructions.md)
                                 to VS Code User profile (Code/User/prompts) for GitHub Copilot Chat
   --copilot-workspace <path>    Export .github/prompts/*.prompt.md and .github/copilot-instructions.md
                                 into a target project repository
+  --agents-workspace <path>     Export universal AGENTS.md (OpenAI Codex / Windsurf) and
+                                .cursor/rules/craftsman.mdc (Cursor) into a target project repository
   --git-hooks                   Install OS-level Git hooks (commit-msg & pre-push) into
                                 ~/.gemini/config/git-hooks and set git config --global core.hooksPath
+
+Google Antigravity Options:
+  --copy                        (Default) Copy skills, rules, hooks.json, and scripts into ~/.gemini/config/
+  --symlink                     Symlink skills, rules, hooks.json, and scripts into ~/.gemini/config/
+  --plugin                      Install as a toggleable Antigravity plugin in ~/.gemini/config/plugins/craftsman
   -h, --help                    Show this help message
 EOF
 }
 
 if [[ $# -gt 0 ]]; then
-  # If user only specified --copilot, --copilot-workspace, or --git-hooks without --copy/--symlink/--plugin,
-  # still install scripts into ~/.gemini/config/scripts so git-hooks have their backend.
   INSTALL_ANTIGRAVITY=false
 fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --all)
+      INSTALL_ANTIGRAVITY=true
+      INSTALL_CLAUDE_USER=true
+      INSTALL_COPILOT_USER=true
+      INSTALL_GIT_HOOKS=true
+      shift
+      ;;
     --copy)
       MODE="copy"
       INSTALL_ANTIGRAVITY=true
@@ -58,6 +69,10 @@ while [[ $# -gt 0 ]]; do
       INSTALL_ANTIGRAVITY=true
       shift
       ;;
+    --claude)
+      INSTALL_CLAUDE_USER=true
+      shift
+      ;;
     --copilot)
       INSTALL_COPILOT_USER=true
       shift
@@ -68,6 +83,14 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       COPILOT_WORKSPACE="$2"
+      shift 2
+      ;;
+    --agents-workspace|--codex-workspace|--cursor-workspace)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: $1 requires a path argument" >&2
+        exit 1
+      fi
+      AGENTS_WORKSPACE="$2"
       shift 2
       ;;
     --git-hooks)
@@ -166,6 +189,11 @@ if [[ "${INSTALL_ANTIGRAVITY}" == true ]]; then
   fi
 fi
 
+if [[ "${INSTALL_CLAUDE_USER}" == true ]]; then
+  echo "Exporting Craftsman suite to Claude Code (~/.claude)..."
+  python3 "${REPO_DIR}/scripts/copilot-export.py" --repo-dir "${REPO_DIR}" --claude-dir
+fi
+
 if [[ "${INSTALL_COPILOT_USER}" == true ]]; then
   echo "Exporting Craftsman suite to GitHub Copilot (VS Code User Profile)..."
   python3 "${REPO_DIR}/scripts/copilot-export.py" --repo-dir "${REPO_DIR}" --user-dir
@@ -174,6 +202,11 @@ fi
 if [[ -n "${COPILOT_WORKSPACE}" ]]; then
   echo "Exporting Craftsman suite to GitHub Copilot workspace: ${COPILOT_WORKSPACE}..."
   python3 "${REPO_DIR}/scripts/copilot-export.py" --repo-dir "${REPO_DIR}" --workspace "${COPILOT_WORKSPACE}"
+fi
+
+if [[ -n "${AGENTS_WORKSPACE}" ]]; then
+  echo "Exporting universal AGENTS.md and Cursor rules to workspace: ${AGENTS_WORKSPACE}..."
+  python3 "${REPO_DIR}/scripts/copilot-export.py" --repo-dir "${REPO_DIR}" --agents-workspace "${AGENTS_WORKSPACE}"
 fi
 
 if [[ "${INSTALL_GIT_HOOKS}" == true ]]; then

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Stop lifecycle hook and CLI state helper for the `/craftsman` Hybrid Hard-Loop.
+"""Stop lifecycle hook and CLI state helper for the `/craftsman` 3-Gear Hybrid Hard-Loop.
 
-Enforces Zero-Trust Quality Gate verification via `transcript.jsonl`:
-- Tracks `base_sha` (cumulative diff from start of task) and `started_at_step`.
-- Auto-detects `/craftsman` or `ultracode` invocations in `transcript.jsonl` even if
-  the main agent forgot to run `--init`.
-- Physically blocks `--complete` and `Stop` (`{"decision": "continue"}`) unless the
-  main agent actually spawned an independent Quality Gate subagent via `invoke_subagent`
-  (`Role: "Craftsman Quality Gate Auditor"`) in `transcript.jsonl` to execute
-  `/simplify`, `/code-review`, `/audit`, and `/verify` on the cumulative diff.
+Supports both Google Antigravity and Claude Code lifecycle hooks:
+- Gear 1 (`quick` / Soft-Loop): Activated via `--tier quick` (`/craftsman --quick`) or
+  automatically (`--tier auto`) when the cumulative git diff (`base_sha..working_tree`)
+  is <= 40 lines across <= 2 files. Allows inline verification without spawning a subagent.
+- Gear 2 (`standard` / Hybrid Hard-Loop): Activated automatically when the cumulative diff
+  exceeds 40 lines or 2 files (or when `--tier standard` is set). Enforces Zero-Trust
+  verification in `transcript.jsonl` that an independent subagent (`Craftsman Quality Gate
+  Auditor`) was invoked via `invoke_subagent`.
+- Gear 3 (`deep` / Full-Audit Hard-Loop): Activated via `--tier deep` (`/craftsman --deep`
+  or keyword `ultracode`). Always requires the independent Quality Gate Auditor subagent
+  regardless of diff size.
 """
 
 from __future__ import annotations
@@ -25,6 +28,10 @@ from typing import Any
 
 REQUIRED_GATES = ("simplified", "reviewed", "verified")
 DEFAULT_MAX_CONTINUATIONS = 3
+SMALL_DIFF_MAX_LINES = 40
+SMALL_DIFF_MAX_FILES = 2
+VALID_TIERS = ("auto", "quick", "standard", "deep")
+
 QUALITY_GATE_ROLE_MARKERS = (
     "quality gate",
     "auditor",
@@ -56,17 +63,96 @@ def get_head_sha(cwd: str | None = None) -> str | None:
     return None
 
 
+def compute_cumulative_diff_stats(cwd: str | None, base_sha: str | None) -> tuple[int, int] | None:
+    """Return (changed_files_count, total_changed_lines) for `git diff <base_sha>` plus untracked files in `cwd`."""
+    if not cwd or not os.path.isdir(cwd):
+        return None
+    ref = base_sha if base_sha else "HEAD"
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--numstat", ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        files_count = 0
+        total_lines = 0
+        for line in proc.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            files_count += 1
+            added = int(parts[0]) if parts[0].isdigit() else 0
+            deleted = int(parts[1]) if parts[1].isdigit() else 0
+            total_lines += added + deleted
+
+        untracked_proc = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        if untracked_proc.returncode == 0:
+            cwd_path = Path(cwd)
+            for rel_path in untracked_proc.stdout.splitlines():
+                rel_path = rel_path.strip()
+                if not rel_path:
+                    continue
+                files_count += 1
+                fpath = cwd_path / rel_path
+                if fpath.is_file():
+                    try:
+                        with fpath.open("rb") as f:
+                            total_lines += sum(1 for _ in f)
+                    except OSError:
+                        pass
+
+        return files_count, total_lines
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def requires_subagent_for_state(state: dict[str, Any], fallback_cwd: str | None = None) -> bool:
+    """Determine whether the current task requires an independent Quality Gate subagent."""
+    tier = str(state.get("tier") or "auto").strip().lower()
+    mode = str(state.get("mode") or "craftsman").strip().lower()
+
+    if mode == "ultracode" or tier in ("deep", "standard"):
+        return True
+    if tier == "quick":
+        return False
+
+    # tier == "auto": measure cumulative diff in git if cwd is available
+    cwd = state.get("cwd") or fallback_cwd
+    base_sha = state.get("base_sha")
+    stats = compute_cumulative_diff_stats(cwd if isinstance(cwd, str) else None, base_sha)
+    if stats is not None:
+        num_files, total_lines = stats
+        if 1 <= num_files <= SMALL_DIFF_MAX_FILES and total_lines <= SMALL_DIFF_MAX_LINES:
+            return False
+    return True
+
+
 def resolve_transcript_for_state_file(
     state_file: Path, payload: dict[str, Any] | None = None
 ) -> Path | None:
     candidates: list[Path] = []
     if payload:
-        raw_t = payload.get("transcriptPath")
-        if isinstance(raw_t, str) and raw_t:
-            candidates.append(Path(raw_t))
+        for key in ("transcriptPath", "transcript_path"):
+            raw_t = payload.get(key)
+            if isinstance(raw_t, str) and raw_t:
+                candidates.append(Path(raw_t).expanduser())
         raw_a = payload.get("artifactDirectoryPath")
         if isinstance(raw_a, str) and raw_a:
-            candidates.append(Path(raw_a) / ".system_generated" / "logs" / "transcript.jsonl")
+            candidates.append(
+                Path(raw_a).expanduser() / ".system_generated" / "logs" / "transcript.jsonl"
+            )
 
     candidates.append(state_file.parent / ".system_generated" / "logs" / "transcript.jsonl")
     for candidate in candidates:
@@ -115,12 +201,16 @@ def get_latest_step_index(entries: list[dict[str, Any]]) -> int:
 
 def default_state(
     mode: str = "craftsman",
+    tier: str = "auto",
+    cwd: str | None = None,
     base_sha: str | None = None,
     started_at_step: int = 0,
 ) -> dict[str, Any]:
     return {
         "active": True,
         "mode": mode,
+        "tier": tier if tier in VALID_TIERS else "auto",
+        "cwd": cwd,
         "stage": "implement",
         "base_sha": base_sha,
         "started_at_step": started_at_step,
@@ -169,7 +259,9 @@ def _try_save_state(state_file: Path, state: dict[str, Any]) -> None:
     try:
         save_state_atomic(state_file, state)
     except OSError as exc:
-        sys.stderr.write(f"[craftsman-stop-gate] Warning: failed to persist state to {state_file}: {exc}\n")
+        sys.stderr.write(
+            f"[craftsman-stop-gate] Warning: failed to persist state to {state_file}: {exc}\n"
+        )
 
 
 def emit_stop_decision(decision: str, reason: str | None = None) -> None:
@@ -196,9 +288,9 @@ def is_waiting_on_ask_question_in_entries(entries: list[dict[str, Any]]) -> bool
 
 def detect_untracked_craftsman_trigger(
     entries: list[dict[str, Any]], after_step: int
-) -> int | None:
-    """If the user triggered `/craftsman` or `ultracode` in USER_INPUT after `after_step`, return its step_index."""
-    found_step: int | None = None
+) -> tuple[int, str] | None:
+    """If user triggered `/craftsman` or `ultracode` after `after_step`, return (step_index, tier)."""
+    found: tuple[int, str] | None = None
     for idx, entry in enumerate(entries):
         step_idx = _safe_int(entry.get("step_index"), idx)
         if step_idx <= after_step:
@@ -206,8 +298,15 @@ def detect_untracked_craftsman_trigger(
         if entry.get("type") == "USER_INPUT":
             content = str(entry.get("content") or "")
             if CRAFTSMAN_TRIGGER_RE.search(content):
-                found_step = step_idx
-    return found_step
+                lower = content.lower()
+                if "ultracode" in lower or "--deep" in lower:
+                    tier = "deep"
+                elif "--quick" in lower or "--soft" in lower:
+                    tier = "quick"
+                else:
+                    tier = "auto"
+                found = (step_idx, tier)
+    return found
 
 
 def _is_quality_gate_subagent_spec(sub: dict[str, Any]) -> bool:
@@ -224,7 +323,7 @@ def _is_quality_gate_subagent_spec(sub: dict[str, Any]) -> bool:
 def has_quality_gate_subagent_in_entries(
     entries: list[dict[str, Any]], since_step: int
 ) -> bool:
-    """Return True if an `invoke_subagent` call for the Quality Gate Auditor occurred at or after `since_step`."""
+    """Return True if an `invoke_subagent` or Claude Code `Task` call for the Quality Gate Auditor occurred at or after `since_step`."""
     for idx, entry in enumerate(entries):
         step_idx = _safe_int(entry.get("step_index"), idx)
         if step_idx < since_step:
@@ -233,11 +332,26 @@ def has_quality_gate_subagent_in_entries(
         if not isinstance(tool_calls, list):
             continue
         for tc in tool_calls:
-            if not isinstance(tc, dict) or tc.get("name") != "invoke_subagent":
+            if not isinstance(tc, dict):
                 continue
-            args = tc.get("args")
+            tc_name = tc.get("name")
+            if tc_name not in ("invoke_subagent", "Task"):
+                continue
+            args = tc.get("args") or tc.get("input")
             if not isinstance(args, dict):
                 continue
+
+            if tc_name == "Task":
+                sub_type = str(args.get("subagent_type") or "general-purpose").strip().lower()
+                if sub_type in ("explore", "research"):
+                    continue
+                combined = f"{args.get('description', '')} {args.get('prompt', '')}".lower()
+                if any(marker in combined for marker in QUALITY_GATE_ROLE_MARKERS) or all(
+                    skill in combined for skill in QUALITY_GATE_SKILL_MARKERS
+                ):
+                    return True
+                continue
+
             raw_subagents = args.get("Subagents")
             parsed_subagents: list[Any] | None = None
             if isinstance(raw_subagents, list):
@@ -279,7 +393,19 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     artifact_dir = payload.get("artifactDirectoryPath")
     if not isinstance(artifact_dir, str) or not artifact_dir.strip():
-        return "allow", None
+        raw_tp = payload.get("transcript_path")
+        if isinstance(raw_tp, str) and raw_tp.strip():
+            artifact_dir = str(Path(raw_tp).expanduser().parent)
+        else:
+            return "allow", None
+
+    workspaces = payload.get("workspacePaths")
+    ws_cwd = (
+        workspaces[0]
+        if isinstance(workspaces, list) and workspaces
+        else payload.get("cwd")
+    )
+    ws_cwd_str = ws_cwd if isinstance(ws_cwd, str) else None
 
     state_file = Path(artifact_dir).expanduser() / "craftsman_state.json"
     transcript_path = resolve_transcript_for_state_file(state_file, payload)
@@ -290,13 +416,14 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     # Auto-detect `/craftsman` or `ultracode` from transcript even if agent forgot `--init`
     if (not state or not state.get("active", False)) and entries:
-        trigger_step = detect_untracked_craftsman_trigger(entries, completed_at)
-        if trigger_step is not None:
-            workspaces = payload.get("workspacePaths")
-            ws_cwd = workspaces[0] if isinstance(workspaces, list) and workspaces else None
+        trigger_info = detect_untracked_craftsman_trigger(entries, completed_at)
+        if trigger_info is not None:
+            trigger_step, detected_tier = trigger_info
             state = default_state(
-                mode="craftsman",
-                base_sha=get_head_sha(ws_cwd),
+                mode="ultracode" if detected_tier == "deep" else "craftsman",
+                tier=detected_tier,
+                cwd=ws_cwd_str,
+                base_sha=get_head_sha(ws_cwd_str),
                 started_at_step=trigger_step,
             )
             _try_save_state(state_file, state)
@@ -308,8 +435,9 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         return "allow", None
 
     since_step = _safe_int(state.get("started_at_step"), 0)
+    needs_subagent = requires_subagent_for_state(state, ws_cwd_str)
     subagent_ok = bool(state.get("subagent_verified", False))
-    if entries:
+    if entries and needs_subagent:
         subagent_ok = has_quality_gate_subagent_in_entries(entries, since_step)
         state["subagent_verified"] = subagent_ok
 
@@ -318,7 +446,12 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         gates = {}
 
     missing = [gate for gate in REQUIRED_GATES if not bool(gates.get(gate, False))]
-    if entries and not subagent_ok and "invoke_subagent(Craftsman Quality Gate Auditor)" not in missing:
+    if (
+        entries
+        and needs_subagent
+        and not subagent_ok
+        and "invoke_subagent(Craftsman Quality Gate Auditor)" not in missing
+    ):
         missing.insert(0, "invoke_subagent(Craftsman Quality Gate Auditor)")
 
     if not missing:
@@ -343,37 +476,50 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     base_sha = state.get("base_sha") or "HEAD~1"
     missing_str = ", ".join(missing)
+    if needs_subagent:
+        return (
+            "continue",
+            f"[CRAFTSMAN HARD-LOOP GATE ({forced + 1}/{max_cont})] "
+            f"Nie możesz zakończyć zadania przed domknięciem Bramki Jakości (Etap 1). "
+            f"Brakujące wymagania: [{missing_str}]. "
+            f"Zasada Twórca != Recenzent: NIE WOLNO robić przeglądu tylko inline w głównym wątku! "
+            f"Musisz wywołać narzędzie 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor'), "
+            f"aby niezależny subagent wczytał przez view_file i wykonał /simplify, /code-review oraz /verify "
+            f"na CAŁYM skumulowanym diffie od początku zadania (git diff {base_sha}), a następnie "
+            f"uruchomić craftsman-stop-gate.py --state-file {state_file} --complete.",
+        )
     return (
         "continue",
-        f"[CRAFTSMAN HARD-LOOP GATE ({forced + 1}/{max_cont})] "
-        f"Nie możesz zakończyć zadania przed domknięciem Bramki Jakości (Etap 1). "
-        f"Brakujące wymagania: [{missing_str}]. "
-        f"Zasada Twórca != Recenzent: NIE WOLNO robić przeglądu tylko inline w głównym wątku! "
-        f"Musisz wywołać narzędzie 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor'), "
-        f"aby niezależny subagent wczytał przez view_file i wykonał /simplify, /code-review oraz /verify "
-        f"na CAŁYM skumulowanym diffie od początku zadania (git diff {base_sha}), a następnie "
-        f"uruchomić craftsman-stop-gate.py --state-file {state_file} --complete.",
+        f"[CRAFTSMAN SOFT-LOOP GATE ({forced + 1}/{max_cont})] "
+        f"Brakujące kroki weryfikacji dla szybkiej zmiany (Quick Mode): [{missing_str}]. "
+        f"Wykonaj /simplify oraz /verify i zamknij bramkę przez "
+        f"craftsman-stop-gate.py --state-file {state_file} --complete.",
     )
 
 
 def run_cli(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Manage craftsman_state.json for Hard-Loop gating.")
+    parser = argparse.ArgumentParser(description="Manage craftsman_state.json for 3-Gear Hard-Loop gating.")
     parser.add_argument("--state-file", required=True, help="Path to craftsman_state.json")
     parser.add_argument("--init", action="store_true", help="Initialize a fresh active state")
-    parser.add_argument("--cwd", help="Repository working directory to capture base_sha")
+    parser.add_argument("--cwd", help="Repository working directory to capture base_sha and diff stats")
     parser.add_argument("--base-sha", help="Explicit base commit SHA for cumulative diff")
     parser.add_argument("--mode", default="craftsman", help="Mode name (craftsman or ultracode)")
+    parser.add_argument(
+        "--tier",
+        choices=VALID_TIERS,
+        help="Gearbox tier: auto (default: <=40 lines & <=2 files -> quick, else standard), quick, standard, or deep",
+    )
     parser.add_argument("--stage", help="Set current stage name")
     parser.add_argument("--await-user", action="store_true", help="Pause hard-loop while waiting for user input")
     parser.add_argument("--resume", action="store_true", help="Resume hard-loop after user input")
     parser.add_argument("--pass-simplify", action="store_true", help="Mark 'simplified' gate as true")
     parser.add_argument("--pass-review", action="store_true", help="Mark 'reviewed' gate as true")
     parser.add_argument("--pass-verify", action="store_true", help="Mark 'verified' gate as true")
-    parser.add_argument("--complete", action="store_true", help="Verify subagent execution and deactivate loop")
+    parser.add_argument("--complete", action="store_true", help="Verify quality gate execution and deactivate loop")
     parser.add_argument(
         "--allow-inline",
         action="store_true",
-        help="Allow completion without transcript invoke_subagent check (for isolated unit tests)",
+        help="Allow completion without transcript invoke_subagent check (Quick Soft-Loop / unit tests)",
     )
     args = parser.parse_args(argv)
 
@@ -387,16 +533,24 @@ def run_cli(argv: list[str]) -> int:
         base_sha = args.base_sha or get_head_sha(args.cwd)
         if args.init:
             start_step = latest_step
+            initial_tier = args.tier or ("deep" if args.mode == "ultracode" else "auto")
         else:
             detected = detect_untracked_craftsman_trigger(entries, -1)
-            start_step = detected if detected is not None else 0
+            start_step = detected[0] if detected is not None else 0
+            initial_tier = args.tier or (detected[1] if detected is not None else "auto")
         state = default_state(
             mode=args.mode,
+            tier=initial_tier,
+            cwd=args.cwd,
             base_sha=base_sha,
             started_at_step=start_step,
         )
 
     gates = state.setdefault("gates", {"simplified": False, "reviewed": False, "verified": False})
+    if args.tier:
+        state["tier"] = args.tier
+    if args.cwd:
+        state["cwd"] = args.cwd
     if args.stage:
         state["stage"] = args.stage
     if args.base_sha:
@@ -415,14 +569,15 @@ def run_cli(argv: list[str]) -> int:
 
     if args.complete:
         since_step = _safe_int(state.get("started_at_step"), 0)
-        if entries and not args.allow_inline:
+        needs_subagent = requires_subagent_for_state(state, args.cwd)
+        if entries and needs_subagent and not args.allow_inline:
             if not has_quality_gate_subagent_in_entries(entries, since_step):
                 sys.stderr.write(
                     "[CRAFTSMAN HARD-LOOP REJECTED] Nie można zamknąć bramki (--complete): "
                     "w transcript.jsonl brak wywołania niezależnego subagenta 'invoke_subagent' "
                     "(TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') od kroku startowego! "
-                    "Najpierw powołaj subagenta przez invoke_subagent, który wczyta i wykona "
-                    "/simplify, /code-review oraz /verify na całym skumulowanym diffie.\n"
+                    "Dla zmian przekraczających próg Quick Mode (>40 linii lub >2 pliki) najpierw "
+                    "powołaj subagenta przez invoke_subagent, który wykona /simplify, /code-review i /verify.\n"
                 )
                 return 1
         state["subagent_verified"] = True
@@ -446,10 +601,6 @@ def main() -> int:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
     except (OSError, json.JSONDecodeError):
-        emit_stop_decision("allow")
-        return 0
-
-    if not isinstance(payload, dict):
         emit_stop_decision("allow")
         return 0
 
