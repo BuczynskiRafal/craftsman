@@ -319,5 +319,103 @@ class StopGateHookTests(unittest.TestCase):
             self.assertEqual(final_state["stage"], "aborted_max_continuations")
 
 
+class NativeGitHooksAndCopilotExportTests(unittest.TestCase):
+    def test_native_commit_msg_hook_blocks_ai_trailers_and_ignores_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            msg_file = Path(tmpdir) / "COMMIT_EDITMSG"
+
+            # Clean message with commented-out trailer -> exit 0
+            msg_file.write_text(
+                "feat(core): add pipeline\n# Co-authored-by: Claude <noreply@anthropic.com>\n",
+                encoding="utf-8",
+            )
+            ok_proc = subprocess.run(
+                [sys.executable, str(GIT_GUARD), "--git-hook", "commit-msg", str(msg_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(ok_proc.returncode, 0)
+
+            # Active AI trailer -> exit 1
+            msg_file.write_text(
+                "feat(core): add pipeline\n\nCo-authored-by: GitHub Copilot <copilot@github.com>\n",
+                encoding="utf-8",
+            )
+            bad_proc = subprocess.run(
+                [sys.executable, str(GIT_GUARD), "--git-hook", "commit-msg", str(msg_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bad_proc.returncode, 1)
+            self.assertIn("Global Rule #2", bad_proc.stderr)
+
+    def test_native_pre_push_hook_enforces_main_protection(self) -> None:
+        import os
+
+        env = dict(os.environ, CRAFTSMAN_NONINTERACTIVE="1", CRAFTSMAN_IGNORE_TRANSCRIPT="1")
+        env.pop("CRAFTSMAN_ALLOW_MAIN_PUSH", None)
+
+        # Feature branch push -> exit 0
+        feat_proc = subprocess.run(
+            [sys.executable, str(GIT_GUARD), "--git-hook", "pre-push", "origin", "https://example.com"],
+            input="refs/heads/feat/x 1111 refs/heads/feat/x 0000\n",
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(feat_proc.returncode, 0)
+
+        # Unconfirmed push to main -> exit 1
+        main_proc = subprocess.run(
+            [sys.executable, str(GIT_GUARD), "--git-hook", "pre-push", "origin", "https://example.com"],
+            input="refs/heads/main 1111 refs/heads/main 0000\n",
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(main_proc.returncode, 1)
+        self.assertIn("Global Rule #1", main_proc.stderr)
+
+        # Confirmed push to main via CRAFTSMAN_ALLOW_MAIN_PUSH=1 -> exit 0
+        env_allowed = dict(env, CRAFTSMAN_ALLOW_MAIN_PUSH="1")
+        allowed_proc = subprocess.run(
+            [sys.executable, str(GIT_GUARD), "--git-hook", "pre-push", "origin", "https://example.com"],
+            input="refs/heads/main 1111 refs/heads/main 0000\n",
+            capture_output=True,
+            text=True,
+            env=env_allowed,
+            check=False,
+        )
+        self.assertEqual(allowed_proc.returncode, 0)
+
+    def test_copilot_export_generates_user_and_workspace_files(self) -> None:
+        exporter = REPO_ROOT / "scripts" / "copilot-export.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_prompts = Path(tmpdir) / "user_prompts"
+            workspace = Path(tmpdir) / "ws"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(exporter),
+                    "--repo-dir",
+                    str(REPO_ROOT),
+                    "--user-dir",
+                    str(user_prompts),
+                    "--workspace",
+                    str(workspace),
+                ],
+                check=True,
+            )
+            self.assertTrue((user_prompts / "craftsman.prompt.md").is_file())
+            self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
+            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 20)
+            self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
+            self.assertEqual(len(list((workspace / ".github" / "prompts").glob("*.prompt.md"))), 20)
+
+
 if __name__ == "__main__":
     unittest.main()

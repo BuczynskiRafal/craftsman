@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -326,24 +327,59 @@ def _unquote_json_str(val: Any) -> str | None:
     return val
 
 
-def was_ask_question_called_since_last_push(transcript_path: Path, fallback_cwd: str | None = None) -> bool:
-    """Check if `ask_question` was invoked after the most recent `git push` in transcript."""
+def _is_completed_successful_run_command(
+    entries: list[dict[str, Any]], idx: int, has_generic_steps: bool
+) -> bool:
+    """Return True only if entries[idx] already finished with exit code 0."""
+    if not has_generic_steps:
+        # Synthetic unit-test transcripts without GENERIC result lines
+        return True
+    if idx + 1 >= len(entries):
+        # Trailing PLANNER_RESPONSE with no GENERIC result yet is currently in-flight
+        return False
+    next_entry = entries[idx + 1]
+    if next_entry.get("type") != "GENERIC":
+        return False
+    if next_entry.get("status") == "ERROR":
+        return False
+    content = next_entry.get("content")
+    if isinstance(content, str) and "The command exited with code " in content:
+        return "The command exited with code 0." in content
+    return True
+
+
+def was_ask_question_called_since_last_push(
+    transcript_path: Path,
+    fallback_cwd: str | None = None,
+    ignore_in_flight_tail: bool = False,
+) -> bool:
+    """Check if `ask_question` was invoked after the most recent successful `git push` in transcript."""
     try:
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        raw_lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return False
 
-    for line in reversed(lines):
+    entries: list[dict[str, Any]] = []
+    for line in raw_lines:
         line = line.strip()
         if not line:
             continue
         try:
-            entry = json.loads(line)
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                entries.append(obj)
         except json.JSONDecodeError:
             continue
 
+    has_generic_steps = any(e.get("type") == "GENERIC" for e in entries)
+
+    for idx in range(len(entries) - 1, -1, -1):
+        entry = entries[idx]
         tool_calls = entry.get("tool_calls")
         if not isinstance(tool_calls, list):
+            continue
+
+        if ignore_in_flight_tail and idx == len(entries) - 1 and entry.get("type") == "PLANNER_RESPONSE":
             continue
 
         for tc in reversed(tool_calls):
@@ -353,6 +389,8 @@ def was_ask_question_called_since_last_push(transcript_path: Path, fallback_cwd:
             if name == "ask_question":
                 return True
             if name == "run_command":
+                if not _is_completed_successful_run_command(entries, idx, has_generic_steps):
+                    continue
                 args = tc.get("args") or {}
                 if not isinstance(args, dict):
                     continue
@@ -434,7 +472,97 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     return "allow", None
 
 
+def has_recent_antigravity_approval(cwd: str | None = None) -> bool:
+    """Check if a recently active Antigravity session transcript approved push via ask_question."""
+    if os.environ.get("CRAFTSMAN_IGNORE_TRANSCRIPT") == "1":
+        return False
+    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
+    if not brain_dir.is_dir():
+        return False
+    transcripts = list(brain_dir.glob("*/.system_generated/logs/transcript.jsonl"))
+    if not transcripts:
+        return False
+    latest = max(transcripts, key=lambda p: p.stat().st_mtime)
+    if (time.time() - latest.stat().st_mtime) > 600:
+        return False
+    return was_ask_question_called_since_last_push(latest, cwd, ignore_in_flight_tail=True)
+
+
+def run_native_commit_msg_hook(msg_file_str: str) -> int:
+    msg_path = Path(msg_file_str)
+    if not msg_path.is_file():
+        return 0
+    try:
+        content = msg_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+
+    # Strip git comment lines starting with '#'
+    active_lines = "\n".join(
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    )
+    if has_ai_attribution(active_lines):
+        sys.stderr.write(
+            "\n[CRAFTSMAN GIT-HOOK] Zablokowano commit (Global Rule #2 — Zero AI Attribution):\n"
+            "Wiadomość commita nie może zawierać 'Co-authored-by:' ani żadnych stopek\n"
+            "przypisujących autorstwo AI (Claude, Gemini, Antigravity, Copilot itp.).\n\n"
+        )
+        return 1
+    return 0
+
+
+def run_native_pre_push_hook() -> int:
+    ref_lines = sys.stdin.read().splitlines()
+    targets_protected = False
+    for line in ref_lines:
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            remote_ref = parts[2]
+            if remote_ref in PROTECTED_BRANCHES:
+                targets_protected = True
+                break
+
+    if not targets_protected:
+        return 0
+
+    if os.environ.get("CRAFTSMAN_ALLOW_MAIN_PUSH") == "1":
+        return 0
+
+    if has_recent_antigravity_approval(os.getcwd()):
+        return 0
+
+    # If running interactively in a terminal, prompt user via /dev/tty
+    if os.environ.get("CRAFTSMAN_NONINTERACTIVE") != "1":
+        try:
+            with open("/dev/tty", "r+", encoding="utf-8") as tty:
+                tty.write(
+                    "[CRAFTSMAN GIT-HOOK] Wykryto 'git push' na chronioną gałąź (main/master). "
+                    "Kontynuować? [y/N]: "
+                )
+                tty.flush()
+                answer = tty.readline().strip().lower()
+                if answer in ("y", "yes", "t", "tak"):
+                    return 0
+        except OSError:
+            pass
+
+    sys.stderr.write(
+        "\n[CRAFTSMAN GIT-HOOK] Zablokowano bezpośredni 'git push' na gałąź main/master (Global Rule #1).\n"
+        "- Najpierw zapytaj użytkownika o zgodę (wybór między nową gałęzią pod PR a bezpośrednim pushem na main).\n"
+        "- Po uzyskaniu jawnej zgody użytkownika wykonaj: CRAFTSMAN_ALLOW_MAIN_PUSH=1 git push ...\n\n"
+    )
+    return 1
+
+
 def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--git-hook":
+        hook_type = sys.argv[2]
+        if hook_type == "commit-msg" and len(sys.argv) >= 4:
+            return run_native_commit_msg_hook(sys.argv[3])
+        if hook_type == "pre-push":
+            return run_native_pre_push_hook()
+        return 0
+
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
