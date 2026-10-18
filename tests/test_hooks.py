@@ -318,6 +318,250 @@ class StopGateHookTests(unittest.TestCase):
             self.assertFalse(final_state["active"])
             self.assertEqual(final_state["stage"], "aborted_max_continuations")
 
+    def test_rejects_complete_and_stop_without_invoke_subagent_in_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "craftsman_state.json"
+            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            transcript = logs_dir / "transcript.jsonl"
+
+            transcript.write_text(
+                json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "/craftsman fix bug"})
+                + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--init"],
+                check=True,
+            )
+
+            # Attempting --complete without invoke_subagent in transcript must fail with exit code 1
+            bad_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(bad_complete.returncode, 1)
+            self.assertIn("invoke_subagent", bad_complete.stderr)
+
+            # Even if agent passes individual flags without invoke_subagent, Stop hook blocks
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--pass-simplify",
+                    "--pass-review",
+                    "--pass-verify",
+                ],
+                check=True,
+            )
+            res_block = run_hook(
+                STOP_GATE,
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "fullyIdle": True,
+                    "artifactDirectoryPath": tmpdir,
+                },
+            )
+            self.assertEqual(res_block["decision"], "continue")
+            self.assertIn("invoke_subagent(Craftsman Quality Gate Auditor)", res_block.get("reason", ""))
+
+            # Even if agent spawns a read-only 'research' subagent mentioning 'simplify', it must NOT satisfy Quality Gate
+            with transcript.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "step_index": 2,
+                            "type": "PLANNER_RESPONSE",
+                            "tool_calls": [
+                                {
+                                    "name": "invoke_subagent",
+                                    "args": {
+                                        "Subagents": json.dumps(
+                                            [
+                                                {
+                                                    "TypeName": "research",
+                                                    "Role": "Codebase Explorer",
+                                                    "Prompt": "Check how to simplify the parser and run auditor checks",
+                                                }
+                                            ]
+                                        )
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                    + "\n"
+                )
+
+            research_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(research_complete.returncode, 1)
+
+            # Once invoke_subagent (TypeName='self', JSON-string Subagents as in real Antigravity transcript) is recorded, --complete and Stop succeed
+            with transcript.open("a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "step_index": 3,
+                            "type": "PLANNER_RESPONSE",
+                            "tool_calls": [
+                                {
+                                    "name": "invoke_subagent",
+                                    "args": {
+                                        "Subagents": json.dumps(
+                                            [
+                                                {
+                                                    "TypeName": "self",
+                                                    "Role": "Craftsman Quality Gate Auditor",
+                                                    "Prompt": "Run /simplify, /code-review, and /verify",
+                                                }
+                                            ]
+                                        )
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                    + "\n"
+                )
+
+            ok_complete = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(ok_complete.returncode, 0)
+
+            res_allow = run_hook(
+                STOP_GATE,
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "fullyIdle": True,
+                    "artifactDirectoryPath": tmpdir,
+                },
+            )
+            self.assertEqual(res_allow["decision"], "allow")
+
+    def test_auto_detects_craftsman_in_transcript_when_init_was_forgotten(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            transcript = logs_dir / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "zrób to przez /craftsman"})
+                + "\n",
+                encoding="utf-8",
+            )
+            res = run_hook(
+                STOP_GATE,
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "fullyIdle": True,
+                    "artifactDirectoryPath": tmpdir,
+                },
+            )
+            self.assertEqual(res["decision"], "continue")
+            self.assertTrue((Path(tmpdir) / "craftsman_state.json").is_file())
+
+    def test_does_not_false_trigger_on_craftsman_paths_or_subagent_transcripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            transcript = logs_dir / "transcript.jsonl"
+            # 1. Subagent transcript (SYSTEM_MESSAGE + view_file on skills/craftsman/SKILL.md)
+            #    and USER_INPUT mentioning file path /scratch/craftsman or skills/craftsman/SKILL.md
+            lines = [
+                json.dumps(
+                    {
+                        "step_index": 0,
+                        "type": "SYSTEM_MESSAGE",
+                        "content": "You are Craftsman Quality Gate Auditor running /craftsman checks",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "tool_calls": [
+                            {
+                                "name": "view_file",
+                                "args": {
+                                    "AbsolutePath": "/Users/dev/scratch/craftsman/skills/craftsman/SKILL.md"
+                                },
+                            }
+                        ],
+                    }
+                ),
+                json.dumps(
+                    {
+                        "step_index": 2,
+                        "type": "USER_INPUT",
+                        "content": "Sprawdź plik /Users/dev/scratch/craftsman/skills/craftsman/SKILL.md",
+                    }
+                ),
+            ]
+            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            res = run_hook(
+                STOP_GATE,
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "fullyIdle": True,
+                    "artifactDirectoryPath": tmpdir,
+                },
+            )
+            self.assertEqual(res["decision"], "allow")
+            self.assertFalse((Path(tmpdir) / "craftsman_state.json").is_file())
+
+    def test_complete_without_prior_init_succeeds_when_subagent_was_invoked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "craftsman_state.json"
+            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            transcript = logs_dir / "transcript.jsonl"
+            lines = [
+                json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "/craftsman fix typo"}),
+                json.dumps(
+                    {
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "tool_calls": [
+                            {
+                                "name": "invoke_subagent",
+                                "args": {
+                                    "Subagents": [
+                                        {
+                                            "TypeName": "self",
+                                            "Role": "Craftsman Quality Gate Auditor",
+                                            "Prompt": "Audit diff",
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ),
+                json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "tool_calls": []}),
+            ]
+            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            proc = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
 
 class NativeGitHooksAndCopilotExportTests(unittest.TestCase):
     def test_native_commit_msg_hook_blocks_ai_trailers_and_ignores_comments(self) -> None:

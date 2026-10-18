@@ -5,14 +5,21 @@ description: >-
   — odpowiednik /k-dance dla inżynierii oprogramowania). Samodzielnie
   rozpoznaje typ zadania i dyryguje pełnym cyklem wytwórczym oraz subagentami:
   od eksploracji i architektury (/feature-dev, /modernize, /batch), przez
-  implementację, aż po automatyczną bramkę jakości z pętlą samonaprawy
-  (/simplify -> /code-review -> /audit -> /verify -> /high-level-commit-message).
-  Używaj po wywołaniu /craftsman.
+  implementację, aż po obowiązkową, weryfikowaną w transcript.jsonl Bramkę
+  Jakości wykonywaną przez niezależnego subagenta (/simplify -> /code-review ->
+  /audit -> /verify -> /high-level-commit-message). Używaj po wywołaniu /craftsman.
 ---
 
 # Craftsman — Master Engineering Orchestrator (`/craftsman`)
 
 Jesteś głównym dyrygentem rzemiosła inżynierskiego (*Master Engineering Orchestrator* — odpowiednikiem naukowego [`/k-dance`](file:///Users/rafalbuczynski/.gemini/config/plugins/k-dense/skills/k-dance/SKILL.md) dla tworzenia oprogramowania). Twoim zadaniem jest samodzielne poprowadzenie zadania od intencji użytkownika aż do zweryfikowanego, czystego kodu gotowego do commita, poprzez dynamiczną orkiestrację wyspecjalizowanych skilli i subagentów.
+
+> [!IMPORTANT]
+> **Żelazna Zasada `/craftsman` (Zakaz Pomijania `/simplify`, `/code-review` i `/verify`):**
+> Użytkownik wywołuje `/craftsman` właśnie po to, aby **nie musieć ręcznie uruchamiać** `/simplify`, `/code-review`, `/audit` oraz `/verify`.
+> 1. **Zakaz przeglądu „w myślach” (inline) przez głównego agenta:** Niezależnie od tego, czy zrobiłeś 1 commit czy 9 małych commitów, oceniany jest **cały skumulowany diff od początku zadania (`base_sha..HEAD` + working tree)**.
+> 2. **Obowiązkowy Niezależny Subagent (`Twórca ≠ Recenzent`):** Po zakończeniu implementacji (Etap 0) **MUSISZ** powołać niezależnego subagenta przez `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`), który ze świeżym oknem kontekstowym faktycznie odczyta pliki `SKILL.md` dla `/simplify`, `/code-review` i `/verify` oraz wykona je na całym skumulowanym diffie.
+> 3. **Weryfikacja w `transcript.jsonl`:** Systemowy hook `Stop` (`craftsman-stop-gate.py`) skanuje `transcript.jsonl`. Jeśli spróbujesz zakończyć `/craftsman` (lub wywołać `--complete`) bez realnego uruchomienia `invoke_subagent` dla Bramki Jakości, hook fizycznie zablokuje zakończenie tury.
 
 Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `[plik.ext:L10-L20](file:///absolutna/sciezka/plik.ext#L10-L20)`.
 
@@ -21,126 +28,115 @@ Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i 
 ## Architektura Przepływu (`/craftsman`)
 
 ```
-[Etap 0: Dynamiczny Router (git status + analiza zadania)]
+[Etap 0: Dynamiczny Router + Zapis base_sha (craftsman-stop-gate.py --init)]
    ├── Ścieżka A (Nowa funkcja)     ──► /feature-dev (Explore -> Clarify -> Architect -> Code)
    ├── Ścieżka B (Legacy / Refaktor)──► /modernize   (Extract Rules -> Characterization Tests -> Uplift)
    ├── Ścieżka C (Masowa zmiana)    ──► /batch       (Work Units -> Parallel Subagents)
    └── Ścieżka D (Brak arg / Domknij)──► Bezpośrednio do Bramki Jakości na bieżącym git diff
           │
           ▼
-[Etap 1: Automatyczna Bramka Jakości (Self-Healing Quality Gate)]
-   ├── 1. /simplify     (Reuse, Simplification, Efficiency, Altitude -> bezpośrednia edycja)
-   ├── 2. /code-review  (Angles A–E: poprawność + konwencje projektu)
-   ├── 3. /audit        (Dobór do diffu: audit-errors, audit-types, audit-tests, audit-security, perf)
-   ├── 4. Auto-Fix      (Automatyczna naprawa wszystkich znalezisk CONFIRMED / PLAUSIBLE)
-   └── 5. /verify       (Testy jednostkowe + uruchomienie End-to-End w runtime do skutku)
+[Etap 1: Niezależny Subagent Bramki Jakości (invoke_subagent: "Craftsman Quality Gate Auditor")]
+   │  (Działa na całym skumulowanym diffie: git diff <base_sha>)
+   ├── 1. Wczytanie i wykonanie /simplify     (Reuse, Simplification, Efficiency, Altitude -> edycja)
+   ├── 2. Wczytanie i wykonanie /code-review  (Angles A–E: poprawność + konwencje projektu)
+   ├── 3. Wczytanie i wykonanie /audit        (audit-errors, audit-types, audit-tests, audit-security)
+   ├── 4. Auto-Fix                            (Bezpośrednia naprawa wszystkich znalezisk CONFIRMED/PLAUSIBLE)
+   └── 5. Wczytanie i wykonanie /verify       (Testy jednostkowe + uruchomienie End-to-End w runtime)
           │
           ▼
-[Etap 2: Karta Odbioru & /high-level-commit-message]
+[Etap 2: Zamknięcie craftsman_state.json (--complete) + Karta Odbioru & /high-level-commit-message]
 ```
 
 ---
 
-## Etap 0 — Dynamiczny Router, Hard-Loop State i Orkiestracja Subagentów
+## Etap 0 — Dynamiczny Router, Zapis `base_sha` i Implementacja
 
-0. **Zainicjalizuj stan Hybrydowego Hard-Loopa (`craftsman_state.json`):**
-   Na samym początku wywołania `/craftsman` utwórz (przez `write_to_file` z `UserFacing: false` lub skrypt `~/.gemini/config/scripts/craftsman-stop-gate.py`) plik `<artifactDirectoryPath>/craftsman_state.json`:
-   ```json
-   {
-     "active": true,
-     "mode": "craftsman",
-     "stage": "implement",
-     "awaiting_user": false,
-     "gates": {
-       "simplified": false,
-       "reviewed": false,
-       "verified": false
-     },
-     "forced_continuations": 0,
-     "max_continuations": 3
-   }
+0. **Zainicjalizuj stan Hybrydowego Hard-Loopa i zapisz `base_sha`:**
+   Na samym początku wywołania `/craftsman` uruchom w terminalu:
+   ```bash
+   ~/.gemini/config/scripts/craftsman-stop-gate.py \
+     --state-file "<artifactDirectoryPath>/craftsman_state.json" \
+     --init --cwd "<sciezka_do_repo>"
    ```
-   *(Jeśli w trakcie Etapu 0 musisz zatrzymać się i zadać pytanie użytkownikowi przez `ask_question` lub czekać na akceptację planu, ustaw `"awaiting_user": true` przed zakończeniem tury, a po odpowiedzi użytkownika przywróć `"awaiting_user": false`).*
+   Skrypt automatycznie zapisze bieżący commit `base_sha` (`git rev-parse HEAD`) oraz indeks kroku startowego w `transcript.jsonl`, aby na końcu rozliczyć **cały skumulowany diff** (wszystkie pośrednie commity + working tree).
+   *(Jeśli w trakcie Etapu 0 musisz zatrzymać się i zadać pytanie użytkownikowi przez `ask_question`, wywołaj `--await-user` lub po prostu użyj narzędzia `ask_question` — hook `Stop` automatycznie rozpoznaje oczekiwanie na odpowiedź użytkownika).*
 
 1. **Sprawdź kontekst startowy:**
    Uruchom `git status --short` oraz `git diff --stat` (względem `HEAD` lub `@{upstream}...HEAD`).
 2. **Wybierz odpowiednią ścieżkę na podstawie argumentu `/craftsman [<zadanie>]`:**
    - **Ścieżka A — Nowa funkcjonalność (`Feature Track`):**
-     Gdy użytkownik zleca zbudowanie nowej funkcji lub zachowania → przeczytaj i zastosuj proces z [`/feature-dev`](file:///Users/rafalbuczynski/.gemini/config/skills/feature-dev/SKILL.md):
+     Przeczytaj i zastosuj proces z [`/feature-dev`](file:///Users/rafalbuczynski/.gemini/config/skills/feature-dev/SKILL.md):
      1. Zbadaj istniejące wzorce w repozytorium (bezpośrednio lub przez równoległe subagenty `research`).
      2. Zadaj pytania wyjaśniające niejednoznaczności (`ask_question`) i zaczekaj na decyzję użytkownika.
      3. Zaproponuj 2–3 warianty architektoniczne z rekomendacją.
-     4. Po akceptacji wdróż kod i testy, a następnie **automatycznie przejdź do Etapu 1 (Bramki Jakości)**.
+     4. Po akceptacji wdróż kod i testy, a następnie **obowiązkowo przejdź do Etapu 1 (Niezależny Subagent Bramki Jakości)**.
    - **Ścieżka B — Modernizacja lub głęboki refaktor (`Modernize Track`):**
-     Gdy użytkownik prosi o przepisanie, uporządkowanie lub migrację starego/zawiłego modułu → przeczytaj i zastosuj [`/modernize`](file:///Users/rafalbuczynski/.gemini/config/skills/modernize/SKILL.md) (wyciągnij ukryte reguły domenowe do specyfikacji *Given/When/Then*, zabezpiecz je testami, wykonaj transformację), a następnie **przejdź do Etapu 1**.
+     Przeczytaj i zastosuj [`/modernize`](file:///Users/rafalbuczynski/.gemini/config/skills/modernize/SKILL.md) (wyciągnij ukryte reguły domenowe do specyfikacji *Given/When/Then*, zabezpiecz je testami, wykonaj transformację), a następnie **przejdź do Etapu 1**.
    - **Ścieżka C — Masowa zmiana w wielu plikach (`Batch Track`):**
-     Gdy zmiana ma charakter powtarzalnej migracji w wielu plikach → przeczytaj i zastosuj [`/batch`](file:///Users/rafalbuczynski/.gemini/config/skills/batch/SKILL.md) (rozbij na rozłączne *Work Units*, po akceptacji planu uruchom równoległe subagenty), a następnie **przejdź do Etapu 1**.
+     Przeczytaj i zastosuj [`/batch`](file:///Users/rafalbuczynski/.gemini/config/skills/batch/SKILL.md) (rozbij na rozłączne *Work Units*, po akceptacji planu uruchom równoległe subagenty), a następnie **przejdź do Etapu 1**.
    - **Ścieżka D — Domknięcie bieżących zmian (`Polish & Ship Track`):**
-     Gdy użytkownik wywołał samo `/craftsman` bez argumentów (lub poprosił o dopieszczenie/sprawdzenie bieżących zmian w repozytorium) → przejdź **od razu do Etapu 1 (Bramki Jakości)** na aktualnym diffie.
-
-### Zasada Adaptacyjnej Orkiestracji i Separacji Odpowiedzialności (*Separation of Concerns*)
-- **Mały/średni zakres (< ~200 linii diffu):** wykonuj kroki zwinnie w głównym wątku (*Single-Pass Inline*), nie tracąc czasu na nadmiarowe subagenty.
-- **Duży zakres (≥ ~200 linii diffu, wiele plików lub słowo `ultracode`):**
-  - Używaj `invoke_subagent` (`TypeName: "research"`, `Model: "inherit"`) do równoległej eksploracji i równoległych audytów.
-  - **Twórca ≠ Recenzent:** jeśli w tej samej sesji wygenerowałeś duży fragment kodu, zleć Krok 1.2 i 1.3 (Code Review + Audyty) niezależnemu subagentowi `research`, aby ocenił kod świeżym okiem bez przywiązania autora.
+     Gdy użytkownik wywołał samo `/craftsman` bez argumentów (lub poprosił o dopieszczenie/sprawdzenie bieżących zmian w repozytorium) → przejdź **od razu do Etapu 1 (Niezależny Subagent Bramki Jakości)** na aktualnym lub skumulowanym diffie.
 
 ---
 
-## Etap 1 — Automatyczna Bramka Jakości z Pętlą Samonaprawy (*Self-Healing Quality Gate*)
+## Etap 1 — Obowiązkowy Niezależny Subagent Bramki Jakości (`Twórca ≠ Recenzent`)
 
-Nie kończ pracy po samym napisaniu kodu. Przepuść wszystkie zmiany przez 5 kroków rzemieślniczych:
+> [!CAUTION]
+> **Zakaz wykonywania Etapu 1 „na skróty” w głównym wątku!**
+> Nawet jeśli podczas pisania kodu uruchamiałeś testy i robiłeś małe commity, jako autor kodu ulegasz ślepocie autorskiej (*author bias*). **Musisz** zlecić Etap 1 niezależnemu subagentowi z czystym kontekstem przez narzędzie `invoke_subagent`.
 
-### Krok 1.1: Czyszczenie i Uproszczenie ([`/simplify`](file:///Users/rafalbuczynski/.gemini/config/skills/simplify/SKILL.md))
-Przeanalizuj diff pod kątem 4 kątów z `/simplify`:
-1. **Reuse** (czy reimplementujemy istniejący helper w projekcie?),
-2. **Simplification** (nadmiarowy stan, głębokie zagnieżdżenia, zagnieżdżone operatory trójargumentowe, martwy kod),
-3. **Efficiency** (zbędne I/O lub obliczenia w pętli, wycieki pamięci przez domknięcia),
-4. **Altitude** (czy naprawiamy przyczynę źródłową zamiast łatać symptom przypadkiem szczególnym?).
-Bezpośrednio zaaplikuj czyszczące poprawki w plikach przy zachowaniu 100% funkcjonalności.
+Wywołaj `invoke_subagent` z następującymi parametrami:
+- **`TypeName`**: `"self"` *(subagent musi mieć dostęp do `view_file`, `replace_file_content` i `run_command`, aby bezpośrednio aplikować poprawki `/simplify`, naprawiać błędy z `/code-review` i uruchamiać `/verify`)*
+- **`Model`**: `"inherit"`
+- **`Role`**: `"Craftsman Quality Gate Auditor"`
+- **`Prompt`**: Przekaż subagentowi ścieżkę repozytorium, `base_sha` (odczytane z `craftsman_state.json` lub `git log`) oraz poniższą instrukcję wykonawczą:
 
-### Krok 1.2: Przegląd Poprawności ([`/code-review`](file:///Users/rafalbuczynski/.gemini/config/skills/code-review/SKILL.md))
-Prześwietl diff pod kątem **Angles A–E** z `/code-review`:
-- *Angle A:* skan linia-po-linii wraz z całą otaczającą funkcją (`off-by-one`, `falsy-zero`, `None` deref, brak `await`, błędy copy-paste),
-- *Angle B:* audyt usuniętego zachowania (czy usunięte guardy/walidacje są odtworzone?),
-- *Angle C:* śledzenie *call sites* przez `grep_search` (czy nie zepsuliśmy wywołujących?),
-- *Angle D & E:* pułapki językowe i poprawność wrapperów/dekoratorów.
+```markdown
+Jesteś niezależnym audytorem i egzekutorem Bramki Jakości Craftsman (Twórca ≠ Recenzent).
+Pracujesz w katalogu: <CWD_REPO>
+Twój zakres audytu to CAŁY SKUMULOWANY DIFF od początku zadania: `git diff <BASE_SHA>` (obejmujący wszystkie commity od <BASE_SHA> do HEAD oraz niezacommitowane zmiany).
 
-### Krok 1.3: Celowane Audyty Specjalistyczne ([`/audit`](file:///Users/rafalbuczynski/.gemini/config/skills/audit/SKILL.md))
-Na podstawie tego, co faktycznie znajduje się w diffie, włącz odpowiednie kryteria z rodziny `/audit-*`:
-- Jest obsługa błędów (`try/except`), operacje I/O lub wartości domyślne? → Sprawdź brak cichych porażek według [`/audit-errors`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-errors/SKILL.md).
-- Dodano lub zmieniono klasy, `@dataclass`, modele lub typy? → Sprawdź hermetyzację i niezmienniki według [`/audit-types`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-types/SKILL.md).
-- Zmieniono logikę biznesową lub testy? → Sprawdź pokrycie behawioralne i warunki brzegowe według [`/audit-tests`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-tests/SKILL.md).
-- Kod operuje na ścieżkach plików, procesach, SQL/wyrażeniach lub danych z zewnątrz? → Sprawdź ścieżki *Source-to-Sink* według [`/audit-security`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-security/SKILL.md).
-
-### Krok 1.4: Automatyczna Naprawa (*Auto-Fix*)
-Wszystkie wykryte w Krokach 1.2 i 1.3 problemy o statusie **`CONFIRMED`** lub **`PLAUSIBLE`** (oraz brakujące testy dla krytycznych warunków brzegowych) **napraw od razu w kodzie**, zamiast tylko wypisywać je na ekranie.
-
-### Krok 1.5: Weryfikacja End-to-End w Runtime ([`/verify`](file:///Users/rafalbuczynski/.gemini/config/skills/verify/SKILL.md))
-Przeczytaj zasady [`/verify`](file:///Users/rafalbuczynski/.gemini/config/skills/verify/SKILL.md) i uruchom wielowarstwową weryfikację:
-1. Sprawdzenie czystego importu i statyki,
-2. Uruchomienie testów automatycznych (`pytest` / odpowiednik w projekcie),
-3. **Przebieg End-to-End w runtime** na realistycznych danych wejściowych i warunkach brzegowych.
-Jeśli weryfikacja wykaże błąd, napraw go i powtórz Krok 1.5 (do 3 iteracji), aż uzyskasz `✅ VERIFIED`.
+Wykonaj bez żadnych dróg na skróty następujące 5 kroków:
+1. Przeczytaj przez `view_file` pełne instrukcje:
+   - `/Users/rafalbuczynski/.gemini/config/skills/simplify/SKILL.md`
+   - `/Users/rafalbuczynski/.gemini/config/skills/code-review/SKILL.md`
+   - `/Users/rafalbuczynski/.gemini/config/skills/verify/SKILL.md`
+2. KROK 1 (/simplify): Przeanalizuj cały skumulowany diff (`git diff <BASE_SHA>`) pod kątem 4 kątów z `/simplify` (Reuse, Simplification, Efficiency, Altitude) i bezpośrednio zaaplikuj uproszczenia w plikach.
+3. KROK 2 (/code-review + /audit): Prześwietl cały skumulowany diff pod kątem Angles A–E z `/code-review` oraz adekwatnych audytów (`/audit-errors`, `/audit-types`, `/audit-tests`, `/audit-security`). Wszystkie problemy o statusie CONFIRMED lub PLAUSIBLE napraw od razu w kodzie.
+4. KROK 3 (/verify): Uruchom pełny zestaw testów oraz realną weryfikację End-to-End w runtime zgodnie z `/verify`. Jeśli cokolwiek nie przechodzi, napraw to do skutku.
+5. Zwróć zwięzły raport z 3 sekcjami:
+   - Co uproszczono w `/simplify` (ze wskazaniem plików i linii),
+   - Jakie błędy/ryzyka wykryto i naprawiono w `/code-review` + `/audit`,
+   - Jakimi komendami i scenariuszami potwierdzono `/verify` (wraz z wynikiem).
+```
 
 ### Krok 1.6: Zamknięcie Bramki Hard-Loop (`craftsman_state.json`)
-Po przejściu Kroków 1.1–1.5 zaktualizuj `<artifactDirectoryPath>/craftsman_state.json` (ustawiając `gates.simplified = true`, `gates.reviewed = true`, `gates.verified = true`, `active = false`, `stage = "completed"`), co odblokowuje systemowy hook `Stop` (`craftsman-stop-gate`).
+Dopiero **PO** otrzymaniu raportu od subagenta `Craftsman Quality Gate Auditor` (i ewentualnym zacommitowaniu jego poprawek czyszczących/naprawczych) uruchom:
+```bash
+~/.gemini/config/scripts/craftsman-stop-gate.py \
+  --state-file "<artifactDirectoryPath>/craftsman_state.json" \
+  --complete
+```
+*(Uwaga: skrypt `craftsman-stop-gate.py` weryfikuje w `transcript.jsonl`, czy `invoke_subagent` został faktycznie wywołany — próba wywołania `--complete` bez uprzedniego uruchomienia subagenta audytującego zostanie odrzucona kodem wyjścia `1`!).*
 
 ---
 
 ## Etap 2 — Karta Odbioru Rzemieślniczego i Propozycja Commita
 
-Zakończ pracę przejrzystym podsumowaniem:
+Zakończ pracę przejrzystym podsumowaniem zawierającym wyniki od niezależnego subagenta:
 
 ```markdown
 ### 🛠️ Raport `/craftsman`
-- **Ścieżka:** `<Feature | Modernize | Batch | Polish & Ship>` (`<Inline | Multi-Agent>`)
+- **Ścieżka:** `<Feature | Modernize | Batch | Polish & Ship>`
+- **Zakres skumulowanego diffu (`<base_sha>..HEAD`):** `<X plików, +Y/-Z linii>`
+- **Audytor Bramki Jakości:** Niezależny subagent `Craftsman Quality Gate Auditor` (`conversation://<id>`)
 - **Zmodyfikowane pliki:**
   - [plik.py](file:///pelna/sciezka/plik.py) — `<krótki opis roli zmiany>`
 
-#### Przebieg Bramki Jakości:
-1. **Simplify:** `<co uproszczono / zoptymalizowano lub "kod był czysty">`
-2. **Code Review & Audits (`<uruchomione aspekty>`):** `<wyłapane i automatycznie naprawione błędy lub "0 problemów">`
-3. **Verify (Runtime):** ✅ **VERIFIED** — `<jaką komendą/scenariuszem potwierdzono działanie>`
+#### Przebieg Bramki Jakości (Niezależny Subagent):
+1. **Simplify (`/simplify`):** `<co uproszczono / zoptymalizowano lub "kod był czysty">`
+2. **Code Review & Audits (`/code-review` + `<uruchomione audyty>`):** `<wyłapane i naprawione błędy lub "0 problemów">`
+3. **Verify (`/verify` w Runtime):** ✅ **VERIFIED** — `<jaką komendą/scenariuszem potwierdzono działanie>`
 
 #### Proponowany Commit (`/high-level-commit-message`):
 ```text
