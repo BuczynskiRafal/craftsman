@@ -4,7 +4,7 @@ description: >-
   Bezlitosny audytor obsługi błędów polujący na „ciche porażki” (Silent
   Failures), połknięte wyjątki, zbyt szerokie bloki try/except, ukryte
   fallbacki zwracające None/0/[] bez logowania oraz nieczytelne komunikaty
-  błędów (na bazie silent-failure-hunter z Claude Code pr-review-toolkit).
+  błędów.
   Używaj po wywołaniu /audit-errors, /hunt-silent-failures lub gdy chcesz
   sprawdzić jakość obsługi błędów w diffie albo module.
 ---

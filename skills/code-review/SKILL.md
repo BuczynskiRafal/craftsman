@@ -13,7 +13,7 @@ description: >-
 
 # Code Review (`/code-review`)
 
-Przeprowadzasz wielokątowy przegląd kodu oparty na architekturze wbudowanego silnika `/code-review` z Claude Code (v2.1.287) połączonej z audytem Pull Requestów.
+Przeprowadzasz wielokątowy przegląd kodu obejmujący lokalne zmiany (git diff), gałęzie oraz zdalne Pull Requesty.
 
 Raporty i wyjaśnienia formułuj **po polsku**, zachowując oryginalne angielskie terminy techniczne (`CONFIRMED`, `PLAUSIBLE`, `REFUTED`, `off-by-one`, `falsy-zero`, `call site`, `invariant`, `guard clause`, `hot path`, `altitude` itd.). Wszystkie odwołania do plików i symboli w raporcie muszą być klikalnymi linkami Markdown w formacie `[nazwa_pliku.ext:L10-L20](file:///absolutna/sciezka/do/pliku.ext#L10-L20)`.
 

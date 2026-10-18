@@ -2,8 +2,7 @@
 name: audit-tests
 description: >-
   Audyt jakości i kompletności pokrycia testami (Behavioral Test Coverage) dla
-  bieżącego diffu, PR-a lub wskazanych modułów (na bazie pr-test-analyzer z
-  Claude Code pr-review-toolkit). Zamiast ślepego procentu linii ocenia
+  bieżącego diffu, PR-a lub wskazanych modułów. Zamiast ślepego procentu linii ocenia
   pokrycie behawioralne, warunki brzegowe, ścieżki błędów oraz odporność testów
   na refaktoryzację. Używaj po wywołaniu /audit-tests lub /test-audit.
 ---

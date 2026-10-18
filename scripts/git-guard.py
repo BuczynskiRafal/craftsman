@@ -237,7 +237,7 @@ def get_current_branch(cwd: str | None) -> str | None:
         )
         if proc.returncode == 0:
             return proc.stdout.strip()
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return None
     return None
 
@@ -302,9 +302,10 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
 
 def resolve_transcript_path(payload: dict[str, Any]) -> Path | None:
     candidates: list[Path] = []
-    raw_transcript = payload.get("transcriptPath")
-    if isinstance(raw_transcript, str) and raw_transcript:
-        candidates.append(Path(raw_transcript))
+    for key in ("transcriptPath", "transcript_path"):
+        raw_transcript = payload.get(key)
+        if isinstance(raw_transcript, str) and raw_transcript:
+            candidates.append(Path(raw_transcript))
     raw_artifact = payload.get("artifactDirectoryPath")
     if isinstance(raw_artifact, str) and raw_artifact:
         candidates.append(Path(raw_artifact) / ".system_generated" / "logs" / "transcript.jsonl")
@@ -386,16 +387,16 @@ def was_ask_question_called_since_last_push(
             if not isinstance(tc, dict):
                 continue
             name = tc.get("name")
-            if name == "ask_question":
+            if name in ("ask_question", "AskUserQuestion"):
                 return True
-            if name == "run_command":
+            if name in ("run_command", "Bash"):
                 if not _is_completed_successful_run_command(entries, idx, has_generic_steps):
                     continue
-                args = tc.get("args") or {}
+                args = tc.get("args") or tc.get("input") or {}
                 if not isinstance(args, dict):
                     continue
-                cmd = _unquote_json_str(args.get("CommandLine"))
-                hist_cwd = _unquote_json_str(args.get("Cwd")) or fallback_cwd
+                cmd = _unquote_json_str(args.get("CommandLine") or args.get("command"))
+                hist_cwd = _unquote_json_str(args.get("Cwd") or args.get("cwd")) or fallback_cwd
                 if cmd:
                     for seg in split_shell_segments(cmd):
                         toks = tokenize_segment(seg)
@@ -407,15 +408,32 @@ def was_ask_question_called_since_last_push(
     return False
 
 
-def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
-    tool_call = payload.get("toolCall") or {}
-    if tool_call.get("name") != "run_command":
-        return "allow", None
+def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Extract (command_line, cwd) from either Antigravity (`toolCall`) or Claude Code (`tool_name`/`tool_input`)."""
+    tool_call = payload.get("toolCall")
+    if isinstance(tool_call, dict):
+        if tool_call.get("name") != "run_command":
+            return None, None
+        args = tool_call.get("args") or {}
+        if not isinstance(args, dict):
+            return None, None
+        cmd = args.get("CommandLine")
+        cwd = args.get("Cwd")
+        return (cmd if isinstance(cmd, str) else None), (cwd if isinstance(cwd, str) else None)
 
-    args = tool_call.get("args") or {}
-    command_line = args.get("CommandLine")
-    default_cwd = args.get("Cwd")
-    cwd_str = default_cwd if isinstance(default_cwd, str) else None
+    tool_name = payload.get("tool_name")
+    if tool_name == "Bash":
+        tool_input = payload.get("tool_input") or {}
+        if isinstance(tool_input, dict):
+            cmd = tool_input.get("command")
+            cwd = payload.get("cwd") or tool_input.get("cwd")
+            return (cmd if isinstance(cmd, str) else None), (cwd if isinstance(cwd, str) else None)
+
+    return None, None
+
+
+def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
+    command_line, cwd_str = _extract_command_and_cwd(payload)
     if not isinstance(command_line, str) or not command_line.strip():
         return "allow", None
 
@@ -473,19 +491,26 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
 
 
 def has_recent_antigravity_approval(cwd: str | None = None) -> bool:
-    """Check if a recently active Antigravity session transcript approved push via ask_question."""
+    """Check if any recently active Antigravity session transcript approved push via ask_question."""
     if os.environ.get("CRAFTSMAN_IGNORE_TRANSCRIPT") == "1":
         return False
     brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
     if not brain_dir.is_dir():
         return False
-    transcripts = list(brain_dir.glob("*/.system_generated/logs/transcript.jsonl"))
-    if not transcripts:
-        return False
-    latest = max(transcripts, key=lambda p: p.stat().st_mtime)
-    if (time.time() - latest.stat().st_mtime) > 600:
-        return False
-    return was_ask_question_called_since_last_push(latest, cwd, ignore_in_flight_tail=True)
+    now = time.time()
+    recent_transcripts: list[tuple[float, Path]] = []
+    for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if (now - mtime) <= 600:
+            recent_transcripts.append((mtime, p))
+    recent_transcripts.sort(key=lambda item: item[0], reverse=True)
+    for _, transcript in recent_transcripts:
+        if was_ask_question_called_since_last_push(transcript, cwd, ignore_in_flight_tail=True):
+            return True
+    return False
 
 
 def run_native_commit_msg_hook(msg_file_str: str) -> int:
@@ -566,7 +591,7 @@ def main() -> int:
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         emit("allow")
         return 0
 

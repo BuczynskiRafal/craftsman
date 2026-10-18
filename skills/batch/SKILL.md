@@ -2,8 +2,7 @@
 name: batch
 description: >-
   Planowanie i równoległe wykonywanie masowych, powtarzalnych zmian w wielu
-  plikach lub modułach (na bazie wbudowanego skilla /batch z Claude Code
-  2.1.287). Dzieli dużą migrację lub refaktor na niezależne jednostki pracy
+  plikach lub modułach. Dzieli dużą migrację lub refaktor na niezależne jednostki pracy
   (Work Units), ustala przepis weryfikacji, a po zatwierdzeniu planu uruchamia
   równoległe subagenty i śledzi postęp w tabeli. Używaj po wywołaniu /batch.
 ---

@@ -2,8 +2,7 @@
 name: audit-comments
 description: >-
   Audyt dokładności, aktualności i wartości komentarzy oraz docstringów pod
-  kątem Comment Rot (na bazie comment-analyzer z Claude Code
-  pr-review-toolkit). Krzyżowo weryfikuje każdy docstring/komentarz względem
+  kątem Comment Rot. Krzyżowo weryfikuje każdy docstring/komentarz względem
   faktycznej implementacji kodu, wykrywa nieaktualne opisy po refaktorach oraz
   komentarze powtarzające oczywisty kod. Używaj po wywołaniu /audit-comments lub
   /comment-audit.
