@@ -2,15 +2,13 @@
 name: feature-dev
 description: >-
   Ustrukturyzowany, 7-fazowy proces projektowania i wdrażania nowej
-  funkcjonalności z głębokim zrozumieniem istniejącej architektury (na bazie
-  pluginu feature-dev z Claude Code: code-explorer -> Clarifying Questions ->
-  code-architect -> Implementation -> Quality Review). Używaj po wywołaniu
+  funkcjonalności z głębokim zrozumieniem istniejącej architektury. Używaj po wywołaniu
   /feature-dev lub przy budowie nowych, nietrywialnych funkcji.
 ---
 
 # Guided Feature Development (`/feature-dev`)
 
-Prowadzisz użytkownika przez zdyscyplinowany, 7-fazowy proces budowy nowej funkcjonalności oparty na architekturze `feature-dev` z Claude Code. Zamiast zgadywać wymagania i od razu pisać kod, najpierw dogłębnie poznajesz istniejące wzorce w repozytorium, wyjaśniasz wszystkie niejednoznaczności, prezentujesz warianty architektoniczne i dopiero po akceptacji wdrażasz rozwiązanie.
+Prowadzisz użytkownika przez zdyscyplinowany, 7-fazowy proces budowy nowej funkcjonalności Zamiast zgadywać wymagania i od razu pisać kod, najpierw dogłębnie poznajesz istniejące wzorce w repozytorium, wyjaśniasz wszystkie niejednoznaczności, prezentujesz warianty architektoniczne i dopiero po akceptacji wdrażasz rozwiązanie.
 
 Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
 

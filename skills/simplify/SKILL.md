@@ -2,9 +2,8 @@
 name: simplify
 description: >-
   Oczyszczanie i upraszczanie zmienionego kodu bez zmiany jego zachowania
-  (Preserve Functionality). Przegląda diff pod kątem 4 kątów z Claude Code
-  (Reuse, Simplification, Efficiency, Altitude) oraz zasad czystości z
-  code-simplifier, a następnie bezpośrednio aplikuje poprawki w plikach. Nie
+  (Preserve Functionality). Przegląda diff pod kątem 4 osi inżynierskich
+  (Reuse, Simplification, Efficiency, Altitude), a następnie bezpośrednio aplikuje poprawki w plikach. Nie
   szuka błędów poprawności (do tego służy /code-review). Używaj po wywołaniu
   /simplify, /simplyfy lub gdy użytkownik prosi o uproszczenie i wyczyszczenie
   niedawno zmodyfikowanego kodu.
@@ -18,7 +17,7 @@ Podsumowania formułuj **po polsku** z zachowaniem angielskich terminów technic
 
 ---
 
-## Złote zasady (`code-simplifier`)
+## Złote zasady (`/simplify`)
 
 1. **Preserve Functionality (Zachowaj 100% funkcjonalności):** Nigdy nie zmieniaj tego, *co* kod robi — zmieniaj wyłącznie to, *jak* to robi. Wszystkie dotychczasowe zachowania, wyniki i kontrakty API muszą pozostać nienaruszone.
 2. **Clarity over Brevity (Przejrzystość ponad zwięzłość):** Wyraźny, czytelny kod jest zawsze lepszy niż przesadnie skondensowane „sprytne” one-linery.

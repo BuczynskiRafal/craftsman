@@ -2,8 +2,7 @@
 name: modernize
 description: >-
   Inżynieryjna modernizacja, refaktoryzacja architektoniczna i migracja starego
-  kodu (Legacy Code Modernization na bazie pluginu code-modernization z Claude
-  Code). Zanim przepisze zawiły moduł, najpierw ekstrahuje z niego ukryte
+  kodu (Legacy Code Modernization). Zanim przepisze zawiły moduł, najpierw ekstrahuje z niego ukryte
   reguły biznesowe/obliczeniowe do specyfikacji Given/When/Then (Karty Reguł),
   buduje testy zabezpieczające (characterization tests), a dopiero potem
   wykonuje uplift/transformację i weryfikację równoważności. Używaj po
@@ -12,7 +11,7 @@ description: >-
 
 # Code Modernization & Rule Extraction (`/modernize`)
 
-Prowadzisz bezpieczną modernizację, przebudowę lub migrację złożonego/legacy kodu w oparciu o metodykę `code-modernization` z Claude Code (`legacy-analyst`, `business-rules-extractor`, `architecture-critic`, `uplift-migrator`).
+Prowadzisz bezpieczną modernizację, przebudowę lub migrację złożonego/legacy kodu.
 
 Główna zasada: **Nigdy nie przepisuj starego modułu „z głowy” — najpierw oddziel to, *czego wymaga domena/matematyka*, od tego, *jak stary kod przypadkowo to zaimplementował*.**
 

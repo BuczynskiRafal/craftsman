@@ -1,8 +1,7 @@
 ---
 name: audit
 description: >-
-  Kompleksowy orkiestrator audytów inżynierskich (na bazie review-pr z
-  pr-review-toolkit w Claude Code). Uruchamia wybrane lub wszystkie
+  Kompleksowy orkiestrator audytów inżynierskich. Uruchamia wybrane lub wszystkie
   specjalistyczne audyty: errors (/audit-errors), tests (/audit-tests), types
   (/audit-types), comments (/audit-comments), security (/audit-security),
   quality (code-quality) oraz perf (extreme-optimizer / leetcode-style). Używaj
@@ -11,7 +10,7 @@ description: >-
 
 # Comprehensive Engineering Audit (`/audit`)
 
-Jesteś orkiestratorem specjalistycznych audytów inżynierskich (wzorowanym na `review-pr` z pakietu `pr-review-toolkit` w Claude Code). Pozwalasz jednym poleceniem `/audit` uruchomić precyzyjnie dobrane audyty na bieżącym diffie, Pull Requeście lub wskazanym module.
+Jesteś orkiestratorem specjalistycznych audytów inżynierskich. Pozwalasz jednym poleceniem `/audit` uruchomić precyzyjnie dobrane audyty na bieżącym diffie, Pull Requeście lub wskazanym module.
 
 Raport formułuj **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
 
@@ -23,13 +22,13 @@ Przeanalizuj argumenty przekazane po `/audit`:
 
 | Aspekt (argument) | Odpowiadający Skill | Kiedy jest automatycznie wybierany (gdy brak argumentu lub `all`) |
 | :--- | :--- | :--- |
-| **`errors`** | [`audit-errors`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-errors/SKILL.md) | Gdy w diffie/module występuje obsługa wyjątków (`try/except`), I/O, parsowanie lub fallbacki |
-| **`tests`** | [`audit-tests`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-tests/SKILL.md) | Gdy zmieniono logikę biznesową lub pliki testowe (`tests/`, `test_*.py`) |
-| **`types`** | [`audit-types`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-types/SKILL.md) | Gdy dodano lub zmodyfikowano klasy, `@dataclass`, modele Pydantic, `Enum` lub kontrakty API |
-| **`comments`** | [`audit-comments`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-comments/SKILL.md) | Gdy dodano/zmieniono docstringi, komentarze lub zmieniono sygnatury udokumentowanych funkcji |
-| **`security`** | [`audit-security`](file:///Users/rafalbuczynski/.gemini/config/skills/audit-security/SKILL.md) | Gdy kod dotyka ścieżek plików, procesów, SQL/wyrażeń, sieci, deserializacji lub uprawnień |
-| **`quality`** | [`code-quality`](file:///Users/rafalbuczynski/.gemini/config/skills/code_quality/SKILL.md) | Na żądanie (`/audit quality`) lub przy dużych klasach/modułach (DRY, SOLID, ortogonalność) |
-| **`perf`** | [`leetcode-style-code-reviewer`](file:///Users/rafalbuczynski/.gemini/config/skills/leetcode-style-code-reviewer/SKILL.md) | Na żądanie (`/audit perf`) lub przy pętlach numerycznych / NumPy / Pandas / hot-path |
+| **`errors`** | [`audit-errors`] | Gdy w diffie/module występuje obsługa wyjątków (`try/except`), I/O, parsowanie lub fallbacki |
+| **`tests`** | [`audit-tests`] | Gdy zmieniono logikę biznesową lub pliki testowe (`tests/`, `test_*.py`) |
+| **`types`** | [`audit-types`] | Gdy dodano lub zmodyfikowano klasy, `@dataclass`, modele Pydantic, `Enum` lub kontrakty API |
+| **`comments`** | [`audit-comments`] | Gdy dodano/zmieniono docstringi, komentarze lub zmieniono sygnatury udokumentowanych funkcji |
+| **`security`** | [`audit-security`] | Gdy kod dotyka ścieżek plików, procesów, SQL/wyrażeń, sieci, deserializacji lub uprawnień |
+| **`quality`** | [`code-quality`] | Na żądanie (`/audit quality`) lub przy dużych klasach/modułach (DRY, SOLID, ortogonalność) |
+| **`perf`** | [`leetcode-style-code-reviewer`] | Na żądanie (`/audit perf`) lub przy pętlach numerycznych / NumPy / Pandas / hot-path |
 | **`all`** *(domyślny)* | Wszystkie pasujące aspekty z powyższej tabeli | Automatycznie dobiera aspekty na podstawie zawartości diffu (`git diff --name-only` + treść hunków) |
 
 ---

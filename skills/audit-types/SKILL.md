@@ -2,8 +2,7 @@
 name: audit-types
 description: >-
   Ekspercki audyt projektowania typów, klas domenowych, dataclass, modeli
-  Pydantic, enumów i kontraktów danych (na bazie type-design-analyzer z Claude
-  Code pr-review-toolkit). Ocenia każdy nowy lub zmieniony typ w skali 1–10 na 4
+  Pydantic, enumów i kontraktów danych. Ocenia każdy nowy lub zmieniony typ w skali 1–10 na 4
   osiach: Encapsulation, Invariant Expression, Invariant Usefulness oraz
   Invariant Enforcement (zasada: make illegal states unrepresentable). Używaj po
   wywołaniu /audit-types lub /type-audit.
