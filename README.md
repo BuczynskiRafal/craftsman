@@ -13,9 +13,13 @@ cd ~/.gemini/craftsman
 ```
 
 ### Tryby instalacji (`./install.sh`):
-- `./install.sh --copy` *(domyślny)* — kopiuje skille do `~/.gemini/config/skills/` oraz reguły do `~/.gemini/config/rules/`.
-- `./install.sh --symlink` *(zalecany)* — tworzy dowiązania symboliczne do sklonowanego repozytorium, dzięki czemu zwykłe `git pull` od razu aktualizuje wszystkie skille i reguły.
+- `./install.sh --copy` *(domyślny)* — kopiuje skille, reguły, `hooks.json` oraz skrypty do `~/.gemini/config/`.
+- `./install.sh --symlink` *(zalecany)* — tworzy dowiązania symboliczne do sklonowanego repozytorium, dzięki czemu zwykłe `git pull` od razu aktualizuje wszystkie skille, reguły i hooki.
 - `./install.sh --plugin` — instaluje cały pakiet jako przełączalny plugin Antigravity w `~/.gemini/config/plugins/craftsman` (zarządzany przez `/plugin`).
+- `./install.sh --copilot` — eksportuje wszystkie 20 skilli jako pliki `*.prompt.md` oraz globalne reguły jako `craftsman-rules.instructions.md` do profilu użytkownika VS Code (`Code/User/prompts`), udostępniając komendy `/craftsman`, `/simplify`, `/code-review`, `/verify` itd. w **GitHub Copilot Chat**.
+- `./install.sh --copilot-workspace <ścieżka>` — eksportuje `.github/prompts/*.prompt.md` oraz `.github/copilot-instructions.md` bezpośrednio do wskazanego repozytorium projektu.
+- `./install.sh --git-hooks` — instaluje globalne hooki `/usr/bin/git` (`commit-msg` oraz `pre-push`) w `~/.gemini/config/git-hooks` i ustawia `git config --global core.hooksPath` (z automatycznym łańcuchowaniem lokalnych hooków `.git/hooks/*` w repozytoriach), co wymusza twardą ochronę Gita również w **GitHub Copilot**, **Cursorze** i zwykłym terminalu.
+- Flagi można łączyć, np.: `./install.sh --symlink --copilot --git-hooks`.
 
 ---
 
