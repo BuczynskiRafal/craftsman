@@ -1,28 +1,34 @@
-# 🛠️ Craftsman — Universal Agentic Engineering Framework
+# Craftsman -- Universal Agentic Engineering & Quality Gate Framework
 
+[![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
+[![Python 3.10-3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
+[![Type Checked: mypy --strict](https://img.shields.io/badge/mypy-strict-blue.svg)](pyproject.toml)
+[![Linter: Ruff](https://img.shields.io/badge/code%20style-ruff-261230.svg)](pyproject.toml)
+[![Dependencies: Zero](https://img.shields.io/badge/dependencies-zero%20(stdlib)-brightgreen.svg)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-2.1.0-emerald.svg)](plugin.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-emerald.svg)](plugin.json)
-[![Platforms](https://img.shields.io/badge/platforms-Claude_Code_%7C_Codex_%7C_Copilot_%7C_Cursor_%7C_Antigravity-purple.svg)](#multi-platform-installation)
 
-**Craftsman** is a universal, zero-trust **Agentic Software Engineering & Quality Gate Framework** (*Creator != Reviewer*). It equips AI coding agents (**Claude Code**, **OpenAI Codex CLI**, **GitHub Copilot**, **Cursor**, and **Google Antigravity**) with 17 structured engineering workflows, a **3-Gear Adaptive Quality Loop** (Soft-Loop vs. Hybrid Hard-Loop), and deterministic OS-level Git and lifecycle guardrails.
+**Craftsman** is a zero-dependency, zero-trust **Agentic Software Engineering & Quality Gate Framework** (*Author != Reviewer*). It equips AI coding agents (**Claude Code**, **OpenAI Codex CLI**, **GitHub Copilot**, **Cursor**, **Windsurf**, and **Google Antigravity**) with 17 structured engineering workflows, a **3-Gear Adaptive Quality Loop** (Soft-Loop vs. Hybrid Hard-Loop), and deterministic OS-level Git and lifecycle guardrails.
 
 ---
 
-## ✨ Why Craftsman?
+## Why Craftsman?
 
-1. **Creator != Reviewer Verified at Runtime:**
-   AI agents suffer from confirmation bias when reviewing code they just wrote in the same context window. For non-trivial changes, Craftsman's `Stop` hook scans `transcript.jsonl` and physically blocks task completion until the primary agent spawns a fresh, independent **`Craftsman Quality Gate Auditor` subagent** to execute `/simplify` -> `/code-review` -> `/verify` on the full cumulative diff (`base_sha..HEAD`).
-2. **3-Gear Automatic Gearbox (`Quick` vs `Standard` vs `Deep`):**
-   No brute-force overhead on 5-line fixes. Craftsman automatically measures the cumulative git diff (`git diff --numstat <base_sha>` plus untracked files) and selects the optimal verification depth:
-   - **Gear 1 — `Quick` (Soft-Loop):** `<= 40` changed lines across `<= 2` files (or `/craftsman --quick`). Runs fast inline `/simplify` + `/verify` with **zero subagent overhead**.
-   - **Gear 2 — `Standard` (Hybrid Hard-Loop):** `> 40` changed lines or `> 2` files. Requires an independent `Craftsman Quality Gate Auditor` subagent verified in `transcript.jsonl`.
-   - **Gear 3 — `Deep` (Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode`. Activates pre-implementation `ultrathink` architecture analysis + independent subagent running all 5 specialized `/audit` suites.
-3. **Write Once, Run Across Every AI Agent:**
-   One repository exports native slash commands, prompts, instructions, and rules to **Claude Code** (`~/.claude/`), **GitHub Copilot** (`Code/User/prompts` & `.github/prompts/`), **OpenAI Codex / Windsurf** (`AGENTS.md`), **Cursor** (`.cursor/rules/craftsman.mdc`), **Google Antigravity** (`~/.gemini/config/`), and **native OS Git hooks** (`commit-msg` & `pre-push`).
+1. **Author != Reviewer Verified at Runtime:**
+   AI agents exhibit strong confirmation bias when reviewing code they just wrote inside the same context window. For non-trivial changes, Craftsman's `Stop` hook inspects `transcript.jsonl` and blocks task completion until the primary agent spawns a fresh, independent **`Craftsman Quality Gate Auditor` subagent** to execute `/simplify` -> `/code-review` -> `/verify` on the full cumulative diff (`base_sha..HEAD`).
+2. **3-Gear Automatic Gearbox (`Quick` vs. `Standard` vs. `Deep`):**
+   Zero multi-agent overhead on 5-line fixes. Craftsman measures the cumulative git diff (`git diff --numstat <base_sha>`) and selects the appropriate verification tier:
+   - **Gear 1 (`Quick` / Soft-Loop):** `<= 40` changed lines across `<= 2` files (or `/craftsman --quick`). Runs fast inline `/simplify` + `/verify` with **zero subagent overhead**.
+   - **Gear 2 (`Standard` / Hybrid Hard-Loop):** `> 40` changed lines or `> 2` files. Enforces an independent `Craftsman Quality Gate Auditor` subagent verified in `transcript.jsonl`.
+   - **Gear 3 (`Deep` / Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode`. Enforces pre-implementation `ultrathink` architecture analysis plus an independent subagent executing all 5 specialized `/audit` suites.
+3. **Write Once, Export Across Every AI Coding Agent:**
+   A single source of truth exports native slash commands, prompt files, instructions, and rules to **Claude Code** (`~/.claude/`), **GitHub Copilot** (`Code/User/prompts` and `.github/prompts/`), **OpenAI Codex / Windsurf / Zed** (`AGENTS.md`), **Cursor** (`.cursor/rules/craftsman.mdc`), **Google Antigravity** (`~/.gemini/config/`), and **native OS Git hooks** (`commit-msg` and `pre-push`).
 
 ---
 
-## 🚀 Multi-Platform Installation
+## Quick Start & Multi-Platform Installation
+
+### Option A: Shell Installer (Zero Setup)
 
 ```bash
 git clone https://github.com/BuczynskiRafal/craftsman.git ~/.craftsman
@@ -32,7 +38,26 @@ cd ~/.craftsman
 ./install.sh --all
 ```
 
-### Target-Specific Flags (`./install.sh`)
+### Option B: Python CLI (`craftsman`)
+
+Craftsman is a standard PEP 621 Python package (`python >= 3.10`) using exclusively the Python standard library:
+
+```bash
+pip install -e .
+
+# Verify installation health, skill manifests, and active Git hooks:
+craftsman doctor
+craftsman doctor --json
+
+# Inspect current repository cumulative diff and recommended Quality Gate Gear:
+craftsman status --cwd /path/to/repo
+
+# Export skills and rules to Claude Code, GitHub Copilot, Codex (AGENTS.md), and Cursor:
+craftsman export --workspace /path/to/repo --agents-workspace /path/to/repo
+```
+
+### Target-Specific Installer Flags (`./install.sh`)
+
 | Flag | Target Platform / Effect |
 | :--- | :--- |
 | `./install.sh --all` | Installs across **Google Antigravity**, **Claude Code**, **GitHub Copilot**, and **Global Git Hooks** in one shot. |
@@ -45,7 +70,7 @@ cd ~/.craftsman
 
 ---
 
-## ⚙️ 3-Gear Adaptive Architecture (`/craftsman`)
+## 3-Gear Adaptive Architecture (`/craftsman`)
 
 ```mermaid
 flowchart TD
@@ -61,7 +86,7 @@ flowchart TD
     Batch --> Gearbox
 
     Gearbox -->|"Gear 1: Quick (<=40 lines & <=2 files\nor --quick)"| SoftLoop["Inline Soft-Loop:\n/simplify + /verify (0 subagents)"]
-    Gearbox -->|"Gear 2: Standard (>40 lines or >2 files)\nGear 3: Deep (--deep / ultracode)"| Subagent["Independent Subagent (Creator != Reviewer):\ninvoke_subagent (Craftsman Quality Gate Auditor)"]
+    Gearbox -->|"Gear 2: Standard (>40 lines or >2 files)\nGear 3: Deep (--deep / ultracode)"| Subagent["Independent Subagent (Author != Reviewer):\ninvoke_subagent (Craftsman Quality Gate Auditor)"]
 
     Subagent --> Simplify["Step 1: /simplify on cumulative diff (base_sha..HEAD)"]
     Simplify --> Review["Step 2: /code-review + /audit-* + Auto-Fix (Angles A-E)"]
@@ -75,25 +100,25 @@ flowchart TD
 
 | Gear | Trigger | Subagent Required? | Verification Scope | Best Used For |
 | :--- | :--- | :---: | :--- | :--- |
-| **Gear 1: `Quick` (Soft-Loop)** | Automatic when cumulative diff is **$\le 40$ lines across $\le 2$ files**, or manual `/craftsman --quick` | ❌ No (Fast Inline) | `/simplify` + `/verify` in main thread | Config tweaks, small bugfixes, 1–2 file adjustments |
-| **Gear 2: `Standard` (Hybrid Hard-Loop)** | Automatic when cumulative diff is **$> 40$ lines or $> 2$ files**, or manual `/craftsman --standard` | ✅ Yes (`Craftsman Quality Gate Auditor`) | Independent subagent runs `/simplify` -> `/code-review` -> `/verify` on `base_sha..HEAD` | Everyday features, multi-file refactors, bugfix PRs |
-| **Gear 3: `Deep` (Full-Audit Hard-Loop)** | Manual `/craftsman --deep` or keyword `ultracode` | ✅ Yes (`Craftsman Quality Gate Auditor`) | `ultrathink` pre-analysis + independent subagent runs `/simplify` -> `/code-review` -> `/audit all` -> `/verify` | Critical core logic, security-sensitive modules, complex migrations |
+| **Gear 1: `Quick` (Soft-Loop)** | Automatic when cumulative diff is **$\le 40$ lines across $\le 2$ files**, or manual `/craftsman --quick` | No (Fast Inline) | `/simplify` + `/verify` in main thread | Config tweaks, small bugfixes, 1-2 file adjustments |
+| **Gear 2: `Standard` (Hybrid Hard-Loop)** | Automatic when cumulative diff is **$> 40$ lines or $> 2$ files**, or manual `/craftsman --standard` | Yes (`Craftsman Quality Gate Auditor`) | Independent subagent runs `/simplify` -> `/code-review` -> `/verify` on `base_sha..HEAD` | Everyday features, multi-file refactors, bugfix PRs |
+| **Gear 3: `Deep` (Full-Audit Hard-Loop)** | Manual `/craftsman --deep` or keyword `ultracode` | Yes (`Craftsman Quality Gate Auditor`) | `ultrathink` pre-analysis + independent subagent runs `/simplify` -> `/code-review` -> `/audit all` -> `/verify` | Critical core logic, security-sensitive modules, complex migrations |
 
 ---
 
-## 📦 Included Skills (17 Core Engineering Workflows)
+## Included Skills (17 Core Engineering Workflows)
 
 ### 1. Master Orchestrator
 | Command | Description |
 | :--- | :--- |
-| **`/craftsman`** | End-to-end engineering orchestrator. Tracks cumulative diff (`base_sha..HEAD`), selects architectural workflow (A–D), and enforces the 3-Gear Quality Gate. |
+| **`/craftsman`** | End-to-end engineering orchestrator. Tracks cumulative diff (`base_sha..HEAD`), selects architectural workflow (A-D), and enforces the 3-Gear Quality Gate. |
 
 ### 2. Architectural & Transformation Workflows
 | Command | Description |
 | :--- | :--- |
-| **`/feature-dev`** | 7-phase feature development: codebase exploration -> clarifying questions -> 2–3 architectural trade-off options -> implementation -> review. |
+| **`/feature-dev`** | 7-phase feature development: codebase exploration -> clarifying questions -> 2-3 architectural trade-off options -> implementation -> review. |
 | **`/modernize`** | Safe legacy modernization: extracts hidden business rules into `Given / When / Then` specs, builds characterization tests, refactors, and proves equivalence. |
-| **`/batch`** | Parallel mass refactoring & migrations across 5–30 independent work units executed by background subagents. |
+| **`/batch`** | Parallel mass refactoring & migrations across 5-30 independent work units executed by background subagents. |
 
 ### 3. Daily Quality Gate
 | Command | Description |
@@ -107,11 +132,11 @@ flowchart TD
 | Command | Description |
 | :--- | :--- |
 | **`/audit`** | Multi-aspect audit orchestrator (`/audit all`, `/audit errors,security`). |
-| **`/audit-errors`** | *Silent Failure Hunter* — detects swallowed exceptions, overly broad `try/except`, and silent `None`/`0`/`[]` fallbacks. |
-| **`/audit-tests`** | *Behavioral Test Coverage* — evaluates behavioral coverage, edge cases, and refactor resilience on a 1–10 scale. |
-| **`/audit-types`** | *Type & Invariant Analyzer* — audits domain models, dataclasses, and Pydantic schemas across 4 axes (*make illegal states unrepresentable*). |
-| **`/audit-comments`** | *Comment Rot Analyzer* — cross-checks docstrings and comments against actual implementation behavior. |
-| **`/audit-security`** | *Source-to-Sink Taint Auditor* — traces untrusted input to sensitive sinks with CWE classification and minimal patches. |
+| **`/audit-errors`** | *Silent Failure Hunter* -- detects swallowed exceptions, overly broad `try/except`, and silent `None`/`0`/`[]` fallbacks. |
+| **`/audit-tests`** | *Behavioral Test Coverage* -- evaluates behavioral coverage, edge cases, and refactor resilience on a 1-10 scale. |
+| **`/audit-types`** | *Type & Invariant Analyzer* -- audits domain models, dataclasses, and Pydantic schemas across 4 axes (*make illegal states unrepresentable*). |
+| **`/audit-comments`** | *Comment Rot Analyzer* -- cross-checks docstrings and comments against actual implementation behavior. |
+| **`/audit-security`** | *Source-to-Sink Taint Auditor* -- traces untrusted input to sensitive sinks with CWE classification and minimal patches. |
 
 ### 5. Performance & Code Hygiene
 | Command | Description |
@@ -122,7 +147,7 @@ flowchart TD
 
 ---
 
-## 🛡️ Deterministic System Guards (`scripts/` & `git-hooks/`)
+## Deterministic System Guards (`scripts/` & `git-hooks/`)
 
 1. **`scripts/git-guard.py` (`PreToolUse` hook + native `commit-msg` & `pre-push` Git hooks):**
    - **Rule #1 (Protected Branch Guard):** Blocks unconfirmed `git push` to `main`/`master` unless the user explicitly confirmed via `ask_question` / `AskUserQuestion` or interactive terminal prompt.
@@ -132,7 +157,20 @@ flowchart TD
 
 ---
 
-## 🙏 Acknowledgments & License
+## Development & Verification
 
-- **License:** Released under the [MIT License](LICENSE) (`Copyright (c) 2026 Rafał Buczyński`).
-- **Architectural Inspiration:** Informed by multi-agent separation-of-concerns patterns (*Creator != Reviewer*), lifecycle hook state machines, and structured specification-driven modernization practices from the AI software engineering ecosystem.
+```bash
+# Run linter, strict type checker, and behavioral test suite:
+make check
+
+# Or run individually:
+ruff check craftsman scripts tests
+mypy --strict craftsman scripts tests
+python3 -m unittest discover -s tests -v
+```
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE) (`Copyright (c) 2026 Rafał Buczyński`).

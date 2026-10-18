@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
@@ -110,7 +111,7 @@ def render_agents_md(repo_dir: Path) -> str:
     lines: list[str] = [
         "# AGENTS.md — Craftsman Agentic Engineering Standard",
         "",
-        "This repository follows the **Craftsman** 3-Gear Hybrid Quality Loop (`Creator != Reviewer`).",
+        "This repository follows the **Craftsman** 3-Gear Hybrid Quality Loop (`Author != Reviewer`).",
         "",
         "## 3-Gear Quality Loop (`Quick` vs `Standard` vs `Deep`)",
         "- **Gear 1 (`quick` / Soft-Loop):** Changes `<= 40` lines across `<= 2` files -> inline `/simplify` + `/verify`.",
@@ -136,7 +137,7 @@ def _export_skill_files(
     skills_dir: Path,
     out_dir: Path,
     suffix: str,
-    renderer: callable,
+    renderer: Callable[[str, str], str],
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0

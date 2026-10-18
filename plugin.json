@@ -1,6 +1,29 @@
 {
   "name": "craftsman",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "license": "MIT",
-  "description": "Deterministic Quality Gates, Zero-Trust Subagent Verification, and Multi-Agent Engineering Workflows for Claude Code, OpenAI Codex, GitHub Copilot, Cursor, and Google Antigravity."
+  "description": "Deterministic Quality Gates, Zero-Trust Subagent Verification, and Multi-Agent Engineering Workflows for Claude Code, OpenAI Codex, GitHub Copilot, Cursor, and Google Antigravity.",
+  "skills": [
+    "audit",
+    "audit-comments",
+    "audit-errors",
+    "audit-security",
+    "audit-tests",
+    "audit-types",
+    "batch",
+    "code-review",
+    "code_quality",
+    "craftsman",
+    "extreme_optimizer",
+    "feature-dev",
+    "high-level-commit-message",
+    "leetcode-style-code-reviewer",
+    "modernize",
+    "simplify",
+    "verify"
+  ],
+  "rules": [
+    "git_workflow.md",
+    "ultra_mode.md"
+  ]
 }

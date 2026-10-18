@@ -9,13 +9,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GIT_GUARD = REPO_ROOT / "scripts" / "git-guard.py"
 STOP_GATE = REPO_ROOT / "scripts" / "craftsman-stop-gate.py"
 
 
-def run_hook(script: Path, payload: dict) -> dict:
+def run_hook(script: Path, payload: dict[str, Any]) -> dict[str, Any]:
     proc = subprocess.run(
         [sys.executable, str(script)],
         input=json.dumps(payload),
@@ -24,7 +25,10 @@ def run_hook(script: Path, payload: dict) -> dict:
         timeout=5,
         check=True,
     )
-    return json.loads(proc.stdout.strip())
+    parsed = json.loads(proc.stdout.strip())
+    assert isinstance(parsed, dict)
+    return parsed
+
 
 
 class GitGuardHookTests(unittest.TestCase):
@@ -457,7 +461,7 @@ class StopGateHookTests(unittest.TestCase):
             logs_dir.mkdir(parents=True)
             transcript = logs_dir / "transcript.jsonl"
             transcript.write_text(
-                json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "run this via /craftsman"})
+                json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "zrób to przez /craftsman"})
                 + "\n",
                 encoding="utf-8",
             )
@@ -505,7 +509,7 @@ class StopGateHookTests(unittest.TestCase):
                     {
                         "step_index": 2,
                         "type": "USER_INPUT",
-                        "content": "Check the file /Users/dev/scratch/craftsman/skills/craftsman/SKILL.md",
+                        "content": "Sprawdź plik /Users/dev/scratch/craftsman/skills/craftsman/SKILL.md",
                     }
                 ),
             ]
@@ -838,6 +842,177 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
             self.assertTrue((workspace / "AGENTS.md").is_file())
             self.assertTrue((workspace / ".cursor" / "rules" / "craftsman.mdc").is_file())
 
+    def test_failed_push_in_compound_command_does_not_consume_ask_question(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "transcript.jsonl"
+            entries = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [{"name": "ask_question", "args": {}}],
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "tool_calls": [
+                        {"name": "view_file", "args": {"AbsolutePath": "/tmp/a"}},
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": "git status --short && git push origin main"},
+                        },
+                    ],
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "File contents...",
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "The command exited with code 128.\nOutput:\nfatal: The current branch main has no upstream branch.",
+                },
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(e) for e in entries) + "\n",
+                encoding="utf-8",
+            )
+            res = run_hook(
+                GIT_GUARD,
+                {
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": "git push -u origin main"},
+                    },
+                },
+            )
+            self.assertEqual(res["decision"], "allow")
+
+
+class CraftsmanCliAndManifestTests(unittest.TestCase):
+    def test_cli_version_and_doctor_json(self) -> None:
+        ver_proc = subprocess.run(
+            [sys.executable, "-m", "craftsman.cli", "--version"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("2.1.0", ver_proc.stdout)
+
+        doc_proc = subprocess.run(
+            [sys.executable, "-m", "craftsman.cli", "doctor", "--json", "--repo-dir", str(REPO_ROOT)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        report = json.loads(doc_proc.stdout)
+        self.assertTrue(report["healthy"])
+        self.assertEqual(report["skills_count"], 17)
+        self.assertEqual(report["rules_count"], 2)
+
+    def test_cli_status_json_reports_gear_and_diff_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "dev@example.com"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Dev"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            app = repo_dir / "app.py"
+            app.write_text("x = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "commit", "--no-verify", "-m", "init"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            app.write_text("x = 2\ny = 3\n", encoding="utf-8")
+
+            stat_proc = subprocess.run(
+                [sys.executable, "-m", "craftsman.cli", "status", "--json", "--cwd", str(repo_dir)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            payload = json.loads(stat_proc.stdout)
+            self.assertIn("quick", payload["effective_gear"])
+            self.assertEqual(payload["diff"]["changed_files"], 1)
+            self.assertGreaterEqual(payload["diff"]["total_changed_lines"], 2)
+
+            # Adding 2 untracked files (total 3 changed files > 2) must shift gear to standard
+            (repo_dir / "u1.py").write_text("a = 1\n", encoding="utf-8")
+            (repo_dir / "u2.py").write_text("b = 2\n", encoding="utf-8")
+            stat_proc2 = subprocess.run(
+                [sys.executable, "-m", "craftsman.cli", "status", "--json", "--cwd", str(repo_dir)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            payload2 = json.loads(stat_proc2.stdout)
+            self.assertIn("standard", payload2["effective_gear"])
+            self.assertEqual(payload2["diff"]["changed_files"], 3)
+
+            # State file with mode=ultracode and gates=None must resolve to deep gear without crashing
+            state_file = Path(tmpdir) / "craftsman_state.json"
+            state_file.write_text(
+                json.dumps({"active": True, "mode": "ultracode", "tier": "auto", "gates": None}),
+                encoding="utf-8",
+            )
+            stat_proc3 = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "craftsman.cli",
+                    "status",
+                    "--json",
+                    "--state-file",
+                    str(state_file),
+                    "--cwd",
+                    str(repo_dir),
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            payload3 = json.loads(stat_proc3.stdout)
+            self.assertIn("deep", payload3["effective_gear"])
+            self.assertFalse(payload3["gates"]["simplified"])
+
+    def test_all_17_skills_have_valid_english_frontmatter_and_match_manifest(self) -> None:
+        manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
+        skill_files = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
+        self.assertEqual(len(skill_files), 17)
+        self.assertEqual(len(manifest["skills"]), 17)
+
+        for skill_md in skill_files:
+            content = skill_md.read_text(encoding="utf-8")
+            self.assertTrue(content.startswith("---\n"), f"Missing frontmatter in {skill_md}")
+            parts = content.split("---", 2)
+            self.assertGreaterEqual(len(parts), 3, f"Unclosed frontmatter in {skill_md}")
+            frontmatter = parts[1]
+            self.assertIn("name:", frontmatter, f"Missing name in {skill_md}")
+            self.assertIn("description:", frontmatter, f"Missing description in {skill_md}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
