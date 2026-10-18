@@ -1,60 +1,60 @@
 ---
 name: batch
 description: >-
-  Planowanie i równoległe wykonywanie masowych, powtarzalnych zmian w wielu
-  plikach lub modułach. Dzieli dużą migrację lub refaktor na niezależne jednostki pracy
-  (Work Units), ustala przepis weryfikacji, a po zatwierdzeniu planu uruchamia
-  równoległe subagenty i śledzi postęp w tabeli. Używaj po wywołaniu /batch.
+  Plan and execute parallel mass refactorings or migrations across many files or
+  modules. Decomposes large migrations into independent Work Units, defines a
+  verification recipe, spawns parallel subagents after plan approval, and tracks
+  progress in a status table. Use when /batch is invoked.
 ---
 
 # Batch Parallel Refactor & Migration (`/batch`)
 
-Planujesz i przeprowadzasz szeroko zakrojone, mechaniczne lub strukturalne zmiany w wielu plikach repozytorium (np. migracje API, masowa aktualizacja typowania, ujednolicenie obsługi błędów, zmiana sygnatur w dziesiątkach modułów), rozbijając je na niezależne, równoległe jednostki pracy (*Work Units*).
+You plan and execute large-scale, mechanical or structural changes across many files in a repository (e.g., API migrations, mass typing upgrades, error-handling standardization, signature updates across dozens of modules) by decomposing them into independent, parallel **Work Units**.
 
-Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
-
----
-
-## Phase 1 — Research & Plan (Badanie i Dekompozycja)
-
-1. **Zbadaj zakres zmiany:**
-   Przeszukaj repozytorium (`grep_search` / `find_by_name`, lub przy bardzo dużym repozytorium za pomocą subagentów `research`), aby znaleźć wszystkie pliki i miejsca objęte instrukcją użytkownika.
-2. **Podziel pracę na niezależne jednostki (*Work Units*):**
-   - Zgrupuj pliki w logiczne, **rozłączne** pakiety (tak, aby dwa subagenty nie edytowały tego samego pliku naraz!).
-   - Dla każdej jednostki określ: krótki tytuł, dokładną listę plików oraz jednozdaniowy opis zmiany.
-3. **Ustal przepis weryfikacji (*Verification Recipe*):**
-   - Określ krótką, konkretną komendę weryfikującą poprawność pojedynczej jednostki (np. `pytest tests/unit/test_xyz.py`, `ruff check <pliki>`, `mypy <pliki>`).
-4. **Przedstaw plan do akceptacji:**
-   Wypisz czytelny plan zawierający:
-   - podsumowanie liczby znalezionych miejsc i plików,
-   - ponumerowaną tabelę jednostek pracy (*Work Units*),
-   - przepis weryfikacyjny,
-   i zapytaj użytkownika, czy uruchomić wykonanie.
+Include clickable `file://` Markdown links for all referenced files.
 
 ---
 
-## Phase 2 — Spawn Workers (Równoległe Wykonanie)
+## Phase 1 — Research & Plan (Decomposition)
 
-Po zatwierdzeniu planu przez użytkownika:
-- Uruchom równoległe subagenty (`invoke_subagent`, `TypeName: "self"`, `Model: "inherit"`).
-  - Jeśli jednostki mają pracować na wspólnych plikach bez konfliktów, rozdziel pliki rozłącznie między subagenty w bieżącym workspace (`Workspace: "inherit"`) lub użyj izolowanego worktree (`Workspace: "share"`), jeśli każda jednostka ma stworzyć osobną gałąź.
-- Każdy subagent musi otrzymać w pełni samodzielny prompt zawierający:
-  1. Cel nadrzędny zmiany,
-  2. Dokładną listę przypisanych mu plików (**zakaz edycji plików spoza swojej listy!**),
-  3. Konwencje projektu, których musi przestrzegać,
-  4. Komendę weryfikacyjną, którą musi uruchomić przed zakończeniem pracy.
+1. **Survey the Scope:**
+   Search the repository (`grep_search` / `find_by_name`, or parallel `research` subagents on large codebases) to locate all files and call sites affected by the user's request.
+2. **Decompose into Disjoint Work Units:**
+   - Group files into logical, **strictly disjoint** batches (so two subagents never edit the same file concurrently!).
+   - For each Work Unit, specify: a short title, the exact list of files, and a one-sentence description of the change.
+3. **Define the Verification Recipe:**
+   - Specify a fast, concrete command that verifies a single Work Unit (e.g., `pytest tests/unit/test_xyz.py`, `ruff check <files>`, `mypy <files>`).
+4. **Present the Plan for Approval:**
+   Output a clear plan containing:
+   - total affected files and occurrences,
+   - numbered table of **Work Units**,
+   - verification recipe,
+   and ask the user to confirm execution.
 
 ---
 
-## Phase 3 — Track Progress & Final Verification (Śledzenie i Domknięcie)
+## Phase 2 — Spawn Workers (Parallel Execution)
 
-1. Po uruchomieniu i zakończeniu pracy subagentów zaprezentuj tabelę statusu:
+Once the user approves the plan:
+- Launch parallel subagents (`invoke_subagent`, `TypeName: "self"`, `Model: "inherit"`).
+  - Assign disjoint file sets to each subagent in the current workspace (`Workspace: "inherit"`) or use isolated worktrees (`Workspace: "share"`) when separate branches are desired.
+- Give each subagent a self-contained prompt containing:
+  1. The overarching migration goal,
+  2. The exact list of assigned files (**strictly forbid editing files outside its assigned list!**),
+  3. Project conventions to follow,
+  4. The verification command it must run before finishing.
+
+---
+
+## Phase 3 — Track Progress & Final Verification
+
+1. As subagents complete, present the consolidated status table:
 
 ```markdown
-| # | Jednostka pracy (Work Unit) | Pliki | Status | Weryfikacja |
+| # | Work Unit | Files | Status | Verification |
 | :-: | :--- | :--- | :---: | :--- |
-| 1 | `<tytuł jednostki 1>` | `<pliki>` | ✅ Done / ❌ Failed | `<wynik testu>` |
-| 2 | `<tytuł jednostki 2>` | `<pliki>` | ✅ Done / ❌ Failed | `<wynik testu>` |
+| 1 | `<unit 1 title>` | `<files>` | ✅ Done / ❌ Failed | `<test result>` |
+| 2 | `<unit 2 title>` | `<files>` | ✅ Done / ❌ Failed | `<test result>` |
 ```
 
-2. Na koniec uruchom zbiorczą weryfikację na całym drzewie roboczym (`git status`, `git diff --stat`, testy / linter), aby potwierdzić pełną spójność między wszystkimi jednostkami.
+2. Run a final repository-wide verification (`git status`, `git diff --stat`, full test suite / linter) to confirm cross-unit consistency.

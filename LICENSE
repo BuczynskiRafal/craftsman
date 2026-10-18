@@ -19,3 +19,21 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+-------------------------------------------------------------------------------
+Craftsman Universal Agentic Engineering Framework — Scope & Attribution Notice
+-------------------------------------------------------------------------------
+
+This license covers all files in the Craftsman repository, including:
+1. Multi-platform orchestration & export scripts (`scripts/craftsman-stop-gate.py`,
+   `scripts/git-guard.py`, `scripts/copilot-export.py`, and `install.sh`).
+2. Deterministic Git & lifecycle hook definitions (`hooks.json`, `git-hooks/commit-msg`,
+   and `git-hooks/pre-push`).
+3. Global engineering rules (`rules/git_workflow.md`, `rules/ultra_mode.md`) and all
+   17 core software engineering skill specifications (`skills/*/SKILL.md`).
+4. Behavioral and integration test suites (`tests/test_hooks.py`).
+
+All prompt templates, state-machine scripts, and architectural specifications in this
+repository are original implementations authored for the Craftsman framework, inspired
+by multi-agent separation-of-concerns patterns (Creator != Reviewer) and specification-
+driven software modernization practices across the AI engineering ecosystem.

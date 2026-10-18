@@ -1,46 +1,46 @@
 ---
 name: audit
 description: >-
-  Kompleksowy orkiestrator audytów inżynierskich. Uruchamia wybrane lub wszystkie
-  specjalistyczne audyty: errors (/audit-errors), tests (/audit-tests), types
-  (/audit-types), comments (/audit-comments), security (/audit-security),
-  quality (code-quality) oraz perf (extreme-optimizer / leetcode-style). Używaj
-  po wywołaniu /audit [aspekty] [cel].
+  Comprehensive engineering audit orchestrator. Runs selected or all specialized
+  audits: errors (/audit-errors), tests (/audit-tests), types (/audit-types),
+  comments (/audit-comments), security (/audit-security), quality (code-quality),
+  and perf (extreme-optimizer / leetcode-style). Use when /audit [aspects]
+  [target] is invoked.
 ---
 
 # Comprehensive Engineering Audit (`/audit`)
 
-Jesteś orkiestratorem specjalistycznych audytów inżynierskich. Pozwalasz jednym poleceniem `/audit` uruchomić precyzyjnie dobrane audyty na bieżącym diffie, Pull Requeście lub wskazanym module.
+You are the orchestrator for specialized engineering audits. A single `/audit` invocation runs targeted deep audits across the current diff, a Pull Request, or a specified module.
 
-Raport formułuj **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
+Include clickable `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)` links for all findings.
 
 ---
 
-## 1. Dostępne Aspekty Audytu (`/audit [aspekty...] [<cel>]`)
+## 1. Available Audit Aspects (`/audit [aspects...] [<target>]`)
 
-Przeanalizuj argumenty przekazane po `/audit`:
+Parse the arguments passed to `/audit`:
 
-| Aspekt (argument) | Odpowiadający Skill | Kiedy jest automatycznie wybierany (gdy brak argumentu lub `all`) |
+| Aspect (argument) | Corresponding Skill | When Automatically Selected (no argument or `all`) |
 | :--- | :--- | :--- |
-| **`errors`** | [`audit-errors`] | Gdy w diffie/module występuje obsługa wyjątków (`try/except`), I/O, parsowanie lub fallbacki |
-| **`tests`** | [`audit-tests`] | Gdy zmieniono logikę biznesową lub pliki testowe (`tests/`, `test_*.py`) |
-| **`types`** | [`audit-types`] | Gdy dodano lub zmodyfikowano klasy, `@dataclass`, modele Pydantic, `Enum` lub kontrakty API |
-| **`comments`** | [`audit-comments`] | Gdy dodano/zmieniono docstringi, komentarze lub zmieniono sygnatury udokumentowanych funkcji |
-| **`security`** | [`audit-security`] | Gdy kod dotyka ścieżek plików, procesów, SQL/wyrażeń, sieci, deserializacji lub uprawnień |
-| **`quality`** | [`code-quality`] | Na żądanie (`/audit quality`) lub przy dużych klasach/modułach (DRY, SOLID, ortogonalność) |
-| **`perf`** | [`leetcode-style-code-reviewer`] | Na żądanie (`/audit perf`) lub przy pętlach numerycznych / NumPy / Pandas / hot-path |
-| **`all`** *(domyślny)* | Wszystkie pasujące aspekty z powyższej tabeli | Automatycznie dobiera aspekty na podstawie zawartości diffu (`git diff --name-only` + treść hunków) |
+| **`errors`** | [`audit-errors`] | When the diff/module contains exception handling (`try/except`), I/O, parsing, or fallbacks |
+| **`tests`** | [`audit-tests`] | When business logic or test files (`tests/`, `test_*.py`) are modified |
+| **`types`** | [`audit-types`] | When classes, `@dataclass`, Pydantic models, `Enum`, or API contracts are added/modified |
+| **`comments`** | [`audit-comments`] | When docstrings, comments, or signatures of documented functions are added/modified |
+| **`security`** | [`audit-security`] | When code touches file paths, subprocesses, SQL/expressions, network, deserialization, or auth |
+| **`quality`** | [`code-quality`] | On demand (`/audit quality`) or on large classes/modules (DRY, SOLID, orthogonality) |
+| **`perf`** | [`leetcode-style-code-reviewer`] | On demand (`/audit perf`) or on numerical loops / NumPy / Pandas / hot-path code |
+| **`all`** *(default)* | All matching aspects above | Automatically selects aspects based on diff contents (`git diff --name-only` + hunk contents) |
 
 ---
 
-## 2. Proces Wykonania (Adaptacyjny)
+## 2. Adaptive Execution Process
 
-1. **Ustal zakres i pasujące aspekty:**
-   - Sprawdź zmienione pliki (`git diff @{upstream}...HEAD` + `git diff HEAD`, lub wskazany plik/katalog/PR).
-   - Jeśli użytkownik podał konkretne aspekty (np. `/audit errors types` albo `/audit security`), przeczytaj odpowiednie pliki `SKILL.md` z tabeli powyżej i wykonaj dokładnie te audyty.
-   - Jeśli użytkownik wpisał samo `/audit` lub `/audit all`, sprawdź jakie elementy zawiera diff (czy są nowe typy? czy jest obsługa błędów? czy są testy? czy są docstringi?) i wybierz wszystkie pasujące aspekty.
-2. **Tryb wykonania (Inline vs. Subagenty):**
-   - **Mały/średni zakres (1–2 aspekty lub diff < ~200 linii):** Przeczytaj instrukcje wybranych skilli i wykonaj audyty sekwencyjnie w bieżącym kontekście.
-   - **Duży zakres (3+ aspektów na dużym diffie / całym module lub z flagą `--parallel`):** Uruchom równoległe subagenty `research` przez `invoke_subagent` (po jednym na każdy wybrany aspekt audytu), przekazując każdemu pełne wytyczne danego skilla.
-3. **Skonsolidowany Raport Końcowy:**
-   Połącz wyniki ze wszystkich uruchomionych aspektów w jeden przejrzysty raport pogrupowany według priorytetu (`CRITICAL` → `HIGH` → `MEDIUM`), z klikalnymi linkami `[plik.ext:L10-L20](file:///...)` i konkretnymi rekomendacjami kodu. Jeśli podano flagę `--fix`, od razu wdróż jednoznaczne poprawki.
+1. **Determine Scope & Matching Aspects:**
+   - Inspect modified files (`git diff @{upstream}...HEAD` + `git diff HEAD`, or the specified file/directory/PR).
+   - If the user specified concrete aspects (e.g., `/audit errors types` or `/audit security`), read the corresponding `SKILL.md` files from the table above and execute those exact audits.
+   - If the user invoked `/audit` or `/audit all`, inspect the diff contents and run all applicable audit aspects.
+2. **Execution Mode (Inline vs. Subagents):**
+   - **Small/Medium Scope (1–2 aspects or diff < ~200 lines):** Read the selected skill instructions and execute the audits sequentially in the current context.
+   - **Large Scope (3+ aspects on a large diff/module or with `--parallel`):** Launch parallel `research` subagents via `invoke_subagent` (one per selected audit aspect), passing each subagent the full guidelines of its assigned skill.
+3. **Consolidated Final Report:**
+   Combine findings from all executed aspects into a single prioritized report (`CRITICAL` → `HIGH` → `MEDIUM`), with clickable `[file.ext:L10-L20](file:///...)` links and concrete code fixes. If `--fix` was passed, apply unambiguous fixes directly.

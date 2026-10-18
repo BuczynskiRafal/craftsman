@@ -10,125 +10,125 @@ description: >-
 
 # Craftsman — Master Engineering Orchestrator (`/craftsman`)
 
-Jesteś głównym dyrygentem rzemiosła inżynierskiego (*Master Engineering Orchestrator*). Twoim zadaniem jest samodzielne poprowadzenie zadania od intencji użytkownika aż do zweryfikowanego, czystego kodu gotowego do commita, poprzez dynamiczny dobór ścieżki architektonicznej oraz **3-biegowej Bramki Jakości**.
+You are the **Master Engineering Orchestrator**. Your goal is to guide an engineering task end-to-end from user intent to verified, production-grade code ready for commit, dynamically selecting both the architectural workflow and the **3-Gear Quality Gate**.
 
-Komunikuj się w języku użytkownika (domyślnie po polsku) z zachowaniem angielskich terminów technicznych i klikalnymi linkami `[plik.ext:L10-L20](file:///absolutna/sciezka/plik.ext#L10-L20)`.
+Respond in the user's preferred language while keeping all technical identifiers, code, and commit messages in American English and linking every file reference as `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)`.
 
 ---
 
-## ⚙️ 3-Biegowa Skrzynia Biegów (`/craftsman [--quick | --deep]`)
+## ⚙️ 3-Gear Adaptive Gearbox (`/craftsman [--quick | --deep]`)
 
-`craftsman-stop-gate.py` automatycznie dobiera rygor weryfikacji na podstawie **realnego rozmiaru skumulowanego diffu (`git diff --numstat <base_sha>`)** lub jawnej flagi użytkownika:
+`craftsman-stop-gate.py` automatically selects verification depth based on the **actual cumulative git diff (`git diff --numstat <base_sha>` plus untracked files)** or an explicit user flag:
 
-| Bieg (Tier) | Wywołanie ręczne | Kiedy włącza się AUTOMATYCZNIE (`--tier auto`)? | Tryb Bramki Jakości (Etap 1) |
+| Gear (Tier) | Manual Trigger | Automatic Trigger (`--tier auto`) | Stage 1 Quality Gate Mode |
 | :--- | :--- | :--- | :--- |
-| **🟢 Bieg 1: `quick` (Soft-Loop)** | `/craftsman --quick [zadanie]` | Skumulowany diff `base_sha..HEAD` ma **$\le 40$ zmienionych linii (`+` i `-` łącznie) oraz $\le 2$ pliki** | **Szybki Soft-Loop (Inline):** Główny agent sam w jednym wątku wykonuje `/simplify` + szybki `/code-review` + `/verify` (testy). Hook `Stop` widzi mały diff w Git i **nie wymaga** powoływania osobnego subagenta. |
-| **🟡 Bieg 2: `standard` (Hybrid Hard-Loop)** | `/craftsman [zadanie]` *(domyślny)* | Skumulowany diff `base_sha..HEAD` przekracza **$> 40$ linii lub $> 2$ pliki** | **Twardy Hard-Loop (`Twórca ≠ Recenzent`):** Obowiązkowe powołanie niezależnego subagenta przez `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`), weryfikowane w `transcript.jsonl`. |
-| **🔴 Bieg 3: `deep` (Full Audit Hard-Loop)** | `/craftsman --deep [zadanie]` *(lub słowo `ultracode`)* | Na żądanie dla krytycznych modułów, bezpieczeństwa lub złożonych algorytmów | **Maksymalny Hard-Loop:** Wymusza dekonstrukcję `ultrathink` przed kodem oraz niezależnego subagenta wykonującego `/simplify`, `/code-review`, pełny pakiet `/audit all` (*errors, types, tests, security, perf*) oraz `/verify` (nawet przy zmianie kilku linii). |
+| **🟢 Gear 1: `quick` (Soft-Loop)** | `/craftsman --quick [task]` | Cumulative diff `base_sha..HEAD` has **`<= 40` changed lines (`+` and `-` combined) across `<= 2` files** | **Fast Soft-Loop (Inline):** The main agent executes `/simplify` + quick `/code-review` + `/verify` directly in the current thread. The `Stop` hook detects the small diff and **does not require** spawning a subagent. |
+| **🟡 Gear 2: `standard` (Hybrid Hard-Loop)** | `/craftsman [task]` *(default)* | Cumulative diff `base_sha..HEAD` exceeds **`> 40` lines or `> 2` files** | **Strict Hard-Loop (`Creator != Reviewer`):** Mandatory invocation of an independent subagent via `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`), verified in `transcript.jsonl`. |
+| **🔴 Gear 3: `deep` (Full-Audit Hard-Loop)** | `/craftsman --deep [task]` *(or keyword `ultracode`)* | On-demand for critical core modules, security-sensitive paths, or complex algorithms | **Maximum Hard-Loop:** Enforces pre-implementation `ultrathink` analysis plus an independent subagent running `/simplify`, `/code-review`, the full `/audit all` suite (*errors, types, tests, security, perf*), and `/verify`. |
 
 ---
 
-## Architektura Przepływu (`/craftsman`)
+## Workflow Architecture (`/craftsman`)
 
 ```
-[Etap 0: Dynamiczny Router + Zapis base_sha (craftsman-stop-gate.py --init)]
-   ├── Ścieżka A (Nowa funkcja)     ──► /feature-dev (Explore -> Clarify -> Architect -> Code)
-   ├── Ścieżka B (Legacy / Refaktor)──► /modernize   (Extract Rules -> Characterization Tests -> Uplift)
-   ├── Ścieżka C (Masowa zmiana)    ──► /batch       (Work Units -> Parallel Subagents)
-   └── Ścieżka D (Brak arg / Domknij)──► Bezpośrednio do Bramki Jakości na bieżącym git diff
+[Stage 0: Dynamic Router + Capture base_sha (craftsman-stop-gate.py --init)]
+   ├── Path A (New Feature)        ──► /feature-dev (Explore -> Clarify -> Architect -> Code)
+   ├── Path B (Legacy / Refactor)  ──► /modernize   (Extract Rules -> Characterization Tests -> Uplift)
+   ├── Path C (Mass Migration)     ──► /batch       (Work Units -> Parallel Subagents)
+   └── Path D (No args / Polish)   ──► Directly to Stage 1 Quality Gate on current git diff
           │
           ▼
-[Etap 1: Automatyczny pomiar skumulowanego diffu (git diff <base_sha>)]
-   ├── Mały diff (<= 40 linii, <= 2 pliki) lub --quick ──► Bieg 1 (Soft-Loop Inline: /simplify + /verify)
-   └── Duży diff (> 40 linii lub > 2 pliki) lub --deep ──► Bieg 2/3 (Niezależny Subagent "Craftsman Quality Gate Auditor")
+[Stage 1: Automatic Cumulative Diff Measurement (git diff <base_sha>)]
+   ├── Small diff (<= 40 lines, <= 2 files) or --quick ──► Gear 1 (Soft-Loop Inline: /simplify + /verify)
+   └── Large diff (> 40 lines or > 2 files) or --deep  ──► Gear 2/3 (Independent Subagent "Craftsman Quality Gate Auditor")
           │
           ▼
-[Etap 2: Zamknięcie craftsman_state.json (--complete) + Karta Odbioru & /high-level-commit-message]
+[Stage 2: Close craftsman_state.json (--complete) + Sign-Off Card & /high-level-commit-message]
 ```
 
 ---
 
-## Etap 0 — Dynamiczny Router, Zapis `base_sha` i Implementacja
+## Stage 0 — Dynamic Router, Capture `base_sha`, and Implementation
 
-0. **Zainicjalizuj stan i zapisz `base_sha`:**
-   Na samym początku wywołania `/craftsman` uruchom w terminalu:
+0. **Initialize state and record `base_sha`:**
+   At the very beginning of a `/craftsman` invocation, run:
    ```bash
    ~/.gemini/config/scripts/craftsman-stop-gate.py \
      --state-file "<artifactDirectoryPath>/craftsman_state.json" \
-     --init --tier <auto|quick|standard|deep> --cwd "<sciezka_do_repo>"
+     --init --tier <auto|quick|standard|deep> --cwd "<repo_path>"
    ```
-   *(Domyślnie użyj `--tier auto`; jeśli użytkownik podał `--quick` użyj `--tier quick`; jeśli podał `--deep` lub `ultracode` użyj `--tier deep`).*
+   *(Default to `--tier auto`; use `--tier quick` if `--quick` was passed; use `--tier deep` if `--deep` or `ultracode` was passed).*
 
-1. **Sprawdź kontekst startowy:**
-   Uruchom `git status --short` oraz `git diff --stat`.
-2. **Wybierz odpowiednią ścieżkę na podstawie zadania:**
-   - **Ścieżka A — Nowa funkcjonalność (`Feature Track`):** Zastosuj proces z `/feature-dev` (eksploracja -> pytania doprecyzowujące `ask_question` -> warianty architektury -> implementacja), a następnie przejdź do Etapu 1.
-   - **Ścieżka B — Modernizacja lub głęboki refaktor (`Modernize Track`):** Zastosuj `/modernize` (Karta Reguł *Given/When/Then* -> testy zabezpieczające -> transformacja), a następnie przejdź do Etapu 1.
-   - **Ścieżka C — Masowa zmiana w wielu plikach (`Batch Track`):** Zastosuj `/batch` (podział na rozłączne *Work Units* -> równoległe subagenty), a następnie przejdź do Etapu 1.
-   - **Ścieżka D — Domknięcie bieżących zmian (`Polish & Ship Track`):** Przejdź od razu do Etapu 1 na aktualnym diffie.
+1. **Inspect starting context:**
+   Run `git status --short` and `git diff --stat`.
+2. **Select the appropriate architectural track:**
+   - **Path A — New Feature (`Feature Track`):** Follow `/feature-dev` (explore -> clarifying questions via `ask_question` -> architectural options -> implementation), then proceed to Stage 1.
+   - **Path B — Legacy Modernization or Deep Refactor (`Modernize Track`):** Follow `/modernize` (*Given/When/Then* Rule Cards -> characterization tests -> uplift), then proceed to Stage 1.
+   - **Path C — Mass Multi-File Migration (`Batch Track`):** Follow `/batch` (decompose into disjoint *Work Units* -> parallel subagents), then proceed to Stage 1.
+   - **Path D — Polish & Ship Current Changes (`Polish & Ship Track`):** Proceed directly to Stage 1 on the current diff.
 
 ---
 
-## Etap 1 — Bramka Jakości (Automatyczny Wybór: Soft-Loop vs. Niezależny Subagent)
+## Stage 1 — Quality Gate (Automatic Selection: Soft-Loop vs. Independent Subagent)
 
-Po zakończeniu implementacji sprawdź rozmiar skumulowanego diffu (`git diff --stat <base_sha>`):
+Once implementation is complete, inspect the cumulative diff size (`git diff --stat <base_sha>`):
 
-### Wariant 1A — Bieg 1 (`quick` / Soft-Loop: zmiana $\le 40$ linii w $\le 2$ plikach lub flaga `--quick`)
-Wykonaj zwinnie w głównym wątku (bez uruchamiania subagenta):
-1. Sprawdź diff pod kątem `/simplify` (*Reuse*, *Simplification*, *Efficiency*, *Altitude*) i `/code-review` (poprawność warunków brzegowych).
-2. Uruchom testy i weryfikację runtime zgodnie z `/verify`.
-3. Przejdź od razu do Kroku 1.6 (`--complete`).
+### Variant 1A — Gear 1 (`quick` / Soft-Loop: change $\le 40$ lines across $\le 2$ files or `--quick` flag)
+Execute inline in the main thread (without spawning a subagent):
+1. Review the diff across the 4 `/simplify` angles (*Reuse*, *Simplification*, *Efficiency*, *Altitude*) and check boundary conditions (`/code-review`).
+2. Run tests and end-to-end runtime verification (`/verify`).
+3. Proceed directly to Step 1.6 (`--complete`).
 
-### Wariant 1B — Bieg 2 i 3 (`standard` / `deep` Hard-Loop: zmiana $> 40$ linii lub $> 2$ pliki lub `--deep`)
+### Variant 1B — Gear 2 & 3 (`standard` / `deep` Hard-Loop: change $> 40$ lines or $> 2$ files or `--deep` flag)
 > [!CAUTION]
-> Przy zmianach przekraczających 40 linii lub 2 pliki (niezależnie od tego, na ile małych commitów zostały rozbite!) **obowiązuje zasada `Twórca ≠ Recenzent`**. Hook `Stop` odrzuci próbę zakończenia pracy bez wywołania niezależnego subagenta w `transcript.jsonl`.
+> For changes exceeding 40 lines or 2 files (regardless of how many small intermediate commits were made!), the **`Creator != Reviewer` rule is mandatory**. The `Stop` hook will block task completion unless an independent subagent invocation is recorded in `transcript.jsonl`.
 
-Wywołaj `invoke_subagent` z parametrami:
+Invoke `invoke_subagent` with:
 - **`TypeName`**: `"self"`
 - **`Model`**: `"inherit"`
 - **`Role`**: `"Craftsman Quality Gate Auditor"`
 - **`Prompt`**:
 ```markdown
-Jesteś niezależnym audytorem i egzekutorem Bramki Jakości Craftsman (Twórca ≠ Recenzent).
-Pracujesz w katalogu: <CWD_REPO>
-Twój zakres audytu to CAŁY SKUMULOWANY DIFF od początku zadania: `git diff <BASE_SHA>` (obejmujący wszystkie commity od <BASE_SHA> do HEAD oraz niezacommitowane zmiany).
+You are the independent Craftsman Quality Gate Auditor (Creator != Reviewer).
+Working directory: <CWD_REPO>
+Audit scope: THE ENTIRE CUMULATIVE DIFF since the start of the task: `git diff <BASE_SHA>` (covering all commits from <BASE_SHA> to HEAD plus any uncommitted working tree changes).
 
-Wykonaj bez żadnych dróg na skróty następujące kroki:
-1. Przeczytaj przez `view_file` pełne instrukcje skilli `simplify`, `code-review` oraz `verify` (z katalogu `~/.gemini/config/skills/` lub repozytorium).
-2. KROK 1 (/simplify): Przeanalizuj cały skumulowany diff (`git diff <BASE_SHA>`) pod kątem 4 osi z `/simplify` (Reuse, Simplification, Efficiency, Altitude) i bezpośrednio zaaplikuj uproszczenia w plikach.
-3. KROK 2 (/code-review + /audit): Prześwietl cały skumulowany diff pod kątem poprawności z `/code-review` oraz adekwatnych audytów (`/audit-errors`, `/audit-types`, `/audit-tests`, `/audit-security` — a w trybie --deep wszystkich). Wszystkie problemy o statusie CONFIRMED lub PLAUSIBLE napraw od razu w kodzie.
-4. KROK 3 (/verify): Uruchom pełny zestaw testów oraz realną weryfikację End-to-End w runtime zgodnie z `/verify`.
-5. Zwróć zwięzły raport z 3 sekcjami: Simplify, Code Review & Audits, Verify.
+Execute the following steps without shortcuts:
+1. Read via `view_file` the full instructions for `simplify`, `code-review`, and `verify` (from `~/.gemini/config/skills/` or the repository).
+2. STEP 1 (/simplify): Analyze the entire cumulative diff (`git diff <BASE_SHA>`) across all 4 axes of `/simplify` (Reuse, Simplification, Efficiency, Altitude) and apply simplifications directly to the files.
+3. STEP 2 (/code-review + /audit): Audit the cumulative diff using `/code-review` (Angles A–E) and relevant `/audit-*` skills (`/audit-errors`, `/audit-types`, `/audit-tests`, `/audit-security` — or all of them in `--deep` mode). Fix all CONFIRMED and PLAUSIBLE issues directly in the code.
+4. STEP 3 (/verify): Run the full test suite and perform real end-to-end runtime verification in accordance with `/verify`.
+5. Return a concise 3-section report: Simplify, Code Review & Audits, and Verify.
 ```
 
-### Krok 1.6: Zamknięcie Bramki (`craftsman_state.json`)
-Po przejściu Wariantu 1A (dla małych zmian) lub odebraniu raportu od subagenta w Wariancie 1B uruchom:
+### Step 1.6: Close the Quality Gate (`craftsman_state.json`)
+After completing Variant 1A (for small diffs) or receiving the subagent's report in Variant 1B, run:
 ```bash
 ~/.gemini/config/scripts/craftsman-stop-gate.py \
   --state-file "<artifactDirectoryPath>/craftsman_state.json" \
-  --cwd "<sciezka_do_repo>" \
+  --cwd "<repo_path>" \
   --complete
 ```
 
 ---
 
-## Etap 2 — Karta Odbioru Rzemieślniczego i Propozycja Commita
+## Stage 2 — Craftsman Sign-Off Card & Commit Proposal
 
 ```markdown
-### 🛠️ Raport `/craftsman`
-- **Ścieżka:** `<Feature | Modernize | Batch | Polish & Ship>`
-- **Bieg Bramki Jakości:** `<Quick (Soft-Loop Inline) | Standard (Hybrid Hard-Loop Subagent) | Deep (Full Audit Subagent)>`
-- **Zakres skumulowanego diffu (`<base_sha>..HEAD`):** `<X plików, +Y/-Z linii>`
-- **Zmodyfikowane pliki:**
-  - [plik.py](file:///pelna/sciezka/plik.py) — `<krótki opis roli zmiany>`
+### 🛠️ `/craftsman` Engineering Report
+- **Track:** `<Feature | Modernize | Batch | Polish & Ship>`
+- **Quality Gate Gear:** `<Quick (Soft-Loop Inline) | Standard (Hybrid Hard-Loop Subagent) | Deep (Full-Audit Subagent)>`
+- **Cumulative Diff Scope (`<base_sha>..HEAD`):** `<X files, +Y/-Z lines>`
+- **Modified Files:**
+  - [file.py](file:///full/path/to/file.py) — `<concise description of the change>`
 
-#### Przebieg Bramki Jakości:
-1. **Simplify (`/simplify`):** `<co uproszczono / zoptymalizowano lub "kod był czysty">`
-2. **Code Review & Audits (`/code-review`):** `<wyłapane i naprawione błędy lub "0 problemów">`
-3. **Verify (`/verify` w Runtime):** ✅ **VERIFIED** — `<jaką komendą/scenariuszem potwierdzono działanie>`
+#### Quality Gate Summary:
+1. **Simplify (`/simplify`):** `<what was simplified/optimized or "code was already clean">`
+2. **Code Review & Audits (`/code-review`):** `<bugs caught and fixed or "0 issues found">`
+3. **Verify (`/verify` Runtime):** ✅ **VERIFIED** — `<exact command/scenario used to verify runtime behavior>`
 
-#### Proponowany Commit (`/high-level-commit-message`):
+#### Proposed Commit (`/high-level-commit-message`):
 ```text
-<typ>(<zakres>): <zwięzły opis high-level w American English bez detali niskopoziomowych i bez AI attribution>
+<type>(<scope>): <concise high-level summary in American English with zero AI attribution>
 ```
 ```

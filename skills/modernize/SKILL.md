@@ -1,62 +1,61 @@
 ---
 name: modernize
 description: >-
-  Inżynieryjna modernizacja, refaktoryzacja architektoniczna i migracja starego
-  kodu (Legacy Code Modernization). Zanim przepisze zawiły moduł, najpierw ekstrahuje z niego ukryte
-  reguły biznesowe/obliczeniowe do specyfikacji Given/When/Then (Karty Reguł),
-  buduje testy zabezpieczające (characterization tests), a dopiero potem
-  wykonuje uplift/transformację i weryfikację równoważności. Używaj po
-  wywołaniu /modernize.
+  Engineering modernization, architectural refactoring, and legacy code
+  migration. Extracts hidden domain and computational rules into Given/When/Then
+  Rule Cards first, builds characterization tests, and then executes the
+  uplift/transformation with equivalence verification. Use when /modernize is
+  invoked.
 ---
 
 # Code Modernization & Rule Extraction (`/modernize`)
 
-Prowadzisz bezpieczną modernizację, przebudowę lub migrację złożonego/legacy kodu.
+You lead safe modernization, refactoring, and migration of complex or legacy code.
 
-Główna zasada: **Nigdy nie przepisuj starego modułu „z głowy” — najpierw oddziel to, *czego wymaga domena/matematyka*, od tego, *jak stary kod przypadkowo to zaimplementował*.**
+Core Principle: **Never rewrite a legacy module from memory — first separate *what the domain/mathematics requires* from *how the legacy code happened to implement it*.**
 
-Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
-
----
-
-## Proces Modernizacji (5 Etapów)
-
-### Etap 1: Preflight & Assessment (Inwentaryzacja i Wybór Strategii)
-1. Przeanalizuj wskazany moduł/system: rozmiar, zależności wejściowe/wyjściowe, pokrycie testami, wąskie gardła i dług technologiczny.
-2. Ustal z użytkownikiem (przez `ask_question`, jeśli nie podano w prompcie) wzorzec modernizacji:
-   - **Uplift (Podniesienie wersji / standardu):** ten sam język i architektura, aktualizacja bibliotek/API/typowania (np. migracja Qt5 → Qt6, Python legacy → nowoczesny typowany Python, Pandas → Polars/NumPy),
-   - **Transform (Przebudowa modułu):** wydzielenie czystej logiki domenowej z monolitycznego kodu (np. oddzielenie logiki obliczeń od GUI w QGIS/FreeCAD),
-   - **Reimagine (Nowa architektura):** zaprojektowanie nowego modułu spełniającego te same reguły domenowe,
-   - **Extract Rules Only (Samo wydobycie reguł i zrozumienie kodu):** udokumentowanie ukrytych reguł i algorytmów bez modyfikacji kodu.
-3. Ustal niezmienniki kontraktu: czy zachowanie musi być bit-po-bicie identyczne (wraz z dotychczasowymi osobliwościami), czy przy okazji naprawiamy znane błędy?
+Include clickable `file://` Markdown links for all referenced files and symbols.
 
 ---
 
-### Etap 2: Business & Domain Rules Extraction (`business-rules-extractor`)
-Prześwietl modernizowany kod i wyciągnij wszystkie ukryte w nim **reguły domenowe i obliczeniowe** (pomijając czystą infrastrukturę, UI czy logowanie):
-- **Obliczenia i wzory:** formuły matematyczne/hydrologiczne/geometryczne, współczynniki, zaokrąglenia, jednostki,
-- **Walidacje i progi (*Thresholds*):** wymagane pola, zakresy wartości, zależności między polami,
-- **Przejścia stanów i warunki kwalifikowalności:** co wyzwala zmianę stanu, kolejność operacji,
-- **Zaszyte stałe (*Magic numbers*):** wypisz wszystkie zahardkodowane liczby i parametry wraz z ich dokładną lokalizacją (`[plik.py:L10-L20](file:///...)`). *(Uwaga bezpieczeństwa: jeśli natrafisz na zahardkodowane hasła/klucze API, zamaskuj wartość jako `<credential — masked>`).*
+## 5-Stage Modernization Process
 
-Dla każdej istotnej reguły sformułuj zwięzłą **Kartę Reguły (*Rule Card*)** ze specyfikacją **Given / When / Then** na konkretnych wartościach liczbowych oraz poziomem pewności (`High` / `Medium` / `Low` — przy `Low` sformułuj pytanie do użytkownika).
-
----
-
-### Etap 3: Characterization Tests (Siatka bezpieczeństwa przed zmianą)
-Zanim zmodyfikujesz stary kod produkcyjny:
-1. Przekształć wyekstrahowane w Etapie 2 reguły `Given / When / Then` w automatyczne testy kontraktowe (*characterization / golden tests*).
-2. Uruchom je na **starym kodzie**, aby potwierdzić, że testy przechodzą i zamrażają obecne zachowanie referencyjne.
+### Stage 1: Preflight & Assessment
+1. Analyze the target module/system: size, input/output dependencies, existing test coverage, bottlenecks, and technical debt.
+2. Confirm with the user (via `ask_question` if not specified in the prompt) the modernization pattern:
+   - **Uplift (Version / Standard Upgrade):** same language and architecture, upgrading libraries, APIs, or typing (e.g., Qt5 → Qt6, legacy Python → modern typed Python, Pandas → Polars/NumPy),
+   - **Transform (Module Restructuring):** extracting pure domain logic out of monolithic code (e.g., decoupling computational engines from GUI layers),
+   - **Reimagine (New Architecture):** designing a new module that satisfies the same extracted domain rules,
+   - **Extract Rules Only:** documenting hidden domain rules and algorithms without modifying code.
+3. Establish contract invariants: must behavior remain bit-for-bit identical (including legacy quirks), or are known bugs being fixed during the uplift?
 
 ---
 
-### Etap 4: Transformacja / Uplift (`architecture-critic` & `uplift-migrator`)
-1. Wdróż docelową architekturę lub migrację w logicznych, atomowych krokach.
-2. Zadbaj o to, by każda wyekstrahowana reguła z Etapu 2 miała swoje czytelne, jawne miejsce w nowym kodzie (a *magic numbers* stały się nazwanymi stałymi lub parametrami konfiguracji).
+### Stage 2: Business & Domain Rules Extraction (`business-rules-extractor`)
+Inspect the legacy code and extract all embedded **domain and computational rules** (ignoring pure boilerplate, UI wiring, or logging):
+- **Calculations & Formulas:** mathematical/scientific/geometric formulas, coefficients, rounding rules, and units,
+- **Validations & Thresholds:** required fields, value ranges, cross-field constraints,
+- **State Transitions & Eligibility:** what triggers state changes and required operation ordering,
+- **Embedded Constants (*Magic Numbers*):** list all hardcoded numbers and parameters with their exact locations (`[file.py:L10-L20](file:///...)`). *(Security note: if you encounter hardcoded passwords or API keys, mask the value as `<credential — masked>`).*
+
+For each significant rule, produce a concise **Rule Card** with a concrete **`Given / When / Then`** specification and a confidence level (`High` / `Medium` / `Low` — ask the user when `Low`).
 
 ---
 
-### Etap 5: Weryfikacja Równoważności (`modernize-verify`)
-1. Uruchom zestaw testów z Etapu 3 na zmodernizowanym kodzie.
-2. Porównaj wyniki (izomorfizm wyjść, wydajność, obsługa błędów).
-3. Przedstaw końcową tabelę podsumowującą: lista zachowanych reguł domenowych, wprowadzone zmiany architektoniczne oraz ewentualne świadomie zmienione zachowania.
+### Stage 3: Characterization Tests (Safety Net Before Editing)
+Before modifying legacy production code:
+1. Turn the Stage 2 `Given / When / Then` Rule Cards into automated **characterization / golden tests**.
+2. Run them against the **legacy code** to confirm they pass and lock in current reference behavior.
+
+---
+
+### Stage 4: Transformation / Uplift (`architecture-critic` & `uplift-migrator`)
+1. Implement the target architecture or migration in logical, atomic steps.
+2. Ensure every extracted rule from Stage 2 has an explicit, readable home in the modernized code (replacing magic numbers with named constants or configuration parameters).
+
+---
+
+### Stage 5: Equivalence Verification (`modernize-verify`)
+1. Run the Stage 3 characterization test suite against the modernized code.
+2. Compare outputs (output isomorphism, performance, error handling).
+3. Present a final summary table listing preserved domain rules, architectural improvements, and any intentionally updated behaviors.

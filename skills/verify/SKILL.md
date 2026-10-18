@@ -1,70 +1,69 @@
 ---
 name: verify
 description: >-
-  Weryfikacja działania zmian w kodzie end-to-end w runtime (/verify). Nie
-  ogranicza się do uruchomienia testów jednostkowych czy lintera — faktycznie
-  uruchamia zmodyfikowany przepływ (CLI, skrypt, serwer, pipeline danych,
-  headless GUI/QGIS/FreeCAD) i obserwuje realne zachowanie oraz wyjście. Używaj
-  po wywołaniu /verify lub przed commitem nietrywialnych zmian w kodzie
-  produkcyjnym.
+  End-to-end runtime verification of code changes (/verify). Goes beyond running
+  unit tests or linters — actually executes the modified flow (CLI, script, HTTP
+  server, data pipeline, headless GUI) and observes real runtime behavior and
+  outputs. Use when /verify is invoked or before committing non-trivial
+  production changes.
 ---
 
 # Verify (`/verify` — End-to-End Runtime Verification)
 
-Weryfikujesz, czy zmiana w kodzie **faktycznie robi to, do czego została stworzona**, poprzez przećwiczenie jej **end-to-end w runtime** i zaobserwowanie realnego zachowania — a nie tylko przez odpalenie `pytest`, `ruff` czy `mypy`.
+You verify that a code change **actually accomplishes what it was built to do** by exercising it **end-to-end at runtime** and observing real behavior — not merely by running static linters or unit tests in isolation.
 
-> **Kiedy NIE używać:** Jeśli diff dotyka wyłącznie dokumentacji (`*.md`), komentarzy lub samych plików testowych bez żadnej powierzchni uruchomieniowej (*runtime surface*) w kodzie produkcyjnym — poinformuj o tym krótko i zakończ. Każda zmiana w kodzie produkcyjnym ma powierzchnię uruchomieniową, którą należy przetestować.
+> **When NOT to use:** If the diff touches only documentation (`*.md`), comments, or test files with zero production runtime surface, state that briefly and finish. Every production code change has a runtime surface that must be exercised.
 
-Raport z weryfikacji formułuj **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
-
----
-
-## Phase 1 — Identyfikacja powierzchni uruchomieniowej (*Runtime Surface*)
-
-1. Sprawdź bieżący diff (`git diff @{upstream}...HEAD` oraz `git diff HEAD`, lub cel wskazany w argumencie `/verify <cel>`).
-2. Sprawdź, czy w repozytorium istnieje już dedykowana instrukcja lub skrypt weryfikacyjny (w `GEMINI.md`, `AGENTS.md`, `CLAUDE.md`, `Makefile`, `pyproject.toml`, `package.json`).
-3. Określ typ powierzchni uruchomieniowej dotkniętej zmianą:
-   - **Narzędzie CLI / Skrypt / Pipeline naukowy (np. SWMM, GIS):** jakie polecenie z jakimi flagami i danymi wejściowymi przechodzi dokładnie przez zmieniony kod?
-   - **Biblioteka / Moduł obliczeniowy:** jaki minimalny skrypt *smoke-test* (`python3 -c "..."`) wywołuje zmienione API na realistycznych danych (w tym na warunkach brzegowych z diffu) i sprawdza niezmienniki wyjścia?
-   - **Serwer / API / Web:** uruchomienie serwera i wykonanie żądania (`curl` / klient testowy) uderzającego w zmieniony endpoint oraz sprawdzenie statusu HTTP, payloadu i logów.
-   - **Wtyczka Desktop / CAD / GIS (QGIS / FreeCAD / Qt):** sprawdzenie ładowania modułu bez błędów importu, wywołanie logiki kontrolera/sesji w trybie *headless* lub uruchomienie dedykowanego skryptu weryfikującego paczkę.
+Include clickable `file://` Markdown links in your verification report.
 
 ---
 
-## Phase 2 — Wykonanie weryfikacji wielowarstwowej
+## Phase 1 — Identify the Runtime Surface
 
-Przeprowadź weryfikację od najszybszej warstwy statycznej do pełnego przebiegu runtime:
-
-1. **Warstwa 1: Statyka i kompilacja / importy**
-   - Sprawdź, czy zmienione moduły importują się czysto w środowisku projektu (brak `SyntaxError`, `ImportError`, cyklicznych importów, błędów typowania).
-2. **Warstwa 2: Testy automatyczne powiązane ze zmianą**
-   - Uruchom testy pokrywające zmieniony moduł (np. `pytest <sciezka_testu>`).
-3. **Warstwa 3: Przebieg End-to-End (Kluczowy krok `/verify`!)**
-   - **Przećwicz dotknięty przepływ na żywo** za pomocą `run_command`:
-     - Przekaż realistyczne dane wejściowe, które zmuszają program do wykonania **dokładnie tych gałęzi kodu (`if/else`, nowych metod, zrefaktorowanych funkcji)**, które zostały zmienione w diffie.
-     - Przetestuj co najmniej **1 przypadek główny (*happy path*)** oraz **1 przypadek brzegowy / błędny (*edge/error case*)** wynikający ze zmiany.
-     - Zaobserwuj rzeczywiste wyjście (`stdout`, `stderr`, kod wyjścia, wygenerowane pliki/artefakty) i sprawdź, czy nie pojawiły się ukryte ostrzeżenia, wyjątki lub błędne wartości liczbowe.
-   - Posprzątaj po sobie wszelkie pliki tymczasowe wygenerowane podczas weryfikacji.
+1. Inspect the current diff (`git diff @{upstream}...HEAD` and `git diff HEAD`, or the target passed to `/verify <target>`).
+2. Check whether the repository defines verification commands or scripts in `GEMINI.md`, `AGENTS.md`, `CLAUDE.md`, `Makefile`, `pyproject.toml`, or `package.json`.
+3. Determine the runtime surface touched by the change:
+   - **CLI Tool / Script / Data Pipeline:** which command, flags, and input data exercise the exact modified code paths?
+   - **Library / Computational Module:** what minimal smoke-test command (`python3 -c "..."`) invokes the modified API on realistic inputs (including boundary conditions from the diff) and asserts output invariants?
+   - **Server / API / Web:** start the server and send a real request (`curl` / test client) hitting the modified endpoint, verifying HTTP status, payload, and logs.
+   - **Desktop / CAD / GIS Plugin:** verify clean module import without errors, invoke controller/session logic in headless mode, or run the package verification script.
 
 ---
 
-## Phase 3 — Werdykt i raport
+## Phase 2 — Multi-Layer Verification Execution
 
-Zakończ zwięzłym raportem:
+Execute verification from the fastest static check up to full end-to-end runtime execution:
+
+1. **Layer 1: Static & Import Health**
+   - Verify modified modules compile and import cleanly in the project environment (zero `SyntaxError`, `ImportError`, circular imports, or type errors).
+2. **Layer 2: Automated Test Suite**
+   - Run automated tests covering the modified module (e.g., `pytest <test_path>` or `python3 -m unittest`).
+3. **Layer 3: Live End-to-End Runtime Execution (Core of `/verify`!)**
+   - **Exercise the touched flow live** via `run_command`:
+     - Pass realistic inputs that force execution through **the exact branches (`if/else`, new methods, refactored functions)** modified in the diff.
+     - Test at least **1 primary happy path** and **1 boundary/error path** introduced or modified by the change.
+     - Inspect actual `stdout`, `stderr`, exit code, and generated artifacts to confirm zero hidden warnings, exceptions, or corrupted outputs.
+   - Clean up any temporary files generated during verification.
+
+---
+
+## Phase 3 — Verdict & Report
+
+Conclude with a concise verification report:
 
 ```markdown
-### Weryfikacja Runtime (`/verify`)
-- **Cel / Zakres:** `<opis sprawdzonych zmian>`
+### Runtime Verification (`/verify`)
+- **Target / Scope:** `<description of verified changes>`
 - **Status:** ✅ **VERIFIED** / ❌ **FAILED** / ⚠️ **PARTIAL**
 
-#### Przeprowadzone próby:
-1. **Import & Statyka:** `<komenda>` → `<wynik>`
-2. **Testy jednostkowe/integracyjne:** `<komenda>` → `<wynik>`
-3. **Przebieg End-to-End (Runtime):**
-   - **Wywołanie:** `<dokładna komenda / scenariusz>`
-   - **Zaobserwowane zachowanie:** `<konkretny wynik, wartości wyjściowe, logi>`
+#### Verification Runs:
+1. **Import & Static Check:** `<command>` → `<result>`
+2. **Unit / Integration Tests:** `<command>` → `<result>`
+3. **End-to-End Runtime Execution:**
+   - **Invocation:** `<exact command / scenario>`
+   - **Observed Behavior:** `<concrete output, exit code, and verified invariants>`
 ```
 
-Jeśli podczas `/verify` wykryjesz błąd w działaniu:
-- Wskaż dokładną przyczynę i linię kodu (`[plik.ext:L10-L20](file:///...)`),
-- Jeśli naprawa jest oczywista i mieści się w zakresie zmian, napraw ją i powtórz przebieg weryfikacyjny, aż uzyskasz `✅ VERIFIED`.
+If `/verify` uncovers a runtime defect:
+- Cite the exact cause and line (`[file.ext:L10-L20](file:///...)`),
+- If the fix is clear and within scope, apply it and re-run verification until `✅ VERIFIED` is achieved.

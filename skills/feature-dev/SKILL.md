@@ -1,75 +1,75 @@
 ---
 name: feature-dev
 description: >-
-  Ustrukturyzowany, 7-fazowy proces projektowania i wdrażania nowej
-  funkcjonalności z głębokim zrozumieniem istniejącej architektury. Używaj po wywołaniu
-  /feature-dev lub przy budowie nowych, nietrywialnych funkcji.
+  Structured 7-phase process for designing and implementing new features with
+  deep architectural understanding. Use when /feature-dev is invoked or when
+  building non-trivial new functionality.
 ---
 
 # Guided Feature Development (`/feature-dev`)
 
-Prowadzisz użytkownika przez zdyscyplinowany, 7-fazowy proces budowy nowej funkcjonalności Zamiast zgadywać wymagania i od razu pisać kod, najpierw dogłębnie poznajesz istniejące wzorce w repozytorium, wyjaśniasz wszystkie niejednoznaczności, prezentujesz warianty architektoniczne i dopiero po akceptacji wdrażasz rozwiązanie.
+You guide the user through a disciplined, 7-phase feature development workflow. Instead of guessing requirements and jumping straight into code, you first explore existing patterns in the repository, resolve ambiguities early, present architectural trade-offs, and implement the chosen design with full verification.
 
-Komunikuj się **po polsku** z zachowaniem angielskich terminów technicznych i klikalnymi linkami `file://`.
-
----
-
-## Zasady Nadrzędne
-
-- **Understand before acting:** Zawsze najpierw zbadaj istniejące konwencje i abstrakcje w projekcie.
-- **Ask clarifying questions early:** Zadaj wszystkie pytania o niedopowiedziane detale i przypadki brzegowe **po** zbadaniu kodu (Faza 2), ale **przed** projektowaniem architektury (Faza 4). Używaj narzędzia `ask_question` do wielokrotnych wyborów architektonicznych i decyzyjnych.
-- **Tryb adaptacyjny:** Dla mniejszych funkcji wykonuj eksplorację bezpośrednio; dla rozbudowanych funkcjonalności obejmujących wiele modułów uruchom równoległe subagenty `research` (`invoke_subagent`).
+Include clickable `file://` Markdown links for all referenced files and symbols.
 
 ---
 
-## 7 Faz Procesu `/feature-dev`
+## Core Principles
 
-### Phase 1: Discovery (Zrozumienie celu)
-1. Jeśli cel biznesowy/inżynierski nowej funkcji jest niejasny na starcie, dopytaj krótko: jaki problem rozwiązujemy, jakie ma być zachowanie docelowe i jakie są ograniczenia.
-2. Podsumuj w 2–3 zdaniach cel zadania i przejdź od razu do eksploracji kodu.
+- **Understand before acting:** Always inspect existing project conventions and abstractions first.
+- **Ask clarifying questions early:** Surface all underspecified requirements and edge cases **after** exploring the codebase (Phase 2), but **before** designing the architecture (Phase 4). Use `ask_question` for architectural and design choices.
+- **Adaptive exploration:** For focused features, explore directly; for multi-module features, launch parallel `research` subagents (`invoke_subagent`).
+
+---
+
+## The 7 Phases of `/feature-dev`
+
+### Phase 1: Discovery
+1. If the user's goal is initially ambiguous, clarify what problem is being solved, the target behavior, and any constraints.
+2. Summarize the objective in 2–3 sentences and proceed immediately to codebase exploration.
 
 ### Phase 2: Codebase Exploration (`code-explorer`)
-**Cel:** Zrozumieć istniejący kod, konwencje i punkty rozszerzeń na wysokim i niskim poziomie.
-1. Przeszukaj repozytorium (bezpośrednio lub uruchamiając 2–3 równoległe subagenty `research` przez `invoke_subagent`) pod kątem:
-   - analogicznych funkcji już zaimplementowanych w projekcie,
-   - warstw architektury, przepływu sterowania i modeli danych,
-   - konwencji obsługi błędów, UI/CLI oraz podejścia do testów.
-2. Przeczytaj kluczowe zidentyfikowane pliki (`view_file`).
-3. Przedstaw zwięzłe podsumowanie odkrytych wzorców i wskazanie najważniejszych plików (`[plik.py](file:///...)`), w które wpisze się nowa funkcja.
+**Goal:** Understand existing code, conventions, and extension points at both high and low levels.
+1. Search the repository (directly or via 2–3 parallel `research` subagents using `invoke_subagent`) for:
+   - analogous features already implemented in the project,
+   - architectural layers, control flow, and domain models,
+   - error-handling conventions, UI/CLI patterns, and testing utilities.
+2. Read the key identified files (`view_file`).
+3. Present a concise summary of discovered patterns and the primary files (`[file.py](file:///...)`) where the new feature will integrate.
 
-### Phase 3: Clarifying Questions (Wyjaśnienie niejednoznaczności)
-**KRYTYCZNA FAZA — NIE POMIJAJ JEJ.**
-1. Na podstawie analizy kodu z Fazy 2 wypunktuj wszystkie niedopowiedziane kwestie:
-   - warunki brzegowe (*edge cases*),
-   - zachowanie w przypadku błędnych danych / braku zasobów,
-   - punkty integracji z istniejącymi modułami i kompatybilność wsteczna,
-   - granice zakresu (*co robimy teraz, a czego nie*).
-2. Zadaj pytania użytkownikowi (użyj narzędzia `ask_question` z rekomendowanymi opcjami `(Recommended)` na pierwszym miejscu) i **zaczekaj na odpowiedź przed przejściem do Fazy 4**.
+### Phase 3: Clarifying Questions
+**CRITICAL PHASE — DO NOT SKIP WHEN AMBIGUITIES EXIST.**
+1. Based on Phase 2 findings, identify any underspecified aspects:
+   - edge cases and boundary conditions,
+   - error handling and invalid input behavior,
+   - integration points and backward compatibility,
+   - scope boundaries (*what is in scope now vs. out of scope*).
+2. Ask the user via `ask_question` (putting your `(Recommended)` option first) and **wait for their response before moving to Phase 4**.
 
 ### Phase 4: Architecture Design (`code-architect`)
-**Cel:** Zaprojektować i porównać podejścia implementacyjne.
-1. Opracuj **2–3 warianty architektoniczne**:
-   - **Wariant A (Minimal changes):** najmniejsza ingerencja, maksymalne reużycie istniejącego kodu,
-   - **Wariant B (Clean architecture):** najczystsze rozdzielenie odpowiedzialności, łatwa rozszerzalność i testowalność,
-   - **Wariant C (Pragmatic balance):** złoty środek między prostotą a czystością architektury.
-2. Przedstaw krótkie porównanie trade-offów, konkretne pliki do utworzenia/modyfikacji oraz **Twoją wyraźną rekomendację z uzasadnieniem**.
-3. Zapytaj użytkownika o zatwierdzenie wybranego wariantu.
+**Goal:** Design and compare implementation approaches.
+1. Formulate **2–3 architectural options**:
+   - **Option A (Minimal changes):** smallest footprint, maximum reuse of existing code,
+   - **Option B (Clean architecture):** cleanest separation of concerns, extensibility, and testability,
+   - **Option C (Pragmatic balance):** sweet spot between simplicity and structural cleanliness.
+2. Present trade-offs, exact files to create/modify, and **your explicit recommendation with rationale**.
+3. Confirm the chosen architecture with the user.
 
-### Phase 5: Implementation (Wdrożenie)
-**NIE ROZPOCZYNAJ BEZ ZATWIERDZENIA ARCHITEKTURY W FAZIE 4.**
-1. Zaimplementuj funkcjonalność ściśle według wybranego projektu i konwencji repozytorium (`GEMINI.md` / `AGENTS.md` / `CLAUDE.md`).
-2. Dopisz testy weryfikujące nową logikę i warunki brzegowe ustalone w Fazie 3.
+### Phase 5: Implementation
+**DO NOT START WITHOUT ARCHITECTURAL APPROVAL IN PHASE 4.**
+1. Implement the feature strictly following the chosen design and project conventions (`GEMINI.md` / `AGENTS.md` / `CLAUDE.md`).
+2. Add tests covering both the happy path and the edge cases established in Phase 3.
 
 ### Phase 6: Quality Review (`/simplify` + `/code-review` + `/verify`)
-1. Przejrzyj właśnie napisany kod pod kątem:
-   - prostoty, DRY i właściwego poziomu abstrakcji (*Altitude*),
-   - poprawności funkcjonalnej i braku *silent failures*,
-   - uruchomienia testów i przebiegu runtime (`/verify`).
-2. Napraw wykryte usterki od ręki lub przedstaw użytkownikowi kwestie wymagające decyzji.
+1. Review the newly written code for:
+   - simplicity, DRY, and proper abstraction altitude,
+   - functional correctness and zero silent failures,
+   - automated test execution and end-to-end runtime verification (`/verify`).
+2. Fix any defects immediately.
 
-### Phase 7: Summary (Podsumowanie)
-Zakończ krótkim raportem:
-- co zostało zbudowane,
-- kluczowe decyzje architektoniczne,
-- lista zmodyfikowanych i nowych plików z klikalnymi linkami `file://`,
-- wynik weryfikacji testowej.
+### Phase 7: Summary
+Conclude with a concise report:
+- what was built,
+- key architectural decisions,
+- modified and newly created files with clickable `file://` links,
+- test and runtime verification results.

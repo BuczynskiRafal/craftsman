@@ -457,7 +457,7 @@ class StopGateHookTests(unittest.TestCase):
             logs_dir.mkdir(parents=True)
             transcript = logs_dir / "transcript.jsonl"
             transcript.write_text(
-                json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "zrób to przez /craftsman"})
+                json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "run this via /craftsman"})
                 + "\n",
                 encoding="utf-8",
             )
@@ -505,7 +505,7 @@ class StopGateHookTests(unittest.TestCase):
                     {
                         "step_index": 2,
                         "type": "USER_INPUT",
-                        "content": "Sprawdź plik /Users/dev/scratch/craftsman/skills/craftsman/SKILL.md",
+                        "content": "Check the file /Users/dev/scratch/craftsman/skills/craftsman/SKILL.md",
                     }
                 ),
             ]

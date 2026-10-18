@@ -35,9 +35,7 @@ VALID_TIERS = ("auto", "quick", "standard", "deep")
 QUALITY_GATE_ROLE_MARKERS = (
     "quality gate",
     "auditor",
-    "audytor",
-    "bramka jakości",
-    "bramki jakości",
+    "code reviewer",
 )
 QUALITY_GATE_SKILL_MARKERS = ("simplify", "code-review", "verify")
 CRAFTSMAN_TRIGGER_RE = re.compile(
@@ -480,19 +478,19 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         return (
             "continue",
             f"[CRAFTSMAN HARD-LOOP GATE ({forced + 1}/{max_cont})] "
-            f"Nie możesz zakończyć zadania przed domknięciem Bramki Jakości (Etap 1). "
-            f"Brakujące wymagania: [{missing_str}]. "
-            f"Zasada Twórca != Recenzent: NIE WOLNO robić przeglądu tylko inline w głównym wątku! "
-            f"Musisz wywołać narzędzie 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor'), "
-            f"aby niezależny subagent wczytał przez view_file i wykonał /simplify, /code-review oraz /verify "
-            f"na CAŁYM skumulowanym diffie od początku zadania (git diff {base_sha}), a następnie "
-            f"uruchomić craftsman-stop-gate.py --state-file {state_file} --complete.",
+            f"Cannot finish the task before completing the Stage 1 Quality Gate. "
+            f"Missing requirements: [{missing_str}]. "
+            f"Creator != Reviewer Rule: Do NOT perform the review solely inline in the main thread! "
+            f"You must invoke 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') "
+            f"so an independent subagent reads and executes /simplify, /code-review, and /verify "
+            f"on the ENTIRE cumulative diff since the start of the task (git diff {base_sha}), and then "
+            f"run craftsman-stop-gate.py --state-file {state_file} --complete.",
         )
     return (
         "continue",
         f"[CRAFTSMAN SOFT-LOOP GATE ({forced + 1}/{max_cont})] "
-        f"Brakujące kroki weryfikacji dla szybkiej zmiany (Quick Mode): [{missing_str}]. "
-        f"Wykonaj /simplify oraz /verify i zamknij bramkę przez "
+        f"Missing verification steps for Quick Mode: [{missing_str}]. "
+        f"Execute /simplify and /verify and close the gate via "
         f"craftsman-stop-gate.py --state-file {state_file} --complete.",
     )
 
@@ -573,11 +571,11 @@ def run_cli(argv: list[str]) -> int:
         if entries and needs_subagent and not args.allow_inline:
             if not has_quality_gate_subagent_in_entries(entries, since_step):
                 sys.stderr.write(
-                    "[CRAFTSMAN HARD-LOOP REJECTED] Nie można zamknąć bramki (--complete): "
-                    "w transcript.jsonl brak wywołania niezależnego subagenta 'invoke_subagent' "
-                    "(TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') od kroku startowego! "
-                    "Dla zmian przekraczających próg Quick Mode (>40 linii lub >2 pliki) najpierw "
-                    "powołaj subagenta przez invoke_subagent, który wykona /simplify, /code-review i /verify.\n"
+                    "[CRAFTSMAN HARD-LOOP REJECTED] Cannot close the gate (--complete): "
+                    "no independent subagent call 'invoke_subagent' (TypeName: 'self', "
+                    "Role: 'Craftsman Quality Gate Auditor') was found in transcript.jsonl since the start step! "
+                    "For changes exceeding the Quick Mode threshold (>40 lines or >2 files), you must first "
+                    "spawn the subagent via invoke_subagent to execute /simplify, /code-review, and /verify.\n"
                 )
                 return 1
         state["subagent_verified"] = True

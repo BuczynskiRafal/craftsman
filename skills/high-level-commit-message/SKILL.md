@@ -150,5 +150,5 @@ config files must be updated to the new schema.
 ## Example Requests
 
 - `Use $high-level-commit-message for the current staged changes.`
-- `Daj jedną wysokopoziomową wiadomość commit po amerykańsku bez opisu diffu.`
+- `Draft a single high-level commit message in American English without listing low-level file edits.`
 - `Use $high-level-commit-message and return 3 variants for this branch.`

@@ -110,7 +110,7 @@ def render_agents_md(repo_dir: Path) -> str:
     lines: list[str] = [
         "# AGENTS.md — Craftsman Agentic Engineering Standard",
         "",
-        "This repository follows the **Craftsman** 3-Gear Hybrid Quality Loop (`Twórca ≠ Recenzent`).",
+        "This repository follows the **Craftsman** 3-Gear Hybrid Quality Loop (`Creator != Reviewer`).",
         "",
         "## 3-Gear Quality Loop (`Quick` vs `Standard` vs `Deep`)",
         "- **Gear 1 (`quick` / Soft-Loop):** Changes `<= 40` lines across `<= 2` files -> inline `/simplify` + `/verify`.",
