@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
@@ -149,7 +150,7 @@ def _export_skill_files(
     skills_dir: Path,
     out_dir: Path,
     suffix: str,
-    renderer: callable,
+    renderer: Callable[[str, str], str],
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0

@@ -280,7 +280,7 @@ def is_waiting_on_ask_question_in_entries(entries: list[dict[str, Any]]) -> bool
             if not isinstance(tool_calls, list) or not tool_calls:
                 return False
             names = [tc.get("name") for tc in tool_calls if isinstance(tc, dict)]
-            return "ask_question" in names
+            return any(n in ("ask_question", "AskUserQuestion") for n in names)
     return False
 
 
@@ -480,19 +480,19 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         return (
             "continue",
             f"[CRAFTSMAN HARD-LOOP GATE ({forced + 1}/{max_cont})] "
-            f"Cannot finish the task before completing the Stage 1 Quality Gate. "
+            f"Task completion blocked until the Stage 1 Quality Gate is satisfied. "
             f"Missing requirements: [{missing_str}]. "
-            f"Hybrid Hard-Loop Context Isolation: Do NOT perform the review solely inline in the main thread! "
+            f"Hybrid Hard-Loop Context Isolation: inline review in the main thread is insufficient. "
             f"You must invoke 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') "
-            f"so an isolated subagent reads and executes /simplify, /code-review, and /verify "
-            f"on the ENTIRE cumulative diff since the start of the task (git diff {base_sha}), and then "
-            f"run craftsman-stop-gate.py --state-file {state_file} --complete.",
+            f"so an isolated subagent executes /simplify, /code-review, and /verify "
+            f"across the full cumulative diff (git diff {base_sha}), and then run "
+            f"craftsman-stop-gate.py --state-file {state_file} --complete.",
         )
     return (
         "continue",
         f"[CRAFTSMAN SOFT-LOOP GATE ({forced + 1}/{max_cont})] "
         f"Missing verification steps for Quick Mode: [{missing_str}]. "
-        f"Execute /simplify, /code-review, and /verify and close the gate via "
+        f"Execute /simplify, /code-review, and /verify, then close the gate via "
         f"craftsman-stop-gate.py --state-file {state_file} --complete.",
     )
 
@@ -573,11 +573,11 @@ def run_cli(argv: list[str]) -> int:
         if entries and needs_subagent and not args.allow_inline:
             if not has_quality_gate_subagent_in_entries(entries, since_step):
                 sys.stderr.write(
-                    "[CRAFTSMAN HARD-LOOP REJECTED] Cannot close the gate (--complete): "
-                    "no isolated subagent call 'invoke_subagent' (TypeName: 'self', "
-                    "Role: 'Craftsman Quality Gate Auditor') was found in transcript.jsonl since the start step! "
-                    "For changes exceeding the Quick Mode threshold (>40 lines or >2 files), you must first "
-                    "spawn the subagent via invoke_subagent to execute /simplify, /code-review, and /verify.\n"
+                    "[CRAFTSMAN HARD-LOOP REJECTED] Cannot close quality gate (--complete): "
+                    "transcript.jsonl does not record an isolated 'invoke_subagent' call "
+                    "(TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') since task start. "
+                    "For changes exceeding Quick Mode thresholds (>40 lines or >2 files), spawn "
+                    "the auditor subagent via invoke_subagent to execute /simplify, /code-review, and /verify.\n"
                 )
                 return 1
         state["subagent_verified"] = True

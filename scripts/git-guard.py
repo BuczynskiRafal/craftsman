@@ -328,25 +328,52 @@ def _unquote_json_str(val: Any) -> str | None:
     return val
 
 
+PUSH_ERROR_MARKERS = (
+    "error: failed to push some refs",
+    "fatal: The current branch",
+    "fatal: Could not read from remote repository",
+    "fatal: unable to access",
+    "fatal: Authentication failed",
+    "[CRAFTSMAN GIT-HOOK]",
+)
+
+
+def _has_push_error_marker(content: Any) -> bool:
+    return isinstance(content, str) and any(marker in content for marker in PUSH_ERROR_MARKERS)
+
+
 def _is_completed_successful_run_command(
     entries: list[dict[str, Any]], idx: int, has_generic_steps: bool
 ) -> bool:
-    """Return True only if entries[idx] already finished with exit code 0."""
+    """Return True only if entries[idx] already finished with exit code 0 and no push error."""
+    entry = entries[idx]
+    if entry.get("status") == "ERROR" or _has_push_error_marker(entry.get("content")):
+        return False
     if not has_generic_steps:
         # Synthetic unit-test transcripts without GENERIC result lines
         return True
-    if idx + 1 >= len(entries):
+
+    generic_steps: list[dict[str, Any]] = []
+    scan_idx = idx + 1
+    while scan_idx < len(entries) and entries[scan_idx].get("type") == "GENERIC":
+        generic_steps.append(entries[scan_idx])
+        scan_idx += 1
+
+    if not generic_steps:
         # Trailing PLANNER_RESPONSE with no GENERIC result yet is currently in-flight
         return False
-    next_entry = entries[idx + 1]
-    if next_entry.get("type") != "GENERIC":
-        return False
-    if next_entry.get("status") == "ERROR":
-        return False
-    content = next_entry.get("content")
-    if isinstance(content, str) and "The command exited with code " in content:
-        return "The command exited with code 0." in content
+
+    for g_entry in generic_steps:
+        if g_entry.get("status") == "ERROR":
+            return False
+        content = g_entry.get("content")
+        if isinstance(content, str):
+            if _has_push_error_marker(content):
+                return False
+            if "The command exited with code " in content and "The command exited with code 0." not in content:
+                return False
     return True
+
 
 
 def was_ask_question_called_since_last_push(
@@ -446,7 +473,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
         if is_ai_attribution_check_target(tokens) and has_ai_attribution(segment, tokens, effective_cwd):
             return (
                 "deny",
-                "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #2 — Zero AI Attribution): "
+                "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #2 - Zero AI Attribution): "
                 "Commits, tags, and Pull Requests must not contain 'Co-authored-by:' or "
                 "any AI attribution trailers.",
             )
@@ -481,10 +508,10 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
 
         return (
             "deny",
-            "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #1 — No Unconfirmed Push to main/master): "
-            "Before executing 'git push' to main/master, you must first ask the user for "
-            "confirmation via the 'ask_question' tool (offering a choice between pushing directly "
-            "to main vs. pushing to a new feature branch for a Pull Request).",
+            "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #1 - No Unconfirmed Push to main/master): "
+            "Before running 'git push' to main/master, you must first ask the user for confirmation "
+            "via the 'ask_question' tool (offering a choice between pushing to a feature branch "
+            "for a PR vs. pushing directly to main).",
         )
 
     return "allow", None
@@ -528,9 +555,9 @@ def run_native_commit_msg_hook(msg_file_str: str) -> int:
     )
     if has_ai_attribution(active_lines):
         sys.stderr.write(
-            "\n[CRAFTSMAN GIT-HOOK] Commit blocked (Global Rule #2 — Zero AI Attribution):\n"
-            "Commit messages must not contain 'Co-authored-by:' or any AI attribution\n"
-            "trailers (Claude, Gemini, Antigravity, Copilot, etc.).\n\n"
+            "\n[CRAFTSMAN GIT-HOOK] Blocked commit (Global Rule #2 - Zero AI Attribution):\n"
+            "Commit messages must not contain 'Co-authored-by:' or any AI attribution trailers\n"
+            "(Claude, Gemini, Antigravity, Copilot, etc.).\n\n"
         )
         return 1
     return 0
@@ -561,20 +588,20 @@ def run_native_pre_push_hook() -> int:
         try:
             with open("/dev/tty", "r+", encoding="utf-8") as tty:
                 tty.write(
-                    "[CRAFTSMAN GIT-HOOK] Detected 'git push' targeting a protected branch (main/master). "
+                    "[CRAFTSMAN GIT-HOOK] Detected 'git push' to a protected branch (main/master). "
                     "Continue? [y/N]: "
                 )
                 tty.flush()
                 answer = tty.readline().strip().lower()
-                if answer in ("y", "yes"):
+                if answer in ("y", "yes", "t", "tak"):
                     return 0
         except OSError:
             pass
 
     sys.stderr.write(
         "\n[CRAFTSMAN GIT-HOOK] Blocked direct 'git push' to main/master (Global Rule #1).\n"
-        "- First ask the user for confirmation (offering a choice between a feature branch for a PR vs. direct push to main).\n"
-        "- Once explicitly approved by the user, run: CRAFTSMAN_ALLOW_MAIN_PUSH=1 git push ...\n\n"
+        "- Ask the user for confirmation first (feature branch PR vs. direct push to main).\n"
+        "- Once confirmed by the user, run: CRAFTSMAN_ALLOW_MAIN_PUSH=1 git push ...\n\n"
     )
     return 1
 

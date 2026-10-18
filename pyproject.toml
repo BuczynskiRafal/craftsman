@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "craftsman"
+version = "2.1.0"
+description = "Universal Agentic Software Engineering & Zero-Trust Quality Gate Framework for Claude Code, OpenAI Codex, GitHub Copilot, Cursor, and Google Antigravity."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Rafał Buczyński", email = "buczynski.rafal2@gmail.com" },
+]
+keywords = [
+  "ai-agents",
+  "claude-code",
+  "github-copilot",
+  "codex",
+  "cursor",
+  "antigravity",
+  "quality-gate",
+  "git-hooks",
+  "developer-tools",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Version Control :: Git",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.8.0",
+  "pytest>=8.0.0",
+  "ruff>=0.4.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/BuczynskiRafal/craftsman"
+Repository = "https://github.com/BuczynskiRafal/craftsman"
+Issues = "https://github.com/BuczynskiRafal/craftsman/issues"
+
+[project.scripts]
+craftsman = "craftsman.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["craftsman*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 105
+src = ["craftsman", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+files = ["craftsman", "scripts", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
