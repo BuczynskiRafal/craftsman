@@ -6,8 +6,19 @@ CONFIG_DIR="${HOME}/.gemini/config"
 SKILLS_DIR="${CONFIG_DIR}/skills"
 RULES_DIR="${CONFIG_DIR}/rules"
 SCRIPTS_DIR="${CONFIG_DIR}/scripts"
+PKG_TARGET_DIR="${CONFIG_DIR}/craftsman"
 GIT_HOOKS_DIR="${CONFIG_DIR}/git-hooks"
 PLUGINS_DIR="${CONFIG_DIR}/plugins"
+
+STANDARD_PASSTHROUGH_GIT_HOOKS=(
+  "pre-commit"
+  "prepare-commit-msg"
+  "post-commit"
+  "pre-rebase"
+  "post-checkout"
+  "post-merge"
+  "post-rewrite"
+)
 
 MODE="copy"
 INSTALL_ANTIGRAVITY=true
@@ -23,15 +34,15 @@ Usage: ./install.sh [options]
 
 Universal Multi-Platform Options:
   --all                         Install everywhere: Antigravity + Claude Code + GitHub Copilot + Git Hooks
-  --claude                      Export 17 slash commands (*.md) and rules into ~/.claude/ (Claude Code)
-  --copilot                     Export 17 skills (*.prompt.md) and rules (*.instructions.md)
+  --claude                      Export slash commands (*.md) and rules into ~/.claude/ (Claude Code)
+  --copilot                     Export skills (*.prompt.md) and rules (*.instructions.md)
                                 to VS Code User profile (Code/User/prompts) for GitHub Copilot Chat
   --copilot-workspace <path>    Export .github/prompts/*.prompt.md and .github/copilot-instructions.md
                                 into a target project repository
   --agents-workspace <path>     Export universal AGENTS.md (OpenAI Codex / Windsurf) and
                                 .cursor/rules/craftsman.mdc (Cursor) into a target project repository
-  --git-hooks                   Install OS-level Git hooks (commit-msg & pre-push) into
-                                ~/.gemini/config/git-hooks and set git config --global core.hooksPath
+  --git-hooks                   Install OS-level Git hooks (commit-msg, pre-push, and local-hook forwarders)
+                                into ~/.gemini/config/git-hooks and set git config --global core.hooksPath
 
 Google Antigravity Options:
   --copy                        (Default) Copy skills, rules, hooks.json, and scripts into ~/.gemini/config/
@@ -113,13 +124,20 @@ chmod +x "${REPO_DIR}/scripts/"*.py "${REPO_DIR}/git-hooks/"* 2>/dev/null || tru
 
 install_scripts() {
   mkdir -p "${SCRIPTS_DIR}"
-  for script_path in "${REPO_DIR}/scripts/"*; do
+  rm -rf "${PKG_TARGET_DIR}"
+  if [[ "${MODE}" == "symlink" || "${MODE}" == "plugin" ]]; then
+    ln -s "${REPO_DIR}/craftsman" "${PKG_TARGET_DIR}"
+  else
+    cp -R "${REPO_DIR}/craftsman" "${PKG_TARGET_DIR}"
+  fi
+
+  for script_path in "${REPO_DIR}/scripts/"*.py; do
     [[ -f "${script_path}" ]] || continue
     chmod +x "${script_path}"
     script_name="$(basename "${script_path}")"
     target="${SCRIPTS_DIR}/${script_name}"
     rm -rf "${target}"
-    if [[ "${MODE}" == "symlink" ]]; then
+    if [[ "${MODE}" == "symlink" || "${MODE}" == "plugin" ]]; then
       ln -s "${script_path}" "${target}"
     else
       cp "${script_path}" "${target}"
@@ -128,10 +146,77 @@ install_scripts() {
   done
 }
 
+install_hooks_json() {
+  local src_hooks="${REPO_DIR}/hooks.json"
+  local target_hooks="${CONFIG_DIR}/hooks.json"
+  [[ -f "${src_hooks}" ]] || return 0
+
+  if [[ "${MODE}" == "symlink" ]]; then
+    if [[ -f "${target_hooks}" && ! -L "${target_hooks}" ]]; then
+      python3 - "${src_hooks}" "${target_hooks}" <<'PY'
+import json, pathlib, shutil, sys
+src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+try:
+    dst_data = json.loads(dst.read_text(encoding="utf-8"))
+    src_data = json.loads(src.read_text(encoding="utf-8"))
+    extra_keys = [k for k in dst_data if k not in src_data]
+    if extra_keys:
+        shutil.copy2(dst, dst.with_suffix(".json.bak"))
+except Exception:
+    pass
+PY
+    fi
+    rm -rf "${target_hooks}"
+    ln -s "${src_hooks}" "${target_hooks}"
+  else
+    if [[ -L "${target_hooks}" ]]; then
+      rm -f "${target_hooks}"
+    fi
+    if [[ -f "${target_hooks}" ]]; then
+      python3 - "${src_hooks}" "${target_hooks}" <<'PY'
+import json, pathlib, sys
+src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+src_data = json.loads(src.read_text(encoding="utf-8"))
+try:
+    dst_data = json.loads(dst.read_text(encoding="utf-8"))
+    if not isinstance(dst_data, dict):
+        dst_data = {}
+except Exception:
+    dst_data = {}
+dst_data.update(src_data)
+dst.write_text(json.dumps(dst_data, indent=2) + "\n", encoding="utf-8")
+PY
+    else
+      cp "${src_hooks}" "${target_hooks}"
+    fi
+  fi
+  echo "  + hooks: ${target_hooks}"
+}
+
+write_passthrough_git_hook() {
+  local hook_name="$1"
+  local target="${GIT_HOOKS_DIR}/${hook_name}"
+  cat > "${target}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOOKS_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+GIT_DIR="\$(git rev-parse --git-dir 2>/dev/null || true)"
+if [[ -n "\${GIT_DIR}" && -x "\${GIT_DIR}/hooks/${hook_name}" ]]; then
+  LOCAL_HOOK_DIR="\$(cd "\${GIT_DIR}/hooks" && pwd)"
+  if [[ "\${LOCAL_HOOK_DIR}" != "\${HOOKS_DIR}" ]]; then
+    exec "\${GIT_DIR}/hooks/${hook_name}" "\$@"
+  fi
+fi
+EOF
+  chmod +x "${target}"
+}
+
 if [[ "${INSTALL_ANTIGRAVITY}" == true ]]; then
   mkdir -p "${SKILLS_DIR}" "${RULES_DIR}" "${SCRIPTS_DIR}" "${PLUGINS_DIR}"
 
   if [[ "${MODE}" == "plugin" ]]; then
+    install_scripts
     TARGET_PLUGIN="${PLUGINS_DIR}/craftsman"
     rm -rf "${TARGET_PLUGIN}"
     ln -s "${REPO_DIR}" "${TARGET_PLUGIN}"
@@ -166,26 +251,17 @@ if [[ "${INSTALL_ANTIGRAVITY}" == true ]]; then
 
     echo "Installing Craftsman Hard-Loop scripts into ${SCRIPTS_DIR} (${MODE} mode)..."
     install_scripts
-    for script_path in "${REPO_DIR}/scripts/"*; do
+    for script_path in "${REPO_DIR}/scripts/"*.py; do
       [[ -f "${script_path}" ]] && echo "  + script: $(basename "${script_path}")"
     done
 
-    if [[ -f "${REPO_DIR}/hooks.json" ]]; then
-      TARGET_HOOKS="${CONFIG_DIR}/hooks.json"
-      rm -rf "${TARGET_HOOKS}"
-      if [[ "${MODE}" == "symlink" ]]; then
-        ln -s "${REPO_DIR}/hooks.json" "${TARGET_HOOKS}"
-      else
-        cp "${REPO_DIR}/hooks.json" "${TARGET_HOOKS}"
-      fi
-      echo "  + hooks: ${TARGET_HOOKS}"
-    fi
+    install_hooks_json
 
     echo ""
     echo "[OK] Craftsman Antigravity suite installed successfully!"
     echo "     Skills installed:  $(find "${REPO_DIR}/skills" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
     echo "     Rules installed:   $(find "${REPO_DIR}/rules" -mindepth 1 -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
-    echo "     Scripts installed: $(find "${REPO_DIR}/scripts" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')"
+    echo "     Scripts installed: $(find "${REPO_DIR}/scripts" -mindepth 1 -maxdepth 1 -name '*.py' | wc -l | tr -d ' ')"
   fi
 fi
 
@@ -227,6 +303,12 @@ if [[ "${INSTALL_GIT_HOOKS}" == true ]]; then
     fi
     echo "  + git-hook: ${hook_name}"
   done
+
+  for passthrough_hook in "${STANDARD_PASSTHROUGH_GIT_HOOKS[@]}"; do
+    write_passthrough_git_hook "${passthrough_hook}"
+    echo "  + git-hook (passthrough): ${passthrough_hook}"
+  done
+
   git config --global core.hooksPath "${GIT_HOOKS_DIR}"
   echo "[OK] Configured git config --global core.hooksPath -> ${GIT_HOOKS_DIR}"
 fi
