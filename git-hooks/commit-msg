@@ -8,11 +8,11 @@ if [[ -x "${GUARD_SCRIPT}" ]]; then
   "${GUARD_SCRIPT}" --git-hook commit-msg "$@"
 fi
 
-# Chain to repository-local .git/hooks/commit-msg if present
-GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || true)"
-if [[ -n "${GIT_DIR}" && -x "${GIT_DIR}/hooks/commit-msg" ]]; then
-  LOCAL_HOOK_DIR="$(cd "${GIT_DIR}/hooks" && pwd)"
+# Chain to repository-local .git/hooks/commit-msg if present (supports linked worktrees)
+GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+if [[ -n "${GIT_COMMON_DIR}" && -x "${GIT_COMMON_DIR}/hooks/commit-msg" ]]; then
+  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" && pwd)"
   if [[ "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" ]]; then
-    exec "${GIT_DIR}/hooks/commit-msg" "$@"
+    exec "${GIT_COMMON_DIR}/hooks/commit-msg" "$@"
   fi
 fi

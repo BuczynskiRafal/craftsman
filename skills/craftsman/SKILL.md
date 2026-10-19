@@ -98,7 +98,7 @@ Execute the following steps without shortcuts:
 2. STEP 1 (/simplify): Analyze the entire cumulative diff (`git diff <BASE_SHA>`) across all 4 axes of `/simplify` (Reuse, Simplification, Efficiency, Altitude) and apply simplifications directly to the files.
 3. STEP 2 (/code-review + /audit): Audit the cumulative diff using `/code-review` (Angles A–E) and relevant `/audit-*` skills (`/audit-errors`, `/audit-tests`, `/audit-types`, `/audit-comments`, `/audit-security` — or all of them in `--deep` mode). Fix all CONFIRMED and PLAUSIBLE issues directly in the code.
 4. STEP 3 (/verify): Run the full test suite and perform real end-to-end runtime verification in accordance with `/verify`.
-5. Return a concise 3-section report: Simplify, Code Review & Audits, and Verify.
+5. Return a concise 3-section report: Simplify, Code Review & Audits, and Verify, ending with a final line `CRAFTSMAN_VERDICT: PASS` (or `CRAFTSMAN_VERDICT: FAIL` if any issue remains unresolved).
 ```
 
 ### Step 1.6: Close the Quality Gate (`craftsman_state.json`)

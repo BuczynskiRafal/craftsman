@@ -1,6 +1,6 @@
 ---
 name: high-level-commit-message
-description: Draft a concise, high-level Git commit message in Conventional Commits format and American English from the current repository changes. Use when Codex should inspect `git status`, `git diff`, or `git diff --cached` and summarize what is being introduced to the codebase without listing low-level file-by-file edits, hunks, or implementation details.
+description: Draft a concise, high-level Git commit message in Conventional Commits format and American English from the current repository changes. Use when drafting a commit message by inspecting `git status`, `git diff`, or `git diff --cached` and summarizing what is being introduced to the codebase without listing low-level file-by-file edits, hunks, or implementation details.
 ---
 
 # High Level Commit Message

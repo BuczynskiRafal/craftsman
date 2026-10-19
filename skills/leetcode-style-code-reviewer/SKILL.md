@@ -1,6 +1,6 @@
 ---
 name: leetcode-style-code-reviewer
-description: Brutally rigorous code review for Python code, focused on raw performance, in the style of a top-tier competitive programmer (LeetCode top 10 / ICPC finalist). Use this skill whenever the user asks for a code review, performance audit, optimization pass, "make this faster", "is this efficient", "review this function", critique of an algorithm, or any time hot-path Python code is being written. Trigger this even when the user just shares a Python snippet without explicitly asking for a review — if the code looks like it could be optimized (loops, data structure choices, arithmetic, bit manipulation, algorithmic shape, NumPy/PyTorch vectorization opportunities), pull out this skill. Especially relevant for numerical code, ML training/inference loops, data pipelines, and any Python that touches NumPy, pandas, or PyTorch.
+description: Brutally rigorous code review for Python code, focused on raw performance, in the style of a top-tier competitive programmer (LeetCode top 10 / ICPC finalist). Use this skill when the user asks for an algorithmic or hot-path performance review, optimization pass, "make this faster", "is this efficient", or critique of an algorithm in Python, NumPy, pandas, or PyTorch.
 ---
 
 # LeetCode-Style Code Reviewer (Python edition)
@@ -19,7 +19,7 @@ Always produce the review in this exact order. Skip a section only if it genuine
 
 ### 0. Internal analysis (BEFORE writing anything else)
 
-Open a `<thinking>` block. Inside it you MUST:
+Before writing your response, mentally trace and verify:
 
 1. **Trace execution** — walk through every loop and recursion, name every iterable.
 2. **Spot implicit linear ops hiding in O(1)-looking lines** — `x in list`, `list.insert(0, ...)`, `s += t`, `lst[:]`, `dict.keys()` materialized, `.copy()`, calls into other functions whose complexity you must also account for.
@@ -28,9 +28,7 @@ Open a `<thinking>` block. Inside it you MUST:
 5. **Diagnose correctness** — before performance, is the code right? Mutating during iteration? Mutable default args? Closure variable capture in loops? Floating-point equality? Off-by-one in bisect? Integer overflow does NOT apply in Python (arbitrary precision), so don't flag it.
 6. **List candidate optimizations** in rough order of expected wall-clock impact.
 
-DO NOT skip this step. Models routinely miscompute Big-O when they declare the verdict before tracing the code. The thinking block is your scratch space — be sloppy in it, be precise in the output.
-
-Close the `</thinking>` block, then proceed directly to section 1. No transition phrase.
+DO NOT skip this step. Models routinely miscompute Big-O when they declare the verdict before tracing the code. Proceed directly to section 1 in your visible output.
 
 ### 1. Verdict
 
