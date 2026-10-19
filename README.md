@@ -1,4 +1,4 @@
-# Craftsman -- Universal Agentic Engineering & Quality Gate Framework
+# Craftsman -- Agentic Engineering & Quality Gate Framework
 
 [![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
 [![Python 3.10-3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
@@ -8,27 +8,43 @@
 [![Version](https://img.shields.io/badge/version-2.1.0-emerald.svg)](plugin.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**Craftsman** is a zero-dependency, zero-trust **Agentic Software Engineering & Quality Gate Framework** (*Author != Reviewer*). It equips AI coding agents (**Claude Code**, **OpenAI Codex CLI**, **GitHub Copilot**, **Cursor**, **Windsurf**, and **Google Antigravity**) with 17 structured engineering workflows, a **3-Gear Adaptive Quality Loop** (Soft-Loop vs. Hybrid Hard-Loop), and deterministic OS-level Git and lifecycle guardrails.
+**Craftsman** is a zero-dependency **Agentic Software Engineering & Quality Gate Framework** (*Author != Reviewer*). It provides 17 structured engineering workflows, a **3-Gear Adaptive Quality Loop** (Soft-Loop vs. Context-Isolated Hard-Loop for **Google Antigravity**), multi-platform skill/rule exporters (**Claude Code**, **OpenAI Codex CLI**, **GitHub Copilot**, **Cursor**, **Windsurf**), and OS-level Git guardrails.
 
 ---
 
 ## Why Craftsman?
 
-1. **Author != Reviewer Verified at Runtime:**
-   AI agents exhibit strong confirmation bias when reviewing code they just wrote inside the same context window. For non-trivial changes, Craftsman's `Stop` hook inspects `transcript.jsonl` and blocks task completion until the primary agent spawns a fresh, independent **`Craftsman Quality Gate Auditor` subagent** to execute `/simplify` -> `/code-review` -> `/verify` on the full cumulative diff (`base_sha..HEAD`).
+1. **Context-Isolated Review (`Author != Reviewer`):**
+   AI coding agents exhibit confirmation bias when reviewing code they just wrote inside the same context window. For non-trivial changes in Google Antigravity, Craftsman's `Stop` hook inspects `transcript.jsonl` and blocks task completion until the primary agent spawns an isolated **`Craftsman Quality Gate Auditor` subagent** to execute `/simplify` -> `/code-review` -> `/verify` on the cumulative diff (`base_sha..HEAD`).
 2. **3-Gear Automatic Gearbox (`Quick` vs. `Standard` vs. `Deep`):**
-   Zero multi-agent overhead on 5-line fixes. Craftsman measures the cumulative git diff (`git diff --numstat <base_sha>`) and selects the appropriate verification tier:
-   - **Gear 1 (`Quick` / Soft-Loop):** `<= 40` changed lines across `<= 2` files (or `/craftsman --quick`). Runs fast inline `/simplify` + `/verify` with **zero subagent overhead**.
-   - **Gear 2 (`Standard` / Hybrid Hard-Loop):** `> 40` changed lines or `> 2` files. Enforces an independent `Craftsman Quality Gate Auditor` subagent verified in `transcript.jsonl`.
-   - **Gear 3 (`Deep` / Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode`. Enforces pre-implementation `ultrathink` architecture analysis plus an independent subagent executing all 5 specialized `/audit` suites.
-3. **Write Once, Export Across Every AI Coding Agent:**
-   A single source of truth exports native slash commands, prompt files, instructions, and rules to **Claude Code** (`~/.claude/`), **GitHub Copilot** (`Code/User/prompts` and `.github/prompts/`), **OpenAI Codex / Windsurf / Zed** (`AGENTS.md`), **Cursor** (`.cursor/rules/craftsman.mdc`), **Google Antigravity** (`~/.gemini/config/`), and **native OS Git hooks** (`commit-msg` and `pre-push`).
+   No subagent overhead on 5-line fixes. Craftsman measures the cumulative git diff (`git diff --numstat <base_sha>`) and selects the appropriate verification tier:
+   - **Gear 1 (`Quick` / Soft-Loop):** `<= 40` changed lines across `<= 2` files (or `/craftsman --quick`). Runs inline `/simplify` + `/code-review` + `/verify` with **zero subagent overhead**.
+   - **Gear 2 (`Standard` / Hybrid Hard-Loop):** `> 40` changed lines or `> 2` files (or `/craftsman --standard`). Requires an isolated `Craftsman Quality Gate Auditor` subagent verified in `transcript.jsonl`.
+   - **Gear 3 (`Deep` / Full-Audit Hard-Loop):** Triggered via `/craftsman --deep` or `ultracode`. Enforces pre-implementation `ultrathink` architecture analysis plus an isolated subagent executing all 5 specialized `/audit` suites.
+3. **Write Once, Export Across AI Coding Agents:**
+   Exports slash commands, prompt files, instructions, and rules from a single source of truth to **Google Antigravity** (`~/.gemini/config/`), **Claude Code** (`~/.claude/`), **GitHub Copilot** (`Code/User/prompts` and `.github/prompts/`), **OpenAI Codex / Windsurf / Zed** (`AGENTS.md`), **Cursor** (`.cursor/rules/craftsman.mdc`), and **native OS Git hooks** (`commit-msg`, `pre-push`, and local-hook forwarders).
+
+---
+
+## Platform Support Matrix & Threat Model
+
+| Capability | Google Antigravity | Claude Code / GitHub Copilot / Codex / Cursor |
+| :--- | :---: | :---: |
+| **17 Engineering Skills / Slash Commands** | Native (`~/.gemini/config/skills/`) | Exported (`~/.claude/commands/`, `.github/prompts/`, `AGENTS.md`) |
+| **Global Engineering & Git Rules** | Native (`~/.gemini/config/rules/`) | Exported (`~/.claude/rules/`, `.cursor/rules/`, `AGENTS.md`) |
+| **Native OS Git Hooks (`commit-msg`, `pre-push`)** | Enforced | Enforced (across all IDEs & terminals) |
+| **3-Gear Lifecycle Hooks (`PreToolUse`, `Stop`)** | Native (`hooks.json` + `transcript.jsonl`) | CLI state manager (`craftsman gate` / `craftsman status`) |
+
+### Threat Model & Design Scope
+Craftsman is an **engineering discipline harness**, not a security sandbox:
+- **What it solves:** Prevents impatient or forgetful AI agents from skipping verification, reviewing their own large diffs inline with confirmation bias, accidentally pushing directly to `main`/`master` without asking, or polluting commit history with `Co-authored-by:` AI trailers.
+- **What it does not claim to be:** It does not defend against an intentionally adversarial agent attempting to subvert local files or tamper with transcripts.
 
 ---
 
 ## Quick Start & Multi-Platform Installation
 
-### Option A: Shell Installer (Zero Setup)
+### Option A: Shell Installer
 
 ```bash
 git clone https://github.com/BuczynskiRafal/craftsman.git ~/.craftsman
@@ -36,20 +52,25 @@ cd ~/.craftsman
 
 # Install everywhere at once (Antigravity + Claude Code + GitHub Copilot + Global Git Hooks):
 ./install.sh --all
+
+# For local development on Craftsman itself, use symlink mode to prevent config drift:
+./install.sh --symlink --git-hooks
 ```
 
 ### Option B: Python CLI (`craftsman`)
 
-Craftsman is a standard PEP 621 Python package (`python >= 3.10`) using exclusively the Python standard library:
+Craftsman is a standard PEP 621 Python package (`python >= 3.10`) using only the Python standard library:
 
 ```bash
+pip install .
+# or editable mode:
 pip install -e .
 
-# Verify installation health, skill manifests, and active Git hooks:
+# Verify installation health, skill manifests, config drift, and active Git hooks:
 craftsman doctor
 craftsman doctor --json
 
-# Inspect current repository cumulative diff and recommended Quality Gate Gear:
+# Inspect current repository cumulative diff and active Quality Gate Gear:
 craftsman status --cwd /path/to/repo
 
 # Export skills and rules to Claude Code, GitHub Copilot, Codex (AGENTS.md), and Cursor:
@@ -63,10 +84,10 @@ craftsman export --workspace /path/to/repo --agents-workspace /path/to/repo
 | `./install.sh --all` | Installs across **Google Antigravity**, **Claude Code**, **GitHub Copilot**, and **Global Git Hooks** in one shot. |
 | `./install.sh --claude` | Exports all 17 slash commands (`~/.claude/commands/*.md`) and global rules (`~/.claude/rules/craftsman-rules.md`) for **Claude Code**. |
 | `./install.sh --copilot` | Exports all 17 prompt files (`*.prompt.md`) and global instructions (`craftsman-rules.instructions.md`) to VS Code User profile for **GitHub Copilot Chat**. |
-| `./install.sh --copilot-workspace <dir>` | Exports `.github/prompts/*.prompt.md` and `.github/copilot-instructions.md` into a project repository. |
-| `./install.sh --agents-workspace <dir>` | Generates universal `AGENTS.md` (**OpenAI Codex CLI**, **Windsurf**, **Zed**) and `.cursor/rules/craftsman.mdc` (**Cursor**) in a project repository. |
-| `./install.sh --git-hooks` | Installs OS-level `commit-msg` and `pre-push` hooks (`git config --global core.hooksPath`) enforcing Zero AI Attribution and `main`/`master` push confirmation across all IDEs and terminals. |
-| `./install.sh --symlink` / `--copy` | Installs skills, rules, `hooks.json`, and scripts into `~/.gemini/config/` for **Google Antigravity**. |
+| `./install.sh --copilot-workspace <dir>` | Exports `.github/prompts/*.prompt.md` and updates `.github/copilot-instructions.md` (preserving existing content via `<!-- craftsman:begin/end -->` markers). |
+| `./install.sh --agents-workspace <dir>` | Updates `AGENTS.md` (preserving existing content via `<!-- craftsman:begin/end -->` markers) and generates `.cursor/rules/craftsman.mdc`. |
+| `./install.sh --git-hooks` | Installs OS-level `commit-msg` and `pre-push` hooks plus passthrough shims for all standard local hooks (`pre-commit`, `post-checkout`, etc.) into `~/.gemini/config/git-hooks`. |
+| `./install.sh --symlink` / `--copy` | Installs skills, rules, `hooks.json` (merged non-destructively), and scripts into `~/.gemini/config/` for **Google Antigravity**. |
 
 ---
 
@@ -85,8 +106,8 @@ flowchart TD
     Mod --> Gearbox
     Batch --> Gearbox
 
-    Gearbox -->|"Gear 1: Quick (<=40 lines & <=2 files\nor --quick)"| SoftLoop["Inline Soft-Loop:\n/simplify + /verify (0 subagents)"]
-    Gearbox -->|"Gear 2: Standard (>40 lines or >2 files)\nGear 3: Deep (--deep / ultracode)"| Subagent["Independent Subagent (Author != Reviewer):\ninvoke_subagent (Craftsman Quality Gate Auditor)"]
+    Gearbox -->|"Gear 1: Quick (<=40 lines & <=2 files\nor --quick)"| SoftLoop["Inline Soft-Loop:\n/simplify + /code-review + /verify (0 subagents)"]
+    Gearbox -->|"Gear 2: Standard (>40 lines or >2 files)\nGear 3: Deep (--deep / ultracode)"| Subagent["Isolated Subagent (Author != Reviewer):\ninvoke_subagent (Craftsman Quality Gate Auditor)"]
 
     Subagent --> Simplify["Step 1: /simplify on cumulative diff (base_sha..HEAD)"]
     Simplify --> Review["Step 2: /code-review + /audit-* + Auto-Fix (Angles A-E)"]
@@ -100,9 +121,9 @@ flowchart TD
 
 | Gear | Trigger | Subagent Required? | Verification Scope | Best Used For |
 | :--- | :--- | :---: | :--- | :--- |
-| **Gear 1: `Quick` (Soft-Loop)** | Automatic when cumulative diff is **$\le 40$ lines across $\le 2$ files**, or manual `/craftsman --quick` | No (Fast Inline) | `/simplify` + `/verify` in main thread | Config tweaks, small bugfixes, 1-2 file adjustments |
-| **Gear 2: `Standard` (Hybrid Hard-Loop)** | Automatic when cumulative diff is **$> 40$ lines or $> 2$ files**, or manual `/craftsman --standard` | Yes (`Craftsman Quality Gate Auditor`) | Independent subagent runs `/simplify` -> `/code-review` -> `/verify` on `base_sha..HEAD` | Everyday features, multi-file refactors, bugfix PRs |
-| **Gear 3: `Deep` (Full-Audit Hard-Loop)** | Manual `/craftsman --deep` or keyword `ultracode` | Yes (`Craftsman Quality Gate Auditor`) | `ultrathink` pre-analysis + independent subagent runs `/simplify` -> `/code-review` -> `/audit all` -> `/verify` | Critical core logic, security-sensitive modules, complex migrations |
+| **Gear 1: `Quick` (Soft-Loop)** | Automatic when cumulative diff is **$\le 40$ lines across $\le 2$ files**, or manual `/craftsman --quick` | No (Fast Inline) | `/simplify` + `/code-review` + `/verify` in main thread | Config tweaks, small bugfixes, 1-2 file adjustments |
+| **Gear 2: `Standard` (Hybrid Hard-Loop)** | Automatic when cumulative diff is **$> 40$ lines or $> 2$ files**, or manual `/craftsman --standard` | Yes (`Craftsman Quality Gate Auditor`) | Isolated subagent runs `/simplify` -> `/code-review` -> `/verify` on `base_sha..HEAD` | Everyday features, multi-file refactors, bugfix PRs |
+| **Gear 3: `Deep` (Full-Audit Hard-Loop)** | Manual `/craftsman --deep` or keyword `ultracode` | Yes (`Craftsman Quality Gate Auditor`) | `ultrathink` pre-analysis + isolated subagent runs `/simplify` -> `/code-review` -> `/audit all` -> `/verify` | Critical core logic, security-sensitive modules, complex migrations |
 
 ---
 
@@ -147,13 +168,13 @@ flowchart TD
 
 ---
 
-## Deterministic System Guards (`scripts/` & `git-hooks/`)
+## System Guards (`craftsman/` & `git-hooks/`)
 
-1. **`scripts/git-guard.py` (`PreToolUse` hook + native `commit-msg` & `pre-push` Git hooks):**
-   - **Rule #1 (Protected Branch Guard):** Blocks unconfirmed `git push` to `main`/`master` unless the user explicitly confirmed via `ask_question` / `AskUserQuestion` or interactive terminal prompt.
+1. **`craftsman.guard` / `scripts/git-guard.py` (`PreToolUse` hook + native `commit-msg` & `pre-push` Git hooks):**
+   - **Rule #1 (Protected Branch Guard):** Blocks unconfirmed `git push` to `main`/`master` (including shell wrappers like `bash -c`, `timeout`, `eval`, git aliases, and `gh pr merge`) unless the user explicitly confirmed push/branch options via `ask_question` in the current workspace session or via an interactive terminal prompt.
    - **Rule #2 (Zero AI Attribution):** Rejects any commit, tag, or PR containing `Co-authored-by:` or `Generated by/with ...` AI trailers.
-2. **`scripts/craftsman-stop-gate.py` (`Stop` hook + state CLI):**
-   - Enforces the 3-Gear Quality Loop and Zero-Trust `transcript.jsonl` verification for Gear 2 (`standard`) and Gear 3 (`deep`).
+2. **`craftsman.gate` / `scripts/craftsman-stop-gate.py` (`Stop` hook + state CLI):**
+   - Enforces the 3-Gear Quality Loop and `transcript.jsonl` verification for Gear 2 (`standard`) and Gear 3 (`deep`).
 
 ---
 
