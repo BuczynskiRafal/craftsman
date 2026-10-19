@@ -16,9 +16,8 @@ from craftsman import __version__
 from craftsman.export import FRONTMATTER_RE, default_repo_dir
 from craftsman.export import main as export_main
 from craftsman.gate import (
-    SMALL_DIFF_MAX_FILES,
-    SMALL_DIFF_MAX_LINES,
     compute_cumulative_diff_summary,
+    resolve_effective_gear_label,
 )
 from craftsman.gate import main as gate_main
 from craftsman.guard import main as guard_main
@@ -132,13 +131,9 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
 
     required_scripts = ("git-guard.py", "craftsman-stop-gate.py", "copilot-export.py")
     scripts_dir = repo_dir / "scripts"
-    if scripts_dir.is_dir():
-        missing_scripts = [
-            name for name in required_scripts if not (scripts_dir / name).is_file()
-        ]
-    else:
-        # In pure wheel installs without scripts/ directory, core modules live in craftsman.*
-        missing_scripts = []
+    missing_scripts = [
+        name for name in required_scripts if not (scripts_dir / name).is_file()
+    ]
 
     git_name = _git_config_get("user.name")
     git_email = _git_config_get("user.email")
@@ -171,6 +166,7 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
         and not skill_errors
         and len(rule_files) >= 2
         and not missing_scripts
+        and not config_drift
     )
 
     report: dict[str, Any] = {
@@ -235,7 +231,6 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
             sys.stderr.write(
                 f"[craftsman] Warning: failed to read state file {state_file}: {exc}\n"
             )
-            state = {}
 
     effective_cwd = cwd or (
         state.get("cwd") if isinstance(state.get("cwd"), str) else os.getcwd()
@@ -244,21 +239,7 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
     diff_summary = compute_cumulative_diff_summary(effective_cwd, base_sha) or _empty_diff_summary()
 
     tier = str(state.get("tier") or "auto").strip().lower()
-    mode = str(state.get("mode") or "craftsman").strip().lower()
-    if mode == "ultracode" or tier == "deep":
-        effective_gear = "deep (Gear 3: Full-Audit Hard-Loop)"
-    elif tier == "quick":
-        effective_gear = "quick (Gear 1: Soft-Loop)"
-    elif tier == "auto":
-        files_n = diff_summary["changed_files"]
-        lines_n = diff_summary["total_changed_lines"]
-        effective_gear = (
-            "quick (Gear 1: Soft-Loop)"
-            if (files_n <= SMALL_DIFF_MAX_FILES and lines_n <= SMALL_DIFF_MAX_LINES)
-            else "standard (Gear 2: Hybrid Hard-Loop)"
-        )
-    else:
-        effective_gear = "standard (Gear 2: Hybrid Hard-Loop)"
+    effective_gear = resolve_effective_gear_label(state, effective_cwd)
 
     raw_gates = state.get("gates")
     gates: dict[str, Any] = (

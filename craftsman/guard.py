@@ -19,23 +19,55 @@ import time
 from pathlib import Path
 from typing import Any
 
-PROTECTED_BRANCHES = frozenset({"main", "master", "refs/heads/main", "refs/heads/master"})
+from craftsman.gate import read_transcript_entries
+
+PROTECTED_BRANCHES = frozenset(
+    {
+        "main",
+        "master",
+        "heads/main",
+        "heads/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    }
+)
 
 AI_ATTRIBUTION_PATTERNS = (
-    re.compile(r"(?im)(?:^|[\r\n]|-m\s+[\"']?)\s*co-authored-by\s*:\s*[^\r\n]+"),
+    re.compile(r"(?im)^[ \t]*co-authored-by[ \t]*:[ \t]*\S+"),
     re.compile(
-        r"(?i)\bgenerated\s+(?:by|with)\s+"
-        r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|ai\b|llm\b)"
+        r"(?i)\bco-authored-by[ \t]*:[ \t]*[^\r\n]*"
+        r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|"
+        r"cursor|windsurf|codex|ai\b|llm\b|bot\b|noreply@|<[^>\r\n]+@[^>\r\n]+>)"
     ),
-    re.compile(r"(?i)🤖\s*generated\s+with"),
+    re.compile(
+        r"(?im)^[ \t]*(?:🤖[ \t]*|[*-][ \t]*|>[ \t]*)?generated[ \t]+(?:by|with)[ \t]+\[?"
+        r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|"
+        r"cursor|windsurf|codex|ai\b|llm\b)"
+    ),
+    re.compile(r"(?i)🤖[ \t]*generated[ \t]+with"),
 )
 
-PUSH_CONFIRM_KEYWORDS_RE = re.compile(
-    r"(?i)\b("
-    r"push\w*|main|master|branch\w*|pull\s+request|pr\b|merge\w*|remote|origin|"
-    r"feature\s+branch|gał[aę][zź]\w*|bezpo[sś]rednio"
-    r")\b"
+PUSH_ACTION_RE = re.compile(
+    r"(?i)\b(push\w*|wypchn\w*|wrzu[cć]\w*|merge\w*|zmerguj\w*|scal\w*)\b"
 )
+PUSH_TARGET_RE = re.compile(
+    r"(?i)\b(main|master|protected\s+branch|chronion\w+\s+gał\w*|pr\b|pull\s+request)\b"
+)
+DIRECT_MAIN_APPROVAL_RE = re.compile(
+    r"(?i)\b(main|master|merge\w*|zmerguj\w*|scal\w*)\b"
+)
+AFFIRMATIVE_SHORT_RE = re.compile(
+    r"(?i)^\s*(?:a\d+\s*:\s*)?(?:\(recommended\)\s*)?(?:yes|tak|y|t|ok|okay|confirm\w*|proceed|zatwierd[zź]\w*)\s*[.!]*\s*$"
+)
+PR_ONLY_REJECTION_RE = re.compile(
+    r"(?i)\b(feature\s+branch|now[aą]\s+gał[aę][zź]|osobn[aą]\s+gał[aę][zź]|"
+    r"bez\s+wypychania|do\s+not\s+push|don't\s+push|nie\s+wypychaj|cancel|skip)\b"
+)
+HEREDOC_OPEN_RE = re.compile(
+    r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+)
+GIT_SCISSORS_RE = re.compile(r"(?m)^# -+ >8 -+[ \t]*$")
+MAX_APPROVAL_STEP_DISTANCE = 25
 
 GIT_GLOBAL_OPTS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
@@ -43,6 +75,10 @@ GIT_GLOBAL_OPTS_WITH_VALUE = frozenset(
 
 PUSH_OPTS_WITH_VALUE = frozenset(
     {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
+)
+
+INLINE_MESSAGE_OPTS = frozenset(
+    {"-m", "--message", "--trailer", "-b", "--body", "-t", "--title", "--notes"}
 )
 
 SHELL_EXECUTABLES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
@@ -60,7 +96,7 @@ def emit(decision: str, reason: str | None = None) -> None:
 
 
 def split_shell_segments(command_line: str) -> list[str]:
-    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, or newlines."""
+    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, or newlines, preserving heredoc bodies."""
     segments: list[str] = []
     current: list[str] = []
     quote: str | None = None
@@ -94,6 +130,30 @@ def split_shell_segments(command_line: str) -> list[str]:
             current.append(ch)
             i += 1
             continue
+        if ch == "\n":
+            seg_so_far = "".join(current)
+            hd_match = HEREDOC_OPEN_RE.search(seg_so_far)
+            if hd_match:
+                delim = hd_match.group(1) or hd_match.group(2) or hd_match.group(3)
+                current.append(ch)
+                i += 1
+                while i < n:
+                    line_end = command_line.find("\n", i)
+                    if line_end == -1:
+                        line_str = command_line[i:]
+                        current.append(line_str)
+                        i = n
+                        break
+                    line_str = command_line[i : line_end + 1]
+                    current.append(line_str)
+                    i = line_end + 1
+                    if line_str.strip() == delim:
+                        break
+                seg = "".join(current).strip()
+                if seg:
+                    segments.append(seg)
+                current = []
+                continue
         if ch in (";", "\n", "(", ")", "`"):
             seg = "".join(current).strip()
             if seg:
@@ -157,15 +217,28 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
         break
 
     # Remove shell here-string operator '<<<' so `xargs git push origin <<< main` preserves 'main'
-    cleaned = [t for t in tokens[idx:] if t != "<<<"]
+    cleaned: list[str] = []
+    for t in tokens[idx:]:
+        if t == "<<<":
+            continue
+        # Split attached output redirection like `main>/dev/null` or `main2>/dev/null`
+        redir_match = re.match(r"^([^<>]+?)(?:\d*>>?|\d*>&\d+).*$", t)
+        if redir_match and redir_match.group(1):
+            cleaned.append(redir_match.group(1))
+        else:
+            cleaned.append(t)
     return cleaned
 
 
 def tokenize_segment(segment: str) -> list[str]:
+    cmd_header = segment.split("\n", 1)[0]
+    hd_match = HEREDOC_OPEN_RE.search(cmd_header)
+    if hd_match:
+        cmd_header = cmd_header[: hd_match.start()]
     try:
-        tokens = shlex.split(segment, posix=True)
+        tokens = shlex.split(cmd_header, posix=True)
     except ValueError:
-        tokens = segment.split()
+        tokens = cmd_header.split()
     return _strip_wrappers_from_tokens(tokens)
 
 
@@ -302,6 +375,28 @@ def is_gh_pr_merge(tokens: list[str]) -> bool:
     return not any(flag in tokens[3:] for flag in ("-h", "--help"))
 
 
+def extract_inline_messages(tokens: list[str]) -> list[str]:
+    """Extract inline message/body/trailer values from command tokens (`-m`, `--trailer`, `--body`, etc.)."""
+    values: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in INLINE_MESSAGE_OPTS and i + 1 < len(tokens):
+            values.append(tokens[i + 1])
+            i += 2
+            continue
+        if any(tok.startswith(f"{opt}=") for opt in INLINE_MESSAGE_OPTS):
+            values.append(tok.split("=", 1)[1])
+            i += 1
+            continue
+        if (tok.startswith("-m") or tok.startswith("-b") or tok.startswith("-t")) and not tok.startswith("--") and len(tok) > 2:
+            values.append(tok[2:])
+            i += 1
+            continue
+        i += 1
+    return values
+
+
 def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
     """Extract contents of any `-F`, `--file`, or `--body-file` arguments if readable."""
     contents: list[str] = []
@@ -317,6 +412,9 @@ def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
             i += 2
         elif any(tok.startswith(f"{flag}=") for flag in file_flags):
             candidate = tok.split("=", 1)[1]
+            i += 1
+        elif tok.startswith("-F") and len(tok) > 2:
+            candidate = tok[2:]
             i += 1
         else:
             i += 1
@@ -334,14 +432,25 @@ def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
     return contents
 
 
+def _matches_ai_attribution_text(text: str) -> bool:
+    normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    return any(
+        pattern.search(text) or pattern.search(normalized)
+        for pattern in AI_ATTRIBUTION_PATTERNS
+    )
+
+
 def has_ai_attribution(
     segment: str, tokens: list[str] | None = None, cwd: str | None = None
 ) -> bool:
-    if any(pattern.search(segment) for pattern in AI_ATTRIBUTION_PATTERNS):
+    if _matches_ai_attribution_text(segment):
         return True
     if tokens:
+        for msg_val in extract_inline_messages(tokens):
+            if _matches_ai_attribution_text(msg_val):
+                return True
         for file_text in extract_message_files(tokens, cwd):
-            if any(pattern.search(file_text) for pattern in AI_ATTRIBUTION_PATTERNS):
+            if _matches_ai_attribution_text(file_text):
                 return True
     return False
 
@@ -389,9 +498,6 @@ def get_repo_toplevel(cwd: str | None) -> Path | None:
 
 def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
     """Return (targets_protected_branch, is_force_push)."""
-    if any(flag in sub_args for flag in ("--dry-run", "-n", "-h", "--help")):
-        return False, False
-
     is_force = False
     is_all_or_mirror = False
     positional: list[str] = []
@@ -408,6 +514,11 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
         if any(arg.startswith(f"{opt}=") for opt in PUSH_OPTS_WITH_VALUE):
             i += 1
             continue
+        if arg.startswith("-o") and len(arg) > 2:
+            i += 1
+            continue
+        if arg in ("--dry-run", "-n", "-h", "--help"):
+            return False, False
         if arg in (
             "-f",
             "--force",
@@ -443,7 +554,7 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
             refspec = refspec[1:]
         dest = refspec.split(":", 1)[-1].strip()
         if dest in PROTECTED_BRANCHES or (
-            dest == "HEAD" and get_current_branch(cwd) in PROTECTED_BRANCHES
+            dest in ("HEAD", "@") and get_current_branch(cwd) in PROTECTED_BRANCHES
         ):
             return True, is_force
 
@@ -530,21 +641,109 @@ def _is_completed_successful_run_command(
     return True
 
 
-def _is_push_confirmation_question(tc: dict[str, Any]) -> bool:
-    """Return True if `ask_question` tool call asks about pushing/branch/main/PR (or has empty synthetic args)."""
+def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
+    """Decode `questions` / `question` fields (including JSON-string-encoded arrays) into plain text."""
     args = tc.get("args") or tc.get("input")
     if not isinstance(args, dict) or not args:
+        return ""
+
+    raw_questions: Any = args.get("questions")
+    if isinstance(raw_questions, str):
+        try:
+            raw_questions = json.loads(raw_questions)
+        except json.JSONDecodeError:
+            pass
+
+    raw_single: Any = args.get("question")
+    parts: list[str] = []
+    if isinstance(raw_single, str) and raw_single.strip():
+        parts.append(raw_single.strip())
+
+    if isinstance(raw_questions, list):
+        for item in raw_questions:
+            if isinstance(item, dict):
+                q_str = item.get("question")
+                if isinstance(q_str, str) and q_str.strip():
+                    parts.append(q_str.strip())
+                opts = item.get("options")
+                if isinstance(opts, list):
+                    for opt in opts:
+                        if isinstance(opt, str) and opt.strip():
+                            parts.append(opt.strip())
+            elif isinstance(item, str) and item.strip():
+                parts.append(item.strip())
+    elif isinstance(raw_questions, str) and raw_questions.strip():
+        parts.append(raw_questions.strip())
+
+    return "\n".join(parts)
+
+
+def _is_push_confirmation_question(tc: dict[str, Any]) -> bool:
+    """Return True only if `ask_question` asks about pushing/merging to a protected branch (`main`/`master`/PR)."""
+    decoded_text = _extract_decoded_question_text(tc)
+    if not decoded_text:
+        return False
+    return bool(PUSH_ACTION_RE.search(decoded_text) and PUSH_TARGET_RE.search(decoded_text))
+
+
+def _is_user_response_approving_main_push(
+    entries: list[dict[str, Any]], idx: int, has_generic_steps: bool
+) -> bool:
+    """Verify the user's answer following `entries[idx]` actually selected direct push/merge rather than a PR branch."""
+    response_step_texts: list[str] = []
+    scan_idx = idx + 1
+    while scan_idx < len(entries) and entries[scan_idx].get("type") in ("GENERIC", "USER_INPUT"):
+        raw_c = entries[scan_idx].get("content")
+        if isinstance(raw_c, str) and raw_c.strip():
+            response_step_texts.append(raw_c.strip())
+        scan_idx += 1
+
+    if not response_step_texts:
+        # If the transcript has GENERIC steps and ask_question is the last entry, it is still unanswered
+        if has_generic_steps and idx == len(entries) - 1:
+            return False
+        # Synthetic unit-test transcript without intermediate GENERIC response steps
         return True
 
-    questions = args.get("questions")
-    question_single = args.get("question")
-    if questions is None and question_single is None:
+    combined_resp = "\n".join(response_step_texts)
+    answer_lines = [
+        line.strip()
+        for line in combined_resp.splitlines()
+        if re.match(r"^A\d+\s*:", line.strip())
+    ]
+    effective_answer = "\n".join(answer_lines) if answer_lines else combined_resp
+
+    if PR_ONLY_REJECTION_RE.search(effective_answer) and not re.search(
+        r"(?i)\b(main|master)\b", effective_answer
+    ):
+        return False
+
+    if DIRECT_MAIN_APPROVAL_RE.search(effective_answer):
+        # Ensure it's not a PR-branch answer like "Wypchnij na gałąź release/x i utwórz Pull Request"
+        if re.search(r"(?i)\b(pull\s+request|utwórz\s+pr|open\s+a\s+pr|feature\s+branch)\b", effective_answer) and not re.search(
+            r"(?i)\b(main|master)\b", effective_answer
+        ):
+            return False
         return True
 
-    combined_text = json.dumps(
-        {"questions": questions, "question": question_single}, ensure_ascii=False
-    )
-    return bool(PUSH_CONFIRM_KEYWORDS_RE.search(combined_text))
+    if AFFIRMATIVE_SHORT_RE.search(effective_answer):
+        return True
+
+    return False
+
+
+def _command_pushes_or_merges_protected(cmd: str, cwd: str | None) -> bool:
+    """Return True if `cmd` invokes `gh pr merge` or `git push` targeting a protected branch."""
+    for seg in expand_shell_segments(cmd):
+        toks = tokenize_segment(seg)
+        if is_gh_pr_merge(toks):
+            return True
+        sub, sub_args, eff_cwd = parse_git_invocation(toks, cwd)
+        if sub == "push":
+            targets_main, _ = analyze_git_push(sub_args, eff_cwd)
+            if targets_main:
+                return True
+    return False
 
 
 def was_ask_question_called_since_last_push(
@@ -552,16 +751,15 @@ def was_ask_question_called_since_last_push(
     fallback_cwd: str | None = None,
     ignore_in_flight_tail: bool = False,
 ) -> bool:
-    """Check if a push-confirmation `ask_question` was invoked after the most recent `git push` in transcript."""
-    from craftsman.gate import read_transcript_entries
-
+    """Check if an approved push-confirmation `ask_question` occurred after the most recent `git push`."""
     entries = read_transcript_entries(transcript_path)
     if not entries:
         return False
 
     has_generic_steps = any(e.get("type") == "GENERIC" for e in entries)
+    min_idx = max(0, len(entries) - MAX_APPROVAL_STEP_DISTANCE)
 
-    for idx in range(len(entries) - 1, -1, -1):
+    for idx in range(len(entries) - 1, min_idx - 1, -1):
         entry = entries[idx]
         tool_calls = entry.get("tool_calls")
         if not isinstance(tool_calls, list):
@@ -579,7 +777,9 @@ def was_ask_question_called_since_last_push(
                 continue
             name = tc.get("name")
             if name in ("ask_question", "AskUserQuestion"):
-                if _is_push_confirmation_question(tc):
+                if _is_push_confirmation_question(tc) and _is_user_response_approving_main_push(
+                    entries, idx, has_generic_steps
+                ):
                     return True
                 continue
             if name in ("run_command", "Bash"):
@@ -590,16 +790,8 @@ def was_ask_question_called_since_last_push(
                     continue
                 cmd = _unquote_json_str(args.get("CommandLine") or args.get("command"))
                 hist_cwd = _unquote_json_str(args.get("Cwd") or args.get("cwd")) or fallback_cwd
-                if cmd:
-                    for seg in expand_shell_segments(cmd):
-                        toks = tokenize_segment(seg)
-                        if is_gh_pr_merge(toks):
-                            return False
-                        sub, sub_args, eff_cwd = parse_git_invocation(toks, hist_cwd)
-                        if sub == "push":
-                            targets_main, _ = analyze_git_push(sub_args, eff_cwd)
-                            if targets_main:
-                                return False
+                if cmd and _command_pushes_or_merges_protected(cmd, hist_cwd):
+                    return False
     return False
 
 
@@ -638,8 +830,19 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     for segment in segments:
         tokens = tokenize_segment(segment)
         _, _, effective_cwd = parse_git_invocation(tokens, cwd_str)
-        if is_ai_attribution_check_target(tokens) and has_ai_attribution(
-            segment, tokens, effective_cwd
+        if is_ai_attribution_check_target(tokens) and (
+            has_ai_attribution(segment, tokens, effective_cwd)
+            or (
+                (
+                    "<<" in command_line
+                    or any(
+                        t in ("-F", "--file", "--body-file")
+                        or t.startswith(("-F", "--file=", "--body-file="))
+                        for t in tokens
+                    )
+                )
+                and has_ai_attribution(command_line)
+            )
         ):
             return (
                 "deny",
@@ -700,53 +903,110 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     return "allow", None
 
 
+def _path_belongs_to_repo(candidate_str: str, repo_root: Path) -> bool:
+    try:
+        resolved = Path(candidate_str).expanduser().resolve()
+        return resolved == repo_root or resolved.is_relative_to(repo_root)
+    except (OSError, ValueError):
+        return False
+
+
 def _transcript_matches_workspace(transcript_path: Path, repo_root: Path | None) -> bool:
     """Return True if the session transcript or its state file belongs to `repo_root`."""
     if repo_root is None:
-        return True
-    repo_str = str(repo_root)
+        return False
+
     brain_conv_dir = transcript_path.parent.parent.parent
     state_file = brain_conv_dir / "craftsman_state.json"
     if state_file.is_file():
         try:
             state = json.loads(state_file.read_text(encoding="utf-8"))
             if isinstance(state, dict) and isinstance(state.get("cwd"), str):
-                state_root = get_repo_toplevel(state["cwd"])
-                if state_root == repo_root:
+                if _path_belongs_to_repo(state["cwd"], repo_root):
                     return True
         except (OSError, json.JSONDecodeError):
             pass
 
-    try:
-        raw_text = transcript_path.read_text(encoding="utf-8", errors="replace")
-        return repo_str in raw_text
-    except OSError:
-        return False
+    entries = read_transcript_entries(transcript_path)
+    path_keys = (
+        "Cwd",
+        "cwd",
+        "TargetFile",
+        "AbsolutePath",
+        "DirectoryPath",
+        "SearchPath",
+        "file_path",
+        "path",
+    )
+    for entry in entries:
+        tool_calls = entry.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            args = tc.get("args") or tc.get("input")
+            if not isinstance(args, dict):
+                continue
+            for key in path_keys:
+                val = _unquote_json_str(args.get(key))
+                if isinstance(val, str) and val and _path_belongs_to_repo(val, repo_root):
+                    return True
+    return False
+
+
+def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600.0) -> list[Path]:
+    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
+    if not brain_dir.is_dir():
+        return []
+    repo_root = get_repo_toplevel(cwd)
+    if repo_root is None:
+        return []
+    now = time.time()
+    recent: list[tuple[float, Path]] = []
+    for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            continue
+        if (now - mtime) <= max_age_sec:
+            recent.append((mtime, p))
+    recent.sort(key=lambda item: item[0], reverse=True)
+    return [p for _, p in recent if _transcript_matches_workspace(p, repo_root)]
 
 
 def has_recent_antigravity_approval(cwd: str | None = None) -> bool:
     """Check if an active Antigravity session for this repository approved push via ask_question."""
     if os.environ.get("CRAFTSMAN_IGNORE_TRANSCRIPT") == "1":
         return False
-    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
-    if not brain_dir.is_dir():
-        return False
-    repo_root = get_repo_toplevel(cwd)
-    now = time.time()
-    recent_transcripts: list[tuple[float, Path]] = []
-    for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            continue
-        if (now - mtime) <= 600:
-            recent_transcripts.append((mtime, p))
-    recent_transcripts.sort(key=lambda item: item[0], reverse=True)
-    for _, transcript in recent_transcripts:
-        if not _transcript_matches_workspace(transcript, repo_root):
-            continue
+    for transcript in _find_recent_workspace_transcripts(cwd, max_age_sec=600.0):
         if was_ask_question_called_since_last_push(transcript, cwd, ignore_in_flight_tail=True):
             return True
+    return False
+
+
+def _has_in_flight_agent_push(cwd: str | None = None) -> bool:
+    """Return True if a very recent workspace transcript has a trailing in-flight `git push` tool call."""
+    if os.environ.get("CRAFTSMAN_IGNORE_TRANSCRIPT") == "1":
+        return False
+
+    for transcript in _find_recent_workspace_transcripts(cwd, max_age_sec=60.0):
+        entries = read_transcript_entries(transcript)
+        if not entries:
+            continue
+        last_entry = entries[-1]
+        if last_entry.get("type") != "PLANNER_RESPONSE":
+            continue
+        for tc in last_entry.get("tool_calls") or []:
+            if not isinstance(tc, dict) or tc.get("name") not in ("run_command", "Bash"):
+                continue
+            args = tc.get("args") or tc.get("input") or {}
+            if not isinstance(args, dict):
+                continue
+            cmd = _unquote_json_str(args.get("CommandLine") or args.get("command"))
+            hist_cwd = _unquote_json_str(args.get("Cwd") or args.get("cwd")) or cwd
+            if cmd and _command_pushes_or_merges_protected(cmd, hist_cwd):
+                return True
     return False
 
 
@@ -758,6 +1018,11 @@ def run_native_commit_msg_hook(msg_file_str: str) -> int:
         content = msg_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return 0
+
+    # Strip everything at and below the `git commit -v` scissors line (`# --- >8 ---`)
+    scissors_match = GIT_SCISSORS_RE.search(content)
+    if scissors_match:
+        content = content[: scissors_match.start()]
 
     # Strip git comment lines starting with '#'
     active_lines = "\n".join(
@@ -790,19 +1055,23 @@ def run_native_pre_push_hook() -> int:
     if os.environ.get("CRAFTSMAN_ALLOW_MAIN_PUSH") == "1":
         return 0
 
-    if has_recent_antigravity_approval(os.getcwd()):
+    cwd = os.getcwd()
+    if has_recent_antigravity_approval(cwd):
         return 0
 
-    # If running interactively in a terminal, prompt user via /dev/tty
-    if os.environ.get("CRAFTSMAN_NONINTERACTIVE") != "1":
+    # If running interactively in a human terminal (and not an unapproved in-flight agent command), prompt via /dev/tty
+    if os.environ.get("CRAFTSMAN_NONINTERACTIVE") != "1" and not _has_in_flight_agent_push(cwd):
         try:
-            with open("/dev/tty", "r+", encoding="utf-8") as tty:
-                tty.write(
+            with (
+                open("/dev/tty", "w", encoding="utf-8") as tty_out,
+                open("/dev/tty", encoding="utf-8") as tty_in,
+            ):
+                tty_out.write(
                     "[CRAFTSMAN GIT-HOOK] Detected 'git push' to a protected branch (main/master). "
                     "Continue? [y/N]: "
                 )
-                tty.flush()
-                answer = tty.readline().strip().lower()
+                tty_out.flush()
+                answer = tty_in.readline().strip().lower()
                 if answer in ("y", "yes", "t", "tak"):
                     return 0
         except OSError:
@@ -819,6 +1088,14 @@ def run_native_pre_push_hook() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] in ("-h", "--help"):
+        print(
+            "Usage: craftsman guard [--git-hook <commit-msg|pre-push> [args...]]\n\n"
+            "Reads PreToolUse JSON payload from stdin when invoked without arguments,\n"
+            "or executes native OS-level Git hooks when invoked with --git-hook."
+        )
+        return 0
+
     if len(args_list) >= 2 and args_list[0] == "--git-hook":
         hook_type = args_list[1]
         if hook_type == "commit-msg" and len(args_list) >= 3:
@@ -829,7 +1106,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         raw = sys.stdin.read()
-        payload = json.loads(raw) if raw.strip() else {}
+        loaded = json.loads(raw) if raw.strip() else {}
+        payload = loaded if isinstance(loaded, dict) else {}
     except (OSError, json.JSONDecodeError):
         emit("allow")
         return 0

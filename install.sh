@@ -11,7 +11,11 @@ GIT_HOOKS_DIR="${CONFIG_DIR}/git-hooks"
 PLUGINS_DIR="${CONFIG_DIR}/plugins"
 
 STANDARD_PASSTHROUGH_GIT_HOOKS=(
+  "applypatch-msg"
+  "pre-applypatch"
+  "post-applypatch"
   "pre-commit"
+  "pre-merge-commit"
   "prepare-commit-msg"
   "post-commit"
   "pre-rebase"
@@ -151,44 +155,40 @@ install_hooks_json() {
   local target_hooks="${CONFIG_DIR}/hooks.json"
   [[ -f "${src_hooks}" ]] || return 0
 
-  if [[ "${MODE}" == "symlink" ]]; then
-    if [[ -f "${target_hooks}" && ! -L "${target_hooks}" ]]; then
-      python3 - "${src_hooks}" "${target_hooks}" <<'PY'
+  if [[ -L "${target_hooks}" ]]; then
+    rm -f "${target_hooks}"
+  fi
+
+  if [[ -f "${target_hooks}" ]]; then
+    python3 - "${src_hooks}" "${target_hooks}" <<'PY'
 import json, pathlib, shutil, sys
-src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-try:
-    dst_data = json.loads(dst.read_text(encoding="utf-8"))
-    src_data = json.loads(src.read_text(encoding="utf-8"))
-    extra_keys = [k for k in dst_data if k not in src_data]
-    if extra_keys:
-        shutil.copy2(dst, dst.with_suffix(".json.bak"))
-except Exception:
-    pass
-PY
-    fi
-    rm -rf "${target_hooks}"
-    ln -s "${src_hooks}" "${target_hooks}"
-  else
-    if [[ -L "${target_hooks}" ]]; then
-      rm -f "${target_hooks}"
-    fi
-    if [[ -f "${target_hooks}" ]]; then
-      python3 - "${src_hooks}" "${target_hooks}" <<'PY'
-import json, pathlib, sys
 src, dst = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
 src_data = json.loads(src.read_text(encoding="utf-8"))
 try:
     dst_data = json.loads(dst.read_text(encoding="utf-8"))
     if not isinstance(dst_data, dict):
-        dst_data = {}
-except Exception:
-    dst_data = {}
-dst_data.update(src_data)
+        raise ValueError("top-level JSON value must be an object")
+except Exception as exc:
+    bak = dst.with_suffix(".json.bak")
+    shutil.copy2(dst, bak)
+    sys.stderr.write(
+        f"[ERROR] Failed to parse existing {dst} ({exc}); backed up to {bak} and aborted merge.\n"
+    )
+    sys.exit(1)
+
+for key, val in src_data.items():
+    existing_entry = dst_data.get(key)
+    if isinstance(existing_entry, dict) and isinstance(val, dict) and isinstance(existing_entry.get("enabled"), bool):
+        merged_entry = dict(val)
+        merged_entry["enabled"] = existing_entry["enabled"]
+        dst_data[key] = merged_entry
+    else:
+        dst_data[key] = val
+
 dst.write_text(json.dumps(dst_data, indent=2) + "\n", encoding="utf-8")
 PY
-    else
-      cp "${src_hooks}" "${target_hooks}"
-    fi
+  else
+    cp "${src_hooks}" "${target_hooks}"
   fi
   echo "  + hooks: ${target_hooks}"
 }
@@ -201,11 +201,11 @@ write_passthrough_git_hook() {
 set -euo pipefail
 
 HOOKS_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
-GIT_DIR="\$(git rev-parse --git-dir 2>/dev/null || true)"
-if [[ -n "\${GIT_DIR}" && -x "\${GIT_DIR}/hooks/${hook_name}" ]]; then
-  LOCAL_HOOK_DIR="\$(cd "\${GIT_DIR}/hooks" && pwd)"
+GIT_COMMON_DIR="\$(git rev-parse --git-common-dir 2>/dev/null || true)"
+if [[ -n "\${GIT_COMMON_DIR}" && -x "\${GIT_COMMON_DIR}/hooks/${hook_name}" ]]; then
+  LOCAL_HOOK_DIR="\$(cd "\${GIT_COMMON_DIR}/hooks" && pwd)"
   if [[ "\${LOCAL_HOOK_DIR}" != "\${HOOKS_DIR}" ]]; then
-    exec "\${GIT_DIR}/hooks/${hook_name}" "\$@"
+    exec "\${GIT_COMMON_DIR}/hooks/${hook_name}" "\$@"
   fi
 fi
 EOF
@@ -309,6 +309,11 @@ if [[ "${INSTALL_GIT_HOOKS}" == true ]]; then
     echo "  + git-hook (passthrough): ${passthrough_hook}"
   done
 
+  PREV_HOOKS_PATH="$(git config --global --get core.hooksPath 2>/dev/null || true)"
+  if [[ -n "${PREV_HOOKS_PATH}" && "${PREV_HOOKS_PATH}" != "${GIT_HOOKS_DIR}" ]]; then
+    printf "%s\n" "${PREV_HOOKS_PATH}" > "${GIT_HOOKS_DIR}/.previous_hooks_path"
+    echo "  ! backed up previous core.hooksPath (${PREV_HOOKS_PATH}) -> ${GIT_HOOKS_DIR}/.previous_hooks_path"
+  fi
   git config --global core.hooksPath "${GIT_HOOKS_DIR}"
   echo "[OK] Configured git config --global core.hooksPath -> ${GIT_HOOKS_DIR}"
 fi

@@ -83,14 +83,27 @@ def extract_description_and_body(skill_md: str, fallback_name: str) -> tuple[str
     return description, body.strip()
 
 
+GATE_SCRIPT_INVOCATION_RE = re.compile(
+    r"(?:python3?\s+)?~/.gemini/config/scripts/craftsman-stop-gate\.py"
+)
+
+
 def _rewrite_antigravity_paths(body: str) -> str:
     """Rewrite Antigravity-specific script and artifact paths to portable CLI equivalents."""
-    rewritten = body.replace(
-        "~/.gemini/config/scripts/craftsman-stop-gate.py", "craftsman gate"
-    )
-    rewritten = rewritten.replace("<artifactDirectoryPath>", ".git/craftsman")
+    rewritten = GATE_SCRIPT_INVOCATION_RE.sub("craftsman gate", body)
     rewritten = rewritten.replace(
-        "<appDataDir>/brain/<conversation-id>", ".git/craftsman"
+        "<artifactDirectoryPath>/craftsman_state.json",
+        '"$(git rev-parse --git-common-dir)/craftsman/craftsman_state.json"',
+    )
+    rewritten = rewritten.replace(
+        "<appDataDir>/brain/<conversation-id>/craftsman_state.json",
+        '"$(git rev-parse --git-common-dir)/craftsman/craftsman_state.json"',
+    )
+    rewritten = rewritten.replace(
+        "<artifactDirectoryPath>", "$(git rev-parse --git-common-dir)/craftsman"
+    )
+    rewritten = rewritten.replace(
+        "<appDataDir>/brain/<conversation-id>", "$(git rev-parse --git-common-dir)/craftsman"
     )
     return rewritten
 
@@ -324,40 +337,42 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_dir = Path(args.repo_dir).resolve()
-    any_target = False
+
+    if not (args.user_dir is not None or args.workspace or args.claude_dir is not None or args.agents_workspace):
+        parser.error(
+            "Specify at least one target: --user-dir, --workspace <path>, --claude-dir, or --agents-workspace <path>"
+        )
+
+    skill_manifests = sorted((repo_dir / "skills").glob("*/SKILL.md"))
+    if not skill_manifests:
+        sys.stderr.write(
+            f"[ERROR] No skill manifests (skills/*/SKILL.md) found under {repo_dir}\n"
+        )
+        return 1
 
     if args.user_dir is not None:
-        any_target = True
         target = Path(args.user_dir) if args.user_dir else default_vscode_prompts_dir()
         count, instr = export_to_vscode_user(repo_dir, target)
         print(f"[OK] Exported {count} Copilot prompt files (*.prompt.md) -> {target}")
         print(f"[OK] Exported global Copilot instructions -> {instr}")
 
     if args.workspace:
-        any_target = True
         ws = Path(args.workspace).resolve()
         count, instr = export_to_workspace(repo_dir, ws)
         print(f"[OK] Exported {count} workspace prompt files -> {ws / '.github' / 'prompts'}")
         print(f"[OK] Exported workspace Copilot instructions -> {instr}")
 
     if args.claude_dir is not None:
-        any_target = True
         target_claude = Path(args.claude_dir) if args.claude_dir else default_claude_dir()
         count, rules_file = export_to_claude_user(repo_dir, target_claude)
         print(f"[OK] Exported {count} Claude Code slash commands -> {target_claude / 'commands'}")
         print(f"[OK] Exported Claude Code global rules -> {rules_file}")
 
     if args.agents_workspace:
-        any_target = True
         ws = Path(args.agents_workspace).resolve()
         agents_md, cursor_mdc = export_to_agents_workspace(repo_dir, ws)
         print(f"[OK] Exported universal AGENTS.md (Codex/Cursor/Windsurf) -> {agents_md}")
         print(f"[OK] Exported Cursor rule -> {cursor_mdc}")
-
-    if not any_target:
-        parser.error(
-            "Specify at least one target: --user-dir, --workspace <path>, --claude-dir, or --agents-workspace <path>"
-        )
 
     return 0
 

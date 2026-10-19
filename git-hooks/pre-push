@@ -9,11 +9,11 @@ if [[ -x "${GUARD_SCRIPT}" ]]; then
   printf "%s\n" "${STDIN_DATA}" | "${GUARD_SCRIPT}" --git-hook pre-push "$@"
 fi
 
-# Chain to repository-local .git/hooks/pre-push if present
-GIT_DIR="$(git rev-parse --git-dir 2>/dev/null || true)"
-if [[ -n "${GIT_DIR}" && -x "${GIT_DIR}/hooks/pre-push" ]]; then
-  LOCAL_HOOK_DIR="$(cd "${GIT_DIR}/hooks" && pwd)"
+# Chain to repository-local .git/hooks/pre-push if present (supports linked worktrees)
+GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
+if [[ -n "${GIT_COMMON_DIR}" && -x "${GIT_COMMON_DIR}/hooks/pre-push" ]]; then
+  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" && pwd)"
   if [[ "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" ]]; then
-    printf "%s\n" "${STDIN_DATA}" | "${GIT_DIR}/hooks/pre-push" "$@"
+    printf "%s\n" "${STDIN_DATA}" | "${GIT_COMMON_DIR}/hooks/pre-push" "$@"
   fi
 fi

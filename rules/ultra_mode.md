@@ -34,7 +34,7 @@ When `ultracode` is present in the prompt, execute the full **Gear 3 (`deep`) Hy
    - The subagent must execute in a fresh context across the entire cumulative diff (`git diff <base_sha>`):
      1. **`/simplify`** (Reuse, Simplification, Efficiency, Altitude) and apply simplifications directly,
      2. **`/code-review`** + **`/audit all`** (`/audit-errors`, `/audit-tests`, `/audit-types`, `/audit-comments`, `/audit-security`) and fix all `CONFIRMED` / `PLAUSIBLE` findings,
-     3. **`/verify`** (unit tests + real end-to-end runtime verification).
+     3. **`/verify`** (unit tests + real end-to-end runtime verification), concluding with `CRAFTSMAN_VERDICT: PASS` (or `CRAFTSMAN_VERDICT: FAIL` if checks fail).
    - Once the subagent reports back, close the Hard-Loop gate:
      ```bash
      python3 ~/.gemini/config/scripts/craftsman-stop-gate.py --state-file <appDataDir>/brain/<conversation-id>/craftsman_state.json --complete
