@@ -54,7 +54,7 @@ Conclude with a concise verification report:
 ```markdown
 ### Runtime Verification (`/verify`)
 - **Target / Scope:** `<description of verified changes>`
-- **Status:** ✅ **VERIFIED** / ❌ **FAILED** / ⚠️ **PARTIAL**
+- **Status:** **PASS (VERIFIED)** / **FAIL** / **PARTIAL (WARNING)**
 
 #### Verification Runs:
 1. **Import & Static Check:** `<command>` → `<result>`
@@ -66,4 +66,4 @@ Conclude with a concise verification report:
 
 If `/verify` uncovers a runtime defect:
 - Cite the exact cause and line (`[file.ext:L10-L20](file:///...)`),
-- If the fix is clear and within scope, apply it and re-run verification until `✅ VERIFIED` is achieved.
+- If the fix is clear and within scope, apply it and re-run verification until `PASS (VERIFIED)` is achieved.
