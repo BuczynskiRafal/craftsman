@@ -1,21 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 GUARD_SCRIPT="${HOOKS_DIR}/../scripts/git-guard.py"
 STDIN_DATA="$(cat)"
 
-if [[ -x "${GUARD_SCRIPT}" ]]; then
-  printf "%s\n" "${STDIN_DATA}" | "${GUARD_SCRIPT}" --git-hook pre-push "$@"
+if [[ -f "${GUARD_SCRIPT}" ]]; then
+  PY_CMD=()
+  if [[ -f "${HOOKS_DIR}/.python_cmd" ]]; then
+    read -r -a PY_CMD < "${HOOKS_DIR}/.python_cmd" || true
+  fi
+  if [[ ${#PY_CMD[@]} -gt 0 ]] && command -v "${PY_CMD[0]}" >/dev/null 2>&1; then
+    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${PY_CMD[@]}" "${GUARD_SCRIPT}" --git-hook pre-push "$@"
+  elif [[ -x "${GUARD_SCRIPT}" ]] && command -v python3 >/dev/null 2>&1; then
+    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${GUARD_SCRIPT}" --git-hook pre-push "$@"
+  elif command -v python >/dev/null 2>&1; then
+    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | python "${GUARD_SCRIPT}" --git-hook pre-push "$@"
+  fi
 fi
 
 # Chain to previous global core.hooksPath if backed up during install
+PREV_RESOLVED=""
 if [[ -f "${HOOKS_DIR}/.previous_hooks_path" ]]; then
   PREV_HOOKS_DIR="$(cat "${HOOKS_DIR}/.previous_hooks_path")"
+  [[ "${PREV_HOOKS_DIR}" == "~" ]] && PREV_HOOKS_DIR="${HOME}"
+  PREV_HOOKS_DIR="${PREV_HOOKS_DIR/#\~\//${HOME}/}"
   if [[ -n "${PREV_HOOKS_DIR}" && -x "${PREV_HOOKS_DIR}/pre-push" ]]; then
-    PREV_RESOLVED="$(cd "${PREV_HOOKS_DIR}" 2>/dev/null && pwd || true)"
+    PREV_RESOLVED="$(cd "${PREV_HOOKS_DIR}" 2>/dev/null && pwd -P || true)"
     if [[ -n "${PREV_RESOLVED}" && "${PREV_RESOLVED}" != "${HOOKS_DIR}" ]]; then
-      printf "%s\n" "${STDIN_DATA}" | "${PREV_RESOLVED}/pre-push" "$@"
+      printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${PREV_RESOLVED}/pre-push" "$@"
     fi
   fi
 fi
@@ -23,8 +36,8 @@ fi
 # Chain to repository-local .git/hooks/pre-push if present (supports linked worktrees)
 GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
 if [[ -n "${GIT_COMMON_DIR}" && -x "${GIT_COMMON_DIR}/hooks/pre-push" ]]; then
-  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" && pwd)"
-  if [[ "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" ]]; then
-    printf "%s\n" "${STDIN_DATA}" | "${GIT_COMMON_DIR}/hooks/pre-push" "$@"
+  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" 2>/dev/null && pwd -P || true)"
+  if [[ -n "${LOCAL_HOOK_DIR}" && "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" && "${LOCAL_HOOK_DIR}" != "${PREV_RESOLVED}" ]]; then
+    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${GIT_COMMON_DIR}/hooks/pre-push" "$@"
   fi
 fi

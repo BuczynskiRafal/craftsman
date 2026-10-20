@@ -13,10 +13,17 @@ from pathlib import Path
 from typing import Any
 
 from craftsman import __version__
-from craftsman.export import FRONTMATTER_RE, default_repo_dir
+from craftsman.export import (
+    FRONTMATTER_RE,
+    _resolve_windows_appdata,
+    default_copilot_skills_dir,
+    default_repo_dir,
+    default_vscode_prompts_dir,
+)
 from craftsman.export import main as export_main
 from craftsman.gate import (
     compute_cumulative_diff_summary,
+    resolve_cli_state_file,
     resolve_effective_gear_label,
 )
 from craftsman.gate import main as gate_main
@@ -89,23 +96,28 @@ def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> 
 
     src_hooks_json = repo_dir / "hooks.json"
     dst_hooks_json = cfg / "hooks.json"
-    if src_hooks_json.is_file() and dst_hooks_json.is_file():
-        try:
-            src_data = json.loads(src_hooks_json.read_text(encoding="utf-8"))
-            dst_data = json.loads(dst_hooks_json.read_text(encoding="utf-8"))
-            if isinstance(src_data, dict) and isinstance(dst_data, dict):
-                for key, val in src_data.items():
-                    dst_entry = dst_data.get(key)
-                    if not isinstance(dst_entry, dict) or not isinstance(val, dict):
-                        drifted.append("hooks.json")
-                        break
-                    if dst_entry.get("command") != val.get("command") or dst_entry.get(
-                        "matcher"
-                    ) != val.get("matcher"):
-                        drifted.append("hooks.json")
-                        break
-        except (OSError, json.JSONDecodeError):
-            drifted.append("hooks.json")
+    if src_hooks_json.is_file():
+        if not dst_hooks_json.is_file():
+            drifted.append(f"hooks.json (missing in {cfg})")
+        else:
+            try:
+                src_data = json.loads(src_hooks_json.read_text(encoding="utf-8"))
+                dst_data = json.loads(dst_hooks_json.read_text(encoding="utf-8"))
+                if not isinstance(src_data, dict) or not isinstance(dst_data, dict):
+                    drifted.append("hooks.json")
+                else:
+                    for key, val in src_data.items():
+                        dst_entry = dst_data.get(key)
+                        if not isinstance(dst_entry, dict) or not isinstance(val, dict):
+                            drifted.append("hooks.json")
+                            break
+                        if not isinstance(dst_entry.get("enabled"), bool) or {
+                            k: v for k, v in dst_entry.items() if k != "enabled"
+                        } != {k: v for k, v in val.items() if k != "enabled"}:
+                            drifted.append("hooks.json")
+                            break
+            except (OSError, json.JSONDecodeError):
+                drifted.append("hooks.json")
 
     return drifted
 
@@ -164,9 +176,18 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
     hooks_path = _git_config_get("core.hooksPath")
 
     home = Path.home()
+    vscode_prompts = default_vscode_prompts_dir()
+    copilot_skills = default_copilot_skills_dir()
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    linux_cfg_root = Path(xdg_cfg) if xdg_cfg else (home / ".config")
+    win_appdata_root = _resolve_windows_appdata(home) or (home / "AppData" / "Roaming")
     installed_targets = {
         "antigravity": (home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file(),
         "claude_code": (home / ".claude" / "commands" / "craftsman.md").is_file(),
+        "github_copilot": (
+            (vscode_prompts / "craftsman.prompt.md").is_file()
+            or (copilot_skills / "craftsman" / "SKILL.md").is_file()
+        ),
         "github_copilot_macos": (
             home
             / "Library"
@@ -177,7 +198,10 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
             / "craftsman.prompt.md"
         ).is_file(),
         "github_copilot_linux": (
-            home / ".config" / "Code" / "User" / "prompts" / "craftsman.prompt.md"
+            linux_cfg_root / "Code" / "User" / "prompts" / "craftsman.prompt.md"
+        ).is_file(),
+        "github_copilot_windows": (
+            win_appdata_root / "Code" / "User" / "prompts" / "craftsman.prompt.md"
         ).is_file(),
         "global_git_hooks": bool(hooks_path and Path(hooks_path).expanduser().is_dir()),
     }
@@ -249,6 +273,10 @@ def _empty_diff_summary() -> dict[str, int]:
 
 def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) -> int:
     """Display the current 3-Gear state machine and cumulative diff metrics."""
+    if state_file is None or "$(git rev-parse" in str(state_file):
+        candidate = resolve_cli_state_file(None, cwd)
+        state_file = candidate if candidate.is_file() else None
+
     state: dict[str, Any] = {}
     if state_file and state_file.is_file():
         try:

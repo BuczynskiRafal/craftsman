@@ -60,14 +60,14 @@ QUALITY_GATE_PROMPT_KEYWORDS = (
     "sprawdź",
 )
 CRAFTSMAN_FINAL_VERDICT_RE = re.compile(
-    r"(?im)(?:^[ \t]*|\bcontent=[ \t]*)(?:[-*>][ \t]*)?\*{0,2}"
+    r"(?im)(?:^[ \t]*|\bcontent=[ \t]*)(?:(?:[-*>]+|#{1,6})[ \t]*)?[*`]{0,3}"
     r"(?:craftsman_verdict|overall[ \t]+verdict)"
-    r"[ \t*]*:[ \t*]*(?:✅[ \t*]*|❌[ \t*]*)?\*{0,2}(pass(?:ed)?|fail(?:ed)?|reject(?:ed)?)\b"
+    r"[ \t*`]*:[ \t*`]*(?:✅[ \t*`]*|❌[ \t*`]*)?[*`]{0,3}(pass(?:ed)?|fail(?:ed)?|reject(?:ed)?)\b"
 )
 AUDIT_SECTION_FAIL_RE = re.compile(
-    r"(?im)(?:^[ \t]*|\bcontent=[ \t]*)(?:[-*>][ \t]*)?\*{0,2}"
-    r"(?:verdict|verify[ \t]+status|status)"
-    r"[ \t*]*:[ \t*]*(?:❌[ \t*]*)?\*{0,2}(?:fail|failed|reject|rejected)\b(?![ \t]+initially\b)"
+    r"(?im)(?:^[ \t]*|\bcontent=[ \t]*)(?:(?:[-*>]+|#{1,6})[ \t]*)?[*`]{0,3}"
+    r"(?:craftsman_verdict|overall[ \t]+verdict|verdict|verify[ \t]+status|status)"
+    r"[ \t*`]*:[ \t*`]*(?:❌[ \t*`]*)?[*`]{0,3}(?:fail|failed|reject|rejected)\b(?![ \t]+initially\b)"
     r"|\bquality_gate_failed\b"
 )
 SUBAGENT_ACK_CONV_ID_RE = re.compile(r'"conversationId"\s*:\s*"([^"]+)"')
@@ -100,9 +100,17 @@ SKILL_METADATA_TRIGGER_RE = re.compile(
     r"<SKILL>[^<]*skills/craftsman/SKILL\.md</SKILL>", re.IGNORECASE
 )
 USER_REQUEST_BLOCK_RE = re.compile(
-    r"<USER_REQUEST>(.*?)</USER_REQUEST>", re.DOTALL | re.IGNORECASE
+    r"<USER_REQUEST>((?:(?!</?USER_REQUEST>).)*?)</USER_REQUEST>", re.DOTALL | re.IGNORECASE
 )
 QUOTED_SPAN_RE = re.compile(r"`[^`]*`|\"[^\"]*\"|(?<![A-Za-z0-9])'[^'\n]*'(?![A-Za-z0-9])")
+GIT_NEW_COMMIT_SEGMENT_RE = re.compile(
+    r"\bgit\b(?:\s+(?:-[Cc]\s+\S+|--[a-z-]+(?:=\S+)?|-[A-Za-z0-9]+))*\s+"
+    r"(?:commit|merge|cherry-pick)\b(?![-\w])"
+)
+GIT_NON_NEW_COMMIT_FLAG_RE = re.compile(
+    r"\s(?:--abort|--quit|--dry-run|--no-commit|--amend|--help|-h)\b"
+    r"|\bcherry-pick\b[^\n;&|]*\s-n\b"
+)
 
 
 def get_head_sha(cwd: str | None = None) -> str | None:
@@ -125,9 +133,10 @@ def get_head_sha(cwd: str | None = None) -> str | None:
 
 def _count_successful_commits_after_trigger(
     entries: list[dict[str, Any]], trigger_step: int
-) -> int:
+) -> tuple[int, bool]:
     has_generic = any(e.get("type") == "GENERIC" for e in entries)
     commit_count = 0
+    saw_command_tool = False
     for idx, entry in enumerate(entries):
         step_idx = _safe_int(entry.get("step_index"), idx + 1)
         if step_idx <= trigger_step:
@@ -146,12 +155,17 @@ def _count_successful_commits_after_trigger(
         for tc in entry.get("tool_calls") or []:
             if not isinstance(tc, dict) or tc.get("name") not in ("run_command", "Bash"):
                 continue
+            saw_command_tool = True
             args = tc.get("args") or tc.get("input") or {}
             if isinstance(args, dict):
                 cmd = str(args.get("CommandLine") or args.get("command") or "")
-                matches = re.findall(r"\bgit\b[^;&|]*?\b(?:commit|merge|cherry-pick)\b", cmd)
-                commit_count += len(matches)
-    return commit_count
+                unquoted_cmd = QUOTED_SPAN_RE.sub(" ", cmd)
+                for seg in re.split(r"[;\n|&]+", unquoted_cmd):
+                    if GIT_NEW_COMMIT_SEGMENT_RE.search(
+                        seg
+                    ) and not GIT_NON_NEW_COMMIT_FLAG_RE.search(seg):
+                        commit_count += 1
+    return commit_count, saw_command_tool
 
 
 def resolve_auto_base_sha(
@@ -165,7 +179,7 @@ def resolve_auto_base_sha(
     if not head_sha or not cwd or not os.path.isdir(cwd):
         return head_sha
 
-    commit_calls = _count_successful_commits_after_trigger(entries, trigger_step)
+    commit_calls, saw_command_tool = _count_successful_commits_after_trigger(entries, trigger_step)
     if commit_calls > 0:
         try:
             proc = subprocess.run(
@@ -181,7 +195,7 @@ def resolve_auto_base_sha(
         except (OSError, subprocess.SubprocessError):
             pass
 
-    if transcript_path is not None and transcript_path.is_file():
+    if not saw_command_tool and transcript_path is not None and transcript_path.is_file():
         try:
             st = transcript_path.stat()
             t_start = getattr(st, "st_birthtime", st.st_ctime)
@@ -194,7 +208,11 @@ def resolve_auto_base_sha(
                 ]
                 earliest_old_sha: str | None = None
                 for ln in reversed(lines):
-                    header = ln.split("\t", 1)[0]
+                    tab_parts = ln.split("\t", 1)
+                    header = tab_parts[0]
+                    action = tab_parts[1] if len(tab_parts) > 1 else ""
+                    if not action.startswith(("commit:", "merge ", "cherry-pick:")):
+                        continue
                     parts = header.split()
                     if len(parts) < 5 or parts[0] == "0" * 40:
                         continue
@@ -317,7 +335,7 @@ def requires_subagent_for_state(state: dict[str, Any], fallback_cwd: str | None 
         return False
 
     # tier == "auto": measure cumulative diff in git if cwd is available
-    cwd = fallback_cwd or state.get("cwd")
+    cwd = state.get("cwd") or fallback_cwd
     base_sha = state.get("base_sha")
     stats = compute_cumulative_diff_stats(
         cwd if isinstance(cwd, str) else None,
@@ -625,8 +643,8 @@ def is_craftsman_trigger_content(content: str) -> tuple[bool, str]:
         args_text = args_match.group(1).strip() if args_match else ""
         return True, _extract_craftsman_flag_tier(f"/craftsman {args_text}", "/craftsman")
 
-    req_match = USER_REQUEST_BLOCK_RE.search(content)
-    user_text = req_match.group(1).strip() if req_match else content.strip()
+    req_matches = list(USER_REQUEST_BLOCK_RE.finditer(content))
+    user_text = req_matches[-1].group(1).strip() if req_matches else content.strip()
     has_skill_tag = bool(SKILL_METADATA_TRIGGER_RE.search(content))
 
     # Strip quoted or backticked mentions (preserving English contractions like Don't / it's)
@@ -698,6 +716,8 @@ def _is_quality_gate_subagent_spec(sub: dict[str, Any]) -> bool:
 
 
 def _entry_invokes_quality_gate_subagent(entry: dict[str, Any]) -> bool:
+    if entry.get("status") == "ERROR":
+        return False
     tool_calls = entry.get("tool_calls")
     if not isinstance(tool_calls, list):
         return False
@@ -739,6 +759,18 @@ def _entry_invokes_quality_gate_subagent(entry: dict[str, Any]) -> bool:
             except json.JSONDecodeError:
                 parsed_subagents = None
 
+        if parsed_subagents is None and any(k in args for k in ("TypeName", "Role", "Prompt")):
+            unquoted_sub: dict[str, Any] = {}
+            for k, v in args.items():
+                if isinstance(v, str) and v.startswith('"') and v.endswith('"'):
+                    try:
+                        unquoted_sub[k] = json.loads(v)
+                    except json.JSONDecodeError:
+                        unquoted_sub[k] = v.strip('"')
+                else:
+                    unquoted_sub[k] = v
+            parsed_subagents = [unquoted_sub]
+
         if parsed_subagents is not None:
             if any(
                 isinstance(sub, dict) and _is_quality_gate_subagent_spec(sub)
@@ -749,7 +781,7 @@ def _entry_invokes_quality_gate_subagent(entry: dict[str, Any]) -> bool:
 
         # Fallback for truncated transcript lines where Subagents JSON string was cut off
         args_dump = json.dumps(args, ensure_ascii=False).lower().replace('\\"', '"')
-        if '"typename": "research"' in args_dump or '"typename":"research"' in args_dump:
+        if re.search(r'"typename"\s*:\s*"+research"+', args_dump):
             continue
         if all(skill in args_dump for skill in QUALITY_GATE_SKILL_MARKERS):
             return True
@@ -766,28 +798,31 @@ SHELL_FILE_MUTATION_RE = re.compile(
     r"|\btee\s+(?:-a\s+)?(?!/dev/null\b|/tmp/|/var/folders/)[A-Za-z0-9_./-]+"
     r"|\b(?:patch|git\s+apply)\b"
     r"|\b(?:cp|mv)\s+(?:-[A-Za-z]+\s+)*\S+\s+(?!/tmp/|/var/folders/)\S+"
-    r"|\b(?:ruff\s+(?:check\s+)?[^\n;&|]*--fix|black\s+|isort\s+|autopep8\s+|gofmt\s+-w|rustfmt\s+|prettier\s+[^\n;&|]*-w)\b)"
+    r"|\b(?:ruff\s+(?:check\s+)?[^\n;&|]*--fix\b"
+    r"|(?:black|isort|autopep8|rustfmt)\s+(?!--check\b|--diff\b|--version\b|--help\b|-h\b)\S+"
+    r"|gofmt\s+-w\b"
+    r"|prettier\s+[^\n;&|]*-w\b))"
 )
 PYTHON_INLINE_WRITE_RE = re.compile(
-    r"\bpython3?(?:\.\d+)?\s+-c\b[^\n;&|]*\b(?:write|write_text|write_bytes|replace|unlink|rename|shutil)\b"
+    r"\bpython3?(?:\.\d+)?\s+-c\b[^\n|&]*\b(?:write|write_text|write_bytes|replace|unlink|rename|shutil)\b"
 )
 
 
 def _shell_segment_mutates_files(seg: str) -> bool:
     if not seg or "craftsman-stop-gate" in seg or "craftsman gate" in seg:
         return False
-    if PYTHON_INLINE_WRITE_RE.search(seg):
-        return True
-    # Strip descriptor redirections (2>&1, >&2) and quoted strings before checking for file redirection
+    # Strip descriptor redirections (2>&1, >&2) before checking for file redirection
     cleaned = re.sub(r"\d*>&\d+|\d*>>?\s*/dev/null\b", " ", seg)
-    cleaned = QUOTED_SPAN_RE.sub(" ", cleaned)
     return bool(SHELL_FILE_MUTATION_RE.search(cleaned))
 
 
 def _shell_command_mutates_files(cmd: str) -> bool:
     if not cmd:
         return False
-    parts = re.split(r"[;\n]|&&|\|\|", cmd)
+    if PYTHON_INLINE_WRITE_RE.search(cmd):
+        return True
+    unquoted = QUOTED_SPAN_RE.sub(" ", cmd)
+    parts = re.split(r"[;\n]|&&|\|\|", unquoted)
     return any(_shell_segment_mutates_files(part.strip()) for part in parts if part.strip())
 
 
@@ -863,14 +898,20 @@ def _has_audit_failure_after(entries: list[dict[str, Any]], after_idx: int) -> b
     subagent_conv_ids: set[str] = set()
     ack_seen = False
     passed_first_planner = False
-    auditor_replies: list[str] = []
+    system_replies: list[str] = []
+    generic_replies: list[str] = []
+    generic_error_seen = False
 
     for entry in entries[after_idx + 1 :]:
         etype = entry.get("type")
         content = entry.get("content")
         content_str = content if isinstance(content, str) else ""
 
-        if etype in ("INVOKE_SUBAGENT", "GENERIC") and "Created the following subagents:" in content_str:
+        if (
+            not passed_first_planner
+            and etype in ("INVOKE_SUBAGENT", "GENERIC")
+            and "Created the following subagent" in content_str
+        ):
             ack_seen = True
             for cid in SUBAGENT_ACK_CONV_ID_RE.findall(content_str):
                 if cid:
@@ -880,18 +921,24 @@ def _has_audit_failure_after(entries: list[dict[str, Any]], after_idx: int) -> b
         if etype == "SYSTEM_MESSAGE" and content_str:
             if subagent_conv_ids:
                 if any(f"sender={cid}" in content_str for cid in subagent_conv_ids):
-                    auditor_replies.append(content_str)
+                    system_replies.append(content_str)
             elif not passed_first_planner:
-                auditor_replies.append(content_str)
+                system_replies.append(content_str)
             continue
 
         if etype == "PLANNER_RESPONSE":
             passed_first_planner = True
             continue
 
-        if etype == "GENERIC" and content_str and not passed_first_planner:
-            auditor_replies.append(content_str)
+        if etype == "GENERIC" and content_str and not passed_first_planner and not ack_seen:
+            if entry.get("status") == "ERROR":
+                generic_error_seen = True
+            generic_replies.append(content_str)
 
+    if not ack_seen and generic_error_seen:
+        return True
+
+    auditor_replies = system_replies if ack_seen else (system_replies + generic_replies)
     if not auditor_replies:
         # If Antigravity recorded the subagent creation ACK, the subagent is still running (no reply yet)
         if ack_seen:
@@ -949,6 +996,22 @@ def _resolve_git_worktree_state_file(cwd: str | None) -> Path | None:
     return None
 
 
+def resolve_cli_state_file(
+    raw_state_file: str | Path | None, cwd: str | None = None
+) -> Path:
+    raw_sf = str(raw_state_file or "").strip()
+    if (
+        not raw_sf
+        or "$(git rev-parse" in raw_sf
+        or raw_sf.replace("\\", "/") == "/craftsman/craftsman_state.json"
+    ):
+        fallback_dir = cwd or os.getcwd()
+        return _resolve_git_worktree_state_file(fallback_dir) or (
+            Path(fallback_dir).resolve() / ".craftsman" / "craftsman" / "craftsman_state.json"
+        )
+    return Path(raw_sf).expanduser()
+
+
 def _resolve_state_file_from_payload(
     payload: dict[str, Any], artifact_dir: str, ws_cwd: str | None = None
 ) -> Path:
@@ -995,8 +1058,11 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
     transcript_path = resolve_transcript_for_state_file(state_file, payload, ws_cwd_str)
     entries = read_transcript_entries(transcript_path)
 
+    latest_step = get_latest_step_index(entries)
     state = load_state(state_file)
     completed_at = _safe_int(state.get("completed_at_step"), -1) if state else -1
+    if completed_at > latest_step:
+        completed_at = -1
 
     # Auto-detect `/craftsman` or `ultracode` from transcript even if agent forgot `--init`
     if (not state or not state.get("active", False)) and entries:
@@ -1108,7 +1174,11 @@ def run_cli(argv: list[str]) -> int:
         prog="craftsman gate",
         description="Manage craftsman_state.json for 3-Gear Hard-Loop gating.",
     )
-    parser.add_argument("--state-file", required=True, help="Path to craftsman_state.json")
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Path to craftsman_state.json (defaults to per-worktree .git/craftsman/craftsman_state.json)",
+    )
     parser.add_argument("--init", action="store_true", help="Initialize a fresh active state")
     parser.add_argument(
         "--cwd", help="Repository working directory to capture base_sha and diff stats"
@@ -1135,7 +1205,7 @@ def run_cli(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    state_file = Path(args.state_file).expanduser()
+    state_file = resolve_cli_state_file(args.state_file, args.cwd)
     existing_state = load_state(state_file)
     hint_cwd = args.cwd or (
         existing_state.get("cwd")
@@ -1147,26 +1217,39 @@ def run_cli(argv: list[str]) -> int:
     latest_step = get_latest_step_index(entries)
 
     state = existing_state
-    if (args.init and not args.complete) or state is None:
+    existing_was_active = bool(state and state.get("active", False))
+    completed_at = _safe_int(state.get("completed_at_step"), -1) if state else -1
+    eff_completed_at = completed_at if completed_at <= latest_step else -1
+    reinit_inactive = (
+        state is not None
+        and not existing_was_active
+        and not args.resume
+        and (
+            detect_untracked_craftsman_trigger(entries, eff_completed_at) is not None
+            or (args.complete and latest_step > eff_completed_at)
+        )
+    )
+
+    if (args.init and not args.complete) or state is None or reinit_inactive:
         if args.init and not args.complete:
             start_step = latest_step
             initial_tier = args.tier or ("deep" if args.mode == "ultracode" else "auto")
-            base_sha = args.base_sha or get_head_sha(args.cwd)
+            base_sha = args.base_sha or get_head_sha(hint_cwd)
         else:
-            detected = detect_untracked_craftsman_trigger(entries, -1)
-            start_step = detected[0] if detected is not None else 0
+            detected = detect_untracked_craftsman_trigger(entries, eff_completed_at)
+            start_step = detected[0] if detected is not None else max(0, eff_completed_at)
             detected_tier = detected[1] if detected is not None else "auto"
             if args.complete and args.tier == "quick" and detected_tier != "quick":
                 initial_tier = detected_tier
             else:
                 initial_tier = args.tier or detected_tier
             base_sha = args.base_sha or resolve_auto_base_sha(
-                args.cwd, entries, start_step, transcript_path
+                hint_cwd, entries, start_step, transcript_path
             )
         state = default_state(
             mode=args.mode,
             tier=initial_tier,
-            cwd=args.cwd,
+            cwd=hint_cwd,
             base_sha=base_sha,
             started_at_step=start_step,
             auto_detected=not bool(args.init and not args.complete),
@@ -1174,8 +1257,7 @@ def run_cli(argv: list[str]) -> int:
     elif args.tier:
         # On an already-active state file, tier is monotonically non-decreasing (cannot downgrade standard/deep -> quick)
         current_tier = str(state.get("tier") or "auto").strip().lower()
-        is_active = bool(state.get("active", False))
-        if not is_active or TIER_RANK.get(args.tier, 1) >= TIER_RANK.get(current_tier, 1):
+        if not existing_was_active or TIER_RANK.get(args.tier, 1) >= TIER_RANK.get(current_tier, 1):
             state["tier"] = args.tier
 
     gates = state.setdefault("gates", {"simplified": False, "reviewed": False, "verified": False})
@@ -1183,7 +1265,11 @@ def run_cli(argv: list[str]) -> int:
         state["cwd"] = args.cwd
     if args.stage:
         state["stage"] = args.stage
-    if args.base_sha:
+    if args.base_sha and (
+        (args.init and not args.complete)
+        or not existing_was_active
+        or not state.get("base_sha")
+    ):
         state["base_sha"] = args.base_sha
     if args.await_user:
         state["awaiting_user"] = True

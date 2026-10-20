@@ -1948,6 +1948,434 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             )
             self.assertEqual(downgrade_res.returncode, 1)
 
+    def test_pr6_review_regressions_gate_and_guard(self) -> None:
+        from craftsman.cli import detect_antigravity_drift
+        from craftsman.export import export_to_agents_workspace
+        from craftsman.gate import (
+            _count_successful_commits_after_trigger,
+            _entry_invokes_quality_gate_subagent,
+            _evaluate_auditor_report_text,
+            _has_audit_failure_after,
+            _shell_command_mutates_files,
+            is_craftsman_trigger_content,
+        )
+
+        # 1. Top-level JSON-quoted invoke_subagent args (Antigravity real format)
+        research_entry = {
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": '"research"',
+                        "Role": '"Code Reviewer"',
+                        "Prompt": '"Run /simplify, /code-review, and /verify on diff"',
+                    },
+                }
+            ],
+        }
+        self.assertFalse(_entry_invokes_quality_gate_subagent(research_entry))
+
+        self_auditor_entry = {
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": '"self"',
+                        "Role": '"Craftsman Quality Gate Auditor"',
+                        "Prompt": '"Run /simplify, /code-review, and /verify on diff"',
+                    },
+                }
+            ],
+        }
+        self.assertTrue(_entry_invokes_quality_gate_subagent(self_auditor_entry))
+
+        # Singular "Created the following subagent:" ACK + sibling GENERIC output must stay pending until SYSTEM_MESSAGE
+        pending_entries = [
+            self_auditor_entry,
+            {"step_index": 2, "type": "GENERIC", "content": "The command exited with code 0."},
+            {
+                "step_index": 3,
+                "type": "GENERIC",
+                "content": 'Created the following subagent:\n{\n  "conversationId": "sub-99"\n}',
+            },
+        ]
+        self.assertTrue(_has_audit_failure_after(pending_entries, 0))
+
+        # Backticked / heading-formatted verdicts
+        self.assertTrue(_evaluate_auditor_report_text("Done.\n`CRAFTSMAN_VERDICT: FAIL`"))
+        self.assertTrue(_evaluate_auditor_report_text("### CRAFTSMAN_VERDICT: FAIL"))
+        self.assertFalse(
+            _evaluate_auditor_report_text(
+                "Fixed a bug where status: failed was returned.\n`CRAFTSMAN_VERDICT: PASS`"
+            )
+        )
+
+        # 2. Shell redirections, braces, and branch names ending in digits
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({"step_index": 1, "type": "USER_INPUT"}) + "\n", encoding="utf-8"
+            )
+            for blocked_cmd in (
+                "git push 2>&1 origin main",
+                "git push &> /dev/null origin main",
+                "git push origin HEAD@{0}:main",
+            ):
+                res = run_hook(
+                    GIT_GUARD,
+                    {
+                        "transcriptPath": str(transcript),
+                        "toolCall": {"name": "run_command", "args": {"CommandLine": blocked_cmd}},
+                    },
+                )
+                self.assertEqual(res["decision"], "deny", f"Expected deny for: {blocked_cmd}")
+
+            # Feature branch main2 with redirection must be allowed
+            res_main2 = run_hook(
+                GIT_GUARD,
+                {
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": "git push origin main2>/dev/null"},
+                    },
+                },
+            )
+            self.assertEqual(res_main2["decision"], "allow")
+
+            # Human Co-authored-by names containing ai/bot/aider substrings must be allowed
+            for human_author in (
+                "Nikolai <nikolai@example.com>",
+                "John Talbot <j@talbot.org>",
+                "Sarah Raider <s@dubai.ae>",
+            ):
+                res_human = run_hook(
+                    GIT_GUARD,
+                    {
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": f'git commit -m "feat: x\n\nCo-authored-by: {human_author}"'
+                            },
+                        }
+                    },
+                )
+                self.assertEqual(res_human["decision"], "allow", f"Failed for {human_author}")
+
+            # Direct-to-main approval with "(no PR)" and echoed "rejected" in question
+            entries_no_pr = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "ask_question",
+                            "args": {
+                                "questions": [
+                                    {
+                                        "question": "The previous hook rejected the push; how should we push to main?",
+                                        "options": [
+                                            "Push directly to main (no PR)",
+                                            "Create a feature branch",
+                                        ],
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "content": "Q1: The previous hook rejected the push; how should we push to main?\nA1: Push directly to main (no PR)",
+                },
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(e) for e in entries_no_pr) + "\n", encoding="utf-8"
+            )
+            res_no_pr = run_hook(
+                GIT_GUARD,
+                {
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": "git push origin main"},
+                    },
+                },
+            )
+            self.assertEqual(res_no_pr["decision"], "allow")
+
+            # Compound command where second segment is --force must still return force_ask
+            res_compound_force = run_hook(
+                GIT_GUARD,
+                {
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {
+                            "CommandLine": "git push origin main && git push --force origin main"
+                        },
+                    },
+                },
+            )
+            self.assertEqual(res_compound_force["decision"], "force_ask")
+
+            # Multi-question ask_question where Q1 is unrelated ("Yes") and Q2 rejects ("Open a PR")
+            entries_multi_q = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "ask_question",
+                            "args": {
+                                "questions": [
+                                    {"question": "Run unit tests first?", "options": ["Yes", "No"]},
+                                    {
+                                        "question": "Push directly to main or open a PR?",
+                                        "options": ["Open a PR", "Push directly to main"],
+                                    },
+                                ]
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "content": "Q1: Run unit tests first?\nA1: Yes\nQ2: Push directly to main or open a PR?\nA2: Open a PR",
+                },
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(e) for e in entries_multi_q) + "\n", encoding="utf-8"
+            )
+            res_multi_q = run_hook(
+                GIT_GUARD,
+                {
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": "git push origin main"},
+                    },
+                },
+            )
+            self.assertEqual(res_multi_q["decision"], "deny")
+
+            # 3. _count_successful_commits_after_trigger ignores read-only git merge-base / commit-graph / cherry-pick -n, but counts commit -n
+            ro_entries = [
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {
+                                "CommandLine": "git merge-base origin/main HEAD && git commit-graph verify && git cherry-pick -n abc1234"
+                            },
+                        }
+                    ],
+                }
+            ]
+            self.assertEqual(_count_successful_commits_after_trigger(ro_entries, 1)[0], 0)
+            commit_n_entries = [
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "run_command",
+                            "args": {"CommandLine": 'git commit -n -m "feat: add x"'},
+                        }
+                    ],
+                }
+            ]
+            self.assertEqual(_count_successful_commits_after_trigger(commit_n_entries, 1)[0], 1)
+
+            # 4. USER_REQUEST_BLOCK_RE ignores <USER_REQUEST> inside <RULE>
+            injected = (
+                "<RULE>When `<USER_REQUEST>` contains `ultracode`, activate Gear 3.</RULE>\n"
+                "<USER_REQUEST>Fix typo in README</USER_REQUEST>"
+            )
+            self.assertEqual(is_craftsman_trigger_content(injected), (False, "auto"))
+
+            # 5. _shell_command_mutates_files catches black ., python3 -c with semicolons, and compound with craftsman-stop-gate
+            self.assertTrue(_shell_command_mutates_files("black ."))
+            self.assertFalse(_shell_command_mutates_files("black --check ."))
+            self.assertTrue(
+                _shell_command_mutates_files(
+                    'python3 -c "import pathlib; pathlib.Path(\'a.py\').write_text(\'x\')"'
+                )
+            )
+            self.assertTrue(
+                _shell_command_mutates_files(
+                    "sed -i 's/a/b/' foo.py && craftsman-stop-gate.py --state-file s.json --complete"
+                )
+            )
+
+            # 6. detect_antigravity_drift detects hooks.json command drift and export quotes globs: "*"
+            fake_cfg = Path(tmpdir) / "cfg"
+            (fake_cfg / "skills" / "craftsman").mkdir(parents=True)
+            (fake_cfg / "skills" / "craftsman" / "SKILL.md").write_text(
+                (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            (fake_cfg / "hooks.json").write_text(
+                json.dumps({"git-guard": {"enabled": True, "PreToolUse": []}}), encoding="utf-8"
+            )
+            self.assertIn("hooks.json", detect_antigravity_drift(REPO_ROOT, fake_cfg))
+
+            ws_dir = Path(tmpdir) / "ws"
+            _, cursor_mdc = export_to_agents_workspace(REPO_ROOT, ws_dir)
+            self.assertIn('globs: "*"', cursor_mdc.read_text(encoding="utf-8"))
+
+    def test_windows_vscode_copilot_profiles_skills_and_auto_install(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        from craftsman.export import (
+            _resolve_windows_appdata,
+            default_vscode_prompts_dir,
+            export_to_copilot_skills,
+            export_to_vscode_user,
+            export_to_workspace,
+        )
+        from craftsman.gate import resolve_cli_state_file
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. Windows %APPDATA%\Code\User\prompts resolution + MSYS2 drive path normalization
+            fake_appdata = str(Path(tmpdir) / "AppData" / "Roaming")
+            with (
+                patch.dict(os.environ, {"APPDATA": fake_appdata}, clear=False),
+                patch("sys.platform", "win32"),
+            ):
+                win_prompts = default_vscode_prompts_dir()
+                self.assertEqual(
+                    win_prompts, Path(fake_appdata) / "Code" / "User" / "prompts"
+                )
+
+            msys_home = Path(tmpdir) / "msys_home"
+            (msys_home / "AppData" / "Roaming").mkdir(parents=True)
+            with (
+                patch.dict(
+                    os.environ,
+                    {"APPDATA": r"C:\Users\Dev\AppData\Roaming"},
+                    clear=False,
+                ),
+                patch("os.name", "posix"),
+            ):
+                self.assertEqual(
+                    _resolve_windows_appdata(msys_home),
+                    msys_home / "AppData" / "Roaming",
+                )
+
+            # 2. Custom VS Code profiles under Code/User/profiles/<id>/prompts
+            code_user = Path(tmpdir) / "Code" / "User"
+            prof_a = code_user / "profiles" / "work-profile-1"
+            prof_a.mkdir(parents=True)
+            export_to_vscode_user(REPO_ROOT, code_user / "prompts")
+            self.assertTrue((code_user / "prompts" / "craftsman.prompt.md").is_file())
+            self.assertTrue((prof_a / "prompts" / "craftsman.prompt.md").is_file())
+            self.assertTrue(
+                (prof_a / "prompts" / "craftsman-rules.instructions.md").is_file()
+            )
+            prompt_content = (code_user / "prompts" / "craftsman.prompt.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("agent: 'agent'", prompt_content)
+
+            # Custom --user-dir not named 'prompts' must not touch sibling profiles/
+            custom_parent = Path(tmpdir) / "custom_parent"
+            unrelated_prof = custom_parent / "profiles" / "unrelated"
+            unrelated_prof.mkdir(parents=True)
+            export_to_vscode_user(REPO_ROOT, custom_parent / "my_out")
+            self.assertFalse((unrelated_prof / "prompts").exists())
+
+            # 3. Native Copilot Agent Skills (~/.copilot/skills/*/SKILL.md and .github/skills/*/SKILL.md)
+            skills_out = Path(tmpdir) / ".copilot" / "skills"
+            skills_count = export_to_copilot_skills(REPO_ROOT, skills_out)
+            self.assertEqual(skills_count, 17)
+            self.assertTrue((skills_out / "craftsman" / "SKILL.md").is_file())
+
+            ws = Path(tmpdir) / "ws_copilot"
+            export_to_workspace(REPO_ROOT, ws)
+            self.assertTrue((ws / ".github" / "skills" / "craftsman" / "SKILL.md").is_file())
+
+            # 4. craftsman gate without --state-file (or with unexpanded PowerShell string) & craftsman status
+            repo_dir = Path(tmpdir) / "repo_ps"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+            init_res = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "craftsman.cli",
+                    "gate",
+                    "--state-file",
+                    "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json",
+                    "--init",
+                    "--tier",
+                    "quick",
+                    "--cwd",
+                    str(repo_dir),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(init_res.returncode, 0, init_res.stderr)
+            self.assertTrue(
+                (repo_dir / ".git" / "craftsman" / "craftsman_state.json").is_file()
+            )
+            self.assertEqual(
+                resolve_cli_state_file("/craftsman/craftsman_state.json", str(repo_dir)).resolve(),
+                (repo_dir / ".git" / "craftsman" / "craftsman_state.json").resolve(),
+            )
+
+            status_res = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "craftsman.cli",
+                    "status",
+                    "--cwd",
+                    str(repo_dir),
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            status_payload = json.loads(status_res.stdout)
+            self.assertTrue(status_payload["active"])
+
+            # 5. install.sh --auto on a Copilot-only machine must NOT create ~/.gemini or ~/.claude
+            fake_home = Path(tmpdir) / "copilot_only_home"
+            fake_appdata_home = fake_home / "AppData" / "Roaming"
+            (fake_appdata_home / "Code" / "User").mkdir(parents=True)
+            env_auto = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": str(fake_home),
+                "APPDATA": str(fake_appdata_home),
+                "TERM_PROGRAM": "vscode",
+            }
+            auto_proc = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "--no-git-hooks"],
+                env=env_auto,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(auto_proc.returncode, 0, auto_proc.stderr)
+            self.assertFalse((fake_home / ".gemini").exists())
+            self.assertFalse((fake_home / ".claude").exists())
+            self.assertTrue((fake_home / ".copilot" / "skills" / "craftsman" / "SKILL.md").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

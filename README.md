@@ -110,20 +110,25 @@ Craftsman is an **engineering discipline harness**, not a cryptographic security
 
 One repository exports native slash commands, prompts, instructions, and lifecycle hooks across all major AI coding harnesses.
 
-### Option A: Shell Installer (Zero Setup)
+### Option A: Shell Installer (Auto-Detect or Target-Specific)
 
 ```bash
 git clone https://github.com/BuczynskiRafal/craftsman.git ~/.craftsman
 cd ~/.craftsman
 
-# Install everywhere at once (Antigravity + Claude Code + GitHub Copilot + Global Git Hooks):
-./install.sh --all
+# Auto-detect installed IDEs/agents on this machine + install Global Git Hooks:
+./install.sh
+
+# Or install only for a specific platform (without touching other IDEs' directories):
+./install.sh --copilot --git-hooks       # VS Code / GitHub Copilot only
+./install.sh --claude --git-hooks        # Claude Code only
+./install.sh --antigravity --git-hooks   # Google Antigravity only
 
 # For local development on Craftsman itself, use symlink mode to prevent config drift:
 ./install.sh --symlink --git-hooks
 ```
 
-### Option B: Python CLI (`craftsman`)
+### Option B: Python CLI (`craftsman` — Cross-Platform: macOS, Linux, Windows PowerShell)
 
 Craftsman is a standard PEP 621 Python package (`python >= 3.10`) using exclusively the Python standard library:
 
@@ -132,6 +137,9 @@ pip install .
 # or editable mode:
 pip install -e .
 
+# Export skills & rules to VS Code GitHub Copilot (%APPDATA%\Code\User\prompts + ~/.copilot/skills):
+craftsman export --user-dir
+
 # Verify installation health, skill manifests, config drift, and active Git hooks:
 craftsman doctor
 craftsman doctor --json
@@ -139,20 +147,21 @@ craftsman doctor --json
 # Inspect current repository cumulative diff and recommended Quality Gate Gear:
 craftsman status --cwd /path/to/repo
 
-# Export skills and rules to Claude Code, GitHub Copilot, Codex (AGENTS.md), and Cursor:
+# Export skills and rules to a project workspace (Copilot, Codex AGENTS.md, and Cursor):
 craftsman export --workspace /path/to/repo --agents-workspace /path/to/repo
 ```
 
 ### Target-Specific Flags (`./install.sh`)
 | Flag | Target Platform / Effect |
 | :--- | :--- |
-| `./install.sh --all` | Installs across **Google Antigravity**, **Claude Code**, **GitHub Copilot**, and **Global Git Hooks** in one shot. |
+| `./install.sh` *(or `--auto`)* | **Recommended:** Auto-detects installed platforms (**GitHub Copilot**, **Claude Code**, **Google Antigravity**) and installs **Global Git Hooks** without creating directories for uninstalled tools. |
+| `./install.sh --copilot` | Exports all 17 prompt files (`*.prompt.md`), native Copilot Agent Skills (`~/.copilot/skills/*/SKILL.md`), and global instructions (`craftsman-rules.instructions.md`) to VS Code User profile (including custom VS Code profiles on Windows, macOS, and Linux). |
 | `./install.sh --claude` | Exports all 17 slash commands (`~/.claude/commands/*.md`) and global rules (`~/.claude/rules/craftsman-rules.md`) for **Claude Code**. |
-| `./install.sh --copilot` | Exports all 17 prompt files (`*.prompt.md`) and global instructions (`craftsman-rules.instructions.md`) to VS Code User profile for **GitHub Copilot Chat**. |
-| `./install.sh --copilot-workspace <dir>` | Exports `.github/prompts/*.prompt.md` and updates `.github/copilot-instructions.md` (preserving existing content via `<!-- craftsman:begin/end -->` markers). |
+| `./install.sh --antigravity` / `--copy` / `--symlink` / `--plugin` | Installs skills, rules, `hooks.json` (merged non-destructively), and scripts into `~/.gemini/config/` (or `~/.gemini/config/plugins/craftsman`) for **Google Antigravity**. |
+| `./install.sh --git-hooks` | Installs OS-level `commit-msg` and `pre-push` hooks plus passthrough shims for all standard local hooks (`pre-commit`, `post-checkout`, etc.) into `~/.craftsman/git-hooks` (or `~/.gemini/config/git-hooks` when Antigravity is present). |
+| `./install.sh --copilot-workspace <dir>` | Exports `.github/prompts/*.prompt.md`, `.github/skills/*/SKILL.md`, and updates `.github/copilot-instructions.md` (preserving existing content via `<!-- craftsman:begin/end -->` markers). |
 | `./install.sh --agents-workspace <dir>` | Updates universal `AGENTS.md` (preserving existing content via `<!-- craftsman:begin/end -->` markers) and generates `.cursor/rules/craftsman.mdc` (**Cursor**). |
-| `./install.sh --git-hooks` | Installs OS-level `commit-msg` and `pre-push` hooks plus passthrough shims for all standard local hooks (`pre-commit`, `post-checkout`, etc.) into `~/.gemini/config/git-hooks`. |
-| `./install.sh --copy` / `--symlink` / `--plugin` | Installs skills, rules, `hooks.json` (merged non-destructively), and scripts into `~/.gemini/config/` (or `~/.gemini/config/plugins/craftsman`) for **Google Antigravity**. |
+| `./install.sh --all` | Force-installs across **all** platforms (**Google Antigravity**, **Claude Code**, **GitHub Copilot**, and **Global Git Hooks**) even if some IDEs are not installed. |
 
 ---
 
