@@ -909,6 +909,12 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                 },
                 {
                     "step_index": 2,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "content": "Q1: Push directly to main?\nA1: Push directly to main",
+                },
+                {
+                    "step_index": 3,
                     "type": "PLANNER_RESPONSE",
                     "status": "DONE",
                     "tool_calls": [
@@ -1699,9 +1705,248 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
         rewritten = _rewrite_antigravity_paths(raw)
         self.assertNotIn("python3 craftsman gate", rewritten)
         self.assertIn(
-            'craftsman gate --state-file "$(git rev-parse --git-common-dir)/craftsman/craftsman_state.json" --complete',
+            'craftsman gate --state-file "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json" --complete',
             rewritten,
         )
+        # Quoted placeholder must not produce double quotes ""...""
+        raw_quoted = '--state-file "<artifactDirectoryPath>/craftsman_state.json"'
+        rewritten_quoted = _rewrite_antigravity_paths(raw_quoted)
+        self.assertNotIn('""', rewritten_quoted)
+        self.assertEqual(
+            rewritten_quoted,
+            '--state-file "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json"',
+        )
+
+    def test_human_co_authored_by_allowed_while_ai_trailers_and_gh_merge_body_blocked(
+        self,
+    ) -> None:
+        # Human co-author trailer must be allowed
+        human_res = run_hook(
+            GIT_GUARD,
+            {
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {
+                        "CommandLine": 'git commit -m "feat: pair work\n\nCo-authored-by: Jan Kowalski <jan@kowalski.pl>"'
+                    },
+                }
+            },
+        )
+        self.assertEqual(human_res["decision"], "allow")
+
+        # AI trailers with '=' or Assisted-by or gh pr merge --body must be denied
+        for cmd in (
+            'git commit -m "feat: x" --trailer "Co-authored-by=Claude"',
+            'git commit -m "feat: x\n\nAssisted-by: Claude"',
+            'gh pr merge 1 --squash --body "Co-authored-by: Claude <noreply@anthropic.com>"',
+            'gh pr comment 1 --body "Generated with [Claude Code](https://claude.com)"',
+        ):
+            res = run_hook(
+                GIT_GUARD,
+                {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}},
+            )
+            self.assertEqual(res["decision"], "deny", f"Expected deny for: {cmd}")
+
+    def test_ask_question_denies_refusals_mentioning_main_and_feature_branch_questions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "transcript.jsonl"
+            q_entry = {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {
+                        "name": "ask_question",
+                        "args": {
+                            "questions": json.dumps(
+                                [
+                                    {
+                                        "question": "How should I push the changes?",
+                                        "options": [
+                                            "(Recommended) Feature branch + PR to main",
+                                            "Push directly to main",
+                                        ],
+                                    }
+                                ]
+                            )
+                        },
+                    }
+                ],
+            }
+            for refusal_text in (
+                "A1: (Recommended) Feature branch + PR to main",
+                "A1: No, do not push to main",
+                "A1: Nie wypychaj na main, zrób PR",
+                "A1: Open PR, then squash merge",
+            ):
+                transcript.write_text(
+                    json.dumps(q_entry)
+                    + "\n"
+                    + json.dumps({"step_index": 2, "type": "GENERIC", "content": refusal_text})
+                    + "\n",
+                    encoding="utf-8",
+                )
+                res = run_hook(
+                    GIT_GUARD,
+                    {
+                        "transcriptPath": str(transcript),
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {"CommandLine": "git push origin main"},
+                        },
+                    },
+                )
+                self.assertEqual(
+                    res["decision"], "deny", f"Expected deny for refusal: {refusal_text}"
+                )
+
+            # Question asking only about feature branch + PR must not unlock push to main
+            pr_only_q = {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {
+                        "name": "ask_question",
+                        "args": {
+                            "questions": [
+                                {
+                                    "question": "Should I push to a feature branch and open a PR?",
+                                    "options": ["Yes", "No"],
+                                }
+                            ]
+                        },
+                    }
+                ],
+            }
+            transcript.write_text(
+                json.dumps(pr_only_q)
+                + "\n"
+                + json.dumps({"step_index": 2, "type": "GENERIC", "content": "A1: Yes"})
+                + "\n",
+                encoding="utf-8",
+            )
+            res_pr_q = run_hook(
+                GIT_GUARD,
+                {
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_command",
+                        "args": {"CommandLine": "git push origin main"},
+                    },
+                },
+            )
+            self.assertEqual(res_pr_q["decision"], "deny")
+
+    def test_gate_verdict_correlates_system_message_and_blocks_tier_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "dev@example.com"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Dev"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            (repo_dir / "big.py").write_text(
+                "\n".join(f"x_{i} = {i}" for i in range(60)) + "\n", encoding="utf-8"
+            )
+
+            artifact_dir = Path(tmpdir) / "brain"
+            logs_dir = artifact_dir / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True)
+            transcript = logs_dir / "transcript.jsonl"
+            state_file = artifact_dir / "craftsman_state.json"
+
+            # Realistic Antigravity sequence: invoke_subagent -> ACK -> PLANNER_RESPONSE (wait) -> SYSTEM_MESSAGE with FAIL
+            entries = [
+                {"step_index": 1, "type": "USER_INPUT", "content": "/craftsman build"},
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {
+                                "Subagents": json.dumps(
+                                    [
+                                        {
+                                            "TypeName": "self",
+                                            "Role": "Craftsman Quality Gate Auditor",
+                                            "Prompt": "Run /simplify, /code-review, and /verify",
+                                        }
+                                    ]
+                                )
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "content": 'Created the following subagents:\n{\n  "conversationId": "aud-123"\n}',
+                },
+                {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "Waiting for auditor..."},
+                {
+                    "step_index": 5,
+                    "type": "SYSTEM_MESSAGE",
+                    "content": "<SYSTEM_MESSAGE>\n[Message] sender=aud-123 content=## Simplify\nVerdict: PASS\n## Verify\nCRAFTSMAN_VERDICT: FAIL\n</SYSTEM_MESSAGE>",
+                },
+            ]
+            transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--init",
+                    "--cwd",
+                    str(repo_dir),
+                    "--tier",
+                    "standard",
+                ],
+                check=True,
+            )
+            st = json.loads(state_file.read_text(encoding="utf-8"))
+            st["started_at_step"] = 1
+            state_file.write_text(json.dumps(st), encoding="utf-8")
+
+            # Must reject --complete because SYSTEM_MESSAGE has CRAFTSMAN_VERDICT: FAIL
+            fail_res = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(fail_res.returncode, 1)
+
+            # Separate call `--tier quick` followed by `--complete` must NOT downgrade active standard tier
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(STOP_GATE),
+                    "--state-file",
+                    str(state_file),
+                    "--tier",
+                    "quick",
+                ],
+                check=True,
+            )
+            downgrade_res = subprocess.run(
+                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(downgrade_res.returncode, 1)
 
 
 if __name__ == "__main__":

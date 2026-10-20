@@ -22,6 +22,12 @@ STANDARD_PASSTHROUGH_GIT_HOOKS=(
   "post-checkout"
   "post-merge"
   "post-rewrite"
+  "pre-receive"
+  "update"
+  "proc-receive"
+  "post-receive"
+  "post-update"
+  "push-to-checkout"
 )
 
 MODE="copy"
@@ -49,8 +55,8 @@ Universal Multi-Platform Options:
                                 into ~/.gemini/config/git-hooks and set git config --global core.hooksPath
 
 Google Antigravity Options:
-  --copy                        (Default) Copy skills, rules, hooks.json, and scripts into ~/.gemini/config/
-  --symlink                     Symlink skills, rules, hooks.json, and scripts into ~/.gemini/config/
+  --copy                        (Default) Copy skills, rules, scripts, and merge hooks.json into ~/.gemini/config/
+  --symlink                     Symlink skills, rules, and scripts (and merge hooks.json) into ~/.gemini/config/
   --plugin                      Install as a toggleable Antigravity plugin in ~/.gemini/config/plugins/craftsman
   -h, --help                    Show this help message
 EOF
@@ -201,6 +207,17 @@ write_passthrough_git_hook() {
 set -euo pipefail
 
 HOOKS_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -f "\${HOOKS_DIR}/.previous_hooks_path" ]]; then
+  PREV_HOOKS_DIR="\$(cat "\${HOOKS_DIR}/.previous_hooks_path")"
+  if [[ -n "\${PREV_HOOKS_DIR}" && -x "\${PREV_HOOKS_DIR}/${hook_name}" ]]; then
+    PREV_RESOLVED="\$(cd "\${PREV_HOOKS_DIR}" 2>/dev/null && pwd || true)"
+    if [[ -n "\${PREV_RESOLVED}" && "\${PREV_RESOLVED}" != "\${HOOKS_DIR}" ]]; then
+      "\${PREV_RESOLVED}/${hook_name}" "\$@"
+    fi
+  fi
+fi
+
 GIT_COMMON_DIR="\$(git rev-parse --git-common-dir 2>/dev/null || true)"
 if [[ -n "\${GIT_COMMON_DIR}" && -x "\${GIT_COMMON_DIR}/hooks/${hook_name}" ]]; then
   LOCAL_HOOK_DIR="\$(cd "\${GIT_COMMON_DIR}/hooks" && pwd)"

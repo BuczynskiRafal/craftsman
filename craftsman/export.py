@@ -89,22 +89,28 @@ GATE_SCRIPT_INVOCATION_RE = re.compile(
 
 
 def _rewrite_antigravity_paths(body: str) -> str:
-    """Rewrite Antigravity-specific script and artifact paths to portable CLI equivalents."""
+    """Rewrite Antigravity-specific script and artifact paths to portable per-worktree CLI equivalents."""
+    state_expr = "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json"
+    dir_expr = "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman"
     rewritten = GATE_SCRIPT_INVOCATION_RE.sub("craftsman gate", body)
     rewritten = rewritten.replace(
+        '"<artifactDirectoryPath>/craftsman_state.json"',
+        f'"{state_expr}"',
+    )
+    rewritten = rewritten.replace(
         "<artifactDirectoryPath>/craftsman_state.json",
-        '"$(git rev-parse --git-common-dir)/craftsman/craftsman_state.json"',
+        f'"{state_expr}"',
+    )
+    rewritten = rewritten.replace(
+        '"<appDataDir>/brain/<conversation-id>/craftsman_state.json"',
+        f'"{state_expr}"',
     )
     rewritten = rewritten.replace(
         "<appDataDir>/brain/<conversation-id>/craftsman_state.json",
-        '"$(git rev-parse --git-common-dir)/craftsman/craftsman_state.json"',
+        f'"{state_expr}"',
     )
-    rewritten = rewritten.replace(
-        "<artifactDirectoryPath>", "$(git rev-parse --git-common-dir)/craftsman"
-    )
-    rewritten = rewritten.replace(
-        "<appDataDir>/brain/<conversation-id>", "$(git rev-parse --git-common-dir)/craftsman"
-    )
+    rewritten = rewritten.replace("<artifactDirectoryPath>", dir_expr)
+    rewritten = rewritten.replace("<appDataDir>/brain/<conversation-id>", dir_expr)
     return rewritten
 
 

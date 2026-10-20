@@ -32,17 +32,22 @@ PROTECTED_BRANCHES = frozenset(
     }
 )
 
+AI_BOT_NAMES_PATTERN = (
+    r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|"
+    r"cursor|windsurf|codex|aider|cody|qwen|deepseek|llama|mistral|"
+    r"ai\b|llm\b|bot\b|agent\b|assistant\b|"
+    r"noreply@anthropic\.com|noreply@openai\.com|copilot@github\.com|"
+    r"gemini\S*@google\.com|ai@google\.com)"
+)
+AI_BOT_NAMES_RE = re.compile(r"(?i)" + AI_BOT_NAMES_PATTERN)
+AI_TRAILER_HEADER_RE = re.compile(
+    r"(?i)\b(?:co-?authored-by|assisted-by)[ \t]*[:=][ \t]*([^\r\n]{1,240})"
+)
+
 AI_ATTRIBUTION_PATTERNS = (
-    re.compile(r"(?im)^[ \t]*co-authored-by[ \t]*:[ \t]*\S+"),
-    re.compile(
-        r"(?i)\bco-authored-by[ \t]*:[ \t]*[^\r\n]*"
-        r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|"
-        r"cursor|windsurf|codex|ai\b|llm\b|bot\b|noreply@|<[^>\r\n]+@[^>\r\n]+>)"
-    ),
     re.compile(
         r"(?im)^[ \t]*(?:🤖[ \t]*|[*-][ \t]*|>[ \t]*)?generated[ \t]+(?:by|with)[ \t]+\[?"
-        r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|"
-        r"cursor|windsurf|codex|ai\b|llm\b)"
+        + AI_BOT_NAMES_PATTERN
     ),
     re.compile(r"(?i)🤖[ \t]*generated[ \t]+with"),
 )
@@ -51,7 +56,10 @@ PUSH_ACTION_RE = re.compile(
     r"(?i)\b(push\w*|wypchn\w*|wrzu[cć]\w*|merge\w*|zmerguj\w*|scal\w*)\b"
 )
 PUSH_TARGET_RE = re.compile(
-    r"(?i)\b(main|master|protected\s+branch|chronion\w+\s+gał\w*|pr\b|pull\s+request)\b"
+    r"(?i)(?:\b(?:main|master|protected\s+branch)\b|"
+    r"\bchronion\w+\s+gał[aąę][zź]\w*|"
+    r"\bgał[aąę][zź]\w*\s+chronion\w*|"
+    r"\bpr\s+merge\b|\bmerge\b[^\n]{0,30}\b(?:pr|pull\s+request)\b)"
 )
 DIRECT_MAIN_APPROVAL_RE = re.compile(
     r"(?i)\b(main|master|merge\w*|zmerguj\w*|scal\w*)\b"
@@ -59,10 +67,14 @@ DIRECT_MAIN_APPROVAL_RE = re.compile(
 AFFIRMATIVE_SHORT_RE = re.compile(
     r"(?i)^\s*(?:a\d+\s*:\s*)?(?:\(recommended\)\s*)?(?:yes|tak|y|t|ok|okay|confirm\w*|proceed|zatwierd[zź]\w*)\s*[.!]*\s*$"
 )
-PR_ONLY_REJECTION_RE = re.compile(
-    r"(?i)\b(feature\s+branch|now[aą]\s+gał[aę][zź]|osobn[aą]\s+gał[aę][zź]|"
-    r"bez\s+wypychania|do\s+not\s+push|don't\s+push|nie\s+wypychaj|cancel|skip)\b"
+PR_BRANCH_REJECTION_RE = re.compile(
+    r"(?i)(?:\b(?:feature\s+branch|pull\s+request|open\s+(?:a\s+)?pr|create\s+(?:a\s+)?pr|"
+    r"utw[oó]rz\s+pr|zrób\s+pr|now[aą]\s+gał[aąę][zź]|osobn[aą]\s+gał[aąę][zź]|"
+    r"bez\s+wypychania|do\s+not\s+push|don't\s+push|nie\s+wypychaj|"
+    r"do\s+not\s+merge|don't\s+merge|cancel|skip|abort|odrzu[cć])\b|"
+    r"(?:^|\b)(?:no|nie)\b)"
 )
+CLAUDE_ANSWER_PAIR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"')
 HEREDOC_OPEN_RE = re.compile(
     r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
 )
@@ -82,7 +94,21 @@ INLINE_MESSAGE_OPTS = frozenset(
 )
 
 SHELL_EXECUTABLES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
-SIMPLE_WRAPPERS = frozenset({"env", "command", "sudo", "time", "nohup", "nice", "stdbuf"})
+SIMPLE_WRAPPERS = frozenset(
+    {"env", "command", "sudo", "time", "nohup", "nice", "stdbuf", "exec", "builtin"}
+)
+SHELL_CONTROL_KEYWORDS = frozenset({"if", "then", "elif", "else", "fi", "do", "done", "while", "until"})
+WRAPPER_OPTS_WITH_VALUE: dict[str, frozenset[str]] = {
+    "nice": frozenset({"-n", "--adjustment"}),
+    "sudo": frozenset({"-u", "-g", "-C", "-D", "-R", "-T", "-h", "-p", "-r", "-t", "--user", "--group", "--chdir", "--prompt"}),
+    "env": frozenset({"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "command": frozenset(),
+    "time": frozenset({"-f", "-o", "--format", "--output"}),
+    "exec": frozenset({"-a"}),
+    "nohup": frozenset(),
+    "builtin": frozenset(),
+}
 TIMEOUT_OPTS_WITH_VALUE = frozenset({"-k", "-s", "--kill-after", "--signal"})
 XARGS_OPTS_WITH_VALUE = frozenset({"-n", "-L", "-I", "-P", "-d", "-E", "-a", "--max-args", "--max-procs"})
 
@@ -96,7 +122,7 @@ def emit(decision: str, reason: str | None = None) -> None:
 
 
 def split_shell_segments(command_line: str) -> list[str]:
-    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, or newlines, preserving heredoc bodies."""
+    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
     segments: list[str] = []
     current: list[str] = []
     quote: str | None = None
@@ -154,7 +180,7 @@ def split_shell_segments(command_line: str) -> list[str]:
                     segments.append(seg)
                 current = []
                 continue
-        if ch in (";", "\n", "(", ")", "`"):
+        if ch in (";", "\n", "(", ")", "{", "}", "`"):
             seg = "".join(current).strip()
             if seg:
                 segments.append(seg)
@@ -181,17 +207,41 @@ def split_shell_segments(command_line: str) -> list[str]:
 
 
 def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
-    """Strip leading env assignments and command wrappers (`env`, `timeout`, `xargs`, etc.)."""
+    """Strip leading env assignments, shell control keywords, and command wrappers (`env`, `nice`, `sudo`, `timeout`, `xargs`, etc.)."""
     idx = 0
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
+        if tok in SHELL_CONTROL_KEYWORDS:
+            idx += 1
+            continue
+        if tok == "for" and idx + 2 < n and tokens[idx + 2] == "in":
+            idx += 3
+            while idx < n and tokens[idx] not in ("do",):
+                idx += 1
+            continue
         if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
             idx += 1
             continue
         exe = os.path.basename(tok)
         if exe in SIMPLE_WRAPPERS:
+            opts_with_val = WRAPPER_OPTS_WITH_VALUE.get(exe, frozenset())
             idx += 1
+            while idx < n:
+                cur_tok = tokens[idx]
+                if cur_tok == "--":
+                    idx += 1
+                    break
+                if "=" in cur_tok and not cur_tok.startswith("-") and cur_tok.split("=", 1)[0].isidentifier():
+                    idx += 1
+                    continue
+                if cur_tok in opts_with_val:
+                    idx += 2
+                    continue
+                if cur_tok.startswith("-"):
+                    idx += 1
+                    continue
+                break
             continue
         if exe == "timeout":
             idx += 1
@@ -217,17 +267,48 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
         break
 
     # Remove shell here-string operator '<<<' so `xargs git push origin <<< main` preserves 'main'
-    cleaned: list[str] = []
-    for t in tokens[idx:]:
-        if t == "<<<":
+    return [t for t in tokens[idx:] if t != "<<<"]
+
+
+def _separate_unquoted_redirections(cmd_header: str) -> str:
+    """Insert spaces before unquoted redirection operators (`>/dev/null`, `2>&1`) without altering quoted strings."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i = 0
+    n = len(cmd_header)
+    while i < n:
+        ch = cmd_header[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
             continue
-        # Split attached output redirection like `main>/dev/null` or `main2>/dev/null`
-        redir_match = re.match(r"^([^<>]+?)(?:\d*>>?|\d*>&\d+).*$", t)
-        if redir_match and redir_match.group(1):
-            cleaned.append(redir_match.group(1))
-        else:
-            cleaned.append(t)
-    return cleaned
+        if ch == "\\":
+            escaped = quote != "'"
+            out.append(ch)
+            i += 1
+            continue
+        if quote:
+            if ch == quote:
+                quote = None
+            out.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        # Check for unquoted `2>&1`, `>/path`, `>>/path`, `2>/path`
+        redir_m = re.match(r"^(\d*>>?|\d*>&\d+)(\S*)", cmd_header[i:])
+        if redir_m and (i == 0 or not cmd_header[i - 1].isdigit()):
+            i += len(redir_m.group(0))
+            out.append(" ")
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def tokenize_segment(segment: str) -> list[str]:
@@ -235,6 +316,7 @@ def tokenize_segment(segment: str) -> list[str]:
     hd_match = HEREDOC_OPEN_RE.search(cmd_header)
     if hd_match:
         cmd_header = cmd_header[: hd_match.start()]
+    cmd_header = _separate_unquoted_redirections(cmd_header)
     try:
         tokens = shlex.split(cmd_header, posix=True)
     except ValueError:
@@ -242,8 +324,8 @@ def tokenize_segment(segment: str) -> list[str]:
     return _strip_wrappers_from_tokens(tokens)
 
 
-def _extract_nested_shell_command(tokens: list[str]) -> str | None:
-    """If `tokens` invoke `bash -c '...'` or `eval ...`, return the inner command string."""
+def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> str | None:
+    """If `tokens` invoke `bash -c '...'`, `bash <<EOF`, or `eval ...`, return the inner command string."""
     if not tokens:
         return None
     exe = os.path.basename(tokens[0])
@@ -261,11 +343,16 @@ def _extract_nested_shell_command(tokens: list[str]) -> str | None:
                 i += 1
                 continue
             break
+        if "\n" in raw_segment and HEREDOC_OPEN_RE.search(raw_segment.split("\n", 1)[0]):
+            body = raw_segment.split("\n", 1)[1]
+            body_lines = body.splitlines()
+            if body_lines:
+                return "\n".join(body_lines[:-1])
     return None
 
 
 def expand_shell_segments(command_line: str, max_depth: int = 4) -> list[str]:
-    """Split a shell command line and recursively expand `sh/bash/zsh -c` and `eval` wrappers."""
+    """Split a shell command line and recursively expand `sh/bash/zsh -c`, heredoc shells, and `eval` wrappers."""
     base_segments = split_shell_segments(command_line)
     if max_depth <= 0:
         return base_segments
@@ -274,7 +361,7 @@ def expand_shell_segments(command_line: str, max_depth: int = 4) -> list[str]:
     for seg in base_segments:
         expanded.append(seg)
         tokens = tokenize_segment(seg)
-        nested = _extract_nested_shell_command(tokens)
+        nested = _extract_nested_shell_command(tokens, seg)
         if nested:
             expanded.extend(expand_shell_segments(nested, max_depth=max_depth - 1))
     return expanded
@@ -348,9 +435,34 @@ def parse_git_invocation(
             resolved = aliases[sub]
             sub = resolved[0]
             sub_args = resolved[1:] + sub_args
+        if sub == "subtree" and sub_args and sub_args[0] == "push":
+            sub = "push"
+            sub_args = sub_args[1:]
         return sub, sub_args, cwd
 
     return None, [], cwd
+
+
+def _parse_gh_subcommands(tokens: list[str]) -> list[str]:
+    """Extract positional subcommands from a `gh` invocation after stripping `-R`/`--repo`/`--hostname`."""
+    if not tokens or os.path.basename(tokens[0]) != "gh":
+        return []
+    pos: list[str] = []
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-R", "--repo", "--hostname") and i + 1 < len(tokens):
+            i += 2
+            continue
+        if tok.startswith(("-R", "--repo=", "--hostname=")) and len(tok) > 2:
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        pos.append(tok)
+        i += 1
+    return pos
 
 
 def is_ai_attribution_check_target(tokens: list[str]) -> bool:
@@ -360,19 +472,37 @@ def is_ai_attribution_check_target(tokens: list[str]) -> bool:
     if exe == "git":
         sub, _, _ = parse_git_invocation(tokens, None)
         return sub in ("commit", "merge", "tag", "notes")
-    if exe == "gh" and len(tokens) >= 3:
-        return (tokens[1], tokens[2]) in (("pr", "create"), ("pr", "edit"), ("release", "create"))
+    if exe == "gh":
+        gh_pos = _parse_gh_subcommands(tokens)
+        if len(gh_pos) >= 2:
+            return (gh_pos[0], gh_pos[1]) in (
+                ("pr", "create"),
+                ("pr", "edit"),
+                ("pr", "merge"),
+                ("pr", "comment"),
+                ("pr", "review"),
+                ("release", "create"),
+                ("release", "edit"),
+                ("issue", "create"),
+                ("issue", "comment"),
+            )
     return False
 
 
 def is_gh_pr_merge(tokens: list[str]) -> bool:
-    """Return True if tokens invoke `gh pr merge` (which merges into base branch on remote)."""
-    if len(tokens) < 3:
+    """Return True if tokens invoke `gh pr merge` or `gh api .../pulls/.../merge`."""
+    if not tokens or os.path.basename(tokens[0]) != "gh":
         return False
-    exe = os.path.basename(tokens[0])
-    if exe != "gh" or (tokens[1], tokens[2]) != ("pr", "merge"):
+    if any(flag in tokens[1:] for flag in ("-h", "--help")):
         return False
-    return not any(flag in tokens[3:] for flag in ("-h", "--help"))
+    gh_pos = _parse_gh_subcommands(tokens)
+    if len(gh_pos) >= 2 and (gh_pos[0], gh_pos[1]) == ("pr", "merge"):
+        return True
+    if gh_pos and gh_pos[0] == "api":
+        joined = " ".join(tokens[1:])
+        if re.search(r"pulls/\d+/merge\b", joined):
+            return True
+    return False
 
 
 def extract_inline_messages(tokens: list[str]) -> list[str]:
@@ -434,10 +564,15 @@ def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
 
 def _matches_ai_attribution_text(text: str) -> bool:
     normalized = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
-    return any(
-        pattern.search(text) or pattern.search(normalized)
-        for pattern in AI_ATTRIBUTION_PATTERNS
-    )
+    candidates = (text,) if normalized == text else (text, normalized)
+    for candidate in candidates:
+        if any(pattern.search(candidate) for pattern in AI_ATTRIBUTION_PATTERNS):
+            return True
+        if AI_BOT_NAMES_RE.search(candidate):
+            for match in AI_TRAILER_HEADER_RE.finditer(candidate):
+                if AI_BOT_NAMES_RE.search(match.group(1)):
+                    return True
+    return False
 
 
 def has_ai_attribution(
@@ -496,10 +631,17 @@ def get_repo_toplevel(cwd: str | None) -> Path | None:
     return None
 
 
+def _normalize_refspec_dest(dest: str) -> str:
+    cleaned = dest.strip().lower()
+    cleaned = re.split(r"[~^]", cleaned, maxsplit=1)[0]
+    return cleaned
+
+
 def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
     """Return (targets_protected_branch, is_force_push)."""
     is_force = False
     is_all_or_mirror = False
+    is_delete = False
     positional: list[str] = []
 
     i = 0
@@ -508,10 +650,10 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
         if arg == "--":
             positional.extend(sub_args[i + 1 :])
             break
-        if arg in PUSH_OPTS_WITH_VALUE:
+        if arg in PUSH_OPTS_WITH_VALUE or arg in ("-P", "--prefix"):
             i += 2
             continue
-        if any(arg.startswith(f"{opt}=") for opt in PUSH_OPTS_WITH_VALUE):
+        if any(arg.startswith(f"{opt}=") for opt in (*PUSH_OPTS_WITH_VALUE, "--prefix")):
             i += 1
             continue
         if arg.startswith("-o") and len(arg) > 2:
@@ -519,6 +661,10 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
             continue
         if arg in ("--dry-run", "-n", "-h", "--help"):
             return False, False
+        if arg in ("-d", "--delete"):
+            is_delete = True
+            i += 1
+            continue
         if arg in (
             "-f",
             "--force",
@@ -532,6 +678,16 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
             is_all_or_mirror = True
             i += 1
             continue
+        if arg.startswith("-") and not arg.startswith("--") and len(arg) > 2:
+            short_flags = arg[1:]
+            if "n" in short_flags or "h" in short_flags:
+                return False, False
+            if "f" in short_flags:
+                is_force = True
+            if "d" in short_flags:
+                is_delete = True
+            i += 1
+            continue
         if arg.startswith("-"):
             i += 1
             continue
@@ -543,7 +699,7 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
 
     # positional[0] is remote (if any), positional[1:] are refspecs
     if len(positional) <= 1:
-        branch = get_current_branch(cwd)
+        branch = (get_current_branch(cwd) or "").lower()
         if branch in PROTECTED_BRANCHES:
             return True, is_force
         return False, is_force
@@ -552,11 +708,14 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
         if refspec.startswith("+"):
             is_force = True
             refspec = refspec[1:]
-        dest = refspec.split(":", 1)[-1].strip()
+        if refspec.startswith(":"):
+            is_delete = True
+        dest = _normalize_refspec_dest(refspec.split(":", 1)[-1])
+        cur_branch = (get_current_branch(cwd) or "").lower()
         if dest in PROTECTED_BRANCHES or (
-            dest in ("HEAD", "@") and get_current_branch(cwd) in PROTECTED_BRANCHES
+            dest in ("head", "@") and cur_branch in PROTECTED_BRANCHES
         ):
-            return True, is_force
+            return True, (is_force or is_delete)
 
     return False, is_force
 
@@ -668,7 +827,11 @@ def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
                 opts = item.get("options")
                 if isinstance(opts, list):
                     for opt in opts:
-                        if isinstance(opt, str) and opt.strip():
+                        if isinstance(opt, dict):
+                            lbl = opt.get("label")
+                            if isinstance(lbl, str) and lbl.strip():
+                                parts.append(lbl.strip())
+                        elif isinstance(opt, str) and opt.strip():
                             parts.append(opt.strip())
             elif isinstance(item, str) and item.strip():
                 parts.append(item.strip())
@@ -679,54 +842,74 @@ def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
 
 
 def _is_push_confirmation_question(tc: dict[str, Any]) -> bool:
-    """Return True only if `ask_question` asks about pushing/merging to a protected branch (`main`/`master`/PR)."""
+    """Return True only if `ask_question` asks about pushing/merging to a protected branch (`main`/`master`)."""
     decoded_text = _extract_decoded_question_text(tc)
     if not decoded_text:
         return False
     return bool(PUSH_ACTION_RE.search(decoded_text) and PUSH_TARGET_RE.search(decoded_text))
 
 
+def _extract_user_answer_candidates(combined_resp: str) -> list[str]:
+    """Extract individual user answer strings from Antigravity (`A1: ...`) or Claude (`"q"="a"`)."""
+    if (
+        "The user doesn't want to proceed" in combined_resp
+        or "rejected" in combined_resp.lower()
+    ):
+        return []
+
+    a_lines = [
+        re.sub(r"^A\d+\s*:\s*", "", line.strip())
+        for line in combined_resp.splitlines()
+        if re.match(r"^A\d+\s*:", line.strip())
+    ]
+    if a_lines:
+        return [a_lines[0]]
+
+    claude_pairs = CLAUDE_ANSWER_PAIR_RE.findall(combined_resp)
+    if claude_pairs:
+        return [ans.strip() for _, ans in claude_pairs if ans.strip()]
+
+    return [combined_resp.strip()]
+
+
 def _is_user_response_approving_main_push(
     entries: list[dict[str, Any]], idx: int, has_generic_steps: bool
 ) -> bool:
     """Verify the user's answer following `entries[idx]` actually selected direct push/merge rather than a PR branch."""
+    if idx + 1 < len(entries):
+        next_type = entries[idx + 1].get("type")
+        if next_type in ("PLANNER_RESPONSE", "SYSTEM_MESSAGE"):
+            return False
+
     response_step_texts: list[str] = []
     scan_idx = idx + 1
     while scan_idx < len(entries) and entries[scan_idx].get("type") in ("GENERIC", "USER_INPUT"):
+        if entries[scan_idx].get("status") == "ERROR":
+            return False
         raw_c = entries[scan_idx].get("content")
         if isinstance(raw_c, str) and raw_c.strip():
             response_step_texts.append(raw_c.strip())
         scan_idx += 1
 
     if not response_step_texts:
-        # If the transcript has GENERIC steps and ask_question is the last entry, it is still unanswered
         if has_generic_steps and idx == len(entries) - 1:
             return False
-        # Synthetic unit-test transcript without intermediate GENERIC response steps
-        return True
+        # Synthetic unit-test transcript with only the ask_question entry
+        return idx == len(entries) - 1
 
     combined_resp = "\n".join(response_step_texts)
-    answer_lines = [
-        line.strip()
-        for line in combined_resp.splitlines()
-        if re.match(r"^A\d+\s*:", line.strip())
-    ]
-    effective_answer = "\n".join(answer_lines) if answer_lines else combined_resp
-
-    if PR_ONLY_REJECTION_RE.search(effective_answer) and not re.search(
-        r"(?i)\b(main|master)\b", effective_answer
-    ):
+    candidates = _extract_user_answer_candidates(combined_resp)
+    if not candidates:
         return False
 
-    if DIRECT_MAIN_APPROVAL_RE.search(effective_answer):
-        # Ensure it's not a PR-branch answer like "Wypchnij na gałąź release/x i utwórz Pull Request"
-        if re.search(r"(?i)\b(pull\s+request|utwórz\s+pr|open\s+a\s+pr|feature\s+branch)\b", effective_answer) and not re.search(
-            r"(?i)\b(main|master)\b", effective_answer
-        ):
-            return False
+    primary_answer = candidates[0]
+    if PR_BRANCH_REJECTION_RE.search(primary_answer):
+        return False
+
+    if DIRECT_MAIN_APPROVAL_RE.search(primary_answer):
         return True
 
-    if AFFIRMATIVE_SHORT_RE.search(effective_answer):
+    if AFFIRMATIVE_SHORT_RE.search(primary_answer):
         return True
 
     return False
@@ -985,10 +1168,27 @@ def has_recent_antigravity_approval(cwd: str | None = None) -> bool:
     return False
 
 
+def _is_agent_execution_environment() -> bool:
+    """Return True if the current process is running inside an AI agent tool runner rather than a human terminal."""
+    agent_env_keys = (
+        "ANTIGRAVITY_AGENT",
+        "ANTIGRAVITY_CONVERSATION_ID",
+        "ANTIGRAVITY_TRAJECTORY_ID",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+    )
+    if any(os.environ.get(k) for k in agent_env_keys):
+        return True
+    return os.environ.get("__CFBundleIdentifier") == "com.google.antigravity"
+
+
 def _has_in_flight_agent_push(cwd: str | None = None) -> bool:
-    """Return True if a very recent workspace transcript has a trailing in-flight `git push` tool call."""
+    """Return True if running in an agent environment or a recent workspace transcript has an in-flight `git push`."""
     if os.environ.get("CRAFTSMAN_IGNORE_TRANSCRIPT") == "1":
         return False
+    if _is_agent_execution_environment():
+        return True
 
     for transcript in _find_recent_workspace_transcripts(cwd, max_age_sec=60.0):
         entries = read_transcript_entries(transcript)
@@ -1059,7 +1259,7 @@ def run_native_pre_push_hook() -> int:
     if has_recent_antigravity_approval(cwd):
         return 0
 
-    # If running interactively in a human terminal (and not an unapproved in-flight agent command), prompt via /dev/tty
+    # If running interactively in a human terminal (and not inside an agent tool runner), prompt via /dev/tty
     if os.environ.get("CRAFTSMAN_NONINTERACTIVE") != "1" and not _has_in_flight_agent_push(cwd):
         try:
             with (
