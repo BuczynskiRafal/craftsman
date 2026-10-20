@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from craftsman.gate import read_transcript_entries
+from craftsman.gate import _encode_claude_project_slug, read_transcript_entries
 
 PROTECTED_BRANCHES = frozenset(
     {
@@ -33,11 +33,11 @@ PROTECTED_BRANCHES = frozenset(
 )
 
 AI_BOT_NAMES_PATTERN = (
-    r"(?:claude|gemini|antigravity|copilot|openai|anthropic|chatgpt|gpt-?\d*|"
+    r"\b(?:claude|gemini\S*@google\.com|gemini|antigravity|copilot@github\.com|copilot|"
+    r"openai|anthropic|chatgpt|gpt(?:-?[a-z0-9.]+)?|"
     r"cursor|windsurf|codex|aider|cody|qwen|deepseek|llama|mistral|"
-    r"ai\b|llm\b|bot\b|agent\b|assistant\b|"
-    r"noreply@anthropic\.com|noreply@openai\.com|copilot@github\.com|"
-    r"gemini\S*@google\.com|ai@google\.com)"
+    r"ai@google\.com|ai|llm|bot|agent|assistant|"
+    r"noreply@anthropic\.com|noreply@openai\.com)\b"
 )
 AI_BOT_NAMES_RE = re.compile(r"(?i)" + AI_BOT_NAMES_PATTERN)
 AI_TRAILER_HEADER_RE = re.compile(
@@ -67,16 +67,29 @@ DIRECT_MAIN_APPROVAL_RE = re.compile(
 AFFIRMATIVE_SHORT_RE = re.compile(
     r"(?i)^\s*(?:a\d+\s*:\s*)?(?:\(recommended\)\s*)?(?:yes|tak|y|t|ok|okay|confirm\w*|proceed|zatwierd[zź]\w*)\s*[.!]*\s*$"
 )
+BENIGN_NO_PR_CLARIFICATION_RE = re.compile(
+    r"(?i)(?:\(\s*(?:no|without|bez)\s+(?:a\s+)?(?:pr|pull\s+request|feature\s+branch)[^)]*\)|"
+    r"\b(?:no|without|bez)\s+(?:a\s+)?(?:pr|pull\s+request|feature\s+branch)\b)"
+)
 PR_BRANCH_REJECTION_RE = re.compile(
     r"(?i)(?:\b(?:feature\s+branch|pull\s+request|open\s+(?:a\s+)?pr|create\s+(?:a\s+)?pr|"
     r"utw[oó]rz\s+pr|zrób\s+pr|now[aą]\s+gał[aąę][zź]|osobn[aą]\s+gał[aąę][zź]|"
     r"bez\s+wypychania|do\s+not\s+push|don't\s+push|nie\s+wypychaj|"
     r"do\s+not\s+merge|don't\s+merge|cancel|skip|abort|odrzu[cć])\b|"
-    r"(?:^|\b)(?:no|nie)\b)"
+    r"(?:^|\b)(?:no(?!\s+(?:pr|pull\s+request)\b)|nie(?!\s+pr\b))\b)"
+)
+USER_CANCELLATION_RE = re.compile(
+    r"(?i)(?:the user doesn't want to proceed|user\s+rejected|rejected\s+by\s+user|"
+    r"tool\s+call\s+rejected|user\s+cancelled|user\s+canceled|anulowano)"
 )
 CLAUDE_ANSWER_PAIR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"')
 HEREDOC_OPEN_RE = re.compile(
     r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+)
+_REDIR_TARGET_PAT = r"[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>]*)"
+UNQUOTED_REDIR_RE = re.compile(
+    r"(?:(?:\d+)?[<>]&[ \t]*(?:\d+|-)"
+    r"|(?:\d+)?(?:&>>?|>>?|>\|" + r"|<(?!<<|\())" + _REDIR_TARGET_PAT + r")"
 )
 GIT_SCISSORS_RE = re.compile(r"(?m)^# -+ >8 -+[ \t]*$")
 MAX_APPROVAL_STEP_DISTANCE = 25
@@ -180,7 +193,17 @@ def split_shell_segments(command_line: str) -> list[str]:
                     segments.append(seg)
                 current = []
                 continue
-        if ch in (";", "\n", "(", ")", "{", "}", "`"):
+        if ch in (";", "\n", "(", ")", "`") or (
+            ch in ("{", "}")
+            and (
+                i == 0
+                or command_line[i - 1] in (" ", "\t", "\n", ";", "(", ")", "|", "&", "`")
+            )
+            and (
+                i + 1 == n
+                or command_line[i + 1] in (" ", "\t", "\n", ";", "(", ")", "|", "&", "`")
+            )
+        ):
             seg = "".join(current).strip()
             if seg:
                 segments.append(seg)
@@ -188,6 +211,13 @@ def split_shell_segments(command_line: str) -> list[str]:
             i += 1
             continue
         if ch in ("|", "&"):
+            if ch == "&" and (
+                (i > 0 and command_line[i - 1] in (">", "<"))
+                or (i + 1 < n and command_line[i + 1] == ">")
+            ):
+                current.append(ch)
+                i += 1
+                continue
             if i + 1 < n and command_line[i + 1] == ch:
                 i += 2
             else:
@@ -300,12 +330,22 @@ def _separate_unquoted_redirections(cmd_header: str) -> str:
             out.append(ch)
             i += 1
             continue
-        # Check for unquoted `2>&1`, `>/path`, `>>/path`, `2>/path`
-        redir_m = re.match(r"^(\d*>>?|\d*>&\d+)(\S*)", cmd_header[i:])
-        if redir_m and (i == 0 or not cmd_header[i - 1].isdigit()):
-            i += len(redir_m.group(0))
-            out.append(" ")
+        if cmd_header[i:].startswith("<<<"):
+            out.append(" <<< ")
+            i += 3
             continue
+        # Check for unquoted redirections (`2>&1`, `&>/path`, `>/path`, `> /path`, `2>/path`, `< /path`)
+        if ch in ("<", ">", "&") or ch.isdigit():
+            redir_m = UNQUOTED_REDIR_RE.match(cmd_header, i)
+            if redir_m and (
+                not ch.isdigit()
+                or i == 0
+                or cmd_header[i - 1].isspace()
+                or cmd_header[i - 1] in (";", "|", "&", "(")
+            ):
+                i = redir_m.end()
+                out.append(" ")
+                continue
         out.append(ch)
         i += 1
     return "".join(out)
@@ -633,7 +673,7 @@ def get_repo_toplevel(cwd: str | None) -> Path | None:
 
 def _normalize_refspec_dest(dest: str) -> str:
     cleaned = dest.strip().lower()
-    cleaned = re.split(r"[~^]", cleaned, maxsplit=1)[0]
+    cleaned = re.split(r"[~^]|@\{", cleaned, maxsplit=1)[0]
     return cleaned
 
 
@@ -704,18 +744,22 @@ def analyze_git_push(sub_args: list[str], cwd: str | None) -> tuple[bool, bool]:
             return True, is_force
         return False, is_force
 
+    cur_branch: str | None = None
     for refspec in positional[1:]:
         if refspec.startswith("+"):
             is_force = True
             refspec = refspec[1:]
         if refspec.startswith(":"):
             is_delete = True
-        dest = _normalize_refspec_dest(refspec.split(":", 1)[-1])
-        cur_branch = (get_current_branch(cwd) or "").lower()
-        if dest in PROTECTED_BRANCHES or (
-            dest in ("head", "@") and cur_branch in PROTECTED_BRANCHES
-        ):
+        refspec_clean = re.sub(r"@\{[^}]*\}", "", refspec)
+        dest = _normalize_refspec_dest(refspec_clean.split(":", 1)[-1])
+        if dest in PROTECTED_BRANCHES:
             return True, (is_force or is_delete)
+        if dest in ("head", "@"):
+            if cur_branch is None:
+                cur_branch = (get_current_branch(cwd) or "").lower()
+            if cur_branch in PROTECTED_BRANCHES:
+                return True, (is_force or is_delete)
 
     return False, is_force
 
@@ -800,11 +844,11 @@ def _is_completed_successful_run_command(
     return True
 
 
-def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
-    """Decode `questions` / `question` fields (including JSON-string-encoded arrays) into plain text."""
+def _extract_individual_questions(tc: dict[str, Any]) -> list[str]:
+    """Decode each question in `tc` into a list of per-question text blocks (question + options)."""
     args = tc.get("args") or tc.get("input")
     if not isinstance(args, dict) or not args:
-        return ""
+        return []
 
     raw_questions: Any = args.get("questions")
     if isinstance(raw_questions, str):
@@ -813,48 +857,55 @@ def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
         except json.JSONDecodeError:
             pass
 
+    questions: list[str] = []
     raw_single: Any = args.get("question")
-    parts: list[str] = []
     if isinstance(raw_single, str) and raw_single.strip():
-        parts.append(raw_single.strip())
+        questions.append(raw_single.strip())
 
     if isinstance(raw_questions, list):
         for item in raw_questions:
             if isinstance(item, dict):
+                q_parts: list[str] = []
                 q_str = item.get("question")
                 if isinstance(q_str, str) and q_str.strip():
-                    parts.append(q_str.strip())
+                    q_parts.append(q_str.strip())
                 opts = item.get("options")
                 if isinstance(opts, list):
                     for opt in opts:
                         if isinstance(opt, dict):
                             lbl = opt.get("label")
                             if isinstance(lbl, str) and lbl.strip():
-                                parts.append(lbl.strip())
+                                q_parts.append(lbl.strip())
                         elif isinstance(opt, str) and opt.strip():
-                            parts.append(opt.strip())
+                            q_parts.append(opt.strip())
+                if q_parts:
+                    questions.append("\n".join(q_parts))
             elif isinstance(item, str) and item.strip():
-                parts.append(item.strip())
+                questions.append(item.strip())
     elif isinstance(raw_questions, str) and raw_questions.strip():
-        parts.append(raw_questions.strip())
+        questions.append(raw_questions.strip())
 
-    return "\n".join(parts)
+    return questions
+
+
+def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
+    """Decode `questions` / `question` fields (including JSON-string-encoded arrays) into plain text."""
+    return "\n".join(_extract_individual_questions(tc))
+
+
+def _is_push_target_question_text(question_text: str) -> bool:
+    return bool(PUSH_ACTION_RE.search(question_text) and PUSH_TARGET_RE.search(question_text))
 
 
 def _is_push_confirmation_question(tc: dict[str, Any]) -> bool:
     """Return True only if `ask_question` asks about pushing/merging to a protected branch (`main`/`master`)."""
-    decoded_text = _extract_decoded_question_text(tc)
-    if not decoded_text:
-        return False
-    return bool(PUSH_ACTION_RE.search(decoded_text) and PUSH_TARGET_RE.search(decoded_text))
+    questions = _extract_individual_questions(tc)
+    return any(_is_push_target_question_text(q) for q in questions)
 
 
 def _extract_user_answer_candidates(combined_resp: str) -> list[str]:
     """Extract individual user answer strings from Antigravity (`A1: ...`) or Claude (`"q"="a"`)."""
-    if (
-        "The user doesn't want to proceed" in combined_resp
-        or "rejected" in combined_resp.lower()
-    ):
+    if USER_CANCELLATION_RE.search(combined_resp):
         return []
 
     a_lines = [
@@ -863,7 +914,7 @@ def _extract_user_answer_candidates(combined_resp: str) -> list[str]:
         if re.match(r"^A\d+\s*:", line.strip())
     ]
     if a_lines:
-        return [a_lines[0]]
+        return a_lines
 
     claude_pairs = CLAUDE_ANSWER_PAIR_RE.findall(combined_resp)
     if claude_pairs:
@@ -872,8 +923,25 @@ def _extract_user_answer_candidates(combined_resp: str) -> list[str]:
     return [combined_resp.strip()]
 
 
+def _answer_rejects_direct_push(answer: str) -> bool:
+    cleaned = BENIGN_NO_PR_CLARIFICATION_RE.sub(" ", answer)
+    return bool(PR_BRANCH_REJECTION_RE.search(cleaned))
+
+
+def _answer_approves_direct_push(answer: str) -> bool:
+    cleaned = BENIGN_NO_PR_CLARIFICATION_RE.sub(" ", answer)
+    if PR_BRANCH_REJECTION_RE.search(cleaned):
+        return False
+    return bool(
+        DIRECT_MAIN_APPROVAL_RE.search(cleaned) or AFFIRMATIVE_SHORT_RE.search(cleaned)
+    )
+
+
 def _is_user_response_approving_main_push(
-    entries: list[dict[str, Any]], idx: int, has_generic_steps: bool
+    entries: list[dict[str, Any]],
+    idx: int,
+    has_generic_steps: bool,
+    tc: dict[str, Any] | None = None,
 ) -> bool:
     """Verify the user's answer following `entries[idx]` actually selected direct push/merge rather than a PR branch."""
     if idx + 1 < len(entries):
@@ -902,17 +970,21 @@ def _is_user_response_approving_main_push(
     if not candidates:
         return False
 
-    primary_answer = candidates[0]
-    if PR_BRANCH_REJECTION_RE.search(primary_answer):
+    questions = _extract_individual_questions(tc) if tc is not None else []
+    if len(questions) > 1 and len(candidates) == len(questions):
+        push_answers = [
+            ans
+            for q, ans in zip(questions, candidates, strict=False)
+            if _is_push_target_question_text(q)
+        ]
+        if not push_answers:
+            return False
+        return all(_answer_approves_direct_push(ans) for ans in push_answers)
+
+    if any(_answer_rejects_direct_push(ans) for ans in candidates):
         return False
 
-    if DIRECT_MAIN_APPROVAL_RE.search(primary_answer):
-        return True
-
-    if AFFIRMATIVE_SHORT_RE.search(primary_answer):
-        return True
-
-    return False
+    return _answer_approves_direct_push(candidates[0])
 
 
 def _command_pushes_or_merges_protected(cmd: str, cwd: str | None) -> bool:
@@ -961,7 +1033,7 @@ def was_ask_question_called_since_last_push(
             name = tc.get("name")
             if name in ("ask_question", "AskUserQuestion"):
                 if _is_push_confirmation_question(tc) and _is_user_response_approving_main_push(
-                    entries, idx, has_generic_steps
+                    entries, idx, has_generic_steps, tc=tc
                 ):
                     return True
                 continue
@@ -1042,7 +1114,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
             if transcript_path is not None and was_ask_question_called_since_last_push(
                 transcript_path, cwd_str
             ):
-                return "allow", None
+                continue
             return (
                 "deny",
                 "[CRAFTSMAN GIT-GUARD] Blocked (Global Rule #1 - No Unconfirmed Merge to Protected Branch): "
@@ -1073,7 +1145,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
             )
 
         if was_ask_question_called_since_last_push(transcript_path, effective_cwd):
-            return "allow", None
+            continue
 
         return (
             "deny",
@@ -1139,27 +1211,38 @@ def _transcript_matches_workspace(transcript_path: Path, repo_root: Path | None)
 
 
 def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600.0) -> list[Path]:
-    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
-    if not brain_dir.is_dir():
-        return []
     repo_root = get_repo_toplevel(cwd)
     if repo_root is None:
         return []
     now = time.time()
     recent: list[tuple[float, Path]] = []
-    for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
-        try:
-            mtime = p.stat().st_mtime
-        except OSError:
-            continue
-        if (now - mtime) <= max_age_sec:
-            recent.append((mtime, p))
+
+    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
+    if brain_dir.is_dir():
+        for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if (now - mtime) <= max_age_sec and _transcript_matches_workspace(p, repo_root):
+                recent.append((mtime, p))
+
+    claude_proj = Path.home() / ".claude" / "projects" / _encode_claude_project_slug(str(repo_root))
+    if claude_proj.is_dir():
+        for p in claude_proj.glob("*.jsonl"):
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if (now - mtime) <= max_age_sec:
+                recent.append((mtime, p))
+
     recent.sort(key=lambda item: item[0], reverse=True)
-    return [p for _, p in recent if _transcript_matches_workspace(p, repo_root)]
+    return [p for _, p in recent]
 
 
 def has_recent_antigravity_approval(cwd: str | None = None) -> bool:
-    """Check if an active Antigravity session for this repository approved push via ask_question."""
+    """Check if an active Antigravity or Claude Code session for this repository approved push via ask_question."""
     if os.environ.get("CRAFTSMAN_IGNORE_TRANSCRIPT") == "1":
         return False
     for transcript in _find_recent_workspace_transcripts(cwd, max_age_sec=600.0):
@@ -1178,9 +1261,7 @@ def _is_agent_execution_environment() -> bool:
         "CLAUDE_CODE_ENTRYPOINT",
         "CODEX_SANDBOX_NETWORK_DISABLED",
     )
-    if any(os.environ.get(k) for k in agent_env_keys):
-        return True
-    return os.environ.get("__CFBundleIdentifier") == "com.google.antigravity"
+    return any(bool(os.environ.get(k)) for k in agent_env_keys)
 
 
 def _has_in_flight_agent_push(cwd: str | None = None) -> bool:
@@ -1259,23 +1340,28 @@ def run_native_pre_push_hook() -> int:
     if has_recent_antigravity_approval(cwd):
         return 0
 
-    # If running interactively in a human terminal (and not inside an agent tool runner), prompt via /dev/tty
+    # If running interactively in a human terminal (and not inside an agent tool runner), prompt via /dev/tty or Windows console
     if os.environ.get("CRAFTSMAN_NONINTERACTIVE") != "1" and not _has_in_flight_agent_push(cwd):
-        try:
-            with (
-                open("/dev/tty", "w", encoding="utf-8") as tty_out,
-                open("/dev/tty", encoding="utf-8") as tty_in,
-            ):
-                tty_out.write(
-                    "[CRAFTSMAN GIT-HOOK] Detected 'git push' to a protected branch (main/master). "
-                    "Continue? [y/N]: "
-                )
-                tty_out.flush()
-                answer = tty_in.readline().strip().lower()
-                if answer in ("y", "yes", "t", "tak"):
-                    return 0
-        except OSError:
-            pass
+        tty_pairs = [("/dev/tty", "/dev/tty")]
+        if os.name == "nt" and sys.stderr.isatty():
+            tty_pairs.append(("CONOUT$", "CONIN$"))
+        for out_dev, in_dev in tty_pairs:
+            try:
+                with (
+                    open(out_dev, "w", encoding="utf-8") as tty_out,
+                    open(in_dev, encoding="utf-8") as tty_in,
+                ):
+                    tty_out.write(
+                        "[CRAFTSMAN GIT-HOOK] Detected 'git push' to a protected branch (main/master). "
+                        "Continue? [y/N]: "
+                    )
+                    tty_out.flush()
+                    answer = tty_in.readline().strip().lower()
+                    if answer in ("y", "yes", "t", "tak"):
+                        return 0
+                break
+            except OSError:
+                continue
 
     sys.stderr.write(
         "\n[CRAFTSMAN GIT-HOOK] Blocked direct 'git push' to main/master (Global Rule #1).\n"
