@@ -2,7 +2,7 @@
 """Universal Multi-Platform Exporter for Craftsman skills and rules.
 
 Supports exporting Craftsman skills and global engineering rules to:
-1. GitHub Copilot (VS Code User Profile `--user-dir` or Workspace `--workspace` -> `.github/prompts/*.prompt.md` + `.github/copilot-instructions.md`)
+1. GitHub Copilot (VS Code User Profile `--user-dir`, Agent Skills `--copilot-skills-dir` -> `~/.copilot/skills/*/SKILL.md`, or Workspace `--workspace` -> `.github/prompts/*.prompt.md` + `.github/skills/*/SKILL.md` + `.github/copilot-instructions.md`)
 2. Claude Code (`--claude-dir` -> `~/.claude/commands/<skill>.md` + `~/.claude/rules/craftsman-rules.md`)
 3. OpenAI Codex / Cursor / Universal Agents (`--agents-workspace <repo_path>` -> `AGENTS.md` + `.cursor/rules/craftsman.mdc`)
 """
@@ -10,6 +10,7 @@ Supports exporting Craftsman skills and global engineering rules to:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -34,12 +35,45 @@ def default_repo_dir() -> Path:
     return repo_root
 
 
+def _resolve_windows_appdata(home: Path | None = None) -> Path | None:
+    resolved_home = home or Path.home()
+    appdata = os.environ.get("APPDATA", "").strip()
+    win_roaming = resolved_home / "AppData" / "Roaming"
+    if appdata:
+        if os.name != "nt":
+            drive_match = re.match(r"^([A-Za-z]):[\\/](.*)$", appdata)
+            if drive_match:
+                drive = drive_match.group(1).lower()
+                rest = drive_match.group(2).replace("\\", "/")
+                for candidate in (
+                    win_roaming,
+                    Path(f"/{drive}/{rest}"),
+                    Path(f"/mnt/{drive}/{rest}"),
+                ):
+                    if candidate.is_dir():
+                        return candidate
+                return win_roaming
+        return Path(appdata)
+    if sys.platform == "win32" or os.name == "nt" or win_roaming.is_dir():
+        return win_roaming
+    return None
+
+
 def default_vscode_prompts_dir() -> Path:
     home = Path.home()
+    win_base = _resolve_windows_appdata(home)
+    if win_base is not None:
+        return win_base / "Code" / "User" / "prompts"
     mac_dir = home / "Library" / "Application Support" / "Code" / "User" / "prompts"
     if sys.platform == "darwin" or mac_dir.parent.is_dir():
         return mac_dir
-    return home / ".config" / "Code" / "User" / "prompts"
+    xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    cfg_root = Path(xdg_cfg) if xdg_cfg else (home / ".config")
+    return cfg_root / "Code" / "User" / "prompts"
+
+
+def default_copilot_skills_dir() -> Path:
+    return Path.home() / ".copilot" / "skills"
 
 
 def default_claude_dir() -> Path:
@@ -120,7 +154,9 @@ def adapt_body_for_copilot(body: str) -> str:
         "> **GitHub Copilot Agent Mode Note:** When running inside GitHub Copilot, map "
         "`run_command` to terminal execution (`run_in_terminal`), `view_file`/`replace_file_content` "
         "to workspace file read/edit tools, `ask_question` to asking the user directly in chat before "
-        "continuing, and `invoke_subagent` to sequential or sub-task execution.\n\n"
+        "continuing, and `invoke_subagent` to sequential or sub-task execution. On Windows PowerShell/CMD "
+        "(or any shell), you may omit `--state-file` and run `craftsman gate --init --tier auto --cwd .` "
+        "and `craftsman gate --complete --cwd .` directly.\n\n"
     )
     return header_note + _rewrite_antigravity_paths(body) + "\n"
 
@@ -140,7 +176,14 @@ def render_copilot_prompt_file(skill_name: str, skill_md: str) -> str:
     description, body = extract_description_and_body(skill_md, skill_name)
     safe_desc = description.replace("'", "''")
     adapted = adapt_body_for_copilot(body)
-    return f"---\nmode: 'agent'\ndescription: '{safe_desc}'\n---\n\n{adapted}"
+    return f"---\nagent: 'agent'\nmode: 'agent'\ndescription: '{safe_desc}'\n---\n\n{adapted}"
+
+
+def render_copilot_skill_file(skill_name: str, skill_md: str) -> str:
+    description, body = extract_description_and_body(skill_md, skill_name)
+    safe_desc = description.replace("'", "''")
+    adapted = adapt_body_for_copilot(body)
+    return f"---\nname: {skill_name}\ndescription: '{safe_desc}'\n---\n\n{adapted}"
 
 
 def render_claude_command_file(skill_name: str, skill_md: str) -> str:
@@ -233,6 +276,18 @@ def upsert_managed_markdown(target_file: Path, inner_content: str) -> None:
     target_file.write_text(prefix + managed_block, encoding="utf-8")
 
 
+def _render_skill_items(
+    skills_dir: Path,
+    renderer: Callable[[str, str], str],
+) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
+        raw_md = skill_path.read_text(encoding="utf-8")
+        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
+        items.append((skill_name, renderer(skill_name, raw_md)))
+    return items
+
+
 def _export_skill_files(
     skills_dir: Path,
     out_dir: Path,
@@ -240,26 +295,51 @@ def _export_skill_files(
     renderer: Callable[[str, str], str],
 ) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
-    for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
-        raw_md = skill_path.read_text(encoding="utf-8")
-        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
-        rendered = renderer(skill_name, raw_md)
+    rendered_items = _render_skill_items(skills_dir, renderer)
+    for skill_name, rendered in rendered_items:
         (out_dir / f"{skill_name}{suffix}").write_text(rendered, encoding="utf-8")
-        count += 1
-    return count
+    return len(rendered_items)
+
+
+def export_to_copilot_skills(repo_dir: Path, skills_out_dir: Path) -> int:
+    """Export native GitHub Copilot Agent Skills (<skills_out_dir>/<skill>/SKILL.md)."""
+    skills_out_dir.mkdir(parents=True, exist_ok=True)
+    rendered_items = _render_skill_items(repo_dir / "skills", render_copilot_skill_file)
+    for skill_name, rendered in rendered_items:
+        skill_dest_dir = skills_out_dir / skill_name
+        skill_dest_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dest_dir / "SKILL.md").write_text(rendered, encoding="utf-8")
+    return len(rendered_items)
 
 
 def export_to_vscode_user(repo_dir: Path, target_dir: Path) -> tuple[int, Path]:
-    count = _export_skill_files(
-        repo_dir / "skills", target_dir, ".prompt.md", render_copilot_prompt_file
+    target_dir.mkdir(parents=True, exist_ok=True)
+    rendered_prompts = _render_skill_items(repo_dir / "skills", render_copilot_prompt_file)
+    for skill_name, rendered in rendered_prompts:
+        (target_dir / f"{skill_name}.prompt.md").write_text(rendered, encoding="utf-8")
+
+    rendered_rules = _rewrite_antigravity_paths(
+        render_combined_rules(repo_dir / "rules", with_frontmatter=True)
     )
     instructions_file = target_dir / "craftsman-rules.instructions.md"
-    instructions_file.write_text(
-        _rewrite_antigravity_paths(render_combined_rules(repo_dir / "rules", with_frontmatter=True)),
-        encoding="utf-8",
-    )
-    return count, instructions_file
+    instructions_file.write_text(rendered_rules, encoding="utf-8")
+
+    # If target_dir is a VS Code User/prompts directory and custom profiles exist under User/profiles/<id>, populate them too
+    profiles_dir = target_dir.parent / "profiles"
+    if target_dir.name == "prompts" and profiles_dir.is_dir():
+        for profile_dir in sorted(profiles_dir.iterdir()):
+            if profile_dir.is_dir():
+                prof_prompts = profile_dir / "prompts"
+                prof_prompts.mkdir(parents=True, exist_ok=True)
+                for skill_name, rendered in rendered_prompts:
+                    (prof_prompts / f"{skill_name}.prompt.md").write_text(
+                        rendered, encoding="utf-8"
+                    )
+                (prof_prompts / "craftsman-rules.instructions.md").write_text(
+                    rendered_rules, encoding="utf-8"
+                )
+
+    return len(rendered_prompts), instructions_file
 
 
 def export_to_workspace(repo_dir: Path, workspace_dir: Path) -> tuple[int, Path]:
@@ -267,6 +347,7 @@ def export_to_workspace(repo_dir: Path, workspace_dir: Path) -> tuple[int, Path]
     count = _export_skill_files(
         repo_dir / "skills", github_dir / "prompts", ".prompt.md", render_copilot_prompt_file
     )
+    export_to_copilot_skills(repo_dir, github_dir / "skills")
     copilot_instructions = github_dir / "copilot-instructions.md"
     rules_content = _rewrite_antigravity_paths(
         render_combined_rules(repo_dir / "rules", with_frontmatter=False)
@@ -303,7 +384,7 @@ def export_to_agents_workspace(repo_dir: Path, workspace_dir: Path) -> tuple[Pat
     cursor_header = (
         "---\n"
         "description: Craftsman Agentic Engineering & Git Workflow Rules\n"
-        "globs: *\n"
+        'globs: "*"\n'
         "alwaysApply: true\n"
         "---\n\n"
     )
@@ -327,8 +408,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Export to VS Code User prompts directory (defaults to OS-specific Code/User/prompts)",
     )
     parser.add_argument(
+        "--copilot-skills-dir",
+        nargs="?",
+        const="",
+        help="Export native Copilot Agent Skills (defaults to ~/.copilot/skills)",
+    )
+    parser.add_argument(
         "--workspace",
-        help="Export to a target project workspace (.github/prompts and .github/copilot-instructions.md)",
+        help="Export to a target project workspace (.github/prompts, .github/skills, and .github/copilot-instructions.md)",
     )
     parser.add_argument(
         "--claude-dir",
@@ -344,9 +431,15 @@ def main(argv: list[str] | None = None) -> int:
 
     repo_dir = Path(args.repo_dir).resolve()
 
-    if not (args.user_dir is not None or args.workspace or args.claude_dir is not None or args.agents_workspace):
+    if not (
+        args.user_dir is not None
+        or args.copilot_skills_dir is not None
+        or args.workspace
+        or args.claude_dir is not None
+        or args.agents_workspace
+    ):
         parser.error(
-            "Specify at least one target: --user-dir, --workspace <path>, --claude-dir, or --agents-workspace <path>"
+            "Specify at least one target: --user-dir, --copilot-skills-dir, --workspace <path>, --claude-dir, or --agents-workspace <path>"
         )
 
     skill_manifests = sorted((repo_dir / "skills").glob("*/SKILL.md"))
@@ -361,11 +454,25 @@ def main(argv: list[str] | None = None) -> int:
         count, instr = export_to_vscode_user(repo_dir, target)
         print(f"[OK] Exported {count} Copilot prompt files (*.prompt.md) -> {target}")
         print(f"[OK] Exported global Copilot instructions -> {instr}")
+        if not args.user_dir and args.copilot_skills_dir is None:
+            skills_target = default_copilot_skills_dir()
+            skills_count = export_to_copilot_skills(repo_dir, skills_target)
+            print(f"[OK] Exported {skills_count} Copilot Agent Skills (SKILL.md) -> {skills_target}")
+
+    if args.copilot_skills_dir is not None:
+        skills_target = (
+            Path(args.copilot_skills_dir)
+            if args.copilot_skills_dir
+            else default_copilot_skills_dir()
+        )
+        skills_count = export_to_copilot_skills(repo_dir, skills_target)
+        print(f"[OK] Exported {skills_count} Copilot Agent Skills (SKILL.md) -> {skills_target}")
 
     if args.workspace:
         ws = Path(args.workspace).resolve()
         count, instr = export_to_workspace(repo_dir, ws)
         print(f"[OK] Exported {count} workspace prompt files -> {ws / '.github' / 'prompts'}")
+        print(f"[OK] Exported {count} workspace Agent Skills -> {ws / '.github' / 'skills'}")
         print(f"[OK] Exported workspace Copilot instructions -> {instr}")
 
     if args.claude_dir is not None:

@@ -2,5 +2,5 @@ graft skills
 graft rules
 graft scripts
 graft git-hooks
-include plugin.json hooks.json LICENSE README.md setup.py pyproject.toml
+include plugin.json hooks.json LICENSE README.md setup.py pyproject.toml .gitattributes
 global-exclude __pycache__ *.py[cod] .DS_Store

@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 GUARD_SCRIPT="${HOOKS_DIR}/../scripts/git-guard.py"
 
-if [[ -x "${GUARD_SCRIPT}" ]]; then
-  "${GUARD_SCRIPT}" --git-hook commit-msg "$@"
+if [[ -f "${GUARD_SCRIPT}" ]]; then
+  PY_CMD=()
+  if [[ -f "${HOOKS_DIR}/.python_cmd" ]]; then
+    read -r -a PY_CMD < "${HOOKS_DIR}/.python_cmd" || true
+  fi
+  if [[ ${#PY_CMD[@]} -gt 0 ]] && command -v "${PY_CMD[0]}" >/dev/null 2>&1; then
+    "${PY_CMD[@]}" "${GUARD_SCRIPT}" --git-hook commit-msg "$@"
+  elif [[ -x "${GUARD_SCRIPT}" ]] && command -v python3 >/dev/null 2>&1; then
+    "${GUARD_SCRIPT}" --git-hook commit-msg "$@"
+  elif command -v python >/dev/null 2>&1; then
+    python "${GUARD_SCRIPT}" --git-hook commit-msg "$@"
+  fi
 fi
 
 # Chain to previous global core.hooksPath if backed up during install
+PREV_RESOLVED=""
 if [[ -f "${HOOKS_DIR}/.previous_hooks_path" ]]; then
   PREV_HOOKS_DIR="$(cat "${HOOKS_DIR}/.previous_hooks_path")"
+  [[ "${PREV_HOOKS_DIR}" == "~" ]] && PREV_HOOKS_DIR="${HOME}"
+  PREV_HOOKS_DIR="${PREV_HOOKS_DIR/#\~\//${HOME}/}"
   if [[ -n "${PREV_HOOKS_DIR}" && -x "${PREV_HOOKS_DIR}/commit-msg" ]]; then
-    PREV_RESOLVED="$(cd "${PREV_HOOKS_DIR}" 2>/dev/null && pwd || true)"
+    PREV_RESOLVED="$(cd "${PREV_HOOKS_DIR}" 2>/dev/null && pwd -P || true)"
     if [[ -n "${PREV_RESOLVED}" && "${PREV_RESOLVED}" != "${HOOKS_DIR}" ]]; then
       "${PREV_RESOLVED}/commit-msg" "$@"
     fi
@@ -22,8 +35,8 @@ fi
 # Chain to repository-local .git/hooks/commit-msg if present (supports linked worktrees)
 GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
 if [[ -n "${GIT_COMMON_DIR}" && -x "${GIT_COMMON_DIR}/hooks/commit-msg" ]]; then
-  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" && pwd)"
-  if [[ "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" ]]; then
+  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" 2>/dev/null && pwd -P || true)"
+  if [[ -n "${LOCAL_HOOK_DIR}" && "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" && "${LOCAL_HOOK_DIR}" != "${PREV_RESOLVED}" ]]; then
     exec "${GIT_COMMON_DIR}/hooks/commit-msg" "$@"
   fi
 fi
