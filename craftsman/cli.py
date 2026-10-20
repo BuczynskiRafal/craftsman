@@ -60,7 +60,7 @@ def _sha256_file(path: Path) -> str | None:
 
 
 def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> list[str]:
-    """Compare SHA-256 hashes of repo skills/rules/scripts against installed ~/.gemini/config."""
+    """Compare SHA-256 hashes of repo skills/rules/scripts/hooks against installed ~/.gemini/config."""
     cfg = config_dir or (Path.home() / ".gemini" / "config")
     if not (cfg / "skills" / "craftsman" / "SKILL.md").is_file():
         return []
@@ -71,18 +71,42 @@ def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> 
         ("rules", "*.md"),
         ("scripts", "*.py"),
         ("craftsman", "*.py"),
+        ("git-hooks", "*"),
     ):
         src_base = repo_dir / subdir
         dst_base = cfg / subdir
         if not src_base.is_dir() or not dst_base.is_dir():
             continue
         for src_file in sorted(src_base.glob(pattern)):
+            if not src_file.is_file():
+                continue
             rel = src_file.relative_to(src_base)
             dst_file = dst_base / rel
             if not dst_file.is_file():
                 drifted.append(f"{subdir}/{rel} (missing in {cfg})")
             elif _sha256_file(src_file) != _sha256_file(dst_file):
                 drifted.append(f"{subdir}/{rel}")
+
+    src_hooks_json = repo_dir / "hooks.json"
+    dst_hooks_json = cfg / "hooks.json"
+    if src_hooks_json.is_file() and dst_hooks_json.is_file():
+        try:
+            src_data = json.loads(src_hooks_json.read_text(encoding="utf-8"))
+            dst_data = json.loads(dst_hooks_json.read_text(encoding="utf-8"))
+            if isinstance(src_data, dict) and isinstance(dst_data, dict):
+                for key, val in src_data.items():
+                    dst_entry = dst_data.get(key)
+                    if not isinstance(dst_entry, dict) or not isinstance(val, dict):
+                        drifted.append("hooks.json")
+                        break
+                    if dst_entry.get("command") != val.get("command") or dst_entry.get(
+                        "matcher"
+                    ) != val.get("matcher"):
+                        drifted.append("hooks.json")
+                        break
+        except (OSError, json.JSONDecodeError):
+            drifted.append("hooks.json")
+
     return drifted
 
 
@@ -204,9 +228,13 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
     print(f"  Git identity   : {git_name or 'unset'} <{git_email or 'unset'}>")
     print(f"  Git hooksPath  : {hooks_path or 'unset'}")
     if config_drift:
+        sync_hint = (
+            "run './install.sh --symlink' to sync"
+            if (repo_dir / "install.sh").is_file()
+            else "reinstall or re-run 'craftsman export' to sync"
+        )
         print(
-            f"  Config drift   : {len(config_drift)} file(s) differ between repo and ~/.gemini/config "
-            f"(run './install.sh --symlink' to sync)"
+            f"  Config drift   : {len(config_drift)} file(s) differ between repo and ~/.gemini/config ({sync_hint})"
         )
     for err in skill_errors:
         print(f"  [ERROR] {err}", file=sys.stderr)
@@ -239,7 +267,8 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
     diff_summary = compute_cumulative_diff_summary(effective_cwd, base_sha) or _empty_diff_summary()
 
     tier = str(state.get("tier") or "auto").strip().lower()
-    effective_gear = resolve_effective_gear_label(state, effective_cwd)
+    effective_state = dict(state, cwd=effective_cwd)
+    effective_gear = resolve_effective_gear_label(effective_state, effective_cwd)
 
     raw_gates = state.get("gates")
     gates: dict[str, Any] = (

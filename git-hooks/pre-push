@@ -9,6 +9,17 @@ if [[ -x "${GUARD_SCRIPT}" ]]; then
   printf "%s\n" "${STDIN_DATA}" | "${GUARD_SCRIPT}" --git-hook pre-push "$@"
 fi
 
+# Chain to previous global core.hooksPath if backed up during install
+if [[ -f "${HOOKS_DIR}/.previous_hooks_path" ]]; then
+  PREV_HOOKS_DIR="$(cat "${HOOKS_DIR}/.previous_hooks_path")"
+  if [[ -n "${PREV_HOOKS_DIR}" && -x "${PREV_HOOKS_DIR}/pre-push" ]]; then
+    PREV_RESOLVED="$(cd "${PREV_HOOKS_DIR}" 2>/dev/null && pwd || true)"
+    if [[ -n "${PREV_RESOLVED}" && "${PREV_RESOLVED}" != "${HOOKS_DIR}" ]]; then
+      printf "%s\n" "${STDIN_DATA}" | "${PREV_RESOLVED}/pre-push" "$@"
+    fi
+  fi
+fi
+
 # Chain to repository-local .git/hooks/pre-push if present (supports linked worktrees)
 GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
 if [[ -n "${GIT_COMMON_DIR}" && -x "${GIT_COMMON_DIR}/hooks/pre-push" ]]; then
