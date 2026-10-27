@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib
 import io
@@ -20,10 +21,16 @@ from craftsman.diffscan import DiffScanError
 from craftsman.evidence import ledger_overview
 from craftsman.export import (
     CLAUDE_HOOK_EVENTS,
+    COPILOT_DISCOVERY,
     FRONTMATTER_RE,
     HOOKS_FILENAME,
+    CopilotClient,
+    CopilotDiscoveryLocation,
     _resolve_windows_appdata,
     _rewrite_antigravity_paths,
+    craftsman_agent_names,
+    craftsman_entity_names,
+    craftsman_skill_names,
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
@@ -31,8 +38,13 @@ from craftsman.export import (
     default_vscode_prompts_dir,
     extract_description_and_body,
     extract_skill_name,
+     has_user_copilot_install,
+    has_workspace_copilot_install,
+    is_craftsman_generated_file,
     is_craftsman_hook_command,
+    iter_discovered_files,
     resolve_craftsman_pkg_dir,
+    resolve_discovery_dirs,
     user_home,
 )
 from craftsman.export import main as export_main
@@ -365,14 +377,237 @@ def _self_check() -> dict[str, bool]:
     return results
 
 
-def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
+def _is_vscode_location_disabled(
+    loc: CopilotDiscoveryLocation, home: Path | None, profile: Path | None
+) -> bool:
+    """Return True if a `.claude` discovery location is explicitly disabled in VS Code settings."""
+    if loc.scope not in ("claude-user", "claude-workspace"):
+        return False
+    setting_key = (
+        "chat.agentFilesLocations"
+        if loc.rel_path.endswith("agents")
+        else "chat.agentSkillsLocations"
+    )
+    settings_files = [default_vscode_prompts_dir(home).parent / "settings.json"]
+    if profile is not None:
+        settings_files.append(profile / "settings.json")
+    candidates: tuple[str, ...]
+    if loc.scope == "claude-user":
+        leaf = "agents" if loc.rel_path.endswith("agents") else "skills"
+        candidates = (
+            f"~/.claude/{leaf}",
+            f".claude/{leaf}",
+            str(default_claude_dir(home) / leaf),
+        )
+    else:
+        candidates = (loc.rel_path, f"./{loc.rel_path}")
+    for settings_path in settings_files:
+        if not settings_path.is_file():
+            continue
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        loc_map = data.get(setting_key)
+        if isinstance(loc_map, dict) and any(loc_map.get(key) is False for key in candidates):
+            return True
+    return False
+
+
+def scan_copilot_duplicates(
+    repo_dir: Path | None = None,
+    *,
+    home: Path | None = None,
+    workspace: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Scan `COPILOT_DISCOVERY` locations and return Craftsman entities discoverable >1 time."""
+    valid_agents = set(craftsman_agent_names(repo_dir))
+    valid_skills = set(craftsman_skill_names(repo_dir))
+    valid_all = craftsman_entity_names(repo_dir)
+
+    profiles: list[Path | None] = [None]
+    profiles_root = default_vscode_prompts_dir(home).parent / "profiles"
+    if profiles_root.is_dir():
+        profiles.extend(p for p in sorted(profiles_root.iterdir()) if p.is_dir())
+
+    duplicates_by_key: dict[
+        tuple[CopilotClient, str, str], list[tuple[CopilotDiscoveryLocation, Path]]
+    ] = {}
+
+    clients: tuple[CopilotClient, ...] = ("vscode", "copilot-cli")
+    for client in clients:
+        client_profiles: list[Path | None] = profiles if client == "vscode" else [None]
+        groups: tuple[tuple[str, tuple[CopilotDiscoveryLocation, ...], set[str]], ...] = (
+            ("agent", COPILOT_DISCOVERY[(client, "agent")], valid_agents),
+            (
+                "skill",
+                (
+                    *COPILOT_DISCOVERY[(client, "skill")],
+                    *COPILOT_DISCOVERY[(client, "prompt")],
+                ),
+                valid_skills,
+            ),
+        )
+        for kind, locations, valid_names in groups:
+            for prof in client_profiles:
+                found_in_profile: dict[str, list[tuple[CopilotDiscoveryLocation, Path]]] = {}
+                for loc in locations:
+                    if client == "vscode" and _is_vscode_location_disabled(loc, home, prof):
+                        continue
+                    for directory in resolve_discovery_dirs(
+                        loc, home=home, workspace=workspace, profile=prof
+                    ):
+                        for entity_name, file_path in iter_discovered_files(
+                            directory, loc.pattern
+                        ):
+                            if entity_name in valid_names:
+                                found_in_profile.setdefault(entity_name, []).append(
+                                    (loc, file_path)
+                                )
+                for entity_name, matches in found_in_profile.items():
+                    if len(matches) <= 1:
+                        continue
+                    key = (client, kind, entity_name)
+                    existing = duplicates_by_key.setdefault(key, [])
+                    seen_paths = {p for _, p in existing}
+                    for loc, file_path in matches:
+                        if file_path not in seen_paths:
+                            existing.append((loc, file_path))
+                            seen_paths.add(file_path)
+
+    results: list[dict[str, Any]] = []
+    for (client, kind, entity_name), entries in sorted(
+        duplicates_by_key.items(), key=lambda item: item[0]
+    ):
+        canonical_entry = next(
+            ((loc, p) for loc, p in entries if loc.canonical),
+            entries[0],
+        )
+        canonical_path = canonical_entry[1]
+        removable_paths: list[str] = []
+        preserved_paths: list[str] = []
+        has_claude_scope = False
+        claude_loc_scope: str | None = None
+        for loc, file_path in entries:
+            if loc.scope in ("claude-user", "claude-workspace"):
+                has_claude_scope = True
+                claude_loc_scope = loc.scope
+            if file_path == canonical_path:
+                continue
+            if loc.scope not in (
+                "claude-user",
+                "claude-workspace",
+            ) and is_craftsman_generated_file(file_path, valid_all):
+                removable_paths.append(str(file_path))
+            else:
+                preserved_paths.append(str(file_path))
+        results.append(
+            {
+                "client": client,
+                "kind": kind,
+                "name": entity_name,
+                "paths": [str(p) for _, p in entries],
+                "canonical_path": str(canonical_path),
+                "removable_paths": removable_paths,
+                "preserved_paths": preserved_paths,
+                "claude_collision": has_claude_scope,
+                "claude_scope": claude_loc_scope,
+            }
+        )
+    return results
+
+
+def _format_duplicate_problem(dup: dict[str, Any]) -> str:
+    client = dup["client"]
+    kind = dup["kind"]
+    name = dup["name"]
+    paths_str = ", ".join(dup["paths"])
+    if dup.get("claude_collision"):
+        setting_name = (
+            "chat.agentFilesLocations" if kind == "agent" else "chat.agentSkillsLocations"
+        )
+        leaf = "agents" if kind == "agent" else "skills"
+        loc_key = (
+            f"~/.claude/{leaf}" if dup.get("claude_scope") == "claude-user" else f".claude/{leaf}"
+        )
+        return (
+            f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
+            f'(VS Code also reads Claude Code directories; set "{setting_name}": {{"{loc_key}": false}} '
+            "in VS Code settings.json to disable)"
+        )
+    if dup["preserved_paths"]:
+        preserved_str = ", ".join(dup["preserved_paths"])
+        return (
+            f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
+            f"(unmarked user file preserved: {preserved_str}; rename or remove one copy manually)"
+        )
+    return (
+        f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
+        "(run `craftsman doctor --fix-duplicates` to remove obsolete Craftsman copies)"
+    )
+
+
+def fix_copilot_duplicates(
+    repo_dir: Path | None = None,
+    *,
+    home: Path | None = None,
+    workspace: Path | None = None,
+) -> tuple[list[Path], list[Path]]:
+    """Remove non-canonical Craftsman-generated Copilot duplicates; preserve unmarked and Claude files."""
+    valid_all = craftsman_entity_names(repo_dir)
+    duplicates = scan_copilot_duplicates(repo_dir, home=home, workspace=workspace)
+    removed: list[Path] = []
+    preserved: list[Path] = []
+    seen_removed: set[Path] = set()
+    seen_preserved: set[Path] = set()
+
+    for dup in duplicates:
+        for p_str in dup["preserved_paths"]:
+            p = Path(p_str)
+            if p not in seen_preserved:
+                preserved.append(p)
+                seen_preserved.add(p)
+        for p_str in dup["removable_paths"]:
+            p = Path(p_str)
+            if p in seen_removed or not p.is_file():
+                continue
+            if not is_craftsman_generated_file(p, valid_all):
+                if p not in seen_preserved:
+                    preserved.append(p)
+                    seen_preserved.add(p)
+                continue
+            if p.name == "SKILL.md":
+                skill_dir = p.parent
+                p.unlink()
+                for companion in ("lenses.md", "scope.md"):
+                    comp_path = skill_dir / companion
+                    if comp_path.is_file():
+                        comp_path.unlink()
+                with contextlib.suppress(OSError):
+                    skill_dir.rmdir()
+            else:
+                p.unlink()
+            removed.append(p)
+            seen_removed.add(p)
+    return removed, preserved
+
+
+def inspect_platforms(
+    workspace: Path | None,
+    *,
+    repo_dir: Path | None = None,
+    home: Path | None = None,
+) -> dict[str, Any]:
     """Copilot and Claude Code integration status; `problems` lists what breaks the gate."""
-    copilot_home = default_copilot_home()
-    claude_dir = default_claude_dir()
-    skills = [_skills_report(default_copilot_skills_dir())]
+    copilot_home = default_copilot_home(home)
+    claude_dir = default_claude_dir(home)
+    skills = [_skills_report(default_copilot_skills_dir(home))]
     if workspace is not None:
         skills.append(_skills_report(workspace / ".github" / "skills"))
     user_hooks = inspect_copilot_hooks(copilot_home / "hooks" / HOOKS_FILENAME)
+    duplicates = scan_copilot_duplicates(repo_dir, home=home, workspace=workspace)
     report: dict[str, Any] = {
         "copilot": {
             "user_hooks": user_hooks,
@@ -385,6 +620,7 @@ def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
                 ),
             },
             "skills": skills,
+            "duplicates": duplicates,
         },
         "claude": {
             "agents": _agents_installed(claude_dir / "agents", CLAUDE_AGENT_NAMES, ".md"),
@@ -402,6 +638,7 @@ def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
             f"{user_hooks['path']} runs missing programs ({', '.join(user_hooks['missing'])}); "
             "re-run `craftsman export --user-dir`"
         )
+    problems.extend(_format_duplicate_problem(dup) for dup in duplicates)
     problems.extend(
         f"craftsman.{module} cannot be imported"
         for module, ok in report["cli_self_check"].items()
@@ -411,8 +648,30 @@ def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
     return report
 
 
-def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = None) -> int:
+def _has_vscode_prompts_target(prompts_dir: Path, *, active_with_user_copilot: bool) -> bool:
+    return (
+        (prompts_dir / "craftsman-rules.instructions.md").is_file()
+        or (prompts_dir / "craftsman.prompt.md").is_file()
+        or active_with_user_copilot
+    )
+
+
+def run_doctor(
+    repo_dir: Path,
+    as_json: bool = False,
+    workspace: Path | None = None,
+    *,
+    fix_duplicates: bool = False,
+) -> int:
     """Inspect repository integrity, Git configuration, drift, and installed agent platforms."""
+    home = user_home()
+    fixed_paths: list[Path] = []
+    if fix_duplicates:
+        fixed_paths, _ = fix_copilot_duplicates(repo_dir, home=home, workspace=workspace)
+        if not as_json:
+            for removed_path in fixed_paths:
+                print(f"  [FIXED] Removed duplicate Craftsman file: {removed_path}")
+
     skill_count, skill_errors = validate_skill_manifests(repo_dir)
     expected_skills = _expected_skill_count(repo_dir)
     rule_files = sorted((repo_dir / "rules").glob("*.md")) if (repo_dir / "rules").is_dir() else []
@@ -432,42 +691,50 @@ def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = N
     git_email = git_config_get("user.email")
     hooks_path = git_config_get("core.hooksPath")
 
-    home = user_home()
-    vscode_prompts = default_vscode_prompts_dir()
-    copilot_skills = default_copilot_skills_dir()
+    vscode_prompts = default_vscode_prompts_dir(home)
+    copilot_skills = default_copilot_skills_dir(home)
+    copilot_home = default_copilot_home(home)
     xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     linux_cfg_root = Path(xdg_cfg) if xdg_cfg else (home / ".config")
     win_appdata_root = _resolve_windows_appdata(home) or (home / "AppData" / "Roaming")
+    mac_prompts = (
+        home / "Library" / "Application Support" / "Code" / "User" / "prompts"
+    )
+    linux_prompts = linux_cfg_root / "Code" / "User" / "prompts"
+    win_prompts = win_appdata_root / "Code" / "User" / "prompts"
+    user_copilot_installed = (
+        (copilot_skills / "craftsman" / "SKILL.md").is_file()
+        or (copilot_home / "agents" / "craftsman.agent.md").is_file()
+        or (vscode_prompts / "craftsman.prompt.md").is_file()
+        or has_user_copilot_install(home, repo_dir)
+    )
+    ws_copilot_installed = workspace is not None and has_workspace_copilot_install(
+        workspace, repo_dir
+    )
     installed_targets = {
         "antigravity": (
             (home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file()
             or (home / ".gemini" / "config" / "plugins" / "craftsman" / "plugin.json").is_file()
         ),
-        "claude_code": (home / ".claude" / "commands" / "craftsman.md").is_file(),
-        "github_copilot": (
-            (vscode_prompts / "craftsman.prompt.md").is_file()
-            or (copilot_skills / "craftsman" / "SKILL.md").is_file()
+        "claude_code": (
+            (home / ".claude" / "commands" / "craftsman.md").is_file()
+            or (home / ".claude" / "agents" / "craftsman-reviewer.md").is_file()
         ),
-        "github_copilot_macos": (
-            home
-            / "Library"
-            / "Application Support"
-            / "Code"
-            / "User"
-            / "prompts"
-            / "craftsman.prompt.md"
-        ).is_file(),
-        "github_copilot_linux": (
-            linux_cfg_root / "Code" / "User" / "prompts" / "craftsman.prompt.md"
-        ).is_file(),
-        "github_copilot_windows": (
-            win_appdata_root / "Code" / "User" / "prompts" / "craftsman.prompt.md"
-        ).is_file(),
+        "github_copilot": user_copilot_installed or ws_copilot_installed,
+        "github_copilot_macos": _has_vscode_prompts_target(
+            mac_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == mac_prompts
+        ),
+        "github_copilot_linux": _has_vscode_prompts_target(
+            linux_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == linux_prompts
+        ),
+        "github_copilot_windows": _has_vscode_prompts_target(
+            win_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == win_prompts
+        ),
         "global_git_hooks": bool(hooks_path and Path(hooks_path).expanduser().is_dir()),
     }
 
     config_drift = detect_antigravity_drift(repo_dir)
-    platforms = inspect_platforms(workspace)
+    platforms = inspect_platforms(workspace, repo_dir=repo_dir, home=home)
     platforms["problems"].extend(inspect_git_hooks(hooks_path, repo_dir, home))
 
     healthy = (
@@ -499,6 +766,8 @@ def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = N
         "installed_targets": installed_targets,
         **platforms,
     }
+    if fix_duplicates:
+        report["fixed_duplicates"] = [str(p) for p in fixed_paths]
 
     if as_json:
         sys.stdout.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
@@ -815,6 +1084,11 @@ def main(argv: list[str] | None = None) -> int:
     doc_parser.add_argument(
         "--workspace", type=Path, help="Also check the Copilot agents and skills of this project."
     )
+    doc_parser.add_argument(
+        "--fix-duplicates",
+        action="store_true",
+        help="Remove obsolete Craftsman-generated duplicate Copilot agents and commands, keeping the canonical copy.",
+    )
 
     stat_parser = subparsers.add_parser(
         "status", help="Inspect the active 3-Gear state machine and cumulative git diff."
@@ -883,7 +1157,12 @@ def main(argv: list[str] | None = None) -> int:
     parsed = parser.parse_args(args_list)
     if parsed.command == "doctor":
         workspace = parsed.workspace.resolve() if parsed.workspace else None
-        return run_doctor(parsed.repo_dir.resolve(), as_json=bool(parsed.json), workspace=workspace)
+        return run_doctor(
+            parsed.repo_dir.resolve(),
+            as_json=bool(parsed.json),
+            workspace=workspace,
+            fix_duplicates=bool(parsed.fix_duplicates),
+        )
     if parsed.command == "status":
         return run_status(parsed.state_file, parsed.cwd, as_json=bool(parsed.json))
 

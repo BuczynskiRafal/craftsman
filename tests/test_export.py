@@ -531,21 +531,34 @@ class DoctorTests(ExportTestCase):
 
     def test_reports_platform_integration(self) -> None:
         ws = self.tmp / "ws"
-        export.export_to_workspace(REPO_ROOT, ws)
         export.export_copilot_home(REPO_ROOT, self.tmp / ".copilot")
         export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
 
-        code, report = self.doctor("--workspace", str(ws))
+        code, report = self.doctor()
 
         self.assertEqual(code, 0, report["problems"])
         self.assertTrue(report["healthy"])
+        self.assertTrue(report["installed_targets"]["github_copilot"])
         self.assertEqual(report["cli_self_check"], {"ledger": True, "diffscan": True})
         copilot = report["copilot"]
         self.assertTrue(copilot["user_hooks"]["exists"])
         self.assertTrue(copilot["user_hooks"]["runnable"])
-        self.assertEqual(copilot["agents"], {"user": True, "workspace": True})
-        self.assertEqual([entry["code_review_lenses"] for entry in copilot["skills"]], [True, True])
+        self.assertEqual(copilot["agents"], {"user": True, "workspace": None})
+        self.assertEqual([entry["code_review_lenses"] for entry in copilot["skills"]], [True])
+        self.assertEqual(copilot["duplicates"], [])
         self.assertEqual(report["claude"], {"agents": False, "hooks_merged": False})
+
+        # Exporting to workspace alongside user install creates duplicate scopes that doctor flags
+        export.export_to_workspace(REPO_ROOT, ws)
+        dup_code, dup_report = self.doctor("--workspace", str(ws))
+        self.assertEqual(dup_code, 1)
+        self.assertFalse(dup_report["healthy"])
+        self.assertEqual(dup_report["copilot"]["agents"], {"user": True, "workspace": True})
+        self.assertEqual(
+            [entry["code_review_lenses"] for entry in dup_report["copilot"]["skills"]],
+            [True, True],
+        )
+        self.assertTrue(dup_report["copilot"]["duplicates"])
 
         export.export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
         text_proc = subprocess.run(

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from craftsman import export
+from craftsman import cli, export
 from craftsman.export import (
     COPILOT_DISCOVERY,
     CRAFTSMAN_GENERATED_MARKER,
@@ -147,6 +147,13 @@ class CopilotDiscoveryAndDedupTests(unittest.TestCase):
                 code = export.main(["--repo-dir", str(REPO_ROOT), *args])
             except SystemExit as exc:
                 code = int(exc.code) if isinstance(exc.code, int) else 2
+        return code, out.getvalue(), err.getvalue()
+
+    def run_doctor(self, *args: str) -> tuple[int, str, str]:
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["doctor", "--repo-dir", str(REPO_ROOT), *args])
         return code, out.getvalue(), err.getvalue()
 
     def test_one_name_one_location_invariant_across_install_configurations(self) -> None:
@@ -425,6 +432,99 @@ class CopilotDiscoveryAndDedupTests(unittest.TestCase):
         self.assertFalse(legacy_agent.exists())
         self.assertTrue(user_file.is_file())
         self.assertIn("removed:", out)
+
+    def test_doctor_detects_duplicates_and_fix_duplicates_preserves_user_and_claude_files(
+        self,
+    ) -> None:
+        # 1. Clean user install -> doctor is healthy and copilot.duplicates is empty
+        code_inst, _, err_inst = self.run_install("--copilot")
+        self.assertEqual(code_inst, 0, err_inst)
+
+        code_doc, out_doc, _ = self.run_doctor("--json")
+        report = json.loads(out_doc)
+        self.assertEqual(code_doc, 0, report["problems"])
+        self.assertTrue(report["healthy"])
+        self.assertEqual(report["copilot"]["duplicates"], [])
+        self.assertTrue(report["installed_targets"]["github_copilot"])
+
+        # 2. Add legacy Craftsman duplicates + an unmarked user file with a Craftsman name
+        vscode_prompts = default_vscode_prompts_dir(self.home)
+        legacy_agent = vscode_prompts / "craftsman.agent.md"
+        write_text_atomic(
+            legacy_agent,
+            "---\nname: craftsman\ndescription: 'x'\n---\n\n> **GitHub Copilot:** legacy\n",
+        )
+        legacy_prompt = vscode_prompts / "code-review.prompt.md"
+        write_text_atomic(
+            legacy_prompt,
+            "---\nagent: 'agent'\ndescription: 'x'\n---\n\n> **GitHub Copilot:** legacy\n",
+        )
+        user_prompt = vscode_prompts / "simplify.prompt.md"
+        user_prompt_text = "---\nagent: 'agent'\ndescription: 'User simplify'\n---\nMy personal prompt.\n"
+        write_text_atomic(user_prompt, user_prompt_text)
+
+        # Doctor detects all 3 duplicates (`craftsman` agent, `code-review` skill, `simplify` skill)
+        code_dup, out_dup, _ = self.run_doctor("--json")
+        dup_report = json.loads(out_dup)
+        self.assertEqual(code_dup, 1)
+        self.assertFalse(dup_report["healthy"])
+        dup_names = {(d["client"], d["kind"], d["name"]) for d in dup_report["copilot"]["duplicates"]}
+        self.assertIn(("vscode", "agent", "craftsman"), dup_names)
+        self.assertIn(("vscode", "skill", "code-review"), dup_names)
+        self.assertIn(("vscode", "skill", "simplify"), dup_names)
+
+        # 3. `craftsman doctor --fix-duplicates` removes Craftsman files, preserves user file
+        code_fix, out_fix, err_fix = self.run_doctor("--fix-duplicates")
+        self.assertFalse(legacy_agent.exists())
+        self.assertFalse(legacy_prompt.exists())
+        self.assertTrue(user_prompt.is_file())
+        self.assertEqual(user_prompt.read_text(encoding="utf-8"), user_prompt_text)
+        self.assertIn(str(legacy_agent), out_fix)
+        self.assertIn(str(legacy_prompt), out_fix)
+        # Still unhealthy because unmarked user_prompt collides with ~/.copilot/skills/simplify/SKILL.md
+        self.assertEqual(code_fix, 1)
+        self.assertIn("unmarked user file preserved", err_fix)
+
+        # Remove user collision -> now doctor is completely healthy
+        user_prompt.unlink()
+        code_clean, out_clean, _ = self.run_doctor("--json")
+        clean_report = json.loads(out_clean)
+        self.assertEqual(code_clean, 0, clean_report["problems"])
+        self.assertTrue(clean_report["healthy"])
+        self.assertEqual(clean_report["copilot"]["duplicates"], [])
+
+    def test_doctor_reports_claude_collision_and_respects_vscode_settings_disable(self) -> None:
+        self.run_install("--copilot")
+        self.run_install("--claude")
+
+        claude_reviewer = self.home / ".claude" / "agents" / "craftsman-reviewer.md"
+        self.assertTrue(claude_reviewer.is_file())
+
+        # Doctor detects that VS Code discovers both ~/.copilot/agents and ~/.claude/agents
+        code, out, _ = self.run_doctor("--json")
+        report = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertFalse(report["healthy"])
+        self.assertTrue(
+            any("chat.agentFilesLocations" in p for p in report["problems"]),
+            report["problems"],
+        )
+
+        # `--fix-duplicates` NEVER deletes Claude Code files
+        self.run_doctor("--fix-duplicates")
+        self.assertTrue(claude_reviewer.is_file())
+
+        # Disabling ~/.claude/agents in VS Code settings.json resolves the duplicate in VS Code
+        vscode_settings = default_vscode_prompts_dir(self.home).parent / "settings.json"
+        write_text_atomic(
+            vscode_settings,
+            json.dumps({"chat.agentFilesLocations": {"~/.claude/agents": False}}, indent=2) + "\n",
+        )
+        code_ok, out_ok, _ = self.run_doctor("--json")
+        ok_report = json.loads(out_ok)
+        self.assertEqual(code_ok, 0, ok_report["problems"])
+        self.assertTrue(ok_report["healthy"])
+        self.assertEqual(ok_report["copilot"]["duplicates"], [])
 
 
 if __name__ == "__main__":

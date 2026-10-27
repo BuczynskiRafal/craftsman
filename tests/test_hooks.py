@@ -2202,11 +2202,17 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             prof_a = code_user / "profiles" / "work-profile-1"
             prof_a.mkdir(parents=True)
             export_to_vscode_user(REPO_ROOT, code_user / "prompts")
-            self.assertTrue((code_user / "prompts" / "craftsman.prompt.md").is_file())
-            self.assertTrue((prof_a / "prompts" / "craftsman.prompt.md").is_file())
+            self.assertFalse((code_user / "prompts" / "craftsman.prompt.md").exists())
+            self.assertFalse((prof_a / "prompts" / "craftsman.prompt.md").exists())
+            self.assertTrue(
+                (code_user / "prompts" / "craftsman-rules.instructions.md").is_file()
+            )
             self.assertTrue(
                 (prof_a / "prompts" / "craftsman-rules.instructions.md").is_file()
             )
+            export_to_vscode_user(REPO_ROOT, code_user / "prompts", prompt_files=True)
+            self.assertTrue((code_user / "prompts" / "craftsman.prompt.md").is_file())
+            self.assertTrue((prof_a / "prompts" / "craftsman.prompt.md").is_file())
             prompt_content = (code_user / "prompts" / "craftsman.prompt.md").read_text(
                 encoding="utf-8"
             )
