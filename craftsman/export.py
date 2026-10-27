@@ -315,7 +315,7 @@ def default_repo_dir() -> Path:
     return repo_root
 
 
-def _resolve_windows_appdata(home: Path | None = None) -> Path | None:
+def resolve_windows_appdata(home: Path | None = None) -> Path | None:
     resolved_home = user_home(home)
     appdata = env_var_for_home("APPDATA", home)
     win_roaming = resolved_home / "AppData" / "Roaming"
@@ -341,7 +341,7 @@ def _resolve_windows_appdata(home: Path | None = None) -> Path | None:
 
 def default_vscode_prompts_dir(home: Path | None = None) -> Path:
     resolved_home = user_home(home)
-    win_base = _resolve_windows_appdata(home)
+    win_base = resolve_windows_appdata(home)
     if win_base is not None:
         return win_base / "Code" / "User" / "prompts"
     mac_dir = resolved_home / "Library" / "Application Support" / "Code" / "User" / "prompts"

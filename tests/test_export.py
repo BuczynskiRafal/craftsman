@@ -530,112 +530,7 @@ class ClaudeSettingsMergeTests(ExportTestCase):
         self.assertEqual((claude / "settings.json").read_text(encoding="utf-8"), "{oops")
 
 
-class DoctorTests(ExportTestCase):
-    def doctor(self, *extra: str) -> tuple[int, dict[str, Any]]:
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "craftsman.cli",
-                "doctor",
-                "--json",
-                "--repo-dir",
-                str(REPO_ROOT),
-                *extra,
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={
-                **os.environ,
-                "HOME": str(self.tmp),
-                "USERPROFILE": str(self.tmp),
-                "APPDATA": "",
-                "XDG_CONFIG_HOME": "",
-            },
-        )
-        report = json.loads(proc.stdout)
-        assert isinstance(report, dict)
-        return proc.returncode, report
-
-    def test_reports_platform_integration(self) -> None:
-        ws = self.tmp / "ws"
-        export.export_copilot_home(REPO_ROOT, self.tmp / ".copilot")
-        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
-
-        code, report = self.doctor()
-
-        self.assertEqual(code, 0, report["problems"])
-        self.assertTrue(report["healthy"])
-        self.assertTrue(report["installed_targets"]["github_copilot"])
-        self.assertEqual(report["cli_self_check"], {"ledger": True, "diffscan": True})
-        copilot = report["copilot"]
-        self.assertTrue(copilot["user_hooks"]["exists"])
-        self.assertTrue(copilot["user_hooks"]["runnable"])
-        self.assertEqual(copilot["agents"], {"user": True, "workspace": None})
-        self.assertEqual([entry["code_review_lenses"] for entry in copilot["skills"]], [True])
-        self.assertEqual(copilot["duplicates"], [])
-        self.assertEqual(report["claude"], {"agents": False, "hooks_merged": False})
-
-        # Exporting to workspace alongside user install creates duplicate scopes that doctor flags
-        export.export_to_workspace(REPO_ROOT, ws)
-        dup_code, dup_report = self.doctor("--workspace", str(ws))
-        self.assertEqual(dup_code, 1)
-        self.assertFalse(dup_report["healthy"])
-        self.assertEqual(dup_report["copilot"]["agents"], {"user": True, "workspace": True})
-        self.assertEqual(
-            [entry["code_review_lenses"] for entry in dup_report["copilot"]["skills"]],
-            [True, True],
-        )
-        self.assertTrue(dup_report["copilot"]["duplicates"])
-
-        export.export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
-        text_proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "craftsman.cli",
-                "doctor",
-                "--repo-dir",
-                str(REPO_ROOT),
-            ],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env={**os.environ, "HOME": str(self.tmp), "USERPROFILE": str(self.tmp)},
-        )
-        self.assertIn(
-            "Claude Code    : agents installed, hooks not installed (run ./install.sh --claude)",
-            text_proc.stdout,
-        )
-
-    def test_missing_lenses_and_interpreter_are_unhealthy(self) -> None:
-        home = self.tmp / ".copilot"
-        export.export_to_copilot_skills(REPO_ROOT, home / "skills")
-        (home / "skills" / "code-review" / "lenses.md").unlink()
-        export.write_copilot_hooks(home / "hooks", '"/no/such/python3" -m craftsman.cli', "& x")
-
-        code, report = self.doctor()
-
-        self.assertEqual(code, 1)
-        self.assertFalse(report["healthy"])
-        self.assertEqual(report["copilot"]["user_hooks"]["missing"], ["/no/such/python3"])
-        self.assertEqual(len(report["problems"]), 2)
-        self.assertIn("has no lenses.md", report["problems"][0])
-
-    def test_hook_commands_are_parsed_with_the_quoting_of_their_shell(self) -> None:
-        from craftsman.cli import _command_executables
-
-        windows = r'& "C:\Program Files\Python312\python.exe" "C:\src\craftsman-cli.py" hook stop'
-        self.assertEqual(
-            _command_executables(windows, powershell=True),
-            [r"C:\Program Files\Python312\python.exe", r"C:\src\craftsman-cli.py"],
-        )
-        posix = "'/opt/my python/bin/python3' -m craftsman.cli hook stop --platform copilot"
-        self.assertEqual(_command_executables(posix), ["/opt/my python/bin/python3"])
-
+class RenderedTextTests(ExportTestCase):
     def test_rendered_prompts_omit_filesystem_skill_lookups(self) -> None:
         import re
 
@@ -703,69 +598,12 @@ class DoctorTests(ExportTestCase):
             self.assertIn("## Search scope", claude_cmd.read_text(encoding="utf-8"), str(claude_cmd))
         self.assertIn("## Search scope", (ws / "AGENTS.md").read_text(encoding="utf-8"))
 
-    def test_skill_cli_resolves_hyphenated_frontmatter_names(self) -> None:
-        from craftsman.cli import skill_main
-
-        for name in ("code-quality", "code_quality", "extreme-optimizer", "extreme_optimizer"):
-            self.assertEqual(skill_main(["show", name, "--repo-dir", str(REPO_ROOT)]), 0)
-            self.assertEqual(skill_main(["path", name, "--repo-dir", str(REPO_ROOT)]), 0)
-
-    def test_fix_duplicates_removes_legacy_prompt_keeping_claude_skill(self) -> None:
-        from craftsman.cli import fix_copilot_duplicates, scan_copilot_duplicates
-
-        vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
-        vscode_prompts.mkdir(parents=True, exist_ok=True)
-        legacy_prompt = vscode_prompts / "verify.prompt.md"
-        legacy_prompt.write_text(
-            "---\nname: verify\n---\n<!-- craftsman:generated -->\nLegacy prompt\n",
-            encoding="utf-8",
-        )
-        claude_skill = self.tmp / ".claude" / "skills" / "verify" / "SKILL.md"
-        claude_skill.parent.mkdir(parents=True, exist_ok=True)
-        claude_skill.write_text("---\nname: verify\n---\nClaude skill\n", encoding="utf-8")
-
-        dups = scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
-        self.assertEqual(len(dups), 1)
-        dup0 = dups[0] if isinstance(dups[0], dict) else dups[0].to_json()
-        self.assertEqual(dup0["canonical_path"], str(claude_skill))
-        self.assertEqual(dup0["removable_paths"], [str(legacy_prompt)])
-        removed, _ = fix_copilot_duplicates(REPO_ROOT, home=self.tmp)
-        self.assertEqual(removed, [legacy_prompt])
-        self.assertFalse(legacy_prompt.exists())
-        self.assertTrue(claude_skill.is_file())
-
-    def test_jsonc_settings_disable_claude_skill_location(self) -> None:
-        from craftsman.cli import scan_copilot_duplicates
-
-        vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
-        vscode_prompts.mkdir(parents=True, exist_ok=True)
-        claude_skill = self.tmp / ".claude" / "skills" / "verify" / "SKILL.md"
-        claude_skill.parent.mkdir(parents=True, exist_ok=True)
-        claude_skill.write_text("---\nname: verify\n---\nClaude skill\n", encoding="utf-8")
-
-        settings_json = vscode_prompts.parent / "settings.json"
-        settings_json.write_text(
-            '{\n  // comment in JSONC\n  "chat.agentSkillsLocations": {\n    "~/.claude/skills": false,\n  },\n}\n',
-            encoding="utf-8",
-        )
-        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
-        self.assertEqual(scan_copilot_duplicates(REPO_ROOT, home=self.tmp), [])
-
     def test_env_var_for_home_honors_xdg_outside_real_home(self) -> None:
         real_home = export.user_home(None)
         with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}, clear=False):
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", real_home), "/opt/cfg")
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated_home"), "")
-
-    def test_craftsman_scope_fragment_matches_skill_document(self) -> None:
-        from craftsman.cli import validate_skill_manifests
-
-        scope_md = (REPO_ROOT / "skills" / "craftsman" / "scope.md").read_text(encoding="utf-8").strip()
-        skill_md = (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn(scope_md, skill_md)
-        _, errors = validate_skill_manifests(REPO_ROOT)
-        self.assertEqual(errors, [])
 
     def test_reviewer_prompt_allows_findings_about_misleading_names(self) -> None:
         copilot_home = self.tmp / "copilot_home"

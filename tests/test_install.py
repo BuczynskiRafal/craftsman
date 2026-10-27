@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from craftsman.cli import detect_antigravity_drift, inspect_git_hooks, run_doctor
+from craftsman.doctor import detect_antigravity_drift, inspect_git_hooks, run_doctor
 from craftsman.export import default_vscode_prompts_dir, remove_claude_hooks, write_text_atomic
 from craftsman.install import (
     MANIFEST_FILENAME,
@@ -25,9 +25,9 @@ from craftsman.install import (
     InstallTracker,
     TargetKind,
     TargetManifest,
-    _expand_tilde,
     _install_scripts_to,
     _TargetInstallSession,
+    expand_tilde,
     install_main,
     load_manifest,
     parse_install_args,
@@ -662,7 +662,7 @@ class GitHooksChainingAndUninstallTests(IsolatedInstallTestCase):
         self.assertNotIn("command not found", stale_commit.stderr)
 
         # craftsman doctor reports the broken hooks as an error with a repair command
-        problems = inspect_git_hooks(str(hooks_dir), REPO_ROOT, self.home)
+        problems = inspect_git_hooks(str(hooks_dir), self.home)
         self.assertEqual(len(problems), 1)
         self.assertIn("cannot find _passthrough.sh helpers", problems[0])
         self.assertIn("./install.sh --git-hooks", problems[0])
@@ -670,13 +670,13 @@ class GitHooksChainingAndUninstallTests(IsolatedInstallTestCase):
         doc_err = io.StringIO()
         with (
             mock.patch(
-                "craftsman.cli.git_config_get",
+                "craftsman.doctor.git_config_get",
                 side_effect=lambda k: str(hooks_dir) if k == "core.hooksPath" else "Test",
             ),
             contextlib.redirect_stdout(doc_out),
             contextlib.redirect_stderr(doc_err),
         ):
-            doc_code = run_doctor(REPO_ROOT)
+            doc_code = run_doctor(REPO_ROOT, as_json=False, workspace=None, fix_duplicates=False)
         self.assertEqual(doc_code, 1)
         self.assertIn("cannot find _passthrough.sh helpers", doc_err.getvalue())
 
@@ -849,7 +849,7 @@ class GitHooksChainingAndUninstallTests(IsolatedInstallTestCase):
         self.assertIn("Keep me!", (ws_sec / "AGENTS.md").read_text(encoding="utf-8"))
 
         # 4. Manifest validation, hashability, tilde expansion, and explicit home isolation
-        self.assertEqual(_expand_tilde("~//my-hooks", self.home), str(self.home / "my-hooks"))
+        self.assertEqual(expand_tilde("~//my-hooks", self.home), str(self.home / "my-hooks"))
         other_home = self.tmp / "other_home"
         other_home.mkdir()
         self.assertIn(other_home, default_vscode_prompts_dir(other_home).parents)

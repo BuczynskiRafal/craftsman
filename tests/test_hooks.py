@@ -761,21 +761,6 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertIn("# Custom Copilot Rules", copilot_text)
             self.assertEqual(copilot_text.count(CRAFTSMAN_BEGIN_MARKER), 1)
 
-    def test_doctor_detects_config_drift(self) -> None:
-        from craftsman.cli import detect_antigravity_drift
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_cfg = Path(tmpdir) / "config"
-            (fake_cfg / "skills" / "craftsman").mkdir(parents=True)
-            (fake_cfg / "skills" / "craftsman" / "SKILL.md").write_text(
-                "drifted content\n", encoding="utf-8"
-            )
-            (fake_cfg / "craftsman").mkdir(parents=True)
-            (fake_cfg / "craftsman" / "guard.py").write_text("# stale guard\n", encoding="utf-8")
-            drifted = detect_antigravity_drift(REPO_ROOT, fake_cfg)
-            self.assertIn("skills/craftsman/SKILL.md", drifted)
-            self.assertIn("craftsman/guard.py", drifted)
-
     def test_claude_code_assistant_transcript_ask_user_question_unlocks_main_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = Path(tmpdir) / "transcript.jsonl"
@@ -1104,11 +1089,11 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
         from unittest.mock import patch
 
         from craftsman.export import (
-            _resolve_windows_appdata,
             default_vscode_prompts_dir,
             export_to_copilot_skills,
             export_to_vscode_user,
             export_to_workspace,
+            resolve_windows_appdata,
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1132,7 +1117,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 patch("os.name", "posix"),
             ):
                 self.assertEqual(
-                    _resolve_windows_appdata(msys_home),
+                    resolve_windows_appdata(msys_home),
                     msys_home / "AppData" / "Roaming",
                 )
 

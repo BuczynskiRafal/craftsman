@@ -28,7 +28,6 @@ from craftsman.export import (
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
     HOOKS_FILENAME,
     ExportError,
-    _resolve_windows_appdata,
     absolute_hook_prefixes,
     craftsman_entity_names,
     default_claude_dir,
@@ -55,6 +54,7 @@ from craftsman.export import (
     remove_managed_markdown,
     resolve_craftsman_pkg_dir,
     resolve_discovery_dirs,
+    resolve_windows_appdata,
     user_home,
     vscode_prompt_dirs,
     write_text_atomic,
@@ -475,7 +475,7 @@ def save_manifest(base_dir: Path, manifest: BaseManifest, *, dry_run: bool) -> P
     return manifest_path
 
 
-def _expand_tilde(raw: str, home: Path | None = None) -> str:
+def expand_tilde(raw: str, home: Path | None = None) -> str:
     resolved_home = str(user_home(home))
     if raw == "~":
         return resolved_home
@@ -599,7 +599,7 @@ def detect_vscode_copilot(home: Path | None = None) -> bool:
     if appdata:
         if (Path(appdata) / "Code" / "User").is_dir():
             return True
-        win_base = _resolve_windows_appdata(home)
+        win_base = resolve_windows_appdata(home)
         if win_base is not None and (win_base / "Code" / "User").is_dir():
             return True
     return shutil.which("code") is not None
@@ -1602,7 +1602,7 @@ def install_git_hooks_target(
     prev_hooks_file = git_hooks_dir / ".previous_hooks_path"
     abs_prev_file = os.path.abspath(str(prev_hooks_file))
     raw_prev = git_config_get("core.hooksPath")
-    expanded_prev = _expand_tilde(raw_prev, home) if raw_prev else None
+    expanded_prev = expand_tilde(raw_prev, home) if raw_prev else None
     git_hooks_resolved = _resolve_safe(git_hooks_dir)
 
     recorded_prev_hooks: str | None = None
@@ -1624,7 +1624,7 @@ def install_git_hooks_target(
                         cand = (
                             (prev_resolved / ".previous_hooks_path").read_text(encoding="utf-8").strip()
                         )
-                        if cand and _resolve_safe(Path(_expand_tilde(cand, home))) not in (
+                        if cand and _resolve_safe(Path(expand_tilde(cand, home))) not in (
                             prev_resolved,
                             git_hooks_resolved,
                         ):
@@ -1638,7 +1638,7 @@ def install_git_hooks_target(
                     )
                     if prior_from_old:
                         recorded_prev_hooks = prior_from_old
-                        expanded_prior = _expand_tilde(prior_from_old, home)
+                        expanded_prior = expand_tilde(prior_from_old, home)
                         if not tracker.dry_run:
                             write_text_atomic(prev_hooks_file, f"{expanded_prior}\n")
                         if abs_prev_file not in session.created_paths:
@@ -1662,13 +1662,13 @@ def install_git_hooks_target(
                     candidate_prior = prev_hooks_file.read_text(encoding="utf-8").strip()
                     if (
                         candidate_prior
-                        and _resolve_safe(Path(_expand_tilde(candidate_prior, home)))
+                        and _resolve_safe(Path(expand_tilde(candidate_prior, home)))
                         != git_hooks_resolved
                     ):
                         prior = candidate_prior
                 if prior:
                     recorded_prev_hooks = prior
-                    expanded_prior = _expand_tilde(prior, home)
+                    expanded_prior = expand_tilde(prior, home)
                     if not tracker.dry_run:
                         write_text_atomic(prev_hooks_file, f"{expanded_prior}\n")
                     if abs_prev_file not in session.created_paths:
@@ -2057,7 +2057,7 @@ def _restore_git_hooks_config(
     if current_hooks is None:
         return
 
-    current_resolved = _resolve_safe(Path(_expand_tilde(current_hooks, home)))
+    current_resolved = _resolve_safe(Path(expand_tilde(current_hooks, home)))
     expected_resolved = _resolve_safe(hooks_dir)
 
     if current_resolved == expected_resolved:
@@ -2072,7 +2072,7 @@ def _restore_git_hooks_config(
             tracker.restored.append("core.hooksPath (unset)")
             print("[OK] Unset git config --global core.hooksPath")
     else:
-        if prev_hooks and current_resolved == _resolve_safe(Path(_expand_tilde(prev_hooks, home))):
+        if prev_hooks and current_resolved == _resolve_safe(Path(expand_tilde(prev_hooks, home))):
             return
         warn_msg = (
             f"Leaving git config --global core.hooksPath ({current_hooks}) untouched "

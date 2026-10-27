@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
+from craftsman.cli import main, skill_main
 from craftsman.gate import GateOwner
 
-from tests.support import EvidenceRepo, assert_cli_error, open_gate
+from tests.support import REPO_ROOT, EvidenceRepo, assert_cli_error, open_gate
 
 
 class StatusTests(unittest.TestCase):
@@ -78,6 +81,36 @@ class StatusTests(unittest.TestCase):
         outside.mkdir()
         proc = self.repo.cli("status", "--cwd", str(outside), check=False)
         assert_cli_error(self, proc, 1, "craftsman status: error:")
+
+
+class SkillCommandTests(unittest.TestCase):
+    def test_skill_is_found_by_its_name(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = skill_main(["path", "code-quality", "--repo-dir", str(REPO_ROOT)])
+
+        self.assertEqual((code, out.getvalue().strip()), (0, str(REPO_ROOT / "skills" / "code-quality")))
+
+    def test_skill_name_with_underscores_is_unknown(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = skill_main(["show", "code_quality", "--repo-dir", str(REPO_ROOT)])
+
+        self.assertEqual(code, 2)
+        self.assertIn("unknown skill 'code_quality'", err.getvalue())
+
+
+class DispatchTests(unittest.TestCase):
+    def test_unknown_command_is_a_usage_error(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            main(["frobnicate"])
+
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_without_a_command_the_help_is_printed(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = main([])
+
+        self.assertEqual(code, 0)
+        self.assertIn("doctor", out.getvalue())
 
 
 if __name__ == "__main__":

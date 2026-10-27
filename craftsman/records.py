@@ -388,6 +388,7 @@ class SignalKind(str, Enum):
     DUPLICATE_LOGIC = "duplicate-logic"
     DICT_DOMAIN = "dict-domain"
     DIFF_SIZE = "diff-size"
+    PARSE_ERROR = "parse-error"
 
 
 @dataclass(frozen=True)

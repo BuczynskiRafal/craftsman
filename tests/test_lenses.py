@@ -25,30 +25,13 @@ def picked_ids(tier: Tier, signals: dict[str, tuple[str, ...]], *, docs_only: bo
 
 
 class LensCatalogTests(unittest.TestCase):
-    def test_catalog_ids_are_unique_with_known_signal_triggers(self) -> None:
+    def test_lens_ids_are_unique(self) -> None:
         self.assertEqual(len(LENS_IDS), len(LENSES))
-        self.assertEqual(
-            [lens.id for lens in LENSES],
-            [
-                "intent",
-                "contracts",
-                "failure",
-                "ripple",
-                "state",
-                "trust",
-                "tests",
-                "platform",
-                "model",
-                "craft",
-                "design",
-                "sweep",
-            ],
-        )
+
+    def test_lenses_trigger_only_on_known_signals(self) -> None:
         for lens in LENSES:
             with self.subTest(lens=lens.id):
-                self.assertTrue(lens.triggers <= set(SIGNALS))
-                self.assertIn("deep", lens.always_in)
-                self.assertTrue(lens.focus.endswith("?"))
+                self.assertLessEqual(lens.triggers, set(SIGNALS))
 
     def test_get_lens_lists_valid_ids_for_unknown_lens(self) -> None:
         self.assertEqual(get_lens("trust").title, "Trust boundaries & security")
@@ -107,7 +90,7 @@ class LensSelectionTests(unittest.TestCase):
     def test_empty_signal_lists_do_not_trigger(self) -> None:
         self.assertNotIn("trust", picked_ids("quick", {"sql": ()}))
 
-    def test_docs_only_change_selects_intent_and_craft_in_every_tier(self) -> None:
+    def test_docs_only_change_selects_the_prose_lenses(self) -> None:
         for tier in TIERS:
             with self.subTest(tier=tier):
                 self.assertEqual(

@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from craftsman.diffscan import DiffSnapshot, Hunk
+from craftsman.diffscan import ChangeStatus, DiffSnapshot, Hunk
 from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_path_for
 from craftsman.ledger import add_coverage, add_finding, add_run, open_round
 from craftsman.lenses import Tier
@@ -73,13 +73,18 @@ FINDING = {
 
 
 def make_hunk(
-    hunk_id: str, path: str = "app.py", lines: Sequence[str] = ("+x = 1",), *, new_start: int = 1
+    hunk_id: str,
+    path: str = "app.py",
+    lines: Sequence[str] = ("+x = 1",),
+    *,
+    new_start: int = 1,
+    status: ChangeStatus = "modified",
 ) -> Hunk:
     return Hunk(
         id=hunk_id,
         path=path,
         old_path=None,
-        status="modified",
+        status=status,
         old_start=new_start,
         old_len=sum(not line.startswith("+") for line in lines),
         new_start=new_start,
@@ -88,6 +93,19 @@ def make_hunk(
         lines=tuple(lines),
         digest=f"d-{path}-{'|'.join(lines)}",
     )
+
+
+def change_hunk(
+    path: str,
+    added: Sequence[str] = (),
+    removed: Sequence[str] = (),
+    *,
+    hunk_id: str = "H1",
+    status: ChangeStatus = "modified",
+) -> Hunk:
+    """A hunk that removes then adds the given lines, as git lists a modification."""
+    lines = (*(f"-{text}" for text in removed), *(f"+{text}" for text in added))
+    return make_hunk(hunk_id, path, lines, status=status)
 
 
 def make_snap(*hunks: Hunk, fingerprint: str = "fp1", base: str = BASE_SHA) -> DiffSnapshot:
@@ -253,30 +271,20 @@ def ask_question(step: int) -> dict[str, Any]:
 REVIEWER = {"TypeName": "self", "Role": "craftsman-reviewer", "Prompt": "Review packet-1.md"}
 
 
-class EvidenceRepo:
-    """A temporary git repository with one committed file, driven through the real CLI."""
+class GitRepo:
+    """A throwaway git repository with deterministic configuration and no hooks."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        root.mkdir(parents=True, exist_ok=True)
-        for args in (
-            ("init", "-q"),
-            ("config", "user.email", "dev@example.com"),
-            ("config", "user.name", "Dev"),
-            ("config", "commit.gpgsign", "false"),
-            ("config", "core.autocrlf", "false"),
-            ("config", "core.hooksPath", str(root / ".git" / "no-hooks")),
+        self.git("init", "-q")
+        for key, value in (
+            ("user.email", "dev@example.com"),
+            ("user.name", "Dev"),
+            ("commit.gpgsign", "false"),
+            ("core.autocrlf", "false"),
+            ("core.hooksPath", str(root / ".git" / "no-hooks")),
         ):
-            self.git(*args)
-        (root / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
-        (root / "app.py").write_text("x = 1\n", encoding="utf-8")
-        self.git("add", "-A")
-        self.git("commit", "-q", "--no-verify", "-m", "init")
-        self.base_sha = self.git("rev-parse", "HEAD").strip()
-
-    @property
-    def ledger_dir(self) -> Path:
-        return self.root / ".git" / "craftsman"
+            self.git("config", key, value)
 
     def git(self, *args: str) -> str:
         proc = subprocess.run(
@@ -284,11 +292,36 @@ class EvidenceRepo:
         )
         return proc.stdout
 
-    def write(self, name: str, text: str) -> Path:
-        path = self.root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-        return path
+    def write(self, path: str, content: str | bytes) -> Path:
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        target.write_bytes(data)
+        return target
+
+    def commit(self, message: str = "commit") -> str:
+        self.git("add", "-A")
+        self.git("commit", "-q", "--no-verify", "-m", message)
+        return self.git("rev-parse", "HEAD").strip()
+
+    def commit_empty(self) -> str:
+        self.git("commit", "-q", "--allow-empty", "--no-verify", "-m", "root")
+        return self.git("rev-parse", "HEAD").strip()
+
+
+class EvidenceRepo(GitRepo):
+    """A temporary git repository with one committed file, driven through the real CLI."""
+
+    def __init__(self, root: Path) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        super().__init__(root)
+        self.write(".gitignore", "__pycache__/\n")
+        self.write("app.py", "x = 1\n")
+        self.base_sha = self.commit("init")
+
+    @property
+    def ledger_dir(self) -> Path:
+        return self.root / ".git" / "craftsman"
 
     def write_lines(self, name: str, count: int) -> Path:
         return self.write(name, "".join(f"value_{index} = {index}\n" for index in range(count)))
