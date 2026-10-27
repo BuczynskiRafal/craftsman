@@ -1161,9 +1161,12 @@ class ReviewSignalTests(RepoTestCase):
 
         self.repo.cli("review", "check")
         report = self.repo.cli("review", "report").stdout
+        self.assertIn("**Process: COMPLETE**", report)
         self.assertIn("## Acknowledged quality signals", report)
         self.assertIn("S1 (`long-function` at `long_mod.py:1`)", report)
         self.assertIn("generated dispatch table at long_mod.py:1", report)
+        self.assertIn("## Not assessed by the gate", report)
+        self.assertIn("Business requirements fit", report)
 
     def test_diff_size_signal_cannot_be_acknowledged(self) -> None:
         lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))

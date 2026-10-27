@@ -896,6 +896,29 @@ def _diff_size_handover_lines(ledger: Ledger, snap: DiffSnapshot) -> list[str]:
     return lines
 
 
+def _not_assessed_lines(ledger: Ledger, tier: Tier, report: GateReport) -> list[str]:
+    if tier == "quick":
+        iso_line = "quick tier (inline review allowed)"
+    elif report.self_reviewed:
+        iso_line = SELF_REVIEWED_BANNER
+    else:
+        iso_line = "verified via subagent stop events in the ledger"
+    acks = (
+        ", ".join(f"{a.signal_id} ({a.reason})" for a in ledger.signal_acks)
+        if ledger.signal_acks
+        else "none"
+    )
+    return [
+        "",
+        "## Not assessed by the gate",
+        "- Business requirements fit and domain behavior not exercised by recorded runs.",
+        "- Naming quality and domain clarity beyond N1 test-naming rules.",
+        "- Architecture and invariants outside the changed files.",
+        f"- Reviewer isolation status: {iso_line}.",
+        f"- Acknowledged quality signals: {acks}.",
+    ]
+
+
 def _report_lines(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -904,7 +927,8 @@ def _report_lines(
     groups: dict[str, list[Finding]],
     runs: Sequence[Run],
 ) -> list[str]:
-    lines = ["# Craftsman review report"]
+    proc_status = "COMPLETE" if report.passed else f"INCOMPLETE ({len(report.issues)} open items)"
+    lines = ["# Craftsman review report", f"**Process: {proc_status}**"]
     if report.self_reviewed:
         lines.append(f"**{SELF_REVIEWED_BANNER}**")
     lines += [
@@ -934,6 +958,7 @@ def _report_lines(
         )
     if report.warnings:
         lines += ["", "## Warnings", *(f"- {warning}" for warning in report.warnings)]
+    lines.extend(_not_assessed_lines(ledger, tier, report))
     return lines
 
 

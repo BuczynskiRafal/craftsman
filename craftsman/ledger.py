@@ -2251,6 +2251,65 @@ def _round_cap_issues(ledger: Ledger, policy: GatePolicy) -> list[GateIssue]:
     ]
 
 
+def _coverage_anomaly_warnings(ledger: Ledger) -> list[str]:
+    warnings: list[str] = []
+    if not ledger.rounds:
+        return warnings
+    latest = ledger.rounds[-1]
+    hunk_lenses = [lens for lens in latest.lenses if lens != DESIGN_LENS]
+    if len(latest.hunks) > 30 and len(hunk_lenses) >= 2:
+        counts = {
+            lens: sum(1 for r in ledger.coverage if r.round == latest.number and r.lens == lens)
+            for lens in hunk_lenses
+        }
+        if all(c > 0 for c in counts.values()) and len(set(counts.values())) == 1:
+            count_val = next(iter(counts.values()))
+            warnings.append(
+                f"Process anomaly: all lenses covered with an identical entry count ({count_val}) "
+                f"across {len(latest.hunks)} hunks (> 30)."
+            )
+    for lens in hunk_lenses:
+        records = [r for r in ledger.coverage if r.round == latest.number and r.lens == lens]
+        digests = sum(len(r.digests) for r in records)
+        if digests > 20 and records:
+            times = [parse_timestamp(r.recorded_at) for r in records]
+            if (max(times) - min(times)).total_seconds() < 120:
+                warnings.append(
+                    f"Process anomaly: {digests} hunks covered in lens `{lens}` in under 2 minutes."
+                )
+    return warnings
+
+
+def _process_anomaly_warnings(ledger: Ledger) -> list[str]:
+    warnings: list[str] = []
+    if len(ledger.findings) >= 5 and all(f.verdict is not None for f in ledger.findings):
+        if sum(1 for f in ledger.findings if f.verdict == "dismissed") == 0:
+            warnings.append(
+                f"Process anomaly: {len(ledger.findings)} findings and 0 dismissed "
+                "(all findings confirmed — typical of self-review)."
+            )
+    warnings.extend(_coverage_anomaly_warnings(ledger))
+    test_runs = [r for r in ledger.runs if r.kind in ("test", "e2e")]
+    for idx, failed in enumerate(test_runs):
+        if failed.exit_code == 0:
+            continue
+        base_cmd = tuple(_without_env_prefix(failed.argv))
+        if not base_cmd:
+            continue
+        for later in test_runs[idx + 1 :]:
+            if (
+                later.fingerprint == failed.fingerprint
+                and tuple(_without_env_prefix(later.argv)) == base_cmd
+                and tuple(later.argv) != tuple(failed.argv)
+            ):
+                warnings.append(
+                    f"Process anomaly: {failed.kind} run {failed.id} failed and was repeated as "
+                    f"{later.id} with a different environment without a code change."
+                )
+                break
+    return warnings
+
+
 def _warnings(
     ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy, *, review_only: bool = False
 ) -> tuple[str, ...]:
@@ -2290,6 +2349,7 @@ def _warnings(
         for run in ledger.runs
         if is_trivial_run(run.argv)
     )
+    warnings.extend(_process_anomaly_warnings(ledger))
     return tuple(warnings)
 
 

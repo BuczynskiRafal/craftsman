@@ -965,6 +965,27 @@ class GateTests(unittest.TestCase):
         )
         self.assertIn("1 accepted (F1)", report.summary)
 
+    def test_process_anomaly_warnings_are_reported_without_blocking(self) -> None:
+        ledger = fully_reviewed(self.snap)
+        for index in range(1, 6):
+            ledger = with_finding(ledger)
+            ledger, _ = set_verdict(ledger, f"F{index}", "probable", PROBABLE, None)
+            ledger, _ = resolve(
+                ledger, f"F{index}", "accepted", f"Accepted reason {index} at a.py:1", fingerprint="fp1"
+            )
+        ledger = add_run(ledger, make_run(("pytest", "-q"), kind="test", exit_code=1))
+        ledger = add_run(ledger, make_run(("env", "FOO=1", "pytest", "-q"), kind="test", exit_code=0))
+
+        report = evaluate(ledger, self.snap, QUICK)
+
+        self.assertIn(
+            "Process anomaly: 5 findings and 0 dismissed (all findings confirmed — typical of self-review).",
+            report.warnings,
+        )
+        self.assertTrue(
+            any("repeated as R3 with a different environment" in w for w in report.warnings)
+        )
+
     def test_render_report_caps_next_actions(self) -> None:
         ledger, _ = prepared(self.snap)
         for _ in range(14):
