@@ -19,34 +19,35 @@ from craftsman import __version__
 from craftsman.export import (
     CLAUDE_HOOK_EVENTS,
     COPILOT_DISCOVERY,
-    FRONTMATTER_RE,
     HOOKS_FILENAME,
     CopilotClient,
     CopilotDiscoveryLocation,
     ExportError,
     craftsman_agent_names,
-    craftsman_entity_names,
     craftsman_skill_names,
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
     default_vscode_prompts_dir,
-    extract_skill_name,
     has_user_copilot_install,
     has_workspace_copilot_install,
     is_craftsman_generated_file,
     is_craftsman_hook_command,
     iter_discovered_files,
+    parse_frontmatter,
     resolve_craftsman_pkg_dir,
     resolve_discovery_dirs,
     user_home,
 )
-from craftsman.install import (
-    MANIFEST_FILENAME,
+from craftsman.githooks import (
+    GUARDED_GIT_HOOKS,
+    PASSTHROUGH_TEMPLATE_NAME,
+    PYTHON_CMD_FILE,
     STANDARD_PASSTHROUGH_GIT_HOOKS,
     expand_tilde,
     git_config_get,
 )
+from craftsman.manifest import InstallError, TargetKind, load_manifest
 from craftsman.records import AGENT_ROLES
 
 CLAUDE_AGENT_NAMES = tuple(AGENT_ROLES)
@@ -192,15 +193,15 @@ def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
 
 def _skill_manifest_errors(skill_path: Path) -> Iterator[str]:
     folder = skill_path.parent.name
-    content = skill_path.read_text(encoding="utf-8")
-    match = FRONTMATTER_RE.match(content)
-    if not match:
-        yield f"{folder}: missing YAML frontmatter block"
+    try:
+        fields, raw_body = parse_frontmatter(skill_path.read_text(encoding="utf-8"), skill_path)
+    except (ExportError, OSError, UnicodeDecodeError) as exc:
+        yield f"{folder}: {exc}"
         return
-    fm_lines, body = match.group(1).splitlines(), match.group(2).strip()
-    if not any(line.startswith("description:") for line in fm_lines):
+    body = raw_body.strip()
+    if not fields.get("description"):
         yield f"{folder}: frontmatter missing 'description:' field"
-    name = extract_skill_name(content, "")
+    name = fields.get("name", "")
     if name != folder:
         yield f"{folder}: the folder must be named after the skill ({name or 'no name:'})"
     if len(body) < MIN_SKILL_BODY_CHARS:
@@ -249,7 +250,7 @@ def _copied_file_drift(
     if not src_base.is_dir() or not dst_base.is_dir():
         return
     for src_file in sorted(src_base.glob(pattern)):
-        if not src_file.is_file() or (label == "git-hooks" and src_file.name.startswith((".", "_"))):
+        if not src_file.is_file() or (label == "git-hooks" and src_file.name.startswith(".")):
             continue
         rel = src_file.relative_to(src_base)
         dst_file = dst_base / rel
@@ -509,13 +510,10 @@ def _build_copilot_duplicate(
     kind: str,
     entity_name: str,
     entries: list[tuple[CopilotDiscoveryLocation, Path]],
-    valid_all: frozenset[str],
 ) -> CopilotDuplicate:
     def removable(loc: CopilotDiscoveryLocation, path: Path) -> bool:
         return (
-            not loc.canonical
-            and loc.scope not in _CLAUDE_SCOPES
-            and is_craftsman_generated_file(path, valid_all)
+            not loc.canonical and loc.scope not in _CLAUDE_SCOPES and is_craftsman_generated_file(path)
         )
 
     canonical_path = next(
@@ -554,7 +552,10 @@ def scan_copilot_duplicates(
     for client in ("vscode", "copilot-cli"):
         locations = {
             "agent": COPILOT_DISCOVERY[(client, "agent")],
-            "skill": (*COPILOT_DISCOVERY[(client, "skill")], *COPILOT_DISCOVERY[(client, "prompt")]),
+            "skill": (
+                *COPILOT_DISCOVERY[(client, "skill")],
+                *COPILOT_DISCOVERY.get((client, "prompt"), ()),
+            ),
         }
         for kind, locs in locations.items():
             for profile in profiles if client == "vscode" else [None]:
@@ -564,9 +565,8 @@ def scan_copilot_duplicates(
                 for entity_name, matches in matches_map.items():
                     if len(matches) > 1:
                         _extend_unique(by_key.setdefault((client, kind, entity_name), []), matches)
-    valid_all = craftsman_entity_names(repo_dir)
     return [
-        _build_copilot_duplicate(client, kind, name, entries, valid_all)
+        _build_copilot_duplicate(client, kind, name, entries)
         for (client, kind, name), entries in sorted(by_key.items(), key=lambda item: item[0])
     ]
 
@@ -627,11 +627,10 @@ def fix_copilot_duplicates(
     repo_dir: Path, *, home: Path | None = None, workspace: Path | None = None
 ) -> list[Path]:
     """Remove non-canonical Craftsman-generated Copilot duplicates; unmarked and Claude files stay."""
-    valid_all = craftsman_entity_names(repo_dir)
     removed: dict[Path, None] = {}
     for dup in scan_copilot_duplicates(repo_dir, home=home, workspace=workspace):
         for path in map(Path, dup.removable_paths):
-            if path not in removed and path.is_file() and is_craftsman_generated_file(path, valid_all):
+            if path not in removed and path.is_file() and is_craftsman_generated_file(path):
                 _unlink_duplicate_file(path)
                 removed[path] = None
     return list(removed)
@@ -640,48 +639,41 @@ def fix_copilot_duplicates(
 # --- git hooks ------------------------------------------------------------------------------
 
 
-def _has_passthrough_helpers(path: Path) -> bool:
-    if not path.is_file():
-        return False
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return "run_craftsman_guard" in text and "chain_git_hook" in text
-
-
-def _hook_can_load_helpers(hooks_dir: Path, hook_file: Path) -> bool:
-    candidates: list[Path] = [hooks_dir / "_passthrough.sh"]
-    if hook_file.is_symlink():
-        target = Path(os.readlink(hook_file))
-        target = target if target.is_absolute() else hook_file.parent / target
-        candidates.append(target.parent / "_passthrough.sh")
-    candidates.append(hooks_dir / "applypatch-msg")
-    return any(_has_passthrough_helpers(candidate) for candidate in candidates)
-
-
 def inspect_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
-    """Check whether a Craftsman `core.hooksPath` directory has working `_passthrough.sh` helpers."""
+    """Problems of the Craftsman git hooks `core.hooksPath` points to; other hooks are not ours."""
     if not hooks_path:
         return []
-    hooks_dir = Path(expand_tilde(hooks_path, home)).expanduser()
-    if not hooks_dir.is_dir():
+    hooks_dir = Path(expand_tilde(hooks_path, home))
+    try:
+        manifest = load_manifest(hooks_dir.parent)
+    except InstallError as exc:
+        return [str(exc)]
+    target = manifest.targets.get(TargetKind.GIT_HOOKS) if manifest else None
+    if (
+        target is None
+        or target.hooks_dir is None
+        or Path(target.hooks_dir).resolve() != hooks_dir.resolve()
+    ):
         return []
-    is_craftsman_dir = (hooks_dir / ".python_cmd").is_file() or (
-        hooks_dir.parent / MANIFEST_FILENAME
-    ).is_file()
-    broken: list[str] = []
-    for hook_name in ("commit-msg", "pre-push"):
-        hook_file = hooks_dir / hook_name
-        if hook_file.is_file():
-            text = hook_file.read_text(encoding="utf-8", errors="replace")
-            if "run_craftsman_guard" in text and not _hook_can_load_helpers(hooks_dir, hook_file):
-                broken.append(hook_name)
-        elif is_craftsman_dir and hook_file.is_symlink():
-            broken.append(hook_name)
-    if not broken:
-        return []
-    return [
-        f"git hooks in {hooks_dir} ({', '.join(broken)}) cannot find _passthrough.sh helpers; "
-        "run './install.sh --git-hooks' (or 'craftsman install --git-hooks') to repair"
+    needed = [
+        hooks_dir / PASSTHROUGH_TEMPLATE_NAME,
+        hooks_dir / PYTHON_CMD_FILE,
+        *(hooks_dir / name for name in GUARDED_GIT_HOOKS),
+        hooks_dir.parent / "scripts" / "git-guard.py",
     ]
+    missing = [str(path) for path in needed if not path.is_file()]
+    if missing:
+        return [
+            f"git hooks in {hooks_dir} are incomplete (missing {', '.join(missing)}); "
+            "run 'craftsman install --git-hooks' to repair"
+        ]
+    python = (hooks_dir / PYTHON_CMD_FILE).read_text(encoding="utf-8").strip()
+    if not (Path(python).is_file() and os.access(python, os.X_OK)):
+        return [
+            f"git hooks in {hooks_dir} run {python or 'no Python'}, which is not an executable "
+            "file, so every commit and push is blocked; run 'craftsman install --git-hooks' to repair"
+        ]
+    return []
 
 
 # --- report ---------------------------------------------------------------------------------
@@ -709,17 +701,17 @@ def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> Copil
 
 def _platform_problems(copilot: CopilotReport, claude: ClaudeReport) -> list[str]:
     problems = [
-        f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman export`"
+        f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
         for entry in copilot.skills
         if entry.code_review_lenses is False
     ]
     hooks = copilot.user_hooks
     if hooks.error is not None:
-        problems.append(f"{hooks.path}: {hooks.error}; re-run `craftsman export --user-dir`")
+        problems.append(f"{hooks.path}: {hooks.error}; re-run `craftsman install --copilot`")
     elif hooks.missing:
         problems.append(
             f"{hooks.path} runs missing programs ({', '.join(hooks.missing)}); "
-            "re-run `craftsman export --user-dir`"
+            "re-run `craftsman install --copilot`"
         )
     if claude.hooks is ClaudeHooks.UNREADABLE:
         problems.append(f"Claude Code settings: {claude.detail}")
@@ -735,7 +727,7 @@ def _installed_targets(
     user_copilot = (
         (default_copilot_skills_dir(home) / "craftsman" / "SKILL.md").is_file()
         or (copilot_home / "agents" / "craftsman.agent.md").is_file()
-        or has_user_copilot_install(home, repo_dir)
+        or has_user_copilot_install(repo_dir, home)
     )
     workspace_copilot = workspace is not None and has_workspace_copilot_install(workspace, repo_dir)
     instructions = default_vscode_prompts_dir(home) / "craftsman-rules.instructions.md"
@@ -763,6 +755,18 @@ def _plugin_mismatch(repo_dir: Path, plugin_skills: tuple[str, ...]) -> list[str
     ]
 
 
+def _git_config(home: Path) -> tuple[GitConfig, list[str]]:
+    """The global git settings doctor shows; git that cannot read them is a problem to report."""
+    try:
+        return GitConfig(
+            git_config_get("user.name", home),
+            git_config_get("user.email", home),
+            git_config_get("core.hooksPath", home),
+        ), []
+    except InstallError as exc:
+        return GitConfig(None, None, None), [str(exc)]
+
+
 def build_report(
     repo_dir: Path, workspace: Path | None, home: Path, fixed: tuple[str, ...] = ()
 ) -> DoctorReport:
@@ -774,13 +778,12 @@ def build_report(
     missing_scripts = tuple(
         name for name in REQUIRED_SCRIPTS if not (repo_dir / "scripts" / name).is_file()
     )
-    git = GitConfig(
-        git_config_get("user.name"), git_config_get("user.email"), git_config_get("core.hooksPath")
-    )
+    git, git_problems = _git_config(home)
     config_drift = tuple(detect_antigravity_drift(repo_dir, home / ".gemini" / "config"))
     copilot = _copilot_report(repo_dir, workspace, home)
     claude = _claude_report(default_claude_dir(home))
     problems = (
+        *git_problems,
         *_platform_problems(copilot, claude),
         *inspect_git_hooks(git.hooks_path, home),
     )
@@ -829,11 +832,7 @@ def print_report(report: DoctorReport) -> None:
     print(f"  Git identity   : {git.user_name or 'unset'} <{git.user_email or 'unset'}>")
     print(f"  Git hooksPath  : {git.hooks_path or 'unset'}")
     if report.config_drift:
-        sync_hint = (
-            "run './install.sh --symlink --git-hooks' to sync"
-            if (repo_dir / "install.sh").is_file()
-            else "reinstall or re-run 'craftsman export' to sync"
-        )
+        sync_hint = "run 'craftsman install --antigravity' to sync"
         print(
             f"  Config drift   : {len(report.config_drift)} file(s) differ between repo and "
             f"~/.gemini/config ({sync_hint})"

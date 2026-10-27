@@ -15,21 +15,19 @@ from pathlib import Path
 from craftsman import __version__
 from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.doctor import run_doctor
-from craftsman.export import (
-    ExportError,
-    default_repo_dir,
-    extract_description_and_body,
-)
+from craftsman.export import ExportError, Skill, default_repo_dir, iter_skills
 from craftsman.export import main as export_main
 from craftsman.gate import GateState, GateStateError, load_state, state_path_for, task_tier
 from craftsman.gate import main as gate_main
 from craftsman.guard import main as guard_main
 from craftsman.hooks import main as hook_main
-from craftsman.install import install_main, uninstall_main
+from craftsman.install import install_main
 from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens
+from craftsman.manifest import InstallError
 from craftsman.records import VERDICTS, Ledger, LedgerError
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
+from craftsman.uninstall import uninstall_main
 
 LATEST_RUNS_SHOWN = 3
 
@@ -190,15 +188,13 @@ def run_status(cwd: str | None, *, as_json: bool) -> int:
 # --- skills ---------------------------------------------------------------------------------
 
 
-def discover_skill_dirs(repo_dir: Path) -> dict[str, Path]:
-    """Bundled skills by name; a skill's folder is named after it (`craftsman doctor` checks)."""
+def discover_skill_dirs(repo_dir: Path) -> dict[str, Skill]:
+    """Bundled skills by name, each inside the skills folder (a symlink out of it is skipped)."""
     skills_root = (repo_dir / "skills").resolve()
-    if not skills_root.is_dir():
-        return {}
     return {
-        skill_md.parent.name: skill_md.parent.resolve()
-        for skill_md in sorted(skills_root.glob("*/SKILL.md"))
-        if skill_md.parent.resolve().is_relative_to(skills_root)
+        skill.name: skill
+        for skill in iter_skills(repo_dir)
+        if skill.directory.resolve().is_relative_to(skills_root)
     }
 
 
@@ -235,10 +231,7 @@ def _validate_skill_relative_file(skill_dir: Path, rel_file: str, skill_name: st
 def _build_skill_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "--repo-dir",
-        type=Path,
-        default=default_repo_dir(),
-        help="Path to the Craftsman repository or bundled assets root.",
+        "--repo-dir", type=Path, help="Path to the Craftsman repository or bundled assets root."
     )
     parser = argparse.ArgumentParser(
         prog="craftsman skill",
@@ -274,13 +267,15 @@ class SkillEntry:
     path: str
 
 
-def _list_skills(known: dict[str, Path], *, as_json: bool) -> int:
-    entries = []
-    for name, skill_dir in known.items():
-        desc, _ = extract_description_and_body(
-            (skill_dir / "SKILL.md").read_text(encoding="utf-8"), name
-        )
-        entries.append(SkillEntry(name, desc.split(". ", 1)[0].rstrip(".") + ".", str(skill_dir)))
+def _first_sentence(text: str) -> str:
+    return text.split(". ", 1)[0].rstrip(".") + "."
+
+
+def _list_skills(known: dict[str, Skill], *, as_json: bool) -> int:
+    entries = [
+        SkillEntry(name, _first_sentence(skill.description), str(skill.directory.resolve()))
+        for name, skill in known.items()
+    ]
     if as_json:
         sys.stdout.write(
             json.dumps([asdict(entry) for entry in entries], indent=2, ensure_ascii=False) + "\n"
@@ -295,7 +290,11 @@ def _list_skills(known: dict[str, Path], *, as_json: bool) -> int:
 def skill_main(argv: list[str]) -> int:
     parser = _build_skill_parser()
     args = parser.parse_args(argv)
-    known = discover_skill_dirs(Path(args.repo_dir).resolve())
+    try:
+        known = discover_skill_dirs((args.repo_dir or default_repo_dir()).resolve())
+    except ExportError as exc:
+        sys.stderr.write(f"craftsman skill: error: {exc}\n")
+        return 1
 
     if args.subcommand == "list":
         return _list_skills(known, as_json=bool(args.json))
@@ -308,7 +307,7 @@ def skill_main(argv: list[str]) -> int:
         )
         return 2
 
-    skill_dir = known[skill_name]
+    skill_dir = known[skill_name].directory.resolve()
     if args.subcommand == "path":
         print(str(skill_dir))
         return 0
@@ -344,12 +343,7 @@ STATUS_HELP = "Show the work tree's quality gate, cumulative diff and review evi
 
 def doctor_main(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="craftsman doctor", description=DOCTOR_HELP)
-    parser.add_argument(
-        "--repo-dir",
-        type=Path,
-        default=default_repo_dir(),
-        help="Path to the Craftsman repository root.",
-    )
+    parser.add_argument("--repo-dir", type=Path, help="Path to the Craftsman repository root.")
     parser.add_argument("--json", action="store_true", help="Output diagnostic report as JSON.")
     parser.add_argument(
         "--workspace", type=Path, help="Also check the Copilot agents and skills of this project."
@@ -362,12 +356,12 @@ def doctor_main(argv: Sequence[str]) -> int:
     args = parser.parse_args(list(argv))
     try:
         return run_doctor(
-            args.repo_dir.resolve(),
+            (args.repo_dir or default_repo_dir()).resolve(),
             as_json=args.json,
             workspace=args.workspace.resolve() if args.workspace else None,
             fix_duplicates=args.fix_duplicates,
         )
-    except ExportError as exc:
+    except (ExportError, InstallError) as exc:
         sys.stderr.write(f"craftsman doctor: error: {exc}\n")
         return 1
 

@@ -3,5 +3,6 @@ graft agents
 graft rules
 graft scripts
 graft git-hooks
+graft templates
 include plugin.json hooks.json LICENSE README.md setup.py pyproject.toml .gitattributes
 global-exclude __pycache__ *.py[cod] .DS_Store

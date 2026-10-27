@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from craftsman.diffscan import ChangeStatus, DiffSnapshot, Hunk
 from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_path_for
+from craftsman.install import install_main
 from craftsman.ledger import add_coverage, add_finding, add_run, open_round
 from craftsman.lenses import Tier
 from craftsman.records import (
@@ -26,6 +32,7 @@ from craftsman.records import (
     format_timestamp,
     parse_timestamp,
 )
+from craftsman.uninstall import uninstall_main
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_COUNT = len(json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))["skills"])
@@ -384,3 +391,84 @@ class EvidenceRepo(GitRepo):
         self.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('tests ok')")
         if tier == "deep":
             self.cli("run", "--kind", "e2e", "--", sys.executable, "-c", "print('e2e ok')")
+
+
+@dataclass(frozen=True)
+class CliResult:
+    code: int
+    out: str
+    err: str
+
+
+def run_main(main: Callable[[list[str]], int], *args: str) -> CliResult:
+    """Run a CLI entry point in this process, capturing its output; argparse exits become codes."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        try:
+            code = main(list(args))
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 2
+    return CliResult(code, out.getvalue(), err.getvalue())
+
+
+def snapshot_tree(root: Path) -> dict[str, tuple[str, bytes | str, int]]:
+    """Every file, symlink and folder under `root`, with contents and permissions."""
+    state: dict[str, tuple[str, bytes | str, int]] = {}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        folder = Path(dirpath)
+        state[str(folder.relative_to(root))] = ("dir", "", folder.lstat().st_mode & 0o777)
+        for name in dirnames + filenames:
+            path = folder / name
+            rel = str(path.relative_to(root))
+            if path.is_symlink():
+                state[rel] = ("symlink", os.readlink(path), 0)
+            elif path.is_file():
+                state[rel] = ("file", path.read_bytes(), path.stat().st_mode & 0o777)
+    return state
+
+
+class IsolatedHomeTestCase(unittest.TestCase):
+    """A throwaway home folder, CRAFTSMAN_HOME and global git configuration; the rest of the
+    environment is cleared, so no detected platform or setting of the real user leaks in."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.git_config = self.tmp / "gitconfig"
+        self.git_config.write_text("", encoding="utf-8")
+        self.env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(self.home),
+            "USERPROFILE": str(self.home),
+            "GIT_CONFIG_GLOBAL": str(self.git_config),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        }
+        patcher = mock.patch.dict(os.environ, self.env, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def install(self, *args: str) -> CliResult:
+        return run_main(install_main, "--repo-dir", str(REPO_ROOT), *args)
+
+    def uninstall(self, *args: str) -> CliResult:
+        return run_main(uninstall_main, *args)
+
+    def git_global(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "config", "--global", *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+
+    def hooks_path(self) -> str | None:
+        proc = self.git_global("--get", "core.hooksPath")
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    def assert_ok(self, result: CliResult) -> None:
+        self.assertEqual(result.code, 0, result.err)

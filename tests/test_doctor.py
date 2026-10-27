@@ -12,20 +12,23 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from craftsman import export
+from craftsman import cli, export
 from craftsman.doctor import (
     build_report,
     command_executables,
     detect_antigravity_drift,
     fix_copilot_duplicates,
+    inspect_git_hooks,
     loads_jsonc_dict,
     plugin_skill_names,
     scan_copilot_duplicates,
     validate_skill_manifests,
 )
-from craftsman.export import ExportError
+from craftsman.export import CRAFTSMAN_GENERATED_MARKER, ExportError
+from craftsman.githooks import PASSTHROUGH_TEMPLATE_NAME
+from craftsman.manifest import MANIFEST_FILENAME
 
-from tests.support import REPO_ROOT
+from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main, snapshot_tree
 
 VERIFY_SKILL = "---\nname: verify\n---\nClaude skill\n"
 
@@ -58,7 +61,8 @@ class DoctorTestCase(unittest.TestCase):
         return proc.returncode, report
 
     def install_user_copilot(self) -> None:
-        export.export_copilot_home(REPO_ROOT, self.tmp / ".copilot")
+        prefixes = export.absolute_hook_prefixes()
+        export.export_copilot_home(REPO_ROOT, self.tmp / ".copilot", prefixes)
         export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
 
 
@@ -308,6 +312,158 @@ class CopilotDuplicateTests(DoctorTestCase):
 
         with self.assertRaisesRegex(ExportError, "cannot read VS Code settings"):
             scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
+
+
+class InstalledDuplicateTests(IsolatedHomeTestCase):
+    def doctor(self, *args: str) -> CliResult:
+        return run_main(cli.main, "doctor", "--repo-dir", str(REPO_ROOT), *args)
+
+    def report(self, *args: str) -> tuple[int, dict[str, Any]]:
+        result = self.doctor("--json", *args)
+        report = json.loads(result.out)
+        assert isinstance(report, dict)
+        return result.code, report
+
+    def marked(self, path: Path, frontmatter: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\n{frontmatter}\n---\n\n{CRAFTSMAN_GENERATED_MARKER}\n", encoding="utf-8")
+        return path
+
+    def test_fresh_copilot_install_has_no_duplicates(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+
+        code, report = self.report()
+
+        self.assertEqual(code, 0, report["problems"])
+        self.assertEqual(report["copilot"]["duplicates"], [])
+
+    def test_marked_agent_in_the_prompts_folder_is_a_duplicate(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+        self.marked(
+            export.default_vscode_prompts_dir(self.home) / "craftsman.agent.md", "name: craftsman"
+        )
+
+        code, report = self.report()
+
+        self.assertEqual(code, 1)
+        names = {(d["client"], d["kind"], d["name"]) for d in report["copilot"]["duplicates"]}
+        self.assertIn(("vscode", "agent", "craftsman"), names)
+
+    def test_fix_removes_marked_copies(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+        prompts = export.default_vscode_prompts_dir(self.home)
+        agent = self.marked(prompts / "craftsman.agent.md", "name: craftsman")
+        prompt = self.marked(prompts / "code-review.prompt.md", "agent: 'agent'")
+
+        result = self.doctor("--fix-duplicates")
+
+        self.assertEqual(result.code, 0, result.err)
+        self.assertFalse(agent.exists())
+        self.assertFalse(prompt.exists())
+        self.assertIn(str(agent), result.out)
+
+    def test_fix_keeps_an_unmarked_user_prompt(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+        prompt = export.default_vscode_prompts_dir(self.home) / "simplify.prompt.md"
+        prompt.write_text("---\nagent: 'agent'\n---\nMy prompt.\n", encoding="utf-8")
+
+        result = self.doctor("--fix-duplicates")
+
+        self.assertEqual(result.code, 1)
+        self.assertEqual(prompt.read_text(encoding="utf-8"), "---\nagent: 'agent'\n---\nMy prompt.\n")
+        self.assertIn("unmarked user file preserved", result.err)
+
+    def test_claude_agents_next_to_copilot_agents_are_reported(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+        self.assert_ok(self.install("--claude"))
+
+        code, report = self.report()
+
+        self.assertEqual(code, 1)
+        self.assertTrue(any("chat.agentFilesLocations" in problem for problem in report["problems"]))
+
+    def test_fix_never_deletes_claude_code_files(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+        self.assert_ok(self.install("--claude"))
+
+        self.doctor("--fix-duplicates")
+
+        self.assertTrue((self.home / ".claude" / "agents" / "craftsman-reviewer.md").is_file())
+
+    def test_claude_agents_disabled_in_vscode_are_no_duplicates(self) -> None:
+        self.assert_ok(self.install("--copilot"))
+        self.assert_ok(self.install("--claude", "--no-claude-hooks"))
+        settings = export.default_vscode_user_dir(self.home) / "settings.json"
+        settings.write_text(
+            json.dumps({"chat.agentFilesLocations": {"~/.claude/agents": False}}), encoding="utf-8"
+        )
+
+        code, report = self.report()
+
+        self.assertEqual(code, 0, report["problems"])
+
+    def test_fix_keeps_both_canonical_scopes(self) -> None:
+        workspace = self.tmp / "ws"
+        workspace.mkdir()
+        self.assert_ok(self.install("--copilot"))
+        self.assert_ok(self.install("--copilot-workspace", str(workspace), "--allow-duplicate-scopes"))
+        before = snapshot_tree(workspace)
+
+        result = self.doctor("--workspace", str(workspace), "--fix-duplicates")
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("both user and workspace scopes are installed", result.err)
+        self.assertEqual(snapshot_tree(workspace), before)
+
+
+class GitHooksInspectionTests(IsolatedHomeTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.hooks_dir = self.home / ".craftsman" / "git-hooks"
+
+    def test_installed_hooks_have_no_problems(self) -> None:
+        self.assert_ok(self.install("--git-hooks"))
+
+        self.assertEqual(inspect_git_hooks(str(self.hooks_dir), self.home), [])
+
+    def test_missing_helpers_are_a_problem(self) -> None:
+        self.assert_ok(self.install("--git-hooks"))
+        (self.hooks_dir / PASSTHROUGH_TEMPLATE_NAME).unlink()
+
+        (problem,) = inspect_git_hooks(str(self.hooks_dir), self.home)
+
+        self.assertIn(f"missing {self.hooks_dir / PASSTHROUGH_TEMPLATE_NAME}", problem)
+        self.assertIn("craftsman install --git-hooks", problem)
+
+    def test_python_that_is_gone_is_a_problem(self) -> None:
+        self.assert_ok(self.install("--git-hooks"))
+        (self.hooks_dir / ".python_cmd").write_text("/no/such/python\n", encoding="utf-8")
+
+        (problem,) = inspect_git_hooks(str(self.hooks_dir), self.home)
+
+        self.assertIn("every commit and push is blocked", problem)
+
+    def test_hooks_of_another_tool_are_not_inspected(self) -> None:
+        (self.tmp / "husky").mkdir()
+
+        self.assertEqual(inspect_git_hooks(str(self.tmp / "husky"), self.home), [])
+
+    def test_unreadable_git_config_is_a_problem(self) -> None:
+        self.git_config.write_text("[core\n", encoding="utf-8")
+
+        result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
+
+        self.assertEqual(result.code, 1)
+        problems = json.loads(result.out)["problems"]
+        self.assertTrue(any("git config --global --get user.name failed" in p for p in problems))
+
+    def test_corrupt_manifest_is_a_problem(self) -> None:
+        self.assert_ok(self.install("--git-hooks"))
+        (self.hooks_dir.parent / MANIFEST_FILENAME).write_text("{", encoding="utf-8")
+
+        (problem,) = inspect_git_hooks(str(self.hooks_dir), self.home)
+
+        self.assertIn("cannot read install manifest", problem)
 
 
 if __name__ == "__main__":
