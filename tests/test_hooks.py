@@ -691,6 +691,7 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                     str(user_prompts),
                     "--workspace",
                     str(workspace),
+                    "--allow-duplicate-scopes",
                     "--claude-dir",
                     str(claude_dir),
                     "--agents-workspace",
@@ -699,11 +700,12 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                 check=True,
                 env={**os.environ, "HOME": tmpdir, "USERPROFILE": tmpdir},
             )
-            self.assertTrue((user_prompts / "craftsman.prompt.md").is_file())
+            self.assertFalse((user_prompts / "craftsman.prompt.md").exists())
             self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
-            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 17)
+            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 0)
             self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
-            self.assertEqual(len(list((workspace / ".github" / "prompts").glob("*.prompt.md"))), 17)
+            self.assertEqual(len(list((workspace / ".github" / "skills").glob("*/SKILL.md"))), 17)
+            self.assertFalse((workspace / ".github" / "prompts").exists())
             self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), 17)
             self.assertTrue((claude_dir / "rules" / "craftsman-rules.md").is_file())
             self.assertTrue((workspace / "AGENTS.md").is_file())

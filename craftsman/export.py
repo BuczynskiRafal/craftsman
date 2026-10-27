@@ -25,7 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, get_args
@@ -33,11 +33,185 @@ from typing import Any, Literal, get_args
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 CRAFTSMAN_BEGIN_MARKER = "<!-- craftsman:begin -->"
 CRAFTSMAN_END_MARKER = "<!-- craftsman:end -->"
+CRAFTSMAN_GENERATED_MARKER = "<!-- craftsman:generated -->"
 INCLUDE_RE = re.compile(r"^\{\{include\s+(\S+)\s*\}\}[ \t]*$", re.MULTILINE)
 MALFORMED_INCLUDE_RE = re.compile(r"^[ \t]*\{\{\s*include\b.*$", re.MULTILINE)
 SIBLING_LINK_RE = re.compile(r"\[[^\]\n]*\]\(([\w.-]+\.md)\)")
 OUR_HOOK_COMMAND_RE = re.compile(r"\bcraftsman(?:\.cli|-cli\.py|\.exe)?[\"']?\s+hook\b")
 COPY_IGNORED_NAMES = frozenset({"__pycache__", ".DS_Store", "Thumbs.db"})
+
+DUPLICATE_SCOPE_USER_TO_WS_MSG = (
+    "Craftsman is already installed for your user in ~/.copilot; a workspace copy would show "
+    "every agent and command twice. Uninstall one scope or pass --allow-duplicate-scopes."
+)
+DUPLICATE_SCOPE_WS_TO_USER_MSG = (
+    "Craftsman is already installed for this workspace in .github; a user-level copy in "
+    "~/.copilot would show every agent and command twice. Uninstall one scope or pass "
+    "--allow-duplicate-scopes."
+)
+
+CopilotClient = Literal["vscode", "copilot-cli"]
+CopilotEntityKind = Literal["agent", "skill", "prompt"]
+CopilotLocationScope = Literal[
+    "user", "profile", "workspace", "claude-user", "claude-workspace"
+]
+
+
+@dataclass(frozen=True)
+class CopilotDiscoveryLocation:
+    scope: CopilotLocationScope
+    rel_path: str
+    pattern: str
+    canonical: bool
+    source_url: str
+    verified_on: str = "2026-10-27"
+
+
+# Single source of truth for Copilot entity discovery across VS Code and GitHub Copilot CLI.
+# Sources verified on 2026-10-27:
+# - VS Code Custom Agents (`chat.agentFilesLocations`):
+#   https://code.visualstudio.com/docs/copilot/customization/custom-agents
+# - VS Code Agent Skills (`chat.agentSkillsLocations`):
+#   https://code.visualstudio.com/docs/copilot/customization/agent-skills
+# - VS Code Prompt Files (`chat.promptFilesLocations`):
+#   https://code.visualstudio.com/docs/copilot/customization/prompt-files
+# - GitHub Copilot CLI Custom Agents & Agent Skills:
+#   https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli
+#   https://docs.github.com/en/copilot/concepts/agents/about-agent-skills
+COPILOT_DISCOVERY: dict[
+    tuple[CopilotClient, CopilotEntityKind], tuple[CopilotDiscoveryLocation, ...]
+] = {
+    ("vscode", "agent"): (
+        CopilotDiscoveryLocation(
+            scope="user",
+            rel_path=".copilot/agents",
+            pattern="*.agent.md",
+            canonical=True,
+            source_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli",
+        ),
+        CopilotDiscoveryLocation(
+            scope="user",
+            rel_path="Code/User/prompts",
+            pattern="*.agent.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
+        ),
+        CopilotDiscoveryLocation(
+            scope="profile",
+            rel_path="Code/User/profiles/*/prompts",
+            pattern="*.agent.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
+        ),
+        CopilotDiscoveryLocation(
+            scope="workspace",
+            rel_path=".github/agents",
+            pattern="*.agent.md",
+            canonical=True,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
+        ),
+        CopilotDiscoveryLocation(
+            scope="claude-user",
+            rel_path=".claude/agents",
+            pattern="*.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
+        ),
+        CopilotDiscoveryLocation(
+            scope="claude-workspace",
+            rel_path=".claude/agents",
+            pattern="*.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
+        ),
+    ),
+    ("vscode", "skill"): (
+        CopilotDiscoveryLocation(
+            scope="user",
+            rel_path=".copilot/skills",
+            pattern="*/SKILL.md",
+            canonical=True,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
+        ),
+        CopilotDiscoveryLocation(
+            scope="workspace",
+            rel_path=".github/skills",
+            pattern="*/SKILL.md",
+            canonical=True,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
+        ),
+        CopilotDiscoveryLocation(
+            scope="claude-user",
+            rel_path=".claude/skills",
+            pattern="*/SKILL.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
+        ),
+        CopilotDiscoveryLocation(
+            scope="claude-workspace",
+            rel_path=".claude/skills",
+            pattern="*/SKILL.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
+        ),
+    ),
+    ("vscode", "prompt"): (
+        CopilotDiscoveryLocation(
+            scope="user",
+            rel_path="Code/User/prompts",
+            pattern="*.prompt.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/prompt-files",
+        ),
+        CopilotDiscoveryLocation(
+            scope="profile",
+            rel_path="Code/User/profiles/*/prompts",
+            pattern="*.prompt.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/prompt-files",
+        ),
+        CopilotDiscoveryLocation(
+            scope="workspace",
+            rel_path=".github/prompts",
+            pattern="*.prompt.md",
+            canonical=False,
+            source_url="https://code.visualstudio.com/docs/copilot/customization/prompt-files",
+        ),
+    ),
+    ("copilot-cli", "agent"): (
+        CopilotDiscoveryLocation(
+            scope="user",
+            rel_path=".copilot/agents",
+            pattern="*.agent.md",
+            canonical=True,
+            source_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli",
+        ),
+        CopilotDiscoveryLocation(
+            scope="workspace",
+            rel_path=".github/agents",
+            pattern="*.agent.md",
+            canonical=True,
+            source_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli",
+        ),
+    ),
+    ("copilot-cli", "skill"): (
+        CopilotDiscoveryLocation(
+            scope="user",
+            rel_path=".copilot/skills",
+            pattern="*/SKILL.md",
+            canonical=True,
+            source_url="https://docs.github.com/en/copilot/concepts/agents/about-agent-skills",
+        ),
+        CopilotDiscoveryLocation(
+            scope="workspace",
+            rel_path=".github/skills",
+            pattern="*/SKILL.md",
+            canonical=True,
+            source_url="https://docs.github.com/en/copilot/concepts/agents/about-agent-skills",
+        ),
+    ),
+    ("copilot-cli", "prompt"): (),
+}
 
 AgentRole = Literal["orchestrator", "reviewer", "verifier"]
 AGENT_ROLES: tuple[AgentRole, ...] = get_args(AgentRole)
@@ -269,8 +443,13 @@ def copilot_note(with_subagents: bool) -> str:
 
 
 def adapt_body_for_copilot(body: str, *, with_subagents: bool = True) -> str:
-    """Prefix the Copilot platform note and normalize legacy paths."""
-    return copilot_note(with_subagents) + _rewrite_antigravity_paths(body) + "\n"
+    """Prefix the generated marker, Copilot platform note, and normalize legacy paths."""
+    return (
+        f"{CRAFTSMAN_GENERATED_MARKER}\n\n"
+        + copilot_note(with_subagents)
+        + _rewrite_antigravity_paths(body)
+        + "\n"
+    )
 
 
 def adapt_body_for_claude(body: str) -> str:
@@ -697,6 +876,7 @@ def render_combined_rules(rules_dir: Path, with_frontmatter: bool) -> str:
     if with_frontmatter:
         parts.append(
             "---\napplyTo: '**'\ndescription: 'Craftsman Global Engineering & Git Rules'\n---\n"
+            f"{CRAFTSMAN_GENERATED_MARKER}\n"
         )
 
     for rule_file in sorted(rules_dir.glob("*.md")):
@@ -707,6 +887,188 @@ def render_combined_rules(rules_dir: Path, with_frontmatter: bool) -> str:
         parts.append("\n\n---\n")
 
     return "\n".join(parts).strip() + "\n"
+
+
+def craftsman_agent_names(repo_dir: Path | None = None) -> tuple[str, ...]:
+    root = repo_dir or default_repo_dir()
+    agents_dir = root / "agents"
+    if not agents_dir.is_dir():
+        return ("craftsman", "craftsman-reviewer", "craftsman-verifier")
+    names: list[str] = []
+    for path in sorted(agents_dir.glob("*.md")):
+        try:
+            fields, _ = parse_frontmatter(path.read_text(encoding="utf-8"), path)
+            name = fields.get("name", "") or path.stem
+        except (OSError, UnicodeDecodeError, ExportError):
+            name = path.stem
+        if name and name not in names:
+            names.append(name)
+    return tuple(names) or ("craftsman", "craftsman-reviewer", "craftsman-verifier")
+
+
+def craftsman_skill_names(repo_dir: Path | None = None) -> tuple[str, ...]:
+    root = repo_dir or default_repo_dir()
+    skills_dir = root / "skills"
+    if not skills_dir.is_dir():
+        return ()
+    names: list[str] = []
+    for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            raw_md = skill_path.read_text(encoding="utf-8")
+            name = extract_skill_name(raw_md, skill_path.parent.name)
+        except (OSError, UnicodeDecodeError):
+            name = skill_path.parent.name
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def craftsman_entity_names(repo_dir: Path | None = None) -> frozenset[str]:
+    return frozenset(
+        (*craftsman_agent_names(repo_dir), *craftsman_skill_names(repo_dir), "craftsman-rules")
+    )
+
+
+def _entity_name_for_path(path: Path) -> str:
+    if path.name == "SKILL.md":
+        return path.parent.name
+    if path.name.endswith(".agent.md"):
+        return path.name.removesuffix(".agent.md")
+    if path.name.endswith(".prompt.md"):
+        return path.name.removesuffix(".prompt.md")
+    if path.name.endswith(".instructions.md"):
+        return path.name.removesuffix(".instructions.md")
+    if path.name.endswith(".md"):
+        return path.stem
+    return path.name
+
+
+def is_craftsman_generated_file(
+    path: Path, valid_names: Collection[str] | None = None
+) -> bool:
+    """Return True if `path` was generated by Craftsman (via marker or v3.0.0 legacy signature)."""
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if CRAFTSMAN_GENERATED_MARKER in text:
+        return True
+    if CRAFTSMAN_BEGIN_MARKER in text and CRAFTSMAN_END_MARKER in text:
+        return True
+    entity_name = _entity_name_for_path(path)
+    allowed = set(valid_names) if valid_names is not None else craftsman_entity_names()
+    if entity_name not in allowed:
+        return False
+    if path.name == "craftsman-rules.instructions.md":
+        return (
+            "description: 'Craftsman Global Engineering & Git Rules'" in text
+            or "# Craftsman Global Engineering" in text
+        )
+    return "> **GitHub Copilot:**" in text
+
+
+def resolve_discovery_dirs(
+    loc: CopilotDiscoveryLocation,
+    *,
+    home: Path | None = None,
+    workspace: Path | None = None,
+    profile: Path | None = None,
+    include_all_profiles: bool = False,
+) -> list[Path]:
+    """Resolve concrete directories on disk for a `CopilotDiscoveryLocation` entry."""
+    if loc.scope == "user":
+        if loc.rel_path == ".copilot/agents":
+            return [default_copilot_home(home) / "agents"]
+        if loc.rel_path == ".copilot/skills":
+            return [default_copilot_skills_dir(home)]
+        if loc.rel_path == "Code/User/prompts":
+            if profile is not None:
+                return []
+            return [default_vscode_prompts_dir(home)]
+        return [user_home(home) / loc.rel_path]
+    if loc.scope == "profile":
+        if profile is not None:
+            return [profile / "prompts"]
+        if not include_all_profiles:
+            return []
+        profiles_root = default_vscode_prompts_dir(home).parent / "profiles"
+        if not profiles_root.is_dir():
+            return []
+        return [p / "prompts" for p in sorted(profiles_root.iterdir()) if p.is_dir()]
+    if loc.scope == "workspace":
+        return [workspace / loc.rel_path] if workspace is not None else []
+    if loc.scope == "claude-user":
+        rel = Path(loc.rel_path).relative_to(".claude")
+        return [default_claude_dir(home) / rel]
+    if loc.scope == "claude-workspace":
+        return [workspace / loc.rel_path] if workspace is not None else []
+    return []
+
+
+def iter_discovered_files(directory: Path, pattern: str) -> Iterator[tuple[str, Path]]:
+    """Yield `(entity_name, file_path)` pairs matching `pattern` directly inside `directory`."""
+    if not directory.is_dir():
+        return
+    if pattern == "*/SKILL.md":
+        for sub in sorted(directory.iterdir()):
+            if not sub.is_dir():
+                continue
+            skill_md = sub / "SKILL.md"
+            if skill_md.is_file():
+                yield sub.name, skill_md
+    elif pattern == "*.agent.md":
+        for path in sorted(directory.glob("*.agent.md")):
+            if path.is_file():
+                yield path.name.removesuffix(".agent.md"), path
+    elif pattern == "*.prompt.md":
+        for path in sorted(directory.glob("*.prompt.md")):
+            if path.is_file():
+                yield path.name.removesuffix(".prompt.md"), path
+    elif pattern == "*.md":
+        for path in sorted(directory.glob("*.md")):
+            if path.is_file():
+                yield path.stem, path
+
+
+def has_user_copilot_install(
+    home: Path | None = None, repo_dir: Path | None = None
+) -> bool:
+    """Return True if user-level Copilot files generated by Craftsman exist under `home`."""
+    valid_names = craftsman_entity_names(repo_dir)
+    for kind in ("agent", "skill", "prompt"):
+        for loc in COPILOT_DISCOVERY[("vscode", kind)]:
+            if loc.scope not in ("user", "profile"):
+                continue
+            for directory in resolve_discovery_dirs(
+                loc, home=home, include_all_profiles=True
+            ):
+                for name, file_path in iter_discovered_files(directory, loc.pattern):
+                    if name in valid_names and is_craftsman_generated_file(
+                        file_path, valid_names
+                    ):
+                        return True
+    return False
+
+
+def has_workspace_copilot_install(
+    workspace_dir: Path, repo_dir: Path | None = None
+) -> bool:
+    """Return True if workspace-level Copilot files generated by Craftsman exist in `workspace_dir`."""
+    valid_names = craftsman_entity_names(repo_dir)
+    ws = workspace_dir.resolve()
+    for kind in ("agent", "skill", "prompt"):
+        for loc in COPILOT_DISCOVERY[("vscode", kind)]:
+            if loc.scope != "workspace":
+                continue
+            for directory in resolve_discovery_dirs(loc, workspace=ws):
+                for name, file_path in iter_discovered_files(directory, loc.pattern):
+                    if name in valid_names and is_craftsman_generated_file(
+                        file_path, valid_names
+                    ):
+                        return True
+    return False
 
 
 def render_agents_md(repo_dir: Path) -> str:
@@ -907,20 +1269,22 @@ def _prompt_dirs(target_dir: Path) -> list[Path]:
 vscode_prompt_dirs = _prompt_dirs
 
 
-def export_to_vscode_user(repo_dir: Path, target_dir: Path) -> tuple[int, Path]:
-    rendered_prompts = _render_skill_items(
-        repo_dir / "skills", render_copilot_prompt_file, inline_siblings=True
+def export_to_vscode_user(
+    repo_dir: Path, target_dir: Path, *, prompt_files: bool = False
+) -> tuple[int, Path]:
+    rendered_prompts = (
+        _render_skill_items(repo_dir / "skills", render_copilot_prompt_file, inline_siblings=True)
+        if prompt_files
+        else []
     )
     rendered_rules = _rewrite_antigravity_paths(
         render_combined_rules(repo_dir / "rules", with_frontmatter=True)
     )
-    templates = load_agent_templates(repo_dir)
     for prompts_dir in _prompt_dirs(target_dir):
         prompts_dir.mkdir(parents=True, exist_ok=True)
         for skill_name, rendered in rendered_prompts:
             write_text_atomic(prompts_dir / f"{skill_name}.prompt.md", rendered)
         write_text_atomic(prompts_dir / "craftsman-rules.instructions.md", rendered_rules)
-        _write_agents(templates, prompts_dir, ".agent.md", render_copilot_agent)
     return len(rendered_prompts), target_dir / "craftsman-rules.instructions.md"
 
 
@@ -933,12 +1297,16 @@ def export_copilot_home(
     return agents, write_copilot_hooks(copilot_home / "hooks", bash, powershell)
 
 
-def export_to_workspace(repo_dir: Path, workspace_dir: Path) -> tuple[int, Path]:
+def export_to_workspace(
+    repo_dir: Path, workspace_dir: Path, *, prompt_files: bool = False
+) -> tuple[int, Path]:
     github_dir = workspace_dir / ".github"
-    count = _export_skill_files(
-        repo_dir / "skills", github_dir / "prompts", ".prompt.md", render_copilot_prompt_file
-    )
-    export_to_copilot_skills(repo_dir, github_dir / "skills")
+    if prompt_files:
+        count = _export_skill_files(
+            repo_dir / "skills", github_dir / "prompts", ".prompt.md", render_copilot_prompt_file
+        )
+    else:
+        count = export_to_copilot_skills(repo_dir, github_dir / "skills")
     export_copilot_agents(repo_dir, github_dir / "agents")
     write_copilot_hooks(github_dir / "hooks", "craftsman", "craftsman")
     copilot_instructions = github_dir / "copilot-instructions.md"
@@ -998,9 +1366,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--user-dir",
         nargs="?",
         const="",
-        help="Export prompts, instructions and agents to a VS Code User prompts directory "
-        "(defaults to the OS-specific Code/User/prompts); also writes the user-level Copilot "
-        "agents and hooks (see --copilot-home)",
+        help="Export global instructions (and legacy prompt files when --copilot-prompt-files is set) "
+        "to a VS Code User prompts directory (defaults to the OS-specific Code/User/prompts); "
+        "when given without a path, also exports Agent Skills, custom agents, and hooks",
     )
     parser.add_argument(
         "--copilot-skills-dir",
@@ -1010,13 +1378,24 @@ def _build_parser() -> argparse.ArgumentParser:
         "user-level Copilot agents and hooks (see --copilot-home)",
     )
     parser.add_argument(
+        "--copilot-prompt-files",
+        action="store_true",
+        help="Export legacy VS Code `.prompt.md` files instead of Agent Skills (`SKILL.md`). "
+        "Mutually exclusive with --copilot-skills-dir.",
+    )
+    parser.add_argument(
+        "--allow-duplicate-scopes",
+        action="store_true",
+        help="Allow exporting Copilot files in both user (~/.copilot) and workspace (.github) scopes.",
+    )
+    parser.add_argument(
         "--copilot-home",
         help="Copilot user directory for agents/ and hooks/craftsman.json (default: ~/.copilot); "
         "the hooks run this Python interpreter by absolute path",
     )
     parser.add_argument(
         "--workspace",
-        help="Export to a project workspace (.github/prompts, skills, agents, hooks and "
+        help="Export to a project workspace (.github/skills, agents, hooks and "
         "copilot-instructions.md)",
     )
     parser.add_argument(
@@ -1053,6 +1432,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--claude-hooks and --no-claude-hooks require --claude-dir")
     if args.claude_hooks and args.no_claude_hooks:
         parser.error("--claude-hooks and --no-claude-hooks are mutually exclusive")
+    if args.copilot_prompt_files and args.copilot_skills_dir is not None:
+        parser.error("--copilot-prompt-files and --copilot-skills-dir are mutually exclusive")
+    if (
+        args.copilot_prompt_files
+        and args.user_dir is None
+        and not args.workspace
+        and not args.copilot_home
+        and args.claude_dir is None
+        and not args.agents_workspace
+    ):
+        args.user_dir = ""
     if not (
         args.user_dir is not None
         or args.copilot_skills_dir is not None
@@ -1079,12 +1469,32 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
+    prompt_files = bool(getattr(args, "copilot_prompt_files", False))
+    allow_duplicates = bool(getattr(args, "allow_duplicate_scopes", False))
+    exporting_user_copilot = (
+        args.user_dir is not None
+        or args.copilot_skills_dir is not None
+        or bool(args.copilot_home)
+    )
+    exporting_default_user_copilot = (
+        "" in (args.user_dir, args.copilot_skills_dir) or bool(args.copilot_home)
+    )
+    if not allow_duplicates:
+        if args.workspace:
+            if exporting_user_copilot or has_user_copilot_install(None, repo_dir):
+                raise ExportError(DUPLICATE_SCOPE_USER_TO_WS_MSG)
+        if exporting_default_user_copilot and has_workspace_copilot_install(
+            Path.cwd(), repo_dir
+        ):
+            raise ExportError(DUPLICATE_SCOPE_WS_TO_USER_MSG)
+
     if args.user_dir is not None:
         target = Path(args.user_dir) if args.user_dir else default_vscode_prompts_dir()
-        count, instr = export_to_vscode_user(repo_dir, target)
-        print(f"[OK] Exported {count} Copilot prompt files and the Craftsman agents -> {target}")
+        count, instr = export_to_vscode_user(repo_dir, target, prompt_files=prompt_files)
+        if prompt_files:
+            print(f"[OK] Exported {count} Copilot prompt files -> {target}")
         print(f"[OK] Exported global Copilot instructions -> {instr}")
-        if not args.user_dir and args.copilot_skills_dir is None:
+        if not args.user_dir and args.copilot_skills_dir is None and not prompt_files:
             skills_target = default_copilot_skills_dir()
             skills_count = export_to_copilot_skills(repo_dir, skills_target)
             print(f"[OK] Exported {skills_count} Copilot Agent Skills -> {skills_target}")
@@ -1105,10 +1515,12 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
 
     if args.workspace:
         ws = Path(args.workspace).resolve()
-        count, instr = export_to_workspace(repo_dir, ws)
+        count, instr = export_to_workspace(repo_dir, ws, prompt_files=prompt_files)
         github = ws / ".github"
-        print(f"[OK] Exported {count} workspace prompt files -> {github / 'prompts'}")
-        print(f"[OK] Exported {count} workspace Agent Skills -> {github / 'skills'}")
+        if prompt_files:
+            print(f"[OK] Exported {count} workspace prompt files -> {github / 'prompts'}")
+        else:
+            print(f"[OK] Exported {count} workspace Agent Skills -> {github / 'skills'}")
         print(f"[OK] Exported workspace custom agents -> {github / 'agents'}")
         print(
             f"[OK] Exported workspace hooks (runs `craftsman` from PATH) -> {github / 'hooks' / HOOKS_FILENAME}"

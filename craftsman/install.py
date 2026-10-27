@@ -20,13 +20,17 @@ from typing import Any
 
 from craftsman import __version__
 from craftsman.export import (
+     COPILOT_DISCOVERY,
     COPY_IGNORED_NAMES,
     CRAFTSMAN_BEGIN_MARKER,
     CRAFTSMAN_END_MARKER,
+    DUPLICATE_SCOPE_USER_TO_WS_MSG,
+    DUPLICATE_SCOPE_WS_TO_USER_MSG,
     HOOKS_FILENAME,
     ExportError,
     _resolve_windows_appdata,
     absolute_hook_prefixes,
+    craftsman_entity_names,
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
@@ -40,12 +44,17 @@ from craftsman.export import (
     export_to_vscode_user,
     export_to_workspace,
     extract_skill_name,
+    has_user_copilot_install,
+    has_workspace_copilot_install,
+    is_craftsman_generated_file,
     is_craftsman_hook_command,
+    iter_discovered_files,
     load_agent_templates,
     merge_claude_hooks,
     remove_claude_hooks,
     remove_managed_markdown,
     resolve_craftsman_pkg_dir,
+    resolve_discovery_dirs,
     user_home,
     vscode_prompt_dirs,
     write_text_atomic,
@@ -104,6 +113,8 @@ class InstallConfig:
     install_claude: bool = False
     disable_claude_hooks: bool = False
     install_copilot: bool = False
+    copilot_prompt_files: bool = False
+    allow_duplicate_scopes: bool = False
     copilot_workspace: Path | None = None
     agents_workspace: Path | None = None
     install_git_hooks: bool = False
@@ -1037,7 +1048,16 @@ def _cleanup_obsolete_target_paths(
             for ncp in new_set
         ):
             continue
-        _remove_path_if_exists(Path(old_p), dry_run=dry_run, stop_roots=stop_roots)
+        old_path = Path(old_p)
+        if not old_path.is_symlink() and old_path.is_file():
+            if old_path.name.endswith((".agent.md", ".prompt.md", ".instructions.md")):
+                if not is_craftsman_generated_file(old_path):
+                    continue
+        elif not old_path.is_symlink() and old_path.is_dir():
+            skill_md = old_path / "SKILL.md"
+            if skill_md.is_file() and not is_craftsman_generated_file(skill_md):
+                continue
+        _remove_path_if_exists(old_path, dry_run=dry_run, stop_roots=stop_roots)
 
 
 def install_antigravity_target(
@@ -1234,10 +1254,52 @@ def install_claude_target(
             session.save(InstallMode.COPY, dry_run=tracker.dry_run, cleanup_obsolete=False)
 
 
+def _cleanup_legacy_copilot_user_files(
+    repo_dir: Path,
+    home: Path,
+    *,
+    prompt_files: bool,
+    stop_roots: Collection[Path],
+    dry_run: bool,
+) -> list[Path]:
+    """Remove Craftsman-generated Copilot files from non-canonical user/profile locations."""
+    valid_names = craftsman_entity_names(repo_dir)
+    removed: list[Path] = []
+    vscode_prompts = default_vscode_prompts_dir(home)
+    for prompts_dir in vscode_prompt_dirs(vscode_prompts):
+        if not prompts_dir.is_dir():
+            continue
+        for agent_file in sorted(prompts_dir.glob("*.agent.md")):
+            if is_craftsman_generated_file(agent_file, valid_names):
+                if _remove_path_if_exists(agent_file, dry_run=dry_run, stop_roots=stop_roots):
+                    removed.append(agent_file)
+                    print(f"  - removed legacy duplicate: {agent_file}")
+        if not prompt_files:
+            for prompt_file in sorted(prompts_dir.glob("*.prompt.md")):
+                if is_craftsman_generated_file(prompt_file, valid_names):
+                    if _remove_path_if_exists(prompt_file, dry_run=dry_run, stop_roots=stop_roots):
+                        removed.append(prompt_file)
+                        print(f"  - removed legacy duplicate: {prompt_file}")
+    if prompt_files:
+        copilot_skills = default_copilot_skills_dir(home)
+        if copilot_skills.is_dir():
+            for skill_dir in sorted(copilot_skills.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                skill_md = skill_dir / "SKILL.md"
+                if is_craftsman_generated_file(skill_md, valid_names):
+                    if _remove_path_if_exists(skill_dir, dry_run=dry_run, stop_roots=stop_roots):
+                        removed.append(skill_dir)
+                        print(f"  - removed legacy duplicate: {skill_dir}")
+    return removed
+
+
 def install_copilot_target(
     repo_dir: Path,
     home: Path,
     tracker: InstallTracker,
+    *,
+    prompt_files: bool = False,
 ) -> None:
     copilot_home = default_copilot_home(home)
     vscode_prompts = default_vscode_prompts_dir(home)
@@ -1258,16 +1320,16 @@ def install_copilot_target(
 
     for prompts_dir in vscode_prompt_dirs(vscode_prompts):
         _record_missing_dirs(prompts_dir, session.created_dirs, session.stop_roots)
-        for s_name in skill_names:
-            session.stage_path(prompts_dir / f"{s_name}.prompt.md", tracker)
+        if prompt_files:
+            for s_name in skill_names:
+                session.stage_path(prompts_dir / f"{s_name}.prompt.md", tracker)
         session.stage_path(prompts_dir / "craftsman-rules.instructions.md", tracker)
-        for tmpl in templates:
-            session.stage_path(prompts_dir / f"{tmpl.name}.agent.md", tracker)
 
-    _record_missing_dirs(copilot_skills, session.created_dirs, session.stop_roots)
-    for s_name in skill_names:
-        skill_dest = copilot_skills / s_name
-        session.stage_path(skill_dest, tracker)
+    if not prompt_files:
+        _record_missing_dirs(copilot_skills, session.created_dirs, session.stop_roots)
+        for s_name in skill_names:
+            skill_dest = copilot_skills / s_name
+            session.stage_path(skill_dest, tracker)
 
     _record_missing_dirs(copilot_home / "agents", session.created_dirs, session.stop_roots)
     for tmpl in templates:
@@ -1278,22 +1340,35 @@ def install_copilot_target(
     session.stage_path(hooks_file, tracker)
 
     if not tracker.dry_run:
-        count, instr = export_to_vscode_user(repo_dir, vscode_prompts)
-        skills_count = export_to_copilot_skills(repo_dir, copilot_skills)
+        count, instr = export_to_vscode_user(
+            repo_dir, vscode_prompts, prompt_files=prompt_files
+        )
+        skills_count = (
+            0 if prompt_files else export_to_copilot_skills(repo_dir, copilot_skills)
+        )
         agents, written_hooks = export_copilot_home(repo_dir, copilot_home)
     else:
-        count = len(skill_names)
+        count = len(skill_names) if prompt_files else 0
         instr = vscode_prompts / "craftsman-rules.instructions.md"
-        skills_count = len(skill_names)
+        skills_count = 0 if prompt_files else len(skill_names)
         agents = [copilot_home / "agents" / f"{t.name}.agent.md" for t in templates]
         written_hooks = hooks_file
 
-    print(f"[OK] Exported {count} Copilot prompt files and the Craftsman agents -> {vscode_prompts}")
+    if prompt_files:
+        print(f"[OK] Exported {count} Copilot prompt files -> {vscode_prompts}")
     print(f"[OK] Exported global Copilot instructions -> {instr}")
-    print(f"[OK] Exported {skills_count} Copilot Agent Skills -> {copilot_skills}")
+    if not prompt_files:
+        print(f"[OK] Exported {skills_count} Copilot Agent Skills -> {copilot_skills}")
     print(f"[OK] Exported {len(agents)} Copilot custom agents -> {copilot_home / 'agents'}")
     print(f"[OK] Exported Copilot hooks -> {written_hooks}")
 
+    _cleanup_legacy_copilot_user_files(
+        repo_dir,
+        home,
+        prompt_files=prompt_files,
+        stop_roots=session.stop_roots,
+        dry_run=tracker.dry_run,
+    )
     session.save(InstallMode.COPY, dry_run=tracker.dry_run, cleanup_obsolete=True)
 
 
@@ -1350,11 +1425,47 @@ def _record_managed_markdown_file(
         tracker.record_installed(target_file)
 
 
+def _cleanup_legacy_copilot_workspace_files(
+    repo_dir: Path,
+    workspace_dir: Path,
+    *,
+    prompt_files: bool,
+    stop_roots: Collection[Path],
+    dry_run: bool,
+) -> list[Path]:
+    """Remove Craftsman-generated Copilot files from non-canonical workspace locations."""
+    valid_names = craftsman_entity_names(repo_dir)
+    removed: list[Path] = []
+    github_dir = workspace_dir / ".github"
+    if not prompt_files:
+        prompts_dir = github_dir / "prompts"
+        if prompts_dir.is_dir():
+            for prompt_file in sorted(prompts_dir.glob("*.prompt.md")):
+                if is_craftsman_generated_file(prompt_file, valid_names):
+                    if _remove_path_if_exists(prompt_file, dry_run=dry_run, stop_roots=stop_roots):
+                        removed.append(prompt_file)
+                        print(f"  - removed legacy duplicate: {prompt_file}")
+    else:
+        skills_dir = github_dir / "skills"
+        if skills_dir.is_dir():
+            for skill_dir in sorted(skills_dir.iterdir()):
+                if not skill_dir.is_dir():
+                    continue
+                skill_md = skill_dir / "SKILL.md"
+                if is_craftsman_generated_file(skill_md, valid_names):
+                    if _remove_path_if_exists(skill_dir, dry_run=dry_run, stop_roots=stop_roots):
+                        removed.append(skill_dir)
+                        print(f"  - removed legacy duplicate: {skill_dir}")
+    return removed
+
+
 def install_copilot_workspace_target(
     repo_dir: Path,
     workspace_dir: Path,
     home: Path,
     tracker: InstallTracker,
+    *,
+    prompt_files: bool = False,
 ) -> None:
     ws = workspace_dir.resolve()
     session = _TargetInstallSession.begin(
@@ -1370,15 +1481,17 @@ def install_copilot_workspace_target(
         for p in skill_manifests
     ]
 
-    for sub in ("prompts", "skills", "agents", "hooks"):
+    active_subs = ("prompts", "agents", "hooks") if prompt_files else ("skills", "agents", "hooks")
+    for sub in active_subs:
         _record_missing_dirs(github_dir / sub, session.created_dirs, session.stop_roots)
 
-    for s_name in skill_names:
-        session.stage_path(github_dir / "prompts" / f"{s_name}.prompt.md", tracker)
-
-    for s_name in skill_names:
-        s_dest = github_dir / "skills" / s_name
-        session.stage_path(s_dest, tracker)
+    if prompt_files:
+        for s_name in skill_names:
+            session.stage_path(github_dir / "prompts" / f"{s_name}.prompt.md", tracker)
+    else:
+        for s_name in skill_names:
+            s_dest = github_dir / "skills" / s_name
+            session.stage_path(s_dest, tracker)
 
     for tmpl in templates:
         session.stage_path(github_dir / "agents" / f"{tmpl.name}.agent.md", tracker)
@@ -1391,7 +1504,7 @@ def install_copilot_workspace_target(
     )
 
     if not tracker.dry_run:
-        count, instr = export_to_workspace(repo_dir, ws)
+        count, instr = export_to_workspace(repo_dir, ws, prompt_files=prompt_files)
     else:
         count = len(skill_names)
         instr = copilot_instructions
@@ -1399,14 +1512,23 @@ def install_copilot_workspace_target(
         copilot_instructions, existed_unowned, before_bytes, session, tracker
     )
 
-    print(f"[OK] Exported {count} workspace prompt files -> {github_dir / 'prompts'}")
-    print(f"[OK] Exported {count} workspace Agent Skills -> {github_dir / 'skills'}")
+    if prompt_files:
+        print(f"[OK] Exported {count} workspace prompt files -> {github_dir / 'prompts'}")
+    else:
+        print(f"[OK] Exported {count} workspace Agent Skills -> {github_dir / 'skills'}")
     print(f"[OK] Exported workspace custom agents -> {github_dir / 'agents'}")
     print(
         f"[OK] Exported workspace hooks (runs `craftsman` from PATH) -> {github_dir / 'hooks' / HOOKS_FILENAME}"
     )
     print(f"[OK] Exported workspace Copilot instructions -> {instr}")
 
+    _cleanup_legacy_copilot_workspace_files(
+        repo_dir,
+        ws,
+        prompt_files=prompt_files,
+        stop_roots=session.stop_roots,
+        dry_run=tracker.dry_run,
+    )
     session.save(InstallMode.COPY, dry_run=tracker.dry_run, cleanup_obsolete=True)
 
 
@@ -1645,6 +1767,16 @@ def _build_cli_parser(prog: str, description: str) -> argparse.ArgumentParser:
         help="Target GitHub Copilot user-level files, skills, custom agents and hooks.",
     )
     parser.add_argument(
+        "--copilot-prompt-files",
+        action="store_true",
+        help="With --copilot or --copilot-workspace: install legacy VS Code `.prompt.md` files instead of Agent Skills (`SKILL.md`).",
+    )
+    parser.add_argument(
+        "--allow-duplicate-scopes",
+        action="store_true",
+        help="Allow installing Copilot files in both user (~/.copilot) and workspace (.github) scopes.",
+    )
+    parser.add_argument(
         "--claude",
         action="store_true",
         help="Target Claude Code slash commands, rules, reviewer/verifier subagents and gate hooks in ~/.claude/.",
@@ -1668,7 +1800,7 @@ def _build_cli_parser(prog: str, description: str) -> argparse.ArgumentParser:
         "--copilot-workspace",
         type=Path,
         metavar="<path>",
-        help="Target .github/{prompts,skills,agents,hooks} and copilot-instructions.md in a workspace.",
+        help="Target .github/{skills,agents,hooks} and copilot-instructions.md in a workspace.",
     )
     parser.add_argument(
         "--agents-workspace",
@@ -1750,9 +1882,13 @@ def parse_install_args(argv: Sequence[str]) -> InstallConfig:
         or ((parsed.copy or parsed.symlink or parsed.plugin) and not parsed.auto)
     )
     install_claude = bool(parsed.all or parsed.claude or parsed.claude_hooks)
-    install_copilot = bool(parsed.all or parsed.copilot)
-    install_git_hooks = bool(parsed.all or parsed.git_hooks)
     copilot_ws = parsed.copilot_workspace
+    install_copilot = bool(
+        parsed.all
+        or parsed.copilot
+        or (parsed.copilot_prompt_files and copilot_ws is None)
+    )
+    install_git_hooks = bool(parsed.all or parsed.git_hooks)
     agents_ws = parsed.agents_workspace
 
     explicit_target = bool(
@@ -1773,6 +1909,8 @@ def parse_install_args(argv: Sequence[str]) -> InstallConfig:
         install_claude=install_claude,
         disable_claude_hooks=bool(parsed.no_claude_hooks),
         install_copilot=install_copilot,
+        copilot_prompt_files=bool(parsed.copilot_prompt_files),
+        allow_duplicate_scopes=bool(parsed.allow_duplicate_scopes),
         copilot_workspace=copilot_ws,
         agents_workspace=agents_ws,
         install_git_hooks=install_git_hooks,
@@ -1808,6 +1946,8 @@ def resolve_install_config(config: InstallConfig, home: Path | None = None) -> I
         install_claude=cl,
         disable_claude_hooks=config.disable_claude_hooks,
         install_copilot=cp,
+        copilot_prompt_files=config.copilot_prompt_files,
+        allow_duplicate_scopes=config.allow_duplicate_scopes,
         copilot_workspace=config.copilot_workspace,
         agents_workspace=config.agents_workspace,
         install_git_hooks=gh,
@@ -1823,6 +1963,19 @@ def run_install(config: InstallConfig, home: Path | None = None) -> InstallTrack
         raise InstallError(f"Repository assets (skills/, rules/) not found under {repo_dir}")
 
     resolved = resolve_install_config(config, home)
+    if not resolved.allow_duplicate_scopes:
+        if resolved.copilot_workspace is not None:
+            if resolved.install_copilot or has_user_copilot_install(h, repo_dir):
+                raise InstallError(DUPLICATE_SCOPE_USER_TO_WS_MSG)
+        if resolved.install_copilot:
+            ws_check = (
+                resolved.copilot_workspace.resolve()
+                if resolved.copilot_workspace is not None
+                else Path.cwd().resolve()
+            )
+            if has_workspace_copilot_install(ws_check, repo_dir):
+                raise InstallError(DUPLICATE_SCOPE_WS_TO_USER_MSG)
+
     tracker = InstallTracker(dry_run=resolved.dry_run)
     if resolved.dry_run:
         print("[DRY-RUN] Planning installation (no files or Git config will be modified)...")
@@ -1851,10 +2004,18 @@ def run_install(config: InstallConfig, home: Path | None = None) -> InstallTrack
         )
 
     if resolved.install_copilot:
-        install_copilot_target(repo_dir, h, tracker)
+        install_copilot_target(
+            repo_dir, h, tracker, prompt_files=resolved.copilot_prompt_files
+        )
 
     if resolved.copilot_workspace is not None:
-        install_copilot_workspace_target(repo_dir, resolved.copilot_workspace, h, tracker)
+        install_copilot_workspace_target(
+            repo_dir,
+            resolved.copilot_workspace,
+            h,
+            tracker,
+            prompt_files=resolved.copilot_prompt_files,
+        )
 
     if resolved.agents_workspace is not None:
         install_agents_workspace_target(repo_dir, resolved.agents_workspace, h, tracker)
@@ -2159,6 +2320,61 @@ def _uninstall_from_base(
         save_manifest(base_dir, updated, dry_run=tracker.dry_run)
 
 
+def _uninstall_legacy_copilot_files(
+    repo_dir: Path,
+    home: Path,
+    tracker: UninstallTracker,
+    *,
+    workspace: Path | None = None,
+) -> None:
+    """Remove any remaining Craftsman-generated Copilot files discovered via `COPILOT_DISCOVERY`."""
+    valid_names = craftsman_entity_names(repo_dir)
+    stop_roots = _stop_roots_for(home, *( [workspace] if workspace is not None else [] ))
+    target_scopes = ("workspace",) if workspace is not None else ("user", "profile")
+    seen_dirs: set[Path] = set()
+    for kind in ("agent", "skill", "prompt"):
+        for loc in COPILOT_DISCOVERY[("vscode", kind)]:
+            if loc.scope not in target_scopes:
+                continue
+            for directory in resolve_discovery_dirs(
+                loc, home=home, workspace=workspace, include_all_profiles=True
+            ):
+                if not directory.is_dir():
+                    continue
+                seen_dirs.add(directory)
+                for name, file_path in list(iter_discovered_files(directory, loc.pattern)):
+                    if name not in valid_names or not is_craftsman_generated_file(
+                        file_path, valid_names
+                    ):
+                        continue
+                    target_to_remove = (
+                        file_path.parent if loc.pattern == "*/SKILL.md" else file_path
+                    )
+                    if _remove_path_if_exists(
+                        target_to_remove, dry_run=tracker.dry_run, stop_roots=stop_roots
+                    ):
+                        tracker.record_removed(target_to_remove)
+                        print(f"  - removed: {target_to_remove}")
+    if workspace is None:
+        for prompts_dir in vscode_prompt_dirs(default_vscode_prompts_dir(home)):
+            instr = prompts_dir / "craftsman-rules.instructions.md"
+            if instr.is_file() and is_craftsman_generated_file(instr, valid_names):
+                seen_dirs.add(prompts_dir)
+                if _remove_path_if_exists(instr, dry_run=tracker.dry_run, stop_roots=stop_roots):
+                    tracker.record_removed(instr)
+                    print(f"  - removed: {instr}")
+    if not tracker.dry_run:
+        for d in sorted(seen_dirs, key=lambda p: len(p.parts), reverse=True):
+            cur = d
+            while cur not in stop_roots and cur.parent != cur:
+                if cur.is_dir() and not cur.is_symlink():
+                    try:
+                        cur.rmdir()
+                    except OSError:
+                        break
+                cur = cur.parent
+
+
 def run_uninstall(config: UninstallConfig, home: Path | None = None) -> UninstallTracker:
     h = user_home(home)
     tracker = UninstallTracker(dry_run=config.dry_run)
@@ -2205,15 +2421,20 @@ def run_uninstall(config: UninstallConfig, home: Path | None = None) -> Uninstal
         _uninstall_from_base(
             config.repo_dir, copilot_home, [TargetKind.COPILOT.value], h, tracker
         )
+        _uninstall_legacy_copilot_files(config.repo_dir, h, tracker)
 
     if config.copilot_workspace is not None:
+        ws_resolved = config.copilot_workspace.resolve()
         _uninstall_from_base(
             config.repo_dir,
-            config.copilot_workspace.resolve(),
+            ws_resolved,
             [TargetKind.COPILOT_WORKSPACE.value],
             h,
             tracker,
             is_workspace=True,
+        )
+        _uninstall_legacy_copilot_files(
+            config.repo_dir, h, tracker, workspace=ws_resolved
         )
 
     if config.agents_workspace is not None:

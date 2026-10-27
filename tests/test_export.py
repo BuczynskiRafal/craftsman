@@ -196,7 +196,7 @@ class SkillExportTests(ExportTestCase):
 
     def test_single_file_formats_inline_linked_siblings(self) -> None:
         prompts = self.tmp / "prompts"
-        export.export_to_vscode_user(REPO_ROOT, prompts)
+        export.export_to_vscode_user(REPO_ROOT, prompts, prompt_files=True)
         claude = self.tmp / "claude"
         export.export_to_claude_user(REPO_ROOT, claude)
 
@@ -208,14 +208,21 @@ class SkillExportTests(ExportTestCase):
         self.assertNotIn("## Appendix", (prompts / "verify.prompt.md").read_text(encoding="utf-8"))
 
     def test_prompt_files_route_craftsman_to_its_agent(self) -> None:
+        default_prompts = self.tmp / "default_prompts"
+        count, instr = export.export_to_vscode_user(REPO_ROOT, default_prompts)
+        self.assertEqual(count, 0)
+        self.assertTrue(instr.is_file())
+        self.assertEqual(list(default_prompts.glob("*.prompt.md")), [])
+        self.assertEqual(list(default_prompts.glob("*.agent.md")), [])
+
         prompts = self.tmp / "prompts"
-        export.export_to_vscode_user(REPO_ROOT, prompts)
+        export.export_to_vscode_user(REPO_ROOT, prompts, prompt_files=True)
         craftsman = (prompts / "craftsman.prompt.md").read_text(encoding="utf-8")
         verify = (prompts / "verify.prompt.md").read_text(encoding="utf-8")
         self.assertEqual(frontmatter(craftsman)[0], "agent: 'craftsman'")
         self.assertEqual(frontmatter(verify)[0], "agent: 'agent'")
         self.assertNotIn("mode:", "".join(frontmatter(craftsman) + frontmatter(verify)))
-        self.assertTrue((prompts / "craftsman-reviewer.agent.md").is_file())
+        self.assertEqual(list(prompts.glob("*.agent.md")), [])
 
     def test_agents_md_describes_the_v3_loop(self) -> None:
         text = export.render_agents_md(REPO_ROOT)
