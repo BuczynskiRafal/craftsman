@@ -40,9 +40,9 @@ from craftsman.evidence import archive_ledger, packet_path
 from craftsman.gate import (
     CLAUDE_COMMAND_ARGS_RE,
     TIER_RANK,
+    GateOwner,
     _safe_int,
     archive_ledger_for_new_base,
-    check_and_claim_owner,
     continuation_reason,
     default_state,
     evaluate_task,
@@ -51,8 +51,10 @@ from craftsman.gate import (
     is_craftsman_trigger_content,
     load_state,
     mark_completed,
+    owns_gate,
     resolve_cli_state_file,
     save_state_atomic,
+    write_gate_owner,
 )
 from craftsman.guard import evaluate_shell_command
 from craftsman.ledger import (
@@ -282,16 +284,23 @@ def open_session(cwd: str) -> Session | None:
     return Session(root=root, state_file=state_file, state=load_state(state_file))
 
 
+def _claim_active_session_owner(session: Session, platform: Platform, session_id: str) -> bool:
+    if not session.active or session.state is None:
+        return False
+    caller = GateOwner(platform=platform, session_id=session_id.strip() or None)
+    if not owns_gate(GateOwner.from_state(session.state), caller):
+        return False
+    if write_gate_owner(session.state, caller, preserve_unowned=True):
+        session.save()
+    return True
+
+
 def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     hook = HookInput.parse(payload)
     reply = Reply(platform, event)
     if event == "pre-tool":
         session = open_session(hook.cwd)
-        is_owner = False
-        if session is not None and session.active:
-            is_owner, claimed = check_and_claim_owner(session.state, platform, hook.session_id)
-            if claimed:
-                session.save()
+        is_owner = _claim_active_session_owner(session, platform, hook.session_id) if session else False
         out = on_pre_tool(hook, reply, session, is_owner=is_owner)
         if session is not None and session.active and is_owner:
             mark_hooks_seen(session, platform)
@@ -300,13 +309,10 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     if session is None:
         return reply.allow()
     if session.active:
-        is_owner, claimed = check_and_claim_owner(session.state, platform, hook.session_id)
-        if not is_owner:
+        if not _claim_active_session_owner(session, platform, hook.session_id):
             if event == "prompt":
                 return on_non_owner_prompt(session, hook, reply)
             return reply.allow()
-        if claimed:
-            session.save()
         mark_hooks_seen(session, platform)
     if event == "prompt":
         return on_prompt(session, hook, reply)
@@ -341,32 +347,38 @@ def on_non_owner_prompt(session: Session, hook: HookInput, reply: Reply) -> Outp
     )
 
 
+def _update_active_prompt_state(session: Session, hook: HookInput, triggered: bool, tier: str) -> bool:
+    """Update an active gate on a user prompt; return True when a capped review should restart."""
+    assert session.state is not None
+    state = session.state
+    if not hook.prompt.lstrip().startswith(GATE_HEADER_PREFIX):
+        state["awaiting_user"] = False
+        state["forced_continuations"] = 0
+        state.pop("best_issue_count", None)
+    restart = triggered and state.get("stage") == "needs_human"
+    if triggered and not restart and TIER_RANK.get(tier, 1) > TIER_RANK.get(str(state.get("tier")), 1):
+        state["tier"] = tier
+    session.save()
+    return restart
+
+
 def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
     triggered, tier = is_craftsman_trigger_content(hook.prompt)
     if session.active and session.state is not None:
-        state = session.state
-        if not hook.prompt.lstrip().startswith(GATE_HEADER_PREFIX):
-            # The user spoke: their answer ends any wait, and the stop hook gets a fresh streak.
-            state["awaiting_user"] = False
-            state["forced_continuations"] = 0
-            state.pop("best_issue_count", None)
-        restart = triggered and state.get("stage") == "needs_human"
-        if triggered and not restart and TIER_RANK.get(tier, 1) > TIER_RANK.get(str(state.get("tier")), 1):
-            state["tier"] = tier
-        session.save()
-        if not restart:
+        if not _update_active_prompt_state(session, hook, triggered, tier):
             return reply.allow()
         archive_ledger(session.ledger_path)  # the capped review needed a human; start over
     elif not triggered:
         return reply.allow()
     root = str(session.root)
     base = get_head_sha(root)
+    owner = GateOwner(platform=reply.platform, session_id=hook.session_id.strip() or None)
     state = default_state(
         mode="ultracraft" if tier == "deep" else "craftsman",
         tier=tier,
         cwd=root,
         base_sha=base,
-        owner={"platform": reply.platform, "session_id": hook.session_id},
+        owner=owner,
     )
     state["task"] = task_from_prompt(hook.prompt)
     state["hooks_seen"] = reply.platform
@@ -621,6 +633,26 @@ def _stopped_since(ledger: Ledger, hook: HookInput, since: datetime) -> bool:
 # --- pre-tool -------------------------------------------------------------------------------
 
 
+def _check_shell_git_guard(hook: HookInput, reply: Reply) -> Output | None:
+    if hook.tool_name.lower() not in SHELL_TOOLS:
+        return None
+    command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
+    if not isinstance(command, str):
+        return None
+    tool_cwd = hook.tool_input.get("cwd") or hook.tool_input.get("Cwd")
+    cwd = str(Path(hook.cwd, tool_cwd)) if isinstance(tool_cwd, str) and tool_cwd else hook.cwd
+    transcript = None
+    if reply.platform == "claude" and hook.transcript_path:
+        candidate = Path(hook.transcript_path).expanduser()
+        transcript = candidate if candidate.is_file() else None
+    decision, reason = evaluate_shell_command(command, cwd, transcript)
+    if decision == "deny":
+        return reply.deny(reason or "Blocked by the Craftsman git guard.")
+    if decision == "force_ask":
+        return reply.ask(reason or "The Craftsman git guard needs your confirmation.")
+    return None
+
+
 def on_pre_tool(
     hook: HookInput,
     reply: Reply,
@@ -629,41 +661,20 @@ def on_pre_tool(
     is_owner: bool | None = None,
 ) -> Output:
     """Apply the git guard to shell commands, then repository search-scope rules when Craftsman is active."""
-    if hook.tool_name.lower() in SHELL_TOOLS:
-        command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
-        if isinstance(command, str):
-            tool_cwd = hook.tool_input.get("cwd") or hook.tool_input.get("Cwd")
-            cwd = (
-                str(Path(hook.cwd, tool_cwd))
-                if isinstance(tool_cwd, str) and tool_cwd
-                else hook.cwd
-            )
-            transcript = None
-            if reply.platform == "claude" and hook.transcript_path:
-                candidate = Path(hook.transcript_path).expanduser()
-                transcript = candidate if candidate.is_file() else None
-            decision, reason = evaluate_shell_command(command, cwd, transcript)
-            if decision == "deny":
-                return reply.deny(reason or "Blocked by the Craftsman git guard.")
-            if decision == "force_ask":
-                return reply.ask(reason or "The Craftsman git guard needs your confirmation.")
-
+    guard_reply = _check_shell_git_guard(hook, reply)
+    if guard_reply is not None:
+        return guard_reply
     if not is_scope_checked_tool(hook.tool_name):
         return reply.allow()
-
     if session is None:
         session = open_session(hook.cwd)
     if session is None:
         return reply.allow()
     if is_owner is None:
-        is_owner = (
-            check_and_claim_owner(session.state, reply.platform, hook.session_id)[0]
-            if session.active
-            else False
-        )
+        caller = GateOwner(platform=reply.platform, session_id=hook.session_id.strip() or None)
+        is_owner = owns_gate(GateOwner.from_state(session.state), caller) if session.active else False
     if not (session.active and is_owner) and not is_craftsman_agent(hook.agent):
         return reply.allow()
-
     policy = load_scope_policy(Path(hook.cwd), session.root)
     if policy.mode == "off":
         return reply.allow()
@@ -671,9 +682,7 @@ def on_pre_tool(
         hook.tool_name, hook.tool_input, Path(hook.cwd), session.root, policy
     )
     if scope_decision.decision == "deny":
-        if policy.mode == "warn":
-            return reply.warn(scope_decision.reason)
-        return reply.deny(scope_decision.reason)
+        return reply.warn(scope_decision.reason) if policy.mode == "warn" else reply.deny(scope_decision.reason)
     return reply.allow()
 
 

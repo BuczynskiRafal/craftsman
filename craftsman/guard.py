@@ -1326,55 +1326,57 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
     return None, None
 
 
+def _is_active_antigravity_owner(
+    payload: dict[str, Any], effective_cwd: Path
+) -> bool:
+    from craftsman.gate import (
+        GateOwner,
+        _extract_antigravity_session_id,
+        load_state,
+        owns_gate,
+        resolve_cli_state_file,
+    )
+
+    caller = GateOwner(platform="antigravity", session_id=_extract_antigravity_session_id(payload))
+    candidates: list[Path] = []
+    raw_artifact_dir = payload.get("artifactDirectoryPath")
+    if isinstance(raw_artifact_dir, str) and raw_artifact_dir.strip():
+        candidates.append(Path(raw_artifact_dir).expanduser() / "craftsman_state.json")
+    candidates.append(resolve_cli_state_file(None, str(effective_cwd)))
+    for state_file in candidates:
+        state = load_state(state_file)
+        if state and state.get("active") and owns_gate(GateOwner.from_state(state), caller):
+            return True
+    return False
+
+
 def _evaluate_antigravity_scope(
     payload: dict[str, Any], command_line: str, cwd_str: str | None
 ) -> tuple[str, str | None]:
     """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
     try:
         from craftsman.diffscan import DiffScanError, worktree_root
-        from craftsman.gate import (
-            _extract_antigravity_session_id,
-            check_and_claim_owner,
-            load_state,
-            resolve_cli_state_file,
-        )
         from craftsman.scope import evaluate_scope, load_scope_policy
 
-        eff_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
-        repo_root = worktree_root(eff_cwd)
+        effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
+        repo_root = worktree_root(effective_cwd)
+        if not _is_active_antigravity_owner(payload, effective_cwd):
+            return "allow", None
     except (ImportError, OSError, DiffScanError):
         return "allow", None
 
-    ag_sid = _extract_antigravity_session_id(payload)
-    candidates: list[Path] = []
-    raw_artifact_dir = payload.get("artifactDirectoryPath")
-    if isinstance(raw_artifact_dir, str) and raw_artifact_dir.strip():
-        candidates.append(Path(raw_artifact_dir).expanduser() / "craftsman_state.json")
-    candidates.append(resolve_cli_state_file(None, str(eff_cwd)))
-
-    is_active_owner = False
-    for sf in candidates:
-        st = load_state(sf)
-        if st and st.get("active"):
-            owned, _ = check_and_claim_owner(st, "antigravity", ag_sid)
-            if owned:
-                is_active_owner = True
-                break
-    if not is_active_owner:
-        return "allow", None
-
-    policy = load_scope_policy(eff_cwd, repo_root)
+    policy = load_scope_policy(effective_cwd, repo_root)
     if policy.mode == "off":
         return "allow", None
-    scope_dec = evaluate_scope(
+    scope_decision = evaluate_scope(
         "run_command",
         {"CommandLine": command_line, "Cwd": cwd_str},
-        eff_cwd,
+        effective_cwd,
         repo_root,
         policy,
     )
-    if scope_dec.decision == "deny" and policy.mode == "deny":
-        return "deny", scope_dec.reason
+    if scope_decision.decision == "deny" and policy.mode == "deny":
+        return "deny", scope_decision.reason
     return "allow", None
 
 

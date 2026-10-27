@@ -664,7 +664,6 @@ class DoctorTests(ExportTestCase):
 
     def test_skill_cli_supports_hyphenated_frontmatter_names_and_noncanonical_duplicates(self) -> None:
         from craftsman.cli import fix_copilot_duplicates, scan_copilot_duplicates, skill_main
-        from craftsman.gate import extract_cli_session_id
 
         # F3: code-quality and extreme-optimizer resolve by both hyphen and underscore names
         for name in ("code-quality", "code_quality", "extreme-optimizer", "extreme_optimizer"):
@@ -700,12 +699,6 @@ class DoctorTests(ExportTestCase):
         )
         export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
         self.assertEqual(scan_copilot_duplicates(REPO_ROOT, home=self.tmp), [])
-
-        # F6: extract_cli_session_id honors ANTIGRAVITY_CONVERSATION_ID
-        self.assertEqual(
-            extract_cli_session_id("antigravity", {"ANTIGRAVITY_CONVERSATION_ID": "conv-abc"}),
-            "conv-abc",
-        )
 
     def test_env_var_for_home_honors_xdg_outside_home_and_skill_scope_sync(self) -> None:
         from craftsman.cli import validate_skill_manifests
