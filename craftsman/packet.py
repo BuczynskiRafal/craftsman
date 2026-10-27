@@ -26,6 +26,7 @@ from craftsman.ledger import (
     FieldError,
     Ledger,
     Round,
+    SignalRef,
     reopened_mentions,
     valid_facts_for_hunk,
 )
@@ -130,7 +131,7 @@ class PacketContext:
     signals_by_hunk: Mapping[str, tuple[str, ...]]
     carried_from: Mapping[str, int]
     reopened: Mapping[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
-    quality_signals: tuple[QualitySignal, ...] = ()
+    quality_signals: tuple[QualitySignal | SignalRef, ...] = ()
     test_files_by_symbol: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     last_runs: tuple[str, ...] = ()
     facts_by_hunk: Mapping[str, tuple[Fact, ...]] = field(default_factory=dict)
@@ -146,7 +147,7 @@ def collect_context(
     symbols: Mapping[str, tuple[str, ...]],
     ledger: Ledger,
     index: WorktreeIndex | None = None,
-    quality_signals: Sequence[QualitySignal] | None = None,
+    quality_signals: Sequence[QualitySignal | SignalRef] | None = None,
 ) -> PacketContext:
     """Gather commits, conventions, scopes and references for the hunks under review."""
     idx = index or WorktreeIndex(root)

@@ -946,7 +946,7 @@ def _is_quality_gate_subagent_spec(sub: dict[str, Any]) -> bool:
     return False
 
 
-def _entry_invokes_quality_gate_subagent(entry: dict[str, Any]) -> bool:
+def _entry_invokes_quality_gate_subagent(entry: Mapping[str, Any]) -> bool:
     if entry.get("status") == "ERROR":
         return False
     tool_calls = entry.get("tool_calls")
@@ -1057,7 +1057,7 @@ def _shell_command_mutates_files(cmd: str) -> bool:
     return any(_shell_segment_mutates_files(part.strip()) for part in parts if part.strip())
 
 
-def _count_post_audit_edit_stats(entries: list[dict[str, Any]], after_idx: int) -> tuple[int, int]:
+def _count_post_audit_edit_stats(entries: Sequence[Mapping[str, Any]], after_idx: int) -> tuple[int, int]:
     """Count (modified_files_count, added_or_replaced_lines) in tool calls after `entries[after_idx]`."""
     edited_files: set[str] = set()
     edited_lines = 0
@@ -1124,7 +1124,7 @@ def _evaluate_auditor_report_text(text: str) -> bool:
     return False
 
 
-def _has_audit_failure_after(entries: list[dict[str, Any]], after_idx: int) -> bool:
+def _has_audit_failure_after(entries: Sequence[Mapping[str, Any]], after_idx: int) -> bool:
     """Return True if the auditor response following `entries[after_idx]` is still pending or reports a failure."""
     subagent_conv_ids: set[str] = set()
     ack_seen = False
@@ -1180,7 +1180,7 @@ def _has_audit_failure_after(entries: list[dict[str, Any]], after_idx: int) -> b
 
 
 def has_quality_gate_subagent_in_entries(
-    entries: list[dict[str, Any]], since_step: int
+    entries: Sequence[Mapping[str, Any]], since_step: int
 ) -> bool:
     """Return True if a valid Quality Gate Auditor subagent was invoked after `since_step` and not invalidated."""
     last_auditor_idx: int | None = None
@@ -1639,7 +1639,7 @@ def run_cli(argv: list[str]) -> int:
     return 0
 
 
-def mark_completed(state: dict[str, Any], completed_at_step: int) -> None:
+def mark_completed(state: MutableMapping[str, Any], completed_at_step: int) -> None:
     state["awaiting_user"] = False
     state["active"] = False
     state["stage"] = "completed"

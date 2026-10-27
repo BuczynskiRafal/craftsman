@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from craftsman.diffscan import resolve_base_sha, snapshot
-from craftsman.quality import SignalKind, collect_quality_signals
+from craftsman.quality import QualitySignal, SignalKind, collect_quality_signals
 
 from tests.support import EvidenceRepo
 
@@ -25,7 +25,7 @@ class QualitySignalTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _signals_for_current_diff(self) -> tuple:
+    def _signals_for_current_diff(self) -> tuple[QualitySignal, ...]:
         base_sha = resolve_base_sha(self.root, "HEAD")
         snap = snapshot(self.root, base_sha)
         return collect_quality_signals(self.root, snap)
