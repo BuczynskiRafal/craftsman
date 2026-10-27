@@ -58,7 +58,7 @@ reading full files top to bottom.
    ```
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, a missing `--json` flag in `craftsman status` and a stale README example are two
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
    separate findings, not one "housekeeping" finding.
 
 ## For each remaining finding

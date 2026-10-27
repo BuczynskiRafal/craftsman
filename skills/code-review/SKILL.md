@@ -137,7 +137,7 @@ For each selected lens, for each non-carried hunk:
    without a verdict):
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, a missing `--json` flag in `craftsman status` and a stale README example are two
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
    separate findings, not one "housekeeping" finding;
 3. write the coverage note while you probe, then record it for groups of **1–4 hunks per entry**.
    For every hunk id give the inputs you tried and what the code does with them, naming the guard
@@ -222,7 +222,7 @@ only on `quick` or when the platform has no subagents.
    ```
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, a missing `--json` flag in `craftsman status` and a stale README example are two
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
    separate findings, not one "housekeeping" finding. A finding that duplicates an already-judged one (for
    example in a later round, where `merge` no longer applies) is `dismissed` with a reference to
    the other finding's `file:line`.

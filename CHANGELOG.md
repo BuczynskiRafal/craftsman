@@ -4,6 +4,70 @@ All notable changes to Craftsman are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Removed
+
+- `craftsman gate`: `--pass-*`, `--mode`, `--stage`, `--state-file` (also on `craftsman status`),
+  the stdin mode and the `--soft` alias. `craftsman review view`: the `--lens` alias.
+- `craftsman install`: `--copilot-prompt-files`, `--claude-hooks`, `--codex-workspace` and
+  `--cursor-workspace`. `craftsman export`: `--copilot-prompt-files` and `--claude-hooks`.
+- `craftsman doctor --fix-duplicates`; `doctor` still reports duplicates and which copy to keep.
+- Every compatibility path for older files: a gate state, ledger or install manifest in an older
+  format is an error, and uninstall no longer sweeps Copilot files no manifest records.
+
+### Changed
+
+- **Gate.** The state requires an owner; an invalid state is an error until
+  `craftsman gate --init --takeover` replaces it. Every action refuses another session's gate
+  (`--session-id` names the caller's). All stop hooks allow at most six continuations without
+  fewer open issues; Antigravity keeps the state in the git directory and proves reviewer
+  isolation only through finished `invoke_subagent` runs. Re-running `--init` never lowers the
+  tier, and an `auto` task with a binary or oversized file gets `standard`.
+- **Hooks fail closed.** `pre-tool` asks the user (Copilot denies) when it cannot check a call; an
+  invalid hook command line exits 2; the git guard denies input that is not a JSON object and
+  asks when a message file cannot be read; `--git-hook` usage errors exit 2. A transcript line
+  that is not a JSON object, an unknown `craftsman.scope` value and an Antigravity Stop payload
+  without `terminationReason`/`fullyIdle` are errors. Only the exact names `craftsman`,
+  `craftsman-reviewer` and `craftsman-verifier` count as Craftsman agents.
+- **Ledger and review.** `ledger.json` must contain every section and field, and records must
+  name signals and hunks of their own round. `review view` refuses a stale round or an unselected
+  lens; the `design` lens covers files only. Merging findings about different signals is refused.
+  `review report` lists exactly the runs the gate counts and each acknowledged signal once.
+- **Packets and quality signals.** Long scopes are trimmed with `[… Lx–Ly omitted …]` markers; a
+  deletion is scoped to its function. A Python file that does not parse is a `parse-error`
+  signal, a 41-line function is `long-function`, and `return a, b` no longer equals `return a`.
+  `*.spec.ts`, `*_test.go`, `spec/` and `__tests__/` count as tests; only prose under `docs/` is
+  docs. The `code_quality` and `extreme_optimizer` skills are `code-quality` and
+  `extreme-optimizer`.
+- **Doctor.** Reports a skill folder not named after its skill, `plugin.json` mismatches or
+  repeats, unreadable settings, unparsable hook commands, an unreadable git config, and git hooks
+  whose Python is gone. JSON: Copilot hooks as `state`/`error`, Claude hooks as `hooks`,
+  `git_config` as `user_name`/`user_email`/`hooks_path`, one `vscode_instructions` target; no
+  `cli_self_check` or `fixed_duplicates`.
+- **Install and uninstall.** Each target records exactly what it created and merged into in
+  `.craftsman-install.json`; uninstall removes only that, checks every recorded path before
+  changing anything, and its `--dry-run` reports what a real run does. A user's file in the way
+  moves into a `.craftsman-backup` folder next to it; merged files keep a one-time `.bak`.
+  A failed target records nothing; files to merge into are checked first. Uninstall has its own
+  flags; `--copy`/`--symlink`/`--plugin` no longer select Antigravity, and `--antigravity` no
+  longer reinstalls git hooks.
+- **Git hooks.** They source only their installed `_passthrough.sh`, block the commit or push when
+  the guard or `.python_cmd` is missing, stay where their manifest records them, and set
+  `core.hooksPath` only once the manifest holds the value it replaced.
+- **Export.** Generated Markdown carries `<!-- craftsman:generated -->`, and only marked files
+  count as Craftsman's; a user's file in the way is moved aside. `--user-dir`,
+  `--copilot-skills-dir` and `--copilot-home` each write only their part. Only the exact hook
+  commands Craftsman writes count as its Claude Code hooks. A symlinked `AGENTS.md` is updated
+  where it points inside the workspace and refused outside it; markers that do not enclose one
+  block are an error. A SKILL.md needs frontmatter with `name` and `description`. VS Code folders
+  follow the operating system (`APPDATA`, `~/Library/Application Support`, `XDG_CONFIG_HOME`).
+
+### Fixed
+
+- A second `craftsman review fact add` failed; `env -u`/`-C`/`-S` values hid a trivial run.
+- The ledger and gate state are flushed to disk before they replace the old file.
+
 ## [3.2.0] - 2026-10-27
 
 ### Added
