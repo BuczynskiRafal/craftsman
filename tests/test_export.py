@@ -433,7 +433,7 @@ class ClaudeSettingsMergeTests(ExportTestCase):
             [
                 *original["hooks"]["PreToolUse"],
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|Read|Grep|Glob|LS",
                     "hooks": [
                         {
                             "type": "command",

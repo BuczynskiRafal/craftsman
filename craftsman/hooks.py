@@ -69,6 +69,7 @@ from craftsman.ledger import (
     uncovered_by_lens,
 )
 from craftsman.packet import CHEAT_SHEET
+from craftsman.scope import evaluate_scope, is_craftsman_agent, load_scope_policy
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
@@ -155,7 +156,7 @@ def _agent_name(payload: dict[str, Any]) -> str:
         for key in ("agent_type", "agentType", "agentName", "agentDisplayName")
         if isinstance(value := payload.get(key), str) and value.strip()
     ]
-    craftsman = [name for name in names if _role(name) is not None]
+    craftsman = [name for name in names if _role(name) is not None or is_craftsman_agent(name)]
     return (craftsman or names or [""])[0]
 
 
@@ -201,6 +202,18 @@ class Reply:
         }
         if self.platform == "copilot":
             out = {"additionalContext": context, **out}
+        return out
+
+    def warn(self, message: str) -> Output:
+        out: Output = {
+            "systemMessage": message,
+            "hookSpecificOutput": {
+                "hookEventName": HOOK_EVENT_NAMES[self.event],
+                "additionalContext": message,
+            },
+        }
+        if self.platform == "copilot":
+            out = {"additionalContext": message, **out}
         return out
 
     def deny(self, reason: str) -> Output:
@@ -264,8 +277,9 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     hook = HookInput.parse(payload)
     reply = Reply(platform, event)
     if event == "pre-tool":
-        out = on_pre_tool(hook, reply)
-        if (session := open_session(hook.cwd)) is not None:
+        session = open_session(hook.cwd)
+        out = on_pre_tool(hook, reply, session)
+        if session is not None:
             mark_hooks_seen(session, platform)
         return out
     session = open_session(hook.cwd)
@@ -562,24 +576,42 @@ def _stopped_since(ledger: Ledger, hook: HookInput, since: datetime) -> bool:
 # --- pre-tool -------------------------------------------------------------------------------
 
 
-def on_pre_tool(hook: HookInput, reply: Reply) -> Output:
-    """Apply the git guard to shell commands, whether or not the cwd is a git work tree."""
-    if hook.tool_name.lower() not in SHELL_TOOLS:
+def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None = None) -> Output:
+    """Apply the git guard to shell commands, then repository search-scope rules when Craftsman is active."""
+    if hook.tool_name.lower() in SHELL_TOOLS:
+        command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
+        if isinstance(command, str):
+            tool_cwd = hook.tool_input.get("cwd") or hook.tool_input.get("Cwd")
+            cwd = (
+                str(Path(hook.cwd, tool_cwd))
+                if isinstance(tool_cwd, str) and tool_cwd
+                else hook.cwd
+            )
+            transcript = None
+            if reply.platform == "claude" and hook.transcript_path:
+                candidate = Path(hook.transcript_path).expanduser()
+                transcript = candidate if candidate.is_file() else None
+            decision, reason = evaluate_shell_command(command, cwd, transcript)
+            if decision == "deny":
+                return reply.deny(reason or "Blocked by the Craftsman git guard.")
+            if decision == "force_ask":
+                return reply.ask(reason or "The Craftsman git guard needs your confirmation.")
+
+    if session is None:
+        session = open_session(hook.cwd)
+    if session is None or (not session.active and not is_craftsman_agent(hook.agent)):
         return reply.allow()
-    command = hook.tool_input.get("command")
-    if not isinstance(command, str):
+
+    policy = load_scope_policy(Path(hook.cwd), session.root)
+    if policy.mode == "off":
         return reply.allow()
-    tool_cwd = hook.tool_input.get("cwd")
-    cwd = str(Path(hook.cwd, tool_cwd)) if isinstance(tool_cwd, str) and tool_cwd else hook.cwd
-    transcript = None
-    if reply.platform == "claude" and hook.transcript_path:
-        candidate = Path(hook.transcript_path).expanduser()
-        transcript = candidate if candidate.is_file() else None
-    decision, reason = evaluate_shell_command(command, cwd, transcript)
-    if decision == "deny":
-        return reply.deny(reason or "Blocked by the Craftsman git guard.")
-    if decision == "force_ask":
-        return reply.ask(reason or "The Craftsman git guard needs your confirmation.")
+    scope_decision = evaluate_scope(
+        hook.tool_name, hook.tool_input, Path(hook.cwd), session.root, policy
+    )
+    if scope_decision.decision == "deny":
+        if policy.mode == "warn":
+            return reply.warn(scope_decision.reason)
+        return reply.deny(scope_decision.reason)
     return reply.allow()
 
 

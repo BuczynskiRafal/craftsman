@@ -74,9 +74,9 @@ CLAUDE_HOOK_EVENTS: dict[str, tuple[str, int]] = {
     "SubagentStop": ("subagent-stop", 30),
     "PreToolUse": ("pre-tool", 30),
 }
-# Claude Code runs a PreToolUse hook for every tool unless it has a matcher; the git guard only
-# looks at shell commands.
-CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash"}
+# Claude Code runs a PreToolUse hook for matched tools; pre-tool enforces both the git guard
+# (on Bash) and the repository search scope (on Bash, Read, Grep, Glob, and LS).
+CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash|Read|Grep|Glob|LS"}
 HOOKS_FILENAME = "craftsman.json"
 CLI_SHIM = Path("scripts") / "craftsman-cli.py"
 IMPORT_CHECK_TIMEOUT_S = 30
