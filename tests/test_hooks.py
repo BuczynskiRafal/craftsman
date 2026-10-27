@@ -810,12 +810,16 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                 "(cd /tmp && ls) && git push",
                 "(cd ~ && ls) && git push origin HEAD",
                 f"pushd {other_dir}; popd; git push",
+                "echo `cd /tmp`; git push",
+                "cd /tmp | true; git push",
+                "cd /tmp & git push",
+                "f() { cd /tmp; }; git push",
+                "(case x in a) cd /tmp;; esac); git push",
             ):
                 with self.subTest(cmd=cmd):
                     res = run_hook(
                         GIT_GUARD,
                         {
-                            "tool": "run_command",
                             "toolCall": {
                                 "name": "run_command",
                                 "args": {"CommandLine": cmd, "Cwd": str(repo_dir)},

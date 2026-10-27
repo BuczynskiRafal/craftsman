@@ -374,9 +374,13 @@ def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
         archive_ledger_for_new_base(root, base)
     save_state_atomic(session.state_file, state)
     short_base = base[:7] if base else "none (no commits yet)"
+    sid_flag = f" --session-id {hook.session_id}" if hook.session_id else ""
+    task_arg = state["task"].replace('"', '\\"')
+    init_cmd = f'craftsman gate --init{sid_flag} --tier {state["tier"]} --task "{task_arg}"'
     return reply.inject(
         f"Craftsman session started (tier {state['tier']}, base {short_base}). Follow the /craftsman "
-        "skill; the gate will block finishing until `craftsman review check` passes.\n"
+        f"skill (Stage 0 command: `{init_cmd}`); the gate will block finishing until "
+        "`craftsman review check` passes.\n"
         f"Scope: work only inside {session.root.resolve()}; see Search scope."
     )
 

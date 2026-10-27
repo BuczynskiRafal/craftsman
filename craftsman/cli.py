@@ -614,7 +614,7 @@ def _format_duplicate_problem(dup: dict[str, Any]) -> str:
         return (
             f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
             "(both user and workspace scopes are installed; uninstall one scope with "
-            "`craftsman uninstall --copilot` or `craftsman uninstall --copilot --workspace <dir>`)"
+            "`craftsman uninstall --copilot` or `craftsman uninstall --copilot-workspace <dir>`)"
         )
     if dup["preserved_paths"]:
         preserved_str = ", ".join(dup["preserved_paths"])

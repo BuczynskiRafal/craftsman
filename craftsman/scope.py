@@ -936,10 +936,9 @@ def _check_git_command_scope(
 
 def _has_unmatched_quotes(command_line: str) -> bool:
     for seg in split_shell_segments(command_line):
-        cmd_header = seg.split("\n", 1)[0]
-        hd_match = HEREDOC_OPEN_RE.search(cmd_header)
-        if hd_match:
-            cmd_header = cmd_header[: hd_match.start()]
+        first_line = seg.split("\n", 1)[0]
+        hd_match = HEREDOC_OPEN_RE.search(first_line)
+        cmd_header = first_line[: hd_match.start()] if hd_match else seg
         # Ignore trailing backslash on Windows drive roots like C:\
         sanitized = re.sub(r"([A-Za-z]:)\\(?=\s|$)", r"\1/", cmd_header)
         try:
@@ -960,8 +959,11 @@ def _evaluate_shell_command_scope(
         return ScopeDecision("allow")
 
     if _has_unmatched_quotes(command_line):
-        sys.stderr.write("craftsman scope warning: ignoring unparseable shell command\n")
-        return ScopeDecision("allow")
+        sys.stderr.write("craftsman scope warning: blocking unparseable shell command\n")
+        return ScopeDecision(
+            "deny",
+            _deny_reason("shell command with unmatched quotes", command_line[:80], repo_root),
+        )
 
     commands = iter_simple_commands(command_line, str(cwd))
     for cmd in commands:

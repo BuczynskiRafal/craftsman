@@ -405,10 +405,9 @@ def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
 
 
 def _tokenize_raw_segment(segment: str) -> list[str]:
-    cmd_header = segment.split("\n", 1)[0]
-    hd_match = HEREDOC_OPEN_RE.search(cmd_header)
-    if hd_match:
-        cmd_header = cmd_header[: hd_match.start()]
+    first_line = segment.split("\n", 1)[0]
+    hd_match = HEREDOC_OPEN_RE.search(first_line)
+    cmd_header = first_line[: hd_match.start()] if hd_match else segment
     cmd_header = _separate_unquoted_redirections(cmd_header)
     cmd_header = _preserve_unquoted_windows_backslashes(cmd_header)
     try:
@@ -1388,7 +1387,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     )
     if decision != "allow":
         return decision, reason
-    if payload.get("tool") == "run_command":
+    if isinstance(payload.get("toolCall"), dict):
         return _evaluate_antigravity_scope(payload, command_line, cwd_str)
     return "allow", None
 
@@ -1450,7 +1449,15 @@ def evaluate_shell_command(
         sub, sub_args, effective_cwd = parse_git_invocation(tokens, cmd.cwd)
         if sub != "push":
             continue
+        _, _, explicit_git_cwd = parse_git_invocation(tokens, None)
         targets_protected, is_force = analyze_git_push(sub_args, effective_cwd)
+        check_cwd = effective_cwd
+        if explicit_git_cwd is None and cwd_str != effective_cwd:
+            start_protected, start_force = analyze_git_push(sub_args, cwd_str)
+            if start_protected and not targets_protected:
+                check_cwd = cwd_str
+            targets_protected = targets_protected or start_protected
+            is_force = is_force or start_force
         if not targets_protected:
             continue
 
@@ -1468,7 +1475,7 @@ def evaluate_shell_command(
                 "Please confirm this operation.",
             )
 
-        if was_ask_question_called_since_last_push(transcript_path, effective_cwd):
+        if was_ask_question_called_since_last_push(transcript_path, check_cwd):
             continue
 
         return (

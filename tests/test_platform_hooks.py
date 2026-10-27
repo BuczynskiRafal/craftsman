@@ -19,7 +19,8 @@ from tests.support import EvidenceRepo, coverage_note
 
 CHANGE = "def total(items):\n    return sum(items)\n"
 STARTED = (
-    "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill; "
+    "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill "
+    "(Stage 0 command: `craftsman gate --init --session-id {sid} --tier {tier} --task \"{task}\"`); "
     "the gate will block finishing until `craftsman review check` passes.\n"
     "Scope: work only inside {root}; see Search scope."
 )
@@ -141,7 +142,13 @@ class PromptTests(HookTestCase):
         payload = vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep add cart totals")
         out, _ = call_hook("prompt", "copilot", payload)
 
-        context = STARTED.format(tier="deep", base=self.repo.base_sha[:7], root=self.root.resolve())
+        context = STARTED.format(
+            tier="deep",
+            base=self.repo.base_sha[:7],
+            sid="vscode-session",
+            task="add cart totals",
+            root=self.root.resolve(),
+        )
         self.assertEqual(
             out,
             {
@@ -182,7 +189,13 @@ class PromptTests(HookTestCase):
         out, _ = call_hook(
             "prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman fix it")
         )
-        context = STARTED.format(tier="auto", base=self.repo.base_sha[:7], root=self.root.resolve())
+        context = STARTED.format(
+            tier="auto",
+            base=self.repo.base_sha[:7],
+            sid="claude-session",
+            task="fix it",
+            root=self.root.resolve(),
+        )
         self.assertEqual(
             out,
             {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}},
@@ -921,7 +934,7 @@ class SessionOwnershipTests(HookTestCase):
         self.assertIn("--takeover", refused.stderr)
         self.assertEqual(self.state()["tier"], "deep")
 
-        # Same platform WITHOUT a session_id (e.g. a second session on the same platform with no session env var) is refused
+        # Same platform WITHOUT a session_id (e.g. a second session on the same platform with no session env var) is refused and told to pass --session-id
         no_sid_refused = self.repo.cli(
             "gate",
             "--init",
@@ -936,22 +949,25 @@ class SessionOwnershipTests(HookTestCase):
         )
         self.assertNotEqual(no_sid_refused.returncode, 0)
         self.assertIn("already owned by claude (session claude-session)", no_sid_refused.stderr)
+        self.assertIn("--session-id", no_sid_refused.stderr)
         self.assertEqual(self.state()["tier"], "deep")
         self.assertEqual(self.state()["task"], "owner task")
 
-        # Same platform AND matching session_id is allowed and preserves session_id
-        same_plat = self.repo.cli(
+        # Passing `--session-id <sid>` from the prompt hook briefing succeeds even with no session env var (e.g. VS Code Copilot terminal)
+        by_flag = self.repo.cli(
             "gate",
             "--init",
+            "--session-id",
+            "claude-session",
             "--tier",
             "deep",
             "--task",
             "refined owner task",
             "--cwd",
             ".",
-            env_extra={"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-session"},
+            env_extra={"CLAUDECODE": "", "CLAUDE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ID": ""},
         )
-        self.assertEqual(same_plat.returncode, 0, same_plat.stderr)
+        self.assertEqual(by_flag.returncode, 0, by_flag.stderr)
         self.assertEqual(
             self.state()["owner"], {"platform": "claude", "session_id": "claude-session"}
         )

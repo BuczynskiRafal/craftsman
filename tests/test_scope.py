@@ -248,7 +248,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             "allow",
         )
 
-        # 2. Unparseable command fails open with diagnostic to stderr
+        # 2. Unparseable command with unmatched quotes is denied with diagnostic to stderr
         err = io.StringIO()
         with redirect_stderr(err):
             unparseable = evaluate_scope(
@@ -258,8 +258,8 @@ class ScopeEnforcementTests(unittest.TestCase):
                 self.repo,
                 self.policy,
             )
-        self.assertEqual(unparseable.decision, "allow")
-        self.assertIn("ignoring unparseable shell command", err.getvalue())
+        self.assertEqual(unparseable.decision, "deny")
+        self.assertIn("blocking unparseable shell command", err.getvalue())
 
     def test_pre_tool_hook_activation_dialects_warn_and_off_modes(self) -> None:
         # 1. Without active gate session and non-craftsman agent -> allow everything
@@ -363,13 +363,34 @@ class ScopeEnforcementTests(unittest.TestCase):
             "allow",
         )
 
-        # 2. Heredoc with an apostrophe (it's) does not fool _has_unmatched_quotes
+        # 2. Heredoc with an apostrophe (it's) and multi-line quoted arguments do not disable the scope check
         heredoc_cmd = "cat <<'EOF'\nit's done\nEOF\nfind ~ -name SKILL.md"
         self.assertEqual(
             evaluate_scope(
                 "Bash", {"command": heredoc_cmd}, self.repo, self.repo, self.policy
             ).decision,
             "deny",
+        )
+        for multiline_cmd in (
+            'git commit -m "subject\n\nbody" && rg secret ~',
+            'python -c "\nprint(1)\n"; find ~ -name SKILL.md',
+        ):
+            with self.subTest(multiline_cmd=multiline_cmd):
+                self.assertEqual(
+                    evaluate_scope(
+                        "Bash", {"command": multiline_cmd}, self.repo, self.repo, self.policy
+                    ).decision,
+                    "deny",
+                )
+        self.assertEqual(
+            evaluate_scope(
+                "Bash",
+                {"command": 'git commit -m "subject\n\nbody" && rg secret src'},
+                self.repo,
+                self.repo,
+                self.policy,
+            ).decision,
+            "allow",
         )
 
         # 3. `cat -n` and `cat -c` do not treat the file operand as an option value
@@ -434,7 +455,6 @@ class ScopeEnforcementTests(unittest.TestCase):
         )
         dec, reason = evaluate_command(
             {
-                "tool": "run_command",
                 "conversation_id": "conv-123",
                 "toolCall": {
                     "name": "run_command",

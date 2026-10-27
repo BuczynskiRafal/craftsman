@@ -551,7 +551,7 @@ class CopilotDiscoveryAndDedupTests(unittest.TestCase):
         self.assertTrue(user_agent.is_file())
         self.assertTrue(user_skill.is_file())
         self.assertIn("both user and workspace scopes are installed", err_fix)
-        self.assertIn("craftsman uninstall --copilot", err_fix)
+        self.assertIn("craftsman uninstall --copilot-workspace", err_fix)
 
         # Workspace manifest paths all still exist on disk
         ws_manifest = load_manifest(ws)

@@ -643,11 +643,9 @@ def is_same_or_unclaimed_owner(
     in_sid = session_id.strip()
     if ex_plat == "cli" and not ex_sid:
         return True
-    if ex_plat != platform:
-        return False
     if ex_sid:
-        return bool(in_sid) and in_sid == ex_sid
-    return True
+        return bool(in_sid) and in_sid == ex_sid and platform in (ex_plat, "cli")
+    return ex_plat == platform
 
 
 def check_and_claim_owner(
@@ -1383,6 +1381,11 @@ def run_cli(argv: list[str]) -> int:
         help="Take over an active gate owned by another agent session",
     )
     parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Explicit session ID of the calling agent session (from the prompt hook briefing)",
+    )
+    parser.add_argument(
         "--cwd", help="Repository working directory to capture base_sha and diff stats"
     )
     parser.add_argument("--base-sha", help="Explicit base commit SHA for cumulative diff")
@@ -1434,7 +1437,8 @@ def run_cli(argv: list[str]) -> int:
 
     if (args.init and not args.complete) or state is None or reinit_inactive:
         caller_platform = detect_cli_platform()
-        caller_sid = extract_cli_session_id(caller_platform)
+        explicit_sid = (args.session_id or "").strip()
+        caller_sid = explicit_sid or extract_cli_session_id(caller_platform)
         takeover_from: Any = None
         if args.init and not args.complete:
             if existing_was_active and existing_state is not None:
@@ -1448,6 +1452,8 @@ def run_cli(argv: list[str]) -> int:
                     sys.stderr.write(
                         f"[CRAFTSMAN GATE] Refusing to initialize: an active gate in this work tree "
                         f"is already owned by {owner_desc} (since {since_desc}).\n"
+                        "If you are that session, pass your session ID from the prompt briefing:\n"
+                        "  craftsman gate --init --session-id <session-id> ...\n"
                         "To work in parallel without interfering with that session, create a separate worktree:\n"
                         "  git worktree add ../<branch-dir> -b <branch>\n"
                         "Or, to explicitly take over the existing gate, pass --takeover:\n"
@@ -1461,13 +1467,23 @@ def run_cli(argv: list[str]) -> int:
             base_sha = args.base_sha or get_head_sha(hint_cwd)
             if existing_was_active and existing_state is not None and not args.takeover:
                 prev_owner = existing_state.get("owner")
+                prev_plat = (
+                    str(prev_owner.get("platform") or "")
+                    if isinstance(prev_owner, dict)
+                    else ""
+                )
+                eff_plat = (
+                    prev_plat
+                    if caller_platform == "cli" and prev_plat and prev_plat != "cli"
+                    else caller_platform
+                )
                 prev_sid = (
                     str(prev_owner.get("session_id") or "")
                     if isinstance(prev_owner, dict)
-                    and prev_owner.get("platform") == caller_platform
+                    and prev_plat in (caller_platform, eff_plat)
                     else ""
                 )
-                new_owner = {"platform": caller_platform, "session_id": caller_sid or prev_sid}
+                new_owner = {"platform": eff_plat, "session_id": caller_sid or prev_sid}
             else:
                 new_owner = {"platform": caller_platform, "session_id": caller_sid}
         else:
