@@ -1183,6 +1183,21 @@ class ReviewSignalTests(RepoTestCase):
         self.assertIn("diff-size", refused.stderr)
         self.assertIn("cannot be acknowledged", refused.stderr)
 
+    def test_oversized_diff_sets_needs_human_with_top_files(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))
+        for name in ("mod_a.py", "mod_b.py", "mod_c.py"):
+            self.repo.write(name, lines)
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        state = json.loads((self.repo.ledger_dir / "craftsman_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["stage"], "needs_human")
+        report = self.repo.cli("review", "report").stdout
+        self.assertIn("## Diff size budget exceeded (needs human decision)", report)
+        self.assertIn("Added production lines: 900 (budget: 800)", report)
+        self.assertIn("`mod_a.py` (+300 lines)", report)
+        self.assertIn("Suggested split into smaller changes:", report)
+
 
 class CoverageNoteValidationTests(RepoTestCase):
     def test_cover_rejects_note_made_of_generic_praise(self) -> None:

@@ -27,6 +27,7 @@ from craftsman.gate import (
     load_state,
     resolve_cli_state_file,
     resolve_effective_tier,
+    save_state_atomic,
 )
 from craftsman.ledger import (
     DESIGN_LENS,
@@ -49,6 +50,7 @@ from craftsman.ledger import (
     add_coverage,
     add_finding,
     evaluate,
+    has_unresolved_diff_size,
     is_trivial_run,
     ledger_path_for,
     load,
@@ -65,7 +67,11 @@ from craftsman.ledger import (
 )
 from craftsman.lenses import LENS_IDS, TIERS, Tier, select_lenses
 from craftsman.packet import collect_context, render_packet
-from craftsman.quality import collect_quality_signals
+from craftsman.quality import (
+    MAX_PRODUCTION_ADDED_LINES,
+    collect_quality_signals,
+    production_diff_growth,
+)
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
@@ -185,8 +191,19 @@ def _prepare(args: argparse.Namespace) -> int:
             quality_signals=quality_signals,
         )
         _write_text(packet, render_packet(ctx))
+    _mark_needs_human_if_oversized(ws, ledger)
     _print_prepare_summary(round_, packet, created)
     return 0
+
+
+def _mark_needs_human_if_oversized(ws: Workspace, ledger: Ledger) -> None:
+    if not has_unresolved_diff_size(ledger):
+        return
+    state_file = resolve_cli_state_file(None, str(ws.root))
+    loaded = load_state(state_file)
+    if loaded is not None and loaded.get("stage") != "needs_human":
+        loaded["stage"] = "needs_human"
+        save_state_atomic(state_file, loaded)
 
 
 def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
@@ -728,6 +745,7 @@ def _evaluate(
             "in /craftsman the full gate applies (run `craftsman review check` without --review-only)"
         )
     ledger = load(ws.ledger_path)
+    _mark_needs_human_if_oversized(ws, ledger)
     tier = evaluation_tier(ws, ledger, tier_override)
     snap = snapshot(ws.root, resolve_base(ws, ledger, None))
     policy = gate_policy(ws.state, tier)
@@ -857,6 +875,27 @@ def _signal_ack_lines(ledger: Ledger) -> list[str]:
     return lines
 
 
+def _diff_size_handover_lines(ledger: Ledger, snap: DiffSnapshot) -> list[str]:
+    if not has_unresolved_diff_size(ledger):
+        return []
+    total_prod, top = production_diff_growth(snap)
+    lines = [
+        "",
+        "## Diff size budget exceeded (needs human decision)",
+        f"- Added production lines: {total_prod} (budget: {MAX_PRODUCTION_ADDED_LINES})",
+        "- Top files by line growth:",
+    ]
+    lines.extend(f"  {idx}. `{path}` (+{count} lines)" for idx, (path, count) in enumerate(top, 1))
+    first = top[0][0] if top else (snap.files[0] if snap.files else "module")
+    rest = ", ".join(f"`{p}`" for p, _ in top[1:3]) or "remaining files"
+    lines += [
+        "- Suggested split into smaller changes:",
+        f"  1. Extract `{first}` and its tests into an initial preparatory change.",
+        f"  2. Land {rest} in a follow-up change once part 1 is reviewed.",
+    ]
+    return lines
+
+
 def _report_lines(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -872,6 +911,7 @@ def _report_lines(
         f"- Base `{snap.base_sha[:7]}` · tier `{tier}` · {len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
+        *_diff_size_handover_lines(ledger, snap),
         "",
         "## Findings",
         *_report_finding_lines(ledger, groups),

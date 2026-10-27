@@ -1894,6 +1894,13 @@ def _is_signal_resolved(
     )
 
 
+def has_unresolved_diff_size(ledger: Ledger) -> bool:
+    """Return True when the latest round recorded an unresolved `diff-size` quality signal."""
+    return bool(ledger.rounds) and any(
+        sig.kind == "diff-size" for sig in ledger.rounds[-1].signals
+    )
+
+
 def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
     ack_keys = _acknowledged_signal_keys(ledger)
     issues: list[GateIssue] = []
@@ -1901,7 +1908,7 @@ def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
         if _is_signal_resolved(ledger, latest, sig, ack_keys):
             continue
         action = (
-            f"shrink the change below the budget or record `craftsman review add --signal {sig.id} ...`"
+            "shrink the change below the budget or hand the review to the user"
             if sig.kind == "diff-size"
             else f"record a finding with `craftsman review add --signal {sig.id} ...` or acknowledge it "
             f'with `craftsman review ack {sig.id} --reason "<concrete reason, >= 40 chars>"`'

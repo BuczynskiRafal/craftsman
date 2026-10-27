@@ -67,6 +67,7 @@ from craftsman.ledger import (
     LedgerError,
     add_agent_event,
     format_timestamp,
+    has_unresolved_diff_size,
     ledger_path_for,
     load,
     mutate,
@@ -419,10 +420,19 @@ def on_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
     if state is None or not session.active or state.get("awaiting_user"):
         return reply.allow()
     try:
-        report, error = evaluate_task(state, str(session.root)).report, None
+        evaluation = evaluate_task(state, str(session.root))
+        report, error = evaluation.report, None
     except (DiffScanError, LedgerError) as exc:
-        report, error = None, str(exc)
+        evaluation, report, error = None, None, str(exc)
 
+    if evaluation is not None and has_unresolved_diff_size(evaluation.ledger):
+        state["stage"] = "needs_human"
+        session.save()
+        return notice(
+            reply,
+            "Craftsman gate: the change exceeds the diff-size budget. The decision belongs to "
+            "the user; `craftsman review report` lists the top files by growth and a split suggestion.",
+        )
     if report is not None and any(issue.code == "round-cap" for issue in report.issues):
         state["stage"] = "needs_human"
         session.save()

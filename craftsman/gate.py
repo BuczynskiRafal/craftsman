@@ -41,6 +41,7 @@ from craftsman.ledger import (
     _has_isolated_reviewer_stop,
     add_agent_event,
     format_timestamp,
+    has_unresolved_diff_size,
     ledger_path_for,
     load,
     mutate,
@@ -1356,14 +1357,19 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         missing_subagent = not state["subagent_verified"]
     elif entries and not state.get("hooks_seen"):
         sync_antigravity_subagent_events(state, entries, ws_cwd_str)
+    evaluation: Evaluation | None = None
     report: GateReport | None = None
     evidence_error: str | None = None
     try:
-        report = evaluate_task(state, ws_cwd_str).report
+        evaluation = evaluate_task(state, ws_cwd_str)
+        report = evaluation.report
     except (DiffScanError, LedgerError) as exc:
         evidence_error = str(exc)
 
-    if report is not None and any(issue.code == "round-cap" for issue in report.issues):
+    if report is not None and (
+        any(issue.code == "round-cap" for issue in report.issues)
+        or (evaluation is not None and has_unresolved_diff_size(evaluation.ledger))
+    ):
         state["stage"] = "needs_human"
         _try_save_state(state_file, state)
         return "allow", None
@@ -1610,6 +1616,14 @@ def run_cli(argv: list[str]) -> int:
         except (DiffScanError, LedgerError) as exc:
             sys.stderr.write(
                 f"[CRAFTSMAN GATE] Cannot complete: cannot evaluate the evidence ledger: {exc}\n"
+            )
+            return 1
+        if has_unresolved_diff_size(evaluation.ledger):
+            state["stage"] = "needs_human"
+            save_state_atomic(state_file, state)
+            sys.stderr.write(
+                "[CRAFTSMAN GATE] Cannot complete: change exceeds the diff-size budget; "
+                "stage set to needs_human. Run `craftsman review report` for the user.\n"
             )
             return 1
         if not evaluation.report.passed:
