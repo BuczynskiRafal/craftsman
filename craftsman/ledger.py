@@ -39,6 +39,7 @@ IssueCode = Literal[
     "tier-too-low",
     "uncovered",
     "sweep-too-early",
+    "unresolved-signal",
     "no-verdict",
     "unresolved",
     "no-passing-run",
@@ -66,6 +67,7 @@ MIN_EVIDENCE_CHARS = 20
 SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
+MIN_SIGNAL_ACK_REASON_CHARS = 40
 QUICK_TIER_MAX_CHANGED_LINES = 40
 MAX_NEXT_ACTIONS = 12
 SUMMARY_RECENT_RUNS = 3
@@ -110,7 +112,8 @@ QUESTION_EVIDENCE_EXAMPLE = (
     "findpaths.py:182 does exactly that, which changes testpaths for configs outside the project root"
 )
 DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
-_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R")}
+_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S")}
+_CONCRETE_TOKEN_RE = re.compile(r"(?:->|`[^`]+`|\b\d+\b|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*\.[A-Za-z_]\w*)")
 
 T = TypeVar("T")
 S = TypeVar("S", bound=str)
@@ -271,6 +274,12 @@ class _Fields:
                 raise exc.within(f"{key}[{index}]") from None
         return tuple(parsed)
 
+    def get_records(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
+        if key not in self._raw or self._raw[key] is None:
+            self._seen.add(key)
+            return ()
+        return self.records(key, parse)
+
     def optional_record(self, key: str, parse: Callable[[Any], T]) -> T | None:
         value: dict[str, Any] | None = self._value(key, (dict, type(None)), "an object or null")
         if value is None:
@@ -341,6 +350,70 @@ class HunkRef:
 
 
 @dataclass(frozen=True)
+class SignalRef:
+    id: str
+    kind: str
+    file: str
+    line: int
+    detail: str
+
+    def __post_init__(self) -> None:
+        _require_id(self.id, "S", "id")
+        _require_text(self.kind, "kind")
+        _require_text(self.file, "file")
+        _require(self.line >= 1, "line", "must be >= 1")
+        _require_text(self.detail, "detail")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SignalRef:
+        f = _Fields(raw)
+        return f.done(
+            cls(
+                id=f.text("id"),
+                kind=f.text("kind"),
+                file=f.text("file"),
+                line=f.integer("line"),
+                detail=f.text("detail"),
+            )
+        )
+
+
+@dataclass(frozen=True)
+class SignalAck:
+    signal_id: str
+    round: int
+    fingerprint: str
+    reason: str
+    recorded_at: str
+
+    def __post_init__(self) -> None:
+        _require_id(self.signal_id, "S", "signal_id")
+        _require(self.round >= 1, "round", "must be >= 1")
+        _require_text(self.fingerprint, "fingerprint")
+        _require_text(self.reason, "reason", min_chars=MIN_SIGNAL_ACK_REASON_CHARS)
+        _require_timestamp(self.recorded_at, "recorded_at")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SignalAck:
+        f = _Fields(raw)
+        return f.done(
+            cls(
+                signal_id=f.text("signal_id"),
+                round=f.integer("round"),
+                fingerprint=f.text("fingerprint"),
+                reason=f.text("reason"),
+                recorded_at=f.text("recorded_at"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class Round:
     number: int
     fingerprint: str
@@ -350,6 +423,7 @@ class Round:
     hunks: tuple[HunkRef, ...]
     lenses: tuple[str, ...]
     packet_path: str
+    signals: tuple[SignalRef, ...] = ()
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
@@ -363,6 +437,8 @@ class Round:
         _require(len(set(self.lenses)) == len(self.lenses), "lenses", "must not repeat a lens")
         hunk_ids = [hunk.id for hunk in self.hunks]
         _require(len(set(hunk_ids)) == len(hunk_ids), "hunks", "must not repeat a hunk id")
+        sig_ids = [sig.id for sig in self.signals]
+        _require(len(set(sig_ids)) == len(sig_ids), "signals", "must not repeat a signal id")
 
     def to_json(self) -> dict[str, Any]:
         return _record_json(self)
@@ -380,6 +456,7 @@ class Round:
                 hunks=f.records("hunks", HunkRef.from_json),
                 lenses=f.texts("lenses"),
                 packet_path=f.text("packet_path"),
+                signals=f.get_records("signals", SignalRef.from_json),
             )
         )
 
@@ -488,9 +565,12 @@ class Finding:
     resolution_note: str
     recorded_at: str
     updated_at: str
+    signal_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_id(self.id, "F", "id")
+        if self.signal_id is not None:
+            _require_id(self.signal_id, "S", "signal_id")
         _require(self.round >= 1, "round", "must be >= 1")
         _require_choice(self.lens, sorted(LENS_IDS), "lens")
         _require_text(self.path, "path")
@@ -551,6 +631,7 @@ class Finding:
                 resolution_note=f.text("resolution_note"),
                 recorded_at=f.text("recorded_at"),
                 updated_at=f.text("updated_at"),
+                signal_id=f.get_optional_text("signal_id"),
             )
         )
 
@@ -687,6 +768,7 @@ class Ledger:
     findings: tuple[Finding, ...] = ()
     runs: tuple[Run, ...] = ()
     agents: tuple[AgentEvent, ...] = ()
+    signal_acks: tuple[SignalAck, ...] = ()
 
     def __post_init__(self) -> None:
         for index, round_ in enumerate(self.rounds):
@@ -738,6 +820,7 @@ class Ledger:
                     findings=f.records("findings", Finding.from_json),
                     runs=f.records("runs", Run.from_json),
                     agents=f.records("agents", AgentEvent.from_json),
+                    signal_acks=f.get_records("signal_acks", SignalAck.from_json),
                 )
             )
         except FieldError as exc:
@@ -909,6 +992,30 @@ def _with_finding(ledger: Ledger, updated: Finding) -> tuple[Ledger, Finding]:
     return replace(ledger, findings=findings), updated
 
 
+def _to_signal_ref(sig: Any) -> SignalRef:
+    if isinstance(sig, SignalRef):
+        return sig
+    kind = sig.kind.value if hasattr(sig.kind, "value") else str(sig.kind)
+    return SignalRef(id=sig.id, kind=kind, file=sig.file, line=sig.line, detail=sig.detail)
+
+
+def _build_hunk_refs(
+    hunks: Sequence[Hunk], carried: frozenset[str], reopened: frozenset[str]
+) -> tuple[HunkRef, ...]:
+    return tuple(
+        HunkRef(
+            hunk.id,
+            hunk.path,
+            hunk.digest,
+            hunk.new_start,
+            hunk.new_len,
+            carried=hunk.id in carried,
+            reopened=hunk.id in reopened,
+        )
+        for hunk in hunks
+    )
+
+
 def open_round(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -916,6 +1023,8 @@ def open_round(
     lenses: Sequence[str],
     packet_path: str,
     symbols_by_hunk: Mapping[str, Sequence[str]],
+    *,
+    signals: Sequence[Any] = (),
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op."""
     if ledger.rounds:
@@ -937,20 +1046,10 @@ def open_round(
         base_sha=snap.base_sha,
         tier=tier,
         prepared_at=_now(),
-        hunks=tuple(
-            HunkRef(
-                hunk.id,
-                hunk.path,
-                hunk.digest,
-                hunk.new_start,
-                hunk.new_len,
-                carried=hunk.id in carried,
-                reopened=hunk.id in reopened,
-            )
-            for hunk in snap.hunks
-        ),
+        hunks=_build_hunk_refs(snap.hunks, carried, reopened),
         lenses=tuple(lenses),
         packet_path=packet_path,
+        signals=tuple(_to_signal_ref(sig) for sig in signals),
     )
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
 
@@ -1134,9 +1233,16 @@ def add_finding(
     title: str,
     scenario: str,
     suggestion: str,
+    signal_id: str | None = None,
 ) -> tuple[Ledger, Finding]:
     """Record a finding against the latest round and the code it reviewed."""
     round_ = _latest_round(ledger)
+    if signal_id is not None and all(sig.id != signal_id for sig in round_.signals):
+        known = ", ".join(sig.id for sig in round_.signals) or "none in this round"
+        raise LedgerError(
+            f"unknown quality signal {signal_id!r} in round {round_.number}; known: {known}",
+            field="signal_id",
+        )
     now = _now()
     finding = Finding(
         id=_next_id("F", (item.id for item in ledger.findings)),
@@ -1156,8 +1262,41 @@ def add_finding(
         resolution_note="",
         recorded_at=now,
         updated_at=now,
+        signal_id=signal_id,
     )
     return replace(ledger, findings=(*ledger.findings, finding)), finding
+
+
+def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, SignalAck]:
+    """Acknowledge a quality signal in the latest round with a concrete reason (>= 40 chars)."""
+    round_ = _latest_round(ledger)
+    sig = next((item for item in round_.signals if item.id == signal_id), None)
+    if sig is None:
+        known = ", ".join(item.id for item in round_.signals) or "none in this round"
+        raise LedgerError(
+            f"unknown quality signal {signal_id!r} in round {round_.number}; known: {known}",
+            field="signal_id",
+        )
+    if sig.kind == "diff-size":
+        raise LedgerError(
+            f"{signal_id} (`diff-size`) cannot be acknowledged by the agent; shrink the change "
+            "or hand the review to the user",
+            field="signal_id",
+        )
+    stripped = reason.strip()
+    _require_text(stripped, "reason", min_chars=MIN_SIGNAL_ACK_REASON_CHARS)
+    if _CONCRETE_TOKEN_RE.search(stripped) is None and _FILE_REFERENCE_RE.search(stripped) is None:
+        raise FieldError(
+            "reason",
+            "must include a concrete code detail (a file:line, symbol(), `identifier`, number, or ->)",
+        )
+    ack = SignalAck(signal_id, round_.number, round_.fingerprint, stripped, _now())
+    kept = tuple(
+        item
+        for item in ledger.signal_acks
+        if not (item.round == round_.number and item.signal_id == signal_id)
+    )
+    return replace(ledger, signal_acks=(*kept, ack)), ack
 
 
 def relocate_finding(
@@ -1538,6 +1677,7 @@ def evaluate(
         *_round_issues(ledger, snap),
         *(_tier_issues(latest, policy) if latest else ()),
         *(_coverage_issues(ledger, latest) if latest else ()),
+        *(_signal_issues(ledger, latest) if latest else ()),
         *_verdict_issues(ledger),
         *fix_and_test,
         *(_isolation_issues(ledger, latest, policy) if latest else ()),
@@ -1549,6 +1689,54 @@ def evaluate(
         _summary(ledger, snap),
         review_only=review_only,
     )
+
+
+def _acknowledged_signal_keys(ledger: Ledger) -> set[tuple[str, str, str]]:
+    by_round_id = {
+        (round_.number, sig.id): (sig.kind, sig.file, sig.detail)
+        for round_ in ledger.rounds
+        for sig in round_.signals
+    }
+    return {
+        key
+        for ack in ledger.signal_acks
+        if (key := by_round_id.get((ack.round, ack.signal_id))) is not None
+    }
+
+
+def _is_signal_resolved(
+    ledger: Ledger, latest: Round, sig: SignalRef, ack_keys: set[tuple[str, str, str]]
+) -> bool:
+    if sig.kind == "diff-size":
+        return False
+    if (sig.kind, sig.file, sig.detail) in ack_keys:
+        return True
+    return any(
+        f.round == latest.number and f.signal_id == sig.id and f.verdict != "dismissed"
+        for f in ledger.findings
+    )
+
+
+def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
+    ack_keys = _acknowledged_signal_keys(ledger)
+    issues: list[GateIssue] = []
+    for sig in latest.signals:
+        if _is_signal_resolved(ledger, latest, sig, ack_keys):
+            continue
+        action = (
+            f"shrink the change below the budget or record `craftsman review add --signal {sig.id} ...`"
+            if sig.kind == "diff-size"
+            else f"record a finding with `craftsman review add --signal {sig.id} ...` or acknowledge it "
+            f'with `craftsman review ack {sig.id} --reason "<concrete reason, >= 40 chars>"`'
+        )
+        issues.append(
+            GateIssue(
+                "unresolved-signal",
+                f"Quality signal {sig.id} ({sig.kind} at {sig.file}:{sig.line} — {sig.detail}) "
+                f"is unresolved; {action}.",
+            )
+        )
+    return issues
 
 
 def require_current_round(ledger: Ledger, snap: DiffSnapshot) -> Round:

@@ -1128,5 +1128,61 @@ class PacketRenderingTests(unittest.TestCase):
         self.assertIn("line 499", render_packet(ctx))
 
 
+class ReviewSignalTests(RepoTestCase):
+    def test_check_fails_while_a_quality_signal_is_unresolved(self) -> None:
+        body = "\n".join(f"    step_{i} = x + {i}" for i in range(45))
+        self.repo.write("long_mod.py", f"def over_budget(x: int) -> int:\n{body}\n    return step_44\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        packet_text = (self.repo.ledger_dir / "packet-1.md").read_text(encoding="utf-8")
+        self.assertIn("## Quality signals", packet_text)
+        self.assertIn("S1", packet_text)
+
+        self.repo.cover_all()
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "import long_mod")
+        blocked = self.repo.cli("review", "check", check=False)
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("[unresolved-signal]", blocked.stdout)
+        self.assertIn("craftsman review add --signal S1", blocked.stdout)
+        self.assertIn("craftsman review ack S1", blocked.stdout)
+
+    def test_ack_reason_appears_in_final_report(self) -> None:
+        body = "\n".join(f"    step_{i} = x + {i}" for i in range(45))
+        self.repo.write("long_mod.py", f"def over_budget(x: int) -> int:\n{body}\n    return step_44\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cover_all()
+        self.repo.cli(
+            "review",
+            "ack",
+            "S1",
+            "--reason",
+            "over_budget() is a generated dispatch table at long_mod.py:1 with 45 linear steps",
+        )
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "import long_mod")
+
+        self.repo.cli("review", "check")
+        report = self.repo.cli("review", "report").stdout
+        self.assertIn("## Acknowledged quality signals", report)
+        self.assertIn("S1 (`long-function` at `long_mod.py:1`)", report)
+        self.assertIn("generated dispatch table at long_mod.py:1", report)
+
+    def test_diff_size_signal_cannot_be_acknowledged(self) -> None:
+        lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))
+        for name in ("mod_a.py", "mod_b.py", "mod_c.py"):
+            self.repo.write(name, lines)
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        refused = self.repo.cli(
+            "review",
+            "ack",
+            "S1",
+            "--reason",
+            "mod_a.py:1 adds 900 constants across 3 modules that cannot be split right now",
+            check=False,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("diff-size", refused.stderr)
+        self.assertIn("cannot be acknowledged", refused.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

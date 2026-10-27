@@ -23,6 +23,7 @@ from craftsman.diffscan import (
 )
 from craftsman.ledger import Ledger, Round, reopened_mentions
 from craftsman.lenses import LensPick
+from craftsman.quality import QualitySignal, collect_quality_signals
 
 MAX_PACKET_CHARS = 350_000
 MAX_COMMITS = 50
@@ -119,6 +120,7 @@ class PacketContext:
     signals_by_hunk: Mapping[str, tuple[str, ...]]
     carried_from: Mapping[str, int]
     reopened: Mapping[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
+    quality_signals: tuple[QualitySignal, ...] = ()
 
 
 def collect_context(
@@ -131,6 +133,7 @@ def collect_context(
     symbols: Mapping[str, tuple[str, ...]],
     ledger: Ledger,
     index: WorktreeIndex | None = None,
+    quality_signals: Sequence[QualitySignal] | None = None,
 ) -> PacketContext:
     """Gather commits, conventions, scopes and references for the hunks under review.
 
@@ -138,6 +141,8 @@ def collect_context(
     """
     if index is None:
         index = WorktreeIndex(root)
+    if quality_signals is None:
+        quality_signals = collect_quality_signals(root, snap)
     carried = {hunk.id for hunk in round_.hunks if hunk.carried}
     open_hunks = [hunk for hunk in snap.hunks if hunk.id not in carried]
     open_symbols = {hunk.id: symbols.get(hunk.id, ()) for hunk in open_hunks}
@@ -155,6 +160,7 @@ def collect_context(
         signals_by_hunk=_signals_by_hunk(snap.hunks),
         carried_from=_carried_from(ledger, round_),
         reopened=reopened_mentions(ledger.coverage, round_, snap.hunks, symbols),
+        quality_signals=tuple(quality_signals),
     )
 
 
@@ -231,17 +237,33 @@ def _carried_from(ledger: Ledger, round_: Round) -> dict[str, int]:
 
 def render_packet(ctx: PacketContext) -> str:
     """Render the packet; enclosing scopes are dropped, largest first, if it grows too large."""
-    preamble = "\n\n".join(
-        [
-            _header(ctx),
-            _intent(ctx),
-            _conventions_section(ctx),
-            _lenses_section(ctx),
-            "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
-        ]
-    )
+    parts = [
+        _header(ctx),
+        _intent(ctx),
+        _conventions_section(ctx),
+        _lenses_section(ctx),
+        "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
+    ]
+    if ctx.quality_signals or ctx.round.signals:
+        parts.append(_quality_signals_section(ctx))
+    preamble = "\n\n".join(parts)
     omitted = _scopes_to_omit(ctx, len(preamble))
     return f"{preamble}\n\n{_hunks_section(ctx, omitted)}\n"
+
+
+def _quality_signals_section(ctx: PacketContext) -> str:
+    signals = ctx.quality_signals or ctx.round.signals
+    lines = [
+        "## Quality signals",
+        "Every signal below must be resolved before `craftsman review check` passes: either "
+        "record a finding with `craftsman review add ... --signal <ID>` or acknowledge it with "
+        '`craftsman review ack <ID> --reason "<concrete reason, >= 40 chars>"`.',
+        "",
+    ]
+    for sig in signals:
+        kind = sig.kind.value if hasattr(sig.kind, "value") else sig.kind
+        lines.append(f"- **{sig.id}** (`{kind}`) `{sig.file}:{sig.line}` — {sig.detail}")
+    return "\n".join(lines)
 
 
 def _scopes_to_omit(ctx: PacketContext, preamble_chars: int) -> frozenset[str]:
