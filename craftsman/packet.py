@@ -429,9 +429,7 @@ def _lenses_section(ctx: PacketContext, only: Collection[str] | None = None) -> 
     return "## Lenses in this round\n" + "\n".join(rows)
 
 
-def _first_hunk_by_symbol(
-    ctx: PacketContext, include: frozenset[str] | None = None
-) -> dict[str, str]:
+def _first_hunk_by_symbol(ctx: PacketContext, include: frozenset[str] | None = None) -> dict[str, str]:
     first: dict[str, str] = {}
     for hunk in ctx.snap.hunks:
         if hunk.id in ctx.carried_from or (include is not None and hunk.id not in include):
@@ -445,8 +443,7 @@ def _hunks_section(ctx: PacketContext, omitted: frozenset[str]) -> str:
     first_by_scope = _first_hunk_by_scope(ctx)
     first_by_symbol = _first_hunk_by_symbol(ctx)
     sections = [
-        _hunk_section(ctx, hunk, omitted, first_by_scope, first_by_symbol)
-        for hunk in ctx.snap.hunks
+        _hunk_section(ctx, hunk, omitted, first_by_scope, first_by_symbol) for hunk in ctx.snap.hunks
     ]
     return "## Hunks\n\n" + "\n\n".join(sections)
 
@@ -462,9 +459,7 @@ def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
     return f"- {hunk.id} · {hunk.path} · {label}"
 
 
-def _view_hunks_section(
-    ctx: PacketContext, assigned: frozenset[str], omitted: frozenset[str]
-) -> str:
+def _view_hunks_section(ctx: PacketContext, assigned: frozenset[str], omitted: frozenset[str]) -> str:
     first_by_scope = _first_hunk_by_scope(ctx, include=assigned)
     first_by_symbol = _first_hunk_by_symbol(ctx, include=assigned)
     full = [
@@ -472,11 +467,7 @@ def _view_hunks_section(
         for hunk in ctx.snap.hunks
         if hunk.id in assigned
     ]
-    other = [
-        _hunk_summary_line(ctx, hunk)
-        for hunk in ctx.snap.hunks
-        if hunk.id not in assigned
-    ]
+    other = [_hunk_summary_line(ctx, hunk) for hunk in ctx.snap.hunks if hunk.id not in assigned]
     parts = ["## Hunks\n\n" + ("\n\n".join(full) if full else "(no hunks assigned)")]
     if other:
         parts.append("### Other hunks (index)\n" + "\n".join(other))
@@ -584,9 +575,7 @@ def _symbol_lines(
             lines.append(f"- `{symbol}`: {listed or '(no other references found)'}")
             test_files = ctx.test_files_by_symbol.get(symbol, ())
             if test_files:
-                lines.append(
-                    f"Tests referencing `{symbol}`: " + ", ".join(f"`{p}`" for p in test_files)
-                )
+                lines.append(f"Tests referencing `{symbol}`: " + ", ".join(f"`{p}`" for p in test_files))
     open_ids = [h.id for h in ctx.snap.hunks if h.id not in ctx.carried_from]
     if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
         lines.append("Last runs: " + " · ".join(ctx.last_runs))

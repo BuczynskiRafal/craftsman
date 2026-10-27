@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from craftsman.gate import _encode_claude_project_slug, read_transcript_entries
+from craftsman.transcript import Entry, TranscriptError, claude_project_slug, read_transcript_entries
 
 PROTECTED_BRANCHES = frozenset(
     {
@@ -53,18 +53,14 @@ AI_ATTRIBUTION_PATTERNS = (
     re.compile(r"(?i)🤖[ \t]*generated[ \t]+with"),
 )
 
-PUSH_ACTION_RE = re.compile(
-    r"(?i)\b(push\w*|wypchn\w*|wrzu[cć]\w*|merge\w*|zmerguj\w*|scal\w*)\b"
-)
+PUSH_ACTION_RE = re.compile(r"(?i)\b(push\w*|wypchn\w*|wrzu[cć]\w*|merge\w*|zmerguj\w*|scal\w*)\b")
 PUSH_TARGET_RE = re.compile(
     r"(?i)(?:\b(?:main|master|protected\s+branch)\b|"
     r"\bchronion\w+\s+gał[aąę][zź]\w*|"
     r"\bgał[aąę][zź]\w*\s+chronion\w*|"
     r"\bpr\s+merge\b|\bmerge\b[^\n]{0,30}\b(?:pr|pull\s+request)\b)"
 )
-DIRECT_MAIN_APPROVAL_RE = re.compile(
-    r"(?i)\b(main|master|merge\w*|zmerguj\w*|scal\w*)\b"
-)
+DIRECT_MAIN_APPROVAL_RE = re.compile(r"(?i)\b(main|master|merge\w*|zmerguj\w*|scal\w*)\b")
 AFFIRMATIVE_SHORT_RE = re.compile(
     r"(?i)^\s*(?:a\d+\s*:\s*)?(?:\(recommended\)\s*)?(?:yes|tak|y|t|ok|okay|confirm\w*|proceed|zatwierd[zź]\w*)\s*[.!]*\s*$"
 )
@@ -84,9 +80,7 @@ USER_CANCELLATION_RE = re.compile(
     r"tool\s+call\s+rejected|user\s+cancelled|user\s+canceled|anulowano)"
 )
 CLAUDE_ANSWER_PAIR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"')
-HEREDOC_OPEN_RE = re.compile(
-    r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
-)
+HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
 _REDIR_TARGET_PAT = r"[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>]*)"
 UNQUOTED_REDIR_RE = re.compile(
     r"(?:(?:\d+)?[<>]&[ \t]*(?:\d+|-)"
@@ -99,9 +93,7 @@ GIT_GLOBAL_OPTS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 )
 
-PUSH_OPTS_WITH_VALUE = frozenset(
-    {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
-)
+PUSH_OPTS_WITH_VALUE = frozenset({"--repo", "--receive-pack", "--exec", "-o", "--push-option"})
 
 INLINE_MESSAGE_OPTS = frozenset(
     {"-m", "--message", "--trailer", "-b", "--body", "-t", "--title", "--notes"}
@@ -114,7 +106,24 @@ SIMPLE_WRAPPERS = frozenset(
 SHELL_CONTROL_KEYWORDS = frozenset({"if", "then", "elif", "else", "fi", "do", "done", "while", "until"})
 WRAPPER_OPTS_WITH_VALUE: dict[str, frozenset[str]] = {
     "nice": frozenset({"-n", "--adjustment"}),
-    "sudo": frozenset({"-u", "-g", "-C", "-D", "-R", "-T", "-h", "-p", "-r", "-t", "--user", "--group", "--chdir", "--prompt"}),
+    "sudo": frozenset(
+        {
+            "-u",
+            "-g",
+            "-C",
+            "-D",
+            "-R",
+            "-T",
+            "-h",
+            "-p",
+            "-r",
+            "-t",
+            "--user",
+            "--group",
+            "--chdir",
+            "--prompt",
+        }
+    ),
     "env": frozenset({"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}),
     "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
     "command": frozenset(),
@@ -124,7 +133,9 @@ WRAPPER_OPTS_WITH_VALUE: dict[str, frozenset[str]] = {
     "builtin": frozenset(),
 }
 TIMEOUT_OPTS_WITH_VALUE = frozenset({"-k", "-s", "--kill-after", "--signal"})
-XARGS_OPTS_WITH_VALUE = frozenset({"-n", "-L", "-I", "-P", "-d", "-E", "-a", "--max-args", "--max-procs"})
+XARGS_OPTS_WITH_VALUE = frozenset(
+    {"-n", "-L", "-I", "-P", "-d", "-E", "-a", "--max-args", "--max-procs"}
+)
 
 
 def emit(decision: str, reason: str | None = None) -> None:
@@ -246,7 +257,11 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
                 if cur_tok == "--":
                     idx += 1
                     break
-                if "=" in cur_tok and not cur_tok.startswith("-") and cur_tok.split("=", 1)[0].isidentifier():
+                if (
+                    "=" in cur_tok
+                    and not cur_tok.startswith("-")
+                    and cur_tok.split("=", 1)[0].isidentifier()
+                ):
                     idx += 1
                     continue
                 if cur_tok in opts_with_val:
@@ -363,7 +378,9 @@ def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
             continue
         if quote is None:
             m = _UNQUOTED_WIN_PATH_TOKEN_RE.match(cmd_header, i)
-            if m and (i == 0 or cmd_header[i - 1].isspace() or cmd_header[i - 1] in (";", "|", "&", "(")):
+            if m and (
+                i == 0 or cmd_header[i - 1].isspace() or cmd_header[i - 1] in (";", "|", "&", "(")
+            ):
                 out.append(m.group(0).replace("\\", "\\\\"))
                 i = m.end()
                 continue
@@ -403,7 +420,12 @@ def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> s
             tok = tokens[i]
             if tok == "-c" and i + 1 < len(tokens):
                 return tokens[i + 1]
-            if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:] and i + 1 < len(tokens):
+            if (
+                tok.startswith("-")
+                and not tok.startswith("--")
+                and "c" in tok[1:]
+                and i + 1 < len(tokens)
+            ):
                 return tokens[i + 1]
             if tok.startswith("-"):
                 i += 1
@@ -781,7 +803,11 @@ def extract_inline_messages(tokens: list[str]) -> list[str]:
             values.append(tok.split("=", 1)[1])
             i += 1
             continue
-        if (tok.startswith("-m") or tok.startswith("-b") or tok.startswith("-t")) and not tok.startswith("--") and len(tok) > 2:
+        if (
+            (tok.startswith("-m") or tok.startswith("-b") or tok.startswith("-t"))
+            and not tok.startswith("--")
+            and len(tok) > 2
+        ):
             values.append(tok[2:])
             i += 1
             continue
@@ -837,9 +863,7 @@ def _matches_ai_attribution_text(text: str) -> bool:
     return False
 
 
-def has_ai_attribution(
-    segment: str, tokens: list[str] | None = None, cwd: str | None = None
-) -> bool:
+def has_ai_attribution(segment: str, tokens: list[str] | None = None, cwd: str | None = None) -> bool:
     if _matches_ai_attribution_text(segment):
         return True
     if tokens:
@@ -1154,9 +1178,7 @@ def _answer_approves_direct_push(answer: str) -> bool:
     cleaned = BENIGN_NO_PR_CLARIFICATION_RE.sub(" ", answer)
     if PR_BRANCH_REJECTION_RE.search(cleaned):
         return False
-    return bool(
-        DIRECT_MAIN_APPROVAL_RE.search(cleaned) or AFFIRMATIVE_SHORT_RE.search(cleaned)
-    )
+    return bool(DIRECT_MAIN_APPROVAL_RE.search(cleaned) or AFFIRMATIVE_SHORT_RE.search(cleaned))
 
 
 def _is_user_response_approving_main_push(
@@ -1223,13 +1245,25 @@ def _command_pushes_or_merges_protected(cmd: str, cwd: str | None) -> bool:
     return False
 
 
+def _readable_entries(transcript_path: Path) -> list[Entry] | None:
+    """The transcript's entries, or None (reported on stderr) when the file cannot be read."""
+    try:
+        return read_transcript_entries(transcript_path)
+    except TranscriptError as exc:
+        sys.stderr.write(f"[CRAFTSMAN GIT-GUARD] {exc}\n")
+        return None
+
+
 def was_ask_question_called_since_last_push(
     transcript_path: Path,
     fallback_cwd: str | None = None,
     ignore_in_flight_tail: bool = False,
 ) -> bool:
-    """Check if an approved push-confirmation `ask_question` occurred after the most recent `git push`."""
-    entries = read_transcript_entries(transcript_path)
+    """Check if an approved push-confirmation `ask_question` occurred after the most recent `git push`.
+
+    An unreadable transcript proves no approval.
+    """
+    entries = _readable_entries(transcript_path)
     if not entries:
         return False
 
@@ -1242,11 +1276,7 @@ def was_ask_question_called_since_last_push(
         if not isinstance(tool_calls, list):
             continue
 
-        if (
-            ignore_in_flight_tail
-            and idx == len(entries) - 1
-            and entry.get("type") == "PLANNER_RESPONSE"
-        ):
+        if ignore_in_flight_tail and idx == len(entries) - 1 and entry.get("type") == "PLANNER_RESPONSE":
             continue
 
         for tc in reversed(tool_calls):
@@ -1296,34 +1326,22 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
     return None, None
 
 
-def _is_active_antigravity_owner(
-    payload: dict[str, Any], effective_cwd: Path
-) -> bool:
-    from craftsman.gate import (
-        GateOwner,
-        _extract_antigravity_session_id,
-        load_state,
-        owns_gate,
-        resolve_cli_state_file,
-    )
+def _is_active_antigravity_owner(payload: dict[str, Any], effective_cwd: Path) -> bool:
+    """Whether the work tree has an active gate that the Antigravity session of `payload` owns."""
+    from craftsman.antigravity import session_id
+    from craftsman.gate import GateOwner, load_state, state_path_for
 
-    caller = GateOwner(platform="antigravity", session_id=_extract_antigravity_session_id(payload))
-    candidates: list[Path] = []
-    raw_artifact_dir = payload.get("artifactDirectoryPath")
-    if isinstance(raw_artifact_dir, str) and raw_artifact_dir.strip():
-        candidates.append(Path(raw_artifact_dir).expanduser() / "craftsman_state.json")
-    candidates.append(resolve_cli_state_file(None, str(effective_cwd)))
-    for state_file in candidates:
-        state = load_state(state_file)
-        if state and state.get("active") and owns_gate(GateOwner.from_state(state), caller):
-            return True
-    return False
+    state = load_state(state_path_for(effective_cwd))
+    caller = GateOwner(platform="antigravity", session_id=session_id(payload))
+    return state is not None and state.active and state.owner.admits(caller)
 
 
 def _evaluate_antigravity_scope(
     payload: dict[str, Any], command_line: str, cwd_str: str | None
 ) -> tuple[str, str | None]:
     """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
+    from craftsman.gate import GateStateError
+
     try:
         from craftsman.diffscan import DiffScanError, worktree_root
         from craftsman.scope import evaluate_scope, load_scope_policy
@@ -1332,6 +1350,8 @@ def _evaluate_antigravity_scope(
         repo_root = worktree_root(effective_cwd)
         if not _is_active_antigravity_owner(payload, effective_cwd):
             return "allow", None
+    except GateStateError as exc:
+        return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
     except (ImportError, OSError, DiffScanError):
         return "allow", None
 
@@ -1354,9 +1374,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     command_line, cwd_str = _extract_command_and_cwd(payload)
     if not isinstance(command_line, str):
         return "allow", None
-    decision, reason = evaluate_shell_command(
-        command_line, cwd_str, resolve_transcript_path(payload)
-    )
+    decision, reason = evaluate_shell_command(command_line, cwd_str, resolve_transcript_path(payload))
     if decision != "allow":
         return decision, reason
     if isinstance(payload.get("toolCall"), dict):
@@ -1470,22 +1488,13 @@ def _path_belongs_to_repo(candidate_str: str, repo_root: Path) -> bool:
 
 
 def _transcript_matches_workspace(transcript_path: Path, repo_root: Path | None) -> bool:
-    """Return True if the session transcript or its state file belongs to `repo_root`."""
+    """Return True if a tool call in the session transcript names a path inside `repo_root`."""
     if repo_root is None:
         return False
 
-    brain_conv_dir = transcript_path.parent.parent.parent
-    state_file = brain_conv_dir / "craftsman_state.json"
-    if state_file.is_file():
-        try:
-            state = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(state, dict) and isinstance(state.get("cwd"), str):
-                if _path_belongs_to_repo(state["cwd"], repo_root):
-                    return True
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    entries = read_transcript_entries(transcript_path)
+    entries = _readable_entries(transcript_path)
+    if entries is None:
+        return False
     path_keys = (
         "Cwd",
         "cwd",
@@ -1530,7 +1539,7 @@ def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600
             if (now - mtime) <= max_age_sec and _transcript_matches_workspace(p, repo_root):
                 recent.append((mtime, p))
 
-    claude_proj = Path.home() / ".claude" / "projects" / _encode_claude_project_slug(str(repo_root))
+    claude_proj = Path.home() / ".claude" / "projects" / claude_project_slug(str(repo_root))
     if claude_proj.is_dir():
         for p in claude_proj.glob("*.jsonl"):
             try:
@@ -1575,7 +1584,10 @@ def _has_in_flight_agent_push(cwd: str | None = None) -> bool:
         return True
 
     for transcript in _find_recent_workspace_transcripts(cwd, max_age_sec=60.0):
-        entries = read_transcript_entries(transcript)
+        entries = _readable_entries(transcript)
+        if entries is None:
+            # An unreadable recent transcript cannot rule out an agent's push in flight.
+            return True
         if not entries:
             continue
         last_entry = entries[-1]
@@ -1609,9 +1621,7 @@ def run_native_commit_msg_hook(msg_file_str: str) -> int:
         content = content[: scissors_match.start()]
 
     # Strip git comment lines starting with '#'
-    active_lines = "\n".join(
-        line for line in content.splitlines() if not line.lstrip().startswith("#")
-    )
+    active_lines = "\n".join(line for line in content.splitlines() if not line.lstrip().startswith("#"))
     if has_ai_attribution(active_lines):
         sys.stderr.write(
             "\n[CRAFTSMAN GIT-HOOK] Blocked commit (Global Rule #2 - Zero AI Attribution):\n"

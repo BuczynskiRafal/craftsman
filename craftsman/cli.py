@@ -19,8 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from craftsman import __version__
-from craftsman.diffscan import DiffScanError
-from craftsman.evidence import ledger_overview
+from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.export import (
     CLAUDE_HOOK_EVENTS,
     COPILOT_DISCOVERY,
@@ -29,7 +28,6 @@ from craftsman.export import (
     CopilotClient,
     CopilotDiscoveryLocation,
     _resolve_windows_appdata,
-    _rewrite_antigravity_paths,
     craftsman_agent_names,
     craftsman_entity_names,
     craftsman_skill_names,
@@ -40,7 +38,7 @@ from craftsman.export import (
     default_vscode_prompts_dir,
     extract_description_and_body,
     extract_skill_name,
-     has_user_copilot_install,
+    has_user_copilot_install,
     has_workspace_copilot_install,
     is_craftsman_generated_file,
     is_craftsman_hook_command,
@@ -50,12 +48,7 @@ from craftsman.export import (
     user_home,
 )
 from craftsman.export import main as export_main
-from craftsman.gate import (
-    compute_cumulative_diff_summary,
-    format_gate_owner,
-    resolve_cli_state_file,
-    resolve_effective_gear_label,
-)
+from craftsman.gate import GateState, GateStateError, load_state, state_path_for, task_tier
 from craftsman.gate import main as gate_main
 from craftsman.guard import main as guard_main
 from craftsman.hooks import main as hook_main
@@ -67,7 +60,16 @@ from craftsman.install import (
     install_main,
     uninstall_main,
 )
-from craftsman.ledger import LedgerError, ledger_path_for, load
+from craftsman.ledger import (
+    AGENT_ROLES,
+    VERDICTS,
+    Ledger,
+    LedgerError,
+    Run,
+    ledger_path_for,
+    load,
+    uncovered_by_lens,
+)
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
 
@@ -116,11 +118,7 @@ def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> 
         )
     )
     for subdir, pattern in subdirs:
-        src_base = (
-            resolve_craftsman_pkg_dir(repo_dir)
-            if subdir == "craftsman"
-            else (repo_dir / subdir)
-        )
+        src_base = resolve_craftsman_pkg_dir(repo_dir) if subdir == "craftsman" else (repo_dir / subdir)
         dst_base = cfg / subdir
         if not src_base.is_dir() or not dst_base.is_dir():
             continue
@@ -218,8 +216,8 @@ def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
     return len(skill_files), errors
 
 
-AGENT_NAMES = ("craftsman", "craftsman-reviewer", "craftsman-verifier")
-CLAUDE_AGENT_NAMES = ("craftsman-reviewer", "craftsman-verifier")
+CLAUDE_AGENT_NAMES = tuple(AGENT_ROLES)
+AGENT_NAMES = ("craftsman", *CLAUDE_AGENT_NAMES)
 SELF_CHECK_MODULES = ("ledger", "diffscan")
 
 
@@ -325,9 +323,7 @@ def _hook_can_load_helpers(hooks_dir: Path, hook_file: Path) -> bool:
             raw_target = ""
         if raw_target:
             target_path = (
-                Path(raw_target)
-                if os.path.isabs(raw_target)
-                else (hook_file.parent / raw_target)
+                Path(raw_target) if os.path.isabs(raw_target) else (hook_file.parent / raw_target)
             )
             candidates.append(target_path.parent / "_passthrough.sh")
     candidates.append(hooks_dir / "applypatch-msg")
@@ -357,9 +353,7 @@ def inspect_git_hooks(
                 hook_text = hook_file.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 hook_text = ""
-            if "run_craftsman_guard" in hook_text and not _hook_can_load_helpers(
-                hooks_dir, hook_file
-            ):
+            if "run_craftsman_guard" in hook_text and not _hook_can_load_helpers(hooks_dir, hook_file):
                 broken_hooks.append(hook_name)
         elif is_craftsman_dir and hook_file.is_symlink():
             broken_hooks.append(hook_name)
@@ -472,9 +466,7 @@ def _is_vscode_location_disabled(
     if loc.scope not in ("claude-user", "claude-workspace"):
         return False
     setting_key = (
-        "chat.agentFilesLocations"
-        if loc.rel_path.endswith("agents")
-        else "chat.agentSkillsLocations"
+        "chat.agentFilesLocations" if loc.rel_path.endswith("agents") else "chat.agentSkillsLocations"
     )
     settings_files = [default_vscode_prompts_dir(home).parent / "settings.json"]
     if profile is not None:
@@ -584,7 +576,9 @@ def scan_copilot_duplicates(
                     if len(matches) > 1:
                         existing = by_key.setdefault((client, kind, entity_name), [])
                         seen = {p for _, p in existing}
-                        existing.extend((loc, p) for loc, p in matches if p not in seen and not seen.add(p))  # type: ignore[func-returns-value]
+                        existing.extend(
+                            (loc, p) for loc, p in matches if p not in seen and not seen.add(p)
+                        )  # type: ignore[func-returns-value]
 
     return [
         _build_copilot_duplicate(client, kind, name, entries, valid_all)
@@ -754,9 +748,7 @@ def run_doctor(
         "craftsman-cli.py",
     )
     scripts_dir = repo_dir / "scripts"
-    missing_scripts = [
-        name for name in required_scripts if not (scripts_dir / name).is_file()
-    ]
+    missing_scripts = [name for name in required_scripts if not (scripts_dir / name).is_file()]
 
     git_name = git_config_get("user.name")
     git_email = git_config_get("user.email")
@@ -768,9 +760,7 @@ def run_doctor(
     xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     linux_cfg_root = Path(xdg_cfg) if xdg_cfg else (home / ".config")
     win_appdata_root = _resolve_windows_appdata(home) or (home / "AppData" / "Roaming")
-    mac_prompts = (
-        home / "Library" / "Application Support" / "Code" / "User" / "prompts"
-    )
+    mac_prompts = home / "Library" / "Application Support" / "Code" / "User" / "prompts"
     linux_prompts = linux_cfg_root / "Code" / "User" / "prompts"
     win_prompts = win_appdata_root / "Code" / "User" / "prompts"
     user_copilot_installed = (
@@ -779,9 +769,7 @@ def run_doctor(
         or (vscode_prompts / "craftsman.prompt.md").is_file()
         or has_user_copilot_install(home, repo_dir)
     )
-    ws_copilot_installed = workspace is not None and has_workspace_copilot_install(
-        workspace, repo_dir
-    )
+    ws_copilot_installed = workspace is not None and has_workspace_copilot_install(workspace, repo_dir)
     installed_targets = {
         "antigravity": (
             (home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file()
@@ -793,13 +781,16 @@ def run_doctor(
         ),
         "github_copilot": user_copilot_installed or ws_copilot_installed,
         "github_copilot_macos": _has_vscode_prompts_target(
-            mac_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == mac_prompts
+            mac_prompts,
+            active_with_user_copilot=user_copilot_installed and vscode_prompts == mac_prompts,
         ),
         "github_copilot_linux": _has_vscode_prompts_target(
-            linux_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == linux_prompts
+            linux_prompts,
+            active_with_user_copilot=user_copilot_installed and vscode_prompts == linux_prompts,
         ),
         "github_copilot_windows": _has_vscode_prompts_target(
-            win_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == win_prompts
+            win_prompts,
+            active_with_user_copilot=user_copilot_installed and vscode_prompts == win_prompts,
         ),
         "global_git_hooks": bool(hooks_path and Path(hooks_path).expanduser().is_dir()),
     }
@@ -873,14 +864,9 @@ def run_doctor(
     )
     claude = platforms["claude"]
     claude_hooks_label = (
-        "installed"
-        if claude["hooks_merged"]
-        else "not installed (run ./install.sh --claude)"
+        "installed" if claude["hooks_merged"] else "not installed (run ./install.sh --claude)"
     )
-    print(
-        f"  Claude Code    : agents {_yes_no(claude['agents'])}, "
-        f"hooks {claude_hooks_label}"
-    )
+    print(f"  Claude Code    : agents {_yes_no(claude['agents'])}, hooks {claude_hooks_label}")
     for problem in platforms["problems"]:
         print(f"  [ERROR] {problem}", file=sys.stderr)
     for err in skill_errors:
@@ -894,101 +880,131 @@ def _yes_no(value: bool) -> str:
     return "installed" if value else "missing"
 
 
-def _empty_diff_summary() -> dict[str, int]:
-    return {"changed_files": 0, "added_lines": 0, "deleted_lines": 0, "total_changed_lines": 0}
+@dataclass(frozen=True)
+class LedgerOverview:
+    """A compact summary of the evidence ledger for `craftsman status`."""
+
+    rounds: int
+    tier: str | None
+    covered: int
+    coverable: int
+    verdicts: dict[str, int]
+    findings: int
+    resolved: int
+    latest_runs: tuple[Run, ...]
+
+    @classmethod
+    def of(cls, ledger: Ledger) -> LedgerOverview:
+        latest = ledger.rounds[-1] if ledger.rounds else None
+        coverable = covered = 0
+        if latest is not None:
+            coverable = sum(not hunk.carried for hunk in latest.hunks) * len(latest.lenses)
+            covered = coverable - sum(len(ids) for ids in uncovered_by_lens(ledger, latest).values())
+        verdicts = {name: 0 for name in (*VERDICTS, "none")}
+        for finding in ledger.findings:
+            verdicts[finding.verdict or "none"] += 1
+        return cls(
+            rounds=len(ledger.rounds),
+            tier=latest.tier if latest is not None else None,
+            covered=covered,
+            coverable=coverable,
+            verdicts=verdicts,
+            findings=len(ledger.findings),
+            resolved=sum(finding.resolution is not None for finding in ledger.findings),
+            latest_runs=ledger.runs[-3:],
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "rounds": self.rounds,
+            "tier": self.tier,
+            "coverage": {"covered": self.covered, "total": self.coverable} if self.rounds else None,
+            "findings": self.findings,
+            "verdicts": self.verdicts,
+            "resolved": self.resolved,
+            "latest_runs": [
+                {"id": run.id, "kind": run.kind, "command": run.command, "exit_code": run.exit_code}
+                for run in self.latest_runs
+            ],
+        }
+
+    def describe(self) -> str:
+        if not self.rounds:
+            return "no review round yet (`craftsman review prepare`)"
+        verdicts = ", ".join(
+            f"{'no verdict' if name == 'none' else name} {count}"
+            for name, count in self.verdicts.items()
+        )
+        runs = ", ".join(f"{run.id} {run.kind} exit {run.exit_code}" for run in self.latest_runs)
+        return (
+            f"{self.rounds} round(s), tier {self.tier}, coverage {self.covered}/{self.coverable}; "
+            f"findings {self.findings} ({verdicts}, resolved {self.resolved}); "
+            f"latest runs: {runs or 'none'}"
+        )
 
 
-def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) -> int:
-    """Display the current 3-Gear state machine and cumulative diff metrics."""
-    if state_file is None or "$(git rev-parse" in str(state_file):
-        candidate = resolve_cli_state_file(None, cwd)
-        state_file = candidate if candidate.is_file() else None
-
-    state: dict[str, Any] = {}
-    if state_file and state_file.is_file():
-        try:
-            loaded = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                state = loaded
-        except (OSError, json.JSONDecodeError) as exc:
-            sys.stderr.write(
-                f"[craftsman] Warning: failed to read state file {state_file}: {exc}\n"
-            )
-
-    effective_cwd = cwd or (
-        state.get("cwd") if isinstance(state.get("cwd"), str) else os.getcwd()
-    )
-    base_sha = state.get("base_sha") if isinstance(state.get("base_sha"), str) else None
-    diff_summary = compute_cumulative_diff_summary(effective_cwd, base_sha) or _empty_diff_summary()
-
-    tier = str(state.get("tier") or "auto").strip().lower()
-    effective_state = dict(state, cwd=effective_cwd)
-    effective_gear = resolve_effective_gear_label(effective_state, effective_cwd)
-
-    ledger_info: dict[str, Any] | None = None
-    ledger_error: str | None = None
+def run_status(cwd: str | None, as_json: bool = False) -> int:
+    """Show the work tree's gate, its cumulative diff and the evidence ledger."""
     try:
-        ledger_info = ledger_overview(load(ledger_path_for(str(effective_cwd))))
-    except (DiffScanError, LedgerError) as exc:
-        ledger_error = str(exc)
-
-    payload: dict[str, Any] = {
-        "state_file": str(state_file) if state_file else None,
-        "active": bool(state.get("active", False)),
-        "owner": state.get("owner"),
-        "started_at": state.get("started_at"),
-        "configured_tier": tier,
-        "effective_gear": effective_gear,
-        "stage": state.get("stage", "idle"),
-        "base_sha": base_sha,
-        "cwd": effective_cwd,
-        "diff": diff_summary,
-        "ledger": ledger_info,
-        "ledger_error": ledger_error,
-        "subagent_verified": bool(state.get("subagent_verified", False)),
-    }
-
+        root = worktree_root(cwd or os.getcwd())
+        state_path = state_path_for(root)
+        state = load_state(state_path)
+        snap = snapshot(root, resolve_base_sha(root, state.base_sha if state is not None else None))
+    except (DiffScanError, GateStateError) as exc:
+        sys.stderr.write(f"craftsman status: error: {exc}\n")
+        return 1
+    try:
+        overview: LedgerOverview | None = LedgerOverview.of(load(ledger_path_for(root)))
+        ledger_error = None
+    except LedgerError as exc:
+        overview, ledger_error = None, str(exc)
+    payload = _status_json(state_path, state, root, snap, overview, ledger_error)
     if as_json:
         sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         return 0
-
-    owner_label = (
-        format_gate_owner(state.get("owner"))
-        if state.get("owner") is not None
-        else ("unknown (legacy)" if payload["active"] else "none")
-    )
+    evidence = overview.describe() if overview is not None else f"unavailable ({ledger_error})"
     print(f"Craftsman Status (v{__version__})")
     print(f"  Active         : {payload['active']}")
-    print(f"  Owner          : {owner_label}")
-    print(f"  Effective Gear : {effective_gear}")
+    print(f"  Owner          : {state.owner.describe() if state is not None else 'none'}")
+    print(f"  Effective Gear : {payload['effective_gear']}")
     print(f"  Stage          : {payload['stage']}")
-    print(f"  Base SHA       : {base_sha or 'HEAD'}")
-    print(
-        f"  Cumulative Diff: {diff_summary['changed_files']} files, "
-        f"+{diff_summary['added_lines']}/-{diff_summary['deleted_lines']} lines"
-    )
-    print(f"  Evidence       : {_describe_ledger(ledger_info, ledger_error)}")
+    print(f"  Base SHA       : {snap.base_sha}")
+    print(f"  Cumulative Diff: {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines")
+    print(f"  Evidence       : {evidence}")
     return 0
 
 
-def _describe_ledger(info: dict[str, Any] | None, error: str | None) -> str:
-    if info is None:
-        return f"unavailable ({error})"
-    if not info["rounds"]:
-        return "no review round yet (`craftsman review prepare`)"
-    coverage = info["coverage"]
-    verdicts = info["verdicts"]
-    runs = ", ".join(
-        f"{run['id']} {run['kind']} exit {run['exit_code']}" for run in info["latest_runs"]
-    )
-    return (
-        f"{info['rounds']} round(s), tier {info['tier']}, "
-        f"coverage {coverage['covered']}/{coverage['total']}; findings {info['findings']} "
-        f"(proven {verdicts['proven']}, probable {verdicts['probable']}, "
-        f"question {verdicts['question']}, dismissed {verdicts['dismissed']}, "
-        f"no verdict {verdicts['none']}, "
-        f"resolved {info['resolved']}); latest runs: {runs or 'none'}"
-    )
+def _status_json(
+    state_path: Path,
+    state: GateState | None,
+    root: Path,
+    snap: DiffSnapshot,
+    overview: LedgerOverview | None,
+    ledger_error: str | None,
+) -> dict[str, Any]:
+    return {
+        "state_file": str(state_path),
+        "active": state is not None and state.active,
+        "owner": state.owner.to_json() if state is not None else None,
+        "takeover_from": state.takeover_from.to_json()
+        if state is not None and state.takeover_from
+        else None,
+        "started_at": state.started_at if state is not None else None,
+        "configured_tier": state.tier if state is not None else "auto",
+        "effective_gear": task_tier(state.tier if state is not None else "auto", snap),
+        "stage": state.stage.value if state is not None else "idle",
+        "isolation_evidence": state.isolation_evidence if state is not None else "none",
+        "base_sha": snap.base_sha,
+        "cwd": str(root),
+        "diff": {
+            "changed_files": len(snap.files),
+            "added_lines": snap.added,
+            "deleted_lines": snap.deleted,
+            "total_changed_lines": snap.added + snap.deleted,
+        },
+        "ledger": overview.to_json() if overview is not None else None,
+        "ledger_error": ledger_error,
+    }
 
 
 def _discover_skill_dirs(repo_dir: Path) -> dict[str, Path]:
@@ -1035,9 +1051,7 @@ def _validate_skill_relative_file(skill_dir: Path, rel_file: str, skill_name: st
                 )
     resolved = (skill_dir / rel_path).resolve()
     if resolved == skill_dir or not resolved.is_relative_to(skill_dir):
-        raise ValueError(
-            f"--file {rel_file!r} must resolve inside skill directory {skill_name!r}"
-        )
+        raise ValueError(f"--file {rel_file!r} must resolve inside skill directory {skill_name!r}")
     if not resolved.is_file():
         raise FileNotFoundError(f"file {rel_file!r} not found in skill {skill_name!r}")
     return resolved
@@ -1130,7 +1144,7 @@ def skill_main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"craftsman skill: error: {exc}\n")
         return 2
 
-    content = _rewrite_antigravity_paths(target.read_text(encoding="utf-8"))
+    content = target.read_text(encoding="utf-8")
     sys.stdout.write(content if content.endswith("\n") else content + "\n")
     return 0
 
@@ -1162,9 +1176,7 @@ def main(argv: list[str] | None = None) -> int:
         default=default_repo_dir(),
         help="Path to the Craftsman repository root.",
     )
-    doc_parser.add_argument(
-        "--json", action="store_true", help="Output diagnostic report as JSON."
-    )
+    doc_parser.add_argument("--json", action="store_true", help="Output diagnostic report as JSON.")
     doc_parser.add_argument(
         "--workspace", type=Path, help="Also check the Copilot agents and skills of this project."
     )
@@ -1175,11 +1187,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     stat_parser = subparsers.add_parser(
-        "status", help="Inspect the active 3-Gear state machine and cumulative git diff."
+        "status", help="Show the work tree's quality gate, cumulative diff and review evidence."
     )
-    stat_parser.add_argument("--state-file", type=Path, help="Path to craftsman_state.json.")
     stat_parser.add_argument(
-        "--cwd", type=str, help="Target repository directory for diff calculation."
+        "--cwd", type=str, help="A directory inside the work tree (default: the current one)."
     )
     stat_parser.add_argument("--json", action="store_true", help="Output status report as JSON.")
 
@@ -1195,20 +1206,16 @@ def main(argv: list[str] | None = None) -> int:
         "export", help="Export skills and rules to Claude Code, GitHub Copilot, Codex, and Cursor."
     )
     subparsers.add_parser(
-        "gate", help="Invoke the 3-Gear Stop Gate state manager or lifecycle hook."
+        "gate", help="Open, update and close the quality gate of the current work tree."
     )
-    subparsers.add_parser(
-        "guard", help="Invoke the Git Guard PreToolUse or native Git hook engine."
-    )
+    subparsers.add_parser("guard", help="Invoke the Git Guard PreToolUse or native Git hook engine.")
     subparsers.add_parser(
         "hook", help="Lifecycle hook for VS Code Copilot, the Copilot CLI and Claude Code."
     )
     subparsers.add_parser(
         "review", help="Prepare review rounds and record findings, coverage and verdicts."
     )
-    subparsers.add_parser(
-        "run", help="Run a command and record its exit code in the evidence ledger."
-    )
+    subparsers.add_parser("run", help="Run a command and record its exit code in the evidence ledger.")
     subparsers.add_parser(
         "skill",
         help="Read bundled Craftsman skills and companion files without searching the disk.",
@@ -1248,7 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
             fix_duplicates=bool(parsed.fix_duplicates),
         )
     if parsed.command == "status":
-        return run_status(parsed.state_file, parsed.cwd, as_json=bool(parsed.json))
+        return run_status(parsed.cwd, as_json=bool(parsed.json))
 
     parser.print_help()
     return 0

@@ -326,7 +326,8 @@ ordered by severity; dismissed ones are listed briefly so the reader sees what w
 
 - **Subagents.** GitHub Copilot (VS Code): use the `craftsman-reviewer` / `craftsman-verifier`
   custom agents as subagents. Claude Code: the `Task`/`Agent` tool with those agent names.
-  Antigravity: `invoke_subagent`. Copilot CLI: `/agent` or the task tool. Codex and others:
+  Antigravity: `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
+  `craftsman-verifier`. Copilot CLI: `/agent` or the task tool. Codex and others:
   run the lenses yourself, one at a time.
 - **Shell.** All `craftsman` commands are identical in bash, zsh, PowerShell and cmd. Keep each
   on one line (no `\` continuations). When a note, scenario or evidence quotes code containing `$`

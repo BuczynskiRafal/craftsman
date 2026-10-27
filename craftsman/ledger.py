@@ -33,6 +33,7 @@ Verdict = Literal["proven", "probable", "question", "dismissed"]
 Resolution = Literal["fixed", "accepted"]
 RunKind = Literal["test", "e2e", "repro", "lint", "build", "other"]
 AgentEventKind = Literal["start", "stop"]
+AgentRole = Literal["reviewer", "verifier"]
 IsolationEvidence = Literal["hooks", "transcript", "none"]
 IssueCode = Literal[
     "no-round",
@@ -56,6 +57,9 @@ RESOLUTIONS: tuple[Resolution, ...] = get_args(Resolution)
 RUN_KINDS: tuple[RunKind, ...] = get_args(RunKind)
 AGENT_EVENT_KINDS: tuple[AgentEventKind, ...] = get_args(AgentEventKind)
 ISOLATION_EVIDENCES: tuple[IsolationEvidence, ...] = get_args(IsolationEvidence)
+REVIEWER_AGENT = "craftsman-reviewer"
+VERIFIER_AGENT = "craftsman-verifier"
+AGENT_ROLES: dict[str, AgentRole] = {REVIEWER_AGENT: "reviewer", VERIFIER_AGENT: "verifier"}
 SELF_REVIEWED_BANNER = (
     "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change"
 )
@@ -767,6 +771,11 @@ class Run:
                 waiver=f.optional_record("waiver", RunWaiver.from_json),
             )
         )
+
+
+def agent_role(agent: str) -> AgentRole | None:
+    """The Craftsman role an agent name plays; only an exact, case-insensitive name counts."""
+    return AGENT_ROLES.get(agent.strip().lower())
 
 
 @dataclass(frozen=True)
@@ -1800,25 +1809,24 @@ class GateReport:
 
 @dataclass(frozen=True)
 class GatePolicy:
+    """How strictly the gate judges a ledger.
+
+    `isolation_evidence` names where proof of an isolated reviewer can come from; with `none`, a
+    `standard` or `deep` review passes as self-reviewed.
+    """
+
     tier: Tier
-    require_isolation: bool = False
-    reviewer_agent_markers: tuple[str, ...] = ("craftsman-reviewer",)
-    max_rounds: int = 5
     isolation_evidence: IsolationEvidence = "none"
+    max_rounds: int = 5
 
     def __post_init__(self) -> None:
         _require_choice(self.tier, TIERS, "tier")
         _require_choice(self.isolation_evidence, ISOLATION_EVIDENCES, "isolation_evidence")
         _require(self.max_rounds >= 1, "max_rounds", "must be >= 1")
-        _require(
-            bool(self.reviewer_agent_markers) and all(m.strip() for m in self.reviewer_agent_markers),
-            "reviewer_agent_markers",
-            "must contain at least one non-blank marker",
-        )
-        if self.require_isolation and self.isolation_evidence == "none":
-            object.__setattr__(self, "isolation_evidence", "hooks")
-        elif self.isolation_evidence != "none" and self.tier != "quick":
-            object.__setattr__(self, "require_isolation", True)
+
+    @property
+    def require_isolation(self) -> bool:
+        return self.isolation_evidence != "none" and self.tier != "quick"
 
 
 def evaluate(
@@ -1857,7 +1865,7 @@ def evaluate(
         latest is not None
         and policy.tier != "quick"
         and not policy.require_isolation
-        and not _has_isolated_reviewer_stop(ledger, latest, policy)
+        and not _has_isolated_reviewer_stop(ledger, latest)
     )
     return GateReport(
         tuple(issues),
@@ -1896,9 +1904,7 @@ def _is_signal_resolved(
 
 def has_unresolved_diff_size(ledger: Ledger) -> bool:
     """Return True when the latest round recorded an unresolved `diff-size` quality signal."""
-    return bool(ledger.rounds) and any(
-        sig.kind == "diff-size" for sig in ledger.rounds[-1].signals
-    )
+    return bool(ledger.rounds) and any(sig.kind == "diff-size" for sig in ledger.rounds[-1].signals)
 
 
 def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
@@ -2210,29 +2216,28 @@ def _failing_run_issues(ledger: Ledger) -> list[GateIssue]:
     ]
 
 
-def _has_isolated_reviewer_stop(ledger: Ledger, latest: Round, policy: GatePolicy) -> bool:
+def _has_isolated_reviewer_stop(ledger: Ledger, latest: Round) -> bool:
     if all(hunk.carried for hunk in latest.hunks):
         return True
     prepared_at = parse_timestamp(latest.prepared_at)
-    markers = [marker.lower() for marker in policy.reviewer_agent_markers]
     return any(
         event.event == "stop"
-        and any(marker in event.agent.lower() for marker in markers)
+        and agent_role(event.agent) == "reviewer"
         and parse_timestamp(event.at) >= prepared_at
         for event in ledger.agents
     )
 
 
 def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
-    if not policy.require_isolation or policy.tier == "quick":
+    if not policy.require_isolation:
         return []
-    if _has_isolated_reviewer_stop(ledger, latest, policy):
+    if _has_isolated_reviewer_stop(ledger, latest):
         return []
     return [
         GateIssue(
             "no-isolation",
             f"No independent review finished since round {latest.number} was prepared; spawn the "
-            f"{policy.reviewer_agent_markers[0]} subagent for round {latest.number}.",
+            f"{REVIEWER_AGENT} subagent for round {latest.number}.",
         )
     ]
 

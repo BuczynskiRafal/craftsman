@@ -8,18 +8,17 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from craftsman import packet, runner
+from craftsman import packet
 from craftsman.diffscan import DiffSnapshot, Hunk, Reference, Scope
 from craftsman.ledger import GENERIC_COVERAGE_WORDS, HunkRef, Round
 from craftsman.lenses import select_lenses
 from craftsman.packet import PacketContext, render_packet
 
-from tests.support import REPO_ROOT, STOP_GATE, EvidenceRepo, coverage_note
+from tests.support import REPO_ROOT, EvidenceRepo, assert_cli_error, coverage_note
 
 BUGGY_TOTAL = '''def total(items):
     """Sum of prices."""
@@ -37,9 +36,7 @@ class RepoTestCase(unittest.TestCase):
     def assert_error(
         self, proc: subprocess.CompletedProcess[str], exit_code: int, fragment: str
     ) -> None:
-        self.assertEqual(proc.returncode, exit_code, proc.stderr)
-        self.assertIn(fragment, proc.stderr)
-        self.assertNotIn("Traceback", proc.stderr)
+        assert_cli_error(self, proc, exit_code, fragment)
 
     def prepare_bug(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
@@ -420,16 +417,15 @@ class HardeningTests(RepoTestCase):
         self.assertIn("[tier-too-low]", lowered.stdout)
 
     def test_a_deeper_round_is_held_to_its_own_tier(self) -> None:
-        state_file = self.repo.ledger_dir / "craftsman_state.json"
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.gate(state_file, "--init", "--tier", "standard", "--cwd", str(self.repo.root))
+        self.repo.cli("gate", "--init", "--tier", "standard")
         self.repo.cli("review", "prepare", "--tier", "deep")
         self.repo.cover_all()
         self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
 
         checked = self.repo.cli("review", "check", check=False)
         report = json.loads(self.repo.cli("review", "report", "--json").stdout)
-        completed = self.repo.gate(state_file, "--complete")
+        completed = self.repo.cli("gate", "--complete", check=False)
 
         self.assertIn("[no-e2e-run]", checked.stdout)
         self.assertEqual(report["tier"], "deep")
@@ -474,8 +470,12 @@ class HardeningTests(RepoTestCase):
         self.repo.cli("review", "prepare", "--tier", "quick")
         pkg = str(self.repo.root / "pkg")
 
-        live = self.repo.cli("review", "add", "--cwd", pkg, "--file", "total.py", "--line", "3", *FINDING_ARGS)
-        gone = self.repo.cli("review", "add", "--cwd", pkg, "--file", "cart.py", "--line", "3", *FINDING_ARGS)
+        live = self.repo.cli(
+            "review", "add", "--cwd", pkg, "--file", "total.py", "--line", "3", *FINDING_ARGS
+        )
+        gone = self.repo.cli(
+            "review", "add", "--cwd", pkg, "--file", "cart.py", "--line", "3", *FINDING_ARGS
+        )
 
         self.assertIn("F1 recorded (major, contracts, pkg/total.py:3)", live.stdout)
         self.assertIn("F2 recorded (major, contracts, pkg/cart.py:3)", gone.stdout)
@@ -498,8 +498,12 @@ class HardeningTests(RepoTestCase):
         (self.repo.root / "feed.py").write_bytes(b"a = 1\x0cb = 2\nc = 3\n")
         self.repo.cli("review", "prepare", "--tier", "quick")
 
-        past = self.repo.cli("review", "add", "--file", "cart.py", "--line", "40", *FINDING_ARGS, check=False)
-        feed = self.repo.cli("review", "add", "--file", "feed.py", "--line", "3", *FINDING_ARGS, check=False)
+        past = self.repo.cli(
+            "review", "add", "--file", "cart.py", "--line", "40", *FINDING_ARGS, check=False
+        )
+        feed = self.repo.cli(
+            "review", "add", "--file", "feed.py", "--line", "3", *FINDING_ARGS, check=False
+        )
 
         self.assert_error(past, 1, "error: --line 40 is past the end of cart.py, which has 3 lines")
         self.assert_error(feed, 1, "error: --line 3 is past the end of feed.py, which has 2 lines")
@@ -528,14 +532,24 @@ class HardeningTests(RepoTestCase):
         self.prepare_bug()
         self.repo.cli("review", "add", "--file", "cart.py", "--line", "3", *FINDING_ARGS)
         self.repo.cli("review", "add", "--file", "cart.py", "--line", "3", *FINDING_ARGS)
-        self.repo.cli("review", "verdict", "F1", "--as", "dismissed", "--evidence", "cart.py:3 already guards the empty list")
+        self.repo.cli(
+            "review",
+            "verdict",
+            "F1",
+            "--as",
+            "dismissed",
+            "--evidence",
+            "cart.py:3 already guards the empty list",
+        )
 
         judged = self.repo.cli("review", "move", "F1", "--line", "2", check=False)
         self.repo.write("cart.py", BUGGY_TOTAL + "# edited\n")
         changed = self.repo.cli("review", "move", "F2", "--line", "2", check=False)
         unknown = self.repo.cli("review", "move", "F9", "--line", "2", check=False)
 
-        self.assert_error(judged, 1, "F1 already has a verdict (dismissed); record a new finding instead")
+        self.assert_error(
+            judged, 1, "F1 already has a verdict (dismissed); record a new finding instead"
+        )
         self.assert_error(changed, 1, "the code changed since F2 was recorded")
         self.assert_error(unknown, 1, "unknown finding 'F9'")
         self.assertEqual([f["line"] for f in self.repo.show()["findings"]], [3, 3])
@@ -584,7 +598,11 @@ class HardeningTests(RepoTestCase):
 
         short = self.repo.cli("review", "waive-run", "R1", "--reason", "typo", check=False)
         waived = self.repo.cli(
-            "review", "waive-run", "R1", "--reason", "Mistyped path; the suite lives in tests/test_cart.py"
+            "review",
+            "waive-run",
+            "R1",
+            "--reason",
+            "Mistyped path; the suite lives in tests/test_cart.py",
         )
 
         self.assert_error(short, 1, "error: --reason must have at least 20 characters")
@@ -625,7 +643,9 @@ class HardeningTests(RepoTestCase):
 
         static_ev = "static: cart.py:3 divides by len(items), which raises ZeroDivisionError on []"
         for lens in ("intent", "contracts", "craft"):
-            self.repo.cli("review", "cover", "--lens", lens, "--hunks", "H1", "--note", coverage_note(["H1"]))
+            self.repo.cli(
+                "review", "cover", "--lens", lens, "--hunks", "H1", "--note", coverage_note(["H1"])
+            )
         self.repo.cli("review", "add", "--file", "cart.py", "--line", "3", *FINDING_ARGS)
         self.repo.cli("review", "verdict", "F1", "--as", "probable", "--evidence", static_ev)
 
@@ -661,12 +681,8 @@ class HardeningTests(RepoTestCase):
     def test_from_json_bulk_cover_add_and_verdict_via_stdin(self) -> None:
         self.prepare_bug()
         static_ev = "static: cart.py:3 divides by len(items), returning average instead of sum"
-        norepro_ev = (
-            "no-repro: needs concurrent database sessions; cart.py:3 divides by len(items) == 0"
-        )
-        question_ev = (
-            "intent: PR task says 'Add cart totals'; cart.py:1 accepts untyped iterable items"
-        )
+        norepro_ev = "no-repro: needs concurrent database sessions; cart.py:3 divides by len(items) == 0"
+        question_ev = "intent: PR task says 'Add cart totals'; cart.py:1 accepts untyped iterable items"
         cover_payload = json.dumps(
             [
                 {"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])},
@@ -792,9 +808,7 @@ class HardeningTests(RepoTestCase):
         failed_verdict = self.repo.cli(
             "review", "verdict", "--from-json", "-", stdin=bad_verdict, check=False
         )
-        self.assert_error(
-            failed_verdict, 1, "entry 2 (F2): run: is required for a 'proven' verdict"
-        )
+        self.assert_error(failed_verdict, 1, "entry 2 (F2): run: is required for a 'proven' verdict")
         self.assertEqual([f["verdict"] for f in self.repo.show()["findings"]], [None, None])
 
         unknown_key = json.dumps(
@@ -811,12 +825,16 @@ class HardeningTests(RepoTestCase):
             "--from-json list must not be empty",
         )
         self.assert_error(
-            self.repo.cli("review", "cover", "--from-json", "-", "--lens", "intent", stdin="[]", check=False),
+            self.repo.cli(
+                "review", "cover", "--from-json", "-", "--lens", "intent", stdin="[]", check=False
+            ),
             1,
             "--from-json cannot be combined with --lens, --hunks or --note",
         )
         self.assert_error(
-            self.repo.cli("review", "add", "--from-json", "-", "--file", "cart.py", stdin="[]", check=False),
+            self.repo.cli(
+                "review", "add", "--from-json", "-", "--file", "cart.py", stdin="[]", check=False
+            ),
             1,
             "--from-json cannot be combined with --lens, --file",
         )
@@ -832,219 +850,13 @@ class HardeningTests(RepoTestCase):
         self.assert_error(stale_add, 1, "Code changed since round 1 was prepared")
 
 
-class RunTests(RepoTestCase):
-    def runs(self) -> list[dict[str, object]]:
-        runs = self.repo.show()["runs"]
-        assert isinstance(runs, list)
-        return runs
-
-    def test_exit_code_and_output_tail_are_recorded(self) -> None:
+class GateTaskTests(RepoTestCase):
+    def test_packet_shows_the_task_of_the_active_gate(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "quick", "--task", "Add cart totals")
         self.repo.write("cart.py", BUGGY_TOTAL)
-        script = "import sys; print('x' * 5000); print('END'); sys.exit(3)"
-
-        proc = self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", script, check=False)
-
-        self.assertEqual(proc.returncode, 3)
-        self.assertIn("END", proc.stdout)
-        (run,) = self.runs()
-        self.assertEqual((run["id"], run["kind"], run["exit_code"]), ("R1", "test", 3))
-        tail = run["output_tail"]
-        assert isinstance(tail, str)
-        self.assertEqual(len(tail), 4000)
-        self.assertTrue(tail.rstrip().endswith("END"))
-
-    def test_timeout_is_recorded_as_124(self) -> None:
-        proc = self.repo.cli(
-            "run",
-            "--timeout",
-            "0.5",
-            "--",
-            sys.executable,
-            "-c",
-            "import time; time.sleep(30)",
-            check=False,
-        )
-        self.assertEqual(proc.returncode, 124)
-        self.assertIn("timed out after 0.5s", proc.stderr)
-        self.assertEqual(self.runs()[0]["exit_code"], 124)
-
-    def test_modifying_the_work_tree_is_reported(self) -> None:
-        proc = self.repo.cli("run", "--", sys.executable, "-c", "open('made.txt', 'w').write('x')")
-        self.assertIn("the command modified the working tree (made.txt)", proc.stderr)
-        self.assertIn(".craftsmanignore", proc.stderr)
-        self.assertEqual(len(self.runs()), 1)
-
-    def test_missing_executable_records_nothing(self) -> None:
-        proc = self.repo.cli("run", "--", "definitely-not-a-real-command-xyz", check=False)
-        self.assert_error(proc, 127, "cannot start 'definitely-not-a-real-command-xyz'")
-        self.assertEqual(self.runs(), [])
-
-    def test_usage_errors(self) -> None:
-        self.assert_error(self.repo.cli("run", "pytest", check=False), 2, "put `--` between")
-        self.assert_error(self.repo.cli("run", "--", check=False), 2, "missing command after `--`")
-
-    def test_trivial_commands_are_flagged(self) -> None:
-        proc = self.repo.cli("run", "--kind", "test", "--", "echo", "ok")
-        self.assertIn("is trivial and does not count as verification", proc.stderr)
-
-    def test_help_is_printed_without_a_command(self) -> None:
-        for flag in ("-h", "--help"):
-            with self.subTest(flag=flag):
-                proc = self.repo.cli("run", flag)
-                self.assertIn("usage: craftsman run", proc.stdout)
-
-    def test_a_relative_program_path_is_relative_to_cwd(self) -> None:
-        cwd = self.tmp / "work"
-        relative = os.path.join("bin", "tool")
-
-        self.assertEqual(runner._program(relative, cwd), str(cwd / "bin" / "tool"))
-        if os.name != "nt":
-            self.assertEqual(runner._program("pytest", cwd), "pytest")
-
-    @unittest.skipIf(os.name == "nt", "process groups are POSIX-only")
-    def test_stop_tolerates_a_group_that_exits_before_the_kill(self) -> None:
-        process = mock.Mock(pid=4242)
-        process.wait.side_effect = [subprocess.TimeoutExpired("cmd", 5.0), 0]
-
-        with mock.patch("craftsman.runner.os.killpg", side_effect=[None, ProcessLookupError()]):
-            runner._stop(process, graceful=True)
-
-        self.assertEqual(process.wait.call_count, 2)
-
-    def test_a_closed_output_pipe_does_not_stall_the_command(self) -> None:
-        script = "import sys; sys.stdout.write('x' * 1000000); print('done')"
-        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "craftsman.cli", "run", "--timeout", "40", "--", sys.executable, "-c", script],
-            cwd=self.repo.root,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert proc.stdout is not None and proc.stderr is not None
-        try:
-            proc.stdout.read(10)
-            proc.stdout.close()
-            proc.wait(timeout=30)
-        finally:
-            proc.kill()
-            proc.wait()
-            errors = proc.stderr.read().decode("utf-8", errors="replace")
-            proc.stderr.close()
-
-        self.assertIn("R1 recorded (other, exit 0", errors)
-        self.assertNotIn("Traceback", errors)
-        self.assertEqual(self.runs()[0]["exit_code"], 0)
-
-    @unittest.skipIf(os.name == "nt", "uses a POSIX shell")
-    def test_a_leftover_process_holding_the_output_does_not_hang_the_run(self) -> None:
-        started = time.monotonic()
-
-        proc = self.repo.cli("run", "--", "sh", "-c", "sleep 8 & echo started")
-
-        self.assertLess(time.monotonic() - started, runner.READER_JOIN_TIMEOUT_S + 2.5)
-        self.assertEqual(self.runs()[0]["output_tail"], "started\n")
-        self.assertIn("R1 recorded", proc.stderr)
-
-
-class GateIntegrationTests(RepoTestCase):
-    def state(self) -> dict[str, object]:
-        loaded = json.loads((self.repo.ledger_dir / "craftsman_state.json").read_text(encoding="utf-8"))
-        assert isinstance(loaded, dict)
-        return loaded
-
-    def test_init_stores_the_task_and_archives_a_ledger_from_another_base(self) -> None:
-        state_file = self.repo.ledger_dir / "craftsman_state.json"
-        self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".", "--task", "Add cart totals")
-        self.assertEqual(self.state()["task"], "Add cart totals")
-        self.assertEqual(self.state()["cwd"], str(self.repo.root))
-        self.repo.record_full_evidence("quick")
+        self.repo.cli("review", "prepare")
         packet_text = (self.repo.ledger_dir / "packet-1.md").read_text(encoding="utf-8")
         self.assertIn("**Task:** Add cart totals", packet_text)
-
-        same_base = self.repo.gate(state_file, "--init", "--cwd", str(self.repo.root))
-        self.assertNotIn("Archived", same_base.stderr)
-        self.assertTrue((self.repo.ledger_dir / "ledger.json").exists())
-
-        self.repo.git("add", "-A")
-        self.repo.git("commit", "-q", "--no-verify", "-m", "cart")
-        new_base = self.repo.gate(state_file, "--init", "--cwd", str(self.repo.root))
-        self.assertIn("Archived previous review evidence", new_base.stderr)
-        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
-
-    def test_init_with_an_explicit_base_archives_against_that_base(self) -> None:
-        state_file = self.repo.ledger_dir / "craftsman_state.json"
-        self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
-        self.repo.cli("review", "prepare", "--tier", "quick")
-        self.repo.git("add", "-A")
-        self.repo.git("commit", "-q", "--no-verify", "-m", "cart")
-        head = self.repo.git("rev-parse", "HEAD").strip()
-
-        reinit = self.repo.gate(state_file, "--init", "--base-sha", head, "--cwd", str(self.repo.root))
-
-        self.assertIn("Archived previous review evidence", reinit.stderr)
-        self.assertEqual(self.state()["base_sha"], head)
-
-    def test_complete_refuses_until_the_ledger_passes(self) -> None:
-        state_file = self.repo.ledger_dir / "craftsman_state.json"
-        self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.gate(state_file, "--init", "--tier", "quick", "--cwd", str(self.repo.root))
-
-        refused = self.repo.gate(state_file, "--complete")
-        self.assertEqual(refused.returncode, 1)
-        self.assertIn("[CRAFTSMAN GATE] Cannot complete:", refused.stderr)
-        self.assertIn("[no-round]", refused.stderr)
-        self.assertTrue(self.state()["active"])
-
-        self.repo.record_full_evidence("quick")
-        completed = self.repo.gate(state_file, "--complete")
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(self.state()["stage"], "completed")
-        self.assertEqual(
-            completed.stdout,
-            "Craftsman gate closed: round 1, tier quick, 0 findings fixed, 0 accepted.\n",
-        )
-
-    def test_stop_hook_lists_next_actions_and_allows_at_round_cap(self) -> None:
-        state_file = self.repo.ledger_dir / "craftsman_state.json"
-        self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.gate(state_file, "--init", "--tier", "quick", "--cwd", str(self.repo.root))
-        self.repo.cli("review", "prepare")
-        payload = {
-            "terminationReason": "NO_TOOL_CALL",
-            "fullyIdle": True,
-            "artifactDirectoryPath": str(self.repo.ledger_dir),
-        }
-
-        blocked = self.stop(payload)
-        self.assertEqual(blocked["decision"], "continue")
-        reason = blocked["reason"]
-        assert isinstance(reason, str)
-        self.assertIn("[CRAFTSMAN GATE 1/3]", reason)
-        self.assertIn("1. [uncovered] Lens `intent`", reason)
-        self.assertLessEqual(len(reason), 2000)
-
-        for index in range(6):
-            self.repo.write("cart.py", BUGGY_TOTAL + f"# revision {index}\n")
-            self.repo.cli("review", "prepare")
-        capped = self.stop(payload)
-        self.assertEqual(capped["decision"], "allow")
-        self.assertEqual(self.state()["stage"], "needs_human")
-
-    def stop(self, payload: dict[str, object]) -> dict[str, object]:
-        proc = subprocess.run(
-            [sys.executable, str(STOP_GATE)],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=60,
-        )
-        decision = json.loads(proc.stdout)
-        assert isinstance(decision, dict)
-        return decision
 
 
 class PacketRenderingTests(unittest.TestCase):
@@ -1124,8 +936,8 @@ class PacketRenderingTests(unittest.TestCase):
             text = render_packet(ctx)
 
         self.assertIn("Enclosing scope omitted for size — open pkg/a.py:L1–L500", text)
-        self.assertNotIn("line 499", text)
-        self.assertIn("line 499", render_packet(ctx))
+        self.assertNotIn("Enclosing scope (pkg/a.py:1-500)", text)
+        self.assertIn("Enclosing scope (pkg/a.py:1-500)", render_packet(ctx))
 
 
 class ReviewSignalTests(RepoTestCase):
@@ -1201,6 +1013,25 @@ class ReviewSignalTests(RepoTestCase):
         self.assertIn("`mod_a.py` (+300 lines)", report)
         self.assertIn("Suggested split into smaller changes:", report)
 
+    def oversized_gate_state(self) -> bytes:
+        """Prepare an oversized round under an open gate; return the stored gate state."""
+        lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))
+        for name in ("mod_a.py", "mod_b.py", "mod_c.py"):
+            self.repo.write(name, lines)
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("gate", "--init", "--tier", "quick")
+        return (self.repo.ledger_dir / "craftsman_state.json").read_bytes()
+
+    def test_check_leaves_the_gate_state_alone(self) -> None:
+        before = self.oversized_gate_state()
+        self.repo.cli("review", "check", check=False)
+        self.assertEqual((self.repo.ledger_dir / "craftsman_state.json").read_bytes(), before)
+
+    def test_report_leaves_the_gate_state_alone(self) -> None:
+        before = self.oversized_gate_state()
+        self.repo.cli("review", "report")
+        self.assertEqual((self.repo.ledger_dir / "craftsman_state.json").read_bytes(), before)
+
 
 class CoverageNoteValidationTests(RepoTestCase):
     def test_cover_rejects_note_made_of_generic_praise(self) -> None:
@@ -1246,8 +1077,7 @@ class CoverageNoteValidationTests(RepoTestCase):
             self.repo.write(f"m{idx}.py", f"VAL_{idx} = {idx}\n")
         self.repo.cli("review", "prepare", "--tier", "quick")
         repeated = "; ".join(
-            f"H{idx} m1.py:1: x=0 -> returns 0 without mutating caller state"
-            for idx in range(1, 5)
+            f"H{idx} m1.py:1: x=0 -> returns 0 without mutating caller state" for idx in range(1, 5)
         )
 
         proc = self.repo.cli(

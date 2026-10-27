@@ -160,12 +160,14 @@ mechanism that blocks completion.
 | GitHub Copilot in VS Code | `Stop` hook blocks until `review check` passes | `SubagentStart`/`SubagentStop` hooks | `craftsman-reviewer`, `craftsman-verifier` agents |
 | GitHub Copilot CLI | `agentStop` hook | `subagentStart`/`subagentStop` hooks | the same agents |
 | Claude Code | `Stop` hook | `SubagentStart`/`SubagentStop` hooks | the same agents in `~/.claude/agents` |
-| Google Antigravity | `Stop` hook | transcript check | `invoke_subagent` |
+| Google Antigravity | `Stop` hook | finished `craftsman-reviewer` subagents in the transcript | `invoke_subagent` (`TypeName: self`, `Role: craftsman-reviewer`) |
 | Codex, Cursor, and others | `craftsman gate --complete` refuses completion until the ledger passes validation | none | none |
 
 The gate runs only in a `/craftsman` session; outside it, the hooks do nothing. After six forced
-continuations in a row, the stop hook lets the agent through and tells the user that the gate was
-not satisfied. An internal hook error prints a warning and does not break the session.
+continuations in a row without fewer open issues, the stop hook lets the agent through and tells
+the user that the gate was not satisfied. When a hook fails, the agent goes on with a warning that
+the gate was not checked; a failing `pre-tool` check asks the user to confirm the tool call
+instead (Copilot denies it).
 
 ## Installation
 
@@ -285,11 +287,14 @@ archives a ledger from an older development version that cannot be read.
 ## Guards
 
 - **Gate** (`craftsman gate`, `craftsman hook stop`): the state machine and stop hook described
-  above. Each active gate is bound to the agent session (`owner.platform` + `owner.session_id`) that
-  opened it, so parallel agent sessions in the same checkout are never blocked by or allowed to
-  corrupt another session's gate (use `git worktree add` for parallel work, or `craftsman gate --init --takeover`
-  to explicitly take over an active gate). On platforms without hooks, `craftsman gate --complete`
-  checks the same thing.
+  above. The state lives in `<git-dir>/craftsman/craftsman_state.json`, next to the ledger. Each
+  active gate is bound to the agent session (`owner.platform` + `owner.session_id`) that opened
+  it, so parallel agent sessions in the same checkout are never blocked by or allowed to corrupt
+  another session's gate (use `git worktree add` for parallel work, or `craftsman gate --init --takeover`
+  to explicitly take over an active gate). Every `craftsman gate` action refuses another session's
+  gate; a command that cannot be traced to its session names it with `--session-id`. A state file that is not a valid gate state is an error
+  for every command and hook until `craftsman gate --init --takeover` replaces it. On platforms
+  without hooks, `craftsman gate --complete` checks the same thing.
 - **Git guard** (`craftsman guard`, `craftsman hook pre-tool`, global `pre-push` and `commit-msg`
   hooks): blocks unconfirmed pushes to `main`/`master`, including through `bash -c`, aliases, and
   `gh pr merge`. Rejects commits, tags, and PRs with AI attribution trailers.

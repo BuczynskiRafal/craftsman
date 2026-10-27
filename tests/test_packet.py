@@ -143,7 +143,10 @@ class CollectContextTests(unittest.TestCase):
 
     def test_tests_referencing_changed_symbol_are_listed(self) -> None:
         self.repo.write("calc.py", "def compute_total(items):\n    return sum(items)\n")
-        self.repo.write("tests/test_calc.py", "from calc import compute_total\ndef test_sum():\n    assert compute_total([1]) == 1\n")
+        self.repo.write(
+            "tests/test_calc.py",
+            "from calc import compute_total\ndef test_sum():\n    assert compute_total([1]) == 1\n",
+        )
         base = self.repo.commit()
         self.repo.write("calc.py", "def compute_total(items):\n    return sum(items) * 2\n")
 
@@ -309,7 +312,17 @@ class RenderTests(unittest.TestCase):
         body_lines = ["def long_fn(x: int) -> int:"] + [f"    line_{i} = {i}" for i in range(2, 82)]
         scope = Scope("pkg/a.py", "long_fn", "function", 1, 81, "\n".join(body_lines))
         hunk = Hunk(
-            "H1", "pkg/a.py", None, "modified", 40, 1, 40, 1, "", ("-    line_40 = 0", "+    line_40 = 40"), "d1"
+            "H1",
+            "pkg/a.py",
+            None,
+            "modified",
+            40,
+            1,
+            40,
+            1,
+            "",
+            ("-    line_40 = 0", "+    line_40 = 40"),
+            "d1",
         )
         snap = DiffSnapshot("b" * 40, "f" * 64, (hunk,), ("pkg/a.py",), (), 1, 1)
         picks = tuple(p for p in select_lenses("standard", {}, docs_only=False) if p.lens.id == "intent")

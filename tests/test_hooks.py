@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral and edge-case test suite for Craftsman Hard-Loop lifecycle hooks."""
+"""End-to-end tests of the git guard script, the exporters, the installer and `craftsman doctor`."""
 
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from tests.support import EvidenceRepo
+from tests.support import SKILL_COUNT, EvidenceRepo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GIT_GUARD = REPO_ROOT / "scripts" / "git-guard.py"
-STOP_GATE = REPO_ROOT / "scripts" / "craftsman-stop-gate.py"
 
 
 def run_hook(script: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -31,7 +30,6 @@ def run_hook(script: Path, payload: dict[str, Any]) -> dict[str, Any]:
     parsed = json.loads(proc.stdout.strip())
     assert isinstance(parsed, dict)
     return parsed
-
 
 
 class GitGuardHookTests(unittest.TestCase):
@@ -216,379 +214,6 @@ class GitGuardHookTests(unittest.TestCase):
         self.assertEqual(res["decision"], "force_ask")
 
 
-class StopGateHookTests(unittest.TestCase):
-    def test_allows_stop_when_no_state_file_exists(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            res = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(res["decision"], "allow")
-
-    def test_blocks_stop_until_all_gates_pass_and_respects_circuit_breaker(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = EvidenceRepo(Path(tmpdir) / "repo")
-            repo.write_lines("app.py", 5)
-            state_file = Path(tmpdir) / "craftsman_state.json"
-            self.assertEqual(repo.gate(state_file, "--init", "--cwd", str(repo.root)).returncode, 0)
-            stop_payload = {
-                "terminationReason": "NO_TOOL_CALL",
-                "fullyIdle": True,
-                "artifactDirectoryPath": tmpdir,
-            }
-
-            # 1st stop attempt without evidence -> continue (1/3) with the ledger's next actions
-            res1 = run_hook(STOP_GATE, stop_payload)
-            self.assertEqual(res1["decision"], "continue")
-            self.assertIn("[CRAFTSMAN GATE 1/3]", res1.get("reason", ""))
-            self.assertIn("[no-round]", res1.get("reason", ""))
-            self.assertIn("craftsman review prepare", res1.get("reason", ""))
-
-            # Pause for user input -> allow
-            self.assertEqual(repo.gate(state_file, "--await-user").returncode, 0)
-            self.assertEqual(run_hook(STOP_GATE, stop_payload)["decision"], "allow")
-
-            # Resume; the deprecated self-reported flags no longer satisfy anything -> continue (2/3)
-            resumed = repo.gate(state_file, "--resume", "--pass-simplify", "--pass-review")
-            self.assertEqual(resumed.returncode, 0)
-            self.assertIn("--pass-simplify no longer satisfies the gate", resumed.stderr)
-            res2 = run_hook(STOP_GATE, stop_payload)
-            self.assertEqual(res2["decision"], "continue")
-            self.assertIn("2/3", res2.get("reason", ""))
-
-            # Real evidence in the ledger -> allow and auto-complete
-            repo.record_full_evidence("quick")
-            res3 = run_hook(STOP_GATE, stop_payload)
-            self.assertEqual(res3["decision"], "allow")
-            final_state = json.loads(state_file.read_text(encoding="utf-8"))
-            self.assertFalse(final_state["active"])
-            self.assertEqual(final_state["stage"], "completed")
-
-    def test_circuit_breaker_trips_after_max_continuations(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = EvidenceRepo(Path(tmpdir) / "repo")
-            repo.write_lines("app.py", 5)
-            state_file = Path(tmpdir) / "craftsman_state.json"
-            repo.gate(state_file, "--init", "--cwd", str(repo.root))
-            stop_payload = {
-                "terminationReason": "NO_TOOL_CALL",
-                "fullyIdle": True,
-                "artifactDirectoryPath": tmpdir,
-            }
-            for _ in range(3):
-                self.assertEqual(run_hook(STOP_GATE, stop_payload)["decision"], "continue")
-
-            # 4th attempt trips circuit breaker -> allow
-            self.assertEqual(run_hook(STOP_GATE, stop_payload)["decision"], "allow")
-            final_state = json.loads(state_file.read_text(encoding="utf-8"))
-            self.assertFalse(final_state["active"])
-            self.assertEqual(final_state["stage"], "aborted_max_continuations")
-
-    def test_rejects_complete_and_stop_without_invoke_subagent_in_transcript(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = EvidenceRepo(Path(tmpdir) / "repo")
-            repo.write_lines("app.py", 50)
-            state_file = Path(tmpdir) / "craftsman_state.json"
-            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-
-            transcript.write_text(
-                json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "/craftsman fix bug"})
-                + "\n",
-                encoding="utf-8",
-            )
-            repo.gate(state_file, "--init", "--cwd", str(repo.root))
-            # The ledger is complete, so only the transcript subagent requirement is under test
-            repo.record_full_evidence("standard")
-
-            # Attempting --complete without invoke_subagent in transcript must fail with exit code 1
-            bad_complete = repo.gate(state_file, "--complete")
-            self.assertEqual(bad_complete.returncode, 1)
-            self.assertIn("invoke_subagent", bad_complete.stderr)
-
-            # Even if agent passes individual flags without invoke_subagent, Stop hook blocks
-            repo.gate(state_file, "--pass-simplify", "--pass-review", "--pass-verify")
-            res_block = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(res_block["decision"], "continue")
-            self.assertIn("`craftsman-reviewer` subagent", res_block.get("reason", ""))
-
-            # Even if agent spawns a read-only 'research' subagent mentioning 'simplify', it must NOT satisfy Quality Gate
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 2,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "invoke_subagent",
-                                    "args": {
-                                        "Subagents": json.dumps(
-                                            [
-                                                {
-                                                    "TypeName": "research",
-                                                    "Role": "Codebase Explorer",
-                                                    "Prompt": "Check how to simplify the parser and run auditor checks",
-                                                }
-                                            ]
-                                        )
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
-                )
-
-            self.assertEqual(repo.gate(state_file, "--complete").returncode, 1)
-
-            # Once invoke_subagent (TypeName='self', JSON-string Subagents as in real Antigravity transcript) is recorded, --complete and Stop succeed
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 3,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "invoke_subagent",
-                                    "args": {
-                                        "Subagents": json.dumps(
-                                            [
-                                                {
-                                                    "TypeName": "self",
-                                                    "Role": "Craftsman Quality Gate Auditor",
-                                                    "Prompt": "Run /simplify, /code-review, and /verify",
-                                                }
-                                            ]
-                                        )
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
-                )
-
-            ok_complete = repo.gate(state_file, "--complete")
-            self.assertEqual(ok_complete.returncode, 0, ok_complete.stderr)
-
-            res_allow = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(res_allow["decision"], "allow")
-
-    def test_auto_detects_craftsman_in_transcript_when_init_was_forgotten(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps({"step_index": 5, "type": "USER_INPUT", "content": "zrób to przez /craftsman"})
-                + "\n",
-                encoding="utf-8",
-            )
-            res = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(res["decision"], "continue")
-            self.assertTrue((Path(tmpdir) / "craftsman_state.json").is_file())
-
-    def test_does_not_false_trigger_on_craftsman_paths_or_subagent_transcripts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            # 1. Subagent transcript (SYSTEM_MESSAGE + view_file on skills/craftsman/SKILL.md)
-            #    and USER_INPUT mentioning file path /scratch/craftsman or skills/craftsman/SKILL.md
-            lines = [
-                json.dumps(
-                    {
-                        "step_index": 0,
-                        "type": "SYSTEM_MESSAGE",
-                        "content": "You are Craftsman Quality Gate Auditor running /craftsman checks",
-                    }
-                ),
-                json.dumps(
-                    {
-                        "step_index": 1,
-                        "type": "PLANNER_RESPONSE",
-                        "tool_calls": [
-                            {
-                                "name": "view_file",
-                                "args": {
-                                    "AbsolutePath": "/Users/dev/scratch/craftsman/skills/craftsman/SKILL.md"
-                                },
-                            }
-                        ],
-                    }
-                ),
-                json.dumps(
-                    {
-                        "step_index": 2,
-                        "type": "USER_INPUT",
-                        "content": "Sprawdź plik /Users/dev/scratch/craftsman/skills/craftsman/SKILL.md",
-                    }
-                ),
-            ]
-            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-            res = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(res["decision"], "allow")
-            self.assertFalse((Path(tmpdir) / "craftsman_state.json").is_file())
-
-    def test_complete_without_prior_init_succeeds_when_subagent_was_invoked(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = EvidenceRepo(Path(tmpdir) / "repo")
-            state_file = Path(tmpdir) / "craftsman_state.json"
-            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            lines = [
-                json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "/craftsman fix typo"}),
-                json.dumps(
-                    {
-                        "step_index": 2,
-                        "type": "PLANNER_RESPONSE",
-                        "tool_calls": [
-                            {
-                                "name": "invoke_subagent",
-                                "args": {
-                                    "Subagents": [
-                                        {
-                                            "TypeName": "self",
-                                            "Role": "Craftsman Quality Gate Auditor",
-                                            "Prompt": "Audit diff",
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    }
-                ),
-                json.dumps({"step_index": 3, "type": "PLANNER_RESPONSE", "tool_calls": []}),
-            ]
-            transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-            # The repository is clean (the typo fix was already committed), so the ledger has nothing to demand
-            proc = repo.gate(state_file, "--complete")
-            self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_3_gear_gearbox_quick_vs_auto_diff_threshold(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = EvidenceRepo(Path(tmpdir) / "repo")
-            repo_dir = repo.root
-            f1 = repo_dir / "app.py"
-
-            artifact_dir = Path(tmpdir) / "brain"
-            logs_dir = artifact_dir / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps({"step_index": 1, "type": "USER_INPUT", "content": "/craftsman small tweak"})
-                + "\n",
-                encoding="utf-8",
-            )
-            state_file = artifact_dir / "craftsman_state.json"
-
-            # Initialize in auto tier pointing to repo_dir
-            repo.gate(state_file, "--init", "--cwd", str(repo_dir))
-
-            # Case 1: Small change (2 lines in 1 file <= 40 lines & <= 2 files) -> Gear 1 (Quick Soft-Loop)
-            # Allows --complete WITHOUT invoke_subagent in transcript once the quick-tier evidence exists
-            f1.write_text("x = 2\ny = 3\n", encoding="utf-8")
-            no_evidence = repo.gate(state_file, "--complete")
-            self.assertEqual(no_evidence.returncode, 1)
-            self.assertIn("[no-round]", no_evidence.stderr)
-            repo.record_full_evidence("quick")
-            small_complete = repo.gate(state_file, "--complete")
-            self.assertEqual(small_complete.returncode, 0, small_complete.stderr)
-
-            # Re-init and make a large change (50 lines in 1 file > 40 lines) -> Gear 2 (Standard Hard-Loop)
-            # Rejects --complete without invoke_subagent!
-            repo.gate(state_file, "--init", "--cwd", str(repo_dir))
-            f1.write_text("\n".join(f"line_{i} = {i}" for i in range(55)) + "\n", encoding="utf-8")
-            large_complete = repo.gate(state_file, "--complete")
-            self.assertEqual(large_complete.returncode, 1)
-            self.assertIn("invoke_subagent", large_complete.stderr)
-
-            # Attempting to downgrade an active state via --tier quick during --complete is rejected
-            self.assertEqual(repo.gate(state_file, "--tier", "quick", "--complete").returncode, 1)
-
-            # Explicit --init --tier quick overrides diff size and allows inline completion
-            repo.gate(state_file, "--init", "--tier", "quick", "--cwd", str(repo_dir))
-            repo.record_full_evidence("quick")
-            quick_override = repo.gate(state_file, "--complete")
-            self.assertEqual(quick_override.returncode, 0, quick_override.stderr)
-
-            # Untracked files (>2 files) also trigger Gear 2 (Standard Hard-Loop)
-            f1.write_text("x = 1\n", encoding="utf-8")
-            for idx in range(3):
-                (repo_dir / f"untracked_{idx}.py").write_text("a = 1\n", encoding="utf-8")
-            repo.gate(state_file, "--init", "--cwd", str(repo_dir))
-            untracked_complete = repo.gate(state_file, "--complete")
-            self.assertEqual(untracked_complete.returncode, 1)
-            self.assertIn("invoke_subagent", untracked_complete.stderr)
-
-            # A quick-tier round does not satisfy the standard gear
-            repo.record_full_evidence("quick")
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 2,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "Task",
-                                    "input": {
-                                        "description": "Craftsman Quality Gate Auditor",
-                                        "prompt": "Run /simplify, /code-review, and /verify",
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
-                )
-            too_low = repo.gate(state_file, "--complete")
-            self.assertEqual(too_low.returncode, 1)
-            self.assertIn("[tier-too-low]", too_low.stderr)
-
-            # Claude Code 'Task' subagent tool call plus standard-tier evidence satisfies Gear 2
-            repo.record_full_evidence("standard")
-            claude_task_complete = repo.gate(state_file, "--complete")
-            self.assertEqual(claude_task_complete.returncode, 0, claude_task_complete.stderr)
-
 class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
     def test_claude_code_bash_payload_is_enforced_by_git_guard(self) -> None:
         res = run_hook(
@@ -704,9 +329,11 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
             self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
             self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 0)
             self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
-            self.assertEqual(len(list((workspace / ".github" / "skills").glob("*/SKILL.md"))), 17)
+            self.assertEqual(
+                len(list((workspace / ".github" / "skills").glob("*/SKILL.md"))), SKILL_COUNT
+            )
             self.assertFalse((workspace / ".github" / "prompts").exists())
-            self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), 17)
+            self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), SKILL_COUNT)
             self.assertTrue((claude_dir / "rules" / "craftsman-rules.md").is_file())
             self.assertTrue((workspace / "AGENTS.md").is_file())
             self.assertTrue((workspace / ".cursor" / "rules" / "craftsman.mdc").is_file())
@@ -785,9 +412,7 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
             other_dir = Path(tmpdir) / "other"
             repo_dir.mkdir()
             other_dir.mkdir()
-            subprocess.run(
-                ["git", "init", "-b", "main"], cwd=repo_dir, capture_output=True, check=True
-            )
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, capture_output=True, check=True)
             subprocess.run(
                 ["git", "config", "user.email", "dev@example.com"],
                 cwd=repo_dir,
@@ -842,7 +467,15 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as fake_home:
             doc_proc = subprocess.run(
-                [sys.executable, "-m", "craftsman.cli", "doctor", "--json", "--repo-dir", str(REPO_ROOT)],
+                [
+                    sys.executable,
+                    "-m",
+                    "craftsman.cli",
+                    "doctor",
+                    "--json",
+                    "--repo-dir",
+                    str(REPO_ROOT),
+                ],
                 cwd=REPO_ROOT,
                 capture_output=True,
                 text=True,
@@ -851,90 +484,8 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             )
         report = json.loads(doc_proc.stdout)
         self.assertTrue(report["healthy"])
-        self.assertEqual(report["skills_count"], 17)
+        self.assertEqual(report["skills_count"], SKILL_COUNT)
         self.assertEqual(report["rules_count"], 2)
-
-    def test_cli_status_json_reports_gear_and_diff_metrics(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_dir = Path(tmpdir) / "repo"
-            repo_dir.mkdir()
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "dev@example.com"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Dev"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            app = repo_dir / "app.py"
-            app.write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "commit", "--no-verify", "-m", "init"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            app.write_text("x = 2\ny = 3\n", encoding="utf-8")
-
-            stat_proc = subprocess.run(
-                [sys.executable, "-m", "craftsman.cli", "status", "--json", "--cwd", str(repo_dir)],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            payload = json.loads(stat_proc.stdout)
-            self.assertIn("quick", payload["effective_gear"])
-            self.assertEqual(payload["diff"]["changed_files"], 1)
-            self.assertGreaterEqual(payload["diff"]["total_changed_lines"], 2)
-
-            # Adding 2 untracked files (total 3 changed files > 2) must shift gear to standard
-            (repo_dir / "u1.py").write_text("a = 1\n", encoding="utf-8")
-            (repo_dir / "u2.py").write_text("b = 2\n", encoding="utf-8")
-            stat_proc2 = subprocess.run(
-                [sys.executable, "-m", "craftsman.cli", "status", "--json", "--cwd", str(repo_dir)],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            payload2 = json.loads(stat_proc2.stdout)
-            self.assertIn("standard", payload2["effective_gear"])
-            self.assertEqual(payload2["diff"]["changed_files"], 3)
-
-            # State file with mode=ultracraft and gates=None must resolve to deep gear without crashing
-            state_file = Path(tmpdir) / "craftsman_state.json"
-            state_file.write_text(
-                json.dumps({"active": True, "mode": "ultracraft", "tier": "auto", "gates": None}),
-                encoding="utf-8",
-            )
-            stat_proc3 = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "craftsman.cli",
-                    "status",
-                    "--json",
-                    "--state-file",
-                    str(state_file),
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            payload3 = json.loads(stat_proc3.stdout)
-            self.assertIn("deep", payload3["effective_gear"])
-            self.assertNotIn("gates", payload3)
-            self.assertEqual(payload3["ledger"]["rounds"], 0)
 
     def test_skill_cli_shows_bundled_skill_files(self) -> None:
         import contextlib
@@ -957,7 +508,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
         code_json, out_json, _ = run_cli("skill", "list", "--json", "--repo-dir", str(REPO_ROOT))
         self.assertEqual(code_json, 0)
         parsed_list = json.loads(out_json)
-        self.assertEqual(len(parsed_list), 17)
+        self.assertEqual(len(parsed_list), SKILL_COUNT)
 
         code_path, out_path, _ = run_cli("skill", "path", "code-review", "--repo-dir", str(REPO_ROOT))
         self.assertEqual(code_path, 0)
@@ -1003,7 +554,9 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             fake_repo = tmp_path / "repo"
             skill_dir = fake_repo / "skills" / "code-review"
             skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text("---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8")
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8"
+            )
             outside = tmp_path / "secret.md"
             outside.write_text("top secret\n", encoding="utf-8")
             (skill_dir / "escape.md").symlink_to(outside)
@@ -1048,11 +601,10 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertTrue(pkt_path.is_file())
             self.assertEqual(pkt_path.name, "packet-1.md")
 
-    def test_all_17_skills_have_valid_english_frontmatter_and_match_manifest(self) -> None:
+    def test_every_manifest_skill_has_frontmatter(self) -> None:
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
         skill_files = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
-        self.assertEqual(len(skill_files), 17)
-        self.assertEqual(len(manifest["skills"]), 17)
+        self.assertEqual([path.parent.name for path in skill_files], sorted(manifest["skills"]))
 
         for skill_md in skill_files:
             content = skill_md.read_text(encoding="utf-8")
@@ -1171,186 +723,6 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             )
             self.assertEqual(res_allow["decision"], "allow")
 
-    def test_stop_gate_ignores_conversational_questions_and_allows_zero_diff(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_dir = Path(tmpdir) / "repo"
-            repo_dir.mkdir()
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "dev@example.com"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Dev"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            (repo_dir / "a.txt").write_text("hello\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "commit", "--no-verify", "-m", "init"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-
-            artifact_dir = Path(tmpdir) / "brain"
-            logs_dir = artifact_dir / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "step_index": 1,
-                        "type": "USER_INPUT",
-                        "content": "Co sądzisz o /craftsman? Tylko opinia, bez zmian w kodzie.",
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            res = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": str(artifact_dir),
-                    "workspacePaths": [str(repo_dir)],
-                },
-            )
-            self.assertEqual(res["decision"], "allow")
-
-            # Zero-diff repository with explicit --init and --complete succeeds with exit code 0
-            state_file = artifact_dir / "craftsman_state.json"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                check=True,
-            )
-            zero_diff_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(zero_diff_complete.returncode, 0, zero_diff_complete.stderr)
-
-    def test_stop_gate_rejects_noop_stale_or_failed_subagent_audit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo = EvidenceRepo(Path(tmpdir) / "repo")
-            state_file = Path(tmpdir) / "craftsman_state.json"
-            logs_dir = Path(tmpdir) / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-
-            # 1. Subagent with dummy 'noop' prompt is rejected
-            entries = [
-                {"step_index": 1, "type": "USER_INPUT", "content": "/craftsman --deep build x"},
-                {
-                    "step_index": 2,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "invoke_subagent",
-                            "args": {
-                                "Subagents": [
-                                    {
-                                        "TypeName": "self",
-                                        "Role": "Craftsman Quality Gate Auditor",
-                                        "Prompt": "noop",
-                                    }
-                                ]
-                            },
-                        }
-                    ],
-                },
-            ]
-            transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--tier",
-                    "deep",
-                    "--cwd",
-                    str(repo.root),
-                ],
-                check=True,
-            )
-            noop_res = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(noop_res.returncode, 1)
-            self.assertIn("invoke_subagent", noop_res.stderr)
-
-            # 2. Valid auditor invoked, but followed by >40 lines of unreviewed edits -> rejected
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 3,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "invoke_subagent",
-                                    "args": {
-                                        "Subagents": [
-                                            {
-                                                "TypeName": "self",
-                                                "Role": "Craftsman Quality Gate Auditor",
-                                                "Prompt": "Run /simplify, /code-review, and /verify",
-                                            }
-                                        ]
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
-                )
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 4,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "write_to_file",
-                                    "args": {
-                                        "TargetFile": "/tmp/app.py",
-                                        "CodeContent": "\n".join(f"x_{i} = {i}" for i in range(60)),
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
-                )
-            stale_res = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(stale_res.returncode, 1)
-            self.assertIn("invoke_subagent", stale_res.stderr)
-
     def test_exporter_preserves_existing_user_content_with_managed_markers(self) -> None:
         from craftsman.export import (
             CRAFTSMAN_BEGIN_MARKER,
@@ -1362,7 +734,9 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             ws = Path(tmpdir)
             agents_md = ws / "AGENTS.md"
-            agents_md.write_text("# Custom Project Architecture\n\nKeep this section.\n", encoding="utf-8")
+            agents_md.write_text(
+                "# Custom Project Architecture\n\nKeep this section.\n", encoding="utf-8"
+            )
 
             copilot_md = ws / ".github" / "copilot-instructions.md"
             copilot_md.parent.mkdir(parents=True, exist_ok=True)
@@ -1397,9 +771,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 "drifted content\n", encoding="utf-8"
             )
             (fake_cfg / "craftsman").mkdir(parents=True)
-            (fake_cfg / "craftsman" / "guard.py").write_text(
-                "# stale guard\n", encoding="utf-8"
-            )
+            (fake_cfg / "craftsman" / "guard.py").write_text("# stale guard\n", encoding="utf-8")
             drifted = detect_antigravity_drift(REPO_ROOT, fake_cfg)
             self.assertIn("skills/craftsman/SKILL.md", drifted)
             self.assertIn("craftsman/guard.py", drifted)
@@ -1467,7 +839,9 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             {
                 "toolCall": {
                     "name": "run_command",
-                    "args": {"CommandLine": 'git commit -m "fix(guard): block Generated by AI trailers"'},
+                    "args": {
+                        "CommandLine": 'git commit -m "fix(guard): block Generated by AI trailers"'
+                    },
                 }
             },
         )
@@ -1606,111 +980,6 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 )
                 self.assertEqual(res["decision"], "deny", f"Expected deny for: {cmd}")
 
-    def test_stop_gate_auto_base_sha_after_commit_and_verdict_parsing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_dir = Path(tmpdir) / "repo"
-            repo_dir.mkdir()
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "dev@example.com"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Dev"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            (repo_dir / "a.txt").write_text("init\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "commit", "--no-verify", "-m", "init"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-
-            artifact_dir = Path(tmpdir) / "brain"
-            logs_dir = artifact_dir / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "step_index": 1,
-                        "type": "USER_INPUT",
-                        "content": "<USER_REQUEST>\n/craftsman add big module\n</USER_REQUEST>",
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            # Agent writes 100 lines and commits before Stop hook fires (forgot --init)
-            (repo_dir / "big.py").write_text(
-                "\n".join(f"x_{i} = {i}" for i in range(100)) + "\n", encoding="utf-8"
-            )
-            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "commit", "--no-verify", "-m", "feat: add big"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-
-            res = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": str(artifact_dir),
-                    "workspacePaths": [str(repo_dir)],
-                },
-            )
-            self.assertEqual(res["decision"], "continue")
-
-            # Verify --complete --tier quick cannot downgrade an active standard/deep state
-            state_file = artifact_dir / "craftsman_state.json"
-            downgrade_res = subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--tier",
-                    "quick",
-                    "--complete",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(downgrade_res.returncode, 1)
-
-    def test_export_rewrites_stop_gate_without_python3_prefix(self) -> None:
-        from craftsman.export import _rewrite_antigravity_paths
-
-        raw = (
-            "python3 ~/.gemini/config/scripts/craftsman-stop-gate.py "
-            "--state-file <appDataDir>/brain/<conversation-id>/craftsman_state.json --complete"
-        )
-        rewritten = _rewrite_antigravity_paths(raw)
-        self.assertNotIn("python3 craftsman gate", rewritten)
-        self.assertIn(
-            'craftsman gate --state-file "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json" --complete',
-            rewritten,
-        )
-        # Quoted placeholder must not produce double quotes ""...""
-        raw_quoted = '--state-file "<artifactDirectoryPath>/craftsman_state.json"'
-        rewritten_quoted = _rewrite_antigravity_paths(raw_quoted)
-        self.assertNotIn('""', rewritten_quoted)
-        self.assertEqual(
-            rewritten_quoted,
-            '--state-file "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json"',
-        )
-
     def test_human_co_authored_by_allowed_while_ai_trailers_and_gh_merge_body_blocked(
         self,
     ) -> None:
@@ -1791,9 +1060,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                         },
                     },
                 )
-                self.assertEqual(
-                    res["decision"], "deny", f"Expected deny for refusal: {refusal_text}"
-                )
+                self.assertEqual(res["decision"], "deny", f"Expected deny for refusal: {refusal_text}")
 
             # Question asking only about feature branch + PR must not unlock push to main
             pr_only_q = {
@@ -1832,402 +1099,6 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             )
             self.assertEqual(res_pr_q["decision"], "deny")
 
-    def test_gate_verdict_correlates_system_message_and_blocks_tier_downgrade(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_dir = Path(tmpdir) / "repo"
-            repo_dir.mkdir()
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "dev@example.com"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Dev"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            (repo_dir / "big.py").write_text(
-                "\n".join(f"x_{i} = {i}" for i in range(60)) + "\n", encoding="utf-8"
-            )
-
-            artifact_dir = Path(tmpdir) / "brain"
-            logs_dir = artifact_dir / ".system_generated" / "logs"
-            logs_dir.mkdir(parents=True)
-            transcript = logs_dir / "transcript.jsonl"
-            state_file = artifact_dir / "craftsman_state.json"
-
-            # Realistic Antigravity sequence: invoke_subagent -> ACK -> PLANNER_RESPONSE (wait) -> SYSTEM_MESSAGE with FAIL
-            entries = [
-                {"step_index": 1, "type": "USER_INPUT", "content": "/craftsman build"},
-                {
-                    "step_index": 2,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "invoke_subagent",
-                            "args": {
-                                "Subagents": json.dumps(
-                                    [
-                                        {
-                                            "TypeName": "self",
-                                            "Role": "Craftsman Quality Gate Auditor",
-                                            "Prompt": "Run /simplify, /code-review, and /verify",
-                                        }
-                                    ]
-                                )
-                            },
-                        }
-                    ],
-                },
-                {
-                    "step_index": 3,
-                    "type": "GENERIC",
-                    "content": 'Created the following subagents:\n{\n  "conversationId": "aud-123"\n}',
-                },
-                {"step_index": 4, "type": "PLANNER_RESPONSE", "content": "Waiting for auditor..."},
-                {
-                    "step_index": 5,
-                    "type": "SYSTEM_MESSAGE",
-                    "content": "<SYSTEM_MESSAGE>\n[Message] sender=aud-123 content=## Simplify\nVerdict: PASS\n## Verify\nCRAFTSMAN_VERDICT: FAIL\n</SYSTEM_MESSAGE>",
-                },
-            ]
-            transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--cwd",
-                    str(repo_dir),
-                    "--tier",
-                    "standard",
-                ],
-                check=True,
-            )
-            st = json.loads(state_file.read_text(encoding="utf-8"))
-            st["started_at_step"] = 1
-            state_file.write_text(json.dumps(st), encoding="utf-8")
-
-            # Must reject --complete because SYSTEM_MESSAGE has CRAFTSMAN_VERDICT: FAIL
-            fail_res = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(fail_res.returncode, 1)
-
-            # Separate call `--tier quick` followed by `--complete` must NOT downgrade active standard tier
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--tier",
-                    "quick",
-                ],
-                check=True,
-            )
-            downgrade_res = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(downgrade_res.returncode, 1)
-
-    def test_pr6_review_regressions_gate_and_guard(self) -> None:
-        from craftsman.cli import detect_antigravity_drift
-        from craftsman.export import export_to_agents_workspace
-        from craftsman.gate import (
-            _count_successful_commits_after_trigger,
-            _entry_invokes_quality_gate_subagent,
-            _evaluate_auditor_report_text,
-            _has_audit_failure_after,
-            _shell_command_mutates_files,
-            is_craftsman_trigger_content,
-        )
-
-        # 1. Top-level JSON-quoted invoke_subagent args (Antigravity real format)
-        research_entry = {
-            "step_index": 2,
-            "type": "PLANNER_RESPONSE",
-            "status": "DONE",
-            "tool_calls": [
-                {
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": '"research"',
-                        "Role": '"Code Reviewer"',
-                        "Prompt": '"Run /simplify, /code-review, and /verify on diff"',
-                    },
-                }
-            ],
-        }
-        self.assertFalse(_entry_invokes_quality_gate_subagent(research_entry))
-
-        self_auditor_entry = {
-            "step_index": 2,
-            "type": "PLANNER_RESPONSE",
-            "status": "DONE",
-            "tool_calls": [
-                {
-                    "name": "invoke_subagent",
-                    "args": {
-                        "TypeName": '"self"',
-                        "Role": '"Craftsman Quality Gate Auditor"',
-                        "Prompt": '"Run /simplify, /code-review, and /verify on diff"',
-                    },
-                }
-            ],
-        }
-        self.assertTrue(_entry_invokes_quality_gate_subagent(self_auditor_entry))
-
-        # Singular "Created the following subagent:" ACK + sibling GENERIC output must stay pending until SYSTEM_MESSAGE
-        pending_entries = [
-            self_auditor_entry,
-            {"step_index": 2, "type": "GENERIC", "content": "The command exited with code 0."},
-            {
-                "step_index": 3,
-                "type": "GENERIC",
-                "content": 'Created the following subagent:\n{\n  "conversationId": "sub-99"\n}',
-            },
-        ]
-        self.assertTrue(_has_audit_failure_after(pending_entries, 0))
-
-        # Backticked / heading-formatted verdicts
-        self.assertTrue(_evaluate_auditor_report_text("Done.\n`CRAFTSMAN_VERDICT: FAIL`"))
-        self.assertTrue(_evaluate_auditor_report_text("### CRAFTSMAN_VERDICT: FAIL"))
-        self.assertFalse(
-            _evaluate_auditor_report_text(
-                "Fixed a bug where status: failed was returned.\n`CRAFTSMAN_VERDICT: PASS`"
-            )
-        )
-
-        # 2. Shell redirections, braces, and branch names ending in digits
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps({"step_index": 1, "type": "USER_INPUT"}) + "\n", encoding="utf-8"
-            )
-            for blocked_cmd in (
-                "git push 2>&1 origin main",
-                "git push &> /dev/null origin main",
-                "git push origin HEAD@{0}:main",
-            ):
-                res = run_hook(
-                    GIT_GUARD,
-                    {
-                        "transcriptPath": str(transcript),
-                        "toolCall": {"name": "run_command", "args": {"CommandLine": blocked_cmd}},
-                    },
-                )
-                self.assertEqual(res["decision"], "deny", f"Expected deny for: {blocked_cmd}")
-
-            # Feature branch main2 with redirection must be allowed
-            res_main2 = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main2>/dev/null"},
-                    },
-                },
-            )
-            self.assertEqual(res_main2["decision"], "allow")
-
-            # Human Co-authored-by names containing ai/bot/aider substrings must be allowed
-            for human_author in (
-                "Nikolai <nikolai@example.com>",
-                "John Talbot <j@talbot.org>",
-                "Sarah Raider <s@dubai.ae>",
-            ):
-                res_human = run_hook(
-                    GIT_GUARD,
-                    {
-                        "toolCall": {
-                            "name": "run_command",
-                            "args": {
-                                "CommandLine": f'git commit -m "feat: x\n\nCo-authored-by: {human_author}"'
-                            },
-                        }
-                    },
-                )
-                self.assertEqual(res_human["decision"], "allow", f"Failed for {human_author}")
-
-            # Direct-to-main approval with "(no PR)" and echoed "rejected" in question
-            entries_no_pr = [
-                {
-                    "step_index": 1,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "ask_question",
-                            "args": {
-                                "questions": [
-                                    {
-                                        "question": "The previous hook rejected the push; how should we push to main?",
-                                        "options": [
-                                            "Push directly to main (no PR)",
-                                            "Create a feature branch",
-                                        ],
-                                    }
-                                ]
-                            },
-                        }
-                    ],
-                },
-                {
-                    "step_index": 2,
-                    "type": "GENERIC",
-                    "content": "Q1: The previous hook rejected the push; how should we push to main?\nA1: Push directly to main (no PR)",
-                },
-            ]
-            transcript.write_text(
-                "\n".join(json.dumps(e) for e in entries_no_pr) + "\n", encoding="utf-8"
-            )
-            res_no_pr = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_no_pr["decision"], "allow")
-
-            # Compound command where second segment is --force must still return force_ask
-            res_compound_force = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {
-                            "CommandLine": "git push origin main && git push --force origin main"
-                        },
-                    },
-                },
-            )
-            self.assertEqual(res_compound_force["decision"], "force_ask")
-
-            # Multi-question ask_question where Q1 is unrelated ("Yes") and Q2 rejects ("Open a PR")
-            entries_multi_q = [
-                {
-                    "step_index": 1,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "ask_question",
-                            "args": {
-                                "questions": [
-                                    {"question": "Run unit tests first?", "options": ["Yes", "No"]},
-                                    {
-                                        "question": "Push directly to main or open a PR?",
-                                        "options": ["Open a PR", "Push directly to main"],
-                                    },
-                                ]
-                            },
-                        }
-                    ],
-                },
-                {
-                    "step_index": 2,
-                    "type": "GENERIC",
-                    "content": "Q1: Run unit tests first?\nA1: Yes\nQ2: Push directly to main or open a PR?\nA2: Open a PR",
-                },
-            ]
-            transcript.write_text(
-                "\n".join(json.dumps(e) for e in entries_multi_q) + "\n", encoding="utf-8"
-            )
-            res_multi_q = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_multi_q["decision"], "deny")
-
-            # 3. _count_successful_commits_after_trigger ignores read-only git merge-base / commit-graph / cherry-pick -n, but counts commit -n
-            ro_entries = [
-                {
-                    "step_index": 2,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "run_command",
-                            "args": {
-                                "CommandLine": "git merge-base origin/main HEAD && git commit-graph verify && git cherry-pick -n abc1234"
-                            },
-                        }
-                    ],
-                }
-            ]
-            self.assertEqual(_count_successful_commits_after_trigger(ro_entries, 1)[0], 0)
-            commit_n_entries = [
-                {
-                    "step_index": 2,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "run_command",
-                            "args": {"CommandLine": 'git commit -n -m "feat: add x"'},
-                        }
-                    ],
-                }
-            ]
-            self.assertEqual(_count_successful_commits_after_trigger(commit_n_entries, 1)[0], 1)
-
-            # 4. USER_REQUEST_BLOCK_RE ignores <USER_REQUEST> inside <RULE>
-            injected = (
-                "<RULE>When `<USER_REQUEST>` contains `ultracraft`, activate Gear 3.</RULE>\n"
-                "<USER_REQUEST>Fix typo in README</USER_REQUEST>"
-            )
-            self.assertEqual(is_craftsman_trigger_content(injected), (False, "auto"))
-
-            # 5. _shell_command_mutates_files catches black ., python3 -c with semicolons, and compound with craftsman-stop-gate
-            self.assertTrue(_shell_command_mutates_files("black ."))
-            self.assertFalse(_shell_command_mutates_files("black --check ."))
-            self.assertTrue(
-                _shell_command_mutates_files(
-                    'python3 -c "import pathlib; pathlib.Path(\'a.py\').write_text(\'x\')"'
-                )
-            )
-            self.assertTrue(
-                _shell_command_mutates_files(
-                    "sed -i 's/a/b/' foo.py && craftsman-stop-gate.py --state-file s.json --complete"
-                )
-            )
-
-            # 6. detect_antigravity_drift detects hooks.json command drift and export quotes globs: "*"
-            fake_cfg = Path(tmpdir) / "cfg"
-            (fake_cfg / "skills" / "craftsman").mkdir(parents=True)
-            (fake_cfg / "skills" / "craftsman" / "SKILL.md").write_text(
-                (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8"),
-                encoding="utf-8",
-            )
-            (fake_cfg / "hooks.json").write_text(
-                json.dumps({"git-guard": {"enabled": True, "PreToolUse": []}}), encoding="utf-8"
-            )
-            self.assertIn("hooks.json", detect_antigravity_drift(REPO_ROOT, fake_cfg))
-
-            ws_dir = Path(tmpdir) / "ws"
-            _, cursor_mdc = export_to_agents_workspace(REPO_ROOT, ws_dir)
-            self.assertIn('globs: "*"', cursor_mdc.read_text(encoding="utf-8"))
-
     def test_windows_vscode_copilot_profiles_skills_and_auto_install(self) -> None:
         import os
         from unittest.mock import patch
@@ -2239,7 +1110,6 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             export_to_vscode_user,
             export_to_workspace,
         )
-        from craftsman.gate import resolve_cli_state_file
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # 1. Windows %APPDATA%\Code\User\prompts resolution + MSYS2 drive path normalization
@@ -2249,9 +1119,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 patch("sys.platform", "win32"),
             ):
                 win_prompts = default_vscode_prompts_dir()
-                self.assertEqual(
-                    win_prompts, Path(fake_appdata) / "Code" / "User" / "prompts"
-                )
+                self.assertEqual(win_prompts, Path(fake_appdata) / "Code" / "User" / "prompts")
 
             msys_home = Path(tmpdir) / "msys_home"
             (msys_home / "AppData" / "Roaming").mkdir(parents=True)
@@ -2275,18 +1143,12 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             export_to_vscode_user(REPO_ROOT, code_user / "prompts")
             self.assertFalse((code_user / "prompts" / "craftsman.prompt.md").exists())
             self.assertFalse((prof_a / "prompts" / "craftsman.prompt.md").exists())
-            self.assertTrue(
-                (code_user / "prompts" / "craftsman-rules.instructions.md").is_file()
-            )
-            self.assertTrue(
-                (prof_a / "prompts" / "craftsman-rules.instructions.md").is_file()
-            )
+            self.assertTrue((code_user / "prompts" / "craftsman-rules.instructions.md").is_file())
+            self.assertTrue((prof_a / "prompts" / "craftsman-rules.instructions.md").is_file())
             export_to_vscode_user(REPO_ROOT, code_user / "prompts", prompt_files=True)
             self.assertTrue((code_user / "prompts" / "craftsman.prompt.md").is_file())
             self.assertTrue((prof_a / "prompts" / "craftsman.prompt.md").is_file())
-            prompt_content = (code_user / "prompts" / "craftsman.prompt.md").read_text(
-                encoding="utf-8"
-            )
+            prompt_content = (code_user / "prompts" / "craftsman.prompt.md").read_text(encoding="utf-8")
             self.assertIn("agent: 'craftsman'", prompt_content)
 
             # Custom --user-dir not named 'prompts' must not touch sibling profiles/
@@ -2299,60 +1161,12 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             # 3. Native Copilot Agent Skills (~/.copilot/skills/*/SKILL.md and .github/skills/*/SKILL.md)
             skills_out = Path(tmpdir) / ".copilot" / "skills"
             skills_count = export_to_copilot_skills(REPO_ROOT, skills_out)
-            self.assertEqual(skills_count, 17)
+            self.assertEqual(skills_count, SKILL_COUNT)
             self.assertTrue((skills_out / "craftsman" / "SKILL.md").is_file())
 
             ws = Path(tmpdir) / "ws_copilot"
             export_to_workspace(REPO_ROOT, ws)
             self.assertTrue((ws / ".github" / "skills" / "craftsman" / "SKILL.md").is_file())
-
-            # 4. craftsman gate without --state-file (or with unexpanded PowerShell string) & craftsman status
-            repo_dir = Path(tmpdir) / "repo_ps"
-            repo_dir.mkdir()
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
-            init_res = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "craftsman.cli",
-                    "gate",
-                    "--state-file",
-                    "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json",
-                    "--init",
-                    "--tier",
-                    "quick",
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(init_res.returncode, 0, init_res.stderr)
-            self.assertTrue(
-                (repo_dir / ".git" / "craftsman" / "craftsman_state.json").is_file()
-            )
-            self.assertEqual(
-                resolve_cli_state_file("/craftsman/craftsman_state.json", str(repo_dir)).resolve(),
-                (repo_dir / ".git" / "craftsman" / "craftsman_state.json").resolve(),
-            )
-
-            status_res = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "craftsman.cli",
-                    "status",
-                    "--cwd",
-                    str(repo_dir),
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            status_payload = json.loads(status_res.stdout)
-            self.assertTrue(status_payload["active"])
 
             # 5. install.sh --auto on a Copilot-only machine must NOT create ~/.gemini or ~/.claude
             fake_home = Path(tmpdir) / "copilot_only_home"

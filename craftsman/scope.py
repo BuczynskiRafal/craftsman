@@ -24,21 +24,48 @@ from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands
 
 ScopeMode = Literal["deny", "warn", "off"]
 SHELL_TOOL_NAMES = frozenset(
-    {"bash", "run_in_terminal", "runinterminal", "terminal", "powershell", "pwsh", "shell", "run_command"}
+    {
+        "bash",
+        "run_in_terminal",
+        "runinterminal",
+        "terminal",
+        "powershell",
+        "pwsh",
+        "shell",
+        "run_command",
+    }
 )
 READ_TOOL_NAMES = frozenset({"read", "read_file", "view_file", "notebookread", "view"})
 SEARCH_TOOL_NAMES = frozenset(
-    {"grep", "grep_search", "ripgrep", "glob", "file_search", "find_by_name", "ls", "list_dir", "list_directory"}
+    {
+        "grep",
+        "grep_search",
+        "ripgrep",
+        "glob",
+        "file_search",
+        "find_by_name",
+        "ls",
+        "list_dir",
+        "list_directory",
+    }
 )
 SCOPE_CHECKED_TOOLS = SHELL_TOOL_NAMES | READ_TOOL_NAMES | SEARCH_TOOL_NAMES
 ALWAYS_RECURSIVE_CMDS = frozenset({"rg", "ripgrep", "ag", "ack", "fd", "fdfind", "find", "tree", "du"})
 READ_CMDS = frozenset({"cat", "head", "tail", "less", "more", "sed", "awk", "gawk", "bat"})
 FORBIDDEN_HOME_RELPATHS = (
-    ".copilot/session-state", ".claude/projects", ".claude/sessions",
-    ".gemini/antigravity/brain", ".gemini/antigravity/conversations",
-    ".Cursor/User/workspaceStorage", ".config/Code/User/workspaceStorage",
+    ".copilot/session-state",
+    ".claude/projects",
+    ".claude/sessions",
+    ".gemini/antigravity/brain",
+    ".gemini/antigravity/conversations",
+    ".Cursor/User/workspaceStorage",
+    ".config/Code/User/workspaceStorage",
     "Library/Application Support/Code/User/workspaceStorage",
-    ".zsh_history", ".bash_history", ".python_history", ".lesshst", ".sh_history",
+    ".zsh_history",
+    ".bash_history",
+    ".python_history",
+    ".lesshst",
+    ".sh_history",
 )
 ENV_VAR_RE = re.compile(
     r"\$\{([A-Za-z_]\w*)\}|\$env:([A-Za-z_]\w*)|\$([A-Za-z_]\w*)|%([A-Za-z_]\w*)%",
@@ -62,8 +89,8 @@ class ScopeDecision:
 
 
 def is_craftsman_agent(agent: str) -> bool:
-    lowered = agent.strip().lower()
-    return any(name in lowered for name in ("craftsman", "craftsman-reviewer", "craftsman-verifier"))
+    """Whether the agent's name marks it as one of Craftsman's own agents."""
+    return "craftsman" in agent.strip().lower()
 
 
 def is_scope_checked_tool(tool_name: str) -> bool:
@@ -89,7 +116,11 @@ def _git_config_lines(cwd: Path, *args: str) -> list[str]:
         )
     except (OSError, subprocess.SubprocessError):
         return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()] if proc.returncode == 0 else []
+    return (
+        [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if proc.returncode == 0
+        else []
+    )
 
 
 def load_scope_policy(cwd: Path, repo_root: Path | None = None) -> ScopePolicy:
@@ -103,7 +134,9 @@ def load_scope_policy(cwd: Path, repo_root: Path | None = None) -> ScopePolicy:
             if not part.strip():
                 continue
             expanded = Path(_expand_vars(part.strip())).expanduser()
-            resolved = (target / expanded).resolve() if not expanded.is_absolute() else expanded.resolve()
+            resolved = (
+                (target / expanded).resolve() if not expanded.is_absolute() else expanded.resolve()
+            )
             if resolved not in allowed:
                 allowed.append(resolved)
     return ScopePolicy(mode=mode, allowed_dirs=tuple(allowed))
@@ -120,7 +153,9 @@ def _expand_vars(value: str) -> str:
     env_map.setdefault("HOME", home)
     env_map.setdefault("USERPROFILE", home)
     expanded = ENV_VAR_RE.sub(
-        lambda m: env_map.get((m.group(1) or m.group(2) or m.group(3) or m.group(4) or "").upper(), m.group(0)),
+        lambda m: env_map.get(
+            (m.group(1) or m.group(2) or m.group(3) or m.group(4) or "").upper(), m.group(0)
+        ),
         value,
     )
     return home + expanded[1:] if expanded == "~" or expanded.startswith(("~/", "~\\")) else expanded
@@ -176,7 +211,9 @@ def _check_target(
     return ScopeDecision("allow")
 
 
-def _classify_shell_tool(tokens: Sequence[str]) -> Literal["recursive", "read", "locate", "mdfind_global", "ignore"]:
+def _classify_shell_tool(
+    tokens: Sequence[str],
+) -> Literal["recursive", "read", "locate", "mdfind_global", "ignore"]:
     cmd = Path(tokens[0].replace("\\", "/")).name.lower().removesuffix(".exe")
     flags = [tok for tok in tokens[1:] if tok.startswith("-") or re.match(r"^/[A-Za-z0-9]$", tok)]
     if cmd == "locate":
@@ -188,13 +225,19 @@ def _classify_shell_tool(tokens: Sequence[str]) -> Literal["recursive", "read", 
     if cmd in ALWAYS_RECURSIVE_CMDS:
         return "recursive"
     if cmd in ("grep", "egrep", "fgrep"):
-        is_rec = any(f in ("-r", "-R", "--recursive", "--dereference-recursive") or re.match(r"^-[A-Za-z]*[rR]", f) for f in flags)
+        is_rec = any(
+            f in ("-r", "-R", "--recursive", "--dereference-recursive")
+            or re.match(r"^-[A-Za-z]*[rR]", f)
+            for f in flags
+        )
         return "recursive" if is_rec else "read"
     if cmd == "ls":
         is_rec = any(f in ("-R", "--recursive") or re.match(r"^-[A-Za-z]*R", f) for f in flags)
         return "recursive" if is_rec else "read"
     if cmd in ("get-childitem", "gci", "dir"):
-        is_rec = any(f.lower() in ("-r", "-recurse", "/s") or f.lower().startswith("-rec") for f in flags)
+        is_rec = any(
+            f.lower() in ("-r", "-recurse", "/s") or f.lower().startswith("-rec") for f in flags
+        )
         return "recursive" if is_rec else "read"
     return "read" if cmd in READ_CMDS else "ignore"
 
@@ -251,7 +294,9 @@ def _evaluate_shell(command_line: str, cwd: Path, repo_root: Path, policy: Scope
         is_rec = kind == "recursive"
         targets = _extract_path_candidates(simple.tokens[1:], eff_cwd) or ([eff_cwd] if is_rec else [])
         for target in targets:
-            decision = _check_target(target, is_recursive=is_rec, repo_root=repo_root, policy=policy, label=label)
+            decision = _check_target(
+                target, is_recursive=is_rec, repo_root=repo_root, policy=policy, label=label
+            )
             if decision.decision == "deny":
                 return decision
     return ScopeDecision("allow")
@@ -275,24 +320,40 @@ def evaluate_scope(
     if lowered in SHELL_TOOL_NAMES:
         cmd = tool_input.get("command") or tool_input.get("CommandLine") or ""
         raw_cwd = tool_input.get("cwd") or tool_input.get("Cwd")
-        eff_cwd = _to_path(_expand_vars(raw_cwd), cwd) if isinstance(raw_cwd, str) and raw_cwd.strip() else cwd
+        eff_cwd = (
+            _to_path(_expand_vars(raw_cwd), cwd) if isinstance(raw_cwd, str) and raw_cwd.strip() else cwd
+        )
         return _evaluate_shell(cmd if isinstance(cmd, str) else "", eff_cwd, repo_root, policy)
     if lowered in READ_TOOL_NAMES:
         for key in ("file_path", "filePath", "path", "TargetFile", "AbsolutePath", "notebook_path"):
             val = tool_input.get(key)
             if isinstance(val, str) and val.strip():
                 target = _to_path(_expand_vars(val.strip()), cwd)
-                return _check_target(target, is_recursive=False, repo_root=repo_root, policy=policy, label=f"{tool_name}({val!r})")
+                return _check_target(
+                    target,
+                    is_recursive=False,
+                    repo_root=repo_root,
+                    policy=policy,
+                    label=f"{tool_name}({val!r})",
+                )
         return ScopeDecision("allow")
     if lowered in SEARCH_TOOL_NAMES:
-        keys = ("path", "pattern", "folder", "DirectoryPath", "SearchDirectory") if lowered == "glob" else (
-            "path", "glob", "includePattern", "folder", "DirectoryPath", "SearchDirectory"
+        keys = (
+            ("path", "pattern", "folder", "DirectoryPath", "SearchDirectory")
+            if lowered == "glob"
+            else ("path", "glob", "includePattern", "folder", "DirectoryPath", "SearchDirectory")
         )
         for key in keys:
             val = tool_input.get(key)
             if isinstance(val, str) and val.strip():
                 target = _to_path(_strip_glob_prefix(_expand_vars(val.strip())), cwd)
-                dec = _check_target(target, is_recursive=True, repo_root=repo_root, policy=policy, label=f"{tool_name}({val!r})")
+                dec = _check_target(
+                    target,
+                    is_recursive=True,
+                    repo_root=repo_root,
+                    policy=policy,
+                    label=f"{tool_name}({val!r})",
+                )
                 if dec.decision == "deny":
                     return dec
     return ScopeDecision("allow")

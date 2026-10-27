@@ -29,16 +29,22 @@ MIN_DUPLICATE_STATEMENTS = 5
 # Changes adding more than 800 production lines exceed the reviewable cognitive budget for a single PR.
 MAX_PRODUCTION_ADDED_LINES = 800
 
-FORBIDDEN_TEST_NAME_RE = re.compile(
-    r"(_v\d+_\d+|_\d+_of_\d+|table_of_\d+|_[A-Za-z]\d+(?:_|$)|_and_)"
-)
+FORBIDDEN_TEST_NAME_RE = re.compile(r"(_v\d+_\d+|_\d+_of_\d+|table_of_\d+|_[A-Za-z]\d+(?:_|$)|_and_)")
 SERIALIZATION_NAMES = frozenset(
     {"to_json", "from_json", "to_dict", "from_dict", "to_state", "from_state"}
 )
 SERIALIZATION_MODULES = frozenset({"serde.py", "serialization.py", "json_codec.py"})
 DICT_TYPE_RE = re.compile(r"\b(?:dict|typing\.Dict|Dict)\s*(?:\[|$)")
 _STMT_TYPES = (
-    ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.If, ast.For, ast.While, ast.Raise, ast.With
+    ast.Assign,
+    ast.AnnAssign,
+    ast.AugAssign,
+    ast.Return,
+    ast.If,
+    ast.For,
+    ast.While,
+    ast.Raise,
+    ast.With,
 )
 
 
@@ -60,11 +66,23 @@ class QualitySignal:
     detail: str
 
     def to_json(self) -> dict[str, Any]:
-        return {"id": self.id, "kind": self.kind.value, "file": self.file, "line": self.line, "detail": self.detail}
+        return {
+            "id": self.id,
+            "kind": self.kind.value,
+            "file": self.file,
+            "line": self.line,
+            "detail": self.detail,
+        }
 
     @classmethod
     def from_json(cls, raw: Mapping[str, Any]) -> QualitySignal:
-        return cls(str(raw["id"]), SignalKind(str(raw["kind"])), str(raw["file"]), int(raw["line"]), str(raw["detail"]))
+        return cls(
+            str(raw["id"]),
+            SignalKind(str(raw["kind"])),
+            str(raw["file"]),
+            int(raw["line"]),
+            str(raw["detail"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -82,7 +100,12 @@ class _ParsedFunction:
 
 def is_test_path(rel_path: str) -> bool:
     p = PurePosixPath(rel_path)
-    return bool({"tests", "test"} & set(p.parts)) or p.name.startswith("test_") or p.name.endswith("_test.py") or ".test." in p.name
+    return (
+        bool({"tests", "test"} & set(p.parts))
+        or p.name.startswith("test_")
+        or p.name.endswith("_test.py")
+        or ".test." in p.name
+    )
 
 
 def is_doc_path(rel_path: str) -> bool:
@@ -105,7 +128,9 @@ def production_diff_growth(snap: DiffSnapshot) -> tuple[int, tuple[tuple[str, in
     return sum(added_by_file.values()), top_files
 
 
-def _changed_lines_by_file(hunks: Sequence[Hunk]) -> tuple[dict[str, set[int]], dict[str, str], dict[str, int]]:
+def _changed_lines_by_file(
+    hunks: Sequence[Hunk],
+) -> tuple[dict[str, set[int]], dict[str, str], dict[str, int]]:
     touched: dict[str, set[int]] = {}
     removed: dict[str, list[str]] = {}
     growth: dict[str, int] = {}
@@ -142,11 +167,20 @@ class _AstNormalizer(ast.NodeTransformer):
 
 def _normalize_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, frozenset[str]]:
     stmts = [
-        s for s in node.body
-        if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))
+        s
+        for s in node.body
+        if not (
+            isinstance(s, ast.Expr)
+            and isinstance(s.value, ast.Constant)
+            and isinstance(s.value.value, str)
+        )
     ]
     norm = _AstNormalizer()
-    body_dump = "|".join(ast.dump(norm.visit(ast.parse(ast.unparse(s)).body[0])) for s in stmts) if len(stmts) >= 2 else ""
+    body_dump = (
+        "|".join(ast.dump(norm.visit(ast.parse(ast.unparse(s)).body[0])) for s in stmts)
+        if len(stmts) >= 2
+        else ""
+    )
     flat: set[str] = set()
     for child in ast.walk(node):
         if isinstance(child, _STMT_TYPES):
@@ -164,23 +198,53 @@ def _check_function_signals(fn: _ParsedFunction, out: list[tuple[SignalKind, str
         return
     if fn.name.startswith("test_"):
         match = FORBIDDEN_TEST_NAME_RE.search(fn.name)
-        reason = f"contains forbidden token `{match.group(0)}`" if match else (
-            f"is {len(fn.name)} characters long (budget: <= {MAX_TEST_NAME_LEN})" if len(fn.name) > MAX_TEST_NAME_LEN else None
+        reason = (
+            f"contains forbidden token `{match.group(0)}`"
+            if match
+            else (
+                f"is {len(fn.name)} characters long (budget: <= {MAX_TEST_NAME_LEN})"
+                if len(fn.name) > MAX_TEST_NAME_LEN
+                else None
+            )
         )
         if reason:
             out.append((SignalKind.TEST_NAME, fn.path, fn.lineno, f"`{fn.name}` {reason}"))
         return
     span = fn.end_lineno - fn.lineno
     if span > MAX_FUNCTION_LINES and not is_test_path(fn.path):
-        out.append((SignalKind.LONG_FUNCTION, fn.path, fn.lineno, f"`{fn.name}` spans {span} lines (budget: <= {MAX_FUNCTION_LINES})"))
-    if fn.is_new and not fn.name.startswith("_") and fn.name not in SERIALIZATION_NAMES and PurePosixPath(fn.path).name not in SERIALIZATION_MODULES and not is_test_path(fn.path):
-        annos = [a.annotation for a in (*fn.node.args.posonlyargs, *fn.node.args.args, *fn.node.args.kwonlyargs) if a.annotation]
+        out.append(
+            (
+                SignalKind.LONG_FUNCTION,
+                fn.path,
+                fn.lineno,
+                f"`{fn.name}` spans {span} lines (budget: <= {MAX_FUNCTION_LINES})",
+            )
+        )
+    if (
+        fn.is_new
+        and not fn.name.startswith("_")
+        and fn.name not in SERIALIZATION_NAMES
+        and PurePosixPath(fn.path).name not in SERIALIZATION_MODULES
+        and not is_test_path(fn.path)
+    ):
+        annos = [
+            a.annotation
+            for a in (*fn.node.args.posonlyargs, *fn.node.args.args, *fn.node.args.kwonlyargs)
+            if a.annotation
+        ]
         if fn.node.returns is not None:
             annos.append(fn.node.returns)
         for ann in annos:
             text = ast.unparse(ann)
             if DICT_TYPE_RE.search(text):
-                out.append((SignalKind.DICT_DOMAIN, fn.path, fn.lineno, f"public function `{fn.name}` uses `{text}` instead of a domain type"))
+                out.append(
+                    (
+                        SignalKind.DICT_DOMAIN,
+                        fn.path,
+                        fn.lineno,
+                        f"public function `{fn.name}` uses `{text}` instead of a domain type",
+                    )
+                )
                 break
 
 
@@ -189,27 +253,52 @@ def _check_duplicate_logic(
 ) -> None:
     for idx, fn_a in enumerate(functions):
         for fn_b in functions[idx + 1 :]:
-            if not (fn_a.is_touched or fn_b.is_touched) or fn_a.name.startswith("test_") or fn_b.name.startswith("test_"):
+            if (
+                not (fn_a.is_touched or fn_b.is_touched)
+                or fn_a.name.startswith("test_")
+                or fn_b.name.startswith("test_")
+            ):
                 continue
             same_body = bool(fn_a.body_dump and fn_a.body_dump == fn_b.body_dump)
-            min_len, max_len = min(len(fn_a.statements), len(fn_b.statements)), max(len(fn_a.statements), len(fn_b.statements))
-            ratio = (len(fn_a.statements & fn_b.statements) / min_len) if min_len >= MIN_DUPLICATE_STATEMENTS and max_len <= 2 * min_len else 0.0
+            min_len, max_len = (
+                min(len(fn_a.statements), len(fn_b.statements)),
+                max(len(fn_a.statements), len(fn_b.statements)),
+            )
+            ratio = (
+                (len(fn_a.statements & fn_b.statements) / min_len)
+                if min_len >= MIN_DUPLICATE_STATEMENTS and max_len <= 2 * min_len
+                else 0.0
+            )
             if same_body or ratio >= DUPLICATE_STATEMENT_RATIO:
                 pct = 100 if same_body else int(round(ratio * 100))
-                out.append((SignalKind.DUPLICATE_LOGIC, fn_b.path, fn_b.lineno, f"`{fn_b.name}` duplicates `{fn_a.name}` at `{fn_a.path}:{fn_a.lineno}` ({pct}% shared AST statements)"))
+                out.append(
+                    (
+                        SignalKind.DUPLICATE_LOGIC,
+                        fn_b.path,
+                        fn_b.lineno,
+                        f"`{fn_b.name}` duplicates `{fn_a.name}` at `{fn_a.path}:{fn_a.lineno}` ({pct}% shared AST statements)",
+                    )
+                )
 
 
 def _parse_file_functions(
     rel_path: str, tree: ast.AST, touched_lines: set[int], removed_src: str
 ) -> list[_ParsedFunction]:
-    nodes = sorted((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), key=lambda n: n.lineno)
+    nodes = sorted(
+        (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))),
+        key=lambda n: n.lineno,
+    )
     result: list[_ParsedFunction] = []
     for node in nodes:
         end_lineno = node.end_lineno or node.lineno
         is_touched = any(ln in touched_lines for ln in range(node.lineno, end_lineno + 1))
         is_new = node.lineno in touched_lines and f"def {node.name}(" not in removed_src
         body_dump, stmts = _normalize_function(node)
-        result.append(_ParsedFunction(rel_path, node.name, node.lineno, end_lineno, is_new, is_touched, node, body_dump, stmts))
+        result.append(
+            _ParsedFunction(
+                rel_path, node.name, node.lineno, end_lineno, is_new, is_touched, node, body_dump, stmts
+            )
+        )
     return result
 
 
@@ -232,9 +321,22 @@ def collect_quality_signals(root: Path, snap: DiffSnapshot) -> tuple[QualitySign
         except (OSError, UnicodeDecodeError, SyntaxError):
             continue
         total_lines, growth = len(source.splitlines()), growth_by_file.get(rel_path, 0)
-        if is_production_path(rel_path) and total_lines > MAX_MODULE_LINES and growth > MAX_MODULE_GROWTH:
-            raw_signals.append((SignalKind.LARGE_MODULE, rel_path, 1, f"`{rel_path}` has {total_lines} lines (> {MAX_MODULE_LINES}) and grew by +{growth} lines (> {MAX_MODULE_GROWTH})"))
-        for fn in _parse_file_functions(rel_path, tree, touched_by_file.get(rel_path, set()), removed_by_file.get(rel_path, "")):
+        if (
+            is_production_path(rel_path)
+            and total_lines > MAX_MODULE_LINES
+            and growth > MAX_MODULE_GROWTH
+        ):
+            raw_signals.append(
+                (
+                    SignalKind.LARGE_MODULE,
+                    rel_path,
+                    1,
+                    f"`{rel_path}` has {total_lines} lines (> {MAX_MODULE_LINES}) and grew by +{growth} lines (> {MAX_MODULE_GROWTH})",
+                )
+            )
+        for fn in _parse_file_functions(
+            rel_path, tree, touched_by_file.get(rel_path, set()), removed_by_file.get(rel_path, "")
+        ):
             parsed_functions.append(fn)
             _check_function_signals(fn, raw_signals)
 
@@ -242,5 +344,15 @@ def collect_quality_signals(root: Path, snap: DiffSnapshot) -> tuple[QualitySign
     total_added, top_files = production_diff_growth(snap)
     if total_added > MAX_PRODUCTION_ADDED_LINES and top_files:
         top_desc = ", ".join(f"{path} (+{cnt})" for path, cnt in top_files)
-        raw_signals.append((SignalKind.DIFF_SIZE, top_files[0][0], 1, f"+{total_added} production lines added (budget: <= {MAX_PRODUCTION_ADDED_LINES}); top files: {top_desc}"))
-    return tuple(QualitySignal(f"S{idx}", kind, path, line, detail) for idx, (kind, path, line, detail) in enumerate(raw_signals, 1))
+        raw_signals.append(
+            (
+                SignalKind.DIFF_SIZE,
+                top_files[0][0],
+                1,
+                f"+{total_added} production lines added (budget: <= {MAX_PRODUCTION_ADDED_LINES}); top files: {top_desc}",
+            )
+        )
+    return tuple(
+        QualitySignal(f"S{idx}", kind, path, line, detail)
+        for idx, (kind, path, line, detail) in enumerate(raw_signals, 1)
+    )

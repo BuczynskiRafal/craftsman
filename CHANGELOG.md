@@ -4,6 +4,26 @@ All notable changes to Craftsman are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- **Strict quality gate with one stop engine.** The gate state in
+  `<git-dir>/craftsman/craftsman_state.json` requires an owner; an invalid or older state file is
+  an error until `craftsman gate --init --takeover` replaces it. `craftsman gate` takes one of
+  `--init`, `--complete`, `--await-user`, `--resume`, or `--tier`/`--task` alone; `--pass-*`,
+  `--mode`, `--stage`, `--state-file` (also on `craftsman status`), its stdin mode and the `--soft`
+  alias are removed. Every action refuses another session's active gate (`--session-id` names the
+  caller's session), and a command from an unidentified platform needs the owner's session id.
+  All stop hooks, Antigravity included, allow at most six continuations in a
+  row without fewer open issues; Antigravity keeps the state in the git directory and proves
+  reviewer isolation only through finished `invoke_subagent` runs with `Role` `craftsman-reviewer`.
+  `pre-tool` asks the user (Copilot denies) when it cannot check a tool call or decode its input,
+  and an `auto` task with a binary or oversized file gets the `standard` tier. Re-running
+  `--init` on one's own gate never lowers its tier. Only the exact agent name
+  `craftsman-reviewer` (any case) counts as the reviewer, and an unreadable transcript is
+  reported instead of read as empty.
+
 ## [3.1.0] - 2026-10-27
 
 ### Added
