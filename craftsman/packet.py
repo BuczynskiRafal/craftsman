@@ -26,6 +26,8 @@ from craftsman.lenses import LensPick
 from craftsman.quality import QualitySignal, collect_quality_signals
 
 MAX_PACKET_CHARS = 350_000
+MAX_SCOPE_LINES = 60
+SCOPE_CONTEXT_RADIUS = 15
 MAX_COMMITS = 50
 MAX_REFERENCES_PER_SYMBOL = 8
 REFERENCE_SEARCH_LIMIT = 40
@@ -266,13 +268,26 @@ def _quality_signals_section(ctx: PacketContext) -> str:
     return "\n".join(lines)
 
 
+def _first_hunk_by_scope(ctx: PacketContext) -> dict[tuple[str, str, int, int], str]:
+    first: dict[tuple[str, str, int, int], str] = {}
+    for hunk in ctx.snap.hunks:
+        if hunk.id in ctx.carried_from:
+            continue
+        scope = ctx.scopes.get(hunk.id)
+        if scope is not None:
+            first.setdefault((hunk.path, scope.name, scope.start, scope.end), hunk.id)
+    return first
+
+
 def _scopes_to_omit(ctx: PacketContext, preamble_chars: int) -> frozenset[str]:
+    first_by_scope = _first_hunk_by_scope(ctx)
     excess = preamble_chars + len(_hunks_section(ctx, frozenset())) + 3 - MAX_PACKET_CHARS
     savings = sorted(
         (
-            (len(_scope_block(hunk.path, scope)) - len(_omitted_scope_line(scope)), hunk.id)
+            (len(_scope_block(hunk, scope)) - len(_omitted_scope_line(scope)), hunk.id)
             for hunk in ctx.snap.hunks
             if (scope := ctx.scopes.get(hunk.id)) is not None
+            and first_by_scope.get((hunk.path, scope.name, scope.start, scope.end)) == hunk.id
         ),
         reverse=True,
     )
@@ -319,12 +334,33 @@ def _lenses_section(ctx: PacketContext) -> str:
     return "## Lenses in this round\n" + "\n".join(rows)
 
 
+def _first_hunk_by_symbol(ctx: PacketContext) -> dict[str, str]:
+    first: dict[str, str] = {}
+    for hunk in ctx.snap.hunks:
+        if hunk.id in ctx.carried_from:
+            continue
+        for symbol in ctx.symbols.get(hunk.id, ()):
+            first.setdefault(symbol, hunk.id)
+    return first
+
+
 def _hunks_section(ctx: PacketContext, omitted: frozenset[str]) -> str:
-    sections = [_hunk_section(ctx, hunk, omitted) for hunk in ctx.snap.hunks]
+    first_by_scope = _first_hunk_by_scope(ctx)
+    first_by_symbol = _first_hunk_by_symbol(ctx)
+    sections = [
+        _hunk_section(ctx, hunk, omitted, first_by_scope, first_by_symbol)
+        for hunk in ctx.snap.hunks
+    ]
     return "## Hunks\n\n" + "\n\n".join(sections)
 
 
-def _hunk_section(ctx: PacketContext, hunk: Hunk, omitted: frozenset[str]) -> str:
+def _hunk_section(
+    ctx: PacketContext,
+    hunk: Hunk,
+    omitted: frozenset[str],
+    first_by_scope: Mapping[tuple[str, str, int, int], str] | None = None,
+    first_by_symbol: Mapping[str, str] | None = None,
+) -> str:
     title = f"### {hunk.id} · `{hunk.path}`{_line_span(hunk)}"
     if hunk.id in ctx.carried_from:
         return f"{title} · carried (covered in round {ctx.carried_from[hunk.id]}, unchanged)"
@@ -338,14 +374,22 @@ def _hunk_section(ctx: PacketContext, hunk: Hunk, omitted: frozenset[str]) -> st
         )
     lines = [title]
     scope = ctx.scopes.get(hunk.id)
+    first_id = (
+        first_by_scope.get((hunk.path, scope.name, scope.start, scope.end), hunk.id)
+        if scope is not None and first_by_scope is not None
+        else hunk.id
+    )
     if scope is not None:
-        lines.append(f"Scope: `{scope.name}` ({scope.kind}, L{scope.start}–L{scope.end})")
+        if first_id != hunk.id:
+            lines.append(f"Scope: `{scope.name}` — shown at {first_id}")
+        else:
+            lines.append(f"Scope: `{scope.name}` ({scope.kind}, L{scope.start}–L{scope.end})")
     header = f"@@ -{hunk.old_start},{hunk.old_len} +{hunk.new_start},{hunk.new_len} @@ {hunk.header}"
     lines.append(_fenced("diff", [header.rstrip(), *hunk.lines]))
-    if scope is not None:
+    if scope is not None and first_id == hunk.id:
         omit = hunk.id in omitted
-        lines.append(_omitted_scope_line(scope) if omit else _scope_block(hunk.path, scope))
-    lines.extend(_symbol_lines(ctx, hunk))
+        lines.append(_omitted_scope_line(scope) if omit else _scope_block(hunk, scope))
+    lines.extend(_symbol_lines(ctx, hunk, first_by_symbol))
     return "\n".join(lines)
 
 
@@ -357,21 +401,53 @@ def _line_span(hunk: Hunk) -> str:
     return ""
 
 
-def _scope_block(path: str, scope: Scope) -> str:
-    fenced = _fenced(_fence_language(path), scope.text.split("\n"))
-    return f"Enclosing scope (L{scope.start}–L{scope.end}):\n{fenced}"
+def _signature_line_count(raw_lines: Sequence[str]) -> int:
+    for idx, line in enumerate(raw_lines[:5], 1):
+        stripped = line.rstrip()
+        if stripped.endswith((":", "{")):
+            return idx
+    return 1
+
+
+def _scope_block(hunk: Hunk, scope: Scope) -> str:
+    raw_lines = scope.text.split("\n")
+    hunk_end = hunk.new_start + max(1, hunk.new_len) - 1
+    if hunk.new_len > 10 and scope.start >= hunk.new_start and scope.end <= hunk_end:
+        return f"Enclosing scope ({hunk.path}:{scope.start}-{scope.end}) — shown in diff above"
+    if len(raw_lines) <= MAX_SCOPE_LINES:
+        fenced = _fenced(_fence_language(hunk.path), raw_lines)
+        return f"Enclosing scope (L{scope.start}–L{scope.end}):\n{fenced}"
+    sig_end = _signature_line_count(raw_lines)
+    h_start = max(scope.start, hunk.new_start)
+    center = h_start - scope.start
+    ctx_lo = max(sig_end, center - SCOPE_CONTEXT_RADIUS)
+    ctx_hi = min(len(raw_lines), center + 1 + SCOPE_CONTEXT_RADIUS)
+    trimmed = list(raw_lines[:sig_end])
+    if ctx_lo > sig_end:
+        trimmed.append(f"    # ... L{scope.start + sig_end}–L{scope.start + ctx_lo - 1} omitted ...")
+    trimmed.extend(raw_lines[ctx_lo:ctx_hi])
+    if ctx_hi < len(raw_lines):
+        trimmed.append(f"    # ... L{scope.start + ctx_hi}–L{scope.end} omitted ...")
+    fenced = _fenced(_fence_language(hunk.path), trimmed)
+    return f"Enclosing scope ({hunk.path}:{scope.start}-{scope.end}):\n{fenced}"
 
 
 def _omitted_scope_line(scope: Scope) -> str:
     return f"Enclosing scope omitted for size — open {scope.path}:L{scope.start}–L{scope.end}"
 
 
-def _symbol_lines(ctx: PacketContext, hunk: Hunk) -> list[str]:
+def _symbol_lines(
+    ctx: PacketContext, hunk: Hunk, first_by_symbol: Mapping[str, str] | None = None
+) -> list[str]:
     symbols = ctx.symbols.get(hunk.id, ())
     if not symbols:
         return []
     lines = ["Defines/changes: " + ", ".join(f"`{symbol}`" for symbol in symbols), "References:"]
     for symbol in symbols:
+        first_id = first_by_symbol.get(symbol, hunk.id) if first_by_symbol is not None else hunk.id
+        if first_id != hunk.id:
+            lines.append(f"- `{symbol}`: (shown at {first_id})")
+            continue
         refs = ctx.references.get(symbol, ())
         listed = " · ".join(
             f"{_inline_code(f'{ref.path}:{ref.line}')} {_inline_code(ref.text)}" for ref in refs

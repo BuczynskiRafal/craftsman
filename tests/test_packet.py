@@ -228,6 +228,63 @@ class RenderTests(unittest.TestCase):
             text,
         )
 
+    def test_scope_shared_by_two_hunks_is_rendered_once(self) -> None:
+        h1 = Hunk("H1", "pkg/a.py", None, "modified", 2, 1, 2, 1, "", ("-a = 1", "+a = 2"), "d1")
+        h2 = Hunk("H2", "pkg/a.py", None, "modified", 8, 1, 8, 1, "", ("-b = 1", "+b = 2"), "d2")
+        snap = DiffSnapshot("b" * 40, "f" * 64, (h1, h2), ("pkg/a.py",), (), 2, 2)
+        scope = Scope("pkg/a.py", "compute", "function", 1, 10, "def compute():\n    a = 2\n    b = 2")
+        picks = tuple(p for p in select_lenses("standard", {}, docs_only=False) if p.lens.id == "intent")
+        ctx = PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_for(snap),
+            picks=picks,
+            task="",
+            commits=(),
+            conventions=(),
+            scopes={"H1": scope, "H2": scope},
+            symbols={"H1": ("compute",), "H2": ("compute",)},
+            references={"compute": (Reference("pkg/use.py", 4, "compute()"),)},
+            signals_by_hunk={},
+            carried_from={},
+        )
+
+        text = render_packet(ctx)
+
+        self.assertEqual(text.count("Enclosing scope (L1–L10):"), 1)
+        self.assertIn("Scope: `compute` — shown at H1", text)
+
+    def test_long_scope_is_rendered_as_signature_and_context_around_hunk(self) -> None:
+        body_lines = ["def long_fn(x: int) -> int:"] + [f"    line_{i} = {i}" for i in range(2, 82)]
+        scope = Scope("pkg/a.py", "long_fn", "function", 1, 81, "\n".join(body_lines))
+        hunk = Hunk(
+            "H1", "pkg/a.py", None, "modified", 40, 1, 40, 1, "", ("-    line_40 = 0", "+    line_40 = 40"), "d1"
+        )
+        snap = DiffSnapshot("b" * 40, "f" * 64, (hunk,), ("pkg/a.py",), (), 1, 1)
+        picks = tuple(p for p in select_lenses("standard", {}, docs_only=False) if p.lens.id == "intent")
+        ctx = PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_for(snap),
+            picks=picks,
+            task="",
+            commits=(),
+            conventions=(),
+            scopes={"H1": scope},
+            symbols={"H1": ("long_fn",)},
+            references={},
+            signals_by_hunk={},
+            carried_from={},
+        )
+
+        text = render_packet(ctx)
+
+        self.assertIn("Enclosing scope (pkg/a.py:1-81):", text)
+        self.assertIn("def long_fn(x: int) -> int:", text)
+        self.assertIn("line_40 = 40", text)
+        self.assertNotIn("line_10 = 10", text)
+        self.assertNotIn("line_75 = 75", text)
+
 
 if __name__ == "__main__":
     unittest.main()
