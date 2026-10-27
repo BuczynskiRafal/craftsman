@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -391,20 +392,87 @@ def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> s
     return None
 
 
+@dataclass(frozen=True)
+class SimpleCommand:
+    """A single tokenized shell segment with its effective working directory."""
+
+    segment: str
+    tokens: list[str]
+    cwd: str | None
+
+
+def expand_shell_path_token(raw: str) -> str:
+    """Expand `~`, `$HOME`, and `${HOME}` in a shell argument."""
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    expanded = re.sub(r"\$(?:HOME|\{HOME\})(?=/|$)", lambda _: home, raw)
+    if expanded == "~" or expanded.startswith("~/") or expanded.startswith("~\\"):
+        return home + expanded[1:]
+    return os.path.expanduser(expanded)
+
+
+def _resolve_cd_target(tokens: list[str], current_cwd: str | None) -> str | None:
+    """Return the updated working directory after a `cd` or `pushd` command."""
+    if not tokens or tokens[0] not in ("cd", "pushd"):
+        return current_cwd
+    cmd = tokens[0]
+    args: list[str] = []
+    idx = 1
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            args.extend(tokens[idx + 1 :])
+            break
+        if tok.startswith("-") and tok != "-":
+            idx += 1
+            continue
+        args.append(tok)
+        idx += 1
+
+    if not args:
+        if cmd == "cd":
+            return expand_shell_path_token("~")
+        return current_cwd
+
+    target = args[0]
+    if target == "-":
+        return current_cwd
+
+    expanded = expand_shell_path_token(target)
+    if os.path.isabs(expanded):
+        try:
+            return str(Path(expanded).resolve())
+        except OSError:
+            return os.path.normpath(expanded)
+    if current_cwd:
+        try:
+            return str((Path(current_cwd) / expanded).resolve())
+        except OSError:
+            return os.path.normpath(os.path.join(current_cwd, expanded))
+    return expanded
+
+
+def iter_simple_commands(
+    command_line: str, cwd_str: str | None = None, max_depth: int = 4
+) -> list[SimpleCommand]:
+    """Split a shell command line into tokenized segments, tracking `cd`/`pushd` and expanding nested shells."""
+    base_segments = split_shell_segments(command_line)
+    commands: list[SimpleCommand] = []
+    cur_cwd = cwd_str
+    for seg in base_segments:
+        tokens = tokenize_segment(seg)
+        commands.append(SimpleCommand(segment=seg, tokens=tokens, cwd=cur_cwd))
+        if max_depth > 0:
+            nested = _extract_nested_shell_command(tokens, seg)
+            if nested:
+                commands.extend(iter_simple_commands(nested, cwd_str=cur_cwd, max_depth=max_depth - 1))
+        if tokens and tokens[0] in ("cd", "pushd"):
+            cur_cwd = _resolve_cd_target(tokens, cur_cwd)
+    return commands
+
+
 def expand_shell_segments(command_line: str, max_depth: int = 4) -> list[str]:
     """Split a shell command line and recursively expand `sh/bash/zsh -c`, heredoc shells, and `eval` wrappers."""
-    base_segments = split_shell_segments(command_line)
-    if max_depth <= 0:
-        return base_segments
-
-    expanded: list[str] = []
-    for seg in base_segments:
-        expanded.append(seg)
-        tokens = tokenize_segment(seg)
-        nested = _extract_nested_shell_command(tokens, seg)
-        if nested:
-            expanded.extend(expand_shell_segments(nested, max_depth=max_depth - 1))
-    return expanded
+    return [cmd.segment for cmd in iter_simple_commands(command_line, max_depth=max_depth)]
 
 
 def _record_git_config_alias(config_expr: str, aliases: dict[str, list[str]]) -> None:
@@ -989,11 +1057,11 @@ def _is_user_response_approving_main_push(
 
 def _command_pushes_or_merges_protected(cmd: str, cwd: str | None) -> bool:
     """Return True if `cmd` invokes `gh pr merge` or `git push` targeting a protected branch."""
-    for seg in expand_shell_segments(cmd):
-        toks = tokenize_segment(seg)
+    for item in iter_simple_commands(cmd, cwd):
+        toks = item.tokens
         if is_gh_pr_merge(toks):
             return True
-        sub, sub_args, eff_cwd = parse_git_invocation(toks, cwd)
+        sub, sub_args, eff_cwd = parse_git_invocation(toks, item.cwd)
         if sub == "push":
             targets_main, _ = analyze_git_push(sub_args, eff_cwd)
             if targets_main:
@@ -1092,12 +1160,13 @@ def evaluate_shell_command(
     if not command_line.strip():
         return "allow", None
 
-    segments = expand_shell_segments(command_line)
+    commands = iter_simple_commands(command_line, cwd_str)
 
     # 1. Check Rule #2: Zero AI attribution in commits / tags / PRs
-    for segment in segments:
-        tokens = tokenize_segment(segment)
-        _, _, effective_cwd = parse_git_invocation(tokens, cwd_str)
+    for cmd in commands:
+        segment = cmd.segment
+        tokens = cmd.tokens
+        _, _, effective_cwd = parse_git_invocation(tokens, cmd.cwd)
         if is_ai_attribution_check_target(tokens) and (
             has_ai_attribution(segment, tokens, effective_cwd)
             or (
@@ -1120,11 +1189,11 @@ def evaluate_shell_command(
             )
 
     # 2. Check Rule #1: No unconfirmed push to main / master (or gh pr merge)
-    for segment in segments:
-        tokens = tokenize_segment(segment)
+    for cmd in commands:
+        tokens = cmd.tokens
         if is_gh_pr_merge(tokens):
             if transcript_path is not None and was_ask_question_called_since_last_push(
-                transcript_path, cwd_str
+                transcript_path, cmd.cwd
             ):
                 continue
             return (
@@ -1134,7 +1203,7 @@ def evaluate_shell_command(
                 "via the 'ask_question' tool.",
             )
 
-        sub, sub_args, effective_cwd = parse_git_invocation(tokens, cwd_str)
+        sub, sub_args, effective_cwd = parse_git_invocation(tokens, cmd.cwd)
         if sub != "push":
             continue
         targets_protected, is_force = analyze_git_push(sub_args, effective_cwd)
