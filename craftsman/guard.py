@@ -352,17 +352,59 @@ def _separate_unquoted_redirections(cmd_header: str) -> str:
     return "".join(out)
 
 
-def tokenize_segment(segment: str) -> list[str]:
+_UNQUOTED_WIN_PATH_TOKEN_RE = re.compile(
+    r"(?<!\S)(?:[A-Za-z]:|~|\.\.?|%[A-Za-z_][A-Za-z0-9_]*%|\$(?:HOME|\{HOME\}|env:[A-Za-z_][A-Za-z0-9_]*))\\[^\s\"';|&<>()]*"
+)
+CD_COMMANDS = frozenset({"cd", "pushd", "chdir", "set-location", "sl"})
+
+
+def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
+    """Double backslashes inside unquoted Windows/tilde/env path tokens before `shlex.split(posix=True)`."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i = 0
+    n = len(cmd_header)
+    while i < n:
+        ch = cmd_header[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch if quote is None else (None if quote == ch else quote)
+            out.append(ch)
+            i += 1
+            continue
+        if quote is None:
+            m = _UNQUOTED_WIN_PATH_TOKEN_RE.match(cmd_header, i)
+            if m and (i == 0 or cmd_header[i - 1].isspace() or cmd_header[i - 1] in (";", "|", "&", "(")):
+                out.append(m.group(0).replace("\\", "\\\\"))
+                i = m.end()
+                continue
+        if ch == "\\":
+            escaped = quote != "'"
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _tokenize_raw_segment(segment: str) -> list[str]:
     cmd_header = segment.split("\n", 1)[0]
     hd_match = HEREDOC_OPEN_RE.search(cmd_header)
     if hd_match:
         cmd_header = cmd_header[: hd_match.start()]
     cmd_header = _separate_unquoted_redirections(cmd_header)
+    cmd_header = _preserve_unquoted_windows_backslashes(cmd_header)
     try:
-        tokens = shlex.split(cmd_header, posix=True)
+        return shlex.split(cmd_header, posix=True)
     except ValueError:
-        tokens = cmd_header.split()
-    return _strip_wrappers_from_tokens(tokens)
+        return cmd_header.split()
+
+
+def tokenize_segment(segment: str) -> list[str]:
+    return _strip_wrappers_from_tokens(_tokenize_raw_segment(segment))
 
 
 def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> str | None:
@@ -402,26 +444,100 @@ class SimpleCommand:
 
 
 def expand_shell_path_token(raw: str) -> str:
-    """Expand `~`, `$HOME`, and `${HOME}` in a shell argument."""
+    """Expand `~`, `$HOME`, `${HOME}`, `$env:HOME`, `$env:USERPROFILE`, and `%USERPROFILE%` in a shell argument."""
     home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
-    expanded = re.sub(r"\$(?:HOME|\{HOME\})(?=/|$)", lambda _: home, raw)
+    expanded = re.sub(
+        r"\$(?:HOME|\{HOME\}|env:USERPROFILE|env:HOME)(?=[/\\]|$)|%USERPROFILE%",
+        lambda _: home,
+        raw,
+        flags=re.IGNORECASE,
+    )
     if expanded == "~" or expanded.startswith("~/") or expanded.startswith("~\\"):
         return home + expanded[1:]
     return os.path.expanduser(expanded)
 
 
+def _join_and_normpath(target: str, current_cwd: str | None) -> str:
+    expanded = expand_shell_path_token(target)
+    if os.sep == "/" and not re.match(r"^[A-Za-z]:[/\\]", expanded):
+        expanded = expanded.replace("\\", "/")
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    if current_cwd:
+        return os.path.normpath(os.path.join(current_cwd, expanded))
+    return os.path.normpath(expanded)
+
+
+def _extract_wrapper_chdir(raw_tokens: list[str], current_cwd: str | None) -> str | None:
+    """Inspect leading `env`/`sudo` wrappers for `-C`, `-D`, or `--chdir` and return the effective cwd."""
+    eff_cwd = current_cwd
+    idx = 0
+    n = len(raw_tokens)
+    while idx < n:
+        tok = raw_tokens[idx]
+        if tok in SHELL_CONTROL_KEYWORDS:
+            idx += 1
+            continue
+        if tok == "for" and idx + 2 < n and raw_tokens[idx + 2] == "in":
+            idx += 3
+            while idx < n and raw_tokens[idx] not in ("do",):
+                idx += 1
+            continue
+        if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+            idx += 1
+            continue
+        exe = os.path.basename(tok)
+        if exe in SIMPLE_WRAPPERS:
+            opts_with_val = WRAPPER_OPTS_WITH_VALUE.get(exe, frozenset())
+            idx += 1
+            while idx < n:
+                cur_tok = raw_tokens[idx]
+                if cur_tok == "--":
+                    idx += 1
+                    break
+                if "=" in cur_tok and not cur_tok.startswith("-") and cur_tok.split("=", 1)[0].isidentifier():
+                    idx += 1
+                    continue
+                if (
+                    (exe == "env" and cur_tok in ("-C", "--chdir"))
+                    or (exe == "sudo" and cur_tok in ("-D", "--chdir"))
+                ) and idx + 1 < n:
+                    eff_cwd = _join_and_normpath(raw_tokens[idx + 1], eff_cwd)
+                    idx += 2
+                    continue
+                if exe in ("env", "sudo") and cur_tok.startswith("--chdir="):
+                    eff_cwd = _join_and_normpath(cur_tok.split("=", 1)[1], eff_cwd)
+                    idx += 1
+                    continue
+                if cur_tok in opts_with_val:
+                    idx += 2
+                    continue
+                if cur_tok.startswith("-"):
+                    idx += 1
+                    continue
+                break
+            continue
+        break
+    return eff_cwd
+
+
 def _resolve_cd_target(tokens: list[str], current_cwd: str | None) -> str | None:
-    """Return the updated working directory after a `cd` or `pushd` command."""
-    if not tokens or tokens[0] not in ("cd", "pushd"):
+    """Return the updated working directory after a `cd`, `pushd`, `chdir`, or `Set-Location`/`sl` command."""
+    if not tokens or tokens[0].lower() not in CD_COMMANDS:
         return current_cwd
-    cmd = tokens[0]
+    cmd = tokens[0].lower()
     args: list[str] = []
     idx = 1
     while idx < len(tokens):
         tok = tokens[idx]
+        low = tok.lower()
         if tok == "--":
             args.extend(tokens[idx + 1 :])
             break
+        if low in ("-path", "-literalpath") and idx + 1 < len(tokens):
+            args.append(tokens[idx + 1])
+            idx += 2
+            continue
         if tok.startswith("-") and tok != "-":
             idx += 1
             continue
@@ -429,7 +545,7 @@ def _resolve_cd_target(tokens: list[str], current_cwd: str | None) -> str | None
         idx += 1
 
     if not args:
-        if cmd == "cd":
+        if cmd in ("cd", "chdir", "set-location", "sl"):
             return expand_shell_path_token("~")
         return current_cwd
 
@@ -437,18 +553,44 @@ def _resolve_cd_target(tokens: list[str], current_cwd: str | None) -> str | None
     if target == "-":
         return current_cwd
 
-    expanded = expand_shell_path_token(target)
-    if os.path.isabs(expanded):
-        try:
-            return str(Path(expanded).resolve())
-        except OSError:
-            return os.path.normpath(expanded)
-    if current_cwd:
-        try:
-            return str((Path(current_cwd) / expanded).resolve())
-        except OSError:
-            return os.path.normpath(os.path.join(current_cwd, expanded))
-    return expanded
+    return _join_and_normpath(target, current_cwd)
+
+
+def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[list[str]]:
+    """Extract subcommands passed to `find ... -exec/-execdir/-ok/-okdir` or `fd ... -x/--exec/-X/--exec-batch`."""
+    if not tokens:
+        return []
+    exe = os.path.basename(tokens[0]).lower()
+    subcommands: list[list[str]] = []
+    if exe == "find":
+        idx = 1
+        n = len(tokens)
+        while idx < n:
+            if tokens[idx] in ("-exec", "-execdir", "-ok", "-okdir"):
+                idx += 1
+                sub: list[str] = []
+                while idx < n and tokens[idx] not in (";", "\\;", "+"):
+                    sub.append(tokens[idx])
+                    idx += 1
+                cleaned = _strip_wrappers_from_tokens(sub)
+                if cleaned:
+                    subcommands.append(cleaned)
+            idx += 1
+    elif exe in ("fd", "fdfind"):
+        idx = 1
+        n = len(tokens)
+        while idx < n:
+            if tokens[idx] in ("-x", "--exec", "-X", "--exec-batch"):
+                idx += 1
+                sub = []
+                while idx < n and tokens[idx] not in (";", "\\;"):
+                    sub.append(tokens[idx])
+                    idx += 1
+                cleaned = _strip_wrappers_from_tokens(sub)
+                if cleaned:
+                    subcommands.append(cleaned)
+            idx += 1
+    return subcommands
 
 
 def iter_simple_commands(
@@ -459,13 +601,23 @@ def iter_simple_commands(
     commands: list[SimpleCommand] = []
     cur_cwd = cwd_str
     for seg in base_segments:
-        tokens = tokenize_segment(seg)
-        commands.append(SimpleCommand(segment=seg, tokens=tokens, cwd=cur_cwd))
+        raw_tokens = _tokenize_raw_segment(seg)
+        cmd_cwd = _extract_wrapper_chdir(raw_tokens, cur_cwd)
+        tokens = _strip_wrappers_from_tokens(raw_tokens)
+        commands.append(SimpleCommand(segment=seg, tokens=tokens, cwd=cmd_cwd))
         if max_depth > 0:
             nested = _extract_nested_shell_command(tokens, seg)
             if nested:
-                commands.extend(iter_simple_commands(nested, cwd_str=cur_cwd, max_depth=max_depth - 1))
-        if tokens and tokens[0] in ("cd", "pushd"):
+                commands.extend(iter_simple_commands(nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
+            for sub_tokens in _extract_find_or_fd_exec_commands(tokens):
+                sub_seg = " ".join(sub_tokens)
+                commands.append(SimpleCommand(segment=sub_seg, tokens=sub_tokens, cwd=cmd_cwd))
+                sub_nested = _extract_nested_shell_command(sub_tokens, sub_seg)
+                if sub_nested:
+                    commands.extend(
+                        iter_simple_commands(sub_nested, cwd_str=cmd_cwd, max_depth=max_depth - 1)
+                    )
+        if tokens and tokens[0].lower() in CD_COMMANDS:
             cur_cwd = _resolve_cd_target(tokens, cur_cwd)
     return commands
 

@@ -81,6 +81,8 @@ class ScopeEnforcementTests(unittest.TestCase):
             "HOME": str(self.home),
             "USERPROFILE": str(self.home),
             "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(self.home / ".gitconfig"),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
         }
         self._env_patcher = mock.patch.dict(os.environ, self.env, clear=True)
         self._env_patcher.start()
@@ -102,19 +104,25 @@ class ScopeEnforcementTests(unittest.TestCase):
             ("find_root", "Bash", {"command": "find / -name x"}, "deny"),
             ("grep_rec_outside", "Bash", {"command": f"grep -r foo {self.other_repo}"}, "deny"),
             ("grep_nonrec_dep", "Bash", {"command": f"grep foo {dep_file}"}, "allow"),
+            ("grep_nonrec_other_repo", "Bash", {"command": "grep foo ../other-repo/secret.py"}, "deny"),
             # 7-12: rg, ag, ack, fd
             ("rg_default_cwd", "Bash", {"command": "rg foo"}, "allow"),
             ("rg_src", "Bash", {"command": "rg foo src"}, "allow"),
             ("rg_parent", "Bash", {"command": "rg foo .."}, "deny"),
             ("rg_sibling_repo", "Bash", {"command": "rg foo ../other-repo"}, "deny"),
             ("rg_files_tilde", "Bash", {"command": "rg --files ~"}, "deny"),
+            ("rg_attached_e_tilde", "Bash", {"command": "rg -efoo ~"}, "deny"),
             ("ag_outside", "Bash", {"command": "ag pattern $HOME"}, "deny"),
+            ("ag_g_tilde", "Bash", {"command": "ag -g SKILL ~"}, "deny"),
+            ("ack_f_tilde", "Bash", {"command": "ack -f ~"}, "deny"),
             ("ack_inside", "Bash", {"command": "ack pattern src"}, "allow"),
             ("fd_outside", "Bash", {"command": "fd SKILL.md ~"}, "deny"),
             ("fd_search_path_out", "Bash", {"command": "fd --search-path .. foo"}, "deny"),
             ("fd_inside", "Bash", {"command": "fd app.py src"}, "allow"),
             # 17-22: ls, tree, du, locate, mdfind
             ("ls_nonrec_copilot", "Bash", {"command": "ls ~/.copilot/skills"}, "allow"),
+            ("ls_nonrec_tilde", "Bash", {"command": "ls ~"}, "deny"),
+            ("ls_nonrec_other_repo", "Bash", {"command": "ls ../other-repo"}, "deny"),
             ("ls_rec_tilde", "Bash", {"command": "ls -R ~"}, "deny"),
             ("ls_laR_parent", "Bash", {"command": "ls -laR .."}, "deny"),
             ("tree_tilde", "Bash", {"command": "tree ~"}, "deny"),
@@ -124,31 +132,48 @@ class ScopeEnforcementTests(unittest.TestCase):
             ("mdfind_global", "Bash", {"command": "mdfind SKILL.md"}, "deny"),
             ("mdfind_onlyin_repo", "Bash", {"command": f"mdfind -onlyin {self.repo} app"}, "allow"),
             ("mdfind_onlyin_home", "Bash", {"command": "mdfind -onlyin ~ app"}, "deny"),
-            # 27-32: cat / head / tail / sed (D3)
+            # 27-32: cat / head / tail / sed / history (D3)
             ("cat_other_packet", "Bash", {"command": "cat ../other-repo/.git/craftsman/packet-1.md"}, "deny"),
             ("cat_abs_other_pkt", "Bash", {"command": f"cat {other_pkt}"}, "deny"),
             ("cat_own_packet", "Bash", {"command": f"cat {own_pkt}"}, "allow"),
             ("cat_tmp_file", "Bash", {"command": f"cat {tmp_file}"}, "allow"),
             ("cat_venv_site_pkg", "Bash", {"command": f"cat {dep_file}"}, "allow"),
             ("head_claude_sess", "Bash", {"command": "head -n 20 ~/.claude/projects/slug/session.jsonl"}, "deny"),
+            ("cat_zsh_history", "Bash", {"command": "cat ~/.zsh_history"}, "deny"),
             ("sed_other_repo", "Bash", {"command": "sed -n '1,20p' ../other-repo/secret.py"}, "deny"),
-            # 34-39: wrappers, cd tracking, PowerShell, cmd, symlinks
+            # 34-39: wrappers, cd tracking, PowerShell, cmd, symlinks, git -C, find -exec
             ("env_bash_c_find", "Bash", {"command": 'env FOO=1 bash -c "find / -name x"'}, "deny"),
+            ("env_C_rg", "Bash", {"command": "env -C .. rg foo"}, "deny"),
+            ("sudo_D_cat", "Bash", {"command": "sudo -D ../other-repo cat secret.py"}, "deny"),
+            ("find_exec_cat_other", "Bash", {"command": "find . -exec cat ../other-repo/secret.py \\;"}, "deny"),
+            ("fd_x_cat_other", "Bash", {"command": "fd . -x cat ../other-repo/secret.py"}, "deny"),
+            ("git_C_other_grep", "Bash", {"command": "git -C ../other-repo grep foo"}, "deny"),
+            ("git_grep_noindex_tilde", "Bash", {"command": "git grep --no-index foo ~"}, "deny"),
+            ("git_grep_inside", "Bash", {"command": "git grep foo"}, "allow"),
             ("cd_tilde_grep_r", "Bash", {"command": "cd ~ && grep -r x ."}, "deny"),
             ("cd_src_rg", "Bash", {"command": "cd src && rg x ."}, "allow"),
+            ("cd_symlink_cat", "Bash", {"command": "cd escape_link && cat leak.txt"}, "deny"),
+            ("cwd_symlink_cat", "Bash", {"command": "cat leak.txt", "cwd": "escape_link"}, "deny"),
+            ("ps_set_location_rg", "powershell", {"command": "Set-Location $env:USERPROFILE; rg foo"}, "deny"),
             ("ps_gci_recurse_c", "powershell", {"command": "Get-ChildItem -Recurse C:\\"}, "deny"),
+            ("ps_gci_recurse_c_users", "powershell", {"command": r"Get-ChildItem -Path C:\Users -Recurse"}, "deny"),
             ("ps_gci_r_dot", "powershell", {"command": "gci -r ."}, "allow"),
             ("cmd_dir_s_c", "run_in_terminal", {"command": "dir /s C:\\"}, "deny"),
             ("symlink_find", "Bash", {"command": "find escape_link -name '*'"}, "deny"),
             ("symlink_read", "Read", {"file_path": str(self.repo / "escape_link" / "leak.txt")}, "deny"),
-            # 42-48: IDE / Claude Read, Grep, Glob, VS Code read_file, list_dir, file_search, grep_search
+            # 42-55: IDE / Claude Read, Grep, Glob, LS, VS Code read_file, list_dir, file_search, grep_search
             ("claude_read_other_repo", "Read", {"file_path": str(self.other_repo / "secret.py")}, "deny"),
             ("claude_read_own_repo", "Read", {"file_path": str(self.repo / "src" / "app.py")}, "allow"),
             ("claude_read_dep", "Read", {"file_path": dep_file}, "allow"),
             ("claude_grep_tilde", "Grep", {"pattern": "foo", "path": "~"}, "deny"),
             ("claude_grep_repo", "Grep", {"pattern": "foo", "path": str(self.repo)}, "allow"),
+            ("claude_ls_tilde", "LS", {"path": "~"}, "deny"),
+            ("vscode_list_dir_parent", "list_dir", {"DirectoryPath": ".."}, "deny"),
             ("claude_glob_outside", "Glob", {"pattern": f"{self.other_repo}/**/*.py"}, "deny"),
+            ("claude_glob_rel_escape", "Glob", {"pattern": "./../../other-repo/**/*.py"}, "deny"),
+            ("claude_glob_symlink_escape", "Glob", {"pattern": "escape_link/**/*.py"}, "deny"),
             ("claude_glob_inside", "Glob", {"pattern": "**/*.py"}, "allow"),
+            ("claude_glob_src_inside", "Glob", {"pattern": "src/**/*.py"}, "allow"),
             (
                 "vscode_read_claude_proj",
                 "read_file",
@@ -184,15 +209,24 @@ class ScopeEnforcementTests(unittest.TestCase):
                     self.assertIn("git config craftsman.scopeAllow", res.reason)
 
     def test_scope_allow_policy_warn_and_off_and_unparseable_command(self) -> None:
-        # 1. scopeAllow unlocks other_repo
+        # 1. scopeAllow unlocks other_repo (including colon/semicolon-separated entries)
+        extra_dir = self.tmp / "shared-contracts"
+        extra_dir.mkdir()
         subprocess.run(
-            ["git", "config", "--add", "craftsman.scopeAllow", str(self.other_repo)],
+            [
+                "git",
+                "config",
+                "--add",
+                "craftsman.scopeAllow",
+                f"{self.other_repo}:{extra_dir}",
+            ],
             cwd=self.repo,
             check=True,
         )
         policy = load_scope_policy(self.repo, self.repo)
         self.assertEqual(policy.mode, "deny")
         self.assertIn(self.other_repo.resolve(), policy.allowed_dirs)
+        self.assertIn(extra_dir.resolve(), policy.allowed_dirs)
         self.assertEqual(
             evaluate_scope(
                 "Read",

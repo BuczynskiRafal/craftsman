@@ -608,6 +608,12 @@ def extract_cli_session_id(platform: str, env: Mapping[str, str] | None = None) 
         ).strip()
     if platform == "copilot":
         return (environ.get("COPILOT_SESSION_ID") or "").strip()
+    if platform == "antigravity":
+        return (
+            environ.get("ANTIGRAVITY_CONVERSATION_ID")
+            or environ.get("ANTIGRAVITY_SESSION_ID")
+            or ""
+        ).strip()
     return ""
 
 
@@ -1240,9 +1246,11 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         else _extract_antigravity_session_id(payload)
     )
     if state and state.get("active", False):
-        is_owner, _ = check_and_claim_owner(state, stop_platform, stop_sid)
+        is_owner, claimed = check_and_claim_owner(state, stop_platform, stop_sid)
         if not is_owner:
             return "allow", None
+        if claimed:
+            _try_save_state(state_file, state)
 
     completed_at = _safe_int(state.get("completed_at_step"), -1) if state else -1
     if completed_at > latest_step:

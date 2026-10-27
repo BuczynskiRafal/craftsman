@@ -523,7 +523,13 @@ class DoctorTests(ExportTestCase):
             capture_output=True,
             text=True,
             timeout=120,
-            env={**os.environ, "HOME": str(self.tmp), "USERPROFILE": str(self.tmp)},
+            env={
+                **os.environ,
+                "HOME": str(self.tmp),
+                "USERPROFILE": str(self.tmp),
+                "APPDATA": "",
+                "XDG_CONFIG_HOME": "",
+            },
         )
         report = json.loads(proc.stdout)
         assert isinstance(report, dict)
@@ -655,6 +661,51 @@ class DoctorTests(ExportTestCase):
             self.assertIn("## Search scope", skill_md.read_text(encoding="utf-8"), str(skill_md))
             self.assertIn("## Search scope", claude_cmd.read_text(encoding="utf-8"), str(claude_cmd))
         self.assertIn("## Search scope", (ws / "AGENTS.md").read_text(encoding="utf-8"))
+
+    def test_skill_cli_supports_hyphenated_frontmatter_names_and_noncanonical_duplicates(self) -> None:
+        from craftsman.cli import fix_copilot_duplicates, scan_copilot_duplicates, skill_main
+        from craftsman.gate import extract_cli_session_id
+
+        # F3: code-quality and extreme-optimizer resolve by both hyphen and underscore names
+        for name in ("code-quality", "code_quality", "extreme-optimizer", "extreme_optimizer"):
+            self.assertEqual(skill_main(["show", name, "--repo-dir", str(REPO_ROOT)]), 0)
+            self.assertEqual(skill_main(["path", name, "--repo-dir", str(REPO_ROOT)]), 0)
+
+        # F4: when no entry is canonical, removable Craftsman prompt file is removed while preserving Claude/user copy
+        vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
+        vscode_prompts.mkdir(parents=True, exist_ok=True)
+        legacy_prompt = vscode_prompts / "verify.prompt.md"
+        legacy_prompt.write_text(
+            "---\nname: verify\n---\n<!-- craftsman:generated -->\nLegacy prompt\n",
+            encoding="utf-8",
+        )
+        claude_skill = self.tmp / ".claude" / "skills" / "verify" / "SKILL.md"
+        claude_skill.parent.mkdir(parents=True, exist_ok=True)
+        claude_skill.write_text("---\nname: verify\n---\nClaude skill\n", encoding="utf-8")
+
+        dups = scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(dups[0]["canonical_path"], str(claude_skill))
+        self.assertEqual(dups[0]["removable_paths"], [str(legacy_prompt)])
+        removed, _ = fix_copilot_duplicates(REPO_ROOT, home=self.tmp)
+        self.assertEqual(removed, [legacy_prompt])
+        self.assertFalse(legacy_prompt.exists())
+        self.assertTrue(claude_skill.is_file())
+
+        # F9: JSONC comments and trailing commas in VS Code settings.json disable .claude location
+        settings_json = vscode_prompts.parent / "settings.json"
+        settings_json.write_text(
+            '{\n  // comment in JSONC\n  "chat.agentSkillsLocations": {\n    "~/.claude/skills": false,\n  },\n}\n',
+            encoding="utf-8",
+        )
+        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
+        self.assertEqual(scan_copilot_duplicates(REPO_ROOT, home=self.tmp), [])
+
+        # F6: extract_cli_session_id honors ANTIGRAVITY_CONVERSATION_ID
+        self.assertEqual(
+            extract_cli_session_id("antigravity", {"ANTIGRAVITY_CONVERSATION_ID": "conv-abc"}),
+            "conv-abc",
+        )
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import importlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -378,6 +379,52 @@ def _self_check() -> dict[str, bool]:
     return results
 
 
+def _loads_jsonc_dict(raw: str) -> dict[str, Any] | None:
+    """Parse a VS Code JSONC file (stripping `//`, `/* */` comments and trailing commas)."""
+    out: list[str] = []
+    in_str = False
+    escaped = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if raw[i : i + 2] == "//":
+            nl = raw.find("\n", i + 2)
+            if nl == -1:
+                break
+            i = nl
+            continue
+        if raw[i : i + 2] == "/*":
+            end = raw.find("*/", i + 2)
+            if end == -1:
+                break
+            i = end + 2
+            continue
+        out.append(ch)
+        i += 1
+    cleaned = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _is_vscode_location_disabled(
     loc: CopilotDiscoveryLocation, home: Path | None, profile: Path | None
 ) -> bool:
@@ -392,28 +439,33 @@ def _is_vscode_location_disabled(
     settings_files = [default_vscode_prompts_dir(home).parent / "settings.json"]
     if profile is not None:
         settings_files.append(profile / "settings.json")
-    candidates: tuple[str, ...]
+    candidates: set[str]
     if loc.scope == "claude-user":
         leaf = "agents" if loc.rel_path.endswith("agents") else "skills"
-        candidates = (
+        candidates = {
             f"~/.claude/{leaf}",
             f".claude/{leaf}",
-            str(default_claude_dir(home) / leaf),
-        )
+            str(default_claude_dir(home) / leaf).replace("\\", "/"),
+        }
     else:
-        candidates = (loc.rel_path, f"./{loc.rel_path}")
+        candidates = {loc.rel_path, f"./{loc.rel_path}"}
     for settings_path in settings_files:
         if not settings_path.is_file():
             continue
         try:
-            data = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw_text = settings_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
             continue
+        data = _loads_jsonc_dict(raw_text)
         if not isinstance(data, dict):
             continue
         loc_map = data.get(setting_key)
-        if isinstance(loc_map, dict) and any(loc_map.get(key) is False for key in candidates):
-            return True
+        if isinstance(loc_map, dict):
+            for k, v in loc_map.items():
+                if v is False and isinstance(k, str):
+                    norm_k = k.replace("\\", "/")
+                    if norm_k in candidates or norm_k.removeprefix("./") in candidates:
+                        return True
     return False
 
 
@@ -482,9 +534,18 @@ def scan_copilot_duplicates(
     for (client, kind, entity_name), entries in sorted(
         duplicates_by_key.items(), key=lambda item: item[0]
     ):
+        def _is_removable(loc: CopilotDiscoveryLocation, p: Path) -> bool:
+            return loc.scope not in (
+                "claude-user",
+                "claude-workspace",
+            ) and is_craftsman_generated_file(p, valid_all)
+
         canonical_entry = next(
             ((loc, p) for loc, p in entries if loc.canonical),
-            entries[0],
+            next(
+                ((loc, p) for loc, p in entries if not _is_removable(loc, p)),
+                entries[0],
+            ),
         )
         canonical_path = canonical_entry[1]
         removable_paths: list[str] = []
@@ -497,10 +558,7 @@ def scan_copilot_duplicates(
                 claude_loc_scope = loc.scope
             if file_path == canonical_path:
                 continue
-            if loc.scope not in (
-                "claude-user",
-                "claude-workspace",
-            ) and is_craftsman_generated_file(file_path, valid_all):
+            if _is_removable(loc, file_path):
                 removable_paths.append(str(file_path))
             else:
                 preserved_paths.append(str(file_path))
@@ -929,7 +987,15 @@ def _discover_skill_dirs(repo_dir: Path) -> dict[str, Path]:
     for skill_md in sorted(skills_root.glob("*/SKILL.md")):
         skill_dir = skill_md.parent.resolve()
         if skill_dir.is_relative_to(skills_root):
-            result[skill_md.parent.name] = skill_dir
+            folder_name = skill_md.parent.name
+            result[folder_name] = skill_dir
+            try:
+                raw = skill_md.read_text(encoding="utf-8")
+                fm_name = extract_skill_name(raw, folder_name)
+                if fm_name:
+                    result.setdefault(fm_name, skill_dir)
+            except OSError:
+                pass
     return result
 
 
@@ -1011,7 +1077,11 @@ def skill_main(argv: list[str] | None = None) -> int:
 
     if args.subcommand == "list":
         entries: list[dict[str, str]] = []
+        seen_dirs: set[Path] = set()
         for folder_name, skill_dir in known.items():
+            if skill_dir in seen_dirs:
+                continue
+            seen_dirs.add(skill_dir)
             raw = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
             name = extract_skill_name(raw, folder_name)
             desc, _ = extract_description_and_body(raw, name)

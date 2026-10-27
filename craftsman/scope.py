@@ -46,9 +46,6 @@ READ_LIST_TOOL_NAMES = frozenset(
         "readfile",
         "view",
         "view_file",
-        "ls",
-        "list_dir",
-        "listdir",
         "get_file_contents",
         "open_file",
     }
@@ -58,6 +55,9 @@ SEARCH_TOOL_NAMES = frozenset(
     {
         "grep",
         "glob",
+        "ls",
+        "list_dir",
+        "listdir",
         "grep_search",
         "grepsearch",
         "file_search",
@@ -68,6 +68,20 @@ SEARCH_TOOL_NAMES = frozenset(
         "semantic_search",
         "codebase_search",
         "search_files",
+    }
+)
+
+SHELL_HISTORY_NAMES = frozenset(
+    {
+        ".bash_history",
+        ".zsh_history",
+        ".sh_history",
+        ".history",
+        ".python_history",
+        ".node_repl_history",
+        ".lesshst",
+        "fish_history",
+        "consolehost_history.txt",
     }
 )
 
@@ -273,6 +287,22 @@ def expand_env_and_tilde(raw: str, home: Path | None = None) -> str:
     return os.path.expanduser(expanded)
 
 
+def _split_scope_allow_values(raw_vals: list[str]) -> list[str]:
+    entries: list[str] = []
+    for raw in raw_vals:
+        if ";" in raw:
+            parts = raw.split(";")
+        elif os.pathsep == ":" and not WINDOWS_DRIVE_RE.match(raw.strip()):
+            parts = raw.split(":")
+        else:
+            parts = [raw]
+        for part in parts:
+            cleaned = part.strip()
+            if cleaned:
+                entries.append(cleaned)
+    return entries
+
+
 def load_scope_policy(cwd: Path, repo_root: Path) -> ScopePolicy:
     """Load `craftsman.scope` and `craftsman.scopeAllow` from repository and global git config."""
     resolved_root = repo_root.resolve()
@@ -283,7 +313,7 @@ def load_scope_policy(cwd: Path, repo_root: Path) -> ScopePolicy:
     home = _current_home()
     allow_vals = _git_config_values(resolved_root, "--get-all", "craftsman.scopeAllow")
     allowed: list[Path] = []
-    for val in allow_vals:
+    for val in _split_scope_allow_values(allow_vals):
         expanded = expand_env_and_tilde(val, home)
         candidate = Path(expanded)
         if not candidate.is_absolute():
@@ -310,6 +340,8 @@ def _is_windows_drive_outside_posix_repo(raw: str, repo_root: Path) -> bool:
 
 def _resolve_lexical_and_real(raw: str, base_cwd: Path, home: Path) -> tuple[Path, Path]:
     expanded = expand_env_and_tilde(raw, home)
+    if os.sep == "/" and not WINDOWS_DRIVE_RE.match(expanded):
+        expanded = expanded.replace("\\", "/")
     p = Path(expanded)
     lexical = p if p.is_absolute() else (base_cwd / p)
     lexical_norm = Path(os.path.normpath(str(lexical)))
@@ -358,6 +390,14 @@ def _is_assistant_session_store(target: Path, home: Path) -> bool:
         ):
             return True
     return False
+
+
+def _is_shell_history_file(target: Path, repo_root: Path) -> bool:
+    if _is_within(target, repo_root):
+        return False
+    if target.name.lower() in SHELL_HISTORY_NAMES:
+        return True
+    return any(part.lower() == "psreadline" for part in target.parts)
 
 
 def _is_other_craftsman_data(target: Path, repo_root: Path, policy: ScopePolicy) -> bool:
@@ -430,6 +470,12 @@ def _check_read_or_list_path(
             _deny_reason(f"{action_desc} (assistant session store)", str(real), repo_root),
         )
 
+    if _is_shell_history_file(real, repo_root) or _is_shell_history_file(lexical, repo_root):
+        return ScopeDecision(
+            "deny",
+            _deny_reason(f"{action_desc} (shell history file)", str(real), repo_root),
+        )
+
     if _is_other_craftsman_data(real, repo_root, policy) or _is_other_craftsman_data(
         lexical, repo_root, policy
     ):
@@ -445,6 +491,27 @@ def _check_read_or_list_path(
             _deny_reason(f"{action_desc} (another git repository {git_wt})", str(real), repo_root),
         )
 
+    return ScopeDecision("allow")
+
+
+def _check_nonrec_ls_path(
+    raw_path: str,
+    base_cwd: Path,
+    repo_root: Path,
+    policy: ScopePolicy,
+    home: Path,
+    exe: str,
+) -> ScopeDecision:
+    decision = _check_read_or_list_path(
+        raw_path, base_cwd, repo_root, policy, home, f"`{exe}` listing"
+    )
+    if decision.decision == "deny":
+        return decision
+    _, real = _resolve_lexical_and_real(raw_path, base_cwd, home)
+    if _is_in_policy_allowlist(real, policy):
+        return ScopeDecision("allow")
+    if real == Path(real.anchor) or real == home or real in repo_root.parents:
+        return ScopeDecision("deny", _deny_reason(f"`{exe}` listing", str(real), repo_root))
     return ScopeDecision("allow")
 
 
@@ -479,6 +546,9 @@ def _is_allowed_recursive_root(
 
     if _is_within(real, repo_root) or _is_in_own_git_craftsman(real, repo_root, policy):
         return True, str(real)
+
+    if ".." in Path(raw_path.replace("\\", "/")).parts:
+        return False, str(real)
 
     # Dedicated subdirectory in system temp is allowed only if it is not a sibling of repo_root
     # when repo_root itself lives inside a test TemporaryDirectory.
@@ -524,13 +594,14 @@ def _extract_find_roots(args: list[str]) -> list[str]:
     return roots or ["."]
 
 
-def _extract_rg_roots(args: list[str]) -> list[str]:
+def _extract_rg_roots(exe: str, args: list[str]) -> list[str]:
     has_explicit_pattern = False
     files_mode = False
     positionals: list[str] = []
     idx = 0
     n = len(args)
     after_double_dash = False
+    is_ag_or_ack = exe in ("ag", "ack")
     while idx < n:
         tok = args[idx]
         if after_double_dash:
@@ -541,8 +612,16 @@ def _extract_rg_roots(args: list[str]) -> list[str]:
             after_double_dash = True
             idx += 1
             continue
-        if tok == "--files":
+        if tok == "--files" or (is_ag_or_ack and tok == "-f"):
             files_mode = True
+            idx += 1
+            continue
+        if is_ag_or_ack and tok in ("-g", "-G"):
+            has_explicit_pattern = True
+            idx += 2 if idx + 1 < n else 1
+            continue
+        if is_ag_or_ack and tok.startswith(("-g", "-G")) and len(tok) > 2:
+            has_explicit_pattern = True
             idx += 1
             continue
         if tok in ("-e", "--regexp", "-f", "--file") or tok.startswith(
@@ -554,8 +633,21 @@ def _extract_rg_roots(args: list[str]) -> list[str]:
             else:
                 idx += 1
             continue
+        if tok.startswith(("-e", "-f")) and not tok.startswith("--") and len(tok) > 2:
+            has_explicit_pattern = True
+            idx += 1
+            continue
         if tok in RG_OPTS_WITH_VALUE:
             idx += 2
+            continue
+        if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1:
+            flags = tok[1:]
+            if "e" in flags or (not is_ag_or_ack and "f" in flags):
+                has_explicit_pattern = True
+                if flags.endswith(("e", "f")) and idx + 1 < n:
+                    idx += 2
+                    continue
+            idx += 1
             continue
         if tok.startswith("-"):
             idx += 1
@@ -608,7 +700,7 @@ def _extract_fd_roots(args: list[str]) -> list[str]:
     return positionals[1:] if len(positionals) > 1 else ["."]
 
 
-def _parse_grep_invocation(args: list[str]) -> tuple[bool, list[str]]:
+def _parse_grep_invocation(args: list[str]) -> tuple[bool, list[str], list[str]]:
     recursive = False
     has_explicit_pattern = False
     positionals: list[str] = []
@@ -643,6 +735,10 @@ def _parse_grep_invocation(args: list[str]) -> tuple[bool, list[str]]:
             else:
                 idx += 1
             continue
+        if tok.startswith(("-e", "-f")) and not tok.startswith("--") and len(tok) > 2:
+            has_explicit_pattern = True
+            idx += 1
+            continue
         if tok in GREP_OPTS_WITH_VALUE:
             idx += 2
             continue
@@ -663,8 +759,8 @@ def _parse_grep_invocation(args: list[str]) -> tuple[bool, list[str]]:
         positionals.append(tok)
         idx += 1
 
-    roots = positionals if has_explicit_pattern else (positionals[1:] if len(positionals) > 1 else ["."])
-    return recursive, (roots or ["."])
+    file_operands = positionals if has_explicit_pattern else positionals[1:]
+    return recursive, (file_operands or ["."]), file_operands
 
 
 def _parse_ls_or_gci(exe: str, args: list[str]) -> tuple[bool, list[str]]:
@@ -773,6 +869,67 @@ def _extract_shell_read_paths(exe: str, args: list[str]) -> list[str]:
     return paths
 
 
+def _check_git_command_scope(
+    args: list[str],
+    eff_cwd: Path,
+    repo_root: Path,
+    policy: ScopePolicy,
+    home: Path,
+) -> ScopeDecision:
+    git_cwd = eff_cwd
+    idx = 0
+    n = len(args)
+    subcmd: str | None = None
+    sub_args: list[str] = []
+    while idx < n:
+        tok = args[idx]
+        if tok == "-C" and idx + 1 < len(args):
+            dir_arg = args[idx + 1]
+            ok, desc = _is_allowed_recursive_root(dir_arg, git_cwd, repo_root, policy, home)
+            if not ok:
+                return ScopeDecision("deny", _deny_reason("`git -C`", desc, repo_root))
+            git_cwd, _ = _resolve_lexical_and_real(dir_arg, git_cwd, home)
+            idx += 2
+            continue
+        if tok in ("--work-tree", "--git-dir") and idx + 1 < len(args):
+            dir_arg = args[idx + 1]
+            ok, desc = _is_allowed_recursive_root(dir_arg, git_cwd, repo_root, policy, home)
+            if not ok:
+                return ScopeDecision("deny", _deny_reason(f"`git {tok}`", desc, repo_root))
+            idx += 2
+            continue
+        if tok.startswith(("--work-tree=", "--git-dir=")):
+            dir_arg = tok.split("=", 1)[1]
+            ok, desc = _is_allowed_recursive_root(dir_arg, git_cwd, repo_root, policy, home)
+            if not ok:
+                return ScopeDecision("deny", _deny_reason("`git` option", desc, repo_root))
+            idx += 1
+            continue
+        if tok in ("-c", "--namespace", "--super-prefix", "--config-env") and idx + 1 < len(args):
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        subcmd = tok
+        sub_args = args[idx + 1 :]
+        break
+
+    if subcmd == "grep":
+        roots = _extract_rg_roots("rg", sub_args)
+        for r in roots:
+            ok, desc = _is_allowed_recursive_root(r, git_cwd, repo_root, policy, home)
+            if not ok:
+                return ScopeDecision("deny", _deny_reason("`git grep`", desc, repo_root))
+    elif subcmd == "ls-files":
+        for tok in sub_args:
+            if not tok.startswith("-") and tok != "--":
+                ok, desc = _is_allowed_recursive_root(tok, git_cwd, repo_root, policy, home)
+                if not ok:
+                    return ScopeDecision("deny", _deny_reason("`git ls-files`", desc, repo_root))
+    return ScopeDecision("allow")
+
+
 def _has_unmatched_quotes(command_line: str) -> bool:
     # Ignore trailing backslash on Windows drive roots like C:\
     sanitized = re.sub(r"([A-Za-z]:)\\(?=\s|$)", r"\1/", command_line)
@@ -812,6 +969,12 @@ def _evaluate_shell_command_scope(
         ):
             continue
 
+        if exe == "git":
+            git_dec = _check_git_command_scope(args, eff_cwd, repo_root, policy, home)
+            if git_dec.decision == "deny":
+                return git_dec
+            continue
+
         # 1. System-wide index searches (locate / mlocate / mdfind)
         if exe in LOCATE_BINS:
             return ScopeDecision("deny", _deny_reason(f"`{exe}` search", "system index", repo_root))
@@ -844,17 +1007,31 @@ def _evaluate_shell_command_scope(
         if exe == "find":
             recursive_roots = _extract_find_roots(args)
         elif exe in ("rg", "ripgrep", "ag", "ack"):
-            recursive_roots = _extract_rg_roots(args)
+            recursive_roots = _extract_rg_roots(exe, args)
         elif exe in ("fd", "fdfind"):
             recursive_roots = _extract_fd_roots(args)
         elif exe in GREP_BINS:
-            is_rec, g_roots = _parse_grep_invocation(args)
+            is_rec, g_roots, g_files = _parse_grep_invocation(args)
             if is_rec:
                 recursive_roots = g_roots
+            else:
+                for raw_p in g_files:
+                    decision = _check_read_or_list_path(
+                        raw_p, eff_cwd, repo_root, policy, home, f"`{exe}` read"
+                    )
+                    if decision.decision == "deny":
+                        return decision
+                continue
         elif exe in LS_BINS:
             is_rec, l_roots = _parse_ls_or_gci(exe, args)
             if is_rec:
                 recursive_roots = l_roots
+            else:
+                for raw_p in l_roots:
+                    decision = _check_nonrec_ls_path(raw_p, eff_cwd, repo_root, policy, home, exe)
+                    if decision.decision == "deny":
+                        return decision
+                continue
         elif exe in ("tree", "du"):
             recursive_roots = _extract_tree_or_du_roots(args)
 
@@ -880,20 +1057,42 @@ def _evaluate_shell_command_scope(
     return ScopeDecision("allow")
 
 
-def _extract_glob_root_prefix(pattern: str) -> str | None:
+def _extract_glob_root_prefix(pattern: str, *, is_query: bool = False) -> str | None:
     expanded = pattern.strip()
     if not expanded:
         return None
-    if not (
+    has_leading_anchor = (
         expanded.startswith(("/", "~", "$HOME", "${HOME}", "%USERPROFILE%", "$env:", ".."))
-        or WINDOWS_DRIVE_RE.match(expanded)
-    ):
+        or bool(WINDOWS_DRIVE_RE.match(expanded))
+    )
+    if GLOB_META_RE.search(expanded):
+        prefix = GLOB_META_RE.split(expanded, maxsplit=1)[0]
+        if prefix.endswith(("/", "\\")):
+            cleaned = prefix.rstrip("/\\")
+            if not cleaned:
+                return "/" if expanded.startswith("/") else expanded[:3]
+            return cleaned
+        if "/" in prefix or "\\" in prefix:
+            sep = "/" if "/" in prefix else "\\"
+            parent = prefix.rsplit(sep, 1)[0]
+            return parent if parent else ("/" if sep == "/" else prefix[:3])
+        if has_leading_anchor:
+            return prefix
         return None
-    prefix = GLOB_META_RE.split(expanded, maxsplit=1)[0]
-    cleaned = prefix.rstrip("/\\")
-    if not cleaned:
-        return "/" if expanded.startswith("/") else expanded[:3]
-    return cleaned
+    if has_leading_anchor or (not is_query and ("/" in expanded or "\\" in expanded)):
+        return expanded.rstrip("/\\") or ("/" if expanded.startswith("/") else expanded[:3])
+    return None
+
+
+def _normalize_cwd_for_repo(cwd: Path, repo_root: Path, resolved_repo: Path) -> Path:
+    if cwd == repo_root or cwd.is_relative_to(repo_root):
+        return Path(os.path.normpath(str(resolved_repo / cwd.relative_to(repo_root))))
+    if cwd == resolved_repo or cwd.is_relative_to(resolved_repo):
+        return Path(os.path.normpath(str(cwd)))
+    try:
+        return cwd.resolve()
+    except OSError:
+        return cwd
 
 
 def evaluate_scope(
@@ -908,17 +1107,15 @@ def evaluate_scope(
         return ScopeDecision("allow")
 
     resolved_repo = repo_root.resolve()
-    try:
-        resolved_cwd = cwd.resolve()
-    except OSError:
-        resolved_cwd = cwd
+    resolved_cwd = _normalize_cwd_for_repo(cwd, repo_root, resolved_repo)
     home = _current_home()
     tool_low = tool_name.strip().lower()
 
-    # Tool-level cwd override if provided in tool_input
+    # Tool-level cwd override if provided in tool_input (preserve lexical path for symlink checks)
     raw_tool_cwd = tool_input.get("cwd") or tool_input.get("Cwd")
     if isinstance(raw_tool_cwd, str) and raw_tool_cwd.strip():
-        _, resolved_cwd = _resolve_lexical_and_real(raw_tool_cwd.strip(), resolved_cwd, home)
+        lexical_cwd, _ = _resolve_lexical_and_real(raw_tool_cwd.strip(), resolved_cwd, home)
+        resolved_cwd = _normalize_cwd_for_repo(lexical_cwd, repo_root, resolved_repo)
 
     # D1 & D3: Shell command tools
     if tool_low in SHELL_TOOL_NAMES:
@@ -927,7 +1124,7 @@ def evaluate_scope(
             return ScopeDecision("allow")
         return _evaluate_shell_command_scope(raw_cmd, resolved_cwd, resolved_repo, policy, home)
 
-    # D2a: Read / list directory tools
+    # D2a: Read file tools
     if tool_low in READ_LIST_TOOL_NAMES:
         for key in (
             "file_path",
@@ -953,10 +1150,19 @@ def evaluate_scope(
                     return decision
         return ScopeDecision("allow")
 
-    # D2b: Search / Grep / Glob tools
+    # D2b: Search / Grep / Glob / LS / list_dir tools
     if tool_low in SEARCH_TOOL_NAMES:
         checked_any = False
-        for key in ("path", "folder", "SearchPath", "SearchDirectory", "dirPath", "directory"):
+        for key in (
+            "path",
+            "folder",
+            "SearchPath",
+            "SearchDirectory",
+            "dirPath",
+            "directory",
+            "DirectoryPath",
+            "AbsolutePath",
+        ):
             val = tool_input.get(key)
             if isinstance(val, str) and val.strip():
                 checked_any = True
@@ -969,7 +1175,7 @@ def evaluate_scope(
         for pat_key in ("pattern", "glob", "includePattern", "query"):
             pat_val = tool_input.get(pat_key)
             if isinstance(pat_val, str) and pat_val.strip():
-                prefix = _extract_glob_root_prefix(pat_val.strip())
+                prefix = _extract_glob_root_prefix(pat_val.strip(), is_query=(pat_key == "query"))
                 if prefix is not None:
                     checked_any = True
                     ok, desc = _is_allowed_recursive_root(
