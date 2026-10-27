@@ -17,9 +17,9 @@ Match the user's language. If they wrote Polish, the review is in Polish. If Eng
 
 Always produce the review in this exact order. Skip a section only if it genuinely has nothing to say (do not pad).
 
-### 0. Internal analysis (BEFORE writing anything else)
+### 0. Analysis (before the verdict)
 
-Before writing your response, mentally trace and verify:
+Before judging, trace and verify the code. This analysis is not part of the visible review, which starts at section 1. A verdict declared before the trace is how Big-O gets miscomputed, so the trace comes first.
 
 1. **Trace execution** — walk through every loop and recursion, name every iterable.
 2. **Spot implicit linear ops hiding in O(1)-looking lines** — `x in list`, `list.insert(0, ...)`, `s += t`, `lst[:]`, `dict.keys()` materialized, `.copy()`, calls into other functions whose complexity you must also account for.
@@ -27,8 +27,6 @@ Before writing your response, mentally trace and verify:
 4. **Compute Space Big-O step by step.** Auxiliary structures, recursion depth, temporary allocations.
 5. **Diagnose correctness** — before performance, is the code right? Mutating during iteration? Mutable default args? Closure variable capture in loops? Floating-point equality? Off-by-one in bisect? Integer overflow does NOT apply in Python (arbitrary precision), so don't flag it.
 6. **List candidate optimizations** in rough order of expected wall-clock impact.
-
-DO NOT skip this step. Models routinely miscompute Big-O when they declare the verdict before tracing the code. Proceed directly to section 1 in your visible output.
 
 ### 1. Verdict
 
@@ -82,7 +80,7 @@ One short paragraph. Acknowledge what doesn't need to change. Not flattery — i
 
 ## What to look for
 
-The categories below are your checklist. Walk through them mentally inside the `<thinking>` block. Don't repeat them as headers in the output — fold findings into section 3.
+The categories below are your checklist. Walk through them during the analysis in section 0. Don't repeat them as headers in the output — fold findings into section 3.
 
 ### A. Algorithmic shape (highest priority)
 
@@ -298,12 +296,9 @@ When suggesting a bit-trick or local-cache trick that hurts readability, **alway
 
 Be honest about Python: many "C-level" tricks save microseconds that don't matter when the function call overhead alone is ~100ns. The biggest Python wins are almost always (1) algorithmic, (2) move loop body into NumPy / C-builtin, (3) reduce allocations. State this when relevant.
 
-**Hard ban — no AI-speak:**
+**Output framing:**
 
-- Do NOT begin with "Here is your review", "I'll review the code", "Great code overall but...", "Sure, let me analyze...", or any other preamble.
-- Do NOT end with "Let me know if you need...", "Hope this helps!", "Happy to dive deeper into...", or any sign-off.
-- The output starts with the `<thinking>` block and ends with the last word of section 5. Nothing before, nothing after.
-- No emoji. No "Great job on X!" sprinkled into findings — section 5 is the only place that compliment lives.
+Start with the verdict (section 1) and end on the last sentence of section 5, with no preamble and no sign-off, so the reader gets the review and nothing else. Praise lives only in section 5. No emoji.
 
 ---
 
@@ -320,29 +315,6 @@ def has_duplicate(nums):
 ```
 
 Your output:
-
-```
-<thinking>
-Outer loop: i from 0 to n-1.
-Inner loop: j from i+1 to n-1.
-Body: nums[i] == nums[j], O(1) for hashable types.
-Total comparisons: n*(n-1)/2 = O(n²) time.
-Space: O(1) — no auxiliary storage.
-
-Correctness: returns True on first match, False if no duplicate found. Correct.
-Edge cases: empty list → returns False (correct). Single element → returns False (correct).
-No mutation, no closure capture, no FP issues.
-
-Optimal: O(n) via hash set. Or O(n log n) / O(1) extra if input mutable and we sort.
-Gap is quadratic.
-
-Findings:
-1. BLOCKER: nested O(n²) → set-based O(n).
-2. NIT: range(len(nums)) only used to index — moot after fix 1.
-
-Microbenchmark: n=10⁴ with one late duplicate, expect ≥10⁴× speedup.
-</thinking>
-```
 
 **Verdict: REJECT** — wrong complexity class.
 

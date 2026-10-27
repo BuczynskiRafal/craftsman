@@ -1,89 +1,50 @@
 ---
 name: audit-types
 description: >-
-  Expert audit of type design, domain classes, dataclasses, Pydantic models,
-  enums, and data contracts. Scores each new or modified type from 1 to 10
-  across 4 axes: Encapsulation, Invariant Expression, Invariant Usefulness, and
-  Invariant Enforcement (make illegal states unrepresentable). Use when
-  /audit-types or /type-audit is invoked.
+  Audit data structures and type design: for each new or changed type, lists
+  its invariants, the illegal states it still allows (with a constructing
+  example), where each invariant is enforced, and the smallest redesign that
+  makes the illegal states unrepresentable. Use when /audit-types is invoked
+  or via /audit types.
 ---
 
-# Type & Domain Model Design Analyzer (`/type-audit`)
+# Type & data-model audit (`/audit-types [target]`)
 
-You are a software architecture specialist focused on strong, well-encapsulated types and domain models. Well-designed types are the foundation of bug-resistant systems (*make illegal states unrepresentable*).
+Deepens the `model` lens of `skills/code-review/lenses.md` — read that playbook first.
 
-Include clickable `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)` links for all findings.
+The measure of a type here is simple: **how many states can be built that the domain forbids,
+and how far does a bad value travel before anything notices?**
 
----
+## For each new or changed type
 
-## 4-Axis Evaluation Framework (1–10 Scale)
+(classes, records, dataclasses, structs, enums, interfaces, schemas, typed dicts, protocol
+messages, database models, configuration objects)
 
-For every new or modified type (`class`, `@dataclass`, `TypedDict`, `NamedTuple`, `BaseModel`, `Enum`, `Protocol`) in the diff or target file, perform 5 steps:
+1. **Invariants.** Write them as checkable statements: ranges, required combinations, mutually
+   exclusive fields, ordering, uniqueness, formats, units, lifecycle (a value valid only after
+   `open()`).
+2. **Illegal states still constructible.** For each invariant, try to construct a violating value
+   through the public API — constructor, factory, deserialization, field assignment, mutation of
+   an exposed collection. Write the one-line constructing expression. No expression means the
+   invariant is enforced.
+3. **Enforcement point.** Where would a violation be noticed: at construction, at load, at first
+   use deep inside the system, or never?
+4. **Redesign.** The smallest change that removes each illegal state: a tagged union or separate
+   types instead of flag-plus-optional fields, an enum or `Literal` instead of a free string,
+   a validated value type instead of a raw primitive, `frozen`/read-only views instead of exposed
+   mutable internals, validation on deserialization. Skip redesigns whose cost exceeds the risk
+   and say so.
 
-1. **Identify Invariants:**
-   - What data consistency requirements must this object satisfy?
-   - What state transitions are valid?
-   - What cross-field constraints hold (e.g., `start_elevation >= end_elevation`, `diameter > 0`, `node_a != node_b`)?
+## Report
 
-2. **Rate Encapsulation (1–10):**
-   - Are internal implementation details hidden?
-   - Can external callers mutate fields directly and violate the object's invariants?
-   - Is the public interface minimal and complete?
-
-3. **Rate Invariant Expression (1–10):**
-   - How clearly does the type structure itself communicate its constraints (e.g., using `Enum` / `Literal` / dedicated Value Objects instead of raw `str` or `int`, or discriminated unions instead of 5 mutually exclusive `Optional` fields)?
-   - Is the type self-documenting, and will a static type checker (`mypy`/`pyright`) catch misuse at compile/check time?
-
-4. **Rate Invariant Usefulness (1–10):**
-   - Do these invariants prevent real domain bugs?
-   - Do they simplify caller code (eliminating repeated `if x is not None` checks across 10 call sites)?
-
-5. **Rate Invariant Enforcement (1–10):**
-   - Are invariants validated at construction time (`__init__`, `__post_init__`, Pydantic validators, factory methods)?
-   - Are all mutation points guarded (or is the object immutable via `frozen=True`)?
-   - Is it impossible to construct an invalid instance?
-
----
-
-## Common Anti-Patterns to Flag
-
-- **Anemic Domain Model** — passive data containers with validation and domain operations scattered across unrelated modules.
-- **Primitive Obsession** — passing raw `str`, `int`, `float`, `dict[str, Any]`, or `(float, float, float)` tuples where a domain concept has its own units and invariants.
-- **Boolean/Optional Soup** — classes with multiple interdependent `Optional[...]` fields and `bool` flags (e.g., "when `is_custom=True`, `custom_value` must not be `None`").
-- **Leaked Mutable Collections** — exposing internal lists or dicts that callers can mutate behind the object's back.
-- **Docstring-Only Invariants** (*"Note: call `initialize()` before `run()`"*) instead of enforcing valid state via constructor or type system.
-
----
-
-## Report Format
-
-For each analyzed type, present:
+Per type:
 
 ```markdown
-## Type: [`TypeName`](file:///full/path/to/file.py#L10-L45)
-
-### Identified Invariants
-- <Invariant 1 — and whether it is currently enforced>
-- <Invariant 2>
-
-### 4-Axis Score
-| Axis | Score | Rationale |
-| :--- | :---: | :--- |
-| **Encapsulation** | **X/10** | <Concise rationale> |
-| **Invariant Expression** | **X/10** | <Concise rationale> |
-| **Invariant Usefulness** | **X/10** | <Concise rationale> |
-| **Invariant Enforcement** | **X/10** | <Concise rationale> |
-
-### Strengths
-- <What the type does well>
-
-### Concerns & Illegal States Possible
-- <Concrete gaps allowing invalid state construction>
-
-### Pragmatic Improvement Proposal
-```python
-# Concrete type design improvement without over-engineering
-```
+### `TypeName` (file:line)
+- Invariants: …
+- Illegal but constructible: `TypeName(kind="circle", radius=None)` -> fails at render time (file:line)
+- Enforced at: construction | load | first use | never
+- Proposal: … (or "keep as is: …")
 ```
 
-Remain pragmatic: propose only improvements whose type-safety and readability benefits clearly outweigh any added complexity.
+Then the findings in the standard form for anything that can already cause a defect.

@@ -1,84 +1,58 @@
 ---
 name: simplify
 description: >-
-  Clean up and simplify recently modified code without changing its behavior
-  (Preserve Functionality). Reviews the diff across 4 engineering angles (Reuse,
-  Simplification, Efficiency, Altitude) and applies fixes directly to the files.
-  Does not hunt for correctness bugs (use /code-review for that). Use when
-  /simplify is invoked or when the user asks to clean up recently written code.
+  Behavior-preserving cleanup of the current diff: removes duplication with
+  existing helpers, needless complexity, dead weight, dishonest names or
+  comments, and wasted work, then proves behavior is unchanged by re-running
+  the same checks. Not a bug hunt (use /code-review). Use when /simplify is
+  invoked or as the first step of the /craftsman quality loop.
 ---
 
-# Simplify (`/simplify`)
+# Simplify (`/simplify [path | ref]`)
 
-You improve the clarity, consistency, and efficiency of recently modified code **without changing its behavior**. Analyze the diff across **Reuse**, **Simplification**, **Efficiency**, and **Abstraction Altitude**, and **apply the improvements directly to the files**. Do not use this skill to hunt for correctness bugs — that is the job of `/code-review`.
+Make the changed code as simple as the problem allows **without changing what it does**. You
+edit files directly. Scope is the cumulative diff (working tree vs. the `/craftsman` base, or
+`HEAD` when no session is active), or the path/ref the user gave.
 
-Include clickable Markdown links `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)` for all file and symbol references.
+## What "behavior-preserving" means here
 
----
+After your edits, for every input: the same return values, the same output (stdout, files,
+network), the same errors raised in the same situations, the same side effects in the same
+order, and the same public names and signatures. If you cannot convince yourself of all of these
+for an edit, do not make it — mention it as a suggestion instead.
 
-## Golden Rules (`/simplify`)
+## Steps
 
-1. **Preserve Functionality (100% Behavior Preservation):** Never change *what* the code does — only *how* it expresses it. All observable behaviors, outputs, and API contracts must remain identical.
-2. **Clarity over Brevity:** Explicit, readable code is always better than overly dense "clever" one-liners.
-   - **IMPORTANT:** Avoid nested ternary operators — prefer clear `if/else` chains, `match/switch` statements, or small helper functions with early returns.
-3. **Maintain Balance (Avoid Over-Simplification):**
-   - Do not merge unrelated responsibilities into a single function or class.
-   - Do not strip helpful abstractions that improve module organization and readability.
-   - Do not optimize for "fewer lines" at the expense of debuggability and extensibility.
-4. **Apply Project Standards:** Respect all rules defined in `GEMINI.md`, `AGENTS.md`, `.agents/rules/*.md`, and `CLAUDE.md` (naming conventions, typing, import sorting, error handling).
+1. **Pin current behavior.** Find how the project runs its checks (`Makefile`, `package.json`,
+   `pyproject.toml`, `AGENTS.md`/`CLAUDE.md`/`GEMINI.md`, CI config) and run the relevant tests
+   through the ledger before touching anything:
+   ```bash
+   craftsman run --kind test -- <test command>
+   ```
+   Simplifying on top of a red baseline hides regressions. Inside `/craftsman`, a failure caused
+   by the change you just built is yours: fix it first, then simplify. A failure that already
+   exists on the base commit, or any failure when `/simplify` runs on its own, is reported to the
+   user instead (`craftsman gate --await-user` while you wait for their decision).
+2. **Read the diff and its surroundings.** For each changed function, read the whole function and
+   the module it lives in; skim neighboring modules for helpers.
+3. **Look for cost, using the `craft` lens probes** (see `skills/code-review/lenses.md`):
+   - reimplemented helpers, constants or patterns that already exist (search by behavior and by
+     likely names, not only the exact name);
+   - derivable state, single-use indirection, always-constant flags, deep nesting that guard
+     clauses flatten, copy-paste blocks that differ in one value;
+   - unused variables, imports, parameters, unreachable branches;
+   - names that no longer say what the thing is; comments or docstrings that describe the old
+     behavior; comments that only restate the code;
+   - repeated I/O or computation in loops, eager work that is rarely needed.
+4. **Edit, one concern at a time.** Prefer the smallest edit that removes the cost. Keep the
+   surrounding style. Readability beats brevity: do not fold clear branches into dense
+   expressions, nested conditionals-in-expressions, or clever one-liners. Do not merge unrelated
+   responsibilities, and do not remove an abstraction that the rest of the code relies on for
+   organization.
+5. **Prove nothing changed.** Re-run exactly the same command through the ledger; it must pass.
+   If it fails, undo the offending edit rather than "fixing" the test.
+6. **Summarize** in a short list: each edit with `file:line`, the cost it removed, and the
+   suggestions you deliberately did not apply (with the reason).
 
----
-
-## Phase 0 — Acquire the Diff (Scope)
-
-1. Run `git diff @{upstream}...HEAD` (or `git diff main...HEAD` / `git diff HEAD~1` if no upstream exists) to inspect committed changes on the current branch.
-2. If uncommitted working tree changes exist or the branch diff is empty, also run `git diff HEAD` and include working tree changes in scope — `/simplify` is most frequently run right before committing.
-3. If the user passed a specific file/directory path, branch name, or PR, scope your work strictly to that target.
-
----
-
-## Phase 1 — 4-Angle Code Cleanup Analysis
-
-### Adaptive Execution Mode
-- **Single-Pass Inline (default for small/medium diffs < ~200 lines):** Walk through all **4 angles** below sequentially in the current context — do not skip any angle.
-- **4-Agent Parallel Fan-Out (for large diffs ≥ ~200 lines or with `--parallel`):** Launch **4 parallel `research` subagents** via `invoke_subagent` in a single call, assigning one of the four angles below to each subagent.
-
-For each finding, record: `file`, `line`, a one-sentence `summary`, and the **concrete cost** (what is duplicated, wasted, or harder to maintain).
-
-### 1. Reuse (Existing Code Reuse)
-Identify newly written code that reimplements functionality already present in the codebase — search (`grep_search`) shared/utility modules (`utils`, `helpers`, `common`, `shared`) and neighboring files, and cite the existing helper or class that should be called instead.
-
-### 2. Simplification (Structural Clarity)
-Identify unnecessary complexity introduced by the diff:
-- redundant or derivable state,
-- copy-paste blocks with minor variation,
-- deep nesting (flatten via guard clauses / early returns),
-- dead code, unused variables, or unused imports left behind,
-- nested ternary expressions,
-- redundant comments restating obvious code (while strictly preserving meaningful docstrings and "why" comments per documentation integrity).
-
-### 3. Efficiency (Zero Waste)
-Identify wasted work introduced by the diff:
-- repeated computation or redundant I/O / queries,
-- independent operations executed sequentially,
-- blocking operations added to startup or hot paths,
-- long-lived objects constructed from closures that retain large surrounding scopes in memory (prefer a class, struct, or `dataclass` copying only the required fields).
-
-### 4. Altitude (Abstraction Depth)
-Check whether each change fixes the **root cause** at the appropriate architectural depth rather than patching a symptom with a shallow bandaid. Adding special-case `if/else` branches onto shared infrastructure is a sign the change is too shallow — prefer a simpler, more general fix in the underlying mechanism.
-
----
-
-## Phase 2 — Apply the Fixes
-
-1. **Deduplicate:** Merge findings from Phase 1 that target the same lines or mechanism.
-2. **Direct Code Edits:** Apply each improvement directly to the files using `replace_file_content`.
-3. **Safe Skipping:** Skip any finding that would:
-   - alter intended runtime behavior,
-   - require invasive changes far outside the diff scope,
-   - reduce readability.
-4. **Final Summary:**
-   Conclude with a concise summary:
-   - Execution mode (*Single-Pass Inline* or *4-Agent Parallel Fan-Out*),
-   - **What Was Simplified:** bulleted list of applied changes with `[file.ext:L10-L20](file:///...)` links, angle (`Reuse` / `Simplification` / `Efficiency` / `Altitude`), and a one-sentence benefit,
-   - **Skipped Suggestions:** brief list of skipped items or confirmation that the code was already clean.
+Do not hunt for correctness bugs here; if you notice one, note it for the review step instead
+of silently changing behavior.

@@ -2,41 +2,35 @@
 trigger: always_on
 ---
 
-# Keyword Triggers: `ultrathink` & `ultracode`
+# Keyword Triggers: `ultrathink` & `ultracraft`
 
-Whenever the user's request (`<USER_REQUEST>`) contains either of the following keywords (case-insensitive), immediately activate the corresponding engineering rigor mode:
+When the user's request contains one of these keywords (case-insensitive), switch to the matching
+rigor mode.
 
----
+## `ultrathink` — think before building
 
-## 1. Keyword: `ultrathink` (Deep Architectural Reasoning)
-When `ultrathink` is present in the prompt, **before writing a single line of code or proposing an edit**, you MUST include an explicit **`### Deep Reasoning & Architecture Analysis`** section covering:
-1. **Deconstruction & Invariants**: Identify hidden assumptions, edge cases, concurrency/state hazards, and domain invariants that must be preserved.
-2. **Complexity & Resource Trade-offs**: Explicitly evaluate time ($O(\dots)$) and memory ($O(\dots)$) complexity, I/O bottlenecks, and failure modes.
-3. **Counterfactual Architecture Comparison**: Compare at least **2 distinct approaches** (e.g., pragmatic minimal change vs. clean structural refactor) with concrete pros/cons before selecting the winning design.
-4. **Failure-Mode Pre-Mortem**: List the top 3 ways the chosen solution could fail in production and how your implementation prevents them.
+Before writing or editing any code, include a section **`### Design analysis`** with:
+1. **Invariants and hazards:** hidden assumptions, edge cases, state and concurrency hazards, and
+   the domain rules the change must preserve.
+2. **Costs:** time and memory complexity of the chosen approach, I/O and network bottlenecks,
+   failure modes of external dependencies.
+3. **Alternatives:** at least two genuinely different approaches (for example the smallest change
+   that fits the current structure vs. a cleaner restructuring) with concrete pros and cons, and
+   the reason for your choice.
+4. **Pre-mortem:** the three most likely ways the chosen solution fails in production and what in
+   your implementation prevents each.
 
----
+## `ultracraft` — the deep quality loop
 
-## 2. Keyword: `ultracode` (Gear 3 Deep Hard-Loop + Isolated Quality Gate Subagent)
-When `ultracode` is present in the prompt, execute the full **Gear 3 (`deep`) Hybrid Hard-Loop** pipeline:
-1. **Initialize Gear 3 (`deep`) Hard-Loop State**:
-   Run:
-   ```bash
-   python3 ~/.gemini/config/scripts/craftsman-stop-gate.py --state-file <appDataDir>/brain/<conversation-id>/craftsman_state.json --init --mode ultracode --tier deep --cwd "$(pwd)"
-   ```
-   *(If waiting on `ask_question`, pass `--await-user`, then `--resume` once the user responds).*
-2. **Parallel Subagent Exploration**:
-   For non-trivial codebase questions, launch 2–3 `research` subagents (`invoke_subagent` with `Model: "inherit"`) in parallel to map all callers, types, and existing patterns before editing.
-3. **Production-Grade Implementation**:
-   - Strictly enforce type safety (*make illegal states unrepresentable*), explicit error handling (zero silent failures or bare `except:`), and DRY/SOLID principles.
-4. **Mandatory Context-Isolated Quality Gate Subagent**:
-   - **Never perform the review solely inline in the main thread!** Before finishing your response, spawn an isolated subagent via **`invoke_subagent`** (`TypeName: "self"`, `Model: "inherit"`, `Role: "Craftsman Quality Gate Auditor"`), passing the repository path and `base_sha` from `craftsman_state.json`.
-   - The subagent must execute in a fresh context across the entire cumulative diff (`git diff <base_sha>`):
-     1. **`/simplify`** (Reuse, Simplification, Efficiency, Altitude) and apply simplifications directly,
-     2. **`/code-review`** + **`/audit all`** (`/audit-errors`, `/audit-tests`, `/audit-types`, `/audit-comments`, `/audit-security`) and fix all `CONFIRMED` / `PLAUSIBLE` findings,
-     3. **`/verify`** (unit tests + real end-to-end runtime verification), concluding with `CRAFTSMAN_VERDICT: PASS` (or `CRAFTSMAN_VERDICT: FAIL` if checks fail).
-   - Once the subagent reports back, close the Hard-Loop gate:
-     ```bash
-     python3 ~/.gemini/config/scripts/craftsman-stop-gate.py --state-file <appDataDir>/brain/<conversation-id>/craftsman_state.json --complete
-     ```
-     *(The script inspects `transcript.jsonl` and rejects `--complete` if `invoke_subagent` was not called).*
+Treat the request as `/craftsman --deep <request>` and follow the `/craftsman` skill end to end:
+1. `craftsman gate --init --tier deep --task "<request in one line>"` before anything else
+   (`--await-user` / `--resume` around questions to the user).
+2. Include the `ultrathink` design analysis before implementing.
+3. Implement with explicit types and explicit error handling: no silent failures, no broad
+   catch-alls, invalid states made impossible where the type system allows it.
+4. Run the quality loop on the whole cumulative diff: `/simplify`, then review rounds with every
+   lens in fresh-context `craftsman-reviewer` subagents plus a final sweep, a
+   `craftsman-verifier` for every finding, fixes with delta re-review, and runtime verification
+   through `craftsman run` (tests **and** an end-to-end run).
+5. Finish only when `craftsman review check` passes, then `craftsman gate --complete` and report
+   with `craftsman review report`.

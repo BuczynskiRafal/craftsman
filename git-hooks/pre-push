@@ -1,43 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-GUARD_SCRIPT="${HOOKS_DIR}/../scripts/git-guard.py"
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+_SCRIPT_DIR="${HOOKS_DIR}"
+if [[ -L "$0" ]]; then
+  _LINK_TARGET="$(readlink "$0" 2>/dev/null || true)"
+  if [[ -n "${_LINK_TARGET}" ]]; then
+    [[ "${_LINK_TARGET}" == /* ]] || _LINK_TARGET="$(dirname "$0")/${_LINK_TARGET}"
+    _SCRIPT_DIR="$(cd "$(dirname "${_LINK_TARGET}")" 2>/dev/null && pwd -P || printf '%s' "${HOOKS_DIR}")"
+  fi
+fi
+
+for _helper in "${HOOKS_DIR}/_passthrough.sh" "${_SCRIPT_DIR}/_passthrough.sh" "${HOOKS_DIR}/applypatch-msg"; do
+  if [[ -f "${_helper}" ]] && grep -q "run_craftsman_guard" "${_helper}" 2>/dev/null; then
+    # shellcheck source=git-hooks/_passthrough.sh
+    source "${_helper}"
+    break
+  fi
+done
+
+if ! declare -F run_craftsman_guard >/dev/null || ! declare -F chain_git_hook >/dev/null; then
+  echo "craftsman git hooks in ${HOOKS_DIR} are out of date (missing _passthrough.sh helpers); run ./install.sh --git-hooks from the Craftsman repo, or bypass once with git -c core.hooksPath= push" >&2
+  exit 1
+fi
+
 STDIN_DATA="$(cat)"
-
-if [[ -f "${GUARD_SCRIPT}" ]]; then
-  PY_CMD=()
-  if [[ -f "${HOOKS_DIR}/.python_cmd" ]]; then
-    read -r -a PY_CMD < "${HOOKS_DIR}/.python_cmd" || true
-  fi
-  if [[ ${#PY_CMD[@]} -gt 0 ]] && command -v "${PY_CMD[0]}" >/dev/null 2>&1; then
-    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${PY_CMD[@]}" "${GUARD_SCRIPT}" --git-hook pre-push "$@"
-  elif [[ -x "${GUARD_SCRIPT}" ]] && command -v python3 >/dev/null 2>&1; then
-    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${GUARD_SCRIPT}" --git-hook pre-push "$@"
-  elif command -v python >/dev/null 2>&1; then
-    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | python "${GUARD_SCRIPT}" --git-hook pre-push "$@"
-  fi
-fi
-
-# Chain to previous global core.hooksPath if backed up during install
-PREV_RESOLVED=""
-if [[ -f "${HOOKS_DIR}/.previous_hooks_path" ]]; then
-  PREV_HOOKS_DIR="$(cat "${HOOKS_DIR}/.previous_hooks_path")"
-  [[ "${PREV_HOOKS_DIR}" == "~" ]] && PREV_HOOKS_DIR="${HOME}"
-  PREV_HOOKS_DIR="${PREV_HOOKS_DIR/#\~\//${HOME}/}"
-  if [[ -n "${PREV_HOOKS_DIR}" && -x "${PREV_HOOKS_DIR}/pre-push" ]]; then
-    PREV_RESOLVED="$(cd "${PREV_HOOKS_DIR}" 2>/dev/null && pwd -P || true)"
-    if [[ -n "${PREV_RESOLVED}" && "${PREV_RESOLVED}" != "${HOOKS_DIR}" ]]; then
-      printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${PREV_RESOLVED}/pre-push" "$@"
-    fi
-  fi
-fi
-
-# Chain to repository-local .git/hooks/pre-push if present (supports linked worktrees)
-GIT_COMMON_DIR="$(git rev-parse --git-common-dir 2>/dev/null || true)"
-if [[ -n "${GIT_COMMON_DIR}" && -x "${GIT_COMMON_DIR}/hooks/pre-push" ]]; then
-  LOCAL_HOOK_DIR="$(cd "${GIT_COMMON_DIR}/hooks" 2>/dev/null && pwd -P || true)"
-  if [[ -n "${LOCAL_HOOK_DIR}" && "${LOCAL_HOOK_DIR}" != "${HOOKS_DIR}" && "${LOCAL_HOOK_DIR}" != "${PREV_RESOLVED}" ]]; then
-    printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | "${GIT_COMMON_DIR}/hooks/pre-push" "$@"
-  fi
-fi
+printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | run_craftsman_guard "pre-push" "$@"
+printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | chain_git_hook "pre-push" "$@"

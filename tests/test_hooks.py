@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+
+from tests.support import EvidenceRepo
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GIT_GUARD = REPO_ROOT / "scripts" / "git-guard.py"
@@ -228,78 +231,38 @@ class StopGateHookTests(unittest.TestCase):
 
     def test_blocks_stop_until_all_gates_pass_and_respects_circuit_breaker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            repo = EvidenceRepo(Path(tmpdir) / "repo")
+            repo.write_lines("app.py", 5)
             state_file = Path(tmpdir) / "craftsman_state.json"
-            subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--init"],
-                check=True,
-            )
+            self.assertEqual(repo.gate(state_file, "--init", "--cwd", str(repo.root)).returncode, 0)
+            stop_payload = {
+                "terminationReason": "NO_TOOL_CALL",
+                "fullyIdle": True,
+                "artifactDirectoryPath": tmpdir,
+            }
 
-            # 1st stop attempt with missing gates -> continue (1/3)
-            res1 = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
+            # 1st stop attempt without evidence -> continue (1/3) with the ledger's next actions
+            res1 = run_hook(STOP_GATE, stop_payload)
             self.assertEqual(res1["decision"], "continue")
-            self.assertIn("1/3", res1.get("reason", ""))
-            self.assertIn("simplified, reviewed, verified", res1.get("reason", ""))
+            self.assertIn("[CRAFTSMAN GATE 1/3]", res1.get("reason", ""))
+            self.assertIn("[no-round]", res1.get("reason", ""))
+            self.assertIn("craftsman review prepare", res1.get("reason", ""))
 
             # Pause for user input -> allow
-            subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--await-user"],
-                check=True,
-            )
-            res_pause = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(res_pause["decision"], "allow")
+            self.assertEqual(repo.gate(state_file, "--await-user").returncode, 0)
+            self.assertEqual(run_hook(STOP_GATE, stop_payload)["decision"], "allow")
 
-            # Resume and pass simplify + review, but not verify -> continue (2/3)
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--resume",
-                    "--pass-simplify",
-                    "--pass-review",
-                ],
-                check=True,
-            )
-            res2 = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
+            # Resume; the deprecated self-reported flags no longer satisfy anything -> continue (2/3)
+            resumed = repo.gate(state_file, "--resume", "--pass-simplify", "--pass-review")
+            self.assertEqual(resumed.returncode, 0)
+            self.assertIn("--pass-simplify no longer satisfies the gate", resumed.stderr)
+            res2 = run_hook(STOP_GATE, stop_payload)
             self.assertEqual(res2["decision"], "continue")
             self.assertIn("2/3", res2.get("reason", ""))
-            self.assertIn("[verified]", res2.get("reason", ""))
 
-            # Pass verify -> allow and auto-complete
-            subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--pass-verify"],
-                check=True,
-            )
-            res3 = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
+            # Real evidence in the ledger -> allow and auto-complete
+            repo.record_full_evidence("quick")
+            res3 = run_hook(STOP_GATE, stop_payload)
             self.assertEqual(res3["decision"], "allow")
             final_state = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertFalse(final_state["active"])
@@ -307,38 +270,28 @@ class StopGateHookTests(unittest.TestCase):
 
     def test_circuit_breaker_trips_after_max_continuations(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            repo = EvidenceRepo(Path(tmpdir) / "repo")
+            repo.write_lines("app.py", 5)
             state_file = Path(tmpdir) / "craftsman_state.json"
-            subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--init"],
-                check=True,
-            )
+            repo.gate(state_file, "--init", "--cwd", str(repo.root))
+            stop_payload = {
+                "terminationReason": "NO_TOOL_CALL",
+                "fullyIdle": True,
+                "artifactDirectoryPath": tmpdir,
+            }
             for _ in range(3):
-                r = run_hook(
-                    STOP_GATE,
-                    {
-                        "terminationReason": "NO_TOOL_CALL",
-                        "fullyIdle": True,
-                        "artifactDirectoryPath": tmpdir,
-                    },
-                )
-                self.assertEqual(r["decision"], "continue")
+                self.assertEqual(run_hook(STOP_GATE, stop_payload)["decision"], "continue")
 
             # 4th attempt trips circuit breaker -> allow
-            r4 = run_hook(
-                STOP_GATE,
-                {
-                    "terminationReason": "NO_TOOL_CALL",
-                    "fullyIdle": True,
-                    "artifactDirectoryPath": tmpdir,
-                },
-            )
-            self.assertEqual(r4["decision"], "allow")
+            self.assertEqual(run_hook(STOP_GATE, stop_payload)["decision"], "allow")
             final_state = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertFalse(final_state["active"])
             self.assertEqual(final_state["stage"], "aborted_max_continuations")
 
     def test_rejects_complete_and_stop_without_invoke_subagent_in_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            repo = EvidenceRepo(Path(tmpdir) / "repo")
+            repo.write_lines("app.py", 50)
             state_file = Path(tmpdir) / "craftsman_state.json"
             logs_dir = Path(tmpdir) / ".system_generated" / "logs"
             logs_dir.mkdir(parents=True)
@@ -349,34 +302,17 @@ class StopGateHookTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--init"],
-                check=True,
-            )
+            repo.gate(state_file, "--init", "--cwd", str(repo.root))
+            # The ledger is complete, so only the transcript subagent requirement is under test
+            repo.record_full_evidence("standard")
 
             # Attempting --complete without invoke_subagent in transcript must fail with exit code 1
-            bad_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            bad_complete = repo.gate(state_file, "--complete")
             self.assertEqual(bad_complete.returncode, 1)
             self.assertIn("invoke_subagent", bad_complete.stderr)
 
             # Even if agent passes individual flags without invoke_subagent, Stop hook blocks
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--pass-simplify",
-                    "--pass-review",
-                    "--pass-verify",
-                ],
-                check=True,
-            )
+            repo.gate(state_file, "--pass-simplify", "--pass-review", "--pass-verify")
             res_block = run_hook(
                 STOP_GATE,
                 {
@@ -386,7 +322,7 @@ class StopGateHookTests(unittest.TestCase):
                 },
             )
             self.assertEqual(res_block["decision"], "continue")
-            self.assertIn("invoke_subagent(Craftsman Quality Gate Auditor)", res_block.get("reason", ""))
+            self.assertIn("`craftsman-reviewer` subagent", res_block.get("reason", ""))
 
             # Even if agent spawns a read-only 'research' subagent mentioning 'simplify', it must NOT satisfy Quality Gate
             with transcript.open("a", encoding="utf-8") as f:
@@ -416,13 +352,7 @@ class StopGateHookTests(unittest.TestCase):
                     + "\n"
                 )
 
-            research_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(research_complete.returncode, 1)
+            self.assertEqual(repo.gate(state_file, "--complete").returncode, 1)
 
             # Once invoke_subagent (TypeName='self', JSON-string Subagents as in real Antigravity transcript) is recorded, --complete and Stop succeed
             with transcript.open("a", encoding="utf-8") as f:
@@ -452,13 +382,8 @@ class StopGateHookTests(unittest.TestCase):
                     + "\n"
                 )
 
-            ok_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(ok_complete.returncode, 0)
+            ok_complete = repo.gate(state_file, "--complete")
+            self.assertEqual(ok_complete.returncode, 0, ok_complete.stderr)
 
             res_allow = run_hook(
                 STOP_GATE,
@@ -543,6 +468,7 @@ class StopGateHookTests(unittest.TestCase):
 
     def test_complete_without_prior_init_succeeds_when_subagent_was_invoked(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            repo = EvidenceRepo(Path(tmpdir) / "repo")
             state_file = Path(tmpdir) / "craftsman_state.json"
             logs_dir = Path(tmpdir) / ".system_generated" / "logs"
             logs_dir.mkdir(parents=True)
@@ -573,40 +499,15 @@ class StopGateHookTests(unittest.TestCase):
             ]
             transcript.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-            proc = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            # The repository is clean (the typo fix was already committed), so the ledger has nothing to demand
+            proc = repo.gate(state_file, "--complete")
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_3_gear_gearbox_quick_vs_auto_diff_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            repo_dir = Path(tmpdir) / "repo"
-            repo_dir.mkdir()
-            subprocess.run(["git", "init"], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "dev@example.com"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Dev"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
+            repo = EvidenceRepo(Path(tmpdir) / "repo")
+            repo_dir = repo.root
             f1 = repo_dir / "app.py"
-            f1.write_text("x = 1\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "commit", "--no-verify", "-m", "initial"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
 
             artifact_dir = Path(tmpdir) / "brain"
             logs_dir = artifact_dir / ".system_generated" / "logs"
@@ -620,125 +521,46 @@ class StopGateHookTests(unittest.TestCase):
             state_file = artifact_dir / "craftsman_state.json"
 
             # Initialize in auto tier pointing to repo_dir
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                check=True,
-            )
+            repo.gate(state_file, "--init", "--cwd", str(repo_dir))
 
             # Case 1: Small change (2 lines in 1 file <= 40 lines & <= 2 files) -> Gear 1 (Quick Soft-Loop)
-            # Allows --complete WITHOUT invoke_subagent in transcript!
+            # Allows --complete WITHOUT invoke_subagent in transcript once the quick-tier evidence exists
             f1.write_text("x = 2\ny = 3\n", encoding="utf-8")
-            small_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            no_evidence = repo.gate(state_file, "--complete")
+            self.assertEqual(no_evidence.returncode, 1)
+            self.assertIn("[no-round]", no_evidence.stderr)
+            repo.record_full_evidence("quick")
+            small_complete = repo.gate(state_file, "--complete")
             self.assertEqual(small_complete.returncode, 0, small_complete.stderr)
 
             # Re-init and make a large change (50 lines in 1 file > 40 lines) -> Gear 2 (Standard Hard-Loop)
             # Rejects --complete without invoke_subagent!
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                check=True,
-            )
+            repo.gate(state_file, "--init", "--cwd", str(repo_dir))
             f1.write_text("\n".join(f"line_{i} = {i}" for i in range(55)) + "\n", encoding="utf-8")
-            large_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            large_complete = repo.gate(state_file, "--complete")
             self.assertEqual(large_complete.returncode, 1)
             self.assertIn("invoke_subagent", large_complete.stderr)
 
             # Attempting to downgrade an active state via --tier quick during --complete is rejected
-            downgrade_attempt = subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--tier",
-                    "quick",
-                    "--complete",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(downgrade_attempt.returncode, 1)
+            self.assertEqual(repo.gate(state_file, "--tier", "quick", "--complete").returncode, 1)
 
             # Explicit --init --tier quick overrides diff size and allows inline completion
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--tier",
-                    "quick",
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                check=True,
-            )
-            quick_override = subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--complete",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            repo.gate(state_file, "--init", "--tier", "quick", "--cwd", str(repo_dir))
+            repo.record_full_evidence("quick")
+            quick_override = repo.gate(state_file, "--complete")
             self.assertEqual(quick_override.returncode, 0, quick_override.stderr)
 
             # Untracked files (>2 files) also trigger Gear 2 (Standard Hard-Loop)
             f1.write_text("x = 1\n", encoding="utf-8")
             for idx in range(3):
                 (repo_dir / f"untracked_{idx}.py").write_text("a = 1\n", encoding="utf-8")
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(STOP_GATE),
-                    "--state-file",
-                    str(state_file),
-                    "--init",
-                    "--cwd",
-                    str(repo_dir),
-                ],
-                check=True,
-            )
-            untracked_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            repo.gate(state_file, "--init", "--cwd", str(repo_dir))
+            untracked_complete = repo.gate(state_file, "--complete")
             self.assertEqual(untracked_complete.returncode, 1)
+            self.assertIn("invoke_subagent", untracked_complete.stderr)
 
-            # Claude Code 'Task' subagent tool call satisfies Gear 2 Hard-Loop
+            # A quick-tier round does not satisfy the standard gear
+            repo.record_full_evidence("quick")
             with transcript.open("a", encoding="utf-8") as f:
                 f.write(
                     json.dumps(
@@ -758,14 +580,14 @@ class StopGateHookTests(unittest.TestCase):
                     )
                     + "\n"
                 )
-            claude_task_complete = subprocess.run(
-                [sys.executable, str(STOP_GATE), "--state-file", str(state_file), "--complete"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(claude_task_complete.returncode, 0, claude_task_complete.stderr)
+            too_low = repo.gate(state_file, "--complete")
+            self.assertEqual(too_low.returncode, 1)
+            self.assertIn("[tier-too-low]", too_low.stderr)
 
+            # Claude Code 'Task' subagent tool call plus standard-tier evidence satisfies Gear 2
+            repo.record_full_evidence("standard")
+            claude_task_complete = repo.gate(state_file, "--complete")
+            self.assertEqual(claude_task_complete.returncode, 0, claude_task_complete.stderr)
 
 class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
     def test_claude_code_bash_payload_is_enforced_by_git_guard(self) -> None:
@@ -875,6 +697,7 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                     str(workspace),
                 ],
                 check=True,
+                env={**os.environ, "HOME": tmpdir, "USERPROFILE": tmpdir},
             )
             self.assertTrue((user_prompts / "craftsman.prompt.md").is_file())
             self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
@@ -964,15 +787,17 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("2.1.0", ver_proc.stdout)
+        self.assertIn("3.0.0", ver_proc.stdout)
 
-        doc_proc = subprocess.run(
-            [sys.executable, "-m", "craftsman.cli", "doctor", "--json", "--repo-dir", str(REPO_ROOT)],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
+        with tempfile.TemporaryDirectory() as fake_home:
+            doc_proc = subprocess.run(
+                [sys.executable, "-m", "craftsman.cli", "doctor", "--json", "--repo-dir", str(REPO_ROOT)],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=True,
+                env={**os.environ, "HOME": fake_home, "USERPROFILE": fake_home},
+            )
         report = json.loads(doc_proc.stdout)
         self.assertTrue(report["healthy"])
         self.assertEqual(report["skills_count"], 17)
@@ -1032,10 +857,10 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertIn("standard", payload2["effective_gear"])
             self.assertEqual(payload2["diff"]["changed_files"], 3)
 
-            # State file with mode=ultracode and gates=None must resolve to deep gear without crashing
+            # State file with mode=ultracraft and gates=None must resolve to deep gear without crashing
             state_file = Path(tmpdir) / "craftsman_state.json"
             state_file.write_text(
-                json.dumps({"active": True, "mode": "ultracode", "tier": "auto", "gates": None}),
+                json.dumps({"active": True, "mode": "ultracraft", "tier": "auto", "gates": None}),
                 encoding="utf-8",
             )
             stat_proc3 = subprocess.run(
@@ -1057,7 +882,8 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             )
             payload3 = json.loads(stat_proc3.stdout)
             self.assertIn("deep", payload3["effective_gear"])
-            self.assertFalse(payload3["gates"]["simplified"])
+            self.assertNotIn("gates", payload3)
+            self.assertEqual(payload3["ledger"]["rounds"], 0)
 
     def test_all_17_skills_have_valid_english_frontmatter_and_match_manifest(self) -> None:
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
@@ -1258,6 +1084,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
 
     def test_stop_gate_rejects_noop_stale_or_failed_subagent_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
+            repo = EvidenceRepo(Path(tmpdir) / "repo")
             state_file = Path(tmpdir) / "craftsman_state.json"
             logs_dir = Path(tmpdir) / ".system_generated" / "logs"
             logs_dir.mkdir(parents=True)
@@ -1295,6 +1122,8 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                     "--init",
                     "--tier",
                     "deep",
+                    "--cwd",
+                    str(repo.root),
                 ],
                 check=True,
             )
@@ -1305,6 +1134,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(noop_res.returncode, 1)
+            self.assertIn("invoke_subagent", noop_res.stderr)
 
             # 2. Valid auditor invoked, but followed by >40 lines of unreviewed edits -> rejected
             with transcript.open("a", encoding="utf-8") as f:
@@ -1356,6 +1186,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(stale_res.returncode, 1)
+            self.assertIn("invoke_subagent", stale_res.stderr)
 
     def test_exporter_preserves_existing_user_content_with_managed_markers(self) -> None:
         from craftsman.export import (
@@ -2199,7 +2030,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
 
             # 4. USER_REQUEST_BLOCK_RE ignores <USER_REQUEST> inside <RULE>
             injected = (
-                "<RULE>When `<USER_REQUEST>` contains `ultracode`, activate Gear 3.</RULE>\n"
+                "<RULE>When `<USER_REQUEST>` contains `ultracraft`, activate Gear 3.</RULE>\n"
                 "<USER_REQUEST>Fix typo in README</USER_REQUEST>"
             )
             self.assertEqual(is_craftsman_trigger_content(injected), (False, "auto"))
@@ -2287,7 +2118,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             prompt_content = (code_user / "prompts" / "craftsman.prompt.md").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("agent: 'agent'", prompt_content)
+            self.assertIn("agent: 'craftsman'", prompt_content)
 
             # Custom --user-dir not named 'prompts' must not touch sibling profiles/
             custom_parent = Path(tmpdir) / "custom_parent"

@@ -5,20 +5,32 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
+import io
 import json
 import os
-import subprocess
+import shlex
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 from craftsman import __version__
+from craftsman.diffscan import DiffScanError
+from craftsman.evidence import ledger_overview
 from craftsman.export import (
+    CLAUDE_HOOK_EVENTS,
     FRONTMATTER_RE,
+    HOOKS_FILENAME,
     _resolve_windows_appdata,
+    default_claude_dir,
+    default_copilot_home,
     default_copilot_skills_dir,
     default_repo_dir,
     default_vscode_prompts_dir,
+    is_craftsman_hook_command,
+    resolve_craftsman_pkg_dir,
+    user_home,
 )
 from craftsman.export import main as export_main
 from craftsman.gate import (
@@ -28,23 +40,18 @@ from craftsman.gate import (
 )
 from craftsman.gate import main as gate_main
 from craftsman.guard import main as guard_main
-
-
-def _git_config_get(key: str) -> str | None:
-    try:
-        proc = subprocess.run(
-            ["git", "config", "--global", "--get", key],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=False,
-        )
-        if proc.returncode == 0:
-            val = proc.stdout.strip()
-            return val if val else None
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return None
+from craftsman.hooks import main as hook_main
+from craftsman.install import (
+    MANIFEST_FILENAME,
+    STANDARD_PASSTHROUGH_GIT_HOOKS,
+    _expand_tilde,
+    git_config_get,
+    install_main,
+    uninstall_main,
+)
+from craftsman.ledger import LedgerError, ledger_path_for, load
+from craftsman.review import main as review_main
+from craftsman.runner import main as run_main
 
 
 def _expected_skill_count(repo_dir: Path) -> int:
@@ -68,24 +75,43 @@ def _sha256_file(path: Path) -> str | None:
 
 def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> list[str]:
     """Compare SHA-256 hashes of repo skills/rules/scripts/hooks against installed ~/.gemini/config."""
-    cfg = config_dir or (Path.home() / ".gemini" / "config")
-    if not (cfg / "skills" / "craftsman" / "SKILL.md").is_file():
+    cfg = config_dir or (user_home() / ".gemini" / "config")
+    has_skills = (cfg / "skills" / "craftsman" / "SKILL.md").is_file()
+    has_plugin = (cfg / "plugins" / "craftsman" / "plugin.json").is_file()
+    if not has_skills and not has_plugin:
         return []
 
     drifted: list[str] = []
-    for subdir, pattern in (
-        ("skills", "*/SKILL.md"),
-        ("rules", "*.md"),
-        ("scripts", "*.py"),
-        ("craftsman", "*.py"),
-        ("git-hooks", "*"),
-    ):
-        src_base = repo_dir / subdir
+    subdirs: tuple[tuple[str, str], ...] = (
+        (
+            ("skills", "*/SKILL.md"),
+            ("rules", "*.md"),
+            ("scripts", "*.py"),
+            ("craftsman", "*.py"),
+            ("git-hooks", "*"),
+        )
+        if has_skills
+        else (
+            ("scripts", "*.py"),
+            ("craftsman", "*.py"),
+            ("git-hooks", "*"),
+        )
+    )
+    for subdir, pattern in subdirs:
+        src_base = (
+            resolve_craftsman_pkg_dir(repo_dir)
+            if subdir == "craftsman"
+            else (repo_dir / subdir)
+        )
         dst_base = cfg / subdir
         if not src_base.is_dir() or not dst_base.is_dir():
             continue
         for src_file in sorted(src_base.glob(pattern)):
             if not src_file.is_file():
+                continue
+            if subdir == "git-hooks" and (
+                src_file.name.startswith("_") or src_file.name.startswith(".")
+            ):
                 continue
             rel = src_file.relative_to(src_base)
             dst_file = dst_base / rel
@@ -93,10 +119,20 @@ def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> 
                 drifted.append(f"{subdir}/{rel} (missing in {cfg})")
             elif _sha256_file(src_file) != _sha256_file(dst_file):
                 drifted.append(f"{subdir}/{rel}")
+        if subdir == "git-hooks":
+            passthrough_src = src_base / "_passthrough.sh"
+            passthrough_sha = _sha256_file(passthrough_src) if passthrough_src.is_file() else None
+            if passthrough_sha is not None:
+                for hook_name in STANDARD_PASSTHROUGH_GIT_HOOKS:
+                    dst_hook = dst_base / hook_name
+                    if not dst_hook.is_file():
+                        drifted.append(f"git-hooks/{hook_name} (missing in {cfg})")
+                    elif _sha256_file(dst_hook) != passthrough_sha:
+                        drifted.append(f"git-hooks/{hook_name}")
 
     src_hooks_json = repo_dir / "hooks.json"
     dst_hooks_json = cfg / "hooks.json"
-    if src_hooks_json.is_file():
+    if has_skills and src_hooks_json.is_file():
         if not dst_hooks_json.is_file():
             drifted.append(f"hooks.json (missing in {cfg})")
         else:
@@ -159,30 +195,251 @@ def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
     return len(skill_files), errors
 
 
-def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
+AGENT_NAMES = ("craftsman", "craftsman-reviewer", "craftsman-verifier")
+CLAUDE_AGENT_NAMES = ("craftsman-reviewer", "craftsman-verifier")
+SELF_CHECK_MODULES = ("ledger", "diffscan")
+
+
+def _command_executables(command: str, powershell: bool = False) -> list[str]:
+    """The interpreter and script a hook command runs, i.e. the words before `hook`."""
+    try:
+        if powershell:  # PowerShell quoting: backslashes are path separators, not escapes
+            words = [word.strip("\"'") for word in shlex.split(command.removeprefix("& "), posix=False)]
+        else:
+            words = shlex.split(command)
+    except ValueError:
+        return [command]
+    head = words[: words.index("hook")] if "hook" in words else words[:1]
+    return [word for word in head if not word.startswith("-") and word != "craftsman.cli"]
+
+
+def _is_runnable(executable: str) -> bool:
+    if os.path.isabs(executable):
+        return Path(executable).is_file()
+    return shutil.which(executable) is not None
+
+
+def inspect_copilot_hooks(hooks_file: Path) -> dict[str, Any]:
+    """Whether a Copilot hooks file exists and every program its commands run is present."""
+    report: dict[str, Any] = {"path": str(hooks_file), "exists": hooks_file.is_file(), "missing": []}
+    if not report["exists"]:
+        report["runnable"] = None
+        return report
+    try:
+        data = json.loads(hooks_file.read_text(encoding="utf-8"))
+        groups = data["hooks"].values()
+        # Check the command this OS will run: Copilot picks `powershell` on Windows, `bash` elsewhere.
+        key = "powershell" if os.name == "nt" else "bash"
+        commands = [
+            str(entry.get(key) or entry.get("command") or "") for group in groups for entry in group
+        ]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        report["runnable"] = False
+        report["missing"] = [f"unreadable hooks file: {exc}"]
+        return report
+    commands = [command for command in commands if command]
+    missing = sorted(
+        {
+            exe
+            for command in commands
+            for exe in _command_executables(command, powershell=key == "powershell")
+            if not _is_runnable(exe)
+        }
+    )
+    report["runnable"] = bool(commands) and not missing
+    report["missing"] = missing or ([] if commands else [f"no `{key}` hook commands"])
+    return report
+
+
+def _agents_installed(directory: Path, names: tuple[str, ...], suffix: str) -> bool:
+    return all((directory / f"{name}{suffix}").is_file() for name in names)
+
+
+def _skills_report(skills_dir: Path) -> dict[str, Any]:
+    review = skills_dir / "code-review"
+    lenses: bool | None = None
+    if (review / "SKILL.md").is_file():
+        lenses = (review / "lenses.md").is_file()
+    return {
+        "path": str(skills_dir),
+        "installed": (skills_dir / "craftsman" / "SKILL.md").is_file(),
+        "code_review_lenses": lenses,
+    }
+
+
+def _claude_hooks_merged(settings_file: Path) -> bool:
+    try:
+        settings = json.loads(settings_file.read_text(encoding="utf-8"))
+        hooks = settings.get("hooks", {})
+        return all(
+            any(
+                is_craftsman_hook_command(entry.get("command"))
+                for group in hooks.get(event, [])
+                for entry in group.get("hooks", [])
+            )
+            for event in CLAUDE_HOOK_EVENTS
+        )
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+
+
+def _has_passthrough_helpers(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "run_craftsman_guard" in text and "chain_git_hook" in text
+
+
+def _hook_can_load_helpers(hooks_dir: Path, hook_file: Path) -> bool:
+    candidates: list[Path] = [hooks_dir / "_passthrough.sh"]
+    if hook_file.is_symlink():
+        try:
+            raw_target = os.readlink(hook_file)
+        except OSError:
+            raw_target = ""
+        if raw_target:
+            target_path = (
+                Path(raw_target)
+                if os.path.isabs(raw_target)
+                else (hook_file.parent / raw_target)
+            )
+            candidates.append(target_path.parent / "_passthrough.sh")
+    candidates.append(hooks_dir / "applypatch-msg")
+    return any(_has_passthrough_helpers(cand) for cand in candidates)
+
+
+def inspect_git_hooks(
+    hooks_path: str | None, repo_dir: Path | None = None, home: Path | None = None
+) -> list[str]:
+    """Check whether a Craftsman `core.hooksPath` directory has working `_passthrough.sh` helpers."""
+    if not hooks_path:
+        return []
+    hooks_dir = Path(_expand_tilde(hooks_path, home)).expanduser()
+    if not hooks_dir.is_dir():
+        return []
+
+    is_craftsman_dir = (
+        (hooks_dir / ".python_cmd").is_file()
+        or (hooks_dir.parent / MANIFEST_FILENAME).is_file()
+        or (hooks_dir / ".previous_hooks_path").is_file()
+    )
+    broken_hooks: list[str] = []
+    for hook_name in ("commit-msg", "pre-push"):
+        hook_file = hooks_dir / hook_name
+        if hook_file.is_file():
+            try:
+                hook_text = hook_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                hook_text = ""
+            if "run_craftsman_guard" in hook_text and not _hook_can_load_helpers(
+                hooks_dir, hook_file
+            ):
+                broken_hooks.append(hook_name)
+        elif is_craftsman_dir and hook_file.is_symlink():
+            broken_hooks.append(hook_name)
+
+    if not broken_hooks:
+        return []
+    _ = repo_dir
+    return [
+        f"git hooks in {hooks_dir} ({', '.join(broken_hooks)}) cannot find _passthrough.sh helpers "
+        "(missing _passthrough.sh next to symlink target and no run_craftsman_guard in applypatch-msg); "
+        "run './install.sh --git-hooks' (or 'craftsman install --git-hooks') to repair"
+    ]
+
+
+def _self_check() -> dict[str, bool]:
+    results: dict[str, bool] = {}
+    for module in SELF_CHECK_MODULES:
+        try:
+            importlib.import_module(f"craftsman.{module}")
+            results[module] = True
+        except ImportError:
+            results[module] = False
+    return results
+
+
+def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
+    """Copilot and Claude Code integration status; `problems` lists what breaks the gate."""
+    copilot_home = default_copilot_home()
+    claude_dir = default_claude_dir()
+    skills = [_skills_report(default_copilot_skills_dir())]
+    if workspace is not None:
+        skills.append(_skills_report(workspace / ".github" / "skills"))
+    user_hooks = inspect_copilot_hooks(copilot_home / "hooks" / HOOKS_FILENAME)
+    report: dict[str, Any] = {
+        "copilot": {
+            "user_hooks": user_hooks,
+            "agents": {
+                "user": _agents_installed(copilot_home / "agents", AGENT_NAMES, ".agent.md"),
+                "workspace": (
+                    _agents_installed(workspace / ".github" / "agents", AGENT_NAMES, ".agent.md")
+                    if workspace is not None
+                    else None
+                ),
+            },
+            "skills": skills,
+        },
+        "claude": {
+            "agents": _agents_installed(claude_dir / "agents", CLAUDE_AGENT_NAMES, ".md"),
+            "hooks_merged": _claude_hooks_merged(claude_dir / "settings.json"),
+        },
+        "cli_self_check": _self_check(),
+    }
+    problems = [
+        f"{entry['path']}/code-review has no lenses.md next to SKILL.md; re-run `craftsman export`"
+        for entry in skills
+        if entry["code_review_lenses"] is False
+    ]
+    if user_hooks["runnable"] is False:
+        problems.append(
+            f"{user_hooks['path']} runs missing programs ({', '.join(user_hooks['missing'])}); "
+            "re-run `craftsman export --user-dir`"
+        )
+    problems.extend(
+        f"craftsman.{module} cannot be imported"
+        for module, ok in report["cli_self_check"].items()
+        if not ok
+    )
+    report["problems"] = problems
+    return report
+
+
+def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = None) -> int:
     """Inspect repository integrity, Git configuration, drift, and installed agent platforms."""
     skill_count, skill_errors = validate_skill_manifests(repo_dir)
     expected_skills = _expected_skill_count(repo_dir)
     rule_files = sorted((repo_dir / "rules").glob("*.md")) if (repo_dir / "rules").is_dir() else []
 
-    required_scripts = ("git-guard.py", "craftsman-stop-gate.py", "copilot-export.py")
+    required_scripts = (
+        "git-guard.py",
+        "craftsman-stop-gate.py",
+        "copilot-export.py",
+        "craftsman-cli.py",
+    )
     scripts_dir = repo_dir / "scripts"
     missing_scripts = [
         name for name in required_scripts if not (scripts_dir / name).is_file()
     ]
 
-    git_name = _git_config_get("user.name")
-    git_email = _git_config_get("user.email")
-    hooks_path = _git_config_get("core.hooksPath")
+    git_name = git_config_get("user.name")
+    git_email = git_config_get("user.email")
+    hooks_path = git_config_get("core.hooksPath")
 
-    home = Path.home()
+    home = user_home()
     vscode_prompts = default_vscode_prompts_dir()
     copilot_skills = default_copilot_skills_dir()
     xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     linux_cfg_root = Path(xdg_cfg) if xdg_cfg else (home / ".config")
     win_appdata_root = _resolve_windows_appdata(home) or (home / "AppData" / "Roaming")
     installed_targets = {
-        "antigravity": (home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file(),
+        "antigravity": (
+            (home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file()
+            or (home / ".gemini" / "config" / "plugins" / "craftsman" / "plugin.json").is_file()
+        ),
         "claude_code": (home / ".claude" / "commands" / "craftsman.md").is_file(),
         "github_copilot": (
             (vscode_prompts / "craftsman.prompt.md").is_file()
@@ -207,6 +464,8 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
     }
 
     config_drift = detect_antigravity_drift(repo_dir)
+    platforms = inspect_platforms(workspace)
+    platforms["problems"].extend(inspect_git_hooks(hooks_path, repo_dir, home))
 
     healthy = (
         sys.version_info >= (3, 10)
@@ -215,6 +474,7 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
         and len(rule_files) >= 2
         and not missing_scripts
         and not config_drift
+        and not platforms["problems"]
     )
 
     report: dict[str, Any] = {
@@ -234,6 +494,7 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
             "core.hooksPath": hooks_path,
         },
         "installed_targets": installed_targets,
+        **platforms,
     }
 
     if as_json:
@@ -253,18 +514,41 @@ def run_doctor(repo_dir: Path, as_json: bool = False) -> int:
     print(f"  Git hooksPath  : {hooks_path or 'unset'}")
     if config_drift:
         sync_hint = (
-            "run './install.sh --symlink' to sync"
+            "run './install.sh --symlink --git-hooks' to sync"
             if (repo_dir / "install.sh").is_file()
             else "reinstall or re-run 'craftsman export' to sync"
         )
         print(
             f"  Config drift   : {len(config_drift)} file(s) differ between repo and ~/.gemini/config ({sync_hint})"
         )
+    copilot = platforms["copilot"]
+    hooks_state = {None: "not installed", True: "ok", False: "BROKEN"}[copilot["user_hooks"]["runnable"]]
+    print(f"  Copilot hooks  : {hooks_state} ({copilot['user_hooks']['path']})")
+    print(
+        f"  Copilot agents : user {_yes_no(copilot['agents']['user'])}"
+        + (f", workspace {_yes_no(copilot['agents']['workspace'])}" if workspace else "")
+    )
+    claude = platforms["claude"]
+    claude_hooks_label = (
+        "installed"
+        if claude["hooks_merged"]
+        else "not installed (run ./install.sh --claude)"
+    )
+    print(
+        f"  Claude Code    : agents {_yes_no(claude['agents'])}, "
+        f"hooks {claude_hooks_label}"
+    )
+    for problem in platforms["problems"]:
+        print(f"  [ERROR] {problem}", file=sys.stderr)
     for err in skill_errors:
         print(f"  [ERROR] {err}", file=sys.stderr)
     for ms in missing_scripts:
         print(f"  [ERROR] Missing script: scripts/{ms}", file=sys.stderr)
     return 0 if healthy else 1
+
+
+def _yes_no(value: bool) -> str:
+    return "installed" if value else "missing"
 
 
 def _empty_diff_summary() -> dict[str, int]:
@@ -298,12 +582,12 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
     effective_state = dict(state, cwd=effective_cwd)
     effective_gear = resolve_effective_gear_label(effective_state, effective_cwd)
 
-    raw_gates = state.get("gates")
-    gates: dict[str, Any] = (
-        raw_gates
-        if isinstance(raw_gates, dict)
-        else {"simplified": False, "reviewed": False, "verified": False}
-    )
+    ledger_info: dict[str, Any] | None = None
+    ledger_error: str | None = None
+    try:
+        ledger_info = ledger_overview(load(ledger_path_for(str(effective_cwd))))
+    except (DiffScanError, LedgerError) as exc:
+        ledger_error = str(exc)
 
     payload: dict[str, Any] = {
         "state_file": str(state_file) if state_file else None,
@@ -314,7 +598,8 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
         "base_sha": base_sha,
         "cwd": effective_cwd,
         "diff": diff_summary,
-        "gates": gates,
+        "ledger": ledger_info,
+        "ledger_error": ledger_error,
         "subagent_verified": bool(state.get("subagent_verified", False)),
     }
 
@@ -331,15 +616,39 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
         f"  Cumulative Diff: {diff_summary['changed_files']} files, "
         f"+{diff_summary['added_lines']}/-{diff_summary['deleted_lines']} lines"
     )
-    print(
-        f"  Quality Gates  : simplified={gates.get('simplified')} | "
-        f"reviewed={gates.get('reviewed')} | verified={gates.get('verified')} | "
-        f"subagent_verified={payload['subagent_verified']}"
-    )
+    print(f"  Evidence       : {_describe_ledger(ledger_info, ledger_error)}")
     return 0
 
 
+def _describe_ledger(info: dict[str, Any] | None, error: str | None) -> str:
+    if info is None:
+        return f"unavailable ({error})"
+    if not info["rounds"]:
+        return "no review round yet (`craftsman review prepare`)"
+    coverage = info["coverage"]
+    verdicts = info["verdicts"]
+    runs = ", ".join(
+        f"{run['id']} {run['kind']} exit {run['exit_code']}" for run in info["latest_runs"]
+    )
+    return (
+        f"{info['rounds']} round(s), tier {info['tier']}, "
+        f"coverage {coverage['covered']}/{coverage['total']}; findings {info['findings']} "
+        f"(proven {verdicts['proven']}, probable {verdicts['probable']}, "
+        f"question {verdicts['question']}, dismissed {verdicts['dismissed']}, "
+        f"no verdict {verdicts['none']}, "
+        f"resolved {info['resolved']}); latest runs: {runs or 'none'}"
+    )
+
+
+def _tolerate_unencodable_output() -> None:
+    """Print `?` for characters the console cannot encode (legacy Windows code pages) instead of crashing."""
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _tolerate_unencodable_output()
     args_list = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         prog="craftsman",
@@ -361,6 +670,9 @@ def main(argv: list[str] | None = None) -> int:
     doc_parser.add_argument(
         "--json", action="store_true", help="Output diagnostic report as JSON."
     )
+    doc_parser.add_argument(
+        "--workspace", type=Path, help="Also check the Copilot agents and skills of this project."
+    )
 
     stat_parser = subparsers.add_parser(
         "status", help="Inspect the active 3-Gear state machine and cumulative git diff."
@@ -372,6 +684,14 @@ def main(argv: list[str] | None = None) -> int:
     stat_parser.add_argument("--json", action="store_true", help="Output status report as JSON.")
 
     subparsers.add_parser(
+        "install",
+        help="Install Craftsman skills, rules, agents, hooks, and git guards across platforms.",
+    )
+    subparsers.add_parser(
+        "uninstall",
+        help="Uninstall Craftsman files recorded in install manifests and restore global hooksPath.",
+    )
+    subparsers.add_parser(
         "export", help="Export skills and rules to Claude Code, GitHub Copilot, Codex, and Cursor."
     )
     subparsers.add_parser(
@@ -380,22 +700,42 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser(
         "guard", help="Invoke the Git Guard PreToolUse or native Git hook engine."
     )
+    subparsers.add_parser(
+        "hook", help="Lifecycle hook for VS Code Copilot, the Copilot CLI and Claude Code."
+    )
+    subparsers.add_parser(
+        "review", help="Prepare review rounds and record findings, coverage and verdicts."
+    )
+    subparsers.add_parser(
+        "run", help="Run a command and record its exit code in the evidence ledger."
+    )
 
     if not args_list:
         parser.print_help()
         return 0
 
     cmd = args_list[0]
+    if cmd == "install":
+        return install_main(args_list[1:])
+    if cmd == "uninstall":
+        return uninstall_main(args_list[1:])
     if cmd == "export":
         return export_main(args_list[1:])
     if cmd == "gate":
         return gate_main(args_list[1:])
     if cmd == "guard":
         return guard_main(args_list[1:])
+    if cmd == "hook":
+        return hook_main(args_list[1:])
+    if cmd == "review":
+        return review_main(args_list[1:])
+    if cmd == "run":
+        return run_main(args_list[1:])
 
     parsed = parser.parse_args(args_list)
     if parsed.command == "doctor":
-        return run_doctor(parsed.repo_dir.resolve(), as_json=bool(parsed.json))
+        workspace = parsed.workspace.resolve() if parsed.workspace else None
+        return run_doctor(parsed.repo_dir.resolve(), as_json=bool(parsed.json), workspace=workspace)
     if parsed.command == "status":
         return run_status(parsed.state_file, parsed.cwd, as_json=bool(parsed.json))
 

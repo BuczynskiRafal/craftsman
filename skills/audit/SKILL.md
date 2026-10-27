@@ -1,46 +1,40 @@
 ---
 name: audit
 description: >-
-  Comprehensive engineering audit orchestrator. Runs selected or all specialized
-  audits: errors (/audit-errors), tests (/audit-tests), types (/audit-types),
-  comments (/audit-comments), security (/audit-security), quality (code-quality),
-  and perf (extreme-optimizer / leetcode-style). Use when /audit [aspects]
-  [target] is invoked.
+  Focused deep audits of a diff, module or directory, one concern at a time:
+  errors, tests, types, comments, security, plus optional quality and perf.
+  Each audit is an in-depth run of the matching review lens with its own
+  inventory table. Use when /audit [aspects] [target] is invoked.
 ---
 
-# Comprehensive Engineering Audit (`/audit`)
+# Audit (`/audit [errors,tests,types,comments,security,quality,perf | all] [target] [--fix]`)
 
-You are the orchestrator for specialized engineering audits. A single `/audit` invocation runs targeted deep audits across the current diff, a Pull Request, or a specified module.
+A review looks at a change through many lenses at once; an audit takes **one** concern and goes
+through the target exhaustively, building an inventory instead of sampling. Use it for code that
+matters more than average, before a release, or when a review hinted at a systemic problem.
 
-Include clickable `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)` links for all findings.
+| Aspect | Skill | Lens it deepens | Selected by `all` when the target… |
+| :--- | :--- | :--- | :--- |
+| `errors` | `/audit-errors` | `failure` | handles errors, does I/O, parsing, subprocesses, network |
+| `tests` | `/audit-tests` | `tests` | changes behavior (almost always) |
+| `types` | `/audit-types` | `model` | adds or changes classes, records, enums, schemas |
+| `comments` | `/audit-comments` | `craft` (probe 4) | adds or changes comments or docstrings |
+| `security` | `/audit-security` | `trust` | touches paths, processes, SQL, deserialization, auth, network |
+| `quality` | `/code-quality` | `craft` | on request |
+| `perf` | `/extreme-optimizer` | — | on request |
 
----
+## How to run
 
-## 1. Available Audit Aspects (`/audit [aspects...] [<target>]`)
-
-Parse the arguments passed to `/audit`:
-
-| Aspect (argument) | Corresponding Skill | When Automatically Selected (no argument or `all`) |
-| :--- | :--- | :--- |
-| **`errors`** | [`audit-errors`] | When the diff/module contains exception handling (`try/except`), I/O, parsing, or fallbacks |
-| **`tests`** | [`audit-tests`] | When business logic or test files (`tests/`, `test_*.py`) are modified |
-| **`types`** | [`audit-types`] | When classes, `@dataclass`, Pydantic models, `Enum`, or API contracts are added/modified |
-| **`comments`** | [`audit-comments`] | When docstrings, comments, or signatures of documented functions are added/modified |
-| **`security`** | [`audit-security`] | When code touches file paths, subprocesses, SQL/expressions, network, deserialization, or auth |
-| **`quality`** | [`code-quality`] | On demand (`/audit quality`) or on large classes/modules (DRY, SOLID, orthogonality) |
-| **`perf`** | [`leetcode-style-code-reviewer`] | On demand (`/audit perf`) or on numerical loops / NumPy / Pandas / hot-path code |
-| **`all`** *(default)* | All matching aspects above | Automatically selects aspects based on diff contents (`git diff --name-only` + hunk contents) |
-
----
-
-## 2. Adaptive Execution Process
-
-1. **Determine Scope & Matching Aspects:**
-   - Inspect modified files (`git diff @{upstream}...HEAD` + `git diff HEAD`, or the specified file/directory/PR).
-   - If the user specified concrete aspects (e.g., `/audit errors types` or `/audit security`), read the corresponding `SKILL.md` files from the table above and execute those exact audits.
-   - If the user invoked `/audit` or `/audit all`, inspect the diff contents and run all applicable audit aspects.
-2. **Execution Mode (Inline vs. Subagents):**
-   - **Small/Medium Scope (1–2 aspects or diff < ~200 lines):** Read the selected skill instructions and execute the audits sequentially in the current context.
-   - **Large Scope (3+ aspects on a large diff/module or with `--parallel`):** Launch parallel `research` subagents via `invoke_subagent` (one per selected audit aspect), passing each subagent the full guidelines of its assigned skill.
-3. **Consolidated Final Report:**
-   Combine findings from all executed aspects into a single prioritized report (`CRITICAL` → `HIGH` → `MEDIUM`), with clickable `[file.ext:L10-L20](file:///...)` links and concrete code fixes. If `--fix` was passed, apply unambiguous fixes directly.
+1. **Target.** Default: the cumulative diff (working tree vs. the `/craftsman` base or `HEAD`),
+   *plus* the full files it touches. A path or module audits those files entirely.
+2. **Select aspects** as listed, or from the argument.
+3. **Execute.** One aspect: do it yourself. Several aspects on a large target: one subagent per
+   aspect when the platform offers subagents, each given the skill to follow and the target.
+4. **Challenge before reporting.** Every finding goes through the verification discipline of
+   `/code-review` Step 3 (try to disprove it, reproduce it if possible). Inside a `/craftsman`
+   session, record findings and verdicts in the ledger with `craftsman review add` /
+   `craftsman review verdict`; outside one, keep them in the report.
+5. **Report** one merged list ordered by severity (`blocker`, `major`, `minor`), each entry with
+   `file:line`, the concrete trigger and outcome, the verdict, and a fix. With `--fix`, apply the
+   fixes that do not change intended behavior, then run the project's tests through
+   `craftsman run --kind test`.

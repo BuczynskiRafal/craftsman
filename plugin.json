@@ -1,6 +1,6 @@
 {
   "name": "craftsman",
-  "version": "2.1.0",
+  "version": "3.0.0",
   "license": "MIT",
   "description": "Adaptive Closed-Loop Engineering Harness and Curated Skill Suite with 3-Gear Hybrid Hard-Loop Verification for Claude Code, OpenAI Codex, GitHub Copilot, Cursor, and Google Antigravity.",
   "skills": [
@@ -21,6 +21,11 @@
     "modernize",
     "simplify",
     "verify"
+  ],
+  "agents": [
+    "craftsman",
+    "craftsman-reviewer",
+    "craftsman-verifier"
   ],
   "rules": [
     "git_workflow.md",
