@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -651,7 +651,7 @@ def owns_gate(owner: GateOwner | None, caller: GateOwner) -> bool:
 
 
 def write_gate_owner(
-    state: dict[str, Any], caller: GateOwner, *, preserve_unowned: bool = False
+    state: MutableMapping[str, Any], caller: GateOwner, *, preserve_unowned: bool = False
 ) -> bool:
     """Write `caller` as the gate owner in `state` (merging with any partial existing owner)."""
     if preserve_unowned and "owner" not in state:

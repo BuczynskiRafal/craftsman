@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -1254,6 +1254,25 @@ def install_claude_target(
             session.save(InstallMode.COPY, dry_run=tracker.dry_run, cleanup_obsolete=False)
 
 
+def _remove_generated_copilot_matches(
+    paths: Iterable[Path],
+    valid_names: frozenset[str],
+    *,
+    remove_parent: bool = False,
+    stop_roots: Collection[Path],
+    dry_run: bool,
+    label: str = "legacy duplicate",
+) -> list[Path]:
+    removed: list[Path] = []
+    for path in paths:
+        if is_craftsman_generated_file(path, valid_names):
+            target = path.parent if remove_parent else path
+            if _remove_path_if_exists(target, dry_run=dry_run, stop_roots=stop_roots):
+                removed.append(target)
+                print(f"  - removed {label}: {target}")
+    return removed
+
+
 def _cleanup_legacy_copilot_user_files(
     repo_dir: Path,
     home: Path,
@@ -1265,32 +1284,28 @@ def _cleanup_legacy_copilot_user_files(
     """Remove Craftsman-generated Copilot files from non-canonical user/profile locations."""
     valid_names = craftsman_entity_names(repo_dir)
     removed: list[Path] = []
-    vscode_prompts = default_vscode_prompts_dir(home)
-    for prompts_dir in vscode_prompt_dirs(vscode_prompts):
+    for prompts_dir in vscode_prompt_dirs(default_vscode_prompts_dir(home)):
         if not prompts_dir.is_dir():
             continue
-        for agent_file in sorted(prompts_dir.glob("*.agent.md")):
-            if is_craftsman_generated_file(agent_file, valid_names):
-                if _remove_path_if_exists(agent_file, dry_run=dry_run, stop_roots=stop_roots):
-                    removed.append(agent_file)
-                    print(f"  - removed legacy duplicate: {agent_file}")
-        if not prompt_files:
-            for prompt_file in sorted(prompts_dir.glob("*.prompt.md")):
-                if is_craftsman_generated_file(prompt_file, valid_names):
-                    if _remove_path_if_exists(prompt_file, dry_run=dry_run, stop_roots=stop_roots):
-                        removed.append(prompt_file)
-                        print(f"  - removed legacy duplicate: {prompt_file}")
+        patterns = ("*.agent.md",) if prompt_files else ("*.agent.md", "*.prompt.md")
+        for pat in patterns:
+            removed.extend(
+                _remove_generated_copilot_matches(
+                    sorted(prompts_dir.glob(pat)), valid_names, stop_roots=stop_roots, dry_run=dry_run
+                )
+            )
     if prompt_files:
-        copilot_skills = default_copilot_skills_dir(home)
-        if copilot_skills.is_dir():
-            for skill_dir in sorted(copilot_skills.iterdir()):
-                if not skill_dir.is_dir():
-                    continue
-                skill_md = skill_dir / "SKILL.md"
-                if is_craftsman_generated_file(skill_md, valid_names):
-                    if _remove_path_if_exists(skill_dir, dry_run=dry_run, stop_roots=stop_roots):
-                        removed.append(skill_dir)
-                        print(f"  - removed legacy duplicate: {skill_dir}")
+        skills_dir = default_copilot_skills_dir(home)
+        if skills_dir.is_dir():
+            removed.extend(
+                _remove_generated_copilot_matches(
+                    sorted(skills_dir.glob("*/SKILL.md")),
+                    valid_names,
+                    remove_parent=True,
+                    stop_roots=stop_roots,
+                    dry_run=dry_run,
+                )
+            )
     return removed
 
 
@@ -1435,28 +1450,27 @@ def _cleanup_legacy_copilot_workspace_files(
 ) -> list[Path]:
     """Remove Craftsman-generated Copilot files from non-canonical workspace locations."""
     valid_names = craftsman_entity_names(repo_dir)
-    removed: list[Path] = []
     github_dir = workspace_dir / ".github"
     if not prompt_files:
         prompts_dir = github_dir / "prompts"
-        if prompts_dir.is_dir():
-            for prompt_file in sorted(prompts_dir.glob("*.prompt.md")):
-                if is_craftsman_generated_file(prompt_file, valid_names):
-                    if _remove_path_if_exists(prompt_file, dry_run=dry_run, stop_roots=stop_roots):
-                        removed.append(prompt_file)
-                        print(f"  - removed legacy duplicate: {prompt_file}")
-    else:
-        skills_dir = github_dir / "skills"
-        if skills_dir.is_dir():
-            for skill_dir in sorted(skills_dir.iterdir()):
-                if not skill_dir.is_dir():
-                    continue
-                skill_md = skill_dir / "SKILL.md"
-                if is_craftsman_generated_file(skill_md, valid_names):
-                    if _remove_path_if_exists(skill_dir, dry_run=dry_run, stop_roots=stop_roots):
-                        removed.append(skill_dir)
-                        print(f"  - removed legacy duplicate: {skill_dir}")
-    return removed
+        if not prompts_dir.is_dir():
+            return []
+        return _remove_generated_copilot_matches(
+            sorted(prompts_dir.glob("*.prompt.md")),
+            valid_names,
+            stop_roots=stop_roots,
+            dry_run=dry_run,
+        )
+    skills_dir = github_dir / "skills"
+    if not skills_dir.is_dir():
+        return []
+    return _remove_generated_copilot_matches(
+        sorted(skills_dir.glob("*/SKILL.md")),
+        valid_names,
+        remove_parent=True,
+        stop_roots=stop_roots,
+        dry_run=dry_run,
+    )
 
 
 def install_copilot_workspace_target(
@@ -2320,6 +2334,18 @@ def _uninstall_from_base(
         save_manifest(base_dir, updated, dry_run=tracker.dry_run)
 
 
+def _prune_empty_dirs(seen_dirs: Iterable[Path], stop_roots: Collection[Path]) -> None:
+    for directory in sorted(seen_dirs, key=lambda p: len(p.parts), reverse=True):
+        cur = directory
+        while cur not in stop_roots and cur.parent != cur:
+            if cur.is_dir() and not cur.is_symlink():
+                try:
+                    cur.rmdir()
+                except OSError:
+                    break
+            cur = cur.parent
+
+
 def _uninstall_legacy_copilot_files(
     repo_dir: Path,
     home: Path,
@@ -2329,50 +2355,34 @@ def _uninstall_legacy_copilot_files(
 ) -> None:
     """Remove any remaining Craftsman-generated Copilot files discovered via `COPILOT_DISCOVERY`."""
     valid_names = craftsman_entity_names(repo_dir)
-    stop_roots = _stop_roots_for(home, *( [workspace] if workspace is not None else [] ))
+    stop_roots = _stop_roots_for(home, *([workspace] if workspace is not None else []))
     target_scopes = ("workspace",) if workspace is not None else ("user", "profile")
     seen_dirs: set[Path] = set()
-    for kind in ("agent", "skill", "prompt"):
-        for loc in COPILOT_DISCOVERY[("vscode", kind)]:
-            if loc.scope not in target_scopes:
+    locs = [
+        loc
+        for kind in ("agent", "skill", "prompt")
+        for loc in COPILOT_DISCOVERY[("vscode", kind)]
+        if loc.scope in target_scopes
+    ]
+    for loc in locs:
+        for directory in resolve_discovery_dirs(
+            loc, home=home, workspace=workspace, include_all_profiles=True
+        ):
+            if not directory.is_dir():
                 continue
-            for directory in resolve_discovery_dirs(
-                loc, home=home, workspace=workspace, include_all_profiles=True
+            seen_dirs.add(directory)
+            matches = [p for n, p in iter_discovered_files(directory, loc.pattern) if n in valid_names]
+            for rem in _remove_generated_copilot_matches(
+                matches, valid_names, remove_parent=(loc.pattern == "*/SKILL.md"), stop_roots=stop_roots, dry_run=tracker.dry_run, label="removed"
             ):
-                if not directory.is_dir():
-                    continue
-                seen_dirs.add(directory)
-                for name, file_path in list(iter_discovered_files(directory, loc.pattern)):
-                    if name not in valid_names or not is_craftsman_generated_file(
-                        file_path, valid_names
-                    ):
-                        continue
-                    target_to_remove = (
-                        file_path.parent if loc.pattern == "*/SKILL.md" else file_path
-                    )
-                    if _remove_path_if_exists(
-                        target_to_remove, dry_run=tracker.dry_run, stop_roots=stop_roots
-                    ):
-                        tracker.record_removed(target_to_remove)
-                        print(f"  - removed: {target_to_remove}")
+                tracker.record_removed(rem)
     if workspace is None:
-        for prompts_dir in vscode_prompt_dirs(default_vscode_prompts_dir(home)):
-            instr = prompts_dir / "craftsman-rules.instructions.md"
-            if instr.is_file() and is_craftsman_generated_file(instr, valid_names):
-                seen_dirs.add(prompts_dir)
-                if _remove_path_if_exists(instr, dry_run=tracker.dry_run, stop_roots=stop_roots):
-                    tracker.record_removed(instr)
-                    print(f"  - removed: {instr}")
+        instrs = [d / "craftsman-rules.instructions.md" for d in vscode_prompt_dirs(default_vscode_prompts_dir(home)) if (d / "craftsman-rules.instructions.md").is_file()]
+        seen_dirs.update(p.parent for p in instrs)
+        for rem in _remove_generated_copilot_matches(instrs, valid_names, stop_roots=stop_roots, dry_run=tracker.dry_run, label="removed"):
+            tracker.record_removed(rem)
     if not tracker.dry_run:
-        for d in sorted(seen_dirs, key=lambda p: len(p.parts), reverse=True):
-            cur = d
-            while cur not in stop_roots and cur.parent != cur:
-                if cur.is_dir() and not cur.is_symlink():
-                    try:
-                        cur.rmdir()
-                    except OSError:
-                        break
-                cur = cur.parent
+        _prune_empty_dirs(seen_dirs, stop_roots)
 
 
 def run_uninstall(config: UninstallConfig, home: Path | None = None) -> UninstallTracker:

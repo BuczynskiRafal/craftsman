@@ -15,7 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -267,7 +267,7 @@ def _strip_glob_prefix(raw: str) -> str:
 
 
 def evaluate_scope(
-    tool_name: str, tool_input: dict[str, Any], cwd: Path, repo_root: Path, policy: ScopePolicy
+    tool_name: str, tool_input: Mapping[str, Any], cwd: Path, repo_root: Path, policy: ScopePolicy
 ) -> ScopeDecision:
     if policy.mode == "off":
         return ScopeDecision("allow")

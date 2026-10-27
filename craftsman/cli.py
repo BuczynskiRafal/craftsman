@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -175,6 +176,15 @@ def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> 
     return drifted
 
 
+def _check_craftsman_scope_sync(skill_dir: Path, body: str) -> str | None:
+    scope_path = skill_dir / "scope.md"
+    if not scope_path.is_file():
+        return "craftsman: missing companion scope.md"
+    if scope_path.read_text(encoding="utf-8").strip() not in body:
+        return "craftsman: SKILL.md 'Search scope' section is out of sync with scope.md"
+    return None
+
+
 def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
     """Validate all SKILL.md files under repo_dir/skills for frontmatter integrity."""
     skills_dir = repo_dir / "skills"
@@ -190,35 +200,21 @@ def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
         except OSError as exc:
             errors.append(f"{folder_name}: unreadable SKILL.md ({exc})")
             continue
-
         match = FRONTMATTER_RE.match(content)
         if not match:
             errors.append(f"{folder_name}: missing YAML frontmatter block")
             continue
-
-        fm_raw, body = match.group(1), match.group(2).strip()
-        fm_lines = fm_raw.splitlines()
-        has_name = any(line.startswith("name:") for line in fm_lines)
-        has_desc = any(line.startswith("description:") for line in fm_lines)
-        if not has_name:
+        fm_lines, body = match.group(1).splitlines(), match.group(2).strip()
+        if not any(line.startswith("name:") for line in fm_lines):
             errors.append(f"{folder_name}: frontmatter missing 'name:' field")
-        if not has_desc:
+        if not any(line.startswith("description:") for line in fm_lines):
             errors.append(f"{folder_name}: frontmatter missing 'description:' field")
         if len(body) < 100:
-            errors.append(
-                f"{folder_name}: SKILL.md body is unexpectedly short ({len(body)} chars)"
-            )
+            errors.append(f"{folder_name}: SKILL.md body is unexpectedly short ({len(body)} chars)")
         if folder_name == "craftsman":
-            scope_path = skill_path.parent / "scope.md"
-            if not scope_path.is_file():
-                errors.append("craftsman: missing companion scope.md")
-            else:
-                scope_body = scope_path.read_text(encoding="utf-8").strip()
-                if scope_body not in body:
-                    errors.append(
-                        "craftsman: SKILL.md 'Search scope' section is out of sync with scope.md"
-                    )
-
+            sync_err = _check_craftsman_scope_sync(skill_path.parent, body)
+            if sync_err:
+                errors.append(sync_err)
     return len(skill_files), errors
 
 
@@ -389,50 +385,84 @@ def _self_check() -> dict[str, bool]:
     return results
 
 
+@dataclass(frozen=True)
+class CopilotDuplicate:
+    client: CopilotClient
+    kind: str
+    name: str
+    paths: tuple[str, ...]
+    canonical_path: str
+    removable_paths: tuple[str, ...]
+    preserved_paths: tuple[str, ...]
+    claude_collision: bool = False
+    claude_scope: str | None = None
+    scope_collision: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "client": self.client,
+            "kind": self.kind,
+            "name": self.name,
+            "paths": list(self.paths),
+            "canonical_path": self.canonical_path,
+            "removable_paths": list(self.removable_paths),
+            "preserved_paths": list(self.preserved_paths),
+            "claude_collision": self.claude_collision,
+            "claude_scope": self.claude_scope,
+            "scope_collision": self.scope_collision,
+        }
+
+    to_json = to_dict
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_dict().get(key, default)
+
+
 def _loads_jsonc_dict(raw: str) -> dict[str, Any] | None:
     """Parse a VS Code JSONC file (stripping `//`, `/* */` comments and trailing commas)."""
     out: list[str] = []
-    in_str = False
-    escaped = False
-    i = 0
-    n = len(raw)
+    in_str = escaped = False
+    i, n = 0, len(raw)
     while i < n:
         ch = raw[i]
         if in_str:
             out.append(ch)
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
+            escaped = (not escaped) and ch == "\\"
+            if ch == '"' and not (len(out) >= 2 and out[-2] == "\\" and not escaped):
                 in_str = False
             i += 1
-            continue
-        if ch == '"':
+        elif ch == '"':
             in_str = True
             out.append(ch)
             i += 1
-            continue
-        if raw[i : i + 2] == "//":
+        elif raw[i : i + 2] == "//":
             nl = raw.find("\n", i + 2)
-            if nl == -1:
-                break
-            i = nl
-            continue
-        if raw[i : i + 2] == "/*":
+            i = n if nl == -1 else nl
+        elif raw[i : i + 2] == "/*":
             end = raw.find("*/", i + 2)
-            if end == -1:
-                break
-            i = end + 2
-            continue
-        out.append(ch)
-        i += 1
-    cleaned = re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+            i = n if end == -1 else end + 2
+        else:
+            out.append(ch)
+            i += 1
     try:
-        data = json.loads(cleaned)
+        data = json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _claude_location_candidates(loc: CopilotDiscoveryLocation, home: Path | None) -> set[str]:
+    if loc.scope == "claude-user":
+        leaf = "agents" if loc.rel_path.endswith("agents") else "skills"
+        return {
+            f"~/.claude/{leaf}",
+            f".claude/{leaf}",
+            str(default_claude_dir(home) / leaf).replace("\\", "/"),
+        }
+    return {loc.rel_path, f"./{loc.rel_path}"}
 
 
 def _is_vscode_location_disabled(
@@ -449,34 +479,78 @@ def _is_vscode_location_disabled(
     settings_files = [default_vscode_prompts_dir(home).parent / "settings.json"]
     if profile is not None:
         settings_files.append(profile / "settings.json")
-    candidates: set[str]
-    if loc.scope == "claude-user":
-        leaf = "agents" if loc.rel_path.endswith("agents") else "skills"
-        candidates = {
-            f"~/.claude/{leaf}",
-            f".claude/{leaf}",
-            str(default_claude_dir(home) / leaf).replace("\\", "/"),
-        }
-    else:
-        candidates = {loc.rel_path, f"./{loc.rel_path}"}
+    candidates = _claude_location_candidates(loc, home)
     for settings_path in settings_files:
-        if not settings_path.is_file():
-            continue
         try:
-            raw_text = settings_path.read_text(encoding="utf-8")
+            data = _loads_jsonc_dict(settings_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             continue
-        data = _loads_jsonc_dict(raw_text)
-        if not isinstance(data, dict):
+        loc_map = data.get(setting_key) if isinstance(data, dict) else None
+        if not isinstance(loc_map, dict):
             continue
-        loc_map = data.get(setting_key)
-        if isinstance(loc_map, dict):
-            for k, v in loc_map.items():
-                if v is False and isinstance(k, str):
-                    norm_k = k.replace("\\", "/")
-                    if norm_k in candidates or norm_k.removeprefix("./") in candidates:
-                        return True
+        for key, val in loc_map.items():
+            if val is False and isinstance(key, str):
+                norm = key.replace("\\", "/")
+                if norm in candidates or norm.removeprefix("./") in candidates:
+                    return True
     return False
+
+
+def _collect_profile_matches(
+    client: CopilotClient,
+    locations: tuple[CopilotDiscoveryLocation, ...],
+    valid_names: set[str],
+    *,
+    home: Path | None,
+    workspace: Path | None,
+    profile: Path | None,
+) -> dict[str, list[tuple[CopilotDiscoveryLocation, Path]]]:
+    found: dict[str, list[tuple[CopilotDiscoveryLocation, Path]]] = {}
+    for loc in locations:
+        if client == "vscode" and _is_vscode_location_disabled(loc, home, profile):
+            continue
+        for directory in resolve_discovery_dirs(loc, home=home, workspace=workspace, profile=profile):
+            for entity_name, file_path in iter_discovered_files(directory, loc.pattern):
+                if entity_name in valid_names:
+                    found.setdefault(entity_name, []).append((loc, file_path))
+    return found
+
+
+def _build_copilot_duplicate(
+    client: CopilotClient,
+    kind: str,
+    entity_name: str,
+    entries: list[tuple[CopilotDiscoveryLocation, Path]],
+    valid_all: frozenset[str],
+) -> CopilotDuplicate:
+    def _is_removable(loc: CopilotDiscoveryLocation, p: Path) -> bool:
+        return (
+            not loc.canonical
+            and loc.scope not in ("claude-user", "claude-workspace")
+            and is_craftsman_generated_file(p, valid_all)
+        )
+
+    canonical_scopes = {loc.scope for loc, _ in entries if loc.canonical}
+    canonical_entry = next(
+        ((loc, p) for loc, p in entries if loc.canonical),
+        next(((loc, p) for loc, p in entries if not _is_removable(loc, p)), entries[0]),
+    )
+    canonical_path = canonical_entry[1]
+    removable = [str(p) for loc, p in entries if p != canonical_path and _is_removable(loc, p)]
+    preserved = [str(p) for loc, p in entries if p != canonical_path and not _is_removable(loc, p)]
+    claude_scopes = [loc.scope for loc, _ in entries if loc.scope in ("claude-user", "claude-workspace")]
+    return CopilotDuplicate(
+        client=client,
+        kind=kind,
+        name=entity_name,
+        paths=tuple(str(p) for _, p in entries),
+        canonical_path=str(canonical_path),
+        removable_paths=tuple(removable),
+        preserved_paths=tuple(preserved),
+        claude_collision=bool(claude_scopes),
+        claude_scope=claude_scopes[-1] if claude_scopes else None,
+        scope_collision=len(canonical_scopes) > 1,
+    )
 
 
 def scan_copilot_duplicates(
@@ -484,148 +558,76 @@ def scan_copilot_duplicates(
     *,
     home: Path | None = None,
     workspace: Path | None = None,
-) -> list[dict[str, Any]]:
+) -> list[CopilotDuplicate]:
     """Scan `COPILOT_DISCOVERY` locations and return Craftsman entities discoverable >1 time."""
     valid_agents = set(craftsman_agent_names(repo_dir))
     valid_skills = set(craftsman_skill_names(repo_dir))
     valid_all = craftsman_entity_names(repo_dir)
-
     profiles: list[Path | None] = [None]
     profiles_root = default_vscode_prompts_dir(home).parent / "profiles"
     if profiles_root.is_dir():
         profiles.extend(p for p in sorted(profiles_root.iterdir()) if p.is_dir())
 
-    duplicates_by_key: dict[
-        tuple[CopilotClient, str, str], list[tuple[CopilotDiscoveryLocation, Path]]
-    ] = {}
-
-    clients: tuple[CopilotClient, ...] = ("vscode", "copilot-cli")
-    for client in clients:
-        client_profiles: list[Path | None] = profiles if client == "vscode" else [None]
-        groups: tuple[tuple[str, tuple[CopilotDiscoveryLocation, ...], set[str]], ...] = (
+    by_key: dict[tuple[CopilotClient, str, str], list[tuple[CopilotDiscoveryLocation, Path]]] = {}
+    for client in ("vscode", "copilot-cli"):
+        client_profiles = profiles if client == "vscode" else [None]
+        skill_locs = (*COPILOT_DISCOVERY[(client, "skill")], *COPILOT_DISCOVERY[(client, "prompt")])
+        for kind, locs, names in (
             ("agent", COPILOT_DISCOVERY[(client, "agent")], valid_agents),
-            (
-                "skill",
-                (
-                    *COPILOT_DISCOVERY[(client, "skill")],
-                    *COPILOT_DISCOVERY[(client, "prompt")],
-                ),
-                valid_skills,
-            ),
-        )
-        for kind, locations, valid_names in groups:
+            ("skill", skill_locs, valid_skills),
+        ):
             for prof in client_profiles:
-                found_in_profile: dict[str, list[tuple[CopilotDiscoveryLocation, Path]]] = {}
-                for loc in locations:
-                    if client == "vscode" and _is_vscode_location_disabled(loc, home, prof):
-                        continue
-                    for directory in resolve_discovery_dirs(
-                        loc, home=home, workspace=workspace, profile=prof
-                    ):
-                        for entity_name, file_path in iter_discovered_files(
-                            directory, loc.pattern
-                        ):
-                            if entity_name in valid_names:
-                                found_in_profile.setdefault(entity_name, []).append(
-                                    (loc, file_path)
-                                )
-                for entity_name, matches in found_in_profile.items():
-                    if len(matches) <= 1:
-                        continue
-                    key = (client, kind, entity_name)
-                    existing = duplicates_by_key.setdefault(key, [])
-                    seen_paths = {p for _, p in existing}
-                    for loc, file_path in matches:
-                        if file_path not in seen_paths:
-                            existing.append((loc, file_path))
-                            seen_paths.add(file_path)
+                matches_map = _collect_profile_matches(
+                    client, locs, names, home=home, workspace=workspace, profile=prof
+                )
+                for entity_name, matches in matches_map.items():
+                    if len(matches) > 1:
+                        existing = by_key.setdefault((client, kind, entity_name), [])
+                        seen = {p for _, p in existing}
+                        existing.extend((loc, p) for loc, p in matches if p not in seen and not seen.add(p))  # type: ignore[func-returns-value]
 
-    results: list[dict[str, Any]] = []
-    for (client, kind, entity_name), entries in sorted(
-        duplicates_by_key.items(), key=lambda item: item[0]
-    ):
-        def _is_removable(loc: CopilotDiscoveryLocation, p: Path) -> bool:
-            return (
-                not loc.canonical
-                and loc.scope not in ("claude-user", "claude-workspace")
-                and is_craftsman_generated_file(p, valid_all)
-            )
-
-        canonical_scopes = {loc.scope for loc, _ in entries if loc.canonical}
-        has_scope_collision = len(canonical_scopes) > 1
-        canonical_entry = next(
-            ((loc, p) for loc, p in entries if loc.canonical),
-            next(
-                ((loc, p) for loc, p in entries if not _is_removable(loc, p)),
-                entries[0],
-            ),
-        )
-        canonical_path = canonical_entry[1]
-        removable_paths: list[str] = []
-        preserved_paths: list[str] = []
-        has_claude_scope = False
-        claude_loc_scope: str | None = None
-        for loc, file_path in entries:
-            if loc.scope in ("claude-user", "claude-workspace"):
-                has_claude_scope = True
-                claude_loc_scope = loc.scope
-            if file_path == canonical_path:
-                continue
-            if _is_removable(loc, file_path):
-                removable_paths.append(str(file_path))
-            else:
-                preserved_paths.append(str(file_path))
-        results.append(
-            {
-                "client": client,
-                "kind": kind,
-                "name": entity_name,
-                "paths": [str(p) for _, p in entries],
-                "canonical_path": str(canonical_path),
-                "removable_paths": removable_paths,
-                "preserved_paths": preserved_paths,
-                "claude_collision": has_claude_scope,
-                "claude_scope": claude_loc_scope,
-                "scope_collision": has_scope_collision,
-            }
-        )
-    return results
+    return [
+        _build_copilot_duplicate(client, kind, name, entries, valid_all)
+        for (client, kind, name), entries in sorted(by_key.items(), key=lambda item: item[0])
+    ]
 
 
-def _format_duplicate_problem(dup: dict[str, Any]) -> str:
-    client = dup["client"]
-    kind = dup["kind"]
-    name = dup["name"]
-    paths_str = ", ".join(dup["paths"])
-    if dup.get("claude_collision"):
-        setting_name = (
-            "chat.agentFilesLocations" if kind == "agent" else "chat.agentSkillsLocations"
-        )
-        leaf = "agents" if kind == "agent" else "skills"
-        loc_key = (
-            f"~/.claude/{leaf}" if dup.get("claude_scope") == "claude-user" else f".claude/{leaf}"
-        )
+def _format_duplicate_problem(dup: CopilotDuplicate) -> str:
+    paths_str = ", ".join(dup.paths)
+    prefix = f"Duplicate Copilot {dup.kind} '{dup.name}' in {dup.client}: {paths_str}"
+    if dup.claude_collision:
+        setting = "chat.agentFilesLocations" if dup.kind == "agent" else "chat.agentSkillsLocations"
+        leaf = "agents" if dup.kind == "agent" else "skills"
+        loc_key = f"~/.claude/{leaf}" if dup.claude_scope == "claude-user" else f".claude/{leaf}"
         return (
-            f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
-            f'(VS Code also reads Claude Code directories; set "{setting_name}": {{"{loc_key}": false}} '
+            f"{prefix} "
+            f'(VS Code also reads Claude Code directories; set "{setting}": {{"{loc_key}": false}} '
             "in VS Code settings.json to disable)"
         )
-    if dup.get("scope_collision") and not dup["removable_paths"]:
+    if dup.scope_collision and not dup.removable_paths:
         return (
-            f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
+            f"{prefix} "
             "(both user and workspace scopes are installed; uninstall one scope with "
             "`craftsman uninstall --copilot` or `craftsman uninstall --copilot-workspace <dir>`)"
         )
-    if dup["preserved_paths"]:
-        preserved_str = ", ".join(dup["preserved_paths"])
-        return (
-            f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
-            f"(unmarked user file preserved: {preserved_str}; rename or remove one copy manually)"
-        )
-    return (
-        f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
-        "(run `craftsman doctor --fix-duplicates` to remove obsolete Craftsman copies)"
-    )
+    if dup.preserved_paths:
+        preserved_str = ", ".join(dup.preserved_paths)
+        return f"{prefix} (unmarked user file preserved: {preserved_str}; rename or remove one copy manually)"
+    return f"{prefix} (run `craftsman doctor --fix-duplicates` to remove obsolete Craftsman copies)"
+
+
+def _unlink_duplicate_file(path: Path) -> None:
+    if path.name == "SKILL.md":
+        skill_dir = path.parent
+        path.unlink()
+        for companion in ("lenses.md", "scope.md"):
+            comp_path = skill_dir / companion
+            if comp_path.is_file():
+                comp_path.unlink()
+        with contextlib.suppress(OSError):
+            skill_dir.rmdir()
+    else:
+        path.unlink()
 
 
 def fix_copilot_duplicates(
@@ -643,12 +645,12 @@ def fix_copilot_duplicates(
     seen_preserved: set[Path] = set()
 
     for dup in duplicates:
-        for p_str in dup["preserved_paths"]:
+        for p_str in dup.preserved_paths:
             p = Path(p_str)
             if p not in seen_preserved:
                 preserved.append(p)
                 seen_preserved.add(p)
-        for p_str in dup["removable_paths"]:
+        for p_str in dup.removable_paths:
             p = Path(p_str)
             if p in seen_removed or not p.is_file():
                 continue
@@ -657,17 +659,7 @@ def fix_copilot_duplicates(
                     preserved.append(p)
                     seen_preserved.add(p)
                 continue
-            if p.name == "SKILL.md":
-                skill_dir = p.parent
-                p.unlink()
-                for companion in ("lenses.md", "scope.md"):
-                    comp_path = skill_dir / companion
-                    if comp_path.is_file():
-                        comp_path.unlink()
-                with contextlib.suppress(OSError):
-                    skill_dir.rmdir()
-            else:
-                p.unlink()
+            _unlink_duplicate_file(p)
             removed.append(p)
             seen_removed.add(p)
     return removed, preserved
@@ -699,7 +691,7 @@ def inspect_platforms(
                 ),
             },
             "skills": skills,
-            "duplicates": duplicates,
+            "duplicates": [d.to_dict() for d in duplicates],
         },
         "claude": {
             "agents": _agents_installed(claude_dir / "agents", CLAUDE_AGENT_NAMES, ".md"),
@@ -1051,7 +1043,7 @@ def _validate_skill_relative_file(skill_dir: Path, rel_file: str, skill_name: st
     return resolved
 
 
-def skill_main(argv: list[str] | None = None) -> int:
+def _build_skill_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
         "--repo-dir",
@@ -1064,7 +1056,6 @@ def skill_main(argv: list[str] | None = None) -> int:
         description="Read bundled Craftsman skills and companion files without searching the disk.",
     )
     sub = parser.add_subparsers(dest="subcommand", required=True)
-
     show_p = sub.add_parser(
         "show",
         parents=[common],
@@ -1072,54 +1063,49 @@ def skill_main(argv: list[str] | None = None) -> int:
     )
     show_p.add_argument("name", help="Skill name (e.g. craftsman, code-review, simplify)")
     show_p.add_argument(
-        "--file",
-        dest="rel_file",
-        help="Relative file inside the skill directory (e.g. lenses.md)",
+        "--file", dest="rel_file", help="Relative file inside the skill directory (e.g. lenses.md)"
     )
-
     list_p = sub.add_parser(
         "list",
         parents=[common],
         help="List bundled skill names and their one-sentence descriptions.",
     )
     list_p.add_argument("--json", action="store_true", help="Output skill list as JSON.")
-
     path_p = sub.add_parser(
-        "path",
-        parents=[common],
-        help="Print the resolved directory path of a bundled skill.",
+        "path", parents=[common], help="Print the resolved directory path of a bundled skill."
     )
     path_p.add_argument("name", help="Skill name (e.g. craftsman, code-review)")
+    return parser
 
+
+def _list_skills(known: dict[str, Path], *, as_json: bool) -> int:
+    entries: list[dict[str, str]] = []
+    seen_dirs: set[Path] = set()
+    for folder_name, skill_dir in known.items():
+        if skill_dir in seen_dirs:
+            continue
+        seen_dirs.add(skill_dir)
+        raw = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        name = extract_skill_name(raw, folder_name)
+        desc, _ = extract_description_and_body(raw, name)
+        first_sentence = desc.split(". ", 1)[0].rstrip(".") + "." if desc else ""
+        entries.append({"name": folder_name, "description": first_sentence, "path": str(skill_dir)})
+    if as_json:
+        sys.stdout.write(json.dumps(entries, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    width = max((len(e["name"]) for e in entries), default=12)
+    for entry in entries:
+        print(f"{entry['name']:<{width}}  {entry['description']}")
+    return 0
+
+
+def skill_main(argv: list[str] | None = None) -> int:
+    parser = _build_skill_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
-    repo_dir = Path(args.repo_dir).resolve()
-    known = _discover_skill_dirs(repo_dir)
+    known = _discover_skill_dirs(Path(args.repo_dir).resolve())
 
     if args.subcommand == "list":
-        entries: list[dict[str, str]] = []
-        seen_dirs: set[Path] = set()
-        for folder_name, skill_dir in known.items():
-            if skill_dir in seen_dirs:
-                continue
-            seen_dirs.add(skill_dir)
-            raw = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
-            name = extract_skill_name(raw, folder_name)
-            desc, _ = extract_description_and_body(raw, name)
-            first_sentence = desc.split(". ", 1)[0].rstrip(".") + "." if desc else ""
-            entries.append(
-                {
-                    "name": folder_name,
-                    "description": first_sentence,
-                    "path": str(skill_dir),
-                }
-            )
-        if args.json:
-            sys.stdout.write(json.dumps(entries, indent=2, ensure_ascii=False) + "\n")
-            return 0
-        width = max((len(e["name"]) for e in entries), default=12)
-        for entry in entries:
-            print(f"{entry['name']:<{width}}  {entry['description']}")
-        return 0
+        return _list_skills(known, as_json=bool(args.json))
 
     skill_name: str = args.name
     if skill_name not in known:
@@ -1134,11 +1120,10 @@ def skill_main(argv: list[str] | None = None) -> int:
         print(str(skill_dir))
         return 0
 
-    rel_file: str | None = args.rel_file
     try:
         target = (
-            _validate_skill_relative_file(skill_dir, rel_file, skill_name)
-            if rel_file is not None
+            _validate_skill_relative_file(skill_dir, args.rel_file, skill_name)
+            if args.rel_file is not None
             else (skill_dir / "SKILL.md").resolve()
         )
     except (ValueError, FileNotFoundError) as exc:
