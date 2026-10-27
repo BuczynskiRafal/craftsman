@@ -6,7 +6,7 @@
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
 [![mypy --strict](https://img.shields.io/badge/mypy-strict-blue.svg)](pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](pyproject.toml)
-[![Version](https://img.shields.io/badge/version-3.1.0-emerald.svg)](plugin.json)
+[![Version](https://img.shields.io/badge/version-3.2.0-emerald.svg)](plugin.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Craftsman is a quality loop for AI coding agents. After implementing a change, the agent simplifies
@@ -117,6 +117,19 @@ Every record is tied to a diff fingerprint, so a code change invalidates the evi
 round reviews the changed hunks and any hunks that reference a changed symbol. Tests must be run
 again. Generated files (`__pycache__`, build caches, `node_modules`, …) are skipped, and custom
 patterns go in `.craftsmanignore`.
+
+### What the gate checks and what it does not
+
+The gate enforces **review and verification evidence** plus **mechanical code-quality signals**:
+every hunk and changed file is covered with a concrete note (naming inputs, callers, or `file:line`
+guards rather than generic praise), every mechanical signal (`long-function`, `large-module`,
+`diff-size`, `test-name`, `duplicate-logic`, `dict-domain`) is either resolved or explicitly
+acknowledged with a code reason shown in the report, oversized changes (`> 800` added production
+lines) are handed to the user as `needs_human`, and reviews without platform or transcript isolation
+evidence are flagged as `SELF-REVIEWED` (or `needs_human` in `deep` mode). The gate **does not**
+assess business-requirement fit, naming quality beyond the mechanical test-name rules, or
+architecture outside the files touched by the diff — those remain the responsibility of the human
+reviewer and are listed explicitly under `Not assessed by the gate` in every report.
 
 ### Lenses
 

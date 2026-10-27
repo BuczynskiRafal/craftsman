@@ -1070,12 +1070,8 @@ def has_workspace_copilot_install(
     return _has_copilot_install(("workspace",), workspace=workspace_dir, repo_dir=repo_dir)
 
 
-def render_agents_md(repo_dir: Path) -> str:
-    """Render a universal AGENTS.md block for OpenAI Codex, Cursor, Windsurf, and GitHub Copilot."""
-    rules_dir = repo_dir / "rules"
-    skills_dir = repo_dir / "skills"
-
-    lines: list[str] = [
+def _agents_md_loop_lines() -> list[str]:
+    return [
         "# AGENTS.md — Craftsman Adaptive Closed-Loop Engineering Standard",
         "",
         "This repository uses **Craftsman**: every change is reviewed and verified against an evidence "
@@ -1114,15 +1110,19 @@ def render_agents_md(repo_dir: Path) -> str:
         "",
         "## Available Skills",
     ]
+
+
+def render_agents_md(repo_dir: Path) -> str:
+    """Render a universal AGENTS.md block for OpenAI Codex, Cursor, Windsurf, and GitHub Copilot."""
+    rules_dir = repo_dir / "rules"
+    skills_dir = repo_dir / "skills"
+    lines = _agents_md_loop_lines()
     for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
         raw_md = skill_path.read_text(encoding="utf-8")
         skill_name = extract_skill_name(raw_md, skill_path.parent.name)
         desc, _ = extract_description_and_body(raw_md, skill_name)
         lines.append(f"- **`/{skill_name}`**: {desc}")
-
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    lines += ["", "---", ""]
     lines.append(
         _rewrite_antigravity_paths(render_combined_rules(rules_dir, with_frontmatter=False).strip())
     )

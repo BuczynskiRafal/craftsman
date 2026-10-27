@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -412,7 +412,7 @@ def gate_policy(state: dict[str, Any], tier: Tier) -> GatePolicy:
 
 
 def sync_antigravity_subagent_events(
-    state: MutableMapping[str, Any], entries: list[dict[str, Any]], cwd: str | None
+    state: MutableMapping[str, Any], entries: Sequence[Mapping[str, Any]], cwd: str | None
 ) -> bool:
     """Sync Antigravity subagent reviewer completions from the session transcript into the ledger.
 
@@ -1368,7 +1368,7 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     if report is not None and (
         any(issue.code == "round-cap" for issue in report.issues)
-        or (evaluation is not None and has_unresolved_diff_size(evaluation.ledger))
+        or (evaluation is not None and has_unresolved_diff_size(evaluation.ledger, evaluation.snap))
     ):
         state["stage"] = "needs_human"
         _try_save_state(state_file, state)
@@ -1618,7 +1618,7 @@ def run_cli(argv: list[str]) -> int:
                 f"[CRAFTSMAN GATE] Cannot complete: cannot evaluate the evidence ledger: {exc}\n"
             )
             return 1
-        if has_unresolved_diff_size(evaluation.ledger):
+        if has_unresolved_diff_size(evaluation.ledger, evaluation.snap):
             state["stage"] = "needs_human"
             save_state_atomic(state_file, state)
             sys.stderr.write(
@@ -1647,7 +1647,7 @@ def mark_completed(state: dict[str, Any], completed_at_step: int) -> None:
 
 
 def complete_gate_for_report(
-    state: dict[str, Any], completed_at_step: int, tier: Tier, report: GateReport
+    state: MutableMapping[str, Any], completed_at_step: int, tier: Tier, report: GateReport
 ) -> None:
     """Transition `state` when the gate passes, accounting for self-reviewed `standard`/`deep` runs."""
     if report.self_reviewed and tier == "deep":

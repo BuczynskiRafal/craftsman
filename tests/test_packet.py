@@ -305,7 +305,7 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(text.count("Enclosing scope (L1–L10):"), 1)
         self.assertIn("Scope: `compute` — shown at H1", text)
 
-    def test_long_scope_is_rendered_as_signature_and_context_around_hunk(self) -> None:
+    def test_long_scope_renders_signature_with_context_around_hunk(self) -> None:
         body_lines = ["def long_fn(x: int) -> int:"] + [f"    line_{i} = {i}" for i in range(2, 82)]
         scope = Scope("pkg/a.py", "long_fn", "function", 1, 81, "\n".join(body_lines))
         hunk = Hunk(
@@ -336,7 +336,7 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("line_10 = 10", text)
         self.assertNotIn("line_75 = 75", text)
 
-    def test_view_renders_assigned_hunks_in_full_and_others_as_one_line(self) -> None:
+    def test_view_renders_assigned_hunks_in_full_with_one_line_index(self) -> None:
         h1 = Hunk("H1", "pkg/a.py", None, "modified", 2, 1, 2, 1, "", ("-a = 1", "+a = 2"), "d1")
         h2 = Hunk("H2", "pkg/b.py", None, "modified", 8, 1, 8, 1, "", ("-b = 1", "+b = 2"), "d2")
         snap = DiffSnapshot("b" * 40, "f" * 64, (h1, h2), ("pkg/a.py", "pkg/b.py"), (), 2, 2)

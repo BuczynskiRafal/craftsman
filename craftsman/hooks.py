@@ -63,6 +63,7 @@ from craftsman.ledger import (
     SWEEP_LENS,
     AgentEvent,
     AgentEventKind,
+    GateReport,
     Ledger,
     LedgerError,
     add_agent_event,
@@ -415,17 +416,10 @@ def task_from_prompt(prompt: str) -> str:
 # --- stop -----------------------------------------------------------------------------------
 
 
-def on_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
-    state = session.state
-    if state is None or not session.active or state.get("awaiting_user"):
-        return reply.allow()
-    try:
-        evaluation = evaluate_task(state, str(session.root))
-        report, error = evaluation.report, None
-    except (DiffScanError, LedgerError) as exc:
-        evaluation, report, error = None, None, str(exc)
-
-    if evaluation is not None and has_unresolved_diff_size(evaluation.ledger):
+def _handle_stop_completion(
+    session: Session, state: dict[str, Any], evaluation: Any, report: GateReport | None, reply: Reply
+) -> Output | None:
+    if evaluation is not None and has_unresolved_diff_size(evaluation.ledger, evaluation.snap):
         state["stage"] = "needs_human"
         session.save()
         return notice(
@@ -446,9 +440,23 @@ def on_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
         complete_gate_for_report(state, _safe_int(state.get("started_at_step"), 0), eff_tier, report)
         session.save()
         return reply.allow()
+    return None
 
-    # Progress means fewer open issues than ever before in this streak; an issue count that
-    # merely oscillates must not keep the agent looping.
+
+def on_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
+    state = session.state
+    if state is None or not session.active or state.get("awaiting_user"):
+        return reply.allow()
+    try:
+        evaluation = evaluate_task(state, str(session.root))
+        report, error = evaluation.report, None
+    except (DiffScanError, LedgerError) as exc:
+        evaluation, report, error = None, None, str(exc)
+
+    completed_out = _handle_stop_completion(session, state, evaluation, report, reply)
+    if completed_out is not None:
+        return completed_out
+
     issue_count = len(report.issues) if report is not None else 1
     forced = _safe_int(state.get("forced_continuations"), 0)
     best = state.get("best_issue_count")

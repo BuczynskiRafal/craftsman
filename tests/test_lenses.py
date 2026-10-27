@@ -25,7 +25,7 @@ def picked_ids(tier: Tier, signals: dict[str, tuple[str, ...]], *, docs_only: bo
 
 
 class LensCatalogTests(unittest.TestCase):
-    def test_catalog_ids_are_unique_and_triggers_are_known_signals(self) -> None:
+    def test_catalog_ids_are_unique_with_known_signal_triggers(self) -> None:
         self.assertEqual(len(LENS_IDS), len(LENSES))
         self.assertEqual(
             [lens.id for lens in LENSES],

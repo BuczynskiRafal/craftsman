@@ -148,35 +148,20 @@ def collect_context(
     index: WorktreeIndex | None = None,
     quality_signals: Sequence[QualitySignal] | None = None,
 ) -> PacketContext:
-    """Gather commits, conventions, scopes and references for the hunks under review.
-
-    Pass the `index` that computed `symbols` so work tree files are read only once.
-    """
-    if index is None:
-        index = WorktreeIndex(root)
-    if quality_signals is None:
-        quality_signals = collect_quality_signals(root, snap)
+    """Gather commits, conventions, scopes and references for the hunks under review."""
+    idx = index or WorktreeIndex(root)
+    sigs = tuple(quality_signals if quality_signals is not None else collect_quality_signals(root, snap))
     carried = {hunk.id for hunk in round_.hunks if hunk.carried}
     open_hunks = [hunk for hunk in snap.hunks if hunk.id not in carried]
     open_symbols = {hunk.id: symbols.get(hunk.id, ()) for hunk in open_hunks}
     return PacketContext(
-        root=root,
-        snap=snap,
-        round=round_,
-        picks=tuple(picks),
-        task=task.strip(),
-        commits=_commits(root, snap.base_sha),
-        conventions=_conventions(root, snap.files),
-        scopes={hunk.id: index.hunk_scope(hunk) for hunk in snap.hunks},
-        symbols=open_symbols,
-        references=_references(index, open_hunks, open_symbols),
-        signals_by_hunk=_signals_by_hunk(snap.hunks),
-        carried_from=_carried_from(ledger, round_),
-        reopened=reopened_mentions(ledger.coverage, round_, snap.hunks, symbols),
-        quality_signals=tuple(quality_signals),
-        test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
-        last_runs=_last_runs(ledger, snap),
-        facts_by_hunk=valid_facts_for_hunk(ledger, root),
+        root=root, snap=snap, round=round_, picks=tuple(picks), task=task.strip(),
+        commits=_commits(root, snap.base_sha), conventions=_conventions(root, snap.files),
+        scopes={hunk.id: idx.hunk_scope(hunk) for hunk in snap.hunks}, symbols=open_symbols,
+        references=_references(idx, open_hunks, open_symbols), signals_by_hunk=_signals_by_hunk(snap.hunks),
+        carried_from=_carried_from(ledger, round_), reopened=reopened_mentions(ledger.coverage, round_, snap.hunks, symbols),
+        quality_signals=sigs, test_files_by_symbol=_test_files_by_symbol(idx, open_symbols),
+        last_runs=_last_runs(ledger, snap), facts_by_hunk=valid_facts_for_hunk(ledger, root),
     )
 
 

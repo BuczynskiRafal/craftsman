@@ -1172,24 +1172,12 @@ def open_round(
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
 
 
-def _carry_over(
-    ledger: Ledger,
+def _reopened_hunk_ids(
     hunks: Sequence[Hunk],
-    lenses: Sequence[str],
+    previous: set[str],
+    reviewed: set[str],
     symbols_by_hunk: Mapping[str, Sequence[str]],
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Ids of the hunks of the next round that are carried over, and of those that are reopened.
-
-    A hunk is reopened when it is unchanged since the previous round and was reviewed, but
-    mentions a symbol defined by a hunk that changed since then, directly or through another
-    such hunk; only coverage recorded from then on counts for it. A hunk every lens already
-    covered is carried over unless it is reopened.
-    """
-    if not ledger.rounds:
-        return frozenset(), frozenset()
-    covered = _carryable_coverage(ledger)
-    reviewed = {digest for _, digest in covered}
-    previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
+) -> set[str]:
     mentioned_by: dict[str, list[Hunk]] = {}
     for hunk in hunks:
         if hunk.digest in previous:
@@ -1212,7 +1200,22 @@ def _carry_over(
             if hunk.id not in affected:
                 affected.add(hunk.id)
                 pending.extend(symbols_by_hunk.get(hunk.id, ()))
-    reopened = {hunk.id for hunk in hunks if hunk.id in affected and hunk.digest in reviewed}
+    return {hunk.id for hunk in hunks if hunk.id in affected and hunk.digest in reviewed}
+
+
+def _carry_over(
+    ledger: Ledger,
+    hunks: Sequence[Hunk],
+    lenses: Sequence[str],
+    symbols_by_hunk: Mapping[str, Sequence[str]],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Ids of the hunks of the next round that are carried over, and of those that are reopened."""
+    if not ledger.rounds:
+        return frozenset(), frozenset()
+    covered = _carryable_coverage(ledger)
+    reviewed = {digest for _, digest in covered}
+    previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
+    reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk)
     carried = {
         hunk.id
         for hunk in hunks
@@ -1498,14 +1501,9 @@ def add_finding(
         scenario=scenario.strip(),
         suggestion=suggestion.strip(),
         fingerprint=round_.fingerprint,
-        verdict=None,
-        verdict_evidence="",
-        verdict_run=None,
-        resolution=None,
-        resolution_note="",
-        recorded_at=now,
-        updated_at=now,
-        signal_id=signal_id,
+        verdict=None, verdict_evidence="", verdict_run=None,
+        resolution=None, resolution_note="",
+        recorded_at=now, updated_at=now, signal_id=signal_id,
     )
     return replace(ledger, findings=(*ledger.findings, finding)), finding
 
@@ -1957,23 +1955,15 @@ def evaluate(
     """Decide whether the evidence in `ledger` covers the current diff `snap`."""
     if snap.is_empty:
         summary = f"Nothing to review: the work tree matches base {snap.base_sha[:12]}."
-        return GateReport(
-            () if review_only else tuple(_unresolved_issues(ledger, snap)),
-            (),
-            summary,
-            review_only=review_only,
-        )
+        issues = () if review_only else tuple(_unresolved_issues(ledger, snap))
+        return GateReport(issues, (), summary, review_only=review_only)
     latest = ledger.rounds[-1] if ledger.rounds else None
     fix_and_test = (
         ()
         if review_only
-        else (
-            *_unresolved_issues(ledger, snap),
-            *_passing_run_issues(ledger, snap, policy),
-            *_failing_run_issues(ledger),
-        )
+        else (*_unresolved_issues(ledger, snap), *_passing_run_issues(ledger, snap, policy), *_failing_run_issues(ledger))
     )
-    issues = [
+    issues = (
         *_round_issues(ledger, snap),
         *(_tier_issues(latest, policy) if latest else ()),
         *(_coverage_issues(ledger, latest) if latest else ()),
@@ -1982,7 +1972,7 @@ def evaluate(
         *fix_and_test,
         *(_isolation_issues(ledger, latest, policy) if latest else ()),
         *_round_cap_issues(ledger, policy),
-    ]
+    )
     self_reviewed = bool(
         latest is not None
         and policy.tier != "quick"
@@ -1990,7 +1980,7 @@ def evaluate(
         and not _has_isolated_reviewer_stop(ledger, latest, policy)
     )
     return GateReport(
-        tuple(issues),
+        issues,
         _warnings(ledger, snap, policy, review_only=review_only),
         _summary(ledger, snap),
         review_only=review_only,
@@ -2024,11 +2014,14 @@ def _is_signal_resolved(
     )
 
 
-def has_unresolved_diff_size(ledger: Ledger) -> bool:
-    """Return True when the latest round recorded an unresolved `diff-size` quality signal."""
-    return bool(ledger.rounds) and any(
-        sig.kind == "diff-size" for sig in ledger.rounds[-1].signals
-    )
+def has_unresolved_diff_size(ledger: Ledger, snap: DiffSnapshot | None = None) -> bool:
+    """Return True when the latest round matches `snap` and has an unresolved `diff-size` signal."""
+    if not ledger.rounds:
+        return False
+    latest = ledger.rounds[-1]
+    if snap is not None and (snap.is_empty or latest.fingerprint != snap.fingerprint):
+        return False
+    return any(sig.kind == "diff-size" for sig in latest.signals)
 
 
 def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:

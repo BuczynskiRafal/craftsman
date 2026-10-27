@@ -29,17 +29,11 @@ MIN_DUPLICATE_STATEMENTS = 5
 # Changes adding more than 800 production lines exceed the reviewable cognitive budget for a single PR.
 MAX_PRODUCTION_ADDED_LINES = 800
 
-FORBIDDEN_TEST_NAME_RE = re.compile(
-    r"(_v\d+_\d+|_\d+_of_\d+|table_of_\d+|_[A-Za-z]\d+(?:_|$)|_and_)"
-)
-SERIALIZATION_NAMES = frozenset(
-    {"to_json", "from_json", "to_dict", "from_dict", "to_state", "from_state"}
-)
+FORBIDDEN_TEST_NAME_RE = re.compile(r"(_v\d+_\d+|_\d+_of_\d+|table_of_\d+|_[A-Za-z]\d+(?:_|$)|_and_)")
+SERIALIZATION_NAMES = frozenset({"to_json", "from_json", "to_dict", "from_dict", "to_state", "from_state"})
 SERIALIZATION_MODULES = frozenset({"serde.py", "serialization.py", "json_codec.py"})
-DICT_TYPE_RE = re.compile(r"\b(?:dict|typing\.Dict|Dict)\s*(?:\[|$)")
-_STMT_TYPES = (
-    ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.If, ast.For, ast.While, ast.Raise, ast.With
-)
+DICT_TYPE_RE = re.compile(r"\b(?:dict|typing\.Dict|Dict)(?:\s*\[\s*str\s*,\s*(?:typing\.)?(?:Any|object)\s*\]|(?!\s*\[)\b)")
+_STMT_TYPES = (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Return, ast.If, ast.For, ast.While, ast.Raise, ast.With)
 
 
 class SignalKind(str, Enum):
@@ -144,11 +138,16 @@ def _normalize_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[s
     stmts = [
         s for s in node.body
         if not (isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant) and isinstance(s.value.value, str))
+        and not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
     norm = _AstNormalizer()
     body_dump = "|".join(ast.dump(norm.visit(ast.parse(ast.unparse(s)).body[0])) for s in stmts) if len(stmts) >= 2 else ""
     flat: set[str] = set()
-    for child in ast.walk(node):
+    queue: list[ast.AST] = list(stmts)
+    while queue:
+        child = queue.pop()
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
         if isinstance(child, _STMT_TYPES):
             copy_node = ast.parse(ast.unparse(child)).body[0]
             if hasattr(copy_node, "body"):
@@ -156,6 +155,7 @@ def _normalize_function(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[s
             if hasattr(copy_node, "orelse") and copy_node.orelse:
                 copy_node.orelse = [ast.Pass()]
             flat.add(ast.dump(norm.visit(copy_node)))
+        queue.extend(ast.iter_child_nodes(child))
     return body_dump, frozenset(flat)
 
 
@@ -184,9 +184,7 @@ def _check_function_signals(fn: _ParsedFunction, out: list[tuple[SignalKind, str
                 break
 
 
-def _check_duplicate_logic(
-    functions: Sequence[_ParsedFunction], out: list[tuple[SignalKind, str, int, str]]
-) -> None:
+def _check_duplicate_logic(functions: Sequence[_ParsedFunction], out: list[tuple[SignalKind, str, int, str]]) -> None:
     for idx, fn_a in enumerate(functions):
         for fn_b in functions[idx + 1 :]:
             if not (fn_a.is_touched or fn_b.is_touched) or fn_a.name.startswith("test_") or fn_b.name.startswith("test_"):
@@ -199,12 +197,15 @@ def _check_duplicate_logic(
                 out.append((SignalKind.DUPLICATE_LOGIC, fn_b.path, fn_b.lineno, f"`{fn_b.name}` duplicates `{fn_a.name}` at `{fn_a.path}:{fn_a.lineno}` ({pct}% shared AST statements)"))
 
 
-def _parse_file_functions(
-    rel_path: str, tree: ast.AST, touched_lines: set[int], removed_src: str
-) -> list[_ParsedFunction]:
-    nodes = sorted((n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), key=lambda n: n.lineno)
+def _parse_file_functions(rel_path: str, tree: ast.AST, touched_lines: set[int], removed_src: str) -> list[_ParsedFunction]:
+    candidates: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    for item in getattr(tree, "body", ()):
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            candidates.append(item)
+        elif isinstance(item, ast.ClassDef):
+            candidates.extend(sub for sub in item.body if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)))
     result: list[_ParsedFunction] = []
-    for node in nodes:
+    for node in sorted(candidates, key=lambda n: n.lineno):
         end_lineno = node.end_lineno or node.lineno
         is_touched = any(ln in touched_lines for ln in range(node.lineno, end_lineno + 1))
         is_new = node.lineno in touched_lines and f"def {node.name}(" not in removed_src

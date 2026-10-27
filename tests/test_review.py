@@ -1124,8 +1124,8 @@ class PacketRenderingTests(unittest.TestCase):
             text = render_packet(ctx)
 
         self.assertIn("Enclosing scope omitted for size — open pkg/a.py:L1–L500", text)
-        self.assertNotIn("line 499", text)
-        self.assertIn("line 499", render_packet(ctx))
+        self.assertNotIn("line 15", text)
+        self.assertIn("line 15", render_packet(ctx))
 
 
 class ReviewSignalTests(RepoTestCase):
@@ -1264,7 +1264,7 @@ class CoverageNoteValidationTests(RepoTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("reuses the same note segment for more than 3 hunks", proc.stderr)
 
-    def test_cover_accepts_note_with_input_and_line_reference(self) -> None:
+    def test_cover_accepts_note_with_input_plus_line_reference(self) -> None:
         self.prepare_bug()
         proc = self.repo.cli(
             "review",
