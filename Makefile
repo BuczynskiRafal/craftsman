@@ -1,4 +1,4 @@
-.PHONY: check lint typecheck test doctor install clean
+.PHONY: check lint typecheck test doctor install uninstall clean
 
 PYTHON ?= python3
 
@@ -26,6 +26,9 @@ doctor:
 
 install:
 	./install.sh --all
+
+uninstall:
+	$(PYTHON) -m craftsman.cli uninstall
 
 clean:
 	rm -rf build dist *.egg-info .mypy_cache .pytest_cache .ruff_cache
