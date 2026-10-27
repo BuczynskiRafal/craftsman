@@ -42,9 +42,11 @@ from craftsman.gate import (
     TIER_RANK,
     _safe_int,
     archive_ledger_for_new_base,
+    check_and_claim_owner,
     continuation_reason,
     default_state,
     evaluate_task,
+    format_gate_owner,
     get_head_sha,
     is_craftsman_trigger_content,
     load_state,
@@ -124,6 +126,7 @@ class HookInput:
     tool_name: str
     tool_input: dict[str, Any]
     transcript_path: str
+    session_id: str = ""
 
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> HookInput:
@@ -138,6 +141,7 @@ class HookInput:
             tool_name=_text(payload, "tool_name", "toolName"),
             tool_input=_tool_input(payload),
             transcript_path=_text(payload, "transcript_path", "transcriptPath"),
+            session_id=_text(payload, "session_id", "sessionId", "conversation_id", "conversationId"),
         )
 
 
@@ -278,14 +282,27 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     reply = Reply(platform, event)
     if event == "pre-tool":
         session = open_session(hook.cwd)
-        out = on_pre_tool(hook, reply, session)
-        if session is not None:
+        is_owner = False
+        if session is not None and session.active:
+            is_owner, claimed = check_and_claim_owner(session.state, platform, hook.session_id)
+            if claimed:
+                session.save()
+        out = on_pre_tool(hook, reply, session, is_owner=is_owner)
+        if session is not None and session.active and is_owner:
             mark_hooks_seen(session, platform)
         return out
     session = open_session(hook.cwd)
     if session is None:
         return reply.allow()
-    mark_hooks_seen(session, platform)
+    if session.active:
+        is_owner, claimed = check_and_claim_owner(session.state, platform, hook.session_id)
+        if not is_owner:
+            if event == "prompt":
+                return on_non_owner_prompt(session, hook, reply)
+            return reply.allow()
+        if claimed:
+            session.save()
+        mark_hooks_seen(session, platform)
     if event == "prompt":
         return on_prompt(session, hook, reply)
     if event == "stop":
@@ -302,6 +319,21 @@ def mark_hooks_seen(session: Session, platform: Platform) -> None:
 
 
 # --- prompt ---------------------------------------------------------------------------------
+
+
+def on_non_owner_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
+    triggered, _ = is_craftsman_trigger_content(hook.prompt)
+    if not triggered:
+        return reply.allow()
+    owner_desc = format_gate_owner(session.state.get("owner") if session.state else None)
+    since = (session.state or {}).get("started_at") or "unknown time"
+    return reply.inject(
+        f"Craftsman gate in {session.root.resolve()} is already active and owned by another session "
+        f"({owner_desc}, since {since}). Your `/craftsman` prompt did not overwrite that gate. "
+        "To run an independent Craftsman session in parallel, create a separate worktree "
+        "(`git worktree add ../<branch-dir> -b <branch>`), or run "
+        "`craftsman gate --init --takeover` to take over the gate in this work tree."
+    )
 
 
 def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
@@ -325,7 +357,11 @@ def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
     root = str(session.root)
     base = get_head_sha(root)
     state = default_state(
-        mode="ultracraft" if tier == "deep" else "craftsman", tier=tier, cwd=root, base_sha=base
+        mode="ultracraft" if tier == "deep" else "craftsman",
+        tier=tier,
+        cwd=root,
+        base_sha=base,
+        owner={"platform": reply.platform, "session_id": hook.session_id},
     )
     state["task"] = task_from_prompt(hook.prompt)
     state["hooks_seen"] = reply.platform
@@ -576,7 +612,13 @@ def _stopped_since(ledger: Ledger, hook: HookInput, since: datetime) -> bool:
 # --- pre-tool -------------------------------------------------------------------------------
 
 
-def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None = None) -> Output:
+def on_pre_tool(
+    hook: HookInput,
+    reply: Reply,
+    session: Session | None = None,
+    *,
+    is_owner: bool | None = None,
+) -> Output:
     """Apply the git guard to shell commands, then repository search-scope rules when Craftsman is active."""
     if hook.tool_name.lower() in SHELL_TOOLS:
         command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
@@ -599,7 +641,15 @@ def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None = None) -
 
     if session is None:
         session = open_session(hook.cwd)
-    if session is None or (not session.active and not is_craftsman_agent(hook.agent)):
+    if session is None:
+        return reply.allow()
+    if is_owner is None:
+        is_owner = (
+            check_and_claim_owner(session.state, reply.platform, hook.session_id)[0]
+            if session.active
+            else False
+        )
+    if not (session.active and is_owner) and not is_craftsman_agent(hook.agent):
         return reply.allow()
 
     policy = load_scope_policy(Path(hook.cwd), session.root)

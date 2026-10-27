@@ -11,6 +11,24 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STOP_GATE = REPO_ROOT / "scripts" / "craftsman-stop-gate.py"
+AMBIENT_PLATFORM_ENV_VARS = frozenset(
+    {
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_SESSION_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "ANTIGRAVITY_AGENT",
+        "AGY_MANAGED_ENV",
+        "ANTIGRAVITY_CONVERSATION_ID",
+        "COPILOT_CLI",
+        "GITHUB_COPILOT_CLI",
+        "COPILOT_SESSION_ID",
+        "VSCODE_PID",
+        "VSCODE_IPC_HOOK",
+        "TERM_PROGRAM",
+        "CRAFTSMAN_SESSION_ID",
+    }
+)
 
 
 def coverage_note(hunk_ids: list[str]) -> str:
@@ -58,9 +76,21 @@ class EvidenceRepo:
         return self.write(name, "".join(f"value_{index} = {index}\n" for index in range(count)))
 
     def cli(
-        self, *args: str, check: bool = True, timeout: float = 60, stdin: str | None = None
+        self,
+        *args: str,
+        check: bool = True,
+        timeout: float = 60,
+        stdin: str | None = None,
+        env_extra: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in AMBIENT_PLATFORM_ENV_VARS
+        }
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        if env_extra:
+            env.update(env_extra)
         proc = subprocess.run(
             [sys.executable, "-m", "craftsman.cli", *args],
             cwd=self.root,
@@ -77,10 +107,23 @@ class EvidenceRepo:
             )
         return proc
 
-    def gate(self, state_file: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    def gate(
+        self,
+        state_file: Path,
+        *args: str,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in AMBIENT_PLATFORM_ENV_VARS
+        }
+        if env_extra:
+            env.update(env_extra)
         return subprocess.run(
             [sys.executable, str(STOP_GATE), "--state-file", str(state_file), *args],
             cwd=self.root,
+            env=env,
             capture_output=True,
             text=True,
             check=False,

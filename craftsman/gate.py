@@ -24,6 +24,8 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -576,6 +578,119 @@ def get_latest_step_index(entries: list[dict[str, Any]]) -> int:
     return len(entries)
 
 
+def detect_cli_platform(env: Mapping[str, str] | None = None) -> str:
+    """Infer the active agent platform from environment variables when `craftsman gate --init` runs."""
+    environ = os.environ if env is None else env
+    if environ.get("CLAUDECODE") or environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "claude"
+    if environ.get("ANTIGRAVITY_AGENT") or environ.get("AGY_MANAGED_ENV"):
+        return "antigravity"
+    if (
+        environ.get("COPILOT_CLI")
+        or environ.get("GITHUB_COPILOT_CLI")
+        or environ.get("VSCODE_PID")
+        or environ.get("VSCODE_IPC_HOOK")
+        or environ.get("TERM_PROGRAM", "").strip().lower() == "vscode"
+    ):
+        return "copilot"
+    return "cli"
+
+
+def extract_cli_session_id(platform: str, env: Mapping[str, str] | None = None) -> str:
+    """Return an explicit session ID from the environment if provided, else empty string."""
+    environ = os.environ if env is None else env
+    explicit = environ.get("CRAFTSMAN_SESSION_ID", "").strip()
+    if explicit:
+        return explicit
+    if platform == "claude":
+        return (
+            environ.get("CLAUDE_SESSION_ID") or environ.get("CLAUDE_CODE_SESSION_ID") or ""
+        ).strip()
+    if platform == "copilot":
+        return (environ.get("COPILOT_SESSION_ID") or "").strip()
+    return ""
+
+
+def format_gate_owner(owner: Any) -> str:
+    """Human-readable representation of `state['owner']`."""
+    if not isinstance(owner, dict):
+        return "unknown"
+    platform = str(owner.get("platform") or "").strip()
+    if not platform:
+        return "unknown"
+    session_id = str(owner.get("session_id") or "").strip()
+    if session_id:
+        return f"{platform} (session {session_id})"
+    return platform
+
+
+def is_same_or_unclaimed_owner(
+    existing_owner: Any, platform: str, session_id: str = ""
+) -> bool:
+    """Return True if `existing_owner` is unset (v3.0.0), unclaimed `cli`, or matches `(platform, session_id)`."""
+    if not isinstance(existing_owner, dict):
+        return True
+    ex_plat = str(existing_owner.get("platform") or "").strip()
+    if not ex_plat:
+        return True
+    ex_sid = str(existing_owner.get("session_id") or "").strip()
+    in_sid = session_id.strip()
+    if ex_plat == "cli" and not ex_sid:
+        return True
+    if ex_plat != platform:
+        return False
+    if ex_sid and in_sid and ex_sid != in_sid:
+        return False
+    return True
+
+
+def check_and_claim_owner(
+    state: dict[str, Any] | None, platform: str, session_id: str
+) -> tuple[bool, bool]:
+    """Check whether `(platform, session_id)` owns `state`, claiming an empty `session_id` if matching.
+
+    Returns `(is_owner, claimed_modified)`. States without `owner` (v3.0.0) treat every session as owner.
+    """
+    if state is None:
+        return True, False
+    owner = state.get("owner")
+    if not isinstance(owner, dict):
+        return True, False
+    ex_plat = str(owner.get("platform") or "").strip()
+    if not ex_plat:
+        return True, False
+    ex_sid = str(owner.get("session_id") or "").strip()
+    in_sid = session_id.strip()
+    if ex_plat == "cli" and not ex_sid:
+        owner["platform"] = platform
+        if in_sid:
+            owner["session_id"] = in_sid
+        return True, True
+    if ex_plat != platform:
+        return False, False
+    if not ex_sid:
+        if in_sid:
+            owner["session_id"] = in_sid
+            return True, True
+        return True, False
+    if not in_sid or in_sid == ex_sid:
+        return True, False
+    return False, False
+
+
+def _extract_antigravity_session_id(payload: dict[str, Any]) -> str:
+    for key in ("conversation_id", "conversationId", "session_id", "sessionId"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if isinstance(artifact_dir, str) and artifact_dir.strip():
+        p = Path(artifact_dir.strip())
+        if p.parent.name == "brain" and p.name:
+            return p.name
+    return ""
+
+
 def default_state(
     mode: str = "craftsman",
     tier: str = "auto",
@@ -583,14 +698,16 @@ def default_state(
     base_sha: str | None = None,
     started_at_step: int = 0,
     auto_detected: bool = False,
+    owner: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    state: dict[str, Any] = {
         "active": True,
         "mode": mode,
         "tier": tier if tier in VALID_TIERS else "auto",
         "cwd": cwd,
         "stage": "implement",
         "base_sha": base_sha,
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "started_at_step": started_at_step,
         "completed_at_step": -1,
         "awaiting_user": False,
@@ -598,6 +715,12 @@ def default_state(
         "auto_detected": auto_detected,
         "forced_continuations": 0,
     }
+    if owner is not None:
+        state["owner"] = {
+            "platform": str(owner.get("platform") or "cli"),
+            "session_id": str(owner.get("session_id") or ""),
+        }
+    return state
 
 
 def load_state(state_file: Path) -> dict[str, Any] | None:
@@ -1110,6 +1233,17 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     latest_step = get_latest_step_index(entries)
     state = load_state(state_file)
+    stop_platform = "claude" if _is_claude_stop_payload(payload) else "antigravity"
+    stop_sid = (
+        str(payload.get("session_id") or payload.get("sessionId") or "").strip()
+        if stop_platform == "claude"
+        else _extract_antigravity_session_id(payload)
+    )
+    if state and state.get("active", False):
+        is_owner, _ = check_and_claim_owner(state, stop_platform, stop_sid)
+        if not is_owner:
+            return "allow", None
+
     completed_at = _safe_int(state.get("completed_at_step"), -1) if state else -1
     if completed_at > latest_step:
         completed_at = -1
@@ -1133,6 +1267,7 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
                 base_sha=auto_base_sha,
                 started_at_step=trigger_step,
                 auto_detected=True,
+                owner={"platform": stop_platform, "session_id": stop_sid},
             )
             _try_save_state(state_file, state)
 
@@ -1237,6 +1372,11 @@ def run_cli(argv: list[str]) -> int:
     )
     parser.add_argument("--init", action="store_true", help="Initialize a fresh active state")
     parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Take over an active gate owned by another agent session",
+    )
+    parser.add_argument(
         "--cwd", help="Repository working directory to capture base_sha and diff stats"
     )
     parser.add_argument("--base-sha", help="Explicit base commit SHA for cumulative diff")
@@ -1287,10 +1427,43 @@ def run_cli(argv: list[str]) -> int:
     )
 
     if (args.init and not args.complete) or state is None or reinit_inactive:
+        caller_platform = detect_cli_platform()
+        caller_sid = extract_cli_session_id(caller_platform)
+        takeover_from: Any = None
         if args.init and not args.complete:
+            if existing_was_active and existing_state is not None:
+                existing_owner = existing_state.get("owner")
+                same_owner = is_same_or_unclaimed_owner(
+                    existing_owner, caller_platform, caller_sid
+                )
+                if not same_owner and not args.takeover:
+                    owner_desc = format_gate_owner(existing_owner)
+                    since_desc = existing_state.get("started_at") or "unknown time"
+                    sys.stderr.write(
+                        f"[CRAFTSMAN GATE] Refusing to initialize: an active gate in this work tree "
+                        f"is already owned by {owner_desc} (since {since_desc}).\n"
+                        "To work in parallel without interfering with that session, create a separate worktree:\n"
+                        "  git worktree add ../<branch-dir> -b <branch>\n"
+                        "Or, to explicitly take over the existing gate, pass --takeover:\n"
+                        "  craftsman gate --init --takeover ...\n"
+                    )
+                    return 1
+                if args.takeover:
+                    takeover_from = existing_owner
             start_step = latest_step
             initial_tier = args.tier or ("deep" if args.mode == "ultracraft" else "auto")
             base_sha = args.base_sha or get_head_sha(hint_cwd)
+            if existing_was_active and existing_state is not None and not args.takeover:
+                prev_owner = existing_state.get("owner")
+                prev_sid = (
+                    str(prev_owner.get("session_id") or "")
+                    if isinstance(prev_owner, dict)
+                    and prev_owner.get("platform") == caller_platform
+                    else ""
+                )
+                new_owner = {"platform": caller_platform, "session_id": caller_sid or prev_sid}
+            else:
+                new_owner = {"platform": caller_platform, "session_id": caller_sid}
         else:
             detected = detect_untracked_craftsman_trigger(entries, eff_completed_at)
             start_step = detected[0] if detected is not None else max(0, eff_completed_at)
@@ -1302,6 +1475,7 @@ def run_cli(argv: list[str]) -> int:
             base_sha = args.base_sha or resolve_auto_base_sha(
                 hint_cwd, entries, start_step, transcript_path
             )
+            new_owner = {"platform": caller_platform, "session_id": caller_sid}
         state = default_state(
             mode=args.mode,
             tier=initial_tier,
@@ -1309,7 +1483,11 @@ def run_cli(argv: list[str]) -> int:
             base_sha=base_sha,
             started_at_step=start_step,
             auto_detected=not bool(args.init and not args.complete),
+            owner=new_owner,
         )
+        if takeover_from is not None:
+            state["takeover_from"] = takeover_from
+            state["takeover_at"] = state["started_at"]
     elif args.tier:
         # On an already-active state file, tier is monotonically non-decreasing (cannot downgrade standard/deep -> quick)
         current_tier = str(state.get("tier") or "auto").strip().lower()

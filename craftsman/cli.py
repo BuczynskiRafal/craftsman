@@ -50,6 +50,7 @@ from craftsman.export import (
 from craftsman.export import main as export_main
 from craftsman.gate import (
     compute_cumulative_diff_summary,
+    format_gate_owner,
     resolve_cli_state_file,
     resolve_effective_gear_label,
 )
@@ -864,6 +865,8 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
     payload: dict[str, Any] = {
         "state_file": str(state_file) if state_file else None,
         "active": bool(state.get("active", False)),
+        "owner": state.get("owner"),
+        "started_at": state.get("started_at"),
         "configured_tier": tier,
         "effective_gear": effective_gear,
         "stage": state.get("stage", "idle"),
@@ -879,8 +882,14 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
         sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         return 0
 
+    owner_label = (
+        format_gate_owner(state.get("owner"))
+        if state.get("owner") is not None
+        else ("unknown (legacy)" if payload["active"] else "none")
+    )
     print(f"Craftsman Status (v{__version__})")
     print(f"  Active         : {payload['active']}")
+    print(f"  Owner          : {owner_label}")
     print(f"  Effective Gear : {effective_gear}")
     print(f"  Stage          : {payload['stage']}")
     print(f"  Base SHA       : {base_sha or 'HEAD'}")
