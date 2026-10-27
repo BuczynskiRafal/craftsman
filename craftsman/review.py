@@ -66,7 +66,7 @@ from craftsman.ledger import (
     waive_run,
 )
 from craftsman.lenses import LENS_IDS, TIERS, Tier, select_lenses
-from craftsman.packet import collect_context, render_packet
+from craftsman.packet import collect_context, expand_hunk_spec, render_packet, render_packet_view
 from craftsman.quality import (
     MAX_PRODUCTION_ADDED_LINES,
     collect_quality_signals,
@@ -79,6 +79,8 @@ CITED_LINE_CHARS = 120
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
     "lens": "--lens",
+    "lenses": "--lenses",
+    "hunks": "--hunks",
     "path": "--file",
     "line": "--line",
     "severity": "--severity",
@@ -230,6 +232,52 @@ def _write_text(path: Path, text: str) -> None:
         path.write_text(text, encoding="utf-8")
     except OSError as exc:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
+
+
+def _view_slug(lenses: Sequence[str], hunks_raw: str | None) -> str:
+    lens_slug = "-".join(lenses)
+    if not hunks_raw or not hunks_raw.strip():
+        return lens_slug
+    hunk_slug = "".join(
+        ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()
+    ).strip("-")
+    return f"{lens_slug}.{hunk_slug}" if hunk_slug else lens_slug
+
+
+def _parse_view_lenses(raw: str) -> list[str]:
+    lenses = [item.strip() for item in raw.split(",") if item.strip()]
+    if not lenses:
+        raise FieldError("lenses", "must name at least one lens")
+    for lens in lenses:
+        if lens not in LENS_IDS:
+            raise FieldError(
+                "lenses", f"unknown lens {lens!r} (choose from {', '.join(sorted(LENS_IDS))})"
+            )
+    return lenses
+
+
+def _view(args: argparse.Namespace) -> int:
+    ws = open_workspace(args.cwd)
+    ledger = load(ws.ledger_path)
+    snap = snapshot(ws.root, resolve_base(ws, ledger, None))
+    round_ = require_current_round(ledger, snap)
+    lenses = _parse_view_lenses(args.lenses)
+    all_ids = [hunk.id for hunk in snap.hunks]
+    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried] or all_ids
+    assigned = expand_hunk_spec(args.hunks, all_ids) if args.hunks else tuple(open_ids)
+    picks = select_lenses(round_.tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
+    index = WorktreeIndex(ws.root)
+    symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
+    task = str(ws.state.get("task") or "")
+    ctx = collect_context(
+        ws.root, snap, round_, picks, task,
+        symbols=symbols, ledger=ledger, index=index, quality_signals=round_.signals,
+    )
+    slug = _view_slug(lenses, args.hunks)
+    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
+    _write_text(view_path, render_packet_view(ctx, lenses=lenses, assigned_hunks=assigned))
+    print(view_path)
+    return 0
 
 
 def _load_json_entries(source: str) -> list[Any]:
@@ -1015,6 +1063,11 @@ def _add_prepare_and_cover_parsers(
     prepare.add_argument("--base", help="Base commit (default: the active task's base or HEAD)")
     prepare.add_argument("--task", help="One-line description of what the change is for")
     prepare.set_defaults(handler=_prepare)
+
+    view = sub.add_parser("view", parents=[common], help="Build a per-reviewer packet view")
+    view.add_argument("--lenses", "--lens", dest="lenses", required=True, help="Comma-separated lens ids")
+    view.add_argument("--hunks", default=None, help="Comma-separated hunk ids or ranges, e.g. H3-H17")
+    view.set_defaults(handler=_view)
 
     cover = sub.add_parser("cover", parents=[common], help="Record that a lens reviewed hunks or files")
     cover.add_argument("--lens", choices=lenses)

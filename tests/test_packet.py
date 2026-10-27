@@ -336,6 +336,37 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("line_10 = 10", text)
         self.assertNotIn("line_75 = 75", text)
 
+    def test_view_renders_assigned_hunks_in_full_and_others_as_one_line(self) -> None:
+        h1 = Hunk("H1", "pkg/a.py", None, "modified", 2, 1, 2, 1, "", ("-a = 1", "+a = 2"), "d1")
+        h2 = Hunk("H2", "pkg/b.py", None, "modified", 8, 1, 8, 1, "", ("-b = 1", "+b = 2"), "d2")
+        snap = DiffSnapshot("b" * 40, "f" * 64, (h1, h2), ("pkg/a.py", "pkg/b.py"), (), 2, 2)
+        scope_a = Scope("pkg/a.py", "alpha", "function", 1, 4, "def alpha():\n    a = 2")
+        scope_b = Scope("pkg/b.py", "beta", "function", 7, 10, "def beta():\n    b = 2")
+        picks = select_lenses("standard", {}, docs_only=False)
+        ctx = PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_for(snap),
+            picks=tuple(picks),
+            task="test view",
+            commits=(),
+            conventions=(),
+            scopes={"H1": scope_a, "H2": scope_b},
+            symbols={"H1": ("alpha",), "H2": ("beta",)},
+            references={},
+            signals_by_hunk={},
+            carried_from={},
+        )
+
+        view = packet.render_packet_view(ctx, lenses=("contracts",), assigned_hunks=("H1",))
+
+        self.assertIn("### H1 · `pkg/a.py`", view)
+        self.assertIn("def alpha():", view)
+        self.assertNotIn("### H2 · `pkg/b.py`", view)
+        self.assertNotIn("def beta():", view)
+        self.assertIn("- H2 · pkg/b.py · beta", view)
+        self.assertEqual(packet.expand_hunk_spec("H1-H2", ("H1", "H2")), ("H1", "H2"))
+
 
 if __name__ == "__main__":
     unittest.main()

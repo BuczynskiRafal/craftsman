@@ -67,10 +67,12 @@ contract run `craftsman skill show craftsman --file scope.md`).
 craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--task "<what the change is for, one line>"]
 ```
 
-This prints the absolute path of the current review packet. Read the packet completely (if you do
-not have the path, run `craftsman review show` or `craftsman review show --packet-path` in the
-repository root; never search for packet or ledger files, as packets, ledgers, and reports of other
-repositories are never relevant). It contains:
+This prints the absolute path of the current review packet (`packet-N.md`), and
+`craftsman review view --lenses <lenses> [--hunks <range>]` writes and prints a per-reviewer view
+(`packet-N.<slug>.md`). Read your view completely, the full packet only for a hunk outside your view
+that you need (if you do not have the path, run `craftsman review show` or
+`craftsman review show --packet-path` in the repository root; never search for packet or ledger
+files, as packets, ledgers, and reports of other repositories are never relevant). It contains:
 - the round number, diff fingerprint, and statistics;
 - the task statement and commit messages (the *intent*);
 - the project convention files to respect (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`,
@@ -185,11 +187,13 @@ Step 3 at low cost; a real defect you filtered out early is lost for good.
   subagents (`craftsman-reviewer`), 1–3 lenses each in parallel, then run one more reviewer for
   the **final sweep** described at the end of `lenses.md`, followed by a separate
   `craftsman-verifier` subagent.
-- **Keep subagent briefs lean:** pass each subagent only the packet path printed by
-  `craftsman review prepare` or `craftsman review show`, its
-  assigned lenses, and the hunk list — never paste file contents into the prompt. The verifier
-  should read `craftsman review show` and the packet first, then open source files only around the
-  cited `file:line` ranges and callers rather than reading full files top to bottom.
+- **Keep subagent briefs lean:** generate a view per reviewer with
+  `craftsman review view --lenses <lenses> [--hunks <range>]` and pass each reviewer subagent its
+  packet view path (`packet-N.<slug>.md`), its assigned lenses, and the hunk list — never paste file
+  contents into the prompt. Each reviewer reads your view completely, the full packet only for a
+  hunk outside your view that you need. The verifier should read `craftsman review show` and the
+  full packet first, then open source files only around the cited `file:line` ranges and callers
+  rather than reading full files top to bottom.
 - When no subagent mechanism exists, do the passes yourself one lens at a time, re-reading the
   packet at the start of each lens.
 

@@ -16,10 +16,11 @@ nothing but the truth about how it behaves. You never edit source files; your ou
 ## Your assignment
 
 The message that started you names:
-- the packet path — the packet path is printed by `craftsman review prepare` and by
-  `craftsman review show` (or `craftsman review show --packet-path`); if you do not have it, run
-  `craftsman review show` in the repository root. Never search for packet or ledger files; packets,
-  ledgers, and reports of other repositories are never relevant;
+- your packet view path (printed by `craftsman review view --lenses <lenses> [--hunks <range>]`) or
+  the full packet path (printed by `craftsman review prepare` and by `craftsman review show` /
+  `craftsman review show --packet-path`); if you do not have it, run `craftsman review show` in the
+  repository root. Never search for packet or ledger files; packets, ledgers, and reports of other
+  repositories are never relevant;
 - the lenses you own (for example `contracts, failure`, or in review-only mode one of the two lens
   halves `{intent, contracts, ripple, tests, craft}` / `{failure, state, trust, platform, model}`)
   — if none are named, take at most three lenses that `craftsman review show` reports as not yet
@@ -31,7 +32,8 @@ The message that started you names:
 
 ## How to work
 
-1. Read the packet completely, then the convention files it lists.
+1. Read your view completely, the full packet only for a hunk outside your view that you need, then
+   the convention files it lists.
 2. For each lens you own, read its playbook below, then apply **every probe to every assigned,
    non-carried hunk**. Open the real files: the full enclosing function, the callers listed under
    *References*, the tests for the touched module. Substitute concrete values; write them down.

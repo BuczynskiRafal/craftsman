@@ -97,9 +97,11 @@ resolved to and the lenses it needs. Then write the **intent brief** of `/code-r
   the reasoning that produced the code, which is exactly what hides its defects):
   1. *Wave 1, in parallel:* `craftsman-reviewer` subagents for every selected lens **except
      `sweep`**, 1–3 lenses each, for example (`intent`, `contracts`), (`failure`, `ripple`),
-     (`state`, `trust`, `platform`), (`tests`, `model`, `craft`). Give each the packet path, the
-     intent brief and its lenses. On a small fix round (one or two open hunks) one reviewer may
-     take every non-sweep lens.
+     (`state`, `trust`, `platform`), (`tests`, `model`, `craft`). Build a packet view for each
+     reviewer with `craftsman review view --lenses <lenses> [--hunks <range>]` and give each its
+     packet view path, the intent brief and its lenses (each reviewer reads your view completely,
+     the full packet only for a hunk outside your view that you need). On a small fix round (one or
+     two open hunks) one reviewer may take every non-sweep lens.
   2. *Wave 2, after wave 1 has finished:* one more `craftsman-reviewer` for lens `sweep` only.
 
 ### 2.4 Challenge findings
