@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -17,17 +17,16 @@ from craftsman.diffscan import (
     DiffSnapshot,
     WorktreeIndex,
     detect_signals,
-    resolve_base_sha,
     snapshot,
-    worktree_root,
 )
 from craftsman.evidence import archive_ledger, effective_tier, packet_path
 from craftsman.gate import (
-    gate_policy,
-    load_state,
-    resolve_cli_state_file,
-    resolve_effective_tier,
-    save_state_atomic,
+    GateState,
+    GateStateError,
+    Stage,
+    current_tier,
+    state_path_for,
+    update_state,
 )
 from craftsman.ledger import (
     DESIGN_LENS,
@@ -39,6 +38,7 @@ from craftsman.ledger import (
     Fact,
     FieldError,
     Finding,
+    GatePolicy,
     GateReport,
     Ledger,
     LedgerError,
@@ -56,7 +56,6 @@ from craftsman.ledger import (
     file_sha256,
     has_unresolved_diff_size,
     is_trivial_run,
-    ledger_path_for,
     load,
     merge_findings,
     mutate,
@@ -76,6 +75,7 @@ from craftsman.quality import (
     collect_quality_signals,
     production_diff_growth,
 )
+from craftsman.workspace import Workspace, open_workspace, resolve_base
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
@@ -114,35 +114,12 @@ JSON_FIELD_NAMES = {
 S = TypeVar("S", bound=str)
 
 
-@dataclass(frozen=True)
-class Workspace:
-    root: Path
-    state: dict[str, Any]  # the active craftsman state, or {} outside an active session
-    ledger_path: Path
-
-
-def open_workspace(cwd: str | None) -> Workspace:
-    """Locate the work tree, the active gate state and the ledger for `cwd`."""
-    root = worktree_root(cwd or os.getcwd())
-    loaded = load_state(resolve_cli_state_file(None, str(root)))
-    state = loaded if loaded and loaded.get("active") else {}
-    return Workspace(root=root, state=state, ledger_path=ledger_path_for(root))
-
-
-def resolve_base(ws: Workspace, ledger: Ledger, explicit: str | None) -> str:
-    """`--base`, else the latest round's base, else the active task's base, else HEAD."""
-    state_base = ws.state.get("base_sha")
-    ledger_base = ledger.rounds[-1].base_sha if ledger.rounds else None
-    ref = explicit or ledger_base or (state_base if isinstance(state_base, str) else None)
-    return resolve_base_sha(ws.root, ref)
-
-
 def resolve_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tier:
     """`--tier`, else the active task's effective gear, else the latest round's, else standard."""
     if explicit is not None:
         return explicit
-    if ws.state:
-        return resolve_effective_tier(ws.state, str(ws.root))
+    if ws.state is not None:
+        return current_tier(ws.state, ws.root)
     return ledger.rounds[-1].tier if ledger.rounds else "standard"
 
 
@@ -152,8 +129,8 @@ def evaluation_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tie
     An explicit `--tier` can raise the bar for `check`, never lower it.
     """
     requested = [explicit] if explicit is not None else []
-    if ws.state:
-        requested.append(resolve_effective_tier(ws.state, str(ws.root)))
+    if ws.state is not None:
+        requested.append(current_tier(ws.state, ws.root))
     if not requested:
         return ledger.rounds[-1].tier if ledger.rounds else "standard"
     return effective_tier(ledger, *requested)
@@ -186,7 +163,7 @@ def _prepare(args: argparse.Namespace) -> int:
     ledger, round_, created = mutate(ws.ledger_path, open_next)
     packet = Path(round_.packet_path)
     if created or not packet.is_file():
-        task = args.task or str(ws.state.get("task") or "")
+        task = args.task or ws.task
         ctx = collect_context(
             ws.root,
             snap,
@@ -205,13 +182,14 @@ def _prepare(args: argparse.Namespace) -> int:
 
 
 def _mark_needs_human_if_oversized(ws: Workspace, ledger: Ledger) -> None:
-    if not has_unresolved_diff_size(ledger):
+    """An oversized change needs the user's decision; the active gate records that."""
+    if ws.state is None or not has_unresolved_diff_size(ledger):
         return
-    state_file = resolve_cli_state_file(None, str(ws.root))
-    loaded = load_state(state_file)
-    if loaded is not None and loaded.get("stage") != "needs_human":
-        loaded["stage"] = "needs_human"
-        save_state_atomic(state_file, loaded)
+    update_state(state_path_for(ws.root), lambda current: (_needing_human(current), None))
+
+
+def _needing_human(state: GateState | None) -> GateState | None:
+    return replace(state, stage=Stage.NEEDS_HUMAN) if state is not None and state.active else state
 
 
 def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
@@ -244,9 +222,7 @@ def _view_slug(lenses: Sequence[str], hunks_raw: str | None) -> str:
     lens_slug = "-".join(lenses)
     if not hunks_raw or not hunks_raw.strip():
         return lens_slug
-    hunk_slug = "".join(
-        ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()
-    ).strip("-")
+    hunk_slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()).strip("-")
     return f"{lens_slug}.{hunk_slug}" if hunk_slug else lens_slug
 
 
@@ -284,10 +260,17 @@ def _view(args: argparse.Namespace) -> int:
     picks = select_lenses(round_.tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    task = str(ws.state.get("task") or "")
+    task = ws.task
     ctx = collect_context(
-        ws.root, snap, round_, picks, task,
-        symbols=symbols, ledger=ledger, index=index, quality_signals=round_.signals,
+        ws.root,
+        snap,
+        round_,
+        picks,
+        task,
+        symbols=symbols,
+        ledger=ledger,
+        index=index,
+        quality_signals=round_.signals,
     )
     slug = _view_slug(lenses, args.hunks)
     view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
@@ -340,7 +323,9 @@ def _cover_from_json(args: argparse.Namespace) -> int:
         round_ = require_current_round(current, snap)
         lines: list[str] = []
         for index, raw in enumerate(raw_entries, 1):
-            label = raw.get("lens") if isinstance(raw, dict) and isinstance(raw.get("lens"), str) else None
+            label = (
+                raw.get("lens") if isinstance(raw, dict) and isinstance(raw.get("lens"), str) else None
+            )
             try:
                 f = _Fields(raw)
                 lens = f.choice("lens", tuple(sorted(LENS_IDS)))
@@ -369,7 +354,9 @@ def _cover(args: argparse.Namespace) -> int:
     if args.hunks is not None and args.files is not None:
         raise LedgerError("pass either --hunks or --files, not both")
     if args.lens == DESIGN_LENS and args.hunks is not None:
-        raise LedgerError("the `design` lens covers changed files, not hunks; pass --files instead of --hunks")
+        raise LedgerError(
+            "the `design` lens covers changed files, not hunks; pass --files instead of --hunks"
+        )
     if args.lens != DESIGN_LENS and args.files is not None:
         raise LedgerError("--files is only used with `--lens design`; pass --hunks for hunk lenses")
     raw_targets = args.files if args.files is not None else args.hunks
@@ -471,7 +458,9 @@ def _add_from_json(args: argparse.Namespace) -> int:
         return current, results
 
     for finding, lines in mutate(ws.ledger_path, record_batch):
-        print(f"{finding.id} recorded ({finding.severity}, {finding.lens}, {finding.path}:{finding.line})")
+        print(
+            f"{finding.id} recorded ({finding.severity}, {finding.lens}, {finding.path}:{finding.line})"
+        )
         print(_cited_line(finding, lines))
     return 0
 
@@ -528,9 +517,7 @@ def _ack(args: argparse.Namespace) -> int:
     return 0
 
 
-def _parse_fact_source(
-    ws: Workspace, cwd: Path, raw: str, snap: DiffSnapshot
-) -> tuple[SourceRef, str]:
+def _parse_fact_source(ws: Workspace, cwd: Path, raw: str, snap: DiffSnapshot) -> tuple[SourceRef, str]:
     if ":" not in raw:
         raise FieldError("source", "must look like path:line (e.g. pkg/a.py:42)")
     raw_path, raw_line = raw.rsplit(":", 1)
@@ -573,9 +560,7 @@ def _fact_add(args: argparse.Namespace) -> int:
         )
 
     fact = mutate(ws.ledger_path, record)
-    print(
-        f"{fact.id} recorded ({', '.join(fact.hunks)}, source {fact.source.path}:{fact.source.line})"
-    )
+    print(f"{fact.id} recorded ({', '.join(fact.hunks)}, source {fact.source.path}:{fact.source.line})")
     return 0
 
 
@@ -621,7 +606,9 @@ def _merge(args: argparse.Namespace) -> int:
 def _cited_line(finding: Finding, lines: Sequence[str] | None) -> str:
     """Echo the cited source line so a wrong `--line` is noticed while the finding is fresh."""
     if lines is None:
-        return f"  ({finding.path} is deleted in the diff; line {finding.line} refers to the base version)"
+        return (
+            f"  ({finding.path} is deleted in the diff; line {finding.line} refers to the base version)"
+        )
     text = lines[finding.line - 1].strip()
     return f"  L{finding.line}: {text[:CITED_LINE_CHARS]}{'…' if len(text) > CITED_LINE_CHARS else ''}"
 
@@ -668,9 +655,7 @@ def _verdict(args: argparse.Namespace) -> int:
             judged: list[Finding] = []
             for index, raw in enumerate(raw_entries, 1):
                 label = (
-                    raw.get("id")
-                    if isinstance(raw, dict) and isinstance(raw.get("id"), str)
-                    else None
+                    raw.get("id") if isinstance(raw, dict) and isinstance(raw.get("id"), str) else None
                 )
                 try:
                     f = _Fields(raw)
@@ -854,23 +839,20 @@ def _run_lines(runs: Sequence[Run], snap: DiffSnapshot) -> list[str]:
 def _evaluate(
     ws: Workspace, tier_override: Tier | None, *, review_only: bool = False
 ) -> tuple[Ledger, DiffSnapshot, Tier, GateReport]:
-    if review_only and ws.state:
+    if review_only and ws.state is not None:
         raise LedgerError(
             "--review-only is not allowed during an active /craftsman gate session; "
             "in /craftsman the full gate applies (run `craftsman review check` without --review-only)"
         )
     ledger = load(ws.ledger_path)
-    _mark_needs_human_if_oversized(ws, ledger)
     tier = evaluation_tier(ws, ledger, tier_override)
     snap = snapshot(ws.root, resolve_base(ws, ledger, None))
-    policy = gate_policy(ws.state, tier)
+    policy = GatePolicy(tier=tier, isolation_evidence=ws.isolation_evidence)
     return ledger, snap, tier, evaluate(ledger, snap, policy, review_only=review_only)
 
 
 def _check(args: argparse.Namespace) -> int:
-    _, _, _, report = _evaluate(
-        open_workspace(args.cwd), args.tier, review_only=args.review_only
-    )
+    _, _, _, report = _evaluate(open_workspace(args.cwd), args.tier, review_only=args.review_only)
     if args.json:
         print(json.dumps(_report_json(report), indent=2, ensure_ascii=False))
     else:
@@ -889,9 +871,7 @@ def _report_json(report: GateReport) -> dict[str, Any]:
 
 
 def _report(args: argparse.Namespace) -> int:
-    ledger, snap, tier, report = _evaluate(
-        open_workspace(args.cwd), None, review_only=args.review_only
-    )
+    ledger, snap, tier, report = _evaluate(open_workspace(args.cwd), None, review_only=args.review_only)
     groups = _finding_groups(ledger.findings)
     runs = _counting_runs(ledger.runs, snap.fingerprint)
     if args.json:
@@ -1132,7 +1112,9 @@ def _add_prepare_and_cover_parsers(
     prepare.set_defaults(handler=_prepare)
 
     view = sub.add_parser("view", parents=[common], help="Build a per-reviewer packet view")
-    view.add_argument("--lenses", "--lens", dest="lenses", required=True, help="Comma-separated lens ids")
+    view.add_argument(
+        "--lenses", "--lens", dest="lenses", required=True, help="Comma-separated lens ids"
+    )
     view.add_argument("--hunks", default=None, help="Comma-separated hunk ids or ranges, e.g. H3-H17")
     view.set_defaults(handler=_view)
 
@@ -1149,9 +1131,7 @@ def _add_prepare_and_cover_parsers(
     cover.set_defaults(handler=_cover, subparser=cover)
 
 
-def _add_finding_parsers(
-    sub: Any, common: argparse.ArgumentParser, lenses: Sequence[str]
-) -> None:
+def _add_finding_parsers(sub: Any, common: argparse.ArgumentParser, lenses: Sequence[str]) -> None:
     add = sub.add_parser("add", parents=[common], help="Record a finding")
     add.add_argument("--lens", choices=lenses)
     add.add_argument("--file")
@@ -1160,7 +1140,9 @@ def _add_finding_parsers(
     add.add_argument("--title")
     add.add_argument("--scenario", help="Trigger -> wrong outcome")
     add.add_argument("--suggestion", default=None)
-    add.add_argument("--signal", default=None, help="Quality signal id resolved by this finding (e.g. S1)")
+    add.add_argument(
+        "--signal", default=None, help="Quality signal id resolved by this finding (e.g. S1)"
+    )
     add.add_argument(
         "--from-json",
         metavar="PATH",
@@ -1180,12 +1162,18 @@ def _add_finding_parsers(
     move.add_argument("--file", help="New file (default: keep the finding's file)")
     move.set_defaults(handler=_move)
 
-    fact = sub.add_parser("fact", parents=[common], help="Record a source-cited fact for other reviewers")
+    fact = sub.add_parser(
+        "fact", parents=[common], help="Record a source-cited fact for other reviewers"
+    )
     fact.add_argument("action", nargs="?", choices=("add",), default="add")
     fact.add_argument("--hunks", required=True, help="Comma-separated hunk ids or ranges, e.g. H3")
-    fact.add_argument("--source", required=True, help="Source file:line in the work tree, e.g. pkg/a.py:42")
+    fact.add_argument(
+        "--source", required=True, help="Source file:line in the work tree, e.g. pkg/a.py:42"
+    )
     fact.add_argument("--text", required=True, help="Verifiable fact (>= 30 chars, no judgement words)")
-    fact.add_argument("--lens", default="contracts", choices=lenses, help="Author lens (default: contracts)")
+    fact.add_argument(
+        "--lens", default="contracts", choices=lenses, help="Author lens (default: contracts)"
+    )
     fact.set_defaults(handler=_fact_add)
 
 
@@ -1204,7 +1192,9 @@ def _add_merge_and_verdict_parsers(sub: Any, common: argparse.ArgumentParser) ->
         ),
     )
     merge.add_argument("target_id", metavar="TARGET_ID", help="Finding id to keep (e.g. F1)")
-    merge.add_argument("duplicate_ids", metavar="DUP_ID", nargs="+", help="Duplicate finding ids to fold into TARGET_ID")
+    merge.add_argument(
+        "duplicate_ids", metavar="DUP_ID", nargs="+", help="Duplicate finding ids to fold into TARGET_ID"
+    )
     merge.add_argument("--title", help="Updated title for the grouped finding")
     merge.add_argument("--scenario", help="Combined root-cause -> consequences scenario")
     merge.add_argument("--suggestion", help="Updated suggestion for the grouped finding")
@@ -1230,9 +1220,13 @@ def _add_resolution_and_status_parsers(sub: Any, common: argparse.ArgumentParser
     resolution.add_argument("--note", required=True)
     resolution.set_defaults(handler=_resolve)
 
-    ack = sub.add_parser("ack", parents=[common], help="Acknowledge a quality signal with a concrete reason")
+    ack = sub.add_parser(
+        "ack", parents=[common], help="Acknowledge a quality signal with a concrete reason"
+    )
     ack.add_argument("signal_id", metavar="ID", help="Quality signal id (e.g. S1)")
-    ack.add_argument("--reason", required=True, help="Why the signal is acceptable (>= 40 chars, concrete)")
+    ack.add_argument(
+        "--reason", required=True, help="Why the signal is acceptable (>= 40 chars, concrete)"
+    )
     ack.set_defaults(handler=_ack)
 
     waiver = sub.add_parser(
@@ -1294,13 +1288,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         result: int = args.handler(args)
-    except (LedgerError, DiffScanError) as exc:
+    except (LedgerError, DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"{PROG}: error: {describe_error(exc)}\n")
         return 1
     return result
 
 
-def describe_error(exc: LedgerError | DiffScanError) -> str:
+def describe_error(exc: LedgerError | DiffScanError | GateStateError) -> str:
     """The error message, naming the command-line flag when a flag's value was rejected."""
     if isinstance(exc, FieldError) and exc.field in FIELD_FLAGS:
         return f"{FIELD_FLAGS[exc.field]} {exc.problem}"

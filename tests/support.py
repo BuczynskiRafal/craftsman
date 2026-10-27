@@ -6,11 +6,14 @@ import json
 import os
 import subprocess
 import sys
+import unittest
 from pathlib import Path
 from typing import Any
 
+from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_path_for
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-STOP_GATE = REPO_ROOT / "scripts" / "craftsman-stop-gate.py"
+SKILL_COUNT = len(json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))["skills"])
 AMBIENT_PLATFORM_ENV_VARS = frozenset(
     {
         "CLAUDECODE",
@@ -36,10 +39,76 @@ def coverage_note(hunk_ids: list[str]) -> str:
     parts: list[str] = []
     for index, item in enumerate(hunk_ids, 1):
         num = item[1:] if item.startswith("H") and item[1:].isdigit() else str(index)
-        parts.append(
-            f"{item} f_{num}.py:{num}: x={num} -> returns {int(num) + 1} on boundary input"
-        )
+        parts.append(f"{item} f_{num}.py:{num}: x={num} -> returns {int(num) + 1} on boundary input")
     return "; ".join(parts)
+
+
+def assert_cli_error(
+    case: unittest.TestCase, proc: subprocess.CompletedProcess[str], exit_code: int, fragment: str
+) -> None:
+    """The command failed with `exit_code` and a message containing `fragment`, not a traceback."""
+    case.assertEqual(proc.returncode, exit_code, proc.stderr)
+    case.assertIn(fragment, proc.stderr)
+    case.assertNotIn("Traceback", proc.stderr)
+
+
+def open_gate(
+    root: Path,
+    base_sha: str,
+    *,
+    tier: GateTier = "standard",
+    task: str = "",
+    owner: GateOwner | None = None,
+    **fields: Any,
+) -> GateState:
+    """Store an active gate for the work tree `root`, as `craftsman gate --init` would."""
+    state = GateState.open(owner or GateOwner("cli"), base_sha, tier, task, **fields)
+    save_state(state_path_for(root), state)
+    return state
+
+
+# --- Antigravity transcript entries ---------------------------------------------------------
+
+
+def user_input(step: int, content: str) -> dict[str, Any]:
+    return {"step_index": step, "type": "USER_INPUT", "content": content}
+
+
+def invoke_subagent(step: int, *specs: dict[str, str]) -> dict[str, Any]:
+    return {
+        "step_index": step,
+        "type": "PLANNER_RESPONSE",
+        "tool_calls": [{"name": "invoke_subagent", "args": {"Subagents": json.dumps(list(specs))}}],
+    }
+
+
+def subagent_ack(step: int, *sub_ids: str) -> dict[str, Any]:
+    ids = ",\n".join(f'  "conversationId": "{sub_id}"' for sub_id in sub_ids)
+    return {
+        "step_index": step,
+        "type": "GENERIC",
+        "content": f"Created the following subagent:\n{{\n{ids}\n}}",
+    }
+
+
+def subagent_done(step: int, sub_id: str) -> dict[str, Any]:
+    return {
+        "step_index": step,
+        "type": "SYSTEM_MESSAGE",
+        "content": f"<SYSTEM_MESSAGE>[Message] sender={sub_id} content=done</SYSTEM_MESSAGE>",
+    }
+
+
+def ask_question(step: int) -> dict[str, Any]:
+    return {
+        "step_index": step,
+        "type": "PLANNER_RESPONSE",
+        "tool_calls": [{"name": "ask_question", "args": {"questions": []}}],
+    }
+
+
+# An Antigravity `invoke_subagent` spec of a Craftsman reviewer.
+REVIEWER = {"TypeName": "self", "Role": "craftsman-reviewer", "Prompt": "Review packet-1.md"}
 
 
 class EvidenceRepo:
@@ -90,11 +159,7 @@ class EvidenceRepo:
         stdin: str | None = None,
         env_extra: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in AMBIENT_PLATFORM_ENV_VARS
-        }
+        env = {k: v for k, v in os.environ.items() if k not in AMBIENT_PLATFORM_ENV_VARS}
         env["PYTHONPATH"] = str(REPO_ROOT)
         if env_extra:
             env.update(env_extra)
@@ -113,29 +178,6 @@ class EvidenceRepo:
                 f"craftsman {' '.join(args)} exited {proc.returncode}:\n{proc.stdout}\n{proc.stderr}"
             )
         return proc
-
-    def gate(
-        self,
-        state_file: Path,
-        *args: str,
-        env_extra: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in AMBIENT_PLATFORM_ENV_VARS
-        }
-        if env_extra:
-            env.update(env_extra)
-        return subprocess.run(
-            [sys.executable, str(STOP_GATE), "--state-file", str(state_file), *args],
-            cwd=self.root,
-            env=env,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
 
     def show(self) -> dict[str, Any]:
         payload = json.loads(self.cli("review", "show", "--json").stdout)

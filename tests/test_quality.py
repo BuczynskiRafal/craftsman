@@ -82,8 +82,7 @@ class QualitySignalTests(unittest.TestCase):
     def test_behavior_named_test_is_not_reported(self) -> None:
         self.repo.write(
             "tests/test_sample.py",
-            "def test_gate_without_owner_accepts_stop_from_any_session() -> None:\n"
-            "    assert True\n",
+            "def test_gate_without_owner_accepts_stop_from_any_session() -> None:\n    assert True\n",
         )
         signals = self._signals_for_current_diff()
         self.assertEqual([s for s in signals if s.kind == SignalKind.TEST_NAME], [])

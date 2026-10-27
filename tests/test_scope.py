@@ -14,8 +14,14 @@ from typing import Any
 from unittest import mock
 
 from craftsman import hooks
+from craftsman.gate import GateOwner
 from craftsman.guard import evaluate_command
 from craftsman.scope import ScopePolicy, evaluate_scope, load_scope_policy
+
+from tests.support import open_gate
+
+# The test repositories have no commit; the scope checks never read the gate's base.
+UNBORN_BASE = "0" * 40
 
 
 def call_pre_tool(platform: str, payload: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -97,81 +103,330 @@ class ScopeEnforcementTests(unittest.TestCase):
 
         cases: list[tuple[str, str, dict[str, Any], str]] = [
             ("recursive find in home is denied", "Bash", {"command": "find ~ -name SKILL.md"}, "deny"),
-            ("recursive find in current directory is allowed", "Bash", {"command": "find . -name x"}, "allow"),
-            ("recursive find in repo subdirectory is allowed", "Bash", {"command": "find src -name '*.py'"}, "allow"),
-            ("recursive find from filesystem root is denied", "Bash", {"command": "find / -name x"}, "deny"),
-            ("recursive grep in sibling repository is denied", "Bash", {"command": f"grep -r foo {self.other_repo}"}, "deny"),
-            ("non-recursive grep on dependency file is allowed", "Bash", {"command": f"grep foo {dep_file}"}, "allow"),
-            ("non-recursive grep in sibling repository is denied", "Bash", {"command": "grep foo ../other-repo/secret.py"}, "deny"),
+            (
+                "recursive find in current directory is allowed",
+                "Bash",
+                {"command": "find . -name x"},
+                "allow",
+            ),
+            (
+                "recursive find in repo subdirectory is allowed",
+                "Bash",
+                {"command": "find src -name '*.py'"},
+                "allow",
+            ),
+            (
+                "recursive find from filesystem root is denied",
+                "Bash",
+                {"command": "find / -name x"},
+                "deny",
+            ),
+            (
+                "recursive grep in sibling repository is denied",
+                "Bash",
+                {"command": f"grep -r foo {self.other_repo}"},
+                "deny",
+            ),
+            (
+                "non-recursive grep on dependency file is allowed",
+                "Bash",
+                {"command": f"grep foo {dep_file}"},
+                "allow",
+            ),
+            (
+                "non-recursive grep in sibling repository is denied",
+                "Bash",
+                {"command": "grep foo ../other-repo/secret.py"},
+                "deny",
+            ),
             ("rg in default working directory is allowed", "Bash", {"command": "rg foo"}, "allow"),
             ("rg in repo subdirectory is allowed", "Bash", {"command": "rg foo src"}, "allow"),
             ("rg in parent directory is denied", "Bash", {"command": "rg foo .."}, "deny"),
             ("rg in sibling repository is denied", "Bash", {"command": "rg foo ../other-repo"}, "deny"),
             ("rg files listing in home is denied", "Bash", {"command": "rg --files ~"}, "deny"),
-            ("rg with attached pattern flag in home is denied", "Bash", {"command": "rg -efoo ~"}, "deny"),
-            ("ag in home via environment variable is denied", "Bash", {"command": "ag pattern $HOME"}, "deny"),
+            (
+                "rg with attached pattern flag in home is denied",
+                "Bash",
+                {"command": "rg -efoo ~"},
+                "deny",
+            ),
+            (
+                "ag in home via environment variable is denied",
+                "Bash",
+                {"command": "ag pattern $HOME"},
+                "deny",
+            ),
             ("ag filename search in home is denied", "Bash", {"command": "ag -g SKILL ~"}, "deny"),
             ("ack file listing in home is denied", "Bash", {"command": "ack -f ~"}, "deny"),
             ("ack inside repo subdirectory is allowed", "Bash", {"command": "ack pattern src"}, "allow"),
             ("fd in home is denied", "Bash", {"command": "fd SKILL.md ~"}, "deny"),
-            ("fd with search-path in parent is denied", "Bash", {"command": "fd --search-path .. foo"}, "deny"),
+            (
+                "fd with search-path in parent is denied",
+                "Bash",
+                {"command": "fd --search-path .. foo"},
+                "deny",
+            ),
             ("fd inside repo subdirectory is allowed", "Bash", {"command": "fd app.py src"}, "allow"),
-            ("non-recursive ls in copilot skills is allowed", "Bash", {"command": "ls ~/.copilot/skills"}, "allow"),
+            (
+                "non-recursive ls in copilot skills is allowed",
+                "Bash",
+                {"command": "ls ~/.copilot/skills"},
+                "allow",
+            ),
             ("non-recursive ls in home is allowed", "Bash", {"command": "ls ~"}, "allow"),
-            ("non-recursive ls in sibling repository is denied", "Bash", {"command": "ls ../other-repo"}, "deny"),
+            (
+                "non-recursive ls in sibling repository is denied",
+                "Bash",
+                {"command": "ls ../other-repo"},
+                "deny",
+            ),
             ("recursive ls in home is denied", "Bash", {"command": "ls -R ~"}, "deny"),
-            ("recursive ls with combined flags in parent is denied", "Bash", {"command": "ls -laR .."}, "deny"),
+            (
+                "recursive ls with combined flags in parent is denied",
+                "Bash",
+                {"command": "ls -laR .."},
+                "deny",
+            ),
             ("tree in home is denied", "Bash", {"command": "tree ~"}, "deny"),
             ("tree in current directory is allowed", "Bash", {"command": "tree ."}, "allow"),
             ("du in parent directory is denied", "Bash", {"command": "du -sh .."}, "deny"),
             ("locate global index query is denied", "Bash", {"command": "locate SKILL.md"}, "deny"),
             ("mdfind without onlyin is denied", "Bash", {"command": "mdfind SKILL.md"}, "deny"),
-            ("mdfind scoped to repository is allowed", "Bash", {"command": f"mdfind -onlyin {self.repo} app"}, "allow"),
+            (
+                "mdfind scoped to repository is allowed",
+                "Bash",
+                {"command": f"mdfind -onlyin {self.repo} app"},
+                "allow",
+            ),
             ("mdfind scoped to home is denied", "Bash", {"command": "mdfind -onlyin ~ app"}, "deny"),
-            ("cat of sibling repository packet is denied", "Bash", {"command": "cat ../other-repo/.git/craftsman/packet-1.md"}, "deny"),
-            ("cat of absolute sibling packet path is denied", "Bash", {"command": f"cat {other_pkt}"}, "deny"),
+            (
+                "cat of sibling repository packet is denied",
+                "Bash",
+                {"command": "cat ../other-repo/.git/craftsman/packet-1.md"},
+                "deny",
+            ),
+            (
+                "cat of absolute sibling packet path is denied",
+                "Bash",
+                {"command": f"cat {other_pkt}"},
+                "deny",
+            ),
             ("cat of own repository packet is allowed", "Bash", {"command": f"cat {own_pkt}"}, "allow"),
-            ("cat of temporary scratch file is allowed", "Bash", {"command": f"cat {tmp_file}"}, "allow"),
-            ("cat of virtualenv site-packages file is allowed", "Bash", {"command": f"cat {dep_file}"}, "allow"),
-            ("head of claude session store is denied", "Bash", {"command": "head -n 20 ~/.claude/projects/slug/session.jsonl"}, "deny"),
+            (
+                "cat of temporary scratch file is allowed",
+                "Bash",
+                {"command": f"cat {tmp_file}"},
+                "allow",
+            ),
+            (
+                "cat of virtualenv site-packages file is allowed",
+                "Bash",
+                {"command": f"cat {dep_file}"},
+                "allow",
+            ),
+            (
+                "head of claude session store is denied",
+                "Bash",
+                {"command": "head -n 20 ~/.claude/projects/slug/session.jsonl"},
+                "deny",
+            ),
             ("cat of shell history file is denied", "Bash", {"command": "cat ~/.zsh_history"}, "deny"),
-            ("sed reading sibling repository file is denied", "Bash", {"command": "sed -n '1,20p' ../other-repo/secret.py"}, "deny"),
-            ("env wrapper invoking bash -c find on root is denied", "Bash", {"command": 'env FOO=1 bash -c "find / -name x"'}, "deny"),
-            ("env -C parent directory with rg is denied", "Bash", {"command": "env -C .. rg foo"}, "deny"),
-            ("sudo -D sibling repository with cat is denied", "Bash", {"command": "sudo -D ../other-repo cat secret.py"}, "deny"),
-            ("find -exec cat on sibling repository is denied", "Bash", {"command": "find . -exec cat ../other-repo/secret.py \\;"}, "deny"),
-            ("fd -x cat on sibling repository is denied", "Bash", {"command": "fd . -x cat ../other-repo/secret.py"}, "deny"),
-            ("git -C sibling repository grep is denied", "Bash", {"command": "git -C ../other-repo grep foo"}, "deny"),
-            ("git grep --no-index in home is denied", "Bash", {"command": "git grep --no-index foo ~"}, "deny"),
+            (
+                "sed reading sibling repository file is denied",
+                "Bash",
+                {"command": "sed -n '1,20p' ../other-repo/secret.py"},
+                "deny",
+            ),
+            (
+                "env wrapper invoking bash -c find on root is denied",
+                "Bash",
+                {"command": 'env FOO=1 bash -c "find / -name x"'},
+                "deny",
+            ),
+            (
+                "env -C parent directory with rg is denied",
+                "Bash",
+                {"command": "env -C .. rg foo"},
+                "deny",
+            ),
+            (
+                "sudo -D sibling repository with cat is denied",
+                "Bash",
+                {"command": "sudo -D ../other-repo cat secret.py"},
+                "deny",
+            ),
+            (
+                "find -exec cat on sibling repository is denied",
+                "Bash",
+                {"command": "find . -exec cat ../other-repo/secret.py \\;"},
+                "deny",
+            ),
+            (
+                "fd -x cat on sibling repository is denied",
+                "Bash",
+                {"command": "fd . -x cat ../other-repo/secret.py"},
+                "deny",
+            ),
+            (
+                "git -C sibling repository grep is denied",
+                "Bash",
+                {"command": "git -C ../other-repo grep foo"},
+                "deny",
+            ),
+            (
+                "git grep --no-index in home is denied",
+                "Bash",
+                {"command": "git grep --no-index foo ~"},
+                "deny",
+            ),
             ("git grep inside repository is allowed", "Bash", {"command": "git grep foo"}, "allow"),
-            ("cd to home followed by recursive grep is denied", "Bash", {"command": "cd ~ && grep -r x ."}, "deny"),
-            ("cd to repo subdirectory followed by rg is allowed", "Bash", {"command": "cd src && rg x ."}, "allow"),
-            ("cd through escaping symlink followed by cat is denied", "Bash", {"command": "cd escape_link && cat leak.txt"}, "deny"),
-            ("tool cwd on escaping symlink followed by cat is denied", "Bash", {"command": "cat leak.txt", "cwd": "escape_link"}, "deny"),
-            ("powershell Set-Location to home before rg is denied", "powershell", {"command": "Set-Location $env:USERPROFILE; rg foo"}, "deny"),
-            ("powershell recursive Get-ChildItem on drive root is denied", "powershell", {"command": "Get-ChildItem -Recurse C:\\"}, "deny"),
-            ("powershell recursive Get-ChildItem on C:\\Users is denied", "powershell", {"command": r"Get-ChildItem -Path C:\Users -Recurse"}, "deny"),
-            ("powershell recursive gci in current directory is allowed", "powershell", {"command": "gci -r ."}, "allow"),
-            ("cmd dir /s on drive root is denied", "run_in_terminal", {"command": "dir /s C:\\"}, "deny"),
-            ("find on escaping symlink inside repo is denied", "Bash", {"command": "find escape_link -name '*'"}, "deny"),
-            ("Read tool on escaping symlink inside repo is denied", "Read", {"file_path": str(self.repo / "escape_link" / "leak.txt")}, "deny"),
-            ("Read tool on sibling repository file is denied", "Read", {"file_path": str(self.other_repo / "secret.py")}, "deny"),
-            ("Read tool on own repository file is allowed", "Read", {"file_path": str(self.repo / "src" / "app.py")}, "allow"),
+            (
+                "cd to home followed by recursive grep is denied",
+                "Bash",
+                {"command": "cd ~ && grep -r x ."},
+                "deny",
+            ),
+            (
+                "cd to repo subdirectory followed by rg is allowed",
+                "Bash",
+                {"command": "cd src && rg x ."},
+                "allow",
+            ),
+            (
+                "cd through escaping symlink followed by cat is denied",
+                "Bash",
+                {"command": "cd escape_link && cat leak.txt"},
+                "deny",
+            ),
+            (
+                "tool cwd on escaping symlink followed by cat is denied",
+                "Bash",
+                {"command": "cat leak.txt", "cwd": "escape_link"},
+                "deny",
+            ),
+            (
+                "powershell Set-Location to home before rg is denied",
+                "powershell",
+                {"command": "Set-Location $env:USERPROFILE; rg foo"},
+                "deny",
+            ),
+            (
+                "powershell recursive Get-ChildItem on drive root is denied",
+                "powershell",
+                {"command": "Get-ChildItem -Recurse C:\\"},
+                "deny",
+            ),
+            (
+                "powershell recursive Get-ChildItem on C:\\Users is denied",
+                "powershell",
+                {"command": r"Get-ChildItem -Path C:\Users -Recurse"},
+                "deny",
+            ),
+            (
+                "powershell recursive gci in current directory is allowed",
+                "powershell",
+                {"command": "gci -r ."},
+                "allow",
+            ),
+            (
+                "cmd dir /s on drive root is denied",
+                "run_in_terminal",
+                {"command": "dir /s C:\\"},
+                "deny",
+            ),
+            (
+                "find on escaping symlink inside repo is denied",
+                "Bash",
+                {"command": "find escape_link -name '*'"},
+                "deny",
+            ),
+            (
+                "Read tool on escaping symlink inside repo is denied",
+                "Read",
+                {"file_path": str(self.repo / "escape_link" / "leak.txt")},
+                "deny",
+            ),
+            (
+                "Read tool on sibling repository file is denied",
+                "Read",
+                {"file_path": str(self.other_repo / "secret.py")},
+                "deny",
+            ),
+            (
+                "Read tool on own repository file is allowed",
+                "Read",
+                {"file_path": str(self.repo / "src" / "app.py")},
+                "allow",
+            ),
             ("Read tool on dependency file is allowed", "Read", {"file_path": dep_file}, "allow"),
             ("Grep tool in home directory is denied", "Grep", {"pattern": "foo", "path": "~"}, "deny"),
-            ("Grep tool in repository is allowed", "Grep", {"pattern": "foo", "path": str(self.repo)}, "allow"),
+            (
+                "Grep tool in repository is allowed",
+                "Grep",
+                {"pattern": "foo", "path": str(self.repo)},
+                "allow",
+            ),
             ("LS tool in home directory is denied", "LS", {"path": "~"}, "deny"),
             ("list_dir tool in parent directory is denied", "list_dir", {"DirectoryPath": ".."}, "deny"),
-            ("Glob tool in sibling repository is denied", "Glob", {"pattern": f"{self.other_repo}/**/*.py"}, "deny"),
-            ("Glob tool escaping via relative parent is denied", "Glob", {"pattern": "./../../other-repo/**/*.py"}, "deny"),
-            ("Glob tool on escaping symlink is denied", "Glob", {"pattern": "escape_link/**/*.py"}, "deny"),
+            (
+                "Glob tool in sibling repository is denied",
+                "Glob",
+                {"pattern": f"{self.other_repo}/**/*.py"},
+                "deny",
+            ),
+            (
+                "Glob tool escaping via relative parent is denied",
+                "Glob",
+                {"pattern": "./../../other-repo/**/*.py"},
+                "deny",
+            ),
+            (
+                "Glob tool on escaping symlink is denied",
+                "Glob",
+                {"pattern": "escape_link/**/*.py"},
+                "deny",
+            ),
             ("Glob tool inside repository is allowed", "Glob", {"pattern": "**/*.py"}, "allow"),
-            ("Glob tool inside repo subdirectory is allowed", "Glob", {"pattern": "src/**/*.py"}, "allow"),
-            ("read_file on claude session store is denied", "read_file", {"filePath": str(self.home / ".claude" / "projects" / "slug" / "session.jsonl")}, "deny"),
-            ("read_file on copilot session store is denied", "read_file", {"filePath": str(self.home / ".copilot" / "session-state" / "session.jsonl")}, "deny"),
-            ("read_file on antigravity brain store is denied", "read_file", {"filePath": str(self.home / ".gemini" / "antigravity" / "brain" / "conv-1" / "session.jsonl")}, "deny"),
-            ("grep_search with includePattern outside repo is denied", "grep_search", {"query": "foo", "includePattern": "../other-repo/**"}, "deny"),
-            ("file_search scoped to repo subdirectory is allowed", "file_search", {"query": "app.py", "folder": str(self.repo / "src")}, "allow"),
+            (
+                "Glob tool inside repo subdirectory is allowed",
+                "Glob",
+                {"pattern": "src/**/*.py"},
+                "allow",
+            ),
+            (
+                "read_file on claude session store is denied",
+                "read_file",
+                {"filePath": str(self.home / ".claude" / "projects" / "slug" / "session.jsonl")},
+                "deny",
+            ),
+            (
+                "read_file on copilot session store is denied",
+                "read_file",
+                {"filePath": str(self.home / ".copilot" / "session-state" / "session.jsonl")},
+                "deny",
+            ),
+            (
+                "read_file on antigravity brain store is denied",
+                "read_file",
+                {
+                    "filePath": str(
+                        self.home / ".gemini" / "antigravity" / "brain" / "conv-1" / "session.jsonl"
+                    )
+                },
+                "deny",
+            ),
+            (
+                "grep_search with includePattern outside repo is denied",
+                "grep_search",
+                {"query": "foo", "includePattern": "../other-repo/**"},
+                "deny",
+            ),
+            (
+                "file_search scoped to repo subdirectory is allowed",
+                "file_search",
+                {"query": "app.py", "folder": str(self.repo / "src")},
+                "allow",
+            ),
         ]
         for description, tool, tool_input, expected in cases:
             with self.subTest(case=description):
@@ -253,11 +508,7 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_pre_tool_enforces_scope_when_gate_is_active(self) -> None:
-        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
-        state_file.write_text(
-            json.dumps({"active": True, "tier": "standard", "cwd": str(self.repo)}),
-            encoding="utf-8",
-        )
+        open_gate(self.repo, UNBORN_BASE)
         claude_read = {
             "hook_event_name": "PreToolUse",
             "cwd": str(self.repo),
@@ -268,11 +519,7 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_pre_tool_emits_warning_when_scope_mode_is_warn(self) -> None:
-        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
-        state_file.write_text(
-            json.dumps({"active": True, "tier": "standard", "cwd": str(self.repo)}),
-            encoding="utf-8",
-        )
+        open_gate(self.repo, UNBORN_BASE)
         subprocess.run(["git", "config", "craftsman.scope", "warn"], cwd=self.repo, check=True)
         payload = {
             "cwd": str(self.repo),
@@ -284,11 +531,7 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.assertIn("[CRAFTSMAN SCOPE-GUARD]", out["systemMessage"])
 
     def test_pre_tool_allows_silently_when_scope_mode_is_off(self) -> None:
-        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
-        state_file.write_text(
-            json.dumps({"active": True, "tier": "standard", "cwd": str(self.repo)}),
-            encoding="utf-8",
-        )
+        open_gate(self.repo, UNBORN_BASE)
         subprocess.run(["git", "config", "craftsman.scope", "off"], cwd=self.repo, check=True)
         payload = {
             "cwd": str(self.repo),
@@ -356,17 +599,23 @@ class ScopeEnforcementTests(unittest.TestCase):
     def test_heredoc_with_apostrophe_does_not_bypass_scope_check(self) -> None:
         heredoc_cmd = "cat <<'EOF'\nit's done\nEOF\nfind ~ -name SKILL.md"
         self.assertEqual(
-            evaluate_scope(
-                "Bash", {"command": heredoc_cmd}, self.repo, self.repo, self.policy
-            ).decision,
+            evaluate_scope("Bash", {"command": heredoc_cmd}, self.repo, self.repo, self.policy).decision,
             "deny",
         )
 
     def test_multiline_quoted_argument_does_not_bypass_scope_check(self) -> None:
         for case, cmd, expected in (
-            ("commit message before rg in home", 'git commit -m "subject\n\nbody" && rg secret ~', "deny"),
+            (
+                "commit message before rg in home",
+                'git commit -m "subject\n\nbody" && rg secret ~',
+                "deny",
+            ),
             ("python -c before find in home", 'python -c "\nprint(1)\n"; find ~ -name SKILL.md', "deny"),
-            ("commit message before rg in repo", 'git commit -m "subject\n\nbody" && rg secret src', "allow"),
+            (
+                "commit message before rg in repo",
+                'git commit -m "subject\n\nbody" && rg secret src',
+                "allow",
+            ),
         ):
             with self.subTest(case=case):
                 self.assertEqual(
@@ -403,21 +652,10 @@ class ScopeEnforcementTests(unittest.TestCase):
                 )
 
     def test_antigravity_run_command_enforces_scope_for_owner_session(self) -> None:
-        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
-        state_file.write_text(
-            json.dumps(
-                {
-                    "active": True,
-                    "tier": "standard",
-                    "cwd": str(self.repo),
-                    "owner": {"platform": "antigravity", "session_id": "conv-123"},
-                }
-            ),
-            encoding="utf-8",
-        )
+        open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
         dec, reason = evaluate_command(
             {
-                "conversation_id": "conv-123",
+                "artifactDirectoryPath": str(self.tmp / "brain" / "conv-123"),
                 "toolCall": {
                     "name": "run_command",
                     "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)},

@@ -205,7 +205,9 @@ class AutoDetectionAndModeTests(IsolatedInstallTestCase):
         self.assertIn("Detected: Google Antigravity", out)
         self.assertIn("Detected: Claude Code", out)
         self.assertIn("Detected: GitHub Copilot", out)
-        self.assertTrue((self.home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file())
+        self.assertTrue(
+            (self.home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file()
+        )
         self.assertTrue((self.home / ".claude" / "commands" / "craftsman.md").is_file())
         self.assertTrue((self.home / ".copilot" / "skills" / "craftsman" / "SKILL.md").is_file())
         self.assertIsNone(self.git_global_get("core.hooksPath"))
@@ -235,9 +237,7 @@ class AutoDetectionAndModeTests(IsolatedInstallTestCase):
 
         # Mutate a passthrough hook to verify detect_antigravity_drift catches git-hooks drift
         (cfg_dir / "git-hooks" / "applypatch-msg").write_text("drifted\n", encoding="utf-8")
-        self.assertEqual(
-            detect_antigravity_drift(REPO_ROOT, cfg_dir), ["git-hooks/applypatch-msg"]
-        )
+        self.assertEqual(detect_antigravity_drift(REPO_ROOT, cfg_dir), ["git-hooks/applypatch-msg"])
 
         # 2. Symlink mode refreshes both Antigravity and already-installed git-hooks
         code, _, err = self.run_cli_inproc("install", "--symlink")
@@ -669,7 +669,10 @@ class GitHooksChainingAndUninstallTests(IsolatedInstallTestCase):
         doc_out = io.StringIO()
         doc_err = io.StringIO()
         with (
-            mock.patch("craftsman.cli.git_config_get", side_effect=lambda k: str(hooks_dir) if k == "core.hooksPath" else "Test"),
+            mock.patch(
+                "craftsman.cli.git_config_get",
+                side_effect=lambda k: str(hooks_dir) if k == "core.hooksPath" else "Test",
+            ),
             contextlib.redirect_stdout(doc_out),
             contextlib.redirect_stderr(doc_err),
         ):
@@ -756,9 +759,7 @@ class GitHooksChainingAndUninstallTests(IsolatedInstallTestCase):
         settings_path = claude_dir / "settings.json"
         initial_settings: dict[str, Any] = {
             "theme": "dark",
-            "hooks": {
-                "Stop": [{"hooks": [{"type": "command", "command": "echo custom-stop"}]}]
-            },
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo custom-stop"}]}]},
         }
         settings_path.write_text(json.dumps(initial_settings, indent=2) + "\n", encoding="utf-8")
 
@@ -977,6 +978,19 @@ class DryRunAndBootstrapTests(IsolatedInstallTestCase):
         self.assertFalse((ws / ".cursor").exists())
         self.assertFalse((ws / ".github").exists())
         self.assertFalse((ws / MANIFEST_FILENAME).exists())
+
+
+class DriftCheckTests(unittest.TestCase):
+    def test_drift_check_reports_a_changed_hooks_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config"
+            skill = cfg / "skills" / "craftsman" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_bytes((REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_bytes())
+            hooks = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))
+            hooks["craftsman-stop-gate"]["Stop"][0]["timeout"] += 1
+            (cfg / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+            self.assertIn("hooks.json", detect_antigravity_drift(REPO_ROOT, cfg))
 
 
 if __name__ == "__main__":

@@ -175,7 +175,7 @@ def codes(report: GateReport) -> list[str]:
     return [issue.code for issue in report.issues]
 
 
-QUICK = GatePolicy(tier="quick", require_isolation=False)
+QUICK = GatePolicy(tier="quick")
 
 
 class OpenRoundTests(unittest.TestCase):
@@ -450,7 +450,7 @@ class VerdictAndResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "is a design question"):
             resolve(ledger, "F1", "accepted", "Requested by maintainer.", fingerprint="fp2")
 
-        report = evaluate(ledger, snap, GatePolicy(tier="quick", require_isolation=False))
+        report = evaluate(ledger, snap, GatePolicy(tier="quick"))
         self.assertNotIn("unresolved", [issue.code for issue in report.issues])
 
     def test_merge_findings_rejects_judged_or_resolved_findings_and_deduplicates_scenarios(
@@ -481,16 +481,14 @@ class VerdictAndResolutionTests(unittest.TestCase):
             suggestion="",
         )
         ledger, _ = set_verdict(ledger, f1.id, "proven", EVIDENCE, "R1")
-        ledger, _ = resolve(
-            ledger, f1.id, "fixed", "Fixed minor issue at app.py:3.", fingerprint="fp2"
-        )
+        ledger, _ = resolve(ledger, f1.id, "fixed", "Fixed minor issue at app.py:3.", fingerprint="fp2")
         ledger, _ = set_verdict(ledger, f2.id, "proven", EVIDENCE, "R1")
 
         # Bypass #1 regression: merging an open blocker into a fixed minor target must fail,
         # and evaluate must still block on F2.
         with self.assertRaisesRegex(LedgerError, "only works on findings without a verdict.*F1"):
             merge_findings(ledger, f1.id, [f2.id])
-        report = evaluate(ledger, snap2, GatePolicy(tier="quick", require_isolation=False))
+        report = evaluate(ledger, snap2, GatePolicy(tier="quick"))
         unresolved = [issue for issue in report.issues if issue.code == "unresolved"]
         self.assertEqual(len(unresolved), 1)
         self.assertIn("F2", unresolved[0].message)
@@ -589,7 +587,9 @@ class VerdictAndResolutionTests(unittest.TestCase):
 
         merged_ledger2, target2, _ = merge_findings(merged_ledger, u1.id, [u3.id])
         self.assertEqual(
-            target2.scenario.count("With -c sub/pytest.ini, parent conftest.py is no longer discovered."),
+            target2.scenario.count(
+                "With -c sub/pytest.ini, parent conftest.py is no longer discovered."
+            ),
             1,
         )
         with self.assertRaisesRegex(LedgerError, "cannot merge F1 into itself"):
@@ -817,7 +817,9 @@ class GateTests(unittest.TestCase):
             ledger, _ = add_coverage(ledger, "sweep", ["H1"], note_for(["H1"]))
             partial = evaluate(ledger, self.snap, QUICK)
             self.assertEqual(codes(partial), ["uncovered"])
-            self.assertIn("Lens `sweep` has 1 uncovered hunk(s) in round 1: H2", partial.issues[0].message)
+            self.assertIn(
+                "Lens `sweep` has 1 uncovered hunk(s) in round 1: H2", partial.issues[0].message
+            )
 
             ledger, _ = add_coverage(ledger, "sweep", ["H2"], note_for(["H2"]))
             self.assertTrue(evaluate(ledger, self.snap, QUICK).passed)
@@ -835,7 +837,7 @@ class GateTests(unittest.TestCase):
 
     def test_round_prepared_below_the_required_tier_is_rejected(self) -> None:
         ledger = fully_reviewed(self.snap)
-        standard = GatePolicy(tier="standard", require_isolation=False)
+        standard = GatePolicy(tier="standard")
 
         report = evaluate(ledger, self.snap, standard)
 
@@ -873,7 +875,7 @@ class GateTests(unittest.TestCase):
 
     def test_deep_tier_requires_an_e2e_run(self) -> None:
         ledger = fully_reviewed(self.snap, tier="deep")
-        deep = GatePolicy(tier="deep", require_isolation=False)
+        deep = GatePolicy(tier="deep")
 
         self.assertEqual(codes(evaluate(ledger, self.snap, deep)), ["no-e2e-run"])
         ledger = add_run(ledger, make_run(("python3", "scripts/smoke.py"), kind="e2e"))
@@ -893,7 +895,7 @@ class GateTests(unittest.TestCase):
         self.assertTrue(evaluate(ledger, self.snap, QUICK).passed)
 
     def test_isolation_requires_a_reviewer_stop_after_the_round_was_prepared(self) -> None:
-        standard = GatePolicy(tier="standard", require_isolation=True)
+        standard = GatePolicy(tier="standard", isolation_evidence="hooks")
         with mock.patch("craftsman.ledger._now", return_value=T1):
             ledger = fully_reviewed(self.snap, tier="standard")
 
@@ -910,13 +912,23 @@ class GateTests(unittest.TestCase):
         for candidate in (too_early, wrong_agent, started_only):
             self.assertEqual(codes(evaluate(candidate, self.snap, standard)), ["no-isolation"])
 
-        reviewed = add_agent_event(ledger, stop("Craftsman-Reviewer#2", T1))
+        reviewed = add_agent_event(ledger, stop("Craftsman-Reviewer", T1))
         self.assertTrue(evaluate(reviewed, self.snap, standard).passed)
         self.assertFalse(evaluate(reviewed, self.snap, standard).self_reviewed)
         self.assertTrue(evaluate(ledger, self.snap, replace(standard, tier="quick")).passed)
 
+    def test_agent_merely_containing_the_reviewer_name_is_not_isolation(self) -> None:
+        standard = GatePolicy(tier="standard", isolation_evidence="hooks")
+        with mock.patch("craftsman.ledger._now", return_value=T1):
+            ledger = fully_reviewed(self.snap, tier="standard")
+        helper = AgentEvent(
+            platform="claude", event="stop", agent="craftsman-reviewer-helper", agent_id="x", at=T1
+        )
+        report = evaluate(add_agent_event(ledger, helper), self.snap, standard)
+        self.assertEqual(codes(report), ["no-isolation"])
+
     def test_standard_review_without_isolation_is_marked_self_reviewed(self) -> None:
-        unisolated = GatePolicy(tier="standard", require_isolation=False)
+        unisolated = GatePolicy(tier="standard")
         ledger = fully_reviewed(self.snap, tier="standard")
 
         report = evaluate(ledger, self.snap, unisolated)
@@ -932,7 +944,7 @@ class GateTests(unittest.TestCase):
         ledger = Ledger()
         for number in range(1, 4):
             ledger, _ = prepared(make_snap(*self.snap.hunks, fingerprint=f"fp{number}"), ledger=ledger)
-        policy = GatePolicy(tier="quick", require_isolation=False, max_rounds=2)
+        policy = GatePolicy(tier="quick", max_rounds=2)
 
         report = evaluate(ledger, make_snap(*self.snap.hunks, fingerprint="fp3"), policy)
 
@@ -982,9 +994,7 @@ class GateTests(unittest.TestCase):
             "Process anomaly: 5 findings and 0 dismissed (all findings confirmed — typical of self-review).",
             report.warnings,
         )
-        self.assertTrue(
-            any("repeated as R3 with a different environment" in w for w in report.warnings)
-        )
+        self.assertTrue(any("repeated as R3 with a different environment" in w for w in report.warnings))
 
     def test_render_report_caps_next_actions(self) -> None:
         ledger, _ = prepared(self.snap)
@@ -1009,7 +1019,7 @@ class GateTests(unittest.TestCase):
             ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
             ledger, _ = set_verdict(ledger, "F2", "probable", PROBABLE, None)
 
-        standard = GatePolicy(tier="standard", require_isolation=False)
+        standard = GatePolicy(tier="standard")
         full_report = evaluate(ledger, self.snap, standard)
         self.assertFalse(full_report.passed)
         self.assertEqual(
@@ -1027,10 +1037,8 @@ class GateTests(unittest.TestCase):
         self.assertFalse(hasattr(standard, "review_only"))
 
     def test_review_only_still_requires_round_coverage_sweep_and_verdicts(self) -> None:
-        standard = GatePolicy(tier="standard", require_isolation=False)
-        self.assertEqual(
-            codes(evaluate(Ledger(), self.snap, standard, review_only=True)), ["no-round"]
-        )
+        standard = GatePolicy(tier="standard")
+        self.assertEqual(codes(evaluate(Ledger(), self.snap, standard, review_only=True)), ["no-round"])
 
         with mock.patch("craftsman.ledger._now", side_effect=clock_from()):
             ledger, _ = prepared(self.snap, lenses=("intent", "sweep"), tier="standard")
@@ -1051,9 +1059,7 @@ class GateTests(unittest.TestCase):
                 )
             )
             changed = make_snap(*self.snap.hunks, fingerprint="fp2")
-            self.assertIn(
-                "stale-round", codes(evaluate(ledger, changed, standard, review_only=True))
-            )
+            self.assertIn("stale-round", codes(evaluate(ledger, changed, standard, review_only=True)))
 
 
 def clock_from(start: int = 0) -> Iterator[str]:
@@ -1071,7 +1077,9 @@ class HardeningTests(unittest.TestCase):
     def test_a_fix_that_is_reverted_counts_as_unresolved_again(self) -> None:
         ledger = add_run(with_finding(fully_reviewed(self.snap)), make_run(kind="repro", exit_code=1))
         ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R2")
-        ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list in total().", fingerprint="fp2")
+        ledger, _ = resolve(
+            ledger, "F1", "fixed", "Guarded the empty list in total().", fingerprint="fp2"
+        )
 
         (issue,) = evaluate(ledger, self.snap, QUICK).issues
 
@@ -1131,7 +1139,11 @@ class HardeningTests(unittest.TestCase):
 
         cases = [
             ("R1", "The command was replaced by another one.", "R1 passed"),
-            ("R9", "The command was replaced by another one.", "unknown run 'R9'; recorded runs: R1, R2"),
+            (
+                "R9",
+                "The command was replaced by another one.",
+                "unknown run 'R9'; recorded runs: R1, R2",
+            ),
             ("R2", "typo", "reason must have at least 20 characters"),
         ]
         for run_id, reason, message in cases:
@@ -1139,7 +1151,9 @@ class HardeningTests(unittest.TestCase):
                 waive_run(ledger, run_id, reason)
 
         with mock.patch("craftsman.ledger._now", return_value=T1):
-            waived, run = waive_run(ledger, "R2", "  Typo in the path; tests/test_cart.py is the real file.  ")
+            waived, run = waive_run(
+                ledger, "R2", "  Typo in the path; tests/test_cart.py is the real file.  "
+            )
 
         self.assertEqual(
             run.waiver, RunWaiver("Typo in the path; tests/test_cart.py is the real file.", T1)
@@ -1152,7 +1166,9 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(Ledger.from_json(json.loads(json.dumps(waived.to_json()))), waived)
 
     def test_a_later_failure_of_the_same_command_is_not_waived(self) -> None:
-        ledger = add_run(fully_reviewed(self.snap), make_run(("ruff", "check"), kind="lint", exit_code=1))
+        ledger = add_run(
+            fully_reviewed(self.snap), make_run(("ruff", "check"), kind="lint", exit_code=1)
+        )
         ledger, _ = waive_run(ledger, "R2", "Ran with a stale config before the rename.")
         ledger = add_run(ledger, make_run(("ruff", "check"), kind="lint", exit_code=1))
 
@@ -1190,15 +1206,21 @@ class HardeningTests(unittest.TestCase):
         snap = make_snap(caller, changed, fingerprint="fp2")
         ledger, round_ = prepared(snap, ledger=ledger, symbols={"H2": ["compute_total"]})
 
-        self.assertEqual([(h.carried, h.reopened) for h in round_.hunks], [(False, True), (False, False)])
-        self.assertEqual(uncovered_by_lens(ledger, round_), {"intent": ["H1", "H2"], "craft": ["H1", "H2"]})
+        self.assertEqual(
+            [(h.carried, h.reopened) for h in round_.hunks], [(False, True), (False, False)]
+        )
+        self.assertEqual(
+            uncovered_by_lens(ledger, round_), {"intent": ["H1", "H2"], "craft": ["H1", "H2"]}
+        )
 
     def test_a_hunk_reopened_in_an_abandoned_round_keeps_needing_fresh_coverage(self) -> None:
         caller = make_hunk("H1", "a.py", (" total = compute_total(x)", "+y = 1"))
         ledger = fully_reviewed(make_snap(caller, make_hunk("H2", "b.py", ("+def compute_total(a):",))))
         changed = make_hunk("H2", "b.py", ("+def compute_total(a, b):",))
         ledger, _ = prepared(
-            make_snap(caller, changed, fingerprint="fp2"), ledger=ledger, symbols={"H2": ["compute_total"]}
+            make_snap(caller, changed, fingerprint="fp2"),
+            ledger=ledger,
+            symbols={"H2": ["compute_total"]},
         )
         ledger, _ = add_coverage(ledger, "intent", ["H1"], note_for(["H1"]))
 
@@ -1219,7 +1241,8 @@ class HardeningTests(unittest.TestCase):
             ledger, round_ = prepared(self.snap, ("intent", "craft", "sweep"), "deep", ledger)
 
             self.assertEqual(
-                uncovered_by_lens(ledger, round_), {"intent": [], "craft": ["H1", "H2"], "sweep": ["H1", "H2"]}
+                uncovered_by_lens(ledger, round_),
+                {"intent": [], "craft": ["H1", "H2"], "sweep": ["H1", "H2"]},
             )
             ledger, _ = add_coverage(ledger, "craft", ["H1", "H2"], note_for(["H1", "H2"]))
             self.assertEqual(codes(evaluate(ledger, self.snap, QUICK)), ["uncovered"])
@@ -1314,7 +1337,7 @@ class HardeningTests(unittest.TestCase):
         snap = DiffSnapshot(BASE, "fp1", (), ("logo.png",), (), 0, 0)
         ledger, _ = prepared(snap, tier="standard")
         ledger = add_run(ledger, make_run())
-        isolated = GatePolicy(tier="standard", require_isolation=True)
+        isolated = GatePolicy(tier="standard", isolation_evidence="hooks")
 
         report = evaluate(ledger, snap, isolated)
 
@@ -1362,7 +1385,7 @@ class HardeningTests(unittest.TestCase):
         ledger, _ = prepared(self.snap)
         ledger, _ = prepared(self.snap, tier="standard", ledger=ledger)
         ledger, _ = prepared(self.snap, tier="deep", ledger=ledger)
-        policy = GatePolicy(tier="quick", require_isolation=False, max_rounds=1)
+        policy = GatePolicy(tier="quick", max_rounds=1)
 
         self.assertNotIn("round-cap", codes(evaluate(ledger, self.snap, policy)))
 

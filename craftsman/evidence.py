@@ -7,16 +7,15 @@ so that `craftsman.gate` can depend on it.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-from craftsman.diffscan import DiffSnapshot, resolve_base_sha, snapshot, worktree_root
+from craftsman.diffscan import DiffSnapshot
 from craftsman.ledger import (
     GatePolicy,
     GateReport,
+    IsolationEvidence,
     Ledger,
     LedgerError,
     evaluate,
@@ -24,7 +23,6 @@ from craftsman.ledger import (
     load,
     locked,
     replace_with_retry,
-    uncovered_by_lens,
 )
 from craftsman.lenses import Tier, strictest_tier
 
@@ -33,24 +31,26 @@ PACKET_GLOB = "packet-*.md"
 
 @dataclass(frozen=True)
 class Evaluation:
+    """The gate's verdict on a work tree: its diff, its ledger, and the tier the gate applied."""
+
     snap: DiffSnapshot
     ledger: Ledger
+    tier: Tier
     report: GateReport
 
 
 def evaluate_evidence(
-    cwd: str | Path, base_ref: str | None, tier: Tier, policy_for: Callable[[Tier], GatePolicy]
+    root: Path, snap: DiffSnapshot, tier: Tier, isolation: IsolationEvidence
 ) -> Evaluation:
-    """Evaluate the ledger of the work tree containing `cwd` against its diff from `base_ref`.
+    """Evaluate the ledger of the work tree `root` against its diff `snap`.
 
-    The policy is built for `tier` or, when the latest round was prepared for a stricter tier,
-    for that one: a review that chose to go deeper is held to it.
+    The gate applies `tier` or, when the latest round was prepared for a stricter tier, that one:
+    a review that chose to go deeper is held to it.
     """
-    root = worktree_root(cwd)
     ledger = load(ledger_path_for(root))
-    snap = snapshot(root, resolve_base_sha(root, base_ref))
-    policy = policy_for(effective_tier(ledger, tier))
-    return Evaluation(snap, ledger, evaluate(ledger, snap, policy))
+    strictest = effective_tier(ledger, tier)
+    report = evaluate(ledger, snap, GatePolicy(tier=strictest, isolation_evidence=isolation))
+    return Evaluation(snap, ledger, strictest, report)
 
 
 def effective_tier(ledger: Ledger, tier: Tier, *others: Tier) -> Tier:
@@ -107,7 +107,10 @@ def _unused_stamp(ledger_path: Path) -> str:
     """A UTC timestamp that names neither an existing archived ledger nor an archive folder."""
     base = stamp = _archive_stamp()
     attempt = 1
-    while _archived_ledger_path(ledger_path, stamp).exists() or _archive_folder(ledger_path, stamp).exists():
+    while (
+        _archived_ledger_path(ledger_path, stamp).exists()
+        or _archive_folder(ledger_path, stamp).exists()
+    ):
         attempt += 1
         stamp = f"{base}-{attempt}"
     return stamp
@@ -119,29 +122,3 @@ def _archived_ledger_path(ledger_path: Path, stamp: str) -> Path:
 
 def _archive_folder(ledger_path: Path, stamp: str) -> Path:
     return ledger_path.parent / f"archive-{stamp}"
-
-
-def ledger_overview(ledger: Ledger) -> dict[str, Any]:
-    """Compact, JSON-ready summary of the ledger for status displays."""
-    latest = ledger.rounds[-1] if ledger.rounds else None
-    coverage: dict[str, Any] | None = None
-    if latest is not None:
-        missing = uncovered_by_lens(ledger, latest)
-        open_hunks = sum(not hunk.carried for hunk in latest.hunks)
-        total = open_hunks * len(latest.lenses)
-        coverage = {"covered": total - sum(len(ids) for ids in missing.values()), "total": total}
-    verdicts = {"none": 0, "proven": 0, "probable": 0, "question": 0, "dismissed": 0}
-    for finding in ledger.findings:
-        verdicts[finding.verdict or "none"] += 1
-    return {
-        "rounds": len(ledger.rounds),
-        "tier": latest.tier if latest else None,
-        "coverage": coverage,
-        "findings": len(ledger.findings),
-        "verdicts": verdicts,
-        "resolved": sum(finding.resolution is not None for finding in ledger.findings),
-        "latest_runs": [
-            {"id": run.id, "kind": run.kind, "command": run.command, "exit_code": run.exit_code}
-            for run in ledger.runs[-3:]
-        ],
-    }

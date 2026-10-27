@@ -20,7 +20,7 @@ from typing import Any
 
 from craftsman import __version__
 from craftsman.export import (
-     COPILOT_DISCOVERY,
+    COPILOT_DISCOVERY,
     COPY_IGNORED_NAMES,
     CRAFTSMAN_BEGIN_MARKER,
     CRAFTSMAN_END_MARKER,
@@ -139,9 +139,7 @@ def _parse_manifest_str_list(raw: dict[str, Any], key: str, source: str) -> tupl
         return ()
     val = raw[key]
     if not isinstance(val, list) or not all(isinstance(item, str) for item in val):
-        raise InstallError(
-            f"Invalid install manifest {source}: '{key}' must be a list of strings"
-        )
+        raise InstallError(f"Invalid install manifest {source}: '{key}' must be a list of strings")
     return tuple(val)
 
 
@@ -157,9 +155,7 @@ class TargetManifest:
     hooks_dir: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "modified_files", MappingProxyType(dict(self.modified_files))
-        )
+        object.__setattr__(self, "modified_files", MappingProxyType(dict(self.modified_files)))
 
     def __hash__(self) -> int:
         return hash(
@@ -191,14 +187,14 @@ class TargetManifest:
         return data
 
     @classmethod
-    def from_dict(cls, target_key: str, raw: dict[str, Any], source: str = "<manifest>") -> TargetManifest:
+    def from_dict(
+        cls, target_key: str, raw: dict[str, Any], source: str = "<manifest>"
+    ) -> TargetManifest:
         created_paths = _parse_manifest_str_list(raw, "created_paths", source)
         created_dirs = _parse_manifest_str_list(raw, "created_dirs", source)
         raw_mod = raw.get("modified_files", {})
         if not isinstance(raw_mod, dict):
-            raise InstallError(
-                f"Invalid install manifest {source}: 'modified_files' must be an object"
-            )
+            raise InstallError(f"Invalid install manifest {source}: 'modified_files' must be an object")
         modified_files = {
             str(k): str(v) for k, v in raw_mod.items() if isinstance(k, str) and isinstance(v, str)
         }
@@ -266,9 +262,7 @@ class BaseManifest:
         prev_hooks: str | None = None
         hooks_dir: str | None = None
         primary_modes = [
-            t_man.mode
-            for t_key, t_man in sorted(targets.items())
-            if t_key != TargetKind.GIT_HOOKS.value
+            t_man.mode for t_key, t_man in sorted(targets.items()) if t_key != TargetKind.GIT_HOOKS.value
         ]
         if TargetKind.ANTIGRAVITY.value in targets:
             mode = targets[TargetKind.ANTIGRAVITY.value].mode
@@ -356,9 +350,7 @@ class _TargetInstallSession:
         preserve_modified: bool = False,
     ) -> _TargetInstallSession:
         existing_manifest = load_manifest(base_dir)
-        prev_target = (
-            existing_manifest.targets.get(target_kind.value) if existing_manifest else None
-        )
+        prev_target = existing_manifest.targets.get(target_kind.value) if existing_manifest else None
         owned_paths = set(existing_manifest.created_paths) if existing_manifest else set()
         other_owned: set[str] = set()
         if existing_manifest:
@@ -375,9 +367,7 @@ class _TargetInstallSession:
             created_paths=[],
             created_dirs=list(prev_target.created_dirs) if prev_target else [],
             modified_files=(
-                dict(prev_target.modified_files)
-                if preserve_modified and prev_target
-                else {}
+                dict(prev_target.modified_files) if preserve_modified and prev_target else {}
             ),
             stop_roots=_stop_roots_for(home, *extra_roots),
         )
@@ -620,19 +610,13 @@ def resolve_git_hooks_base_dir(
 ) -> Path:
     h = user_home(home)
     config_dir = h / ".gemini" / "config"
-    if (
-        installing_antigravity
-        or config_dir.is_dir()
-        or (h / ".gemini" / "antigravity").is_dir()
-    ):
+    if installing_antigravity or config_dir.is_dir() or (h / ".gemini" / "antigravity").is_dir():
         return config_dir
     craftsman_home = env_var_for_home("CRAFTSMAN_HOME", home)
     return Path(craftsman_home) if craftsman_home else (h / ".craftsman")
 
 
-def _record_missing_dirs(
-    directory: Path, created_dirs: list[str], stop_roots: set[Path]
-) -> None:
+def _record_missing_dirs(directory: Path, created_dirs: list[str], stop_roots: set[Path]) -> None:
     chain: list[Path] = []
     cur = Path(os.path.abspath(str(directory)))
     while cur not in stop_roots and cur.parent != cur:
@@ -660,9 +644,7 @@ def _stop_roots_for(home: Path, *extra: Path) -> set[Path]:
     return roots
 
 
-def _allowed_roots_for_target(
-    base_dir: Path, target_key: str, home: Path
-) -> tuple[Path, ...]:
+def _allowed_roots_for_target(base_dir: Path, target_key: str, home: Path) -> tuple[Path, ...]:
     roots: list[Path] = [base_dir]
     if target_key in (TargetKind.COPILOT.value, "default"):
         roots.append(default_copilot_skills_dir(home))
@@ -720,9 +702,7 @@ def _ensure_safe_target(
 ) -> None:
     """Back up `target` if it exists and is not owned by a previous Craftsman install; remove if owned."""
     if _has_symlinked_parent(target, stop_roots):
-        raise InstallError(
-            f"Refusing to write {target}: an intermediate parent directory is a symlink."
-        )
+        raise InstallError(f"Refusing to write {target}: an intermediate parent directory is a symlink.")
     if not (target.exists() or target.is_symlink()):
         return
     if _is_owned(target, owned_paths):
@@ -737,9 +717,9 @@ def _ensure_safe_target(
 
 
 def _has_symlinked_parent(path: Path, stop_roots: Collection[Path] = ()) -> bool:
-    effective_stops: set[Path] = {
-        Path(os.path.abspath(str(r))) for r in stop_roots
-    } | {_resolve_safe(r) for r in stop_roots}
+    effective_stops: set[Path] = {Path(os.path.abspath(str(r))) for r in stop_roots} | {
+        _resolve_safe(r) for r in stop_roots
+    }
     ambient_home = user_home(None)
     effective_stops.add(Path(os.path.abspath(str(ambient_home))))
     effective_stops.add(_resolve_safe(ambient_home))
@@ -755,9 +735,7 @@ def _has_symlinked_parent(path: Path, stop_roots: Collection[Path] = ()) -> bool
     return False
 
 
-def _remove_path_if_exists(
-    path: Path, *, dry_run: bool, stop_roots: Collection[Path] = ()
-) -> bool:
+def _remove_path_if_exists(path: Path, *, dry_run: bool, stop_roots: Collection[Path] = ()) -> bool:
     """Remove `path` without traversing through a symlinked intermediate directory below `stop_roots`."""
     if _has_symlinked_parent(path, stop_roots):
         return False
@@ -771,17 +749,13 @@ def _remove_path_if_exists(
     return True
 
 
-def _copy_file_atomic(
-    src: Path, dst: Path, *, executable: bool = False, dry_run: bool = False
-) -> None:
+def _copy_file_atomic(src: Path, dst: Path, *, executable: bool = False, dry_run: bool = False) -> None:
     if dry_run:
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     data = src.read_bytes()
     mode = 0o755 if executable else (src.stat().st_mode & 0o777 or 0o644)
-    fd, tmp_str = tempfile.mkstemp(
-        prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent)
-    )
+    fd, tmp_str = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
@@ -840,9 +814,7 @@ def _install_scripts_to(
     if not tracker.dry_run:
         target_scripts_dir.mkdir(parents=True, exist_ok=True)
 
-    _ensure_safe_target(
-        target_pkg_dir, session.owned_paths, tracker, stop_roots=session.stop_roots
-    )
+    _ensure_safe_target(target_pkg_dir, session.owned_paths, tracker, stop_roots=session.stop_roots)
     if mode in (InstallMode.SYMLINK, InstallMode.PLUGIN):
         if not tracker.dry_run:
             target_pkg_dir.symlink_to(pkg_src_dir, target_is_directory=True)
@@ -961,9 +933,7 @@ def _merge_antigravity_hooks_json(
     print(f"  + hooks: {target_hooks}")
 
 
-def _unmerge_antigravity_hooks_json(
-    repo_dir: Path, target_hooks: Path, *, dry_run: bool
-) -> bool:
+def _unmerge_antigravity_hooks_json(repo_dir: Path, target_hooks: Path, *, dry_run: bool) -> bool:
     if not target_hooks.is_file():
         return False
     src_hooks = repo_dir / "hooks.json"
@@ -985,9 +955,7 @@ def _unmerge_antigravity_hooks_json(
     if updated == dst_data:
         return False
     if not dry_run:
-        write_text_atomic(
-            target_hooks, json.dumps(updated, indent=2, ensure_ascii=False) + "\n"
-        )
+        write_text_atomic(target_hooks, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
     return True
 
 
@@ -1009,8 +977,7 @@ def _has_claude_craftsman_hooks(settings_path: Path) -> bool:
         for group in groups:
             entries = group.get("hooks") if isinstance(group, dict) else None
             if isinstance(entries, list) and any(
-                isinstance(e, dict) and is_craftsman_hook_command(e.get("command"))
-                for e in entries
+                isinstance(e, dict) and is_craftsman_hook_command(e.get("command")) for e in entries
             ):
                 return True
     return False
@@ -1043,10 +1010,7 @@ def _cleanup_obsolete_target_paths(
     for old_p in sorted(prev_target.created_paths, key=lambda s: len(Path(s).parts), reverse=True):
         if old_p in new_set or old_p in other_owned_paths:
             continue
-        if any(
-            ncp.startswith(old_p + os.sep) or old_p.startswith(ncp + os.sep)
-            for ncp in new_set
-        ):
+        if any(ncp.startswith(old_p + os.sep) or old_p.startswith(ncp + os.sep) for ncp in new_set):
             continue
         old_path = Path(old_p)
         if not old_path.is_symlink() and old_path.is_file():
@@ -1089,14 +1053,9 @@ def install_antigravity_target(
             abs_hooks = os.path.abspath(str(target_hooks))
             if target_hooks.is_file() and (
                 _is_owned(target_hooks, session.owned_paths)
-                or (
-                    session.prev_target is not None
-                    and abs_hooks in session.prev_target.modified_files
-                )
+                or (session.prev_target is not None and abs_hooks in session.prev_target.modified_files)
             ):
-                _unmerge_antigravity_hooks_json(
-                    repo_dir, target_hooks, dry_run=tracker.dry_run
-                )
+                _unmerge_antigravity_hooks_json(repo_dir, target_hooks, dry_run=tracker.dry_run)
                 if (
                     not tracker.dry_run
                     and _is_owned(target_hooks, session.owned_paths)
@@ -1138,9 +1097,7 @@ def install_antigravity_target(
                 if not skill_dir.is_dir():
                     continue
                 target = skills_dir / skill_dir.name
-                _ensure_safe_target(
-                    target, session.owned_paths, tracker, stop_roots=session.stop_roots
-                )
+                _ensure_safe_target(target, session.owned_paths, tracker, stop_roots=session.stop_roots)
                 if mode == InstallMode.SYMLINK:
                     if not tracker.dry_run:
                         target.symlink_to(skill_dir, target_is_directory=True)
@@ -1178,9 +1135,7 @@ def install_claude_target(
     tracker: InstallTracker,
 ) -> None:
     claude_dir = default_claude_dir(home)
-    session = _TargetInstallSession.begin(
-        claude_dir, TargetKind.CLAUDE, home, preserve_modified=True
-    )
+    session = _TargetInstallSession.begin(claude_dir, TargetKind.CLAUDE, home, preserve_modified=True)
     settings_path = claude_dir / "settings.json"
     abs_settings = os.path.abspath(str(settings_path))
 
@@ -1329,8 +1284,7 @@ def install_copilot_target(
     templates = load_agent_templates(repo_dir)
     skill_manifests = sorted((repo_dir / "skills").glob("*/SKILL.md"))
     skill_names = [
-        extract_skill_name(p.read_text(encoding="utf-8"), p.parent.name)
-        for p in skill_manifests
+        extract_skill_name(p.read_text(encoding="utf-8"), p.parent.name) for p in skill_manifests
     ]
 
     for prompts_dir in vscode_prompt_dirs(vscode_prompts):
@@ -1355,12 +1309,8 @@ def install_copilot_target(
     session.stage_path(hooks_file, tracker)
 
     if not tracker.dry_run:
-        count, instr = export_to_vscode_user(
-            repo_dir, vscode_prompts, prompt_files=prompt_files
-        )
-        skills_count = (
-            0 if prompt_files else export_to_copilot_skills(repo_dir, copilot_skills)
-        )
+        count, instr = export_to_vscode_user(repo_dir, vscode_prompts, prompt_files=prompt_files)
+        skills_count = 0 if prompt_files else export_to_copilot_skills(repo_dir, copilot_skills)
         agents, written_hooks = export_copilot_home(repo_dir, copilot_home)
     else:
         count = len(skill_names) if prompt_files else 0
@@ -1398,9 +1348,7 @@ def _stage_managed_markdown_file(
             f"Refusing to modify {target_file}: path escapes workspace {session.base_dir}"
         )
     if target_file.is_symlink():
-        _ensure_safe_target(
-            target_file, session.owned_paths, tracker, stop_roots=session.stop_roots
-        )
+        _ensure_safe_target(target_file, session.owned_paths, tracker, stop_roots=session.stop_roots)
     abs_path = os.path.abspath(str(target_file))
     was_modified_by_us = (
         session.prev_target is not None
@@ -1412,7 +1360,11 @@ def _stage_managed_markdown_file(
     ) or was_modified_by_us
     before_bytes = target_file.read_bytes() if target_file.is_file() else None
     bak_path = target_file.with_name(target_file.name + ".bak")
-    if target_file.is_file() and not _is_owned(target_file, session.owned_paths) and not bak_path.exists():
+    if (
+        target_file.is_file()
+        and not _is_owned(target_file, session.owned_paths)
+        and not bak_path.exists()
+    ):
         if not tracker.dry_run:
             shutil.copy2(target_file, bak_path)
         tracker.record_backup(target_file, bak_path)
@@ -1491,8 +1443,7 @@ def install_copilot_workspace_target(
     templates = load_agent_templates(repo_dir)
     skill_manifests = sorted((repo_dir / "skills").glob("*/SKILL.md"))
     skill_names = [
-        extract_skill_name(p.read_text(encoding="utf-8"), p.parent.name)
-        for p in skill_manifests
+        extract_skill_name(p.read_text(encoding="utf-8"), p.parent.name) for p in skill_manifests
     ]
 
     active_subs = ("prompts", "agents", "hooks") if prompt_files else ("skills", "agents", "hooks")
@@ -1513,18 +1464,14 @@ def install_copilot_workspace_target(
     session.stage_path(github_dir / "hooks" / HOOKS_FILENAME, tracker)
 
     copilot_instructions = github_dir / "copilot-instructions.md"
-    existed_unowned, before_bytes = _stage_managed_markdown_file(
-        copilot_instructions, session, tracker
-    )
+    existed_unowned, before_bytes = _stage_managed_markdown_file(copilot_instructions, session, tracker)
 
     if not tracker.dry_run:
         count, instr = export_to_workspace(repo_dir, ws, prompt_files=prompt_files)
     else:
         count = len(skill_names)
         instr = copilot_instructions
-    _record_managed_markdown_file(
-        copilot_instructions, existed_unowned, before_bytes, session, tracker
-    )
+    _record_managed_markdown_file(copilot_instructions, existed_unowned, before_bytes, session, tracker)
 
     if prompt_files:
         print(f"[OK] Exported {count} workspace prompt files -> {github_dir / 'prompts'}")
@@ -1564,17 +1511,13 @@ def install_agents_workspace_target(
     session.stage_path(cursor_mdc, tracker)
 
     agents_md = ws / "AGENTS.md"
-    existed_unowned, before_bytes = _stage_managed_markdown_file(
-        agents_md, session, tracker
-    )
+    existed_unowned, before_bytes = _stage_managed_markdown_file(agents_md, session, tracker)
 
     if not tracker.dry_run:
         written_agents, written_mdc = export_to_agents_workspace(repo_dir, ws)
     else:
         written_agents, written_mdc = agents_md, cursor_mdc
-    _record_managed_markdown_file(
-        agents_md, existed_unowned, before_bytes, session, tracker
-    )
+    _record_managed_markdown_file(agents_md, existed_unowned, before_bytes, session, tracker)
 
     print(f"[OK] Exported universal AGENTS.md (Codex/Cursor/Windsurf) -> {written_agents}")
     print(f"[OK] Exported Cursor rule -> {written_mdc}")
@@ -1590,9 +1533,7 @@ def install_git_hooks_target(
     installing_antigravity: bool,
     tracker: InstallTracker,
 ) -> None:
-    hooks_base_dir = resolve_git_hooks_base_dir(
-        home, installing_antigravity=installing_antigravity
-    )
+    hooks_base_dir = resolve_git_hooks_base_dir(home, installing_antigravity=installing_antigravity)
     git_hooks_dir = hooks_base_dir / "git-hooks"
 
     session = _TargetInstallSession.begin(hooks_base_dir, TargetKind.GIT_HOOKS, home)
@@ -1680,7 +1621,9 @@ def install_git_hooks_target(
                     old_gh_target = old_manifest.targets[TargetKind.GIT_HOOKS.value]
                     prior_from_old = old_gh_target.previous_hooks_path
                     if prior_from_old is None and (prev_resolved / ".previous_hooks_path").is_file():
-                        cand = (prev_resolved / ".previous_hooks_path").read_text(encoding="utf-8").strip()
+                        cand = (
+                            (prev_resolved / ".previous_hooks_path").read_text(encoding="utf-8").strip()
+                        )
                         if cand and _resolve_safe(Path(_expand_tilde(cand, home))) not in (
                             prev_resolved,
                             git_hooks_resolved,
@@ -1712,16 +1655,16 @@ def install_git_hooks_target(
                     write_text_atomic(prev_hooks_file, f"{expanded_prev}\n")
                 if abs_prev_file not in session.created_paths:
                     session.created_paths.append(abs_prev_file)
-                print(
-                    f"  ! backed up previous core.hooksPath ({raw_prev}) -> {prev_hooks_file}"
-                )
+                print(f"  ! backed up previous core.hooksPath ({raw_prev}) -> {prev_hooks_file}")
             else:
                 prior = session.prev_target.previous_hooks_path if session.prev_target else None
                 if prior is None and prev_hooks_file.is_file():
                     candidate_prior = prev_hooks_file.read_text(encoding="utf-8").strip()
-                    if candidate_prior and _resolve_safe(
-                        Path(_expand_tilde(candidate_prior, home))
-                    ) != git_hooks_resolved:
+                    if (
+                        candidate_prior
+                        and _resolve_safe(Path(_expand_tilde(candidate_prior, home)))
+                        != git_hooks_resolved
+                    ):
                         prior = candidate_prior
                 if prior:
                     recorded_prev_hooks = prior
@@ -1735,9 +1678,7 @@ def install_git_hooks_target(
                         prev_hooks_file, dry_run=tracker.dry_run, stop_roots=session.stop_roots
                     )
     else:
-        _remove_path_if_exists(
-            prev_hooks_file, dry_run=tracker.dry_run, stop_roots=session.stop_roots
-        )
+        _remove_path_if_exists(prev_hooks_file, dry_run=tracker.dry_run, stop_roots=session.stop_roots)
 
     if not tracker.dry_run:
         _git_config_set("core.hooksPath", str(git_hooks_dir))
@@ -1878,7 +1819,9 @@ def _validate_cli_flags(parsed: argparse.Namespace) -> InstallMode:
     if parsed.no_git_hooks and parsed.all:
         raise InstallError("Conflicting flags: --no-git-hooks cannot be combined with --all.")
     if parsed.no_claude_hooks and parsed.claude_hooks:
-        raise InstallError("Conflicting flags: --no-claude-hooks cannot be combined with --claude-hooks.")
+        raise InstallError(
+            "Conflicting flags: --no-claude-hooks cannot be combined with --claude-hooks."
+        )
     return modes_requested[0][1] if modes_requested else InstallMode.COPY
 
 
@@ -1898,9 +1841,7 @@ def parse_install_args(argv: Sequence[str]) -> InstallConfig:
     install_claude = bool(parsed.all or parsed.claude or parsed.claude_hooks)
     copilot_ws = parsed.copilot_workspace
     install_copilot = bool(
-        parsed.all
-        or parsed.copilot
-        or (parsed.copilot_prompt_files and copilot_ws is None)
+        parsed.all or parsed.copilot or (parsed.copilot_prompt_files and copilot_ws is None)
     )
     install_git_hooks = bool(parsed.all or parsed.git_hooks)
     agents_ws = parsed.agents_workspace
@@ -1995,11 +1936,7 @@ def run_install(config: InstallConfig, home: Path | None = None) -> InstallTrack
         print("[DRY-RUN] Planning installation (no files or Git config will be modified)...")
 
     should_install_git_hooks = resolved.install_git_hooks
-    if (
-        resolved.install_antigravity
-        and not should_install_git_hooks
-        and not resolved.disable_git_hooks
-    ):
+    if resolved.install_antigravity and not should_install_git_hooks and not resolved.disable_git_hooks:
         ag_cfg = h / ".gemini" / "config"
         if (ag_cfg / "git-hooks").is_dir() and (ag_cfg / MANIFEST_FILENAME).is_file():
             try:
@@ -2013,14 +1950,10 @@ def run_install(config: InstallConfig, home: Path | None = None) -> InstallTrack
         install_antigravity_target(repo_dir, h, resolved.mode, tracker)
 
     if resolved.install_claude:
-        install_claude_target(
-            repo_dir, h, with_hooks=not resolved.disable_claude_hooks, tracker=tracker
-        )
+        install_claude_target(repo_dir, h, with_hooks=not resolved.disable_claude_hooks, tracker=tracker)
 
     if resolved.install_copilot:
-        install_copilot_target(
-            repo_dir, h, tracker, prompt_files=resolved.copilot_prompt_files
-        )
+        install_copilot_target(repo_dir, h, tracker, prompt_files=resolved.copilot_prompt_files)
 
     if resolved.copilot_workspace is not None:
         install_copilot_workspace_target(
@@ -2117,9 +2050,7 @@ def _restore_git_hooks_config(
         if candidate:
             prev_hooks = candidate
 
-    if _remove_path_if_exists(
-        prev_hooks_file, dry_run=tracker.dry_run, stop_roots=(base_dir, home)
-    ):
+    if _remove_path_if_exists(prev_hooks_file, dry_run=tracker.dry_run, stop_roots=(base_dir, home)):
         tracker.record_removed(prev_hooks_file)
 
     current_hooks = git_config_get("core.hooksPath")
@@ -2141,9 +2072,7 @@ def _restore_git_hooks_config(
             tracker.restored.append("core.hooksPath (unset)")
             print("[OK] Unset git config --global core.hooksPath")
     else:
-        if prev_hooks and current_resolved == _resolve_safe(
-            Path(_expand_tilde(prev_hooks, home))
-        ):
+        if prev_hooks and current_resolved == _resolve_safe(Path(_expand_tilde(prev_hooks, home))):
             return
         warn_msg = (
             f"Leaving git config --global core.hooksPath ({current_hooks}) untouched "
@@ -2172,25 +2101,15 @@ def _uninstall_from_base(
     if not matching_keys:
         return
 
-    remaining_targets = {
-        k: v for k, v in manifest.targets.items() if k not in matching_keys
-    }
-    remaining_owned_paths: set[str] = {
-        p for t in remaining_targets.values() for p in t.created_paths
-    }
-    remaining_created_dirs: set[str] = {
-        d for t in remaining_targets.values() for d in t.created_dirs
-    }
+    remaining_targets = {k: v for k, v in manifest.targets.items() if k not in matching_keys}
+    remaining_owned_paths: set[str] = {p for t in remaining_targets.values() for p in t.created_paths}
+    remaining_created_dirs: set[str] = {d for t in remaining_targets.values() for d in t.created_dirs}
 
     dirs_to_prune: list[str] = []
 
     for key in matching_keys:
         t_man = manifest.targets[key]
-        allowed_roots = (
-            (base_dir,)
-            if is_workspace
-            else _allowed_roots_for_target(base_dir, key, home)
-        )
+        allowed_roots = (base_dir,) if is_workspace else _allowed_roots_for_target(base_dir, key, home)
         stop_roots: set[Path] = set(allowed_roots) | {home}
 
         if not is_workspace and (
@@ -2207,9 +2126,7 @@ def _uninstall_from_base(
             created_by_us = mod_path_str in t_man.created_paths
             if mod_kind == "claude_settings":
                 if not tracker.dry_run:
-                    changed = remove_claude_hooks(
-                        mod_path, create_backup=not created_by_us
-                    )
+                    changed = remove_claude_hooks(mod_path, create_backup=not created_by_us)
                 else:
                     changed = _has_claude_craftsman_hooks(mod_path)
                 if created_by_us and mod_path.is_file():
@@ -2231,9 +2148,7 @@ def _uninstall_from_base(
                     tracker.restored.append(str(mod_path))
                     print(f"  - removed Craftsman hooks from {mod_path}")
             elif mod_kind == "hooks_json":
-                changed = _unmerge_antigravity_hooks_json(
-                    repo_dir, mod_path, dry_run=tracker.dry_run
-                )
+                changed = _unmerge_antigravity_hooks_json(repo_dir, mod_path, dry_run=tracker.dry_run)
                 if created_by_us and mod_path.is_file():
                     if not tracker.dry_run:
                         try:
@@ -2275,9 +2190,7 @@ def _uninstall_from_base(
                     tracker.restored.append(str(mod_path))
                     print(f"  - removed Craftsman block from {mod_path}")
 
-        sorted_paths = sorted(
-            t_man.created_paths, key=lambda s: len(Path(s).parts), reverse=True
-        )
+        sorted_paths = sorted(t_man.created_paths, key=lambda s: len(Path(s).parts), reverse=True)
         for p_str in sorted_paths:
             if p_str in remaining_owned_paths or p_str in t_man.modified_files:
                 continue
@@ -2296,9 +2209,7 @@ def _uninstall_from_base(
 
     manifest_path = base_dir / MANIFEST_FILENAME
     if not remaining_targets:
-        if _remove_path_if_exists(
-            manifest_path, dry_run=tracker.dry_run, stop_roots=(base_dir, home)
-        ):
+        if _remove_path_if_exists(manifest_path, dry_run=tracker.dry_run, stop_roots=(base_dir, home)):
             tracker.record_removed(manifest_path)
 
     surviving_dirs: list[str] = []
@@ -2373,13 +2284,24 @@ def _uninstall_legacy_copilot_files(
             seen_dirs.add(directory)
             matches = [p for n, p in iter_discovered_files(directory, loc.pattern) if n in valid_names]
             for rem in _remove_generated_copilot_matches(
-                matches, valid_names, remove_parent=(loc.pattern == "*/SKILL.md"), stop_roots=stop_roots, dry_run=tracker.dry_run, label="removed"
+                matches,
+                valid_names,
+                remove_parent=(loc.pattern == "*/SKILL.md"),
+                stop_roots=stop_roots,
+                dry_run=tracker.dry_run,
+                label="removed",
             ):
                 tracker.record_removed(rem)
     if workspace is None:
-        instrs = [d / "craftsman-rules.instructions.md" for d in vscode_prompt_dirs(default_vscode_prompts_dir(home)) if (d / "craftsman-rules.instructions.md").is_file()]
+        instrs = [
+            d / "craftsman-rules.instructions.md"
+            for d in vscode_prompt_dirs(default_vscode_prompts_dir(home))
+            if (d / "craftsman-rules.instructions.md").is_file()
+        ]
         seen_dirs.update(p.parent for p in instrs)
-        for rem in _remove_generated_copilot_matches(instrs, valid_names, stop_roots=stop_roots, dry_run=tracker.dry_run, label="removed"):
+        for rem in _remove_generated_copilot_matches(
+            instrs, valid_names, stop_roots=stop_roots, dry_run=tracker.dry_run, label="removed"
+        ):
             tracker.record_removed(rem)
     if not tracker.dry_run:
         _prune_empty_dirs(seen_dirs, stop_roots)
@@ -2406,16 +2328,12 @@ def run_uninstall(config: UninstallConfig, home: Path | None = None) -> Uninstal
         _uninstall_from_base(config.repo_dir, config_dir, ag_keys, h, tracker)
 
     if config.uninstall_git_hooks and _resolve_safe(craftsman_home) != _resolve_safe(config_dir):
-        _uninstall_from_base(
-            config.repo_dir, craftsman_home, [TargetKind.GIT_HOOKS.value], h, tracker
-        )
+        _uninstall_from_base(config.repo_dir, craftsman_home, [TargetKind.GIT_HOOKS.value], h, tracker)
 
     if config.uninstall_claude:
         claude_manifest = load_manifest(claude_dir)
         if claude_manifest is not None:
-            _uninstall_from_base(
-                config.repo_dir, claude_dir, [TargetKind.CLAUDE.value], h, tracker
-            )
+            _uninstall_from_base(config.repo_dir, claude_dir, [TargetKind.CLAUDE.value], h, tracker)
         else:
             settings_path = claude_dir / "settings.json"
             if settings_path.is_file():
@@ -2428,9 +2346,7 @@ def run_uninstall(config: UninstallConfig, home: Path | None = None) -> Uninstal
                     print(f"  - removed Craftsman hooks from {settings_path}")
 
     if config.uninstall_copilot:
-        _uninstall_from_base(
-            config.repo_dir, copilot_home, [TargetKind.COPILOT.value], h, tracker
-        )
+        _uninstall_from_base(config.repo_dir, copilot_home, [TargetKind.COPILOT.value], h, tracker)
         _uninstall_legacy_copilot_files(config.repo_dir, h, tracker)
 
     if config.copilot_workspace is not None:
@@ -2443,9 +2359,7 @@ def run_uninstall(config: UninstallConfig, home: Path | None = None) -> Uninstal
             tracker,
             is_workspace=True,
         )
-        _uninstall_legacy_copilot_files(
-            config.repo_dir, h, tracker, workspace=ws_resolved
-        )
+        _uninstall_legacy_copilot_files(config.repo_dir, h, tracker, workspace=ws_resolved)
 
     if config.agents_workspace is not None:
         _uninstall_from_base(

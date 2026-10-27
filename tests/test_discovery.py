@@ -63,7 +63,9 @@ def _discover_counts_for_profile(
 
     for kind in ("skill", "prompt"):
         for loc in COPILOT_DISCOVERY[("vscode", kind)]:
-            for directory in resolve_discovery_dirs(loc, home=home, workspace=workspace, profile=profile):
+            for directory in resolve_discovery_dirs(
+                loc, home=home, workspace=workspace, profile=profile
+            ):
                 for name, path in iter_discovered_files(directory, loc.pattern):
                     if name in commands_found and (
                         not only_craftsman_generated or is_craftsman_generated_file(path, valid_all)
@@ -285,10 +287,14 @@ class CopilotDiscoveryTests(unittest.TestCase):
                     self.assertEqual(len(paths), 1, f"{scenario} cli agent {agent_name}: {paths}")
                 expected_cli_skills = 0 if scenario == "legacy_prompt_files" else 1
                 for skill_name, paths in cli_counts["skill"].items():
-                    self.assertEqual(len(paths), expected_cli_skills, f"{scenario} {skill_name}: {paths}")
+                    self.assertEqual(
+                        len(paths), expected_cli_skills, f"{scenario} {skill_name}: {paths}"
+                    )
 
     def test_reinstall_removes_legacy_copilot_files_from_prompts_dirs(self) -> None:
-        vscode_prompts, profile_prompts, user_same_name, user_custom_agent = self._seed_legacy_copilot_files()
+        vscode_prompts, profile_prompts, user_same_name, user_custom_agent = (
+            self._seed_legacy_copilot_files()
+        )
         code, out, err = self.run_install("--copilot")
         self.assertEqual(code, 0, err)
         self.assertIn("removed legacy duplicate:", out)
@@ -338,9 +344,7 @@ class CopilotDiscoveryTests(unittest.TestCase):
         ws.mkdir()
         self.assertEqual(self.run_install("--copilot")[0], 0)
 
-        code_ok, _, err_ok = self.run_install(
-            "--copilot-workspace", str(ws), "--allow-duplicate-scopes"
-        )
+        code_ok, _, err_ok = self.run_install("--copilot-workspace", str(ws), "--allow-duplicate-scopes")
         self.assertEqual(code_ok, 0, err_ok)
         self.assertTrue((ws / ".github" / "agents" / "craftsman.agent.md").is_file())
 
@@ -438,7 +442,9 @@ class CopilotDiscoveryTests(unittest.TestCase):
         self.assertEqual(self.run_install("--copilot")[0], 0)
         vscode_prompts = default_vscode_prompts_dir(self.home)
         user_prompt = vscode_prompts / "simplify.prompt.md"
-        user_prompt_text = "---\nagent: 'agent'\ndescription: 'User simplify'\n---\nMy personal prompt.\n"
+        user_prompt_text = (
+            "---\nagent: 'agent'\ndescription: 'User simplify'\n---\nMy personal prompt.\n"
+        )
         write_text_atomic(user_prompt, user_prompt_text)
 
         code_fix, _, err_fix = self.run_doctor("--fix-duplicates")

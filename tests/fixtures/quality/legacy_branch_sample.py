@@ -7,9 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-def is_same_or_unclaimed_owner(
-    existing_owner: Any, platform: str, session_id: str = ""
-) -> bool:
+def is_same_or_unclaimed_owner(existing_owner: Any, platform: str, session_id: str = "") -> bool:
     """Return True if `existing_owner` is unset (v3.0.0), unclaimed `cli`, or matches `(platform, session_id)`."""
     if not isinstance(existing_owner, dict):
         return True

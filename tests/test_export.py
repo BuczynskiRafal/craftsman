@@ -127,7 +127,6 @@ class AgentRenderingTests(ExportTestCase):
         with self.assertRaisesRegex(ExportError, "role must be one of orchestrator, reviewer, verifier"):
             load_agent_templates(repo)
 
-
     def test_include_paths_must_stay_in_the_repository_and_be_well_formed(self) -> None:
         for directive, message in (
             ("{{include ../outside.md}}", "must be a path inside"),
@@ -159,7 +158,9 @@ class AgentRenderingTests(ExportTestCase):
         self.assertEqual(export._unquote('"say \\"hi\\""'), 'say "hi"')
         skill = "---\nname: x\ndescription: |-\n  Block text.\n---\nBody\n"
         self.assertEqual(export.extract_description_and_body(skill, "x")[0], "Block text.")
-        claude = export.render_claude_command_file("x", "---\nname: x\ndescription: Match \\bword\\b\n---\nB\n")
+        claude = export.render_claude_command_file(
+            "x", "---\nname: x\ndescription: Match \\bword\\b\n---\nB\n"
+        )
         self.assertIn("description: 'Match \\bword\\b'", claude)
 
 
@@ -207,6 +208,25 @@ class SkillExportTests(ExportTestCase):
             self.assertIn("\n## Appendix: lenses.md\n\n# Craftsman Review Lenses\n", rendered)
         self.assertNotIn("## Appendix", (prompts / "verify.prompt.md").read_text(encoding="utf-8"))
 
+    def test_exported_text_names_no_removed_gate_invocation(self) -> None:
+        prompts = self.tmp / "prompts"
+        export.export_to_vscode_user(REPO_ROOT, prompts, prompt_files=True)
+        claude = self.tmp / "claude"
+        export.export_to_claude_user(REPO_ROOT, claude)
+
+        exported = [
+            *prompts.glob("*.md"),
+            *(claude / "commands").glob("*.md"),
+            *(claude / "agents").glob("*.md"),
+            *(claude / "rules").glob("*.md"),
+        ]
+        self.assertTrue(exported)
+        for path in exported:
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertNotIn("--state-file", text)
+                self.assertNotIn("craftsman-stop-gate.py", text)
+
     def test_prompt_files_route_craftsman_to_its_agent(self) -> None:
         default_prompts = self.tmp / "default_prompts"
         count, instr = export.export_to_vscode_user(REPO_ROOT, default_prompts)
@@ -228,6 +248,10 @@ class SkillExportTests(ExportTestCase):
         text = export.render_agents_md(REPO_ROOT)
         self.assertIn("**Done means** `craftsman review check` passes", text)
         self.assertNotIn("invoke_subagent", text.split("## Available Skills")[0])
+
+    def test_cursor_rule_applies_to_every_file(self) -> None:
+        _, cursor_rule = export.export_to_agents_workspace(REPO_ROOT, self.tmp / "ws")
+        self.assertIn('globs: "*"', frontmatter(cursor_rule.read_text(encoding="utf-8")))
 
 
 class HookExportTests(ExportTestCase):
@@ -664,7 +688,15 @@ class DoctorTests(ExportTestCase):
         for agent_file in [*copilot_home.glob("agents/*.agent.md"), *claude_dir.glob("agents/*.md")]:
             self.assertIn("Search scope", agent_file.read_text(encoding="utf-8"), str(agent_file))
 
-        for skill_name in ("craftsman", "feature-dev", "verify", "code-review", "simplify", "modernize", "batch"):
+        for skill_name in (
+            "craftsman",
+            "feature-dev",
+            "verify",
+            "code-review",
+            "simplify",
+            "modernize",
+            "batch",
+        ):
             skill_md = copilot_skills / skill_name / "SKILL.md"
             claude_cmd = claude_dir / "commands" / f"{skill_name}.md"
             self.assertIn("## Search scope", skill_md.read_text(encoding="utf-8"), str(skill_md))
@@ -724,9 +756,7 @@ class DoctorTests(ExportTestCase):
         with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}, clear=False):
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", real_home), "/opt/cfg")
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
-            self.assertEqual(
-                export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated_home"), ""
-            )
+            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated_home"), "")
 
     def test_craftsman_scope_fragment_matches_skill_document(self) -> None:
         from craftsman.cli import validate_skill_manifests
@@ -750,9 +780,7 @@ class DoctorTests(ExportTestCase):
             ("antigravity", antigravity_skills / "code-review" / "SKILL.md"),
             ("claude", claude_dir / "agents" / "craftsman-reviewer.md"),
         )
-        expected = (
-            "Record naming and structure problems when you can state the wrong reading"
-        )
+        expected = "Record naming and structure problems when you can state the wrong reading"
         for platform, path in targets:
             with self.subTest(platform=platform):
                 text = " ".join(path.read_text(encoding="utf-8").split())
@@ -771,7 +799,9 @@ class DoctorTests(ExportTestCase):
             ("antigravity", antigravity_skills / "code-review" / "SKILL.md"),
             ("claude", claude_dir / "agents" / "craftsman-reviewer.md"),
         )
-        expected = "your view completely, the full packet only for a hunk outside your view that you need"
+        expected = (
+            "your view completely, the full packet only for a hunk outside your view that you need"
+        )
         for platform, path in targets:
             with self.subTest(platform=platform):
                 text = " ".join(path.read_text(encoding="utf-8").split())
