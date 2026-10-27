@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import hashlib
 import json
 import os
 import re
@@ -73,6 +74,7 @@ SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
 MIN_SIGNAL_ACK_REASON_CHARS = 40
+MIN_FACT_TEXT_CHARS = 30
 MIN_HUNK_NOTE_SEGMENT_CHARS = 40
 MIN_SUBSTANTIVE_NOTE_CHARS = 20
 MAX_REUSED_NOTE_SEGMENTS = 3
@@ -97,6 +99,14 @@ GENERIC_COVERAGE_WORDS: tuple[str, ...] = (
     "accurate",
     "checked",
     "reviewed",
+)
+FACT_JUDGEMENT_WORDS: tuple[str, ...] = (
+    *GENERIC_COVERAGE_WORDS,
+    "bug",
+    "wrong",
+    "issue",
+    "problem",
+    "should",
 )
 QUICK_TIER_MAX_CHANGED_LINES = 40
 MAX_NEXT_ACTIONS = 12
@@ -143,10 +153,14 @@ QUESTION_EVIDENCE_EXAMPLE = (
     "findpaths.py:182 does exactly that, which changes testpaths for configs outside the project root"
 )
 DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
-_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S")}
+_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S", "F-")}
 _CONCRETE_TOKEN_RE = re.compile(r"(?:->|`[^`]+`|\b\d+\b|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*\.[A-Za-z_]\w*)")
 _GENERIC_WORDS_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(word) for word in GENERIC_COVERAGE_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+_FACT_JUDGEMENT_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in FACT_JUDGEMENT_WORDS) + r")\b",
     re.IGNORECASE,
 )
 _CONCRETE_COVERAGE_RE = re.compile(
@@ -800,6 +814,68 @@ class AgentEvent:
 
 
 @dataclass(frozen=True)
+class SourceRef:
+    path: str
+    line: int
+
+    def __post_init__(self) -> None:
+        _require_text(self.path, "path")
+        _require(self.line >= 1, "line", "must be >= 1")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SourceRef:
+        f = _Fields(raw)
+        return f.done(cls(path=f.text("path"), line=f.integer("line")))
+
+
+@dataclass(frozen=True)
+class Fact:
+    id: str
+    hunks: tuple[str, ...]
+    source: SourceRef
+    text: str
+    file_digest: str
+    author_lens: str
+
+    def __post_init__(self) -> None:
+        _require_id(self.id, "F-", "id")
+        _require(bool(self.hunks), "hunks", "must list at least one hunk id")
+        for hunk_id in self.hunks:
+            _require_id(hunk_id, "H", "hunks")
+        _require_text(self.text, "text", min_chars=MIN_FACT_TEXT_CHARS)
+        match = _FACT_JUDGEMENT_RE.search(self.text)
+        if match is not None:
+            raise FieldError(
+                "text",
+                f"must state a verifiable source fact without judgement words ({match.group(0)!r} found; "
+                "record defects with `craftsman review add`)",
+            )
+        _require_text(self.file_digest, "file_digest")
+        if self.author_lens:
+            _require_choice(self.author_lens, sorted(LENS_IDS), "author_lens")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> Fact:
+        f = _Fields(raw)
+        return f.done(
+            cls(
+                id=f.text("id"),
+                hunks=f.texts("hunks"),
+                source=SourceRef.from_json(f._value("source", dict, "an object")),
+                text=f.text("text"),
+                file_digest=f.text("file_digest"),
+                author_lens=f.text("author_lens"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class Ledger:
     rounds: tuple[Round, ...] = ()
     coverage: tuple[Coverage, ...] = ()
@@ -807,6 +883,7 @@ class Ledger:
     runs: tuple[Run, ...] = ()
     agents: tuple[AgentEvent, ...] = ()
     signal_acks: tuple[SignalAck, ...] = ()
+    facts: tuple[Fact, ...] = ()
 
     def __post_init__(self) -> None:
         for index, round_ in enumerate(self.rounds):
@@ -829,6 +906,8 @@ class Ledger:
         _require(len(set(run_ids)) == len(run_ids), "runs", "must not repeat an id")
         finding_ids = [finding.id for finding in self.findings]
         _require(len(set(finding_ids)) == len(finding_ids), "findings", "must not repeat an id")
+        fact_ids = [fact.id for fact in self.facts]
+        _require(len(set(fact_ids)) == len(fact_ids), "facts", "must not repeat an id")
         for index, finding in enumerate(self.findings):
             where = f"findings[{index}]"
             _require(finding.round <= len(self.rounds), f"{where}.round", "references an unknown round")
@@ -859,6 +938,7 @@ class Ledger:
                     runs=f.records("runs", Run.from_json),
                     agents=f.records("agents", AgentEvent.from_json),
                     signal_acks=f.get_records("signal_acks", SignalAck.from_json),
+                    facts=f.get_records("facts", Fact.from_json),
                 )
             )
         except FieldError as exc:
@@ -1460,6 +1540,56 @@ def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, Sig
         if not (item.round == round_.number and item.signal_id == signal_id)
     )
     return replace(ledger, signal_acks=(*kept, ack)), ack
+
+
+def file_sha256(root: Path, rel_path: str) -> str | None:
+    target = root / rel_path
+    if not target.is_file():
+        return None
+    try:
+        return hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def add_fact(
+    ledger: Ledger,
+    *,
+    hunks: Sequence[str],
+    source: SourceRef,
+    text: str,
+    file_digest: str,
+    author_lens: str = "contracts",
+) -> tuple[Ledger, Fact]:
+    round_ = _latest_round(ledger)
+    known_hunks = {h.id for h in round_.hunks}
+    clean_hunks = tuple(dict.fromkeys(h.strip() for h in hunks if h.strip()))
+    _require(bool(clean_hunks), "hunks", "must name at least one hunk id")
+    for hid in clean_hunks:
+        _require(hid in known_hunks, "hunks", f"{hid} is not in round {round_.number}")
+    fact_id = _next_id("F-", (item.id for item in ledger.facts))
+    fact = Fact(
+        id=fact_id,
+        hunks=clean_hunks,
+        source=source,
+        text=text.strip(),
+        file_digest=file_digest,
+        author_lens=author_lens,
+    )
+    return replace(ledger, facts=(*ledger.facts, fact)), fact
+
+
+def valid_facts_for_hunk(ledger: Ledger, root: Path) -> dict[str, tuple[Fact, ...]]:
+    by_hunk: dict[str, list[Fact]] = {}
+    digest_cache: dict[str, str | None] = {}
+    for fact in ledger.facts:
+        path = fact.source.path
+        if path not in digest_cache:
+            digest_cache[path] = file_sha256(root, path)
+        if digest_cache[path] is not None and digest_cache[path] == fact.file_digest:
+            for hid in fact.hunks:
+                by_hunk.setdefault(hid, []).append(fact)
+    return {hid: tuple(items) for hid, items in by_hunk.items()}
 
 
 def relocate_finding(

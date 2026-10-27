@@ -64,7 +64,9 @@ reading full files top to bottom.
 ## For each remaining finding
 
 1. **Re-read the code yourself.** Open the file around the cited `file:line` range, the enclosing
-   function, and its callers. Do not rely on the finding's description of the code.
+   function, and its callers. Do not rely on the finding's description of the code. If a finding or
+   your verdict relies on a shared fact (`F-1`, `F-2`, …), cite its fact ID in `--evidence` and open
+   the `source` (`path:line`) of every cited fact yourself — a recorded fact is a pointer, not proof.
 2. **Try to break the finding.** Look for, in this order:
    - a guard that makes the trigger impossible (a check in a caller, a type, validation on load,
      a framework guarantee);

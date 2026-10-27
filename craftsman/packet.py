@@ -21,7 +21,14 @@ from craftsman.diffscan import (
     detect_signals,
     git_output,
 )
-from craftsman.ledger import FieldError, Ledger, Round, reopened_mentions
+from craftsman.ledger import (
+    Fact,
+    FieldError,
+    Ledger,
+    Round,
+    reopened_mentions,
+    valid_facts_for_hunk,
+)
 from craftsman.lenses import LensPick
 from craftsman.quality import QualitySignal, collect_quality_signals, is_test_path
 
@@ -126,6 +133,7 @@ class PacketContext:
     quality_signals: tuple[QualitySignal, ...] = ()
     test_files_by_symbol: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     last_runs: tuple[str, ...] = ()
+    facts_by_hunk: Mapping[str, tuple[Fact, ...]] = field(default_factory=dict)
 
 
 def collect_context(
@@ -168,6 +176,7 @@ def collect_context(
         quality_signals=tuple(quality_signals),
         test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
         last_runs=_last_runs(ledger, snap),
+        facts_by_hunk=valid_facts_for_hunk(ledger, root),
     )
 
 
@@ -590,6 +599,8 @@ def _symbol_lines(
     open_ids = [h.id for h in ctx.snap.hunks if h.id not in ctx.carried_from]
     if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
         lines.append("Last runs: " + " · ".join(ctx.last_runs))
+    for fact in ctx.facts_by_hunk.get(hunk.id, ()):
+        lines.append(f"Facts: {fact.id} {fact.text} (source {fact.source.path}:{fact.source.line})")
     return lines
 
 

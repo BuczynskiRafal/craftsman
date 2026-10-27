@@ -1310,5 +1310,89 @@ class CoverageNoteValidationTests(RepoTestCase):
         self.assertIn("`design` covered cart.py", covered.stdout)
 
 
+class ReviewFactTests(RepoTestCase):
+    def test_fact_with_missing_source_line_is_rejected(self) -> None:
+        self.prepare_bug()
+        proc = self.repo.cli(
+            "review",
+            "fact",
+            "add",
+            "--hunks",
+            "H1",
+            "--source",
+            "cart.py:99",
+            "--text",
+            "total(items) is called from api.py:12 with a list of item dicts",
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("past the end of cart.py", proc.stderr)
+
+    def test_fact_containing_a_judgement_is_rejected(self) -> None:
+        self.prepare_bug()
+        for word in ("bug", "wrong", "issue", "problem", "should", "clean"):
+            with self.subTest(word=word):
+                proc = self.repo.cli(
+                    "review",
+                    "fact",
+                    "add",
+                    "--hunks",
+                    "H1",
+                    "--source",
+                    "cart.py:1",
+                    "--text",
+                    f"total(items) at cart.py:3 has a {word} when callers pass empty lists",
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 1, word)
+                self.assertIn("without judgement words", proc.stderr)
+
+    def test_fact_disappears_from_view_after_source_file_changes(self) -> None:
+        self.repo.write("caller.py", "from cart import total\nval = total([])\n")
+        self.prepare_bug()
+        added = self.repo.cli(
+            "review",
+            "fact",
+            "add",
+            "--hunks",
+            "H1",
+            "--source",
+            "caller.py:2",
+            "--text",
+            "total is invoked from caller.py:2 with an empty list literal",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        view_path = Path(self.repo.cli("review", "view", "--lenses", "contracts").stdout.strip())
+        self.assertIn(
+            "Facts: F-1 total is invoked from caller.py:2 with an empty list literal (source caller.py:2)",
+            view_path.read_text(encoding="utf-8"),
+        )
+        self.repo.write("caller.py", "from cart import total\nval = total([{'price': 1}])\n")
+        refreshed = Path(self.repo.cli("review", "view", "--lenses", "contracts").stdout.strip())
+        self.assertNotIn("Facts: F-1", refreshed.read_text(encoding="utf-8"))
+
+    def test_findings_never_appear_in_a_reviewer_view(self) -> None:
+        self.prepare_bug()
+        self.repo.cli(
+            "review",
+            "add",
+            "--lens",
+            "contracts",
+            "--file",
+            "cart.py",
+            "--line",
+            "3",
+            "--severity",
+            "major",
+            "--title",
+            "SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY",
+            "--scenario",
+            "items=[] -> ZeroDivisionError on cart.py:3",
+        )
+        view_path = Path(self.repo.cli("review", "view", "--lenses", "ripple").stdout.strip())
+        view_text = view_path.read_text(encoding="utf-8")
+        self.assertNotIn("SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY", view_text)
+
+
 if __name__ == "__main__":
     unittest.main()

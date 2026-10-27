@@ -36,6 +36,7 @@ from craftsman.ledger import (
     SEVERITIES,
     SWEEP_LENS,
     VERDICTS,
+    Fact,
     FieldError,
     Finding,
     GateReport,
@@ -44,12 +45,15 @@ from craftsman.ledger import (
     Round,
     Run,
     SignalAck,
+    SourceRef,
     _Fields,
     _next_id,
     ack_signal,
     add_coverage,
+    add_fact,
     add_finding,
     evaluate,
+    file_sha256,
     has_unresolved_diff_size,
     is_trivial_run,
     ledger_path_for,
@@ -81,6 +85,8 @@ FIELD_FLAGS = {
     "lens": "--lens",
     "lenses": "--lenses",
     "hunks": "--hunks",
+    "source": "--source",
+    "text": "--text",
     "path": "--file",
     "line": "--line",
     "severity": "--severity",
@@ -259,11 +265,13 @@ def _parse_view_lenses(raw: str) -> list[str]:
 def _view(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
+    if not ledger.rounds:
+        raise LedgerError("no review round yet; run `craftsman review prepare` first")
+    round_ = ledger.rounds[-1]
     snap = snapshot(ws.root, resolve_base(ws, ledger, None))
-    round_ = require_current_round(ledger, snap)
     lenses = _parse_view_lenses(args.lenses)
     all_ids = [hunk.id for hunk in snap.hunks]
-    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried] or all_ids
+    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried and hunk.id in all_ids] or all_ids
     assigned = expand_hunk_spec(args.hunks, all_ids) if args.hunks else tuple(open_ids)
     picks = select_lenses(round_.tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
     index = WorktreeIndex(ws.root)
@@ -509,6 +517,57 @@ def _ack(args: argparse.Namespace) -> int:
 
     ack = mutate(ws.ledger_path, record)
     print(f"{ack.signal_id} acknowledged in round {ack.round}: {ack.reason}")
+    return 0
+
+
+def _parse_fact_source(
+    ws: Workspace, cwd: Path, raw: str, snap: DiffSnapshot
+) -> tuple[SourceRef, str]:
+    if ":" not in raw:
+        raise FieldError("source", "must look like path:line (e.g. pkg/a.py:42)")
+    raw_path, raw_line = raw.rsplit(":", 1)
+    try:
+        line = int(raw_line)
+    except ValueError:
+        raise FieldError("source", f"line {raw_line!r} must be an integer") from None
+    if line < 1:
+        raise FieldError("source", f"line must be >= 1 (got {line})")
+    try:
+        rel_path = _finding_path(ws.root, cwd, raw_path, snap)
+    except FieldError as exc:
+        raise FieldError("source", exc.problem) from None
+    digest = file_sha256(ws.root, rel_path)
+    if digest is None:
+        raise FieldError("source", f"{rel_path} does not exist in the work tree")
+    try:
+        _source_lines(ws.root, rel_path, line)
+    except FieldError as exc:
+        raise FieldError("source", exc.problem) from None
+    return SourceRef(path=rel_path, line=line), digest
+
+
+def _fact_add(args: argparse.Namespace) -> int:
+    ws = open_workspace(args.cwd)
+    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
+    source, digest = _parse_fact_source(ws, Path(args.cwd or os.getcwd()), args.source, snap)
+
+    def record(current: Ledger) -> tuple[Ledger, Fact]:
+        round_ = require_current_round(current, snap)
+        all_ids = [hunk.id for hunk in round_.hunks]
+        hunks = expand_hunk_spec(args.hunks, all_ids)
+        return add_fact(
+            current,
+            hunks=hunks,
+            source=source,
+            text=args.text,
+            file_digest=digest,
+            author_lens=args.lens,
+        )
+
+    fact = mutate(ws.ledger_path, record)
+    print(
+        f"{fact.id} recorded ({', '.join(fact.hunks)}, source {fact.source.path}:{fact.source.line})"
+    )
     return 0
 
 
@@ -1112,6 +1171,14 @@ def _add_finding_parsers(
     move.add_argument("--line", required=True, type=int)
     move.add_argument("--file", help="New file (default: keep the finding's file)")
     move.set_defaults(handler=_move)
+
+    fact = sub.add_parser("fact", parents=[common], help="Record a source-cited fact for other reviewers")
+    fact.add_argument("action", nargs="?", choices=("add",), default="add")
+    fact.add_argument("--hunks", required=True, help="Comma-separated hunk ids or ranges, e.g. H3")
+    fact.add_argument("--source", required=True, help="Source file:line in the work tree, e.g. pkg/a.py:42")
+    fact.add_argument("--text", required=True, help="Verifiable fact (>= 30 chars, no judgement words)")
+    fact.add_argument("--lens", default="contracts", choices=lenses, help="Author lens (default: contracts)")
+    fact.set_defaults(handler=_fact_add)
 
 
 def _add_merge_and_verdict_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
