@@ -21,17 +21,10 @@ from craftsman.diffscan import (
     detect_signals,
     git_output,
 )
-from craftsman.ledger import (
-    Fact,
-    FieldError,
-    Ledger,
-    Round,
-    SignalRef,
-    reopened_mentions,
-    valid_facts_for_hunk,
-)
+from craftsman.ledger import reopened_mentions, valid_facts_for_hunk
 from craftsman.lenses import LensPick
-from craftsman.quality import QualitySignal, collect_quality_signals, is_test_path
+from craftsman.quality import is_test_path
+from craftsman.records import SWEEP_LENS, Fact, FieldError, Ledger, Round
 
 MAX_PACKET_CHARS = 350_000
 MAX_SCOPE_LINES = 60
@@ -40,7 +33,6 @@ MAX_COMMITS = 50
 MAX_REFERENCES_PER_SYMBOL = 8
 MAX_TEST_FILES_PER_SYMBOL = 5
 REFERENCE_SEARCH_LIMIT = 40
-SWEEP_LENS = "sweep"
 
 _CONVENTION_FILES = (
     "AGENTS.md",
@@ -91,12 +83,13 @@ CHEAT_SHEET = (
     '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "hunks": ["H1", "H2"], '
     '"note": "H1 f: x=None -> L42 raises; H2 g: callers a.py:19 ok"}]`, or single:\n'
     '  `craftsman review cover --lens <lens> --hunks H1,H2 --note "H1 f: x=None -> L42 raises; '
-    'H2 g: callers a.py:19 ok"`',
+    'H2 g: callers a.py:19 ok"`; the `design` lens takes `--files a.py` (`"files"` in JSON) '
+    "instead of hunk ids",
     "- Finding (one per root cause; for >1 entry, prefer `--from-json - <<'EOF'`; group unjudged "
     "duplicates before verification with `craftsman review merge F1 F2` — Merge only when ONE fix "
     "removes every consequence. Different fixes are separate findings, even on the same line, file, "
-    "or category, e.g. ordering entries in `AUTHORS` and a missing changelog entry are two separate "
-    "findings, not one 'housekeeping' finding):\n"
+    "or category, e.g. a missing `--json` flag in `craftsman status` and a stale README example are "
+    "two separate findings, not one 'housekeeping' finding):\n"
     '  `craftsman review add --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "file": "<path>", '
     '"line": 42, "severity": "major", "title": "...", "scenario": "<root cause -> wrong outcomes>", '
     '"suggestion": "..."}]`, or single:\n'
@@ -131,7 +124,6 @@ class PacketContext:
     signals_by_hunk: Mapping[str, tuple[str, ...]]
     carried_from: Mapping[str, int]
     reopened: Mapping[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
-    quality_signals: tuple[QualitySignal | SignalRef, ...] = ()
     test_files_by_symbol: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     last_runs: tuple[str, ...] = ()
     facts_by_hunk: Mapping[str, tuple[Fact, ...]] = field(default_factory=dict)
@@ -147,11 +139,9 @@ def collect_context(
     symbols: Mapping[str, tuple[str, ...]],
     ledger: Ledger,
     index: WorktreeIndex | None = None,
-    quality_signals: Sequence[QualitySignal | SignalRef] | None = None,
 ) -> PacketContext:
     """Gather commits, conventions, scopes and references for the hunks under review."""
     idx = index or WorktreeIndex(root)
-    sigs = tuple(quality_signals if quality_signals is not None else collect_quality_signals(root, snap))
     carried = {hunk.id for hunk in round_.hunks if hunk.carried}
     open_hunks = [hunk for hunk in snap.hunks if hunk.id not in carried]
     open_symbols = {hunk.id: symbols.get(hunk.id, ()) for hunk in open_hunks}
@@ -168,8 +158,7 @@ def collect_context(
         references=_references(idx, open_hunks, open_symbols),
         signals_by_hunk=_signals_by_hunk(snap.hunks),
         carried_from=_carried_from(ledger, round_),
-        reopened=reopened_mentions(ledger.coverage, round_, snap.hunks, symbols),
-        quality_signals=sigs,
+        reopened=reopened_mentions(round_, snap.hunks, symbols),
         test_files_by_symbol=_test_files_by_symbol(idx, open_symbols),
         last_runs=_last_runs(ledger, snap),
         facts_by_hunk=valid_facts_for_hunk(ledger, root),
@@ -276,13 +265,14 @@ def _carried_from(ledger: Ledger, round_: Round) -> dict[str, int]:
 _HUNK_RANGE_RE = re.compile(r"^H(\d+)-H(\d+)$")
 
 
-def expand_hunk_spec(raw: str | None, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
+def expand_hunk_spec(raw: str, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
     """Expand a comma-separated list of hunk IDs and ranges (`H3-H17`) against `all_hunk_ids`."""
-    if not raw or not raw.strip():
-        return tuple(all_hunk_ids)
+    tokens = [part.strip() for part in raw.split(",") if part.strip()]
+    if not tokens:
+        raise FieldError("hunks", "must name at least one hunk id or range")
     known = set(all_hunk_ids)
     ordered: list[str] = []
-    for token in (part.strip() for part in raw.split(",") if part.strip()):
+    for token in tokens:
         match = _HUNK_RANGE_RE.match(token)
         if match:
             lo, hi = int(match.group(1)), int(match.group(2))
@@ -308,7 +298,7 @@ def render_packet(ctx: PacketContext) -> str:
         _lenses_section(ctx),
         "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
     ]
-    if ctx.quality_signals or ctx.round.signals:
+    if ctx.round.signals:
         parts.append(_quality_signals_section(ctx))
     preamble = "\n\n".join(parts)
     omitted = _scopes_to_omit(ctx, len(preamble))
@@ -327,7 +317,7 @@ def render_packet_view(
         _lenses_section(ctx, only=frozenset(lenses)),
         "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
     ]
-    if ctx.quality_signals or ctx.round.signals:
+    if ctx.round.signals:
         parts.append(_quality_signals_section(ctx))
     preamble = "\n\n".join(parts)
     total_hunks = max(1, len(ctx.snap.hunks))
@@ -337,7 +327,6 @@ def render_packet_view(
 
 
 def _quality_signals_section(ctx: PacketContext) -> str:
-    signals = ctx.quality_signals or ctx.round.signals
     lines = [
         "## Quality signals",
         "Every signal below must be resolved before `craftsman review check` passes: either "
@@ -345,9 +334,8 @@ def _quality_signals_section(ctx: PacketContext) -> str:
         '`craftsman review ack <ID> --reason "<concrete reason, >= 40 chars>"`.',
         "",
     ]
-    for sig in signals:
-        kind = sig.kind.value if hasattr(sig.kind, "value") else sig.kind
-        lines.append(f"- **{sig.id}** (`{kind}`) `{sig.file}:{sig.line}` — {sig.detail}")
+    for sig in ctx.round.signals:
+        lines.append(f"- **{sig.id}** (`{sig.kind.value}`) `{sig.file}:{sig.line}` — {sig.detail}")
     return "\n".join(lines)
 
 

@@ -34,16 +34,8 @@ from craftsman.gate import (
     state_path_for,
     update_state,
 )
-from craftsman.ledger import (
-    REVIEWER_AGENT,
-    AgentEvent,
-    Ledger,
-    LedgerError,
-    add_agent_event,
-    format_timestamp,
-    ledger_path_for,
-    mutate,
-)
+from craftsman.ledger import add_agent_event, ledger_path_for, mutate
+from craftsman.records import REVIEWER_AGENT, AgentEvent, Ledger, LedgerError, format_timestamp
 from craftsman.transcript import (
     Entry,
     TranscriptError,

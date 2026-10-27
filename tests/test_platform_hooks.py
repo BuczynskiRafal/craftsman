@@ -14,8 +14,8 @@ from unittest import mock
 
 from craftsman import antigravity, hooks
 from craftsman.gate import MAX_CONTINUATIONS
+from craftsman.gatecheck import MAX_ROUNDS
 from craftsman.hooks import COPILOT_PUSH_NOTE, REVIEWER_STOP_REASON, HookInput, HookInputError
-from craftsman.ledger import GatePolicy
 
 from tests.support import EvidenceRepo, coverage_note
 
@@ -381,7 +381,7 @@ class StopTests(HookTestCase):
 
     def exceed_the_round_cap(self) -> None:
         self.init("quick")
-        for revision in range(GatePolicy("quick").max_rounds + 1):
+        for revision in range(MAX_ROUNDS + 1):
             self.repo.write("cart.py", CHANGE + f"# revision {revision}\n")
             self.repo.cli("review", "prepare", "--tier", "quick")
 

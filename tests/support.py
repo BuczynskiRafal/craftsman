@@ -7,10 +7,25 @@ import os
 import subprocess
 import sys
 import unittest
+from collections.abc import Mapping, Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+from craftsman.diffscan import DiffSnapshot, Hunk
 from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_path_for
+from craftsman.ledger import add_coverage, add_finding, add_run, open_round
+from craftsman.lenses import Tier
+from craftsman.records import (
+    Coverage,
+    Ledger,
+    QualitySignal,
+    Round,
+    RunKind,
+    Severity,
+    format_timestamp,
+    parse_timestamp,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_COUNT = len(json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))["skills"])
@@ -35,12 +50,139 @@ AMBIENT_PLATFORM_ENV_VARS = frozenset(
 )
 
 
-def coverage_note(hunk_ids: list[str]) -> str:
+def coverage_note(hunk_ids: Sequence[str]) -> str:
     parts: list[str] = []
     for index, item in enumerate(hunk_ids, 1):
         num = item[1:] if item.startswith("H") and item[1:].isdigit() else str(index)
         parts.append(f"{item} f_{num}.py:{num}: x={num} -> returns {int(num) + 1} on boundary input")
     return "; ".join(parts)
+
+
+# --- in-memory ledgers ----------------------------------------------------------------------
+
+BASE_SHA = "b" * 40
+FINDING = {
+    "lens": "intent",
+    "path": "app.py",
+    "line": 3,
+    "title": "Empty list crashes total()",
+    "scenario": "Calling total([]) divides by len(items) == 0 and raises.",
+    "suggestion": "Return 0 for an empty list.",
+    "signal_id": None,
+}
+
+
+def make_hunk(
+    hunk_id: str, path: str = "app.py", lines: Sequence[str] = ("+x = 1",), *, new_start: int = 1
+) -> Hunk:
+    return Hunk(
+        id=hunk_id,
+        path=path,
+        old_path=None,
+        status="modified",
+        old_start=new_start,
+        old_len=sum(not line.startswith("+") for line in lines),
+        new_start=new_start,
+        new_len=sum(not line.startswith("-") for line in lines),
+        header="",
+        lines=tuple(lines),
+        digest=f"d-{path}-{'|'.join(lines)}",
+    )
+
+
+def make_snap(*hunks: Hunk, fingerprint: str = "fp1", base: str = BASE_SHA) -> DiffSnapshot:
+    return DiffSnapshot(
+        base_sha=base,
+        fingerprint=fingerprint,
+        hunks=hunks,
+        files=tuple(dict.fromkeys(hunk.path for hunk in hunks)),
+        skipped=(),
+        added=sum(line.startswith("+") for hunk in hunks for line in hunk.lines),
+        deleted=sum(line.startswith("-") for hunk in hunks for line in hunk.lines),
+    )
+
+
+def two_hunks(fingerprint: str = "fp1") -> DiffSnapshot:
+    return make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py"), fingerprint=fingerprint)
+
+
+def prepared(
+    snap: DiffSnapshot,
+    lenses: Sequence[str] = ("intent", "craft"),
+    tier: Tier = "quick",
+    ledger: Ledger | None = None,
+    symbols: Mapping[str, Sequence[str]] | None = None,
+    signals: tuple[QualitySignal, ...] = (),
+) -> tuple[Ledger, Round]:
+    return open_round(
+        ledger or Ledger(), snap, tier, lenses, "packet.md", symbols or {}, signals=signals
+    )
+
+
+def cover_open_hunks(ledger: Ledger, lens: str) -> Ledger:
+    """Cover every open hunk (or file, for `design`) of the latest round with `lens`."""
+    round_ = ledger.rounds[-1]
+    targets = round_.open_files if lens == "design" else round_.open_hunk_ids
+    for start in range(0, len(targets), 4):
+        batch = list(targets[start : start + 4])
+        ledger, _ = add_coverage(ledger, lens, batch, coverage_note(batch))
+    return ledger
+
+
+def record_run(
+    ledger: Ledger,
+    argv: Sequence[str] = ("pytest", "-q"),
+    *,
+    kind: RunKind = "test",
+    exit_code: int = 0,
+    fingerprint: str = "fp1",
+    cwd: str = ".",
+    fingerprint_after: str | None = None,
+) -> Ledger:
+    ledger, _ = add_run(
+        ledger,
+        kind=kind,
+        argv=argv,
+        cwd=cwd,
+        exit_code=exit_code,
+        duration_s=1.5,
+        fingerprint=fingerprint,
+        started_at="2026-01-01T00:00:00.000Z",
+        output_tail="ok",
+        fingerprint_after=fingerprint_after,
+    )
+    return ledger
+
+
+def fully_reviewed(
+    snap: DiffSnapshot, lenses: Sequence[str] = ("intent", "craft"), tier: Tier = "quick"
+) -> Ledger:
+    """A round for `snap` covered by every lens, with a passing test run at its fingerprint."""
+    ledger, _ = prepared(snap, lenses, tier)
+    for lens in lenses:
+        ledger = cover_open_hunks(ledger, lens)
+    return record_run(ledger, fingerprint=snap.fingerprint)
+
+
+def record_finding(ledger: Ledger, severity: Severity = "major", **overrides: Any) -> Ledger:
+    ledger, _ = add_finding(ledger, **{**FINDING, "severity": severity, **overrides})
+    return ledger
+
+
+def coverage_record(round_number: int, lens: str, digests: list[str], at: str) -> Coverage:
+    return Coverage(round_number, lens, tuple(digests), coverage_note(["H1"]), at)
+
+
+def swept(snap: DiffSnapshot) -> Ledger:
+    """A standard round with `intent` and `sweep`, both covered in order, and a passing run."""
+    ledger, _ = prepared(snap, lenses=("intent", "sweep"), tier="standard")
+    ledger = cover_open_hunks(ledger, "intent")
+    return record_run(cover_open_hunks(ledger, "sweep"), fingerprint=snap.fingerprint)
+
+
+def shifted(timestamp: str, seconds: float) -> str:
+    """`timestamp` moved by `seconds`, in the ledger's timestamp format."""
+    return format_timestamp(parse_timestamp(timestamp) + timedelta(seconds=seconds))
 
 
 def assert_cli_error(

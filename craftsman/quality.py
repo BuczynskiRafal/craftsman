@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 from craftsman.diffscan import DiffSnapshot, Hunk
+from craftsman.records import QualitySignal, SignalKind
 
 _DOC_SUFFIXES = frozenset({".md", ".rst", ".txt", ".adoc"})
 
@@ -46,43 +45,6 @@ _STMT_TYPES = (
     ast.Raise,
     ast.With,
 )
-
-
-class SignalKind(str, Enum):
-    LONG_FUNCTION = "long-function"
-    LARGE_MODULE = "large-module"
-    TEST_NAME = "test-name"
-    DUPLICATE_LOGIC = "duplicate-logic"
-    DICT_DOMAIN = "dict-domain"
-    DIFF_SIZE = "diff-size"
-
-
-@dataclass(frozen=True)
-class QualitySignal:
-    id: str
-    kind: SignalKind
-    file: str
-    line: int
-    detail: str
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "kind": self.kind.value,
-            "file": self.file,
-            "line": self.line,
-            "detail": self.detail,
-        }
-
-    @classmethod
-    def from_json(cls, raw: Mapping[str, Any]) -> QualitySignal:
-        return cls(
-            str(raw["id"]),
-            SignalKind(str(raw["kind"])),
-            str(raw["file"]),
-            int(raw["line"]),
-            str(raw["detail"]),
-        )
 
 
 @dataclass(frozen=True)

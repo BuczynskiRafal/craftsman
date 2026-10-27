@@ -25,20 +25,16 @@ from typing import IO
 
 from craftsman.diffscan import DiffScanError, DiffSnapshot, snapshot
 from craftsman.gate import GateStateError
-from craftsman.ledger import (
+from craftsman.ledger import add_run, load, mutate
+from craftsman.records import (
     OUTPUT_TAIL_CHARS,
     RUN_KINDS,
-    Ledger,
     LedgerError,
-    Run,
     RunKind,
-    add_run,
     format_timestamp,
-    is_trivial_run,
-    load,
-    mutate,
 )
-from craftsman.workspace import Workspace, open_workspace, resolve_base
+from craftsman.triviality import is_trivial_run
+from craftsman.workspace import open_workspace
 
 CHANGED_PATHS_SHOWN = 5
 PROG = "craftsman run"
@@ -211,14 +207,6 @@ def _changed_paths(before: DiffSnapshot, after: DiffSnapshot) -> list[str]:
     return sorted({path for path, _ in old ^ new})
 
 
-def _record(ws: Workspace, run: Run) -> Run:
-    def append(current: Ledger) -> tuple[Ledger, Run]:
-        updated = add_run(current, run)
-        return updated, updated.runs[-1]
-
-    return mutate(ws.ledger_path, append)
-
-
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -258,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
 def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: float) -> int:
     """Run `command` in `cwd` and record the run; the exit status to report to the caller."""
     ws = open_workspace(str(cwd))
-    base = resolve_base(ws, load(ws.ledger_path), None)
+    base = ws.base_sha(load(ws.ledger_path))
     before = snapshot(ws.root, base)
     started_at = format_timestamp(datetime.now(timezone.utc))
     try:
@@ -276,12 +264,12 @@ def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: f
     modified = after.fingerprint != before.fingerprint
     if modified:
         _warn_modified(before, after)
-    run = _record(
-        ws,
-        Run(
-            id="",
+    run = mutate(
+        ws.ledger_path,
+        lambda current: add_run(
+            current,
             kind=kind,
-            argv=tuple(command),
+            argv=command,
             cwd=str(cwd),
             exit_code=outcome.exit_code,
             duration_s=round(outcome.duration_s, 3),

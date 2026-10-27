@@ -6,9 +6,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from craftsman.diffscan import resolve_base_sha, worktree_root
+from craftsman.diffscan import DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.gate import GateState, load_state, state_path_for
-from craftsman.ledger import IsolationEvidence, Ledger, ledger_path_for
+from craftsman.ledger import ledger_path_for, load
+from craftsman.records import IsolationEvidence, Ledger
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,16 @@ class Workspace:
     def isolation_evidence(self) -> IsolationEvidence:
         return self.state.isolation_evidence if self.state is not None else "none"
 
+    def base_sha(self, ledger: Ledger, explicit: str | None = None) -> str:
+        """`explicit`, else the latest round's base, else the active task's base, else HEAD."""
+        ledger_base = ledger.rounds[-1].base_sha if ledger.rounds else None
+        task_base = self.state.base_sha if self.state is not None else None
+        return resolve_base_sha(self.root, explicit or ledger_base or task_base)
+
+    def current_snapshot(self) -> DiffSnapshot:
+        """The diff since the base the review (or else the active task) is measured against."""
+        return snapshot(self.root, self.base_sha(load(self.ledger_path)))
+
 
 def open_workspace(cwd: str | None) -> Workspace:
     """Locate the work tree, its active gate and its ledger for `cwd` (default: the current one).
@@ -37,10 +48,3 @@ def open_workspace(cwd: str | None) -> Workspace:
     state = load_state(state_path_for(root))
     active = state if state is not None and state.active else None
     return Workspace(root=root, state=active, ledger_path=ledger_path_for(root))
-
-
-def resolve_base(ws: Workspace, ledger: Ledger, explicit: str | None) -> str:
-    """`--base`, else the latest round's base, else the active task's base, else HEAD."""
-    ledger_base = ledger.rounds[-1].base_sha if ledger.rounds else None
-    task_base = ws.state.base_sha if ws.state is not None else None
-    return resolve_base_sha(ws.root, explicit or ledger_base or task_base)

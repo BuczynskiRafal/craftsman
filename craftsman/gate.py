@@ -36,19 +36,16 @@ from craftsman.diffscan import (
     worktree_root,
 )
 from craftsman.evidence import Evaluation, archive_ledger_if_rebased, evaluate_evidence
-from craftsman.ledger import (
-    ISOLATION_EVIDENCES,
+from craftsman.gatecheck import (
     QUICK_TIER_MAX_CHANGED_LINES,
     GateReport,
-    IsolationEvidence,
-    LedgerError,
-    format_timestamp,
     has_unresolved_diff_size,
-    locked,
     render_next_actions,
     render_report,
 )
+from craftsman.ledger import locked
 from craftsman.lenses import Tier
+from craftsman.records import ISOLATION_EVIDENCES, IsolationEvidence, LedgerError, format_timestamp
 
 GateTier = Literal["auto", "quick", "standard", "deep"]
 GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]

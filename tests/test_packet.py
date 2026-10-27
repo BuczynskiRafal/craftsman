@@ -20,10 +20,11 @@ from craftsman.diffscan import (
     resolve_base_sha,
     snapshot,
 )
-from craftsman.ledger import HunkRef, Ledger, Round, Run, add_run
 from craftsman.lenses import select_lenses
 from craftsman.packet import PacketContext, collect_context, render_packet
+from craftsman.records import HunkRef, Ledger, Round
 
+from tests.support import record_run
 from tests.test_diffscan import GitRepo
 
 PREPARED_AT = "2026-01-01T00:00:00.000Z"
@@ -45,6 +46,7 @@ def round_for(snap: DiffSnapshot) -> Round:
         ),
         lenses=("intent", "sweep"),
         packet_path="packet-1.md",
+        signals=(),
     )
 
 
@@ -166,20 +168,7 @@ class CollectContextTests(unittest.TestCase):
             for pick in select_lenses("standard", {}, docs_only=False)
             if pick.lens.id in ("intent", "sweep")
         )
-        ledger = add_run(
-            Ledger(),
-            Run(
-                id="R1",
-                kind="test",
-                argv=("pytest", "-q"),
-                cwd=".",
-                exit_code=0,
-                duration_s=0.4,
-                fingerprint="stale_fp",
-                started_at=PREPARED_AT,
-                output_tail="1 passed",
-            ),
-        )
+        ledger = record_run(Ledger(), fingerprint="stale_fp")
         ctx = collect_context(
             self.repo.root,
             snap,
@@ -237,6 +226,7 @@ def rendered_context(
         hunks=(HunkRef("H1", path, "d1", 1, 1, False),),
         lenses=("intent",),
         packet_path="packet-1.md",
+        signals=(),
     )
     return PacketContext(
         root=Path("."),
@@ -379,6 +369,84 @@ class RenderTests(unittest.TestCase):
         self.assertNotIn("def beta():", view)
         self.assertIn("- H2 · pkg/b.py · beta", view)
         self.assertEqual(packet.expand_hunk_spec("H1-H2", ("H1", "H2")), ("H1", "H2"))
+
+
+class PacketLayoutTests(unittest.TestCase):
+    def context(self, *, scope_lines: int = 3) -> PacketContext:
+        hunks = (
+            Hunk(
+                "H1", "pkg/a.py", None, "modified", 1, 1, 1, 2, "def f():", (" x = 1", "+y = ```"), "d1"
+            ),
+            Hunk("H2", "pkg/b.py", None, "modified", 4, 1, 4, 1, "", ("-a", "+b"), "d2"),
+        )
+        snap = DiffSnapshot("b" * 40, "f" * 64, hunks, ("pkg/a.py", "pkg/b.py"), (), 2, 1)
+        round_ = Round(
+            number=2,
+            fingerprint=snap.fingerprint,
+            base_sha=snap.base_sha,
+            tier="standard",
+            prepared_at=PREPARED_AT,
+            hunks=(
+                HunkRef("H1", "pkg/a.py", "d1", 1, 2, False),
+                HunkRef("H2", "pkg/b.py", "d2", 4, 1, True),
+            ),
+            lenses=("intent", "sweep"),
+            packet_path="packet-2.md",
+            signals=(),
+        )
+        body = "\n".join(f"line {i}" for i in range(scope_lines))
+        return PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_,
+            picks=tuple(
+                pick
+                for pick in select_lenses("standard", {}, docs_only=False)
+                if pick.lens.id in ("intent", "sweep")
+            ),
+            task="",
+            commits=("abc1234 feat: add f",),
+            conventions=("AGENTS.md",),
+            scopes={"H1": Scope("pkg/a.py", "f", "function", 1, scope_lines, body)},
+            symbols={"H1": ("helper_fn",)},
+            references={"helper_fn": (Reference("pkg/c.py", 40, "x = helper_fn(y)"),)},
+            signals_by_hunk={"H1": ("errors",)},
+            carried_from={"H2": 1},
+        )
+
+    def test_sections_appear_in_order(self) -> None:
+        text = render_packet(self.context())
+
+        headings = [line for line in text.splitlines() if line.startswith("#")]
+        self.assertEqual(
+            headings[:7],
+            [
+                "# Craftsman review packet — round 2",
+                "## Intent",
+                "## Conventions to read first",
+                "## Lenses in this round",
+                "## Recording cheat sheet",
+                "## Hunks",
+                "### H1 · `pkg/a.py` L1–L2 · modified · signals: errors",
+            ],
+        )
+
+    def test_carried_hunk_is_listed_without_its_diff(self) -> None:
+        text = render_packet(self.context())
+
+        self.assertIn("### H2 · `pkg/b.py` L4–L4 · carried (covered in round 1, unchanged)", text)
+
+    def test_diff_fence_is_longer_than_backticks_in_the_hunk(self) -> None:
+        text = render_packet(self.context())
+
+        self.assertIn("````diff\n@@ -1,1 +1,2 @@ def f():\n x = 1\n+y = ```\n````", text)
+
+    def test_size_guard_drops_enclosing_scopes(self) -> None:
+        ctx = self.context(scope_lines=500)
+        with mock.patch.object(packet, "MAX_PACKET_CHARS", 3000):
+            text = render_packet(ctx)
+
+        self.assertIn("Enclosing scope omitted for size — open pkg/a.py:L1–L500", text)
 
 
 if __name__ == "__main__":

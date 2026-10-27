@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from craftsman import runner
-from craftsman.ledger import OUTPUT_TAIL_CHARS
+from craftsman.records import OUTPUT_TAIL_CHARS
 
 from tests.support import REPO_ROOT, EvidenceRepo, assert_cli_error
 
@@ -64,6 +64,14 @@ class RunTests(unittest.TestCase):
         self.assertIn("the command modified the working tree (made.txt)", proc.stderr)
         self.assertIn(".craftsmanignore", proc.stderr)
         self.assertEqual(len(self.runs()), 1)
+
+    def test_run_that_modified_the_tree_records_both_fingerprints(self) -> None:
+        self.repo.cli("run", "--", sys.executable, "-c", "open('made.txt', 'w').write('x')")
+
+        (run,) = self.runs()
+
+        self.assertIsNotNone(run["fingerprint_after"])
+        self.assertNotEqual(run["fingerprint_after"], run["fingerprint"])
 
     def test_missing_executable_records_nothing(self) -> None:
         proc = self.repo.cli("run", "--", "definitely-not-a-real-command-xyz", check=False)

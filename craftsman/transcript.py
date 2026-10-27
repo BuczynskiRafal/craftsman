@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from craftsman.ledger import agent_role
+from craftsman.records import agent_role
 
 Entry = dict[str, Any]
 

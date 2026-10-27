@@ -18,7 +18,8 @@ from unittest import mock
 
 from craftsman import antigravity
 from craftsman.gate import MAX_CONTINUATIONS, GateOwner, GateState, Stage, load_state, state_path_for
-from craftsman.ledger import format_timestamp, ledger_path_for, load
+from craftsman.ledger import ledger_path_for, load
+from craftsman.records import format_timestamp
 
 from tests.support import (
     REPO_ROOT,

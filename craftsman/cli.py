@@ -60,16 +60,8 @@ from craftsman.install import (
     install_main,
     uninstall_main,
 )
-from craftsman.ledger import (
-    AGENT_ROLES,
-    VERDICTS,
-    Ledger,
-    LedgerError,
-    Run,
-    ledger_path_for,
-    load,
-    uncovered_by_lens,
-)
+from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens
+from craftsman.records import AGENT_ROLES, VERDICTS, Ledger, LedgerError, Run
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
 
@@ -900,7 +892,7 @@ class LedgerOverview:
         latest = ledger.rounds[-1] if ledger.rounds else None
         coverable = covered = 0
         if latest is not None:
-            coverable = sum(not hunk.carried for hunk in latest.hunks) * len(latest.lenses)
+            coverable = sum(len(open_units(latest, lens)) for lens in latest.lenses)
             covered = coverable - sum(len(ids) for ids in uncovered_by_lens(ledger, latest).values())
         verdicts = {name: 0 for name in (*VERDICTS, "none")}
         for finding in ledger.findings:

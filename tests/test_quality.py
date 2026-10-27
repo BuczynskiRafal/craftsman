@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 
 from craftsman.diffscan import resolve_base_sha, snapshot
-from craftsman.quality import QualitySignal, SignalKind, collect_quality_signals
+from craftsman.quality import collect_quality_signals
+from craftsman.records import QualitySignal, SignalKind
 
 from tests.support import EvidenceRepo
 

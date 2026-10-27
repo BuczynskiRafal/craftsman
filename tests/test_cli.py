@@ -25,6 +25,18 @@ class StatusTests(unittest.TestCase):
         assert isinstance(payload, dict)
         return payload
 
+    def test_status_counts_design_coverage_per_file(self) -> None:
+        lines = [f"value_{index} = {index}\n" for index in range(30)]
+        self.repo.write("app.py", "".join(lines))
+        self.repo.git("commit", "-qam", "values")
+        self.repo.write("app.py", "".join(["first = 0\n", *lines[1:-1], "last = 0\n"]))
+        self.repo.cli("review", "prepare", "--tier", "standard", "--base", "HEAD")
+
+        ledger = self.status()["ledger"]
+
+        lenses = len(self.repo.show()["round"]["lenses"])
+        self.assertEqual(ledger["coverage"], {"covered": 0, "total": 2 * (lenses - 1) + 1})
+
     def test_status_without_gate_is_idle(self) -> None:
         payload = self.status()
         self.assertEqual((payload["active"], payload["stage"], payload["owner"]), (False, "idle", None))
