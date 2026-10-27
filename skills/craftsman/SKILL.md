@@ -19,13 +19,22 @@ to finish early, you will be sent back with the list of what is missing.
 Talk to the user in their language; keep code, identifiers and commit messages in American
 English.
 
-**How to run the pieces.** A `/name` below means: follow `skills/<name>/SKILL.md` (invoke it as a
-skill or slash command if your platform offers that, otherwise open the file and follow it).
+**How to run the pieces.** A `/name` below means: invoke `/name` as a skill or slash command if
+your platform offers it; otherwise run `craftsman skill show <name>` and follow its output. Never
+search the file system for skill files.
 Subagents are the `craftsman-reviewer` and `craftsman-verifier` agents: custom agents in VS Code
 Copilot, `/agent` or the task tool in the Copilot CLI, the Agent/Task tool in Claude Code,
 `invoke_subagent` in Antigravity. Without any subagent mechanism, play each role yourself, one at a
 time. Write every `craftsman` command on one line (no `\` continuations, which PowerShell and cmd do
 not understand).
+
+## Search scope
+
+- **Workspace boundary:** Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`). Search, list, and read only inside it: prefer `git ls-files`, `git grep`, and the editor's search tools scoped to this folder (in a multi-root workspace, always pass an include pattern for this folder).
+- **Permitted reads outside the work tree:** Outside the work tree you may read only: (a) the exact file a stack trace, import, or build error points to (for example, an installed dependency's source), (b) a directory inside the system temp folder that you created for this task, (c) Craftsman's own data via `craftsman …` CLI commands (`craftsman skill show`, `craftsman review show`, `craftsman status` — never by opening `.git/craftsman` files of any repository by hand except the exact packet path `craftsman review prepare` or `craftsman review show` prints for this repository), and (d) external evidence about *this* repository, branch, or commit — such as CI (Jenkins, GitHub Actions) results and logs for the current branch or PR — when the task needs it.
+- **Forbidden searches and reads:** Never run recursive searches of the home directory, the file-system root, a drive root, or any parent directory of the work tree (`find ~`, `find /`, `grep -r … ~`, `rg … ..`, `Get-ChildItem -Recurse C:\`, `mdfind`, `locate`, `tree ~`). Never open other repositories, other projects' reports, packets, or ledgers, or any assistant's session store (`~/.copilot/session-state`, `~/.claude/projects`, `~/.gemini/antigravity/brain`, `~/.gemini/antigravity/conversations`).
+- **Ask when in doubt:** If you believe a file outside the work tree is needed, stop and ask the user for the exact path before reading it.
+- **Focused reading:** Read what the task needs: the hunks, their enclosing scopes, their callers and tests, and the project's convention files. Do not read unrelated history, old reports, or documentation that the change does not touch.
 
 ## Gears
 
@@ -47,7 +56,8 @@ craftsman gate --init --tier <auto|quick|standard|deep> --task "<the user's requ
 This records the base commit; every later review covers the whole cumulative diff since this
 point, including commits you make along the way. Then look at `git status` and the files the
 task touches. (When the user asks only for a review without `--fix`, `/craftsman`, or `ultracraft`,
-do not run `craftsman gate --init`; follow `skills/code-review/SKILL.md` in review-only mode and
+do not run `craftsman gate --init`; invoke `/code-review` as a skill if your platform offers it, or
+run `craftsman skill show code-review` and follow its output, in review-only mode and
 finish with `craftsman review check --review-only` and `craftsman review report --review-only`.)
 
 For `deep` / `ultracraft`: before writing code, write a short design note in chat — invariants

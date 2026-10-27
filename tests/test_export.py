@@ -586,6 +586,56 @@ class DoctorTests(ExportTestCase):
         posix = "'/opt/my python/bin/python3' -m craftsman.cli hook stop --platform copilot"
         self.assertEqual(_command_executables(posix), ["/opt/my python/bin/python3"])
 
+    def test_rendered_prompts_have_no_filesystem_skill_lookups_and_include_search_scope(self) -> None:
+        import re
+
+        user_prompts = self.tmp / "prompts"
+        copilot_skills = self.tmp / "copilot_skills"
+        copilot_home = self.tmp / "copilot_home"
+        claude_dir = self.tmp / "claude"
+        ws = self.tmp / "ws"
+        export.export_to_vscode_user(REPO_ROOT, user_prompts)
+        export.export_to_copilot_skills(REPO_ROOT, copilot_skills)
+        export.export_copilot_home(REPO_ROOT, copilot_home)
+        export.export_to_claude_user(REPO_ROOT, claude_dir)
+        export.export_to_agents_workspace(REPO_ROOT, ws)
+
+        rendered_files = [
+            *user_prompts.rglob("*.md"),
+            *copilot_skills.rglob("*.md"),
+            *copilot_home.rglob("*.md"),
+            *claude_dir.rglob("*.md"),
+            ws / "AGENTS.md",
+        ]
+        self.assertGreater(len(rendered_files), 30)
+
+        forbidden_phrases = (
+            "installed next to this agent",
+            "open the file and follow it",
+            "in the `code-review` skill folder (`lenses.md`)",
+        )
+        bare_skill_lookup_re = re.compile(r"skills/[a-z0-9_-]+/SKILL\.md")
+
+        for path in rendered_files:
+            text = path.read_text(encoding="utf-8")
+            for phrase in forbidden_phrases:
+                self.assertNotIn(phrase, text, f"Forbidden phrase {phrase!r} in {path}")
+            self.assertIsNone(
+                bare_skill_lookup_re.search(text),
+                f"Bare skills/<name>/SKILL.md lookup in {path}",
+            )
+
+        # Every rendered agent and craftsman/feature-dev/verify/code-review skill/command contains 'Search scope'
+        for agent_file in [*copilot_home.glob("agents/*.agent.md"), *claude_dir.glob("agents/*.md")]:
+            self.assertIn("Search scope", agent_file.read_text(encoding="utf-8"), str(agent_file))
+
+        for skill_name in ("craftsman", "feature-dev", "verify", "code-review", "simplify", "modernize", "batch"):
+            skill_md = copilot_skills / skill_name / "SKILL.md"
+            claude_cmd = claude_dir / "commands" / f"{skill_name}.md"
+            self.assertIn("## Search scope", skill_md.read_text(encoding="utf-8"), str(skill_md))
+            self.assertIn("## Search scope", claude_cmd.read_text(encoding="utf-8"), str(claude_cmd))
+        self.assertIn("## Search scope", (ws / "AGENTS.md").read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

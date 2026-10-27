@@ -19,10 +19,14 @@ delete caches your runs leave in the repository (`__pycache__`, …).
 
 ## Your assignment
 
-Run `craftsman review show` and read the packet (`packet-<N>.md`) first: it states the task, the
-base commit (`<base>` below), the convention files, and each hunk's enclosing scope and callers —
-you need them to judge intent. Open source files only around the cited `file:line` ranges and
-callers rather than reading full files top to bottom.
+Run `craftsman review show` in the repository root and read the packet path it prints (or run
+`craftsman review show --packet-path`) first: it states the task, the base commit (`<base>` below),
+the convention files, and each hunk's enclosing scope and callers — you need them to judge intent.
+Never search for packet or ledger files; packets, ledgers, and reports of other repositories are
+never relevant. Open source files only around the cited `file:line` ranges and callers rather than
+reading full files top to bottom.
+
+{{include skills/craftsman/scope.md}}
 
 ## Step 0 — Final `sweep` pass (without `--fix` only) and root-cause deduplication
 

@@ -13,6 +13,16 @@ Most feature bugs are decided before the first line is written: a missed existin
 unasked question about an edge case, a design that fights the codebase. This workflow front-loads
 those decisions and keeps them visible.
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI
+commands. Never run recursive searches of `~`, `/`, or parent directories, and never open other
+repositories, other projects' packets/ledgers/reports, or assistant session stores (run
+`craftsman skill show craftsman --file scope.md` for the full contract).
+
 ## 1. Frame the feature
 Write two or three sentences: who needs what, and how they will notice it works. Add explicit
 **non-goals**. If you cannot write this without guessing, ask now.

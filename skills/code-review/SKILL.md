@@ -20,6 +20,16 @@ Everything you examine and conclude is written to the **evidence ledger** throug
 `craftsman` CLI. The quality gate reads the ledger, not your prose. A review that is not in the
 ledger did not happen.
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI
+commands. Never run recursive searches of `~`, `/`, or parent directories, and never open other
+repositories, other projects' packets/ledgers/reports, or assistant session stores (for the full
+contract run `craftsman skill show craftsman --file scope.md`).
+
 ## Arguments
 
 `/code-review [target] [--tier quick|standard|deep] [--fix] [--comment]`
@@ -57,7 +67,10 @@ ledger did not happen.
 craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--task "<what the change is for, one line>"]
 ```
 
-This prints the path of `packet-<N>.md`. Read the packet completely. It contains:
+This prints the absolute path of the current review packet. Read the packet completely (if you do
+not have the path, run `craftsman review show` or `craftsman review show --packet-path` in the
+repository root; never search for packet or ledger files, as packets, ledgers, and reports of other
+repositories are never relevant). It contains:
 - the round number, diff fingerprint, and statistics;
 - the task statement and commit messages (the *intent*);
 - the project convention files to respect (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`,
@@ -83,8 +96,9 @@ review stays fast and focused on the diff.
 
 ## Step 2 — Lens passes
 
-The lens playbooks are in [`lenses.md`](lenses.md) next to this file. Read the playbook of each
-lens before applying it.
+The lens playbooks are in [`lenses.md`](lenses.md) (inlined at the end of this prompt on
+single-file platforms, or readable via `craftsman skill show code-review --file lenses.md`; never
+search the file system for `lenses.md`). Read the playbook of each lens before applying it.
 
 For each selected lens, for each non-carried hunk:
 1. apply every probe of the playbook, substituting concrete values;
@@ -168,7 +182,8 @@ Step 3 at low cost; a real defect you filtered out early is lost for good.
   subagents (`craftsman-reviewer`), 1–3 lenses each in parallel, then run one more reviewer for
   the **final sweep** described at the end of `lenses.md`, followed by a separate
   `craftsman-verifier` subagent.
-- **Keep subagent briefs lean:** pass each subagent only the packet path (`packet-<N>.md`), its
+- **Keep subagent briefs lean:** pass each subagent only the packet path printed by
+  `craftsman review prepare` or `craftsman review show`, its
   assigned lenses, and the hunk list — never paste file contents into the prompt. The verifier
   should read `craftsman review show` and the packet first, then open source files only around the
   cited `file:line` ranges and callers rather than reading full files top to bottom.

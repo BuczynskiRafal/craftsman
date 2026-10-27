@@ -10,7 +10,16 @@ description: >-
 
 # Type & data-model audit (`/audit-types [target]`)
 
-Deepens the `model` lens of `skills/code-review/lenses.md` — read that playbook first.
+Deepens the `model` lens (run `craftsman skill show code-review --file lenses.md` to read that
+playbook first; never search the file system for `lenses.md`).
+
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Never run recursive searches of `~`, `/`, or parent directories, and never open other
+repositories, other projects' packets/ledgers/reports, or assistant session stores (run
+`craftsman skill show craftsman --file scope.md` for the full contract).
 
 The measure of a type here is simple: **how many states can be built that the domain forbids,
 and how far does a bad value travel before anything notices?**

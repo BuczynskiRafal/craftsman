@@ -321,7 +321,8 @@ def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
     short_base = base[:7] if base else "none (no commits yet)"
     return reply.inject(
         f"Craftsman session started (tier {state['tier']}, base {short_base}). Follow the /craftsman "
-        "skill; the gate will block finishing until `craftsman review check` passes."
+        "skill; the gate will block finishing until `craftsman review check` passes.\n"
+        f"Scope: work only inside {session.root.resolve()}; see Search scope."
     )
 
 
@@ -423,15 +424,39 @@ def on_subagent_start(session: Session, hook: HookInput, reply: Reply) -> Output
     ledger = record_agent_event(session, hook, "start", reply.platform)
     if role is None or not ledger.rounds:
         return reply.allow()
-    return reply.inject(briefing(role, ledger, session.ledger_path, review_only=not session.active))
+    return reply.inject(
+        briefing(
+            role,
+            ledger,
+            session.ledger_path,
+            review_only=not session.active,
+            repo_root=session.root,
+        )
+    )
 
 
-def briefing(role: Role, ledger: Ledger, ledger_path: Path, *, review_only: bool = False) -> str:
+def _infer_repo_root_from_ledger_path(ledger_path: Path) -> Path:
+    resolved = ledger_path.resolve()
+    if resolved.parent.name == "craftsman" and resolved.parent.parent.name in (".git", ".craftsman"):
+        return resolved.parent.parent.parent
+    return resolved.parent
+
+
+def briefing(
+    role: Role,
+    ledger: Ledger,
+    ledger_path: Path,
+    *,
+    review_only: bool = False,
+    repo_root: Path | None = None,
+) -> str:
     """What a Craftsman reviewer or verifier needs to know about the current round."""
     latest = ledger.rounds[-1]
+    effective_root = (repo_root.resolve() if repo_root is not None else _infer_repo_root_from_ledger_path(ledger_path))
     lines = [
         f"Craftsman review round {latest.number}. "
-        f"Packet: {latest.packet_path or packet_path(ledger_path, latest.number)}"
+        f"Packet: {latest.packet_path or packet_path(ledger_path, latest.number)}",
+        f"Scope: work only inside {effective_root}; see Search scope.",
     ]
     if role == "reviewer":
         missing = {lens: ids for lens, ids in uncovered_by_lens(ledger, latest).items() if ids}

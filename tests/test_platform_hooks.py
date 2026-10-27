@@ -20,7 +20,8 @@ from tests.support import EvidenceRepo, coverage_note
 CHANGE = "def total(items):\n    return sum(items)\n"
 STARTED = (
     "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill; "
-    "the gate will block finishing until `craftsman review check` passes."
+    "the gate will block finishing until `craftsman review check` passes.\n"
+    "Scope: work only inside {root}; see Search scope."
 )
 
 
@@ -140,7 +141,7 @@ class PromptTests(HookTestCase):
         payload = vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep add cart totals")
         out, _ = call_hook("prompt", "copilot", payload)
 
-        context = STARTED.format(tier="deep", base=self.repo.base_sha[:7])
+        context = STARTED.format(tier="deep", base=self.repo.base_sha[:7], root=self.root.resolve())
         self.assertEqual(
             out,
             {
@@ -181,7 +182,7 @@ class PromptTests(HookTestCase):
         out, _ = call_hook(
             "prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman fix it")
         )
-        context = STARTED.format(tier="auto", base=self.repo.base_sha[:7])
+        context = STARTED.format(tier="auto", base=self.repo.base_sha[:7], root=self.root.resolve())
         self.assertEqual(
             out,
             {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}},

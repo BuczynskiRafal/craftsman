@@ -14,6 +14,16 @@ Make the changed code as simple as the problem allows **without changing what it
 edit files directly. Scope is the cumulative diff (working tree vs. the `/craftsman` base, or
 `HEAD` when no session is active), or the path/ref the user gave.
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, or Craftsman's own data via `craftsman …` CLI commands. Never run recursive
+searches of `~`, `/`, or parent directories, and never open other repositories, other projects'
+packets/ledgers/reports, or assistant session stores (run `craftsman skill show craftsman --file
+scope.md` for the full contract).
+
 ## What "behavior-preserving" means here
 
 After your edits, for every input: the same return values, the same output (stdout, files,
@@ -35,7 +45,7 @@ for an edit, do not make it — mention it as a suggestion instead.
    user instead (`craftsman gate --await-user` while you wait for their decision).
 2. **Read the diff and its surroundings.** For each changed function, read the whole function and
    the module it lives in; skim neighboring modules for helpers.
-3. **Look for cost, using the `craft` lens probes** (see `skills/code-review/lenses.md`):
+3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show code-review --file lenses.md` to read the playbook; never search the file system for `lenses.md`):
    - reimplemented helpers, constants or patterns that already exist (search by behavior and by
      likely names, not only the exact name);
    - derivable state, single-use indirection, always-constant flags, deep nesting that guard

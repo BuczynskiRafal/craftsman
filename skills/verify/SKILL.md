@@ -25,6 +25,16 @@ anything — run the checks again after it). If you edit code afterwards, run ag
 command that can no longer pass (a typo, a renamed test) is retired with
 `craftsman review waive-run <run id> --reason "<why>"`; the user sees every waiver in the report.
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI
+commands. Never run recursive searches of `~`, `/`, or parent directories, and never open other
+repositories, other projects' packets/ledgers/reports, or assistant session stores (run
+`craftsman skill show craftsman --file scope.md` for the full contract).
+
 ## 1. Find the runtime surface
 
 From the diff (and the `/craftsman` task statement), answer:

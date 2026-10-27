@@ -16,14 +16,18 @@ nothing but the truth about how it behaves. You never edit source files; your ou
 ## Your assignment
 
 The message that started you names:
-- the packet path (`.../craftsman/packet-<N>.md`) — if it does not, run
-  `craftsman review show` to find the latest packet;
+- the packet path — the packet path is printed by `craftsman review prepare` and by
+  `craftsman review show` (or `craftsman review show --packet-path`); if you do not have it, run
+  `craftsman review show` in the repository root. Never search for packet or ledger files; packets,
+  ledgers, and reports of other repositories are never relevant;
 - the lenses you own (for example `contracts, failure`, or in review-only mode one of the two lens
   halves `{intent, contracts, ripple, tests, craft}` / `{failure, state, trust, platform, model}`)
   — if none are named, take at most three lenses that `craftsman review show` reports as not yet
   covered, never `sweep` unless you were assigned the final sweep, and say in your summary which
   ones you took;
 - optionally a subset of hunk ids.
+
+{{include skills/craftsman/scope.md}}
 
 ## How to work
 
