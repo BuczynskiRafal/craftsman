@@ -300,6 +300,26 @@ record items with a concrete cost (a likely future bug, duplicated maintenance, 
 6. Consistency: error handling, logging, naming and layout match the surrounding code and the
    project's convention files.
 
+## `design` — Design & size: the change as a whole
+
+Run by a dedicated `craftsman-reviewer` subagent after the hunk-level lenses and before `sweep`.
+Coverage is recorded per changed file (`craftsman review cover --lens design --files path/a.py,path/b.py --note "..."`),
+not per hunk.
+
+**Probes**
+1. Size vs. task: how many production lines were added, and how many does the task actually
+   require? List three things that could be deleted without losing required behavior.
+2. Duplicate questions: do two functions in the change answer the same question?
+3. Domain types vs. dicts: are fixed-shape domain values represented as explicit types
+   (dataclasses, NamedTuples, TypedDicts) rather than plain `dict`s?
+4. Honest names: do symbol and test names state what the thing is or what behavior the test
+   verifies, without references to plan IDs, version numbers, or counters?
+5. Soundness of the model: is the underlying model sound, or are findings patching symptoms of
+   the wrong model (for example, per-tool option tables instead of path candidates vs. forbidden
+   zones)?
+6. Quality signals: for every quality signal reported for this file, verify that there is either
+   a finding (`--signal <ID>`) or a concrete `ack` justification.
+
 ## `sweep` — Final sweep: interactions between hunks
 
 Run after all other lenses, by a reviewer who did none of them (or in review-only mode without

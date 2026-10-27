@@ -33,10 +33,13 @@ AMBIENT_PLATFORM_ENV_VARS = frozenset(
 
 
 def coverage_note(hunk_ids: list[str]) -> str:
-    return "; ".join(
-        f"{hid} f_{hid[1:]}.py:{hid[1:]}: x={hid[1:]} -> returns {int(hid[1:]) + 1} on boundary input"
-        for hid in hunk_ids
-    )
+    parts: list[str] = []
+    for index, item in enumerate(hunk_ids, 1):
+        num = item[1:] if item.startswith("H") and item[1:].isdigit() else str(index)
+        parts.append(
+            f"{item} f_{num}.py:{num}: x={num} -> returns {int(num) + 1} on boundary input"
+        )
+    return "; ".join(parts)
 
 
 class EvidenceRepo:
@@ -140,9 +143,10 @@ class EvidenceRepo:
         return payload
 
     def cover_all(self) -> None:
-        """Cover every open hunk with every lens of the latest round, sweep last."""
+        """Cover every open hunk/file with every lens of the latest round, sweep last."""
         for lens, entry in self.show()["coverage"].items():
             missing = list(entry["missing"])
+            flag = "--files" if lens == "design" else "--hunks"
             for start in range(0, len(missing), 4):
                 batch = missing[start : start + 4]
                 self.cli(
@@ -150,7 +154,7 @@ class EvidenceRepo:
                     "cover",
                     "--lens",
                     lens,
-                    "--hunks",
+                    flag,
                     ",".join(batch),
                     "--note",
                     coverage_note(batch),

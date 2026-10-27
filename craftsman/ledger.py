@@ -123,6 +123,7 @@ _NO_REPRO_PREFIX = "no-repro:"
 _STATIC_PREFIX = "static:"
 _INTENT_PREFIX = "intent:"
 GROUPED_EVIDENCE_PREFIX = "Grouped into "
+DESIGN_LENS = "design"
 SWEEP_LENS = "sweep"
 COVERAGE_NOTE_EXAMPLE = "H3 parse_cfg: x=None -> L42 TypeError; callers cli.py:19 ok"
 PROBABLE_EVIDENCE_EXAMPLE = (
@@ -1130,9 +1131,29 @@ def _carry_over(
     carried = {
         hunk.id
         for hunk in hunks
-        if hunk.id not in reopened and all((lens, hunk.digest) in covered for lens in lenses)
+        if hunk.id not in reopened
+        and all(
+            (lens, _file_digest(hunks, hunk.path) if lens == DESIGN_LENS else hunk.digest) in covered
+            for lens in lenses
+        )
     }
     return frozenset(carried), frozenset(reopened)
+
+
+def _file_digest(hunks: Sequence[Hunk | HunkRef], path: str) -> str:
+    return "file:" + path + ":" + ",".join(h.digest for h in hunks if h.path == path)
+
+
+def _round_files(round_: Round) -> list[tuple[str, str, bool]]:
+    paths = list(dict.fromkeys(h.path for h in round_.hunks))
+    return [
+        (
+            path,
+            _file_digest(round_.hunks, path),
+            all(h.carried for h in round_.hunks if h.path == path),
+        )
+        for path in paths
+    ]
 
 
 def _mentioned_words(hunk: Hunk) -> frozenset[str]:
@@ -1182,7 +1203,29 @@ def reopened_mentions(
     return mentions
 
 
-def _validate_coverage_target(round_: Round, lens: str, hunk_ids: Sequence[str]) -> dict[str, HunkRef]:
+def _validate_design_targets(round_: Round, targets: Sequence[str]) -> tuple[str, ...]:
+    files_by_path = {path: (digest, carried) for path, digest, carried in _round_files(round_)}
+    by_hunk = {hunk.id: hunk.path for hunk in round_.hunks}
+    resolved = [by_hunk.get(item, item) for item in targets]
+    unknown = [item for item, path in zip(targets, resolved, strict=True) if path not in files_by_path]
+    if unknown:
+        open_files = [path for path, _, carried in _round_files(round_) if not carried]
+        raise LedgerError(
+            f"unknown files in round {round_.number}: {', '.join(unknown)}; "
+            f"files to cover: {', '.join(open_files) or 'none'}",
+            field="digests",
+        )
+    carried = [path for path in resolved if files_by_path[path][1]]
+    if carried:
+        raise LedgerError(
+            f"{', '.join(carried)} already covered in an earlier round (carried over); "
+            "cover only the remaining files",
+            field="digests",
+        )
+    return tuple(files_by_path[path][0] for path in resolved)
+
+
+def _validate_coverage_target(round_: Round, lens: str, hunk_ids: Sequence[str]) -> tuple[str, ...]:
     if lens not in round_.lenses:
         if lens not in LENS_IDS:
             raise LedgerError(
@@ -1202,6 +1245,8 @@ def _validate_coverage_target(round_: Round, lens: str, hunk_ids: Sequence[str])
         )
     if len(set(hunk_ids)) != len(hunk_ids):
         raise LedgerError(f"hunk ids must not repeat: {', '.join(hunk_ids)}", field="digests")
+    if lens == DESIGN_LENS:
+        return _validate_design_targets(round_, hunk_ids)
     by_id = {hunk.id: hunk for hunk in round_.hunks}
     unknown = [hunk_id for hunk_id in hunk_ids if hunk_id not in by_id]
     if unknown:
@@ -1218,13 +1263,17 @@ def _validate_coverage_target(round_: Round, lens: str, hunk_ids: Sequence[str])
             "cover only the remaining hunks",
             field="digests",
         )
-    return by_id
+    return tuple(by_id[hunk_id].digest for hunk_id in hunk_ids)
+
+
+def _target_pattern(target: str) -> str:
+    return rf"(?<!\w){re.escape(target)}(?!\w)"
 
 
 def _extract_hunk_segments(hunk_ids: Sequence[str], note: str) -> dict[str, str]:
     spans: list[tuple[int, str]] = []
     for hid in hunk_ids:
-        match = re.search(rf"\b{re.escape(hid)}\b", note)
+        match = re.search(_target_pattern(hid), note)
         if match is not None:
             spans.append((match.start(), hid))
     spans.sort()
@@ -1235,13 +1284,14 @@ def _extract_hunk_segments(hunk_ids: Sequence[str], note: str) -> dict[str, str]
     return segments
 
 
-def _normalize_note_segment(segment: str) -> str:
-    without_ids = re.sub(r"\bH[1-9]\d*\b", "", segment)
+def _normalize_note_segment(segment: str, target: str = "") -> str:
+    cleaned = re.sub(_target_pattern(target), "", segment) if target else segment
+    without_ids = re.sub(r"\bH[1-9]\d*\b", "", cleaned)
     return re.sub(r"\s+", " ", without_ids.strip().strip(";:,-.")).strip().lower()
 
 
 def _validate_hunk_segment(hid: str, segment: str) -> str:
-    without_id = re.sub(rf"\b{re.escape(hid)}\b", " ", segment)
+    without_id = re.sub(_target_pattern(hid), " ", segment)
     stripped_generic = _GENERIC_WORDS_RE.sub(" ", without_id)
     substantive = re.sub(r"[\W_]+", "", stripped_generic)
     if len(segment) < MIN_HUNK_NOTE_SEGMENT_CHARS or len(substantive) < MIN_SUBSTANTIVE_NOTE_CHARS:
@@ -1260,13 +1310,13 @@ def _validate_hunk_segment(hid: str, segment: str) -> str:
             f"for {hid} must include a concrete detail (file:line, number/literal, ->, or symbol name). "
             f'Example: "{COVERAGE_NOTE_EXAMPLE}"',
         )
-    return _normalize_note_segment(segment)
+    return _normalize_note_segment(segment, hid)
 
 
 def _validate_coverage_note(
     ledger: Ledger, round_: Round, lens: str, hunk_ids: Sequence[str], note: str
 ) -> None:
-    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(rf"\b{re.escape(hunk_id)}\b", note)]
+    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(_target_pattern(hunk_id), note)]
     if unnamed:
         raise LedgerError(
             f"the coverage note must name every covered hunk and what was tried on it; missing: "
@@ -1275,11 +1325,16 @@ def _validate_coverage_note(
         )
     segments = _extract_hunk_segments(hunk_ids, note)
     norm_by_hunk: dict[str, str] = {}
+    all_files = [path for path, _, _ in _round_files(round_)]
     for record in ledger.coverage:
         if record.round == round_.number and record.lens == lens:
-            rec_ids = re.findall(r"\bH[1-9]\d*\b", record.note)
+            rec_ids = (
+                [p for p in all_files if re.search(_target_pattern(p), record.note)]
+                if lens == DESIGN_LENS
+                else re.findall(r"\bH[1-9]\d*\b", record.note)
+            )
             for hid, seg in _extract_hunk_segments(rec_ids, record.note).items():
-                norm_by_hunk[hid] = _normalize_note_segment(seg)
+                norm_by_hunk[hid] = _normalize_note_segment(seg, hid)
     for hid in hunk_ids:
         norm_by_hunk[hid] = _validate_hunk_segment(hid, segments[hid])
     counts: dict[str, int] = {}
@@ -1296,16 +1351,16 @@ def _validate_coverage_note(
 def add_coverage(
     ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
 ) -> tuple[Ledger, Coverage]:
-    """Record that `lens` reviewed the given hunks of the latest round."""
+    """Record that `lens` reviewed the given hunks (or files for `design`) of the latest round."""
     round_ = _latest_round(ledger)
-    by_id = _validate_coverage_target(round_, lens, hunk_ids)
+    digests = _validate_coverage_target(round_, lens, hunk_ids)
     _validate_coverage_note(ledger, round_, lens, hunk_ids, note)
     if lens == SWEEP_LENS:
         _require_lenses_before_sweep(ledger, round_)
     record = Coverage(
         round=round_.number,
         lens=lens,
-        digests=tuple(by_id[hunk_id].digest for hunk_id in hunk_ids),
+        digests=digests,
         note=note.strip(),
         recorded_at=_now(),
     )
@@ -1889,12 +1944,13 @@ def _tier_issues(latest: Round, policy: GatePolicy) -> list[GateIssue]:
 
 
 def _reopened_in(ledger: Ledger, upto: int) -> dict[str, int]:
-    """Per hunk digest, the latest round up to `upto` that reopened it."""
+    """Per hunk (and file) digest, the latest round up to `upto` that reopened it."""
     latest: dict[str, int] = {}
     for round_ in ledger.rounds[:upto]:
         for hunk in round_.hunks:
             if hunk.reopened:
                 latest[hunk.digest] = round_.number
+                latest[_file_digest(round_.hunks, hunk.path)] = round_.number
     return latest
 
 
@@ -1917,14 +1973,21 @@ def _lens_coverage(ledger: Ledger, upto: int) -> dict[tuple[str, str], datetime]
 
 
 def _lenses_done_at(ledger: Ledger, round_: Round) -> datetime | None:
-    """When every lens but the sweep had covered every open hunk of `round_`; None if not yet."""
+    """When every lens but the sweep had covered every open hunk/file of `round_`; None if not yet."""
     first = _lens_coverage(ledger, round_.number)
     done = datetime.min.replace(tzinfo=timezone.utc)
-    for hunk in round_.hunks:
-        for lens in round_.lenses:
-            if hunk.carried or lens == SWEEP_LENS:
+    for lens in round_.lenses:
+        if lens == SWEEP_LENS:
+            continue
+        units = (
+            [(digest, carried) for _, digest, carried in _round_files(round_)]
+            if lens == DESIGN_LENS
+            else [(hunk.digest, hunk.carried) for hunk in round_.hunks]
+        )
+        for digest, carried in units:
+            if carried:
                 continue
-            at = first.get((lens, hunk.digest))
+            at = first.get((lens, digest))
             if at is None:
                 return None
             done = max(done, at)
@@ -1957,12 +2020,7 @@ def _carryable_coverage(ledger: Ledger) -> set[tuple[str, str]]:
 
 
 def uncovered_by_lens(ledger: Ledger, round_: Round) -> dict[str, list[str]]:
-    """Hunk ids of `round_` that each of its lenses still has to cover.
-
-    Lens coverage from earlier rounds counts, except for a hunk reopened because it mentions a
-    changed symbol: from the round that reopened it on, only fresh coverage does. The sweep
-    always has to be recorded in `round_` itself, after its other lenses.
-    """
+    """Hunk ids (or file paths for `design`) of `round_` that each of its lenses still has to cover."""
     lenses = _lens_coverage(ledger, round_.number)
     swept = {
         digest
@@ -1971,8 +2029,13 @@ def uncovered_by_lens(ledger: Ledger, round_: Round) -> dict[str, list[str]]:
         for digest in record.digests
     }
     missing: dict[str, list[str]] = {lens: [] for lens in round_.lenses}
-    for hunk in round_.hunks:
-        for lens in round_.lenses:
+    for lens in round_.lenses:
+        if lens == DESIGN_LENS:
+            for path, digest, carried in _round_files(round_):
+                if not carried and (DESIGN_LENS, digest) not in lenses:
+                    missing[lens].append(path)
+            continue
+        for hunk in round_.hunks:
             covered = hunk.digest in swept if lens == SWEEP_LENS else (lens, hunk.digest) in lenses
             if not hunk.carried and not covered:
                 missing[lens].append(hunk.id)
@@ -2005,11 +2068,13 @@ def _uncovered_issue(lens: str, missing: Sequence[str], round_: Round) -> GateIs
     batch = ",".join(missing[:MAX_HUNKS_PER_COVERAGE])
     extra = len(missing) - MAX_HUNKS_PER_COVERAGE
     more = f" (+{extra} more)" if extra > 0 else ""
+    unit = "file(s)" if lens == DESIGN_LENS else "hunk(s)"
+    flag = "--files" if lens == DESIGN_LENS else "--hunks"
     return GateIssue(
         "uncovered",
-        f"Lens `{lens}` has {len(missing)} uncovered hunk(s) in round {round_.number}: "
+        f"Lens `{lens}` has {len(missing)} uncovered {unit} in round {round_.number}: "
         f"{batch}{more}; review them and run "
-        f'`craftsman review cover --lens {lens} --hunks {batch} --note "..."`.',
+        f'`craftsman review cover --lens {lens} {flag} {batch} --note "..."`.',
     )
 
 
@@ -2217,7 +2282,8 @@ def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
 def _coverage_summary(ledger: Ledger, latest: Round) -> str:
     missing = uncovered_by_lens(ledger, latest)
     open_hunks = sum(not hunk.carried for hunk in latest.hunks)
-    total = open_hunks * len(latest.lenses)
+    open_files = sum(not carried for _, _, carried in _round_files(latest))
+    total = sum(open_files if lens == DESIGN_LENS else open_hunks for lens in latest.lenses)
     done = total - sum(len(ids) for ids in missing.values())
     carried = len(latest.hunks) - open_hunks
     line = f"Coverage: {done}/{total} lens-hunk pairs; {carried} hunk(s) carried from earlier rounds."

@@ -110,6 +110,13 @@ LENSES: tuple[Lens, ...] = (
         triggers=frozenset(),
     ),
     Lens(
+        id="design",
+        title="Design & size — the change as a whole",
+        focus="Is this the smallest clear design for the task? What could be deleted?",
+        always_in=_STANDARD_AND_DEEP,
+        triggers=frozenset(),
+    ),
+    Lens(
         id="sweep",
         title="Final sweep — interactions between hunks",
         focus="Do hunks that are each correct still agree with each other, the docs and the config?",

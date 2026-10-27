@@ -37,6 +37,7 @@ class LensCatalogTests(unittest.TestCase):
                 "platform",
                 "model",
                 "craft",
+                "design",
                 "sweep",
             ],
         )
@@ -59,7 +60,7 @@ class LensSelectionTests(unittest.TestCase):
     def test_standard_tier_adds_its_always_on_lenses(self) -> None:
         self.assertEqual(
             picked_ids("standard", {}),
-            ["intent", "contracts", "failure", "ripple", "tests", "craft", "sweep"],
+            ["intent", "contracts", "failure", "ripple", "tests", "craft", "design", "sweep"],
         )
 
     def test_deep_tier_selects_every_lens(self) -> None:

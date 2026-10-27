@@ -29,6 +29,7 @@ from craftsman.gate import (
     resolve_effective_tier,
 )
 from craftsman.ledger import (
+    DESIGN_LENS,
     RESOLUTIONS,
     SEVERITIES,
     SWEEP_LENS,
@@ -246,63 +247,71 @@ def _batch_error(index: int, label: str | None, exc: LedgerError) -> LedgerError
     return LedgerError(f"{head}: {exc}")
 
 
+def _cover_from_json(args: argparse.Namespace) -> int:
+    if any(val is not None for val in (args.lens, args.hunks, args.files, args.note)):
+        raise LedgerError("--from-json cannot be combined with --lens, --hunks, --files or --note")
+    raw_entries = _load_json_entries(args.from_json)
+    ws = open_workspace(args.cwd)
+    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
+
+    def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
+        round_ = require_current_round(current, snap)
+        lines: list[str] = []
+        for index, raw in enumerate(raw_entries, 1):
+            label = raw.get("lens") if isinstance(raw, dict) and isinstance(raw.get("lens"), str) else None
+            try:
+                f = _Fields(raw)
+                lens = f.choice("lens", tuple(sorted(LENS_IDS)))
+                key = "files" if isinstance(raw, dict) and "files" in raw else "hunks"
+                targets = [item.strip() for item in f.texts(key) if item.strip()]
+                note = f.text("note")
+                f.done(None)
+                current, _ = add_coverage(current, lens, targets, note)
+            except LedgerError as exc:
+                raise _batch_error(index, label, exc) from None
+            left = sum(len(ids) for ids in uncovered_by_lens(current, round_).values())
+            lines.append(
+                f"Coverage recorded: `{lens}` covered {', '.join(targets)} in round "
+                f"{round_.number}; {left} lens-hunk pair(s) left in this round."
+            )
+        return current, lines
+
+    for line in mutate(ws.ledger_path, record_batch):
+        print(line)
+    return 0
+
+
 def _cover(args: argparse.Namespace) -> int:
     if args.from_json is not None:
-        if any(val is not None for val in (args.lens, args.hunks, args.note)):
-            raise LedgerError("--from-json cannot be combined with --lens, --hunks or --note")
-        raw_entries = _load_json_entries(args.from_json)
-        ws = open_workspace(args.cwd)
-        snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-
-        def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
-            round_ = require_current_round(current, snap)
-            lines: list[str] = []
-            for index, raw in enumerate(raw_entries, 1):
-                label = (
-                    raw.get("lens")
-                    if isinstance(raw, dict) and isinstance(raw.get("lens"), str)
-                    else None
-                )
-                try:
-                    f = _Fields(raw)
-                    lens = f.choice("lens", tuple(sorted(LENS_IDS)))
-                    hunk_ids = [item.strip() for item in f.texts("hunks") if item.strip()]
-                    note = f.text("note")
-                    f.done(None)
-                    current, _ = add_coverage(current, lens, hunk_ids, note)
-                except LedgerError as exc:
-                    raise _batch_error(index, label, exc) from None
-                left = sum(len(ids) for ids in uncovered_by_lens(current, round_).values())
-                lines.append(
-                    f"Coverage recorded: `{lens}` covered {', '.join(hunk_ids)} in round "
-                    f"{round_.number}; {left} lens-hunk pair(s) left in this round."
-                )
-            return current, lines
-
-        for line in mutate(ws.ledger_path, record_batch):
-            print(line)
-        return 0
-
+        return _cover_from_json(args)
+    if args.hunks is not None and args.files is not None:
+        raise LedgerError("pass either --hunks or --files, not both")
+    if args.lens == DESIGN_LENS and args.hunks is not None:
+        raise LedgerError("the `design` lens covers changed files, not hunks; pass --files instead of --hunks")
+    if args.lens != DESIGN_LENS and args.files is not None:
+        raise LedgerError("--files is only used with `--lens design`; pass --hunks for hunk lenses")
+    raw_targets = args.files if args.files is not None else args.hunks
+    target_flag = "--files" if args.lens == DESIGN_LENS else "--hunks"
     missing = [
         flag
-        for flag, val in (("--lens", args.lens), ("--hunks", args.hunks), ("--note", args.note))
+        for flag, val in (("--lens", args.lens), (target_flag, raw_targets), ("--note", args.note))
         if val is None
     ]
     if missing:
         args.subparser.error(f"the following arguments are required: {', '.join(missing)}")
     ws = open_workspace(args.cwd)
     snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-    hunk_ids = [item.strip() for item in args.hunks.split(",") if item.strip()]
+    targets = [item.strip() for item in (raw_targets or "").split(",") if item.strip()]
 
     def record(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round]]:
         require_current_round(current, snap)
-        updated, _ = add_coverage(current, args.lens, hunk_ids, args.note)
+        updated, _ = add_coverage(current, args.lens, targets, args.note)
         return updated, (updated, updated.rounds[-1])
 
     ledger, round_ = mutate(ws.ledger_path, record)
     left = sum(len(ids) for ids in uncovered_by_lens(ledger, round_).values())
     print(
-        f"Coverage recorded: `{args.lens}` covered {', '.join(hunk_ids)} in round {round_.number}; "
+        f"Coverage recorded: `{args.lens}` covered {', '.join(targets)} in round {round_.number}; "
         f"{left} lens-hunk pair(s) left in this round."
     )
     return 0
@@ -651,9 +660,15 @@ def _round_json(round_: Round, snap: DiffSnapshot) -> dict[str, Any]:
 
 
 def _coverage_json(ledger: Ledger, round_: Round) -> dict[str, Any]:
-    total = sum(not hunk.carried for hunk in round_.hunks)
+    open_hunks = sum(not hunk.carried for hunk in round_.hunks)
+    paths = list(dict.fromkeys(h.path for h in round_.hunks))
+    open_files = sum(not all(h.carried for h in round_.hunks if h.path == p) for p in paths)
     return {
-        lens: {"covered": total - len(missing), "total": total, "missing": missing}
+        lens: {
+            "covered": (open_files if lens == DESIGN_LENS else open_hunks) - len(missing),
+            "total": open_files if lens == DESIGN_LENS else open_hunks,
+            "missing": missing,
+        }
         for lens, missing in uncovered_by_lens(ledger, round_).items()
     }
 
@@ -932,14 +947,15 @@ def _add_prepare_and_cover_parsers(
     prepare.add_argument("--task", help="One-line description of what the change is for")
     prepare.set_defaults(handler=_prepare)
 
-    cover = sub.add_parser("cover", parents=[common], help="Record that a lens reviewed hunks")
+    cover = sub.add_parser("cover", parents=[common], help="Record that a lens reviewed hunks or files")
     cover.add_argument("--lens", choices=lenses)
     cover.add_argument("--hunks", help="Comma-separated hunk ids, e.g. H1,H3")
-    cover.add_argument("--note", help="What you tried on each named hunk")
+    cover.add_argument("--files", help="Comma-separated file paths for `--lens design`, e.g. pkg/a.py")
+    cover.add_argument("--note", help="What you tried on each named hunk or file")
     cover.add_argument(
         "--from-json",
         metavar="PATH",
-        help='Bulk JSON list of {"lens", "hunks", "note"} objects (use - for stdin)',
+        help='Bulk JSON list of {"lens", "hunks"|"files", "note"} objects (use - for stdin)',
     )
     cover.set_defaults(handler=_cover, subparser=cover)
 

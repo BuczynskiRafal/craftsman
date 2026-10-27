@@ -1261,6 +1261,36 @@ class CoverageNoteValidationTests(RepoTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("Coverage recorded: `intent` covered H1", proc.stdout)
 
+    def test_design_lens_covers_changed_files(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        wrong_flag = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "design",
+            "--hunks",
+            "H1",
+            "--note",
+            "H1 cart.py:3: items=[] -> raises ZeroDivisionError",
+            check=False,
+        )
+        self.assertEqual(wrong_flag.returncode, 1)
+        self.assertIn("pass --files instead of --hunks", wrong_flag.stderr)
+
+        covered = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "design",
+            "--files",
+            "cart.py",
+            "--note",
+            "cart.py:1 total(items) adds 3 lines -> minimal shape with no extra abstractions",
+        )
+        self.assertEqual(covered.returncode, 0)
+        self.assertIn("`design` covered cart.py", covered.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
