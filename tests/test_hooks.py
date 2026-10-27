@@ -789,7 +789,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("3.0.0", ver_proc.stdout)
+        self.assertIn("3.1.0", ver_proc.stdout)
 
         with tempfile.TemporaryDirectory() as fake_home:
             doc_proc = subprocess.run(

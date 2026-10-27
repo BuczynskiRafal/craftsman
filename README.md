@@ -6,7 +6,7 @@
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
 [![mypy --strict](https://img.shields.io/badge/mypy-strict-blue.svg)](pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](pyproject.toml)
-[![Version](https://img.shields.io/badge/version-3.0.0-emerald.svg)](plugin.json)
+[![Version](https://img.shields.io/badge/version-3.1.0-emerald.svg)](plugin.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Craftsman is a quality loop for AI coding agents. After implementing a change, the agent simplifies
@@ -180,10 +180,10 @@ cd ~/.craftsman
 For a chosen platform:
 
 ```bash
-./install.sh --copilot --git-hooks        # VS Code + Copilot CLI: prompts, skills, agents, user hooks
+./install.sh --copilot --git-hooks        # VS Code + Copilot CLI: instructions, skills, agents, user hooks
 ./install.sh --claude --git-hooks         # Claude Code: commands, agents, and the gate hooks
 ./install.sh --antigravity --git-hooks    # Google Antigravity
-./install.sh --copilot-workspace ~/src/app   # commit .github/{prompts,skills,agents,hooks} to a repo
+./install.sh --copilot-workspace ~/src/app   # commit .github/{skills,agents,hooks} to a repo
 ./install.sh --agents-workspace ~/src/app    # AGENTS.md + .cursor/rules for Codex and Cursor
 ```
 
@@ -193,29 +193,42 @@ The same through the CLI, on any OS, including Windows PowerShell:
 pip install .
 craftsman install                                  # same flags as ./install.sh (--auto, --all, --dry-run, …)
 craftsman uninstall                                # remove manifest-owned files and restore core.hooksPath
-craftsman export --user-dir --copilot-skills-dir   # VS Code profile prompts + ~/.copilot/{skills,agents,hooks}
+craftsman export --user-dir --copilot-skills-dir   # VS Code profile instructions + ~/.copilot/{skills,agents,hooks}
 craftsman export --workspace path/to/repo          # .github/ for a team repository
 craftsman export --claude-dir                      # ~/.claude (settings.json is merged, a .bak is kept)
-craftsman doctor                                   # installation health, hooks, agents, drift
+craftsman doctor                                   # installation health, hooks, agents, duplicates, drift
+craftsman doctor --fix-duplicates                  # remove obsolete Craftsman duplicate files, keeping canonical copies
+craftsman skill list                               # list bundled skills without searching the disk
+craftsman skill show code-review --file lenses.md  # print a bundled skill or companion file
 ```
 
 | `craftsman install` / `install.sh` flag | Effect |
 | :--- | :--- |
 | *(none)* / `--auto` | Detects installed platforms, installs for each, and adds global Git hooks. |
-| `--copilot` | Prompts, instructions, skills (`~/.copilot/skills`), the three agents (`~/.copilot/agents` and the VS Code profile prompts folder), gate hooks (`~/.copilot/hooks/craftsman.json`). |
+| `--copilot` | Global instructions (`craftsman-rules.instructions.md` per VS Code profile), Agent Skills (`~/.copilot/skills/<skill>/SKILL.md`), the three custom agents (`~/.copilot/agents/<name>.agent.md`), and gate hooks (`~/.copilot/hooks/craftsman.json`). |
+| `--copilot-prompt-files` | Legacy fallback for older VS Code versions without Agent Skills: writes `<skill>.prompt.md` into VS Code user/profile `prompts/` instead of `~/.copilot/skills/` (mutually exclusive with `--copilot-skills-dir`). |
 | `--claude` | Commands, rules, reviewer and verifier agents in `~/.claude`, gate hooks in `settings.json`. `--no-claude-hooks` skips the hooks, `--claude-hooks` is an alias for `--claude`. |
 | `--antigravity` (`--copy`, `--symlink`, `--plugin`) | Skills, rules, scripts, and `hooks.json` in `~/.gemini/config`. `--copy`, `--symlink`, and `--plugin` are mutually exclusive. |
-| `--copilot-workspace <dir>` | `.github/prompts`, `.github/skills`, `.github/agents`, `.github/hooks/craftsman.json`, and a marked block in `.github/copilot-instructions.md`. Workspace hooks call `craftsman` from `PATH`. |
+| `--copilot-workspace <dir>` | `.github/skills`, `.github/agents`, `.github/hooks/craftsman.json`, and a marked block in `.github/copilot-instructions.md` (plus `.github/prompts` when `--copilot-prompt-files` is passed). Workspace hooks call `craftsman` from `PATH`. |
+| `--allow-duplicate-scopes` | Overrides the default refusal when installing `--copilot-workspace` on a machine that already has a user-level `--copilot` install (or vice versa). |
 | `--agents-workspace <dir>` | Marked block in `AGENTS.md` and `.cursor/rules/craftsman.mdc` (aliases: `--codex-workspace`, `--cursor-workspace`). |
 | `--git-hooks` / `--no-git-hooks` | Installs or skips global `commit-msg`, `pre-push`, and passthrough hooks (`core.hooksPath`). |
 | `--all` | All platforms, without detection. `--no-claude-hooks` skips the Claude Code hooks. |
 | `--dry-run` | Prints the install or uninstall plan without changing files or Git config. |
 
-User agents go into the VS Code profile (read by the local harness) and into `~/.copilot/agents`
-(read by the Copilot harness and Copilot CLI). If your VS Code version reads both places, the
-agents will appear twice on the list. `craftsman export` with explicit directories
-(`--user-dir <dir>`, `--copilot-skills-dir <dir>`) does not modify `~/.copilot` unless you add
-`--copilot-home`.
+#### GitHub Copilot discovery locations ("one name = one location")
+
+VS Code Copilot and the GitHub Copilot CLI scan multiple directories at once and merge discovered items without deduplication. To ensure every Craftsman agent and `/skill` slash command appears **exactly once**, Craftsman installs into a single canonical location per scope (`COPILOT_DISCOVERY` in [`craftsman/export.py`](craftsman/export.py)):
+
+| Entity | User scope (`--copilot`, canonical) | Workspace scope (`--copilot-workspace`, canonical) | Legacy / non-canonical locations scanned by VS Code (`doctor` checks for duplicates) |
+| :--- | :--- | :--- | :--- |
+| **Custom agents** (`craftsman`, `craftsman-reviewer`, `craftsman-verifier`) | `~/.copilot/agents/*.agent.md` | `<workspace>/.github/agents/*.agent.md` | `Code/User/prompts/*.agent.md`, `Code/User/profiles/*/prompts/*.agent.md`, `~/.claude/agents/*.md`, `.claude/agents/*.md` |
+| **Slash commands / Agent Skills** (`/craftsman`, `/code-review`, …) | `~/.copilot/skills/<name>/SKILL.md` | `<workspace>/.github/skills/<name>/SKILL.md` | `Code/User/prompts/*.prompt.md`, `Code/User/profiles/*/prompts/*.prompt.md`, `.github/prompts/*.prompt.md` (`--copilot-prompt-files`), `~/.claude/skills/*/SKILL.md` |
+| **Global instructions** | `Code/User/prompts/craftsman-rules.instructions.md` (+ each profile) | `<workspace>/.github/copilot-instructions.md` | — |
+
+- Installing both `--copilot` (user) and `--copilot-workspace` (workspace) in the same project would show every agent and command twice in VS Code, so `install` and `export` refuse by default unless `--allow-duplicate-scopes` is passed.
+- Upgrading from v3.0.0 with `craftsman install --copilot` (or running `craftsman doctor --fix-duplicates`) automatically removes obsolete Craftsman-generated `.agent.md` and `.prompt.md` files from `Code/User/prompts/` and `profiles/*/prompts/` while leaving user-authored files untouched.
+- If both GitHub Copilot and Claude Code are installed on the same machine, VS Code also scans `~/.claude/agents` by default; `craftsman doctor` detects the collision and shows the `"chat.agentFilesLocations": {"~/.claude/agents": false}` setting to add to VS Code `settings.json`.
 
 ### Uninstall
 
@@ -272,10 +285,43 @@ archives a ledger from an older development version that cannot be read.
 ## Guards
 
 - **Gate** (`craftsman gate`, `craftsman hook stop`): the state machine and stop hook described
-  above. On platforms without hooks, `craftsman gate --complete` checks the same thing.
+  above. Each active gate is bound to the agent session (`owner.platform` + `owner.session_id`) that
+  opened it, so parallel agent sessions in the same checkout are never blocked by or allowed to
+  corrupt another session's gate (use `git worktree add` for parallel work, or `craftsman gate --init --takeover`
+  to explicitly take over an active gate). On platforms without hooks, `craftsman gate --complete`
+  checks the same thing.
 - **Git guard** (`craftsman guard`, `craftsman hook pre-tool`, global `pre-push` and `commit-msg`
   hooks): blocks unconfirmed pushes to `main`/`master`, including through `bash -c`, aliases, and
   `gh pr merge`. Rejects commits, tags, and PRs with AI attribution trailers.
+- **Search scope guard** (`craftsman hook pre-tool`, [`craftsman/scope.py`](craftsman/scope.py)):
+  confines Craftsman sessions and `craftsman-*` subagents to the current git work tree.
+
+### Search scope
+
+During an active `/craftsman` session (or inside a `craftsman`, `craftsman-reviewer`, or
+`craftsman-verifier` agent), the `pre-tool` hook enforces a repository search-scope policy:
+
+- **Allowed**:
+  - Reading, listing, and searching inside the active git work tree (`git rev-parse --show-toplevel`).
+  - Reading a specific file outside the work tree inside installed dependency/stdlib paths (`site-packages`,
+    `dist-packages`, `node_modules`, `.venv`, `venv`, `virtualenv`, `.tox`, `.nox`, `conda`, `pyenv`,
+    `cargo/registry`, `go/pkg/mod`, `/usr/lib`, `/usr/local/lib`, `/Library/Frameworks`), the system
+    temp directory (`$TMPDIR` / `/tmp`), or the bundled Craftsman package (`craftsman skill path <name>`).
+- **Blocked**:
+  - Recursive search or directory listing (`find`, `rg`, `grep -R`, `fd`, `ls`, `tree`, `du`, `Glob`,
+    `Grep`, `LS`, etc.) rooted outside the work tree (such as `~`, `..`, `/Users`, `/home`, or a sibling repo).
+  - Reading files in sibling repositories, `~/.claude/projects`, `~/.copilot/session-state`,
+    `~/.gemini/antigravity/brain`, or shell history files, as well as searching for `SKILL.md`,
+    `lenses.md`, `packet-*.md`, or `ledger.json` on disk (use `craftsman skill show <name>` and
+    `craftsman review show --packet-path` instead).
+- **Configuration (per repository via `git config`)**:
+  ```bash
+  # Allow additional directories outside the work tree (colon-separated on POSIX, semicolon on Windows, or multi-valued):
+  git config --add craftsman.scopeAllow ../shared-schemas
+  # Switch enforcement mode: enforce (default, blocks), warn (allows with warning), or off (disabled):
+  git config craftsman.scope warn
+  git config craftsman.scope off
+  ```
 
 Guards protect against an agent that rushes or forgets a step. They are not a sandbox: an agent
 that deliberately edits Craftsman's state files will bypass the gate.
