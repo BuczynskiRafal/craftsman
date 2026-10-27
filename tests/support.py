@@ -33,7 +33,10 @@ AMBIENT_PLATFORM_ENV_VARS = frozenset(
 
 
 def coverage_note(hunk_ids: list[str]) -> str:
-    return f"{' '.join(hunk_ids)}: traced empty, boundary and typical inputs through every branch"
+    return "; ".join(
+        f"{hid} f_{hid[1:]}.py:{hid[1:]}: x={hid[1:]} -> returns {int(hid[1:]) + 1} on boundary input"
+        for hid in hunk_ids
+    )
 
 
 class EvidenceRepo:

@@ -149,6 +149,21 @@ class QualitySignalTests(unittest.TestCase):
         self.assertIn(SignalKind.LONG_FUNCTION, kinds)
         self.assertIn(SignalKind.DICT_DOMAIN, kinds)
 
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        rejected = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "craft",
+            "--hunks",
+            "H1",
+            "--note",
+            "H1 looks good, well-factored and readable with clear structure",
+            check=False,
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("Example:", rejected.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

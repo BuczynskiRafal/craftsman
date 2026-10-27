@@ -68,6 +68,31 @@ SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
 MIN_SIGNAL_ACK_REASON_CHARS = 40
+MIN_HUNK_NOTE_SEGMENT_CHARS = 40
+MIN_SUBSTANTIVE_NOTE_CHARS = 20
+MAX_REUSED_NOTE_SEGMENTS = 3
+GENERIC_COVERAGE_WORDS: tuple[str, ...] = (
+    "looks good",
+    "well-factored",
+    "well factored",
+    "clear structure",
+    "no issues",
+    "nothing to report",
+    "clean",
+    "ok",
+    "okay",
+    "fine",
+    "good",
+    "lgtm",
+    "readable",
+    "clear",
+    "dry",
+    "consistent",
+    "concise",
+    "accurate",
+    "checked",
+    "reviewed",
+)
 QUICK_TIER_MAX_CHANGED_LINES = 40
 MAX_NEXT_ACTIONS = 12
 SUMMARY_RECENT_RUNS = 3
@@ -114,6 +139,13 @@ QUESTION_EVIDENCE_EXAMPLE = (
 DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
 _ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S")}
 _CONCRETE_TOKEN_RE = re.compile(r"(?:->|`[^`]+`|\b\d+\b|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*\.[A-Za-z_]\w*)")
+_GENERIC_WORDS_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in GENERIC_COVERAGE_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+_CONCRETE_COVERAGE_RE = re.compile(
+    r"(?:->|\bL?\d+\b|['\"`]|\b(?:None|True|False)\b|\[\]|\{\}|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*_[A-Za-z0-9_]*)"
+)
 
 T = TypeVar("T")
 S = TypeVar("S", bound=str)
@@ -1150,11 +1182,7 @@ def reopened_mentions(
     return mentions
 
 
-def add_coverage(
-    ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
-) -> tuple[Ledger, Coverage]:
-    """Record that `lens` reviewed the given hunks of the latest round."""
-    round_ = _latest_round(ledger)
+def _validate_coverage_target(round_: Round, lens: str, hunk_ids: Sequence[str]) -> dict[str, HunkRef]:
     if lens not in round_.lenses:
         if lens not in LENS_IDS:
             raise LedgerError(
@@ -1175,9 +1203,9 @@ def add_coverage(
     if len(set(hunk_ids)) != len(hunk_ids):
         raise LedgerError(f"hunk ids must not repeat: {', '.join(hunk_ids)}", field="digests")
     by_id = {hunk.id: hunk for hunk in round_.hunks}
-    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried]
     unknown = [hunk_id for hunk_id in hunk_ids if hunk_id not in by_id]
     if unknown:
+        open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried]
         raise LedgerError(
             f"unknown hunk ids in round {round_.number}: {', '.join(unknown)}; "
             f"hunks to cover: {', '.join(open_ids) or 'none'}",
@@ -1190,13 +1218,88 @@ def add_coverage(
             "cover only the remaining hunks",
             field="digests",
         )
-    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(rf"\b{hunk_id}\b", note)]
+    return by_id
+
+
+def _extract_hunk_segments(hunk_ids: Sequence[str], note: str) -> dict[str, str]:
+    spans: list[tuple[int, str]] = []
+    for hid in hunk_ids:
+        match = re.search(rf"\b{re.escape(hid)}\b", note)
+        if match is not None:
+            spans.append((match.start(), hid))
+    spans.sort()
+    segments: dict[str, str] = {}
+    for index, (start, hid) in enumerate(spans):
+        end = spans[index + 1][0] if index + 1 < len(spans) else len(note)
+        segments[hid] = note[start:end].strip()
+    return segments
+
+
+def _normalize_note_segment(segment: str) -> str:
+    without_ids = re.sub(r"\bH[1-9]\d*\b", "", segment)
+    return re.sub(r"\s+", " ", without_ids.strip().strip(";:,-.")).strip().lower()
+
+
+def _validate_hunk_segment(hid: str, segment: str) -> str:
+    without_id = re.sub(rf"\b{re.escape(hid)}\b", " ", segment)
+    stripped_generic = _GENERIC_WORDS_RE.sub(" ", without_id)
+    substantive = re.sub(r"[\W_]+", "", stripped_generic)
+    if len(segment) < MIN_HUNK_NOTE_SEGMENT_CHARS or len(substantive) < MIN_SUBSTANTIVE_NOTE_CHARS:
+        raise FieldError(
+            "note",
+            f"must have at least {MIN_COVERAGE_NOTE_CHARS} characters (>= {MIN_HUNK_NOTE_SEGMENT_CHARS} "
+            f"chars and >= {MIN_SUBSTANTIVE_NOTE_CHARS} non-generic chars per hunk; {hid} has too little "
+            f'concrete detail). Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        )
+    if (
+        _FILE_REFERENCE_RE.search(without_id) is None
+        and _CONCRETE_COVERAGE_RE.search(without_id) is None
+    ):
+        raise FieldError(
+            "note",
+            f"for {hid} must include a concrete detail (file:line, number/literal, ->, or symbol name). "
+            f'Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        )
+    return _normalize_note_segment(segment)
+
+
+def _validate_coverage_note(
+    ledger: Ledger, round_: Round, lens: str, hunk_ids: Sequence[str], note: str
+) -> None:
+    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(rf"\b{re.escape(hunk_id)}\b", note)]
     if unnamed:
         raise LedgerError(
             f"the coverage note must name every covered hunk and what was tried on it; missing: "
             f'{", ".join(unnamed)}. Example: "{COVERAGE_NOTE_EXAMPLE}"',
             field="note",
         )
+    segments = _extract_hunk_segments(hunk_ids, note)
+    norm_by_hunk: dict[str, str] = {}
+    for record in ledger.coverage:
+        if record.round == round_.number and record.lens == lens:
+            rec_ids = re.findall(r"\bH[1-9]\d*\b", record.note)
+            for hid, seg in _extract_hunk_segments(rec_ids, record.note).items():
+                norm_by_hunk[hid] = _normalize_note_segment(seg)
+    for hid in hunk_ids:
+        norm_by_hunk[hid] = _validate_hunk_segment(hid, segments[hid])
+    counts: dict[str, int] = {}
+    for body in norm_by_hunk.values():
+        counts[body] = counts.get(body, 0) + 1
+        if counts[body] > MAX_REUSED_NOTE_SEGMENTS:
+            raise FieldError(
+                "note",
+                f"reuses the same note segment for more than {MAX_REUSED_NOTE_SEGMENTS} hunks in lens "
+                f'`{lens}`; write a specific note per hunk. Example: "{COVERAGE_NOTE_EXAMPLE}"',
+            )
+
+
+def add_coverage(
+    ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
+) -> tuple[Ledger, Coverage]:
+    """Record that `lens` reviewed the given hunks of the latest round."""
+    round_ = _latest_round(ledger)
+    by_id = _validate_coverage_target(round_, lens, hunk_ids)
+    _validate_coverage_note(ledger, round_, lens, hunk_ids, note)
     if lens == SWEEP_LENS:
         _require_lenses_before_sweep(ledger, round_)
     record = Coverage(

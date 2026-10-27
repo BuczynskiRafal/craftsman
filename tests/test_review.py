@@ -15,7 +15,7 @@ from unittest import mock
 
 from craftsman import packet, runner
 from craftsman.diffscan import DiffSnapshot, Hunk, Reference, Scope
-from craftsman.ledger import HunkRef, Round
+from craftsman.ledger import GENERIC_COVERAGE_WORDS, HunkRef, Round
 from craftsman.lenses import select_lenses
 from craftsman.packet import PacketContext, render_packet
 
@@ -1182,6 +1182,84 @@ class ReviewSignalTests(RepoTestCase):
         self.assertEqual(refused.returncode, 1)
         self.assertIn("diff-size", refused.stderr)
         self.assertIn("cannot be acknowledged", refused.stderr)
+
+
+class CoverageNoteValidationTests(RepoTestCase):
+    def test_cover_rejects_note_made_of_generic_praise(self) -> None:
+        self.prepare_bug()
+        for word in GENERIC_COVERAGE_WORDS:
+            with self.subTest(word=word):
+                repeated = " ".join([word] * max(2, (45 // len(word)) + 1))
+                proc = self.repo.cli(
+                    "review",
+                    "cover",
+                    "--lens",
+                    "craft",
+                    "--hunks",
+                    "H1",
+                    "--note",
+                    f"H1 {repeated}",
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 1, word)
+                self.assertIn("Example:", proc.stderr)
+
+    def test_cover_rejects_note_missing_a_listed_hunk(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.repo.write("extra.py", "EXTRA = 1\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        proc = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "intent",
+            "--hunks",
+            "H1,H2",
+            "--note",
+            "H1 cart.py:3: items=[] -> raises ZeroDivisionError when cart is empty",
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("missing: H2", proc.stderr)
+
+    def test_cover_rejects_same_note_reused_for_many_hunks(self) -> None:
+        for idx in range(1, 5):
+            self.repo.write(f"m{idx}.py", f"VAL_{idx} = {idx}\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        repeated = "; ".join(
+            f"H{idx} m1.py:1: x=0 -> returns 0 without mutating caller state"
+            for idx in range(1, 5)
+        )
+
+        proc = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "intent",
+            "--hunks",
+            "H1,H2,H3,H4",
+            "--note",
+            repeated,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("reuses the same note segment for more than 3 hunks", proc.stderr)
+
+    def test_cover_accepts_note_with_input_and_line_reference(self) -> None:
+        self.prepare_bug()
+        proc = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "intent",
+            "--hunks",
+            "H1",
+            "--note",
+            "H1 cart.py:3: items=[{'price': 10}] -> returns 10.0 as expected",
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("Coverage recorded: `intent` covered H1", proc.stdout)
 
 
 if __name__ == "__main__":

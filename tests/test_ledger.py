@@ -63,7 +63,10 @@ DISMISSED = "guarded by app.py:2, which returns 0 for an empty list"
 
 
 def note_for(hunk_ids: Sequence[str]) -> str:
-    return f"{' '.join(hunk_ids)}: traced empty, single and duplicate inputs through every branch"
+    return "; ".join(
+        f"{hid} f_{hid[1:]}.py:{hid[1:]}: x={hid[1:]} -> returns {int(hid[1:]) + 1} on boundary input"
+        for hid in hunk_ids
+    )
 
 
 def init_repo(root: Path) -> None:
