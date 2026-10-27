@@ -224,7 +224,7 @@ _COPILOT_HOOK_RE = re.compile(r" hook [a-z-]+ --platform copilot$")
 def user_home(home: Path | None = None) -> Path:
     if home is not None:
         return home
-    env_home = os.environ.get("HOME", "").strip()
+    env_home = os.environ.get("HOME", "").strip() or os.environ.get("USERPROFILE", "").strip()
     if env_home:
         return Path(env_home)
     try:

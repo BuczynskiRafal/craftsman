@@ -213,7 +213,7 @@ def _subagent_specs(args: Any) -> list[Any]:
     if not isinstance(args, dict):
         return []
     if "Subagents" not in args:
-        return [{key: _unquote(value) for key, value in args.items()}]
+        return [{key: decode_json_text(value) for key, value in args.items()}]
     raw = args["Subagents"]
     if isinstance(raw, str):
         try:
@@ -223,8 +223,8 @@ def _subagent_specs(args: Any) -> list[Any]:
     return raw if isinstance(raw, list) else []
 
 
-def _unquote(value: Any) -> Any:
-    """Antigravity may write a top-level spec field as JSON text (`'"self"'`)."""
+def decode_json_text(value: Any) -> Any:
+    """Antigravity may write a field as JSON text (`'"self"'`): the decoded value, else `value`."""
     if isinstance(value, str) and len(value) >= 2 and value.startswith('"') and value.endswith('"'):
         try:
             return json.loads(value)

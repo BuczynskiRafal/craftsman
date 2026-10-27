@@ -20,7 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from craftsman.transcript import Entry, TranscriptError, claude_project_slug, read_transcript_entries
+from craftsman.export import user_home
+from craftsman.transcript import (
+    QUESTION_TOOLS,
+    Entry,
+    TranscriptError,
+    claude_project_slug,
+    decode_json_text,
+    read_transcript_entries,
+)
 
 PROTECTED_BRANCHES = frozenset(
     {
@@ -441,7 +449,7 @@ class SimpleCommand:
 
 def expand_shell_path_token(raw: str) -> str:
     """Expand `~`, `$HOME`, `${HOME}`, `$env:HOME`, `$env:USERPROFILE`, and `%USERPROFILE%` in a shell argument."""
-    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    home = str(user_home())
     expanded = re.sub(
         r"\$(?:HOME|\{HOME\}|env:USERPROFILE|env:HOME)(?=[/\\]|$)|%USERPROFILE%",
         lambda _: home,
@@ -1013,15 +1021,11 @@ def resolve_transcript_path(payload: dict[str, Any]) -> Path | None:
 
 
 def _unquote_json_str(val: Any) -> str | None:
+    """A string field, decoded when Antigravity wrote it as JSON text; None for anything else."""
     if not isinstance(val, str):
         return None
-    if val.startswith('"') and val.endswith('"'):
-        try:
-            parsed = json.loads(val)
-            return parsed if isinstance(parsed, str) else val
-        except json.JSONDecodeError:
-            return val
-    return val
+    decoded = decode_json_text(val)
+    return decoded if isinstance(decoded, str) else val
 
 
 PUSH_ERROR_MARKERS = (
@@ -1262,7 +1266,7 @@ def was_ask_question_called_since_last_push(
             if not isinstance(tc, dict):
                 continue
             name = tc.get("name")
-            if name in ("ask_question", "AskUserQuestion"):
+            if name in QUESTION_TOOLS:
                 if _is_push_confirmation_question(tc) and _is_user_response_approving_main_push(
                     entries, idx, has_generic_steps, tc=tc
                 ):
@@ -1523,7 +1527,7 @@ def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600
     now = time.time()
     recent: list[tuple[float, Path]] = []
 
-    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
+    brain_dir = user_home() / ".gemini" / "antigravity" / "brain"
     if brain_dir.is_dir():
         for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
             try:
@@ -1533,7 +1537,7 @@ def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600
             if (now - mtime) <= max_age_sec and _transcript_matches_workspace(p, repo_root):
                 recent.append((mtime, p))
 
-    claude_proj = Path.home() / ".claude" / "projects" / claude_project_slug(str(repo_root))
+    claude_proj = user_home() / ".claude" / "projects" / claude_project_slug(str(repo_root))
     if claude_proj.is_dir():
         for p in claude_proj.glob("*.jsonl"):
             try:

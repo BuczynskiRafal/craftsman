@@ -11,7 +11,7 @@ import argparse
 import os
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -487,29 +487,34 @@ def parse_install_args(argv: Sequence[str]) -> InstallConfig:
     )
 
 
-def report(tracker: Tracker, summary: str) -> None:
+def run_reported(
+    dry_run: bool, run: Callable[[Tracker], None], summary: Callable[[Tracker], str]
+) -> int:
+    """Run an install or uninstall and print what it did; an error ends it with exit code 1."""
+    tracker = Tracker(dry_run=dry_run)
+    try:
+        run(tracker)
+    except (InstallError, ExportError, UnsafePathError, OSError) as exc:
+        tracker.render(sys.stdout, sys.stderr)  # what was done before the failure
+        sys.stderr.write(f"[ERROR] {exc}\n")
+        return 1
     tracker.render(sys.stdout, sys.stderr)
-    prefix = "[DRY-RUN] " if tracker.dry_run else ""
-    print(f"{prefix}{summary}")
+    print(f"{'[DRY-RUN] ' if dry_run else ''}{summary(tracker)}")
+    return 0
+
+
+def _install_summary(tracker: Tracker) -> str:
+    return (
+        f"Summary: {tracker.count(EventKind.INSTALLED)} installed, "
+        f"{tracker.count(EventKind.BACKED_UP)} backed up, "
+        f"{tracker.count(EventKind.UNCHANGED)} unchanged."
+    )
 
 
 def install_main(argv: Sequence[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
     try:
-        config = parse_install_args(args)
-        tracker = Tracker(dry_run=config.dry_run)
-        try:
-            run_install(config, tracker)
-        except BaseException:
-            tracker.render(sys.stdout, sys.stderr)  # what was done before the failure
-            raise
-        report(
-            tracker,
-            f"Summary: {tracker.count(EventKind.INSTALLED)} installed, "
-            f"{tracker.count(EventKind.BACKED_UP)} backed up, "
-            f"{tracker.count(EventKind.UNCHANGED)} unchanged.",
-        )
-    except (InstallError, ExportError, UnsafePathError, OSError) as exc:
+        config = parse_install_args(list(sys.argv[1:] if argv is None else argv))
+    except (InstallError, ExportError) as exc:
         sys.stderr.write(f"[ERROR] {exc}\n")
         return 1
-    return 0
+    return run_reported(config.dry_run, lambda tracker: run_install(config, tracker), _install_summary)

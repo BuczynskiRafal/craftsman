@@ -14,6 +14,7 @@ from types import MappingProxyType
 from typing import Any
 
 from craftsman.files import write_text_atomic
+from craftsman.records import FieldError, Fields, as_choice
 
 MANIFEST_FILENAME = ".craftsman-install.json"
 
@@ -62,29 +63,22 @@ class TargetManifest:
         }
 
     @classmethod
-    def from_json(cls, raw: Any, where: str) -> TargetManifest:
-        fields = _exact_object(raw, where, _TARGET_FIELDS)
-        modified = _object(fields["modified_files"], f"{where}.modified_files")
-        try:
-            kinds = {
-                _text(path, f"{where}.modified_files"): ModifiedKind(kind)
-                for path, kind in modified.items()
-            }
-        except ValueError as exc:
-            raise InstallError(f"{where}.modified_files: {exc}") from None
-        return cls(
-            created_paths=_texts(fields["created_paths"], f"{where}.created_paths"),
-            created_dirs=_texts(fields["created_dirs"], f"{where}.created_dirs"),
-            modified_files=kinds,
-            hooks_json_keys=_texts(fields["hooks_json_keys"], f"{where}.hooks_json_keys"),
-            previous_hooks_path=_optional_text(
-                fields["previous_hooks_path"], f"{where}.previous_hooks_path"
-            ),
-            hooks_dir=_optional_text(fields["hooks_dir"], f"{where}.hooks_dir"),
+    def from_fields(cls, raw: Any) -> TargetManifest:
+        fields = Fields(raw)
+        target = cls(
+            created_paths=fields.texts("created_paths"),
+            created_dirs=fields.texts("created_dirs"),
+            modified_files=fields.record("modified_files", _modified_kinds),
+            hooks_json_keys=fields.texts("hooks_json_keys"),
+            previous_hooks_path=fields.optional_text("previous_hooks_path"),
+            hooks_dir=fields.optional_text("hooks_dir"),
         )
+        return fields.done(target)
 
 
-_TARGET_FIELDS = frozenset(TargetManifest().to_json())
+def _modified_kinds(raw: Any) -> dict[str, ModifiedKind]:
+    fields = Fields(raw)
+    return fields.done({path: fields.member(path, ModifiedKind) for path in raw})
 
 
 @dataclass(frozen=True)
@@ -116,34 +110,35 @@ class InstallManifest:
         return {"targets": {kind.value: self.targets[kind].to_json() for kind in sorted(self.targets)}}
 
     @classmethod
-    def from_json(cls, raw: Any, source: str) -> InstallManifest:
-        targets = _object(
-            _exact_object(raw, source, frozenset({"targets"}))["targets"], f"{source}: targets"
+    def from_fields(cls, raw: Any) -> InstallManifest:
+        fields = Fields(raw)
+        return fields.done(cls(fields.record("targets", _targets)))
+
+
+def _targets(raw: Any) -> dict[TargetKind, TargetManifest]:
+    fields = Fields(raw)
+    if not raw:
+        raise FieldError("", "is empty")
+    targets: dict[TargetKind, TargetManifest] = {}
+    for key in raw:
+        kind = as_choice(key, tuple(TargetKind))
+        if kind is None:
+            raise FieldError(key, "is not a target")
+        targets[TargetKind(kind)] = _require_fields_of(
+            kind, fields.record(key, TargetManifest.from_fields), key
         )
-        if not targets:
-            raise InstallError(f"{source}: `targets` is empty")
-        parsed: dict[TargetKind, TargetManifest] = {}
-        for key, value in targets.items():
-            try:
-                kind = TargetKind(key)
-            except ValueError:
-                raise InstallError(f"{source}: unknown target {key!r}") from None
-            where = f"{source}: targets.{key}"
-            parsed[kind] = _require_fields_of(kind, TargetManifest.from_json(value, where), where)
-        return cls(parsed)
+    return fields.done(targets)
 
 
-def _require_fields_of(kind: TargetKind, target: TargetManifest, where: str) -> TargetManifest:
+def _require_fields_of(kind: TargetKind, target: TargetManifest, key: str) -> TargetManifest:
     """The git hooks fields belong to the git hooks target, the hooks.json keys to Antigravity."""
     is_hooks = kind is TargetKind.GIT_HOOKS
     if is_hooks and target.hooks_dir is None:
-        raise InstallError(f"{where}: the git hooks target needs `hooks_dir`")
+        raise FieldError(key, "needs `hooks_dir`, as the git hooks target")
     if not is_hooks and (target.hooks_dir is not None or target.previous_hooks_path is not None):
-        raise InstallError(
-            f"{where}: only the git hooks target has `hooks_dir` and `previous_hooks_path`"
-        )
+        raise FieldError(key, "has `hooks_dir` or `previous_hooks_path`, which only git hooks have")
     if kind is not TargetKind.ANTIGRAVITY and target.hooks_json_keys:
-        raise InstallError(f"{where}: only the Antigravity target has `hooks_json_keys`")
+        raise FieldError(key, "has `hooks_json_keys`, which only Antigravity has")
     return target
 
 
@@ -156,7 +151,10 @@ def load_manifest(base_dir: Path) -> InstallManifest | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InstallError(f"cannot read install manifest {path}: {exc}") from exc
-    return InstallManifest.from_json(raw, str(path))
+    try:
+        return InstallManifest.from_fields(raw)
+    except FieldError as exc:
+        raise InstallError(f"invalid install manifest {path}: {exc}") from None
 
 
 def save_manifest(base_dir: Path, manifest: InstallManifest, *, dry_run: bool) -> None:
@@ -172,35 +170,3 @@ def save_manifest(base_dir: Path, manifest: InstallManifest, *, dry_run: bool) -
 
 def _union(groups: Iterable[tuple[str, ...]]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(item for group in groups for item in group))
-
-
-def _object(raw: Any, where: str) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise InstallError(f"{where} must be a JSON object")
-    return raw
-
-
-def _exact_object(raw: Any, where: str, expected: Collection[str]) -> dict[str, Any]:
-    fields = _object(raw, where)
-    if set(fields) != set(expected):
-        raise InstallError(
-            f"{where} must have exactly the fields {', '.join(sorted(expected))} "
-            f"(got {', '.join(sorted(fields)) or 'none'})"
-        )
-    return fields
-
-
-def _text(raw: Any, where: str) -> str:
-    if not isinstance(raw, str) or not raw:
-        raise InstallError(f"{where}: expected a non-empty string, got {raw!r}")
-    return raw
-
-
-def _texts(raw: Any, where: str) -> tuple[str, ...]:
-    if not isinstance(raw, list):
-        raise InstallError(f"{where} must be a list of strings")
-    return tuple(_text(item, where) for item in raw)
-
-
-def _optional_text(raw: Any, where: str) -> str | None:
-    return None if raw is None else _text(raw, where)

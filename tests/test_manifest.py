@@ -90,19 +90,19 @@ class StrictFormatTests(ManifestTestCase):
     def test_manifest_without_targets_is_an_error(self) -> None:
         self.write({"created_paths": [], "created_dirs": []})
 
-        with self.assertRaisesRegex(InstallError, "exactly the fields targets"):
+        with self.assertRaisesRegex(InstallError, "targets is missing"):
             load_manifest(self.base)
 
     def test_empty_targets_are_an_error(self) -> None:
         self.write({"targets": {}})
 
-        with self.assertRaisesRegex(InstallError, "`targets` is empty"):
+        with self.assertRaisesRegex(InstallError, "targets is empty"):
             load_manifest(self.base)
 
     def test_unknown_target_is_an_error(self) -> None:
         self.write({"targets": {"default": self.valid_json()["targets"]["git_hooks"]}})
 
-        with self.assertRaisesRegex(InstallError, "unknown target 'default'"):
+        with self.assertRaisesRegex(InstallError, "targets.default is not a target"):
             load_manifest(self.base)
 
     def test_target_with_extra_field_is_an_error(self) -> None:
@@ -110,7 +110,7 @@ class StrictFormatTests(ManifestTestCase):
         data["targets"]["git_hooks"]["mode"] = "copy"
         self.write(data)
 
-        with self.assertRaisesRegex(InstallError, "exactly the fields"):
+        with self.assertRaisesRegex(InstallError, "mode is not a known field"):
             load_manifest(self.base)
 
     def test_unknown_modified_kind_is_an_error(self) -> None:
@@ -134,14 +134,14 @@ class StrictFormatTests(ManifestTestCase):
         data["targets"]["claude"] = data["targets"].pop("git_hooks")
         self.write(data)
 
-        with self.assertRaisesRegex(InstallError, "only the git hooks target"):
+        with self.assertRaisesRegex(InstallError, "which only git hooks have"):
             load_manifest(self.base)
 
     def test_hooks_json_keys_outside_antigravity_are_an_error(self) -> None:
         target = TargetManifest(hooks_json_keys=("craftsman-stop-gate",))
         self.write(InstallManifest({TargetKind.CLAUDE: target}).to_json())
 
-        with self.assertRaisesRegex(InstallError, "only the Antigravity target"):
+        with self.assertRaisesRegex(InstallError, "which only Antigravity has"):
             load_manifest(self.base)
 
     def test_path_that_is_no_string_is_an_error(self) -> None:

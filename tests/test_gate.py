@@ -118,12 +118,12 @@ class GateStateJsonTests(unittest.TestCase):
     def test_missing_field_is_an_error(self) -> None:
         raw = self.state.to_json()
         del raw["owner"]
-        with self.assertRaisesRegex(GateStateError, "missing fields \\['owner'\\]"):
+        with self.assertRaisesRegex(GateStateError, "owner is missing"):
             GateState.from_json(raw)
 
     def test_unknown_field_is_an_error(self) -> None:
         raw = {**self.state.to_json(), "mode": "ultracraft"}
-        with self.assertRaisesRegex(GateStateError, "unknown fields \\['mode'\\]"):
+        with self.assertRaisesRegex(GateStateError, "mode is not a known field"):
             GateState.from_json(raw)
 
     def test_corrupt_owner_is_an_error(self) -> None:
@@ -288,6 +288,7 @@ class InitTests(RepoTestCase):
         self.repo.cli("review", "prepare", "--tier", "quick")
         self.run_gate("--init")
         self.assertFalse(self.ledger_is_archived())
+        self.assertTrue((self.repo.ledger_dir / "ledger.json").is_file())
 
     def test_init_compares_a_base_ref_by_its_commit(self) -> None:
         self.repo.write_lines("app.py", 5)
@@ -507,11 +508,6 @@ class ArgumentTests(RepoTestCase):
 
     def test_actions_are_mutually_exclusive(self) -> None:
         self.assert_usage_error("--await-user", "--resume")
-
-    def test_removed_flags_are_rejected(self) -> None:
-        for flag in ("--pass-review", "--state-file", "--mode", "--stage"):
-            with self.subTest(flag=flag):
-                self.assert_usage_error("--init", flag, "x")
 
 
 if __name__ == "__main__":

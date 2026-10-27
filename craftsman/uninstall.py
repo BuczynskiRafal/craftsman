@@ -10,18 +10,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from craftsman.export import (
-    ExportError,
     default_claude_dir,
     default_copilot_home,
     default_vscode_user_dir,
     require_resolves_within,
     user_home,
 )
-from craftsman.files import UnsafePathError, exists, remove_path, require_no_symlinked_parent
+from craftsman.files import exists, remove_path, require_no_symlinked_parent
 from craftsman.githooks import craftsman_home_dir, restore_hooks_path
-from craftsman.install import report
+from craftsman.install import run_reported
 from craftsman.manifest import (
-    InstallError,
     InstallManifest,
     ModifiedKind,
     TargetKind,
@@ -220,24 +218,15 @@ def parse_uninstall_args(argv: Sequence[str]) -> UninstallConfig:
     )
 
 
+def _uninstall_summary(tracker: Tracker) -> str:
+    removed, restored = tracker.count(EventKind.REMOVED), tracker.count(EventKind.RESTORED)
+    if not removed and not restored:
+        return "Nothing to uninstall."
+    return f"Uninstall summary: {removed} path(s) removed, {restored} configuration(s) restored."
+
+
 def uninstall_main(argv: Sequence[str] | None = None) -> int:
-    args = list(sys.argv[1:] if argv is None else argv)
-    try:
-        config = parse_uninstall_args(args)
-        tracker = Tracker(dry_run=config.dry_run)
-        try:
-            run_uninstall(config, tracker)
-        except BaseException:
-            tracker.render(sys.stdout, sys.stderr)  # what was done before the failure
-            raise
-        removed, restored = tracker.count(EventKind.REMOVED), tracker.count(EventKind.RESTORED)
-        report(
-            tracker,
-            f"Uninstall summary: {removed} path(s) removed, {restored} configuration(s) restored."
-            if removed or restored
-            else "Nothing to uninstall.",
-        )
-    except (InstallError, ExportError, UnsafePathError, OSError) as exc:
-        sys.stderr.write(f"[ERROR] {exc}\n")
-        return 1
-    return 0
+    config = parse_uninstall_args(list(sys.argv[1:] if argv is None else argv))
+    return run_reported(
+        config.dry_run, lambda tracker: run_uninstall(config, tracker), _uninstall_summary
+    )

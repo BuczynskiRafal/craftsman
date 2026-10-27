@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from craftsman.export import user_home
 from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands
 from craftsman.records import CRAFTSMAN_AGENTS
 
@@ -155,13 +156,8 @@ def _scope_mode(raw: str) -> ScopeMode:
     )
 
 
-def _current_home() -> Path:
-    env_home = os.environ.get("HOME") or os.environ.get("USERPROFILE")
-    return Path(env_home) if env_home else Path.home()
-
-
 def _expand_vars(value: str) -> str:
-    home = str(_current_home())
+    home = str(user_home())
     env_map = {k.upper(): v for k, v in os.environ.items()}
     env_map.setdefault("HOME", home)
     env_map.setdefault("USERPROFILE", home)
@@ -188,7 +184,7 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 def _is_forbidden_store(candidate: Path) -> bool:
-    home = _current_home()
+    home = user_home()
     resolved_cand = candidate.resolve()
     for base in {home, home.resolve()}:
         for rel in FORBIDDEN_HOME_RELPATHS:

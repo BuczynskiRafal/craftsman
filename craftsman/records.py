@@ -258,6 +258,10 @@ class Fields:
         value: int = self._value(key, int, "an integer")
         return value
 
+    def optional_integer(self, key: str) -> int | None:
+        value: int | None = self._value(key, (int, type(None)), "an integer or null")
+        return value
+
     def number(self, key: str) -> float:
         return float(self._value(key, (int, float), "a number"))
 

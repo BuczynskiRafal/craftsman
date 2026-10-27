@@ -20,7 +20,7 @@ import os
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -45,7 +45,14 @@ from craftsman.gatecheck import (
 )
 from craftsman.ledger import locked
 from craftsman.lenses import Tier
-from craftsman.records import ISOLATION_EVIDENCES, IsolationEvidence, LedgerError, format_timestamp
+from craftsman.records import (
+    ISOLATION_EVIDENCES,
+    FieldError,
+    Fields,
+    IsolationEvidence,
+    LedgerError,
+    format_timestamp,
+)
 
 GateTier = Literal["auto", "quick", "standard", "deep"]
 GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
@@ -71,6 +78,7 @@ ROUND_CAP_NOTICE = (
     "`craftsman review report` lists them. Start `/craftsman` again to restart."
 )
 
+P = TypeVar("P")
 T = TypeVar("T")
 
 
@@ -105,8 +113,13 @@ class GateOwner:
 
     @classmethod
     def from_json(cls, raw: object) -> GateOwner:
-        data = _exact_object(raw, ("platform", "session_id"), "owner")
-        return cls(data["platform"], _optional(data, "session_id", str, "owner"))
+        return _parsed(raw, cls.from_fields, "owner")
+
+    @classmethod
+    def from_fields(cls, raw: object) -> GateOwner:
+        fields = Fields(raw)
+        owner = cls(fields.choice("platform", GATE_PLATFORMS), fields.optional_text("session_id"))
+        return fields.done(owner)
 
     def to_json(self) -> dict[str, str | None]:
         return {"platform": self.platform, "session_id": self.session_id}
@@ -181,27 +194,27 @@ class GateState:
 
     @classmethod
     def from_json(cls, raw: object) -> GateState:
-        data = _exact_object(raw, tuple(field.name for field in fields(cls)), "state")
-        try:
-            stage = Stage(data["stage"])
-        except ValueError:
-            raise GateStateError(f"state.stage: unknown stage {data['stage']!r}") from None
-        takeover_from = data["takeover_from"]
-        return cls(
-            owner=GateOwner.from_json(data["owner"]),
-            base_sha=_required(data, "base_sha", str, "state"),
-            tier=data["tier"],
-            task=_required(data, "task", str, "state"),
-            started_at=_required(data, "started_at", str, "state"),
-            active=_required(data, "active", bool, "state"),
-            stage=stage,
-            awaiting_user=_required(data, "awaiting_user", bool, "state"),
-            isolation_evidence=data["isolation_evidence"],
-            forced_continuations=_required(data, "forced_continuations", int, "state"),
-            best_issue_count=_optional(data, "best_issue_count", int, "state"),
-            takeover_from=None if takeover_from is None else GateOwner.from_json(takeover_from),
-            request_step=_optional(data, "request_step", int, "state"),
+        return _parsed(raw, cls._from_fields, "state")
+
+    @classmethod
+    def _from_fields(cls, raw: object) -> GateState:
+        fields = Fields(raw)
+        state = cls(
+            owner=fields.record("owner", GateOwner.from_fields),
+            base_sha=fields.text("base_sha"),
+            tier=fields.choice("tier", GATE_TIERS),
+            task=fields.text("task"),
+            started_at=fields.text("started_at"),
+            active=fields.flag("active"),
+            stage=fields.member("stage", Stage),
+            awaiting_user=fields.flag("awaiting_user"),
+            isolation_evidence=fields.choice("isolation_evidence", ISOLATION_EVIDENCES),
+            forced_continuations=fields.integer("forced_continuations"),
+            best_issue_count=fields.optional_integer("best_issue_count"),
+            takeover_from=fields.optional_record("takeover_from", GateOwner.from_fields),
+            request_step=fields.optional_integer("request_step"),
         )
+        return fields.done(state)
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -223,25 +236,11 @@ class GateState:
         return replace(self, active=False, awaiting_user=False, stage=stage)
 
 
-def _exact_object(raw: object, keys: tuple[str, ...], where: str) -> dict[str, Any]:
-    if not isinstance(raw, dict):
-        raise GateStateError(f"{where}: expected a JSON object")
-    missing = sorted(set(keys) - set(raw))
-    unknown = sorted(set(raw) - set(keys))
-    if missing or unknown:
-        raise GateStateError(f"{where}: missing fields {missing}, unknown fields {unknown}")
-    return raw
-
-
-def _required(data: Mapping[str, Any], key: str, kind: type[T], where: str) -> T:
-    value = data[key]
-    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
-        raise GateStateError(f"{where}.{key}: expected {kind.__name__}, got {value!r}")
-    return value
-
-
-def _optional(data: Mapping[str, Any], key: str, kind: type[T], where: str) -> T | None:
-    return None if data[key] is None else _required(data, key, kind, where)
+def _parsed(raw: object, parse: Callable[[object], P], where: str) -> P:
+    try:
+        return parse(raw)
+    except FieldError as exc:
+        raise GateStateError(f"{where}: {exc}") from None
 
 
 def raised_tier(current: GateTier, requested: GateTier) -> GateTier:
