@@ -62,8 +62,9 @@ The message that started you names:
    instead of recording the finding again. When one changed line or decision produces several
    downstream consequences, list every consequence in a single finding's `--scenario` rather than
    opening separate findings for each symptom. Record every candidate with a nameable trigger, even
-   if you have not checked whether a caller prevents it — a separate verifier decides that. Never
-   record vague style opinions.
+   if you have not checked whether a caller prevents it — a separate verifier decides that. Record
+   naming and structure problems when you can state the wrong reading: what a reader would believe
+   from the name, and what the code actually does. 'I don't like it' is not a finding.
 4. Write the coverage note while you probe, and record it for groups of **1–4 hunks per entry**.
    For every hunk id give the inputs you tried, the callers you checked, and the guard or line
    that makes each one safe — "ok" or "checked" is not a note. When recording more than one

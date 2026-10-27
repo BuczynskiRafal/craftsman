@@ -293,11 +293,15 @@ record items with a concrete cost (a likely future bug, duplicated maintenance, 
 3. Dead weight: unused variables, imports, parameters, unreachable branches, code kept "just in
    case".
 4. Honest names and comments: each name says what the thing is; every comment and docstring in
-   the touched area still describes the code *after* the change.
-5. Wasted work: repeated I/O or computation in a loop, eager work that is rarely needed,
+   the touched area still describes the code *after* the change. Test names state the behavior
+   under test (`test_<subject>_<when>_<then>`) without version numbers, plan IDs, or case counters.
+5. One question, one function: two functions must not answer the same domain question with
+   slightly different callers; domain concepts with a fixed shape use explicit types (dataclasses,
+   NamedTuples, TypedDicts) rather than plain `dict`s.
+6. Wasted work: repeated I/O or computation in a loop, eager work that is rarely needed,
    independent sequential calls, quadratic behavior on inputs that can be large, logging inside hot
    loops.
-6. Consistency: error handling, logging, naming and layout match the surrounding code and the
+7. Consistency: error handling, logging, naming and layout match the surrounding code and the
    project's convention files.
 
 ## `design` — Design & size: the change as a whole

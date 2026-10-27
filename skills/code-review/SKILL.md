@@ -167,7 +167,10 @@ Step 3 at low cost; a real defect you filtered out early is lost for good.
 - `blocker` — wrong results, data loss, security hole, or crash on a path real users take.
 - `major` — wrong behavior on a plausible path, a broken contract for some caller, or an error
   that is hidden instead of reported.
-- `minor` — a real but low-impact edge case, or a maintainability cost with a concrete future bug.
+- `minor` — a real but low-impact edge case, a maintainability cost with a concrete future bug, or
+  a name or structure that misleads the reader, with the misleading reading stated. Record naming
+  and structure problems when you can state the wrong reading: what a reader would believe from the
+  name, and what the code actually does. 'I don't like it' is not a finding.
 - `nit` — only when a project convention file explicitly requires it.
 
 **Use isolated reviewers when the platform offers them.** On tiers `standard` and `deep`:
