@@ -208,6 +208,16 @@ def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
             errors.append(
                 f"{folder_name}: SKILL.md body is unexpectedly short ({len(body)} chars)"
             )
+        if folder_name == "craftsman":
+            scope_path = skill_path.parent / "scope.md"
+            if not scope_path.is_file():
+                errors.append("craftsman: missing companion scope.md")
+            else:
+                scope_body = scope_path.read_text(encoding="utf-8").strip()
+                if scope_body not in body:
+                    errors.append(
+                        "craftsman: SKILL.md 'Search scope' section is out of sync with scope.md"
+                    )
 
     return len(skill_files), errors
 
@@ -535,11 +545,14 @@ def scan_copilot_duplicates(
         duplicates_by_key.items(), key=lambda item: item[0]
     ):
         def _is_removable(loc: CopilotDiscoveryLocation, p: Path) -> bool:
-            return loc.scope not in (
-                "claude-user",
-                "claude-workspace",
-            ) and is_craftsman_generated_file(p, valid_all)
+            return (
+                not loc.canonical
+                and loc.scope not in ("claude-user", "claude-workspace")
+                and is_craftsman_generated_file(p, valid_all)
+            )
 
+        canonical_scopes = {loc.scope for loc, _ in entries if loc.canonical}
+        has_scope_collision = len(canonical_scopes) > 1
         canonical_entry = next(
             ((loc, p) for loc, p in entries if loc.canonical),
             next(
@@ -573,6 +586,7 @@ def scan_copilot_duplicates(
                 "preserved_paths": preserved_paths,
                 "claude_collision": has_claude_scope,
                 "claude_scope": claude_loc_scope,
+                "scope_collision": has_scope_collision,
             }
         )
     return results
@@ -595,6 +609,12 @@ def _format_duplicate_problem(dup: dict[str, Any]) -> str:
             f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
             f'(VS Code also reads Claude Code directories; set "{setting_name}": {{"{loc_key}": false}} '
             "in VS Code settings.json to disable)"
+        )
+    if dup.get("scope_collision") and not dup["removable_paths"]:
+        return (
+            f"Duplicate Copilot {kind} '{name}' in {client}: {paths_str} "
+            "(both user and workspace scopes are installed; uninstall one scope with "
+            "`craftsman uninstall --copilot` or `craftsman uninstall --copilot --workspace <dir>`)"
         )
     if dup["preserved_paths"]:
         preserved_str = ", ".join(dup["preserved_paths"])

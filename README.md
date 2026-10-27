@@ -302,23 +302,24 @@ During an active `/craftsman` session (or inside a `craftsman`, `craftsman-revie
 `craftsman-verifier` agent), the `pre-tool` hook enforces a repository search-scope policy:
 
 - **Allowed**:
-  - Reading, listing, and searching inside the active git work tree (`git rev-parse --show-toplevel`).
-  - Reading a specific file outside the work tree inside installed dependency/stdlib paths (`site-packages`,
-    `dist-packages`, `node_modules`, `.venv`, `venv`, `virtualenv`, `.tox`, `.nox`, `conda`, `pyenv`,
-    `cargo/registry`, `go/pkg/mod`, `/usr/lib`, `/usr/local/lib`, `/Library/Frameworks`), the system
-    temp directory (`$TMPDIR` / `/tmp`), or the bundled Craftsman package (`craftsman skill path <name>`).
+  - Reading, listing, and searching inside the active git work tree (`git rev-parse --show-toplevel`,
+    including submodules and nested repositories inside it) and inside dedicated subdirectories in the
+    system temp directory (`$TMPDIR` / `/tmp`).
+  - Reading a specific file or non-recursively listing a directory outside the work tree (such as
+    installed dependency/stdlib paths, parent directories like `ls ..`, or files cited by stack traces),
+    as long as the target is not inside another git repository, an assistant session store, or a shell
+    history file.
 - **Blocked**:
-  - Recursive search or directory listing (`find`, `rg`, `grep -R`, `fd`, `ls`, `tree`, `du`, `Glob`,
+  - Recursive search or directory listing (`find`, `rg`, `grep -R`, `fd`, `ls -R`, `tree`, `du`, `Glob`,
     `Grep`, `LS`, etc.) rooted outside the work tree (such as `~`, `..`, `/Users`, `/home`, or a sibling repo).
-  - Reading files in sibling repositories, `~/.claude/projects`, `~/.copilot/session-state`,
-    `~/.gemini/antigravity/brain`, or shell history files, as well as searching for `SKILL.md`,
-    `lenses.md`, `packet-*.md`, or `ledger.json` on disk (use `craftsman skill show <name>` and
-    `craftsman review show --packet-path` instead).
+  - Reading or listing files in other git repositories, `~/.claude/projects`, `~/.copilot/session-state`,
+    `~/.gemini/antigravity/brain`, `~/.gemini/antigravity/conversations`, other repositories'
+    `.git/craftsman` data, or shell history files.
 - **Configuration (per repository via `git config`)**:
   ```bash
   # Allow additional directories outside the work tree (colon-separated on POSIX, semicolon on Windows, or multi-valued):
   git config --add craftsman.scopeAllow ../shared-schemas
-  # Switch enforcement mode: enforce (default, blocks), warn (allows with warning), or off (disabled):
+  # Switch enforcement mode: deny (or enforce, default, blocks), warn (allows with warning), or off (disabled):
   git config craftsman.scope warn
   git config craftsman.scope off
   ```

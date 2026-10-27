@@ -707,6 +707,26 @@ class DoctorTests(ExportTestCase):
             "conv-abc",
         )
 
+    def test_env_var_for_home_honors_xdg_outside_home_and_skill_scope_sync(self) -> None:
+        from craftsman.cli import validate_skill_manifests
+
+        # Minor 8: when `home` matches `user_home(None)`, XDG_CONFIG_HOME or CRAFTSMAN_HOME outside $HOME is honored
+        real_home = export.user_home(None)
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}, clear=False):
+            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", real_home), "/opt/cfg")
+            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
+            # When an isolated test `home` different from `user_home(None)` is passed, outside env is ignored
+            self.assertEqual(
+                export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated_home"), ""
+            )
+
+        # Minor 12: `skills/craftsman/scope.md` and `skills/craftsman/SKILL.md` are in exact sync
+        scope_md = (REPO_ROOT / "skills" / "craftsman" / "scope.md").read_text(encoding="utf-8").strip()
+        skill_md = (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(scope_md, skill_md)
+        _, errors = validate_skill_manifests(REPO_ROOT)
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

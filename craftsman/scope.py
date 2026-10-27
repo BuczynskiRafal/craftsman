@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from craftsman.guard import iter_simple_commands
+from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_segments
 
 ScopeMode = Literal["deny", "warn", "off"]
 DecisionKind = Literal["allow", "deny"]
@@ -70,6 +70,17 @@ SEARCH_TOOL_NAMES = frozenset(
         "search_files",
     }
 )
+
+GLOB_PATTERN_TOOL_NAMES = frozenset(
+    {
+        "glob",
+        "file_search",
+        "filesearch",
+        "find_by_name",
+    }
+)
+
+SCOPE_CHECKED_TOOL_NAMES = SHELL_TOOL_NAMES | READ_LIST_TOOL_NAMES | SEARCH_TOOL_NAMES
 
 SHELL_HISTORY_NAMES = frozenset(
     {
@@ -229,6 +240,13 @@ def is_craftsman_agent(agent_name: str | None) -> bool:
     return any(normalized.endswith(f"/{name}") or normalized.endswith(f":{name}") for name in CRAFTSMAN_AGENT_NAMES)
 
 
+def is_scope_checked_tool(tool_name: str | None) -> bool:
+    """Return True if `tool_name` is a shell, file-read, or search/list tool checked by the scope guard."""
+    if not tool_name:
+        return False
+    return tool_name.strip().lower() in SCOPE_CHECKED_TOOL_NAMES
+
+
 def _git_config_values(cwd: Path, *args: str) -> list[str]:
     try:
         proc = subprocess.run(
@@ -308,6 +326,8 @@ def load_scope_policy(cwd: Path, repo_root: Path) -> ScopePolicy:
     resolved_root = repo_root.resolve()
     mode_vals = _git_config_values(resolved_root, "--get", "craftsman.scope")
     raw_mode = mode_vals[-1].lower() if mode_vals else "deny"
+    if raw_mode == "enforce":
+        raw_mode = "deny"
     mode: ScopeMode = raw_mode if raw_mode in ("deny", "warn", "off") else "deny"  # type: ignore[assignment]
 
     home = _current_home()
@@ -494,27 +514,6 @@ def _check_read_or_list_path(
     return ScopeDecision("allow")
 
 
-def _check_nonrec_ls_path(
-    raw_path: str,
-    base_cwd: Path,
-    repo_root: Path,
-    policy: ScopePolicy,
-    home: Path,
-    exe: str,
-) -> ScopeDecision:
-    decision = _check_read_or_list_path(
-        raw_path, base_cwd, repo_root, policy, home, f"`{exe}` listing"
-    )
-    if decision.decision == "deny":
-        return decision
-    _, real = _resolve_lexical_and_real(raw_path, base_cwd, home)
-    if _is_in_policy_allowlist(real, policy):
-        return ScopeDecision("allow")
-    if real == Path(real.anchor) or real == home or real in repo_root.parents:
-        return ScopeDecision("deny", _deny_reason(f"`{exe}` listing", str(real), repo_root))
-    return ScopeDecision("allow")
-
-
 def _is_allowed_recursive_root(
     raw_path: str,
     base_cwd: Path,
@@ -540,12 +539,12 @@ def _is_allowed_recursive_root(
     if _is_assistant_session_store(real, home) or _is_other_craftsman_data(real, repo_root, policy):
         return False, str(real)
 
+    if _is_within(real, repo_root) or _is_in_own_git_craftsman(real, repo_root, policy):
+        return True, str(real)
+
     git_wt = _nearest_git_worktree(real)
     if git_wt is not None and git_wt != repo_root:
         return False, str(real)
-
-    if _is_within(real, repo_root) or _is_in_own_git_craftsman(real, repo_root, policy):
-        return True, str(real)
 
     if ".." in Path(raw_path.replace("\\", "/")).parts:
         return False, str(real)
@@ -851,10 +850,15 @@ def _extract_shell_read_paths(exe: str, args: list[str]) -> list[str]:
             idx += 1
         return non_opts_awk if has_prog_file else non_opts_awk[1:]
 
+    is_head_tail_gc = exe in ("head", "tail", "get-content", "gc")
     while idx < n:
         tok = args[idx]
         low = tok.lower()
-        if low in ("-n", "-c", "-lines", "-bytes", "-totalcount", "-tail") and idx + 1 < n:
+        if (
+            is_head_tail_gc
+            and low in ("-n", "-c", "-lines", "-bytes", "-totalcount", "-tail")
+            and idx + 1 < n
+        ):
             idx += 2
             continue
         if low in ("-path", "-literalpath") and idx + 1 < n:
@@ -931,13 +935,18 @@ def _check_git_command_scope(
 
 
 def _has_unmatched_quotes(command_line: str) -> bool:
-    # Ignore trailing backslash on Windows drive roots like C:\
-    sanitized = re.sub(r"([A-Za-z]:)\\(?=\s|$)", r"\1/", command_line)
-    try:
-        shlex.split(sanitized, posix=True)
-        return False
-    except ValueError:
-        return True
+    for seg in split_shell_segments(command_line):
+        cmd_header = seg.split("\n", 1)[0]
+        hd_match = HEREDOC_OPEN_RE.search(cmd_header)
+        if hd_match:
+            cmd_header = cmd_header[: hd_match.start()]
+        # Ignore trailing backslash on Windows drive roots like C:\
+        sanitized = re.sub(r"([A-Za-z]:)\\(?=\s|$)", r"\1/", cmd_header)
+        try:
+            shlex.split(sanitized, posix=True)
+        except ValueError:
+            return True
+    return False
 
 
 def _evaluate_shell_command_scope(
@@ -1028,7 +1037,9 @@ def _evaluate_shell_command_scope(
                 recursive_roots = l_roots
             else:
                 for raw_p in l_roots:
-                    decision = _check_nonrec_ls_path(raw_p, eff_cwd, repo_root, policy, home, exe)
+                    decision = _check_read_or_list_path(
+                        raw_p, eff_cwd, repo_root, policy, home, f"`{exe}` listing"
+                    )
                     if decision.decision == "deny":
                         return decision
                 continue
@@ -1057,7 +1068,7 @@ def _evaluate_shell_command_scope(
     return ScopeDecision("allow")
 
 
-def _extract_glob_root_prefix(pattern: str, *, is_query: bool = False) -> str | None:
+def _extract_glob_root_prefix(pattern: str) -> str | None:
     expanded = pattern.strip()
     if not expanded:
         return None
@@ -1079,7 +1090,7 @@ def _extract_glob_root_prefix(pattern: str, *, is_query: bool = False) -> str | 
         if has_leading_anchor:
             return prefix
         return None
-    if has_leading_anchor or (not is_query and ("/" in expanded or "\\" in expanded)):
+    if has_leading_anchor or ("/" in expanded or "\\" in expanded):
         return expanded.rstrip("/\\") or ("/" if expanded.startswith("/") else expanded[:3])
     return None
 
@@ -1172,10 +1183,15 @@ def evaluate_scope(
                 if not ok:
                     return ScopeDecision("deny", _deny_reason(f"`{tool_name}` search", desc, resolved_repo))
 
-        for pat_key in ("pattern", "glob", "includePattern", "query"):
+        glob_keys: tuple[str, ...] = (
+            ("pattern", "glob", "includePattern")
+            if tool_low in GLOB_PATTERN_TOOL_NAMES
+            else ("glob", "includePattern")
+        )
+        for pat_key in glob_keys:
             pat_val = tool_input.get(pat_key)
             if isinstance(pat_val, str) and pat_val.strip():
-                prefix = _extract_glob_root_prefix(pat_val.strip(), is_query=(pat_key == "query"))
+                prefix = _extract_glob_root_prefix(pat_val.strip())
                 if prefix is not None:
                     checked_any = True
                     ok, desc = _is_allowed_recursive_root(

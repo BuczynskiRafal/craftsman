@@ -526,6 +526,39 @@ class CopilotDiscoveryAndDedupTests(unittest.TestCase):
         self.assertTrue(ok_report["healthy"])
         self.assertEqual(ok_report["copilot"]["duplicates"], [])
 
+    def test_doctor_fix_duplicates_preserves_workspace_canonical_install_when_both_scopes_exist(
+        self,
+    ) -> None:
+        ws = self.tmp / "both_scopes_ws"
+        ws.mkdir()
+        self.assertEqual(self.run_install("--copilot")[0], 0)
+        self.assertEqual(
+            self.run_install("--copilot-workspace", str(ws), "--allow-duplicate-scopes")[0], 0
+        )
+
+        ws_agent = ws / ".github" / "agents" / "craftsman.agent.md"
+        ws_skill = ws / ".github" / "skills" / "craftsman" / "SKILL.md"
+        user_agent = self.home / ".copilot" / "agents" / "craftsman.agent.md"
+        user_skill = self.home / ".copilot" / "skills" / "craftsman" / "SKILL.md"
+        self.assertTrue(ws_agent.is_file())
+        self.assertTrue(ws_skill.is_file())
+
+        # Running `doctor --workspace ws --fix-duplicates` must NOT delete any canonical workspace or user files!
+        code_fix, _, err_fix = self.run_doctor("--workspace", str(ws), "--fix-duplicates")
+        self.assertEqual(code_fix, 1)
+        self.assertTrue(ws_agent.is_file())
+        self.assertTrue(ws_skill.is_file())
+        self.assertTrue(user_agent.is_file())
+        self.assertTrue(user_skill.is_file())
+        self.assertIn("both user and workspace scopes are installed", err_fix)
+        self.assertIn("craftsman uninstall --copilot", err_fix)
+
+        # Workspace manifest paths all still exist on disk
+        ws_manifest = load_manifest(ws)
+        assert ws_manifest is not None
+        for p_str in ws_manifest.targets["copilot_workspace"].created_paths:
+            self.assertTrue(Path(p_str).exists(), f"Deleted workspace file: {p_str}")
+
 
 if __name__ == "__main__":
     unittest.main()

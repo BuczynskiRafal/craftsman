@@ -10,11 +10,12 @@ All notable changes to Craftsman are recorded here. The format follows
 
 - **Repository search-scope guard** (`craftsman/scope.py`, `craftsman hook pre-tool`, and
   `skills/craftsman/scope.md`): blocks recursive directory searches (`find`, `rg`, `grep -R`, `fd`,
-  `Glob`, `Grep`, `LS`, etc.) outside the active git work tree and blocks reading sibling
-  repositories, prior agent session logs (`~/.claude/projects`, `~/.copilot/session-state`,
+  `ls -R`, `Glob`, `Grep`, `LS`, etc.) outside the active git work tree and blocks reading other
+  git repositories, prior agent session logs (`~/.claude/projects`, `~/.copilot/session-state`,
   `~/.gemini/antigravity/brain`), or shell history during Craftsman sessions while allowing
-  dependency/stdlib paths, `$TMPDIR`, and paths added via `git config craftsman.scopeAllow`
-  (configurable with `git config craftsman.scope enforce|warn|off`).
+  single-file reads outside other repositories/session stores, dedicated `$TMPDIR` subdirectories,
+  and paths added via `git config craftsman.scopeAllow` (configurable with
+  `git config craftsman.scope deny|warn|off`).
 - **`craftsman skill {show,list,path}`** and **`craftsman review show --packet-path`**: read bundled
   skills, companion files (such as `lenses.md`), and the active round's review packet path directly
   from the CLI without searching the file system.

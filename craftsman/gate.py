@@ -645,8 +645,8 @@ def is_same_or_unclaimed_owner(
         return True
     if ex_plat != platform:
         return False
-    if ex_sid and in_sid and ex_sid != in_sid:
-        return False
+    if ex_sid:
+        return bool(in_sid) and in_sid == ex_sid
     return True
 
 
@@ -679,9 +679,7 @@ def check_and_claim_owner(
             owner["session_id"] = in_sid
             return True, True
         return True, False
-    if not in_sid or in_sid == ex_sid:
-        return True, False
-    return False, False
+    return (bool(in_sid) and in_sid == ex_sid), False
 
 
 def _extract_antigravity_session_id(payload: dict[str, Any]) -> str:

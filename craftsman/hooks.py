@@ -71,7 +71,12 @@ from craftsman.ledger import (
     uncovered_by_lens,
 )
 from craftsman.packet import CHEAT_SHEET
-from craftsman.scope import evaluate_scope, is_craftsman_agent, load_scope_policy
+from craftsman.scope import (
+    evaluate_scope,
+    is_craftsman_agent,
+    is_scope_checked_tool,
+    load_scope_policy,
+)
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
@@ -638,6 +643,9 @@ def on_pre_tool(
                 return reply.deny(reason or "Blocked by the Craftsman git guard.")
             if decision == "force_ask":
                 return reply.ask(reason or "The Craftsman git guard needs your confirmation.")
+
+    if not is_scope_checked_tool(hook.tool_name):
+        return reply.allow()
 
     if session is None:
         session = open_session(hook.cwd)

@@ -135,9 +135,9 @@ def emit(decision: str, reason: str | None = None) -> None:
     sys.stdout.flush()
 
 
-def split_shell_segments(command_line: str) -> list[str]:
-    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
-    segments: list[str] = []
+def _split_shell_events(command_line: str) -> list[str]:
+    """Split a shell command line into command segments and subshell boundary tokens `(` and `)`."""
+    events: list[str] = []
     current: list[str] = []
     quote: str | None = None
     escaped = False
@@ -191,10 +191,18 @@ def split_shell_segments(command_line: str) -> list[str]:
                         break
                 seg = "".join(current).strip()
                 if seg:
-                    segments.append(seg)
+                    events.append(seg)
                 current = []
                 continue
-        if ch in (";", "\n", "(", ")", "`") or (
+        if ch in ("(", ")"):
+            seg = "".join(current).strip()
+            if seg:
+                events.append(seg)
+            current = []
+            events.append(ch)
+            i += 1
+            continue
+        if ch in (";", "\n", "`") or (
             ch in ("{", "}")
             and (
                 i == 0
@@ -207,7 +215,7 @@ def split_shell_segments(command_line: str) -> list[str]:
         ):
             seg = "".join(current).strip()
             if seg:
-                segments.append(seg)
+                events.append(seg)
             current = []
             i += 1
             continue
@@ -225,7 +233,7 @@ def split_shell_segments(command_line: str) -> list[str]:
                 i += 1
             seg = "".join(current).strip()
             if seg:
-                segments.append(seg)
+                events.append(seg)
             current = []
             continue
         current.append(ch)
@@ -233,8 +241,13 @@ def split_shell_segments(command_line: str) -> list[str]:
 
     tail = "".join(current).strip()
     if tail:
-        segments.append(tail)
-    return segments
+        events.append(tail)
+    return events
+
+
+def split_shell_segments(command_line: str) -> list[str]:
+    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
+    return [ev for ev in _split_shell_events(command_line) if ev not in ("(", ")")]
 
 
 def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
@@ -356,6 +369,7 @@ _UNQUOTED_WIN_PATH_TOKEN_RE = re.compile(
     r"(?<!\S)(?:[A-Za-z]:|~|\.\.?|%[A-Za-z_][A-Za-z0-9_]*%|\$(?:HOME|\{HOME\}|env:[A-Za-z_][A-Za-z0-9_]*))\\[^\s\"';|&<>()]*"
 )
 CD_COMMANDS = frozenset({"cd", "pushd", "chdir", "set-location", "sl"})
+POPD_COMMANDS = frozenset({"popd", "pop-location"})
 
 
 def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
@@ -596,11 +610,23 @@ def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[list[str]]:
 def iter_simple_commands(
     command_line: str, cwd_str: str | None = None, max_depth: int = 4
 ) -> list[SimpleCommand]:
-    """Split a shell command line into tokenized segments, tracking `cd`/`pushd` and expanding nested shells."""
-    base_segments = split_shell_segments(command_line)
+    """Split a shell command line into tokenized segments, tracking `cd`/`pushd`/`popd`, subshell `( ... )` scope, and expanding nested shells."""
+    events = _split_shell_events(command_line)
     commands: list[SimpleCommand] = []
     cur_cwd = cwd_str
-    for seg in base_segments:
+    dir_stack: list[str | None] = []
+    subshell_stack: list[tuple[str | None, list[str | None]]] = []
+
+    for ev in events:
+        if ev == "(":
+            subshell_stack.append((cur_cwd, list(dir_stack)))
+            continue
+        if ev == ")":
+            if subshell_stack:
+                cur_cwd, dir_stack = subshell_stack.pop()
+            continue
+
+        seg = ev
         raw_tokens = _tokenize_raw_segment(seg)
         cmd_cwd = _extract_wrapper_chdir(raw_tokens, cur_cwd)
         tokens = _strip_wrappers_from_tokens(raw_tokens)
@@ -617,8 +643,15 @@ def iter_simple_commands(
                     commands.extend(
                         iter_simple_commands(sub_nested, cwd_str=cmd_cwd, max_depth=max_depth - 1)
                     )
-        if tokens and tokens[0].lower() in CD_COMMANDS:
-            cur_cwd = _resolve_cd_target(tokens, cur_cwd)
+        if tokens:
+            cmd_low = tokens[0].lower()
+            if cmd_low in CD_COMMANDS:
+                if cmd_low == "pushd":
+                    dir_stack.append(cur_cwd)
+                cur_cwd = _resolve_cd_target(tokens, cur_cwd)
+            elif cmd_low in POPD_COMMANDS:
+                if dir_stack:
+                    cur_cwd = dir_stack.pop()
     return commands
 
 
@@ -1294,11 +1327,70 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
     return None, None
 
 
+def _evaluate_antigravity_scope(
+    payload: dict[str, Any], command_line: str, cwd_str: str | None
+) -> tuple[str, str | None]:
+    """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
+    try:
+        from craftsman.diffscan import DiffScanError, worktree_root
+        from craftsman.gate import (
+            _extract_antigravity_session_id,
+            check_and_claim_owner,
+            load_state,
+            resolve_cli_state_file,
+        )
+        from craftsman.scope import evaluate_scope, load_scope_policy
+
+        eff_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
+        repo_root = worktree_root(eff_cwd)
+    except (ImportError, OSError, DiffScanError):
+        return "allow", None
+
+    ag_sid = _extract_antigravity_session_id(payload)
+    candidates: list[Path] = []
+    raw_artifact_dir = payload.get("artifactDirectoryPath")
+    if isinstance(raw_artifact_dir, str) and raw_artifact_dir.strip():
+        candidates.append(Path(raw_artifact_dir).expanduser() / "craftsman_state.json")
+    candidates.append(resolve_cli_state_file(None, str(eff_cwd)))
+
+    is_active_owner = False
+    for sf in candidates:
+        st = load_state(sf)
+        if st and st.get("active"):
+            owned, _ = check_and_claim_owner(st, "antigravity", ag_sid)
+            if owned:
+                is_active_owner = True
+                break
+    if not is_active_owner:
+        return "allow", None
+
+    policy = load_scope_policy(eff_cwd, repo_root)
+    if policy.mode == "off":
+        return "allow", None
+    scope_dec = evaluate_scope(
+        "run_command",
+        {"CommandLine": command_line, "Cwd": cwd_str},
+        eff_cwd,
+        repo_root,
+        policy,
+    )
+    if scope_dec.decision == "deny" and policy.mode == "deny":
+        return "deny", scope_dec.reason
+    return "allow", None
+
+
 def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     command_line, cwd_str = _extract_command_and_cwd(payload)
     if not isinstance(command_line, str):
         return "allow", None
-    return evaluate_shell_command(command_line, cwd_str, resolve_transcript_path(payload))
+    decision, reason = evaluate_shell_command(
+        command_line, cwd_str, resolve_transcript_path(payload)
+    )
+    if decision != "allow":
+        return decision, reason
+    if payload.get("tool") == "run_command":
+        return _evaluate_antigravity_scope(payload, command_line, cwd_str)
+    return "allow", None
 
 
 def evaluate_shell_command(

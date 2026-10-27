@@ -646,6 +646,18 @@ class PreToolTests(HookTestCase):
         self.assertEqual(call_hook("pre-tool", "copilot", payload)[0], {})
         self.assertEqual(self.state()["hooks_seen"], "copilot")
 
+    def test_non_scope_checked_tools_skip_load_scope_policy_subprocesses(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        with mock.patch("craftsman.hooks.load_scope_policy") as mock_policy:
+            for tool in ("Edit", "Write", "editFiles", "replace_string_in_file"):
+                out, _ = call_hook(
+                    "pre-tool",
+                    "copilot",
+                    vscode("PreToolUse", self.root, tool_name=tool, tool_input={"file_path": "a.py"}),
+                )
+                self.assertEqual(out, {})
+            mock_policy.assert_not_called()
+
 
 class TranscriptReviewerTests(unittest.TestCase):
     def test_antigravity_recognizes_the_craftsman_reviewer_role(self) -> None:
@@ -909,7 +921,25 @@ class SessionOwnershipTests(HookTestCase):
         self.assertIn("--takeover", refused.stderr)
         self.assertEqual(self.state()["tier"], "deep")
 
-        # Same platform (`CLAUDECODE=1`, e.g. agent running step 1 after on_prompt) is allowed and preserves session_id
+        # Same platform WITHOUT a session_id (e.g. a second session on the same platform with no session env var) is refused
+        no_sid_refused = self.repo.cli(
+            "gate",
+            "--init",
+            "--tier",
+            "quick",
+            "--task",
+            "hijack task",
+            "--cwd",
+            ".",
+            check=False,
+            env_extra={"CLAUDECODE": "1", "CLAUDE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ID": ""},
+        )
+        self.assertNotEqual(no_sid_refused.returncode, 0)
+        self.assertIn("already owned by claude (session claude-session)", no_sid_refused.stderr)
+        self.assertEqual(self.state()["tier"], "deep")
+        self.assertEqual(self.state()["task"], "owner task")
+
+        # Same platform AND matching session_id is allowed and preserves session_id
         same_plat = self.repo.cli(
             "gate",
             "--init",
@@ -919,12 +949,13 @@ class SessionOwnershipTests(HookTestCase):
             "refined owner task",
             "--cwd",
             ".",
-            env_extra={"CLAUDECODE": "1"},
+            env_extra={"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-session"},
         )
-        self.assertEqual(same_plat.returncode, 0)
+        self.assertEqual(same_plat.returncode, 0, same_plat.stderr)
         self.assertEqual(
             self.state()["owner"], {"platform": "claude", "session_id": "claude-session"}
         )
+        self.assertEqual(self.state()["tier"], "deep")
         self.assertEqual(self.state()["task"], "refined owner task")
 
         # `--takeover` from Copilot explicitly takes over and records `takeover_from`

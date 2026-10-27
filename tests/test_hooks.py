@@ -779,6 +779,51 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
             )
             self.assertEqual(res["decision"], "allow")
 
+    def test_subshell_cd_and_pushd_popd_do_not_bypass_push_to_main_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            other_dir = Path(tmpdir) / "other"
+            repo_dir.mkdir()
+            other_dir.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"], cwd=repo_dir, capture_output=True, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "dev@example.com"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Dev"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "--no-verify", "-m", "init"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            for cmd in (
+                "(cd /tmp && ls) && git push",
+                "(cd ~ && ls) && git push origin HEAD",
+                f"pushd {other_dir}; popd; git push",
+            ):
+                with self.subTest(cmd=cmd):
+                    res = run_hook(
+                        GIT_GUARD,
+                        {
+                            "tool": "run_command",
+                            "toolCall": {
+                                "name": "run_command",
+                                "args": {"CommandLine": cmd, "Cwd": str(repo_dir)},
+                            },
+                        },
+                    )
+                    self.assertEqual(res["decision"], "force_ask", cmd)
+
 
 class CraftsmanCliAndManifestTests(unittest.TestCase):
     def test_cli_version_and_doctor_json(self) -> None:

@@ -121,7 +121,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             ("fd_inside", "Bash", {"command": "fd app.py src"}, "allow"),
             # 17-22: ls, tree, du, locate, mdfind
             ("ls_nonrec_copilot", "Bash", {"command": "ls ~/.copilot/skills"}, "allow"),
-            ("ls_nonrec_tilde", "Bash", {"command": "ls ~"}, "deny"),
+            ("ls_nonrec_tilde", "Bash", {"command": "ls ~"}, "allow"),
             ("ls_nonrec_other_repo", "Bash", {"command": "ls ../other-repo"}, "deny"),
             ("ls_rec_tilde", "Bash", {"command": "ls -R ~"}, "deny"),
             ("ls_laR_parent", "Bash", {"command": "ls -laR .."}, "deny"),
@@ -308,6 +308,142 @@ class ScopeEnforcementTests(unittest.TestCase):
         subprocess.run(["git", "config", "craftsman.scope", "off"], cwd=self.repo, check=True)
         out_off, _ = call_pre_tool("copilot", copilot_camel)
         self.assertEqual(out_off, {})
+
+        # 6. craftsman.scope = enforce is accepted as an alias for deny
+        subprocess.run(["git", "config", "craftsman.scope", "enforce"], cwd=self.repo, check=True)
+        self.assertEqual(load_scope_policy(self.repo, self.repo).mode, "deny")
+
+    def test_grep_regex_patterns_and_queries_are_not_treated_as_paths(self) -> None:
+        for tool, inp in (
+            ("Grep", {"pattern": "/api/v1"}),
+            ("Grep", {"pattern": "~/.claude"}),
+            ("Grep", {"pattern": "$HOME"}),
+            ("grep_search", {"query": "/tmp/"}),
+            ("grep_search", {"query": "~/.copilot/session-state"}),
+        ):
+            with self.subTest(tool=tool, inp=inp):
+                dec = evaluate_scope(tool, inp, self.repo, self.repo, self.policy)
+                self.assertEqual(dec.decision, "allow", f"{tool} {inp}: {dec.reason}")
+
+    def test_submodules_and_nested_repos_inside_worktree_are_allowed(self) -> None:
+        nested = self.repo / "vendor" / "lib"
+        nested.mkdir(parents=True)
+        subprocess.run(["git", "init"], cwd=nested, capture_output=True, check=True)
+        (nested / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+        self.assertEqual(
+            evaluate_scope(
+                "Bash", {"command": "rg foo vendor/lib"}, self.repo, self.repo, self.policy
+            ).decision,
+            "allow",
+        )
+        self.assertEqual(
+            evaluate_scope(
+                "Grep", {"path": "vendor/lib", "pattern": "foo"}, self.repo, self.repo, self.policy
+            ).decision,
+            "allow",
+        )
+
+    def test_subshell_cd_pushd_popd_heredoc_apostrophes_cat_flags_and_nonrec_ls(self) -> None:
+        # 1. Subshell cd does not leak into following command; pushd/popd restores cwd
+        self.assertEqual(
+            evaluate_scope(
+                "Bash", {"command": "(cd ~ && pwd); rg foo"}, self.repo, self.repo, self.policy
+            ).decision,
+            "allow",
+        )
+        self.assertEqual(
+            evaluate_scope(
+                "Bash",
+                {"command": f"pushd {self.other_repo}; popd; rg foo"},
+                self.repo,
+                self.repo,
+                self.policy,
+            ).decision,
+            "allow",
+        )
+
+        # 2. Heredoc with an apostrophe (it's) does not fool _has_unmatched_quotes
+        heredoc_cmd = "cat <<'EOF'\nit's done\nEOF\nfind ~ -name SKILL.md"
+        self.assertEqual(
+            evaluate_scope(
+                "Bash", {"command": heredoc_cmd}, self.repo, self.repo, self.policy
+            ).decision,
+            "deny",
+        )
+
+        # 3. `cat -n` and `cat -c` do not treat the file operand as an option value
+        self.assertEqual(
+            evaluate_scope(
+                "Bash",
+                {"command": f"cat -n {self.other_repo}/.git/craftsman/packet-1.md"},
+                self.repo,
+                self.repo,
+                self.policy,
+            ).decision,
+            "deny",
+        )
+        self.assertEqual(
+            evaluate_scope(
+                "Bash",
+                {"command": f"cat -n {self.other_repo}/secret.py"},
+                self.repo,
+                self.repo,
+                self.policy,
+            ).decision,
+            "deny",
+        )
+
+        # 4. Non-recursive `ls ..` and `ls ~` are allowed, while `ls -R ..`, `ls ../other-repo`, and `ls ~/.claude/projects` are denied
+        for allowed_ls in ("ls ..", "ls ~", "ls -la .."):
+            with self.subTest(allowed_ls=allowed_ls):
+                self.assertEqual(
+                    evaluate_scope(
+                        "Bash", {"command": allowed_ls}, self.repo, self.repo, self.policy
+                    ).decision,
+                    "allow",
+                )
+        for denied_ls in (
+            "ls -R ..",
+            "ls -R ~",
+            f"ls {self.other_repo}",
+            "ls ~/.claude/projects",
+        ):
+            with self.subTest(denied_ls=denied_ls):
+                self.assertEqual(
+                    evaluate_scope(
+                        "Bash", {"command": denied_ls}, self.repo, self.repo, self.policy
+                    ).decision,
+                    "deny",
+                )
+
+    def test_antigravity_run_command_enforces_scope_when_gate_is_owned_by_antigravity(self) -> None:
+        from craftsman.guard import evaluate_command
+
+        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "active": True,
+                    "tier": "standard",
+                    "cwd": str(self.repo),
+                    "owner": {"platform": "antigravity", "session_id": "conv-123"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        dec, reason = evaluate_command(
+            {
+                "tool": "run_command",
+                "conversation_id": "conv-123",
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)},
+                },
+            }
+        )
+        self.assertEqual(dec, "deny")
+        self.assertIn("[CRAFTSMAN SCOPE-GUARD]", reason or "")
 
 
 if __name__ == "__main__":

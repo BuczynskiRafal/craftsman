@@ -272,23 +272,6 @@ def user_home(home: Path | None = None) -> Path:
         return Path(".")
 
 
-def _is_temp_path(path: Path) -> bool:
-    for raw_tmp in (tempfile.gettempdir(), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"):
-        try:
-            tmp_root = Path(os.path.abspath(raw_tmp))
-            resolved_tmp = Path(raw_tmp).resolve()
-        except OSError:
-            continue
-        if (
-            path == tmp_root
-            or tmp_root in path.parents
-            or path == resolved_tmp
-            or resolved_tmp in path.parents
-        ):
-            return True
-    return False
-
-
 def env_var_for_home(env_key: str, home: Path | None = None) -> str:
     val = os.environ.get(env_key, "").strip()
     if not val:
@@ -300,7 +283,7 @@ def env_var_for_home(env_key: str, home: Path | None = None) -> str:
     abs_home = Path(os.path.abspath(str(eff_home)))
     if abs_val == abs_home or abs_home in abs_val.parents:
         return val
-    if home is None and (not _is_temp_path(abs_home) or _is_temp_path(abs_val)):
+    if abs_home == Path(os.path.abspath(str(user_home(None)))):
         return val
     return ""
 
