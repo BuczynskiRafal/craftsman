@@ -23,13 +23,14 @@ from craftsman.diffscan import (
 )
 from craftsman.ledger import Ledger, Round, reopened_mentions
 from craftsman.lenses import LensPick
-from craftsman.quality import QualitySignal, collect_quality_signals
+from craftsman.quality import QualitySignal, collect_quality_signals, is_test_path
 
 MAX_PACKET_CHARS = 350_000
 MAX_SCOPE_LINES = 60
 SCOPE_CONTEXT_RADIUS = 15
 MAX_COMMITS = 50
 MAX_REFERENCES_PER_SYMBOL = 8
+MAX_TEST_FILES_PER_SYMBOL = 5
 REFERENCE_SEARCH_LIMIT = 40
 SWEEP_LENS = "sweep"
 
@@ -123,6 +124,8 @@ class PacketContext:
     carried_from: Mapping[str, int]
     reopened: Mapping[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
     quality_signals: tuple[QualitySignal, ...] = ()
+    test_files_by_symbol: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    last_runs: tuple[str, ...] = ()
 
 
 def collect_context(
@@ -163,6 +166,8 @@ def collect_context(
         carried_from=_carried_from(ledger, round_),
         reopened=reopened_mentions(ledger.coverage, round_, snap.hunks, symbols),
         quality_signals=tuple(quality_signals),
+        test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
+        last_runs=_last_runs(ledger, snap),
     )
 
 
@@ -210,6 +215,32 @@ def _references(
         outside = [ref for ref in found if not any(_inside(ref, hunk) for hunk in defining)]
         references[symbol] = tuple(outside[:MAX_REFERENCES_PER_SYMBOL])
     return references
+
+
+def _test_files_by_symbol(
+    index: WorktreeIndex, symbols: Mapping[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    unique_symbols = sorted({sym for items in symbols.values() for sym in items})
+    result: dict[str, tuple[str, ...]] = {}
+    for sym in unique_symbols:
+        refs = index.references(sym, limit=REFERENCE_SEARCH_LIMIT)
+        paths = list(dict.fromkeys(ref.path for ref in refs if is_test_path(ref.path)))
+        if paths:
+            result[sym] = tuple(paths[:MAX_TEST_FILES_PER_SYMBOL])
+    return result
+
+
+def _last_runs(ledger: Ledger, snap: DiffSnapshot) -> tuple[str, ...]:
+    latest_by_kind = {run.kind: run for run in ledger.runs if run.kind in ("test", "e2e")}
+    lines: list[str] = []
+    for kind in ("test", "e2e"):
+        run = latest_by_kind.get(kind)
+        if run is not None:
+            freshness = "current" if run.fingerprint == snap.fingerprint else "stale"
+            lines.append(
+                f"{run.id} `{run.short_command}` ({run.kind}) exit {run.exit_code} ({freshness})"
+            )
+    return tuple(lines)
 
 
 def _inside(ref: Reference, hunk: Hunk) -> bool:
@@ -440,19 +471,27 @@ def _symbol_lines(
     ctx: PacketContext, hunk: Hunk, first_by_symbol: Mapping[str, str] | None = None
 ) -> list[str]:
     symbols = ctx.symbols.get(hunk.id, ())
-    if not symbols:
-        return []
-    lines = ["Defines/changes: " + ", ".join(f"`{symbol}`" for symbol in symbols), "References:"]
-    for symbol in symbols:
-        first_id = first_by_symbol.get(symbol, hunk.id) if first_by_symbol is not None else hunk.id
-        if first_id != hunk.id:
-            lines.append(f"- `{symbol}`: (shown at {first_id})")
-            continue
-        refs = ctx.references.get(symbol, ())
-        listed = " · ".join(
-            f"{_inline_code(f'{ref.path}:{ref.line}')} {_inline_code(ref.text)}" for ref in refs
-        )
-        lines.append(f"- `{symbol}`: {listed or '(no other references found)'}")
+    lines: list[str] = []
+    if symbols:
+        lines += ["Defines/changes: " + ", ".join(f"`{symbol}`" for symbol in symbols), "References:"]
+        for symbol in symbols:
+            first_id = first_by_symbol.get(symbol, hunk.id) if first_by_symbol is not None else hunk.id
+            if first_id != hunk.id:
+                lines.append(f"- `{symbol}`: (shown at {first_id})")
+                continue
+            refs = ctx.references.get(symbol, ())
+            listed = " · ".join(
+                f"{_inline_code(f'{ref.path}:{ref.line}')} {_inline_code(ref.text)}" for ref in refs
+            )
+            lines.append(f"- `{symbol}`: {listed or '(no other references found)'}")
+            test_files = ctx.test_files_by_symbol.get(symbol, ())
+            if test_files:
+                lines.append(
+                    f"Tests referencing `{symbol}`: " + ", ".join(f"`{p}`" for p in test_files)
+                )
+    open_ids = [h.id for h in ctx.snap.hunks if h.id not in ctx.carried_from]
+    if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
+        lines.append("Last runs: " + " · ".join(ctx.last_runs))
     return lines
 
 

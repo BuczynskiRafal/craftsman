@@ -20,7 +20,7 @@ from craftsman.diffscan import (
     resolve_base_sha,
     snapshot,
 )
-from craftsman.ledger import HunkRef, Ledger, Round
+from craftsman.ledger import HunkRef, Ledger, Round, Run, add_run
 from craftsman.lenses import select_lenses
 from craftsman.packet import PacketContext, collect_context, render_packet
 
@@ -140,6 +140,57 @@ class CollectContextTests(unittest.TestCase):
 
         self.assertEqual(ctx.symbols["H1"], ("compute_total",))
         self.assertEqual(ctx.references["compute_total"][0].path, "use.py")
+
+    def test_tests_referencing_changed_symbol_are_listed(self) -> None:
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items)\n")
+        self.repo.write("tests/test_calc.py", "from calc import compute_total\ndef test_sum():\n    assert compute_total([1]) == 1\n")
+        base = self.repo.commit()
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items) * 2\n")
+
+        text = render_packet(self.context(base))
+
+        self.assertIn("Tests referencing `compute_total`: `tests/test_calc.py`", text)
+
+    def test_last_test_run_is_shown_with_staleness(self) -> None:
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items)\n")
+        base = self.repo.commit()
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items) * 2\n")
+        snap = snapshot(self.repo.root, base)
+        index = WorktreeIndex(self.repo.root)
+        symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
+        picks = tuple(
+            pick
+            for pick in select_lenses("standard", {}, docs_only=False)
+            if pick.lens.id in ("intent", "sweep")
+        )
+        ledger = add_run(
+            Ledger(),
+            Run(
+                id="R1",
+                kind="test",
+                argv=("pytest", "-q"),
+                cwd=".",
+                exit_code=0,
+                duration_s=0.4,
+                fingerprint="stale_fp",
+                started_at=PREPARED_AT,
+                output_tail="1 passed",
+            ),
+        )
+        ctx = collect_context(
+            self.repo.root,
+            snap,
+            round_for(snap),
+            picks,
+            "task",
+            symbols=symbols,
+            ledger=ledger,
+            index=index,
+        )
+
+        text = render_packet(ctx)
+
+        self.assertIn("Last runs: R1 `pytest -q` (test) exit 0 (stale)", text)
 
     def test_conventions_include_contributing_variants_and_changelog_readme(self) -> None:
         self.repo.write("CONTRIBUTING.rst", "How to contribute.\n")
