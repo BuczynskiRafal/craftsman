@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from craftsman.files import (
     BACKUP_DIR_NAME,
@@ -36,6 +37,16 @@ class AtomicWriteTests(FilesTestCase):
         write_bytes_atomic(path, b"new\n")
 
         self.assertEqual((path.read_bytes(), path.stat().st_mode & 0o777), (b"new\n", 0o750))
+
+    def test_interrupted_write_leaves_no_temporary_file(self) -> None:
+        path = self.tmp / "ledger.json"
+        path.write_text("old\n", encoding="utf-8")
+
+        with mock.patch("os.fsync", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            write_bytes_atomic(path, b"new\n")
+
+        self.assertEqual([p.name for p in self.tmp.iterdir()], ["ledger.json"])
+        self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
 
     def test_symlinked_file_is_written_where_it_lives(self) -> None:
         real = self.tmp / "dotfiles" / "settings.json"

@@ -30,35 +30,48 @@ class TranscriptError(Exception):
 
 
 def read_transcript_entries(transcript_path: Path | None) -> list[Entry]:
-    """The entries of a JSONL transcript; lines that are not JSON objects are skipped.
+    """The entries of a JSONL transcript.
 
-    No path or a missing file yields no entries: the session has not written one yet. Any other
-    failure to read the file raises `TranscriptError`.
+    No path or a missing file yields no entries: the session has not written one yet. A last line
+    without its newline is one the agent is still writing and is left out; any other line that is
+    not a JSON object, or a file that cannot be read, raises `TranscriptError`, since a skipped
+    entry could hide what the guard must see.
     """
     if transcript_path is None:
         return []
-    entries: list[Entry] = []
     try:
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for index, line in enumerate(handle, start=1):
-                obj = _json_object(line)
-                if obj is not None:
-                    entries.append(_normalize(obj, index))
+        text = transcript_path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return []
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise TranscriptError(f"cannot read the transcript {transcript_path}: {exc}") from exc
+    lines = text.split("\n")
+    complete, partial = lines[:-1], lines[-1]
+    entries = [
+        _normalize(_json_object(line, transcript_path, index), index)
+        for index, line in enumerate(complete, start=1)
+        if line.strip()
+    ]
+    if partial.strip() and _is_json_object(partial):  # a finished entry without its newline
+        entries.append(_normalize(json.loads(partial), len(lines)))
     return entries
 
 
-def _json_object(line: str) -> Entry | None:
-    if not line.strip():
-        return None
+def _is_json_object(line: str) -> bool:
+    try:
+        return isinstance(json.loads(line), dict)
+    except json.JSONDecodeError:
+        return False
+
+
+def _json_object(line: str, path: Path, line_number: int) -> Entry:
     try:
         obj = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError as exc:
+        raise TranscriptError(f"{path}:{line_number} is not JSON: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise TranscriptError(f"{path}:{line_number} is not a JSON object")
+    return obj
 
 
 def _normalize(obj: Entry, line_number: int) -> Entry:

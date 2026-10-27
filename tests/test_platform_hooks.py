@@ -140,6 +140,14 @@ class InactiveTests(HookTestCase):
         out, _ = call_hook("stop", "claude", "[1, 2]")
         self.assertIn("not a JSON object", out["systemMessage"])
 
+    def test_pre_tool_input_without_cwd_asks_the_user(self) -> None:
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"}
+
+        out, _ = call_hook("pre-tool", "claude", payload)
+
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("has no `cwd`", out["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_unreadable_pre_tool_input_asks_the_user(self) -> None:
         out, _ = call_hook("pre-tool", "claude", "{not json")
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
@@ -160,12 +168,12 @@ class InactiveTests(HookTestCase):
         out, _ = call_hook("pre-tool", "copilot", "{not json")
         self.assertEqual(out["permissionDecision"], "deny")
 
-    def test_invalid_arguments_allow_with_an_error_line(self) -> None:
+    def test_invalid_arguments_block_the_event(self) -> None:
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("sys.stdin", io.StringIO("{}")), redirect_stdout(out), redirect_stderr(err):
             code = hooks.main(["finish", "--platform", "copilot"])
-        self.assertEqual((code, out.getvalue()), (0, "{}\n"))
-        self.assertIn("craftsman hook error: UsageError: argument event: invalid choice", err.getvalue())
+        self.assertEqual((code, out.getvalue()), (2, ""))
+        self.assertIn("craftsman hook error: argument event: invalid choice", err.getvalue())
 
 
 class PromptTests(HookTestCase):

@@ -33,7 +33,9 @@ AGENT_EVENT_KINDS: tuple[AgentEventKind, ...] = get_args(AgentEventKind)
 ISOLATION_EVIDENCES: tuple[IsolationEvidence, ...] = get_args(IsolationEvidence)
 REVIEWER_AGENT = "craftsman-reviewer"
 VERIFIER_AGENT = "craftsman-verifier"
+ORCHESTRATOR_AGENT = "craftsman"
 AGENT_ROLES: dict[str, AgentRole] = {REVIEWER_AGENT: "reviewer", VERIFIER_AGENT: "verifier"}
+CRAFTSMAN_AGENTS = frozenset({ORCHESTRATOR_AGENT, *AGENT_ROLES})
 
 SCHEMA_VERSION = 1
 LEDGER_FILENAME = "ledger.json"

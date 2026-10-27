@@ -101,11 +101,26 @@ class ReadTranscriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "t.jsonl"
             line = {"type": "user", "message": {"content": [{"type": "text", "text": "hello"}]}}
-            path.write_text("not json\n" + json.dumps(line) + "\n", encoding="utf-8")
+            path.write_text("\n" + json.dumps(line) + "\n", encoding="utf-8")
             self.assertEqual(
                 read_transcript_entries(path),
                 [{"step_index": 2, "type": "USER_INPUT", "content": "hello"}],
             )
+
+    def test_corrupt_line_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            path.write_text('not json\n{"type": "USER_INPUT"}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(TranscriptError, "t.jsonl:1 is not JSON"):
+                read_transcript_entries(path)
+
+    def test_last_line_being_written_is_left_out(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.jsonl"
+            path.write_text('{"step_index": 1, "type": "USER_INPUT"}\n{"step_ind', encoding="utf-8")
+
+            self.assertEqual(read_transcript_entries(path), [{"step_index": 1, "type": "USER_INPUT"}])
 
     def test_missing_transcript_has_no_entries(self) -> None:
         self.assertEqual(read_transcript_entries(Path("/nonexistent/transcript.jsonl")), [])

@@ -9,8 +9,11 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
-from craftsman.guard import evaluate_command, was_ask_question_called_since_last_push
+from craftsman.guard import evaluate_command, main, was_ask_question_called_since_last_push
+
+from tests.support import run_main
 
 
 def push_question(*questions: dict[str, Any]) -> dict[str, Any]:
@@ -124,6 +127,35 @@ class AttributionTests(GuardTestCase):
             with self.subTest(author=author):
                 command = f'git commit -m "feat: x\n\nCo-authored-by: {author}"'
                 self.assertEqual(self.decision(command), "allow")
+
+    @unittest.skipUnless(Path("/proc/self/mem").is_file(), "needs a file whose read fails")
+    def test_message_file_that_cannot_be_read_asks_the_user(self) -> None:
+        command = "git commit -F /proc/self/mem"
+
+        self.assertEqual(self.decision(command), "force_ask")
+
+
+class HookInputTests(unittest.TestCase):
+    def guard(self, stdin: str, *args: str) -> tuple[int, str]:
+        with mock.patch("sys.stdin", io.StringIO(stdin)):
+            result = run_main(main, *args)
+        return result.code, result.out
+
+    def test_input_that_is_no_json_is_denied(self) -> None:
+        code, out = self.guard("{not json")
+
+        self.assertEqual((code, json.loads(out)["decision"]), (0, "deny"))
+
+    def test_input_that_is_no_object_is_denied(self) -> None:
+        code, out = self.guard("[1]")
+
+        self.assertEqual((code, json.loads(out)["decision"]), (0, "deny"))
+
+    def test_unknown_git_hook_is_a_usage_error(self) -> None:
+        self.assertEqual(self.guard("", "--git-hook", "bogus")[0], 2)
+
+    def test_commit_msg_hook_without_a_file_is_a_usage_error(self) -> None:
+        self.assertEqual(self.guard("", "--git-hook", "commit-msg")[0], 2)
 
 
 if __name__ == "__main__":

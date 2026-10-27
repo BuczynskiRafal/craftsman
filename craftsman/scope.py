@@ -18,9 +18,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands
+from craftsman.records import CRAFTSMAN_AGENTS
 
 ScopeMode = Literal["deny", "warn", "off"]
 SHELL_TOOL_NAMES = frozenset(
@@ -88,9 +89,13 @@ class ScopeDecision:
     reason: str = ""
 
 
+class ScopeConfigError(ValueError):
+    """`git config craftsman.scope` holds a value that is not a scope mode."""
+
+
 def is_craftsman_agent(agent: str) -> bool:
-    """Whether the agent's name marks it as one of Craftsman's own agents."""
-    return "craftsman" in agent.strip().lower()
+    """Whether the agent is one of Craftsman's own agents (its exact name, in any case)."""
+    return agent.strip().lower() in CRAFTSMAN_AGENTS
 
 
 def is_scope_checked_tool(tool_name: str) -> bool:
@@ -126,8 +131,7 @@ def _git_config_lines(cwd: Path, *args: str) -> list[str]:
 def load_scope_policy(cwd: Path, repo_root: Path | None = None) -> ScopePolicy:
     target = repo_root or cwd
     mode_lines = _git_config_lines(target, "--get", "craftsman.scope")
-    raw_mode = mode_lines[-1].lower() if mode_lines else "deny"
-    mode: ScopeMode = "off" if raw_mode == "off" else ("warn" if raw_mode == "warn" else "deny")
+    mode = _scope_mode(mode_lines[-1] if mode_lines else "deny")
     allowed: list[Path] = []
     for line in _git_config_lines(target, "--get-all", "craftsman.scopeAllow"):
         for part in SCOPE_ALLOW_SPLIT_RE.split(line):
@@ -140,6 +144,15 @@ def load_scope_policy(cwd: Path, repo_root: Path | None = None) -> ScopePolicy:
             if resolved not in allowed:
                 allowed.append(resolved)
     return ScopePolicy(mode=mode, allowed_dirs=tuple(allowed))
+
+
+def _scope_mode(raw: str) -> ScopeMode:
+    for mode in get_args(ScopeMode):
+        if raw.strip().lower() == mode:
+            return mode  # type: ignore[no-any-return]
+    raise ScopeConfigError(
+        f"git config craftsman.scope is {raw!r}; use one of {', '.join(get_args(ScopeMode))}"
+    )
 
 
 def _current_home() -> Path:

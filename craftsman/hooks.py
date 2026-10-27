@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from dataclasses import dataclass, replace
@@ -106,7 +105,7 @@ COPILOT_PUSH_NOTE = (
 
 
 class UsageError(Exception):
-    """The hook command line is invalid; reported without breaking the session."""
+    """The hook command line is invalid; the event is blocked, since nothing was checked."""
 
 
 class HookInputError(ValueError):
@@ -135,7 +134,7 @@ class HookInput:
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> HookInput:
         return cls(
-            cwd=_text(payload, "cwd") or os.getcwd(),
+            cwd=_required_text(payload, "cwd"),
             agent=_agent_name(payload),
             agent_id=_text(payload, "agent_id", "agentId"),
             stop_hook_active=any(
@@ -147,6 +146,13 @@ class HookInput:
             transcript_path=_text(payload, "transcript_path", "transcriptPath"),
             session_id=_text(payload, "session_id", "sessionId").strip() or None,
         )
+
+
+def _required_text(payload: dict[str, Any], key: str) -> str:
+    value = _text(payload, key)
+    if not value:
+        raise HookInputError(f"the hook input has no `{key}`")
+    return value
 
 
 def _text(payload: dict[str, Any], *keys: str) -> str:
@@ -640,9 +646,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     except UsageError as exc:
-        sys.stderr.write(f"craftsman hook error: UsageError: {exc}\n")
-        _emit({})
-        return 0
+        # Exit code 2 makes the platform block the event: an unchecked tool call must not pass.
+        sys.stderr.write(f"craftsman hook error: {exc}\n")
+        return 2
     reply = Reply(args.platform, args.event)
     try:
         payload = json.loads(_read_stdin().strip() or "{}")

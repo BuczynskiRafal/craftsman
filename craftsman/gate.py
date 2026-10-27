@@ -18,7 +18,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields, replace
@@ -36,6 +35,7 @@ from craftsman.diffscan import (
     worktree_root,
 )
 from craftsman.evidence import Evaluation, archive_ledger_if_rebased, evaluate_evidence
+from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
     QUICK_TIER_MAX_CHANGED_LINES,
     GateReport,
@@ -272,23 +272,10 @@ def load_state(path: Path) -> GateState | None:
 
 
 def save_state(path: Path, state: GateState) -> None:
-    """Write `state` atomically: a temporary file in the same directory replaces `path`."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, staged_name = tempfile.mkstemp(prefix=".craftsman_state_", suffix=".tmp", dir=path.parent)
+        write_text_atomic(path, json.dumps(state.to_json(), indent=2, ensure_ascii=False) + "\n")
     except OSError as exc:
         raise GateStateError(f"cannot write {path}: {exc}") from exc
-    staged = Path(staged_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(state.to_json(), handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-        os.replace(staged, path)
-    except BaseException as exc:
-        staged.unlink(missing_ok=True)
-        if isinstance(exc, OSError):
-            raise GateStateError(f"cannot write {path}: {exc}") from exc
-        raise
 
 
 @contextmanager

@@ -81,6 +81,15 @@ class NoGateTests(AntigravityTestCase):
         self.repo.write_lines("app.py", 5)
         self.assertEqual(self.stop(terminationReason="TOOL_CALL")[0], {"decision": "allow"})
 
+    def test_payload_without_termination_reason_is_reported(self) -> None:
+        payload = {"fullyIdle": True, "artifactDirectoryPath": str(self.session_dir)}
+        err = io.StringIO()
+        with redirect_stderr(err):
+            answer = antigravity.answer(payload)
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertIn("needs `terminationReason` and `fullyIdle`", err.getvalue())
+
     def test_payload_without_workspace_allows_with_an_error(self) -> None:
         answer, err = self.stop(workspacePaths=[])
         self.assertEqual(answer, {"decision": "allow"})

@@ -163,9 +163,9 @@ COPILOT_DISCOVERY: dict[
     ),
 }
 
-AgentRole = Literal["orchestrator", "reviewer", "verifier"]
-AGENT_ROLES: tuple[AgentRole, ...] = get_args(AgentRole)
-COPILOT_AGENT_TOOLS: dict[AgentRole, tuple[str, ...]] = {
+TemplateRole = Literal["orchestrator", "reviewer", "verifier"]
+TEMPLATE_ROLES: tuple[TemplateRole, ...] = get_args(TemplateRole)
+COPILOT_AGENT_TOOLS: dict[TemplateRole, tuple[str, ...]] = {
     "orchestrator": ("read", "edit", "search", "execute", "agent", "todo", "web"),
     "reviewer": ("read", "search", "execute"),
     "verifier": ("read", "search", "execute"),
@@ -425,7 +425,7 @@ def _strip_frontmatter(text: str) -> str:
 class AgentTemplate:
     name: str
     description: str
-    role: AgentRole
+    role: TemplateRole
     subagents: tuple[str, ...]
     body: str  # with includes expanded
 
@@ -465,8 +465,8 @@ def _load_agent_template(path: Path, repo_dir: Path) -> AgentTemplate:
     fields, body = parse_frontmatter(path.read_text(encoding="utf-8"), path)
     _required_fields(fields, path, "name", "description")
     role = fields.get("role", "")
-    if role not in AGENT_ROLES:
-        raise ExportError(f"{path}: role must be one of {', '.join(AGENT_ROLES)} (got {role!r})")
+    if role not in TEMPLATE_ROLES:
+        raise ExportError(f"{path}: role must be one of {', '.join(TEMPLATE_ROLES)} (got {role!r})")
     return AgentTemplate(
         name=fields["name"],
         description=fields["description"],

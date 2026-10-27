@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
@@ -10,7 +9,7 @@ import shlex
 import shutil
 import sys
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -31,7 +30,6 @@ from craftsman.export import (
     default_vscode_prompts_dir,
     has_user_copilot_install,
     has_workspace_copilot_install,
-    is_craftsman_generated_file,
     is_craftsman_hook_command,
     iter_discovered_files,
     parse_frontmatter,
@@ -95,8 +93,6 @@ class CopilotDuplicate:
     name: str
     paths: tuple[str, ...]
     canonical_path: str
-    removable_paths: tuple[str, ...]
-    preserved_paths: tuple[str, ...]
     claude_collision: bool
     claude_scope: str | None
     scope_collision: bool
@@ -156,7 +152,6 @@ class DoctorReport:
     copilot: CopilotReport
     claude: ClaudeReport
     problems: tuple[str, ...]
-    fixed_duplicates: tuple[str, ...] = field(default=())
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -360,7 +355,7 @@ def _skills_report(skills_dir: Path) -> SkillsReport:
     return SkillsReport(str(skills_dir), (skills_dir / "craftsman" / "SKILL.md").is_file(), lenses)
 
 
-_CLAUDE_HOOKS_HINT = "run ./install.sh --claude"
+_CLAUDE_HOOKS_HINT = "run craftsman install --claude"
 
 
 def _claude_report(claude_dir: Path) -> ClaudeReport:
@@ -511,16 +506,7 @@ def _build_copilot_duplicate(
     entity_name: str,
     entries: list[tuple[CopilotDiscoveryLocation, Path]],
 ) -> CopilotDuplicate:
-    def removable(loc: CopilotDiscoveryLocation, path: Path) -> bool:
-        return (
-            not loc.canonical and loc.scope not in _CLAUDE_SCOPES and is_craftsman_generated_file(path)
-        )
-
-    canonical_path = next(
-        (path for loc, path in entries if loc.canonical),
-        next((path for loc, path in entries if not removable(loc, path)), entries[0][1]),
-    )
-    others = [(loc, path) for loc, path in entries if path != canonical_path]
+    canonical_path = next((path for loc, path in entries if loc.canonical), entries[0][1])
     claude_scopes = [loc.scope for loc, _ in entries if loc.scope in _CLAUDE_SCOPES]
     return CopilotDuplicate(
         client=client,
@@ -528,8 +514,6 @@ def _build_copilot_duplicate(
         name=entity_name,
         paths=tuple(str(path) for _, path in entries),
         canonical_path=str(canonical_path),
-        removable_paths=tuple(str(path) for loc, path in others if removable(loc, path)),
-        preserved_paths=tuple(str(path) for loc, path in others if not removable(loc, path)),
         claude_collision=bool(claude_scopes),
         claude_scope=claude_scopes[-1] if claude_scopes else None,
         scope_collision=len({loc.scope for loc, _ in entries if loc.canonical}) > 1,
@@ -593,47 +577,13 @@ def _format_duplicate_problem(dup: CopilotDuplicate) -> str:
             f'(VS Code also reads Claude Code directories; set "{setting}": {{"{loc_key}": false}} '
             "in VS Code settings.json to disable)"
         )
-    if dup.scope_collision and not dup.removable_paths:
+    if dup.scope_collision:
         return (
             f"{prefix} "
             "(both user and workspace scopes are installed; uninstall one scope with "
             "`craftsman uninstall --copilot` or `craftsman uninstall --copilot-workspace <dir>`)"
         )
-    if dup.preserved_paths:
-        preserved = ", ".join(dup.preserved_paths)
-        return (
-            f"{prefix} (unmarked user file preserved: {preserved}; rename or remove one copy manually)"
-        )
-    return f"{prefix} (run `craftsman doctor --fix-duplicates` to remove obsolete Craftsman copies)"
-
-
-def _unlink_duplicate_file(path: Path) -> None:
-    if path.name != "SKILL.md":
-        path.unlink()
-        return
-    skill_dir = path.parent
-    path.unlink()
-    for companion in ("lenses.md", "scope.md"):
-        (skill_dir / companion).unlink(missing_ok=True)
-    try:
-        skill_dir.rmdir()
-    except OSError as exc:
-        # A folder with files the user added stays (POSIX allows either errno for that).
-        if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST):
-            raise
-
-
-def fix_copilot_duplicates(
-    repo_dir: Path, *, home: Path | None = None, workspace: Path | None = None
-) -> list[Path]:
-    """Remove non-canonical Craftsman-generated Copilot duplicates; unmarked and Claude files stay."""
-    removed: dict[Path, None] = {}
-    for dup in scan_copilot_duplicates(repo_dir, home=home, workspace=workspace):
-        for path in map(Path, dup.removable_paths):
-            if path not in removed and path.is_file() and is_craftsman_generated_file(path):
-                _unlink_duplicate_file(path)
-                removed[path] = None
-    return list(removed)
+    return f"{prefix} (keep {dup.canonical_path}; rename or remove the other copies)"
 
 
 # --- git hooks ------------------------------------------------------------------------------
@@ -767,9 +717,7 @@ def _git_config(home: Path) -> tuple[GitConfig, list[str]]:
         return GitConfig(None, None, None), [str(exc)]
 
 
-def build_report(
-    repo_dir: Path, workspace: Path | None, home: Path, fixed: tuple[str, ...] = ()
-) -> DoctorReport:
+def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorReport:
     plugin_skills = plugin_skill_names(repo_dir)
     skill_count, skill_errors = validate_skill_manifests(repo_dir)
     skill_errors += _plugin_mismatch(repo_dir, plugin_skills)
@@ -811,7 +759,6 @@ def build_report(
         copilot=copilot,
         claude=claude,
         problems=tuple(problems),
-        fixed_duplicates=fixed,
     )
 
 
@@ -860,16 +807,9 @@ def _yes_no(value: bool) -> str:
     return "installed" if value else "missing"
 
 
-def run_doctor(repo_dir: Path, *, as_json: bool, workspace: Path | None, fix_duplicates: bool) -> int:
+def run_doctor(repo_dir: Path, *, as_json: bool, workspace: Path | None) -> int:
     """Inspect repository integrity, Git configuration, drift, and installed agent platforms."""
-    home = user_home()
-    fixed: list[Path] = []
-    if fix_duplicates:
-        fixed = fix_copilot_duplicates(repo_dir, home=home, workspace=workspace)
-        if not as_json:
-            for removed_path in fixed:
-                print(f"  [FIXED] Removed duplicate Craftsman file: {removed_path}")
-    report = build_report(repo_dir, workspace, home, tuple(str(p) for p in fixed))
+    report = build_report(repo_dir, workspace, user_home())
     if as_json:
         sys.stdout.write(json.dumps(report.to_json(), indent=2, ensure_ascii=False) + "\n")
     else:

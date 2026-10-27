@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Collection
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,8 @@ from pathlib import Path
 # Replaced user files are moved into this folder next to them: inside it a skill folder is two
 # levels deep, so no agent discovers the backup as a second copy of the skill.
 BACKUP_DIR_NAME = ".craftsman-backup"
+REPLACE_RETRIES = 5
+REPLACE_RETRY_S = 0.05
 
 
 class UnsafePathError(RuntimeError):
@@ -21,7 +24,8 @@ class UnsafePathError(RuntimeError):
 def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> None:
     """Replace `path` atomically; a symlinked file (dotfiles) is updated where it really lives.
 
-    `mode` defaults to the permissions of the replaced file, or 0o644 for a new one.
+    `mode` defaults to the permissions of the replaced file, or 0o644 for a new one. The data is
+    flushed to disk first: without that, a crash right after the rename can leave an empty file.
     """
     path = path.resolve() if path.is_symlink() else path
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,11 +35,25 @@ def write_bytes_atomic(path: Path, data: bytes, *, mode: int | None = None) -> N
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.chmod(staged, mode)
-        os.replace(staged, path)
+        replace_with_retry(Path(staged), path)
     except BaseException:
         Path(staged).unlink(missing_ok=True)
         raise
+
+
+def replace_with_retry(source: Path, target: Path) -> None:
+    """`os.replace`, retried briefly: Windows refuses while another process has the file open."""
+    for attempt in range(REPLACE_RETRIES + 1):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == REPLACE_RETRIES:
+                raise
+            time.sleep(REPLACE_RETRY_S)
 
 
 def write_text_atomic(path: Path, text: str) -> None:

@@ -348,18 +348,12 @@ def doctor_main(argv: Sequence[str]) -> int:
     parser.add_argument(
         "--workspace", type=Path, help="Also check the Copilot agents and skills of this project."
     )
-    parser.add_argument(
-        "--fix-duplicates",
-        action="store_true",
-        help="Remove obsolete Craftsman-generated duplicate Copilot agents and commands, keeping the canonical copy.",
-    )
     args = parser.parse_args(list(argv))
     try:
         return run_doctor(
             (args.repo_dir or default_repo_dir()).resolve(),
             as_json=args.json,
             workspace=args.workspace.resolve() if args.workspace else None,
-            fix_duplicates=args.fix_duplicates,
         )
     except (ExportError, InstallError) as exc:
         sys.stderr.write(f"craftsman doctor: error: {exc}\n")

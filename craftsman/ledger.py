@@ -15,7 +15,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -25,6 +24,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
+from craftsman.files import write_text_atomic
 from craftsman.lenses import LENS_IDS, Tier
 from craftsman.records import (
     DESIGN_LENS,
@@ -62,7 +62,6 @@ from craftsman.records import (
 from craftsman.triviality import is_trivial_run
 
 LOCK_POLL_S = 0.05
-REPLACE_RETRIES = 5
 # Of a hunk's coverage-note segment, at least this many characters must be more than praise.
 MIN_SUBSTANTIVE_NOTE_CHARS = 20
 # One note segment may describe at most this many hunks of a lens before it reads as boilerplate.
@@ -181,36 +180,10 @@ def load(path: Path) -> Ledger:
 
 
 def save(path: Path, ledger: Ledger) -> None:
-    """Write the ledger atomically: a temporary file in the same directory replaces `path`."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, staged_name = tempfile.mkstemp(prefix=".ledger_", suffix=".tmp", dir=path.parent)
+        write_text_atomic(path, json.dumps(ledger.to_json(), indent=2, ensure_ascii=False) + "\n")
     except OSError as exc:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
-    staged = Path(staged_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(ledger.to_json(), handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            # Without this, a crash right after the rename can leave an empty ledger behind.
-            os.fsync(handle.fileno())
-        replace_with_retry(staged, path)
-    except OSError as exc:
-        staged.unlink(missing_ok=True)
-        raise LedgerError(f"cannot write {path}: {exc}") from exc
-
-
-def replace_with_retry(source: Path, target: Path) -> None:
-    """`os.replace`, retried briefly: Windows refuses while another process has the file open."""
-    for attempt in range(REPLACE_RETRIES + 1):
-        try:
-            os.replace(source, target)
-            return
-        except PermissionError:
-            if attempt == REPLACE_RETRIES:
-                raise
-            time.sleep(LOCK_POLL_S)
 
 
 def mutate(path: Path, fn: Callable[[Ledger], tuple[Ledger, T]]) -> T:

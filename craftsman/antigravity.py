@@ -85,10 +85,10 @@ def session_id(payload: Mapping[str, Any]) -> str | None:
 
 def is_final_stop(payload: Mapping[str, Any]) -> bool:
     """True when the agent ends its turn, rather than pausing between tool calls."""
-    return (
-        payload.get("terminationReason", "NO_TOOL_CALL") == "NO_TOOL_CALL"
-        and payload.get("fullyIdle") is not False
-    )
+    reason, idle = payload.get("terminationReason"), payload.get("fullyIdle")
+    if not isinstance(reason, str) or not isinstance(idle, bool):
+        raise PayloadError("the Stop payload needs `terminationReason` and `fullyIdle`")
+    return reason == "NO_TOOL_CALL" and idle
 
 
 def on_stop(stop: StopPayload) -> str | None:
@@ -210,9 +210,9 @@ def answer(payload: object) -> dict[str, str]:
     """The hook's answer to one Stop payload."""
     if not isinstance(payload, dict):
         return _allow_after_error("the Stop payload is not a JSON object")
-    if not is_final_stop(payload):
-        return {"decision": "allow"}
     try:
+        if not is_final_stop(payload):
+            return {"decision": "allow"}
         reason = on_stop(StopPayload.parse(payload))
     except (PayloadError, DiffScanError, LedgerError, GateStateError, TranscriptError, OSError) as exc:
         return _allow_after_error(str(exc))

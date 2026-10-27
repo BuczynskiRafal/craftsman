@@ -16,7 +16,13 @@ from unittest import mock
 from craftsman import hooks
 from craftsman.gate import GateOwner
 from craftsman.guard import evaluate_command
-from craftsman.scope import ScopePolicy, evaluate_scope, load_scope_policy
+from craftsman.scope import (
+    ScopeConfigError,
+    ScopePolicy,
+    evaluate_scope,
+    is_craftsman_agent,
+    load_scope_policy,
+)
 
 from tests.support import open_gate
 
@@ -541,9 +547,15 @@ class ScopeEnforcementTests(unittest.TestCase):
         out, _ = call_pre_tool("copilot", payload)
         self.assertEqual(out, {})
 
-    def test_load_scope_policy_treats_enforce_as_deny(self) -> None:
+    def test_only_craftsman_agent_names_are_craftsman_agents(self) -> None:
+        self.assertTrue(is_craftsman_agent("Craftsman-Reviewer"))
+        self.assertFalse(is_craftsman_agent("my-craftsman-helper"))
+
+    def test_unknown_scope_mode_is_an_error(self) -> None:
         subprocess.run(["git", "config", "craftsman.scope", "enforce"], cwd=self.repo, check=True)
-        self.assertEqual(load_scope_policy(self.repo, self.repo).mode, "deny")
+
+        with self.assertRaisesRegex(ScopeConfigError, "use one of deny, warn, off"):
+            load_scope_policy(self.repo, self.repo)
 
     def test_grep_regex_arguments_are_ignored_by_scope_check(self) -> None:
         for case, tool, inp in (

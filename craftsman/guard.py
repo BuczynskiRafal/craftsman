@@ -226,11 +226,6 @@ def _split_shell_events(command_line: str) -> list[str]:
     return events
 
 
-def split_shell_segments(command_line: str) -> list[str]:
-    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
-    return [ev for ev in _split_shell_events(command_line) if ev not in ("(", ")")]
-
-
 def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
     """Strip leading env assignments, shell control keywords, and command wrappers (`env`, `nice`, `sudo`, `timeout`, `xargs`, etc.)."""
     idx = 0
@@ -401,10 +396,6 @@ def _tokenize_raw_segment(segment: str) -> list[str]:
         return shlex.split(cmd_header, posix=True)
     except ValueError:
         return cmd_header.split()
-
-
-def tokenize_segment(segment: str) -> list[str]:
-    return _strip_wrappers_from_tokens(_tokenize_raw_segment(segment))
 
 
 def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> str | None:
@@ -646,11 +637,6 @@ def iter_simple_commands(
     return commands
 
 
-def expand_shell_segments(command_line: str, max_depth: int = 4) -> list[str]:
-    """Split a shell command line and recursively expand `sh/bash/zsh -c`, heredoc shells, and `eval` wrappers."""
-    return [cmd.segment for cmd in iter_simple_commands(command_line, max_depth=max_depth)]
-
-
 def _record_git_config_alias(config_expr: str, aliases: dict[str, list[str]]) -> None:
     if "=" not in config_expr:
         return
@@ -816,7 +802,8 @@ def extract_inline_messages(tokens: list[str]) -> list[str]:
 
 
 def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
-    """Extract contents of any `-F`, `--file`, or `--body-file` arguments if readable."""
+    """The contents of the files `-F`, `--file` or `--body-file` name; a file that exists but
+    cannot be read is an error, so the caller cannot pass a message it did not check."""
     contents: list[str] = []
     file_flags = {"-F", "--file", "--body-file"}
     base_dir = Path(cwd) if cwd and os.path.isdir(cwd) else Path.cwd()
@@ -843,10 +830,7 @@ def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
             if not fpath.is_absolute():
                 fpath = base_dir / fpath
             if fpath.is_file():
-                try:
-                    contents.append(fpath.read_text(encoding="utf-8", errors="replace"))
-                except OSError:
-                    pass
+                contents.append(fpath.read_text(encoding="utf-8", errors="replace"))
     return contents
 
 
@@ -1101,7 +1085,7 @@ def _extract_individual_questions(tc: dict[str, Any]) -> list[str]:
         try:
             raw_questions = json.loads(raw_questions)
         except json.JSONDecodeError:
-            pass
+            raw_questions = None  # questions that cannot be read approve nothing
 
     questions: list[str] = []
     raw_single: Any = args.get("question")
@@ -1132,11 +1116,6 @@ def _extract_individual_questions(tc: dict[str, Any]) -> list[str]:
         questions.append(raw_questions.strip())
 
     return questions
-
-
-def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
-    """Decode `questions` / `question` fields (including JSON-string-encoded arrays) into plain text."""
-    return "\n".join(_extract_individual_questions(tc))
 
 
 def _is_push_target_question_text(question_text: str) -> bool:
@@ -1344,7 +1323,7 @@ def _evaluate_antigravity_scope(
 
     try:
         from craftsman.diffscan import DiffScanError, worktree_root
-        from craftsman.scope import evaluate_scope, load_scope_policy
+        from craftsman.scope import ScopeConfigError, evaluate_scope, load_scope_policy
 
         effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
         repo_root = worktree_root(effective_cwd)
@@ -1352,10 +1331,13 @@ def _evaluate_antigravity_scope(
             return "allow", None
     except GateStateError as exc:
         return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
-    except (ImportError, OSError, DiffScanError):
+    except DiffScanError:  # outside a git work tree there is no gate and no scope
         return "allow", None
 
-    policy = load_scope_policy(effective_cwd, repo_root)
+    try:
+        policy = load_scope_policy(effective_cwd, repo_root)
+    except ScopeConfigError as exc:
+        return "force_ask", f"[CRAFTSMAN SCOPE-GUARD] {exc}"
     if policy.mode == "off":
         return "allow", None
     scope_decision = evaluate_scope(
@@ -1382,20 +1364,10 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     return "allow", None
 
 
-def evaluate_shell_command(
-    command_line: str, cwd_str: str | None, transcript_path: Path | None = None
-) -> tuple[str, str | None]:
-    """Apply the git rules to one shell command line: ("allow" | "deny" | "force_ask", reason).
-
-    `transcript_path` is a readable session transcript in which a push confirmation may be found;
-    without one, a push to a protected branch can only be confirmed by the user directly.
-    """
-    if not command_line.strip():
-        return "allow", None
-
-    commands = iter_simple_commands(command_line, cwd_str)
-
-    # 1. Check Rule #2: Zero AI attribution in commits / tags / PRs
+def _ai_attribution_verdict(
+    commands: list[SimpleCommand], command_line: str
+) -> tuple[str, str | None] | None:
+    """Rule #2, zero AI attribution in commits, tags and pull requests: the deny, or None."""
     for cmd in commands:
         segment = cmd.segment
         tokens = cmd.tokens
@@ -1420,6 +1392,28 @@ def evaluate_shell_command(
                 "Commits, tags, and Pull Requests must not contain 'Co-authored-by:' or "
                 "any AI attribution trailers.",
             )
+    return None
+
+
+def evaluate_shell_command(
+    command_line: str, cwd_str: str | None, transcript_path: Path | None = None
+) -> tuple[str, str | None]:
+    """Apply the git rules to one shell command line: ("allow" | "deny" | "force_ask", reason).
+
+    `transcript_path` is a readable session transcript in which a push confirmation may be found;
+    without one, a push to a protected branch can only be confirmed by the user directly.
+    """
+    if not command_line.strip():
+        return "allow", None
+
+    commands = iter_simple_commands(command_line, cwd_str)
+
+    try:
+        attribution = _ai_attribution_verdict(commands, command_line)
+    except OSError as exc:
+        return "force_ask", f"[CRAFTSMAN GIT-GUARD] Cannot read the message file to check it: {exc}"
+    if attribution is not None:
+        return attribution
 
     # 2. Check Rule #1: No unconfirmed push to main / master (or gh pr merge)
     for cmd in commands:
@@ -1695,20 +1689,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if len(args_list) >= 2 and args_list[0] == "--git-hook":
-        hook_type = args_list[1]
-        if hook_type == "commit-msg" and len(args_list) >= 3:
+    if args_list and args_list[0] == "--git-hook":
+        if args_list[1:2] == ["commit-msg"] and len(args_list) == 3:
             return run_native_commit_msg_hook(args_list[2])
-        if hook_type == "pre-push":
+        if args_list[1:2] == ["pre-push"]:
             return run_native_pre_push_hook()
-        return 0
+        sys.stderr.write("craftsman guard: --git-hook takes `commit-msg <file>` or `pre-push`\n")
+        return 2
+    if args_list:
+        sys.stderr.write(f"craftsman guard: unknown arguments {' '.join(args_list)}\n")
+        return 2
 
     try:
-        raw = sys.stdin.read()
-        loaded = json.loads(raw) if raw.strip() else {}
-        payload = loaded if isinstance(loaded, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        emit("allow")
+        payload = json.loads(sys.stdin.read())
+    except (OSError, ValueError) as exc:
+        emit("deny", f"[CRAFTSMAN GIT-GUARD] Unreadable hook input, so the call was not checked: {exc}")
+        return 0
+    if not isinstance(payload, dict):
+        emit(
+            "deny",
+            "[CRAFTSMAN GIT-GUARD] The hook input is not a JSON object, so the call was not checked.",
+        )
         return 0
 
     decision, reason = evaluate_command(payload)

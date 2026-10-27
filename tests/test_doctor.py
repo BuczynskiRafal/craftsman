@@ -17,7 +17,6 @@ from craftsman.doctor import (
     build_report,
     command_executables,
     detect_antigravity_drift,
-    fix_copilot_duplicates,
     inspect_git_hooks,
     loads_jsonc_dict,
     plugin_skill_names,
@@ -28,7 +27,7 @@ from craftsman.export import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.githooks import PASSTHROUGH_TEMPLATE_NAME
 from craftsman.manifest import MANIFEST_FILENAME
 
-from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main, snapshot_tree
+from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main
 
 VERIFY_SKILL = "---\nname: verify\n---\nClaude skill\n"
 
@@ -267,29 +266,19 @@ class CopilotDuplicateTests(DoctorTestCase):
         path.write_text(VERIFY_SKILL, encoding="utf-8")
         return path
 
-    def generated_prompt(self) -> Path:
+    def user_prompt(self) -> Path:
         prompts = export.default_vscode_prompts_dir(self.tmp)
         prompts.mkdir(parents=True, exist_ok=True)
         path = prompts / "verify.prompt.md"
-        path.write_text(
-            "---\nname: verify\n---\n<!-- craftsman:generated -->\nPrompt\n", encoding="utf-8"
-        )
+        path.write_text("---\nname: verify\n---\nPrompt\n", encoding="utf-8")
         return path
 
-    def test_claude_skill_is_canonical_over_a_generated_prompt(self) -> None:
-        claude_skill, prompt = self.claude_skill(), self.generated_prompt()
+    def test_skill_and_prompt_of_one_name_are_a_duplicate(self) -> None:
+        claude_skill, prompt = self.claude_skill(), self.user_prompt()
 
         (dup,) = scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
 
-        self.assertEqual((dup.canonical_path, dup.removable_paths), (str(claude_skill), (str(prompt),)))
-
-    def test_fix_removes_the_generated_copy_only(self) -> None:
-        claude_skill, prompt = self.claude_skill(), self.generated_prompt()
-
-        removed = fix_copilot_duplicates(REPO_ROOT, home=self.tmp)
-
-        self.assertEqual(removed, [prompt])
-        self.assertTrue(claude_skill.is_file())
+        self.assertEqual(set(dup.paths), {str(claude_skill), str(prompt)})
 
     def test_location_disabled_in_jsonc_settings_is_no_duplicate(self) -> None:
         self.claude_skill()
@@ -349,29 +338,16 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
         names = {(d["client"], d["kind"], d["name"]) for d in report["copilot"]["duplicates"]}
         self.assertIn(("vscode", "agent", "craftsman"), names)
 
-    def test_fix_removes_marked_copies(self) -> None:
-        self.assert_ok(self.install("--copilot"))
-        prompts = export.default_vscode_prompts_dir(self.home)
-        agent = self.marked(prompts / "craftsman.agent.md", "name: craftsman")
-        prompt = self.marked(prompts / "code-review.prompt.md", "agent: 'agent'")
-
-        result = self.doctor("--fix-duplicates")
-
-        self.assertEqual(result.code, 0, result.err)
-        self.assertFalse(agent.exists())
-        self.assertFalse(prompt.exists())
-        self.assertIn(str(agent), result.out)
-
-    def test_fix_keeps_an_unmarked_user_prompt(self) -> None:
+    def test_duplicate_names_the_installed_copy_to_keep(self) -> None:
         self.assert_ok(self.install("--copilot"))
         prompt = export.default_vscode_prompts_dir(self.home) / "simplify.prompt.md"
         prompt.write_text("---\nagent: 'agent'\n---\nMy prompt.\n", encoding="utf-8")
 
-        result = self.doctor("--fix-duplicates")
+        result = self.doctor()
 
         self.assertEqual(result.code, 1)
-        self.assertEqual(prompt.read_text(encoding="utf-8"), "---\nagent: 'agent'\n---\nMy prompt.\n")
-        self.assertIn("unmarked user file preserved", result.err)
+        kept = self.home / ".copilot" / "skills" / "simplify" / "SKILL.md"
+        self.assertIn(f"keep {kept}; rename or remove the other copies", result.err)
 
     def test_claude_agents_next_to_copilot_agents_are_reported(self) -> None:
         self.assert_ok(self.install("--copilot"))
@@ -381,14 +357,6 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
 
         self.assertEqual(code, 1)
         self.assertTrue(any("chat.agentFilesLocations" in problem for problem in report["problems"]))
-
-    def test_fix_never_deletes_claude_code_files(self) -> None:
-        self.assert_ok(self.install("--copilot"))
-        self.assert_ok(self.install("--claude"))
-
-        self.doctor("--fix-duplicates")
-
-        self.assertTrue((self.home / ".claude" / "agents" / "craftsman-reviewer.md").is_file())
 
     def test_claude_agents_disabled_in_vscode_are_no_duplicates(self) -> None:
         self.assert_ok(self.install("--copilot"))
@@ -402,18 +370,16 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
 
         self.assertEqual(code, 0, report["problems"])
 
-    def test_fix_keeps_both_canonical_scopes(self) -> None:
+    def test_both_scopes_installed_point_to_uninstalling_one(self) -> None:
         workspace = self.tmp / "ws"
         workspace.mkdir()
         self.assert_ok(self.install("--copilot"))
         self.assert_ok(self.install("--copilot-workspace", str(workspace), "--allow-duplicate-scopes"))
-        before = snapshot_tree(workspace)
 
-        result = self.doctor("--workspace", str(workspace), "--fix-duplicates")
+        result = self.doctor("--workspace", str(workspace))
 
         self.assertEqual(result.code, 1)
         self.assertIn("both user and workspace scopes are installed", result.err)
-        self.assertEqual(snapshot_tree(workspace), before)
 
 
 class GitHooksInspectionTests(IsolatedHomeTestCase):
