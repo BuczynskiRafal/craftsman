@@ -31,6 +31,7 @@ from tests.support import (
     subagent_ack,
     subagent_done,
     user_input,
+    write_jsonl,
 )
 
 SESSION = "conv-1"
@@ -48,9 +49,7 @@ class AntigravityTestCase(unittest.TestCase):
         self.caller = GateOwner("antigravity", SESSION)
 
     def write_transcript(self, *entries: dict[str, Any], session_dir: Path | None = None) -> None:
-        path = (session_dir or self.session_dir) / antigravity.TRANSCRIPT
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+        write_jsonl((session_dir or self.session_dir) / antigravity.TRANSCRIPT, *entries)
 
     def stop(self, **extra: Any) -> tuple[dict[str, str], str]:
         payload = {

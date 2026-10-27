@@ -36,6 +36,7 @@ class ArchiveTests(unittest.TestCase):
         packet_path(self.path, 1).write_text("packet", encoding="utf-8")
 
     def test_archives_made_in_the_same_millisecond_are_all_kept(self) -> None:
+        # No public path sets the clock, and two real archives rarely share a millisecond.
         with mock.patch.object(evidence, "_archive_stamp", return_value=STAMP):
             for _ in range(2):
                 self.record_review()

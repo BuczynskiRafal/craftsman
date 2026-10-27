@@ -1,1050 +1,937 @@
-#!/usr/bin/env python3
-"""End-to-end tests of the git guard script, the exporters, the installer and `craftsman doctor`."""
+"""Tests for `craftsman hook`: the VS Code Copilot, Copilot CLI and Claude Code lifecycle hooks."""
 
 from __future__ import annotations
 
+import io
 import json
-import os
-import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
-from tests.support import SKILL_COUNT, EvidenceRepo
+from craftsman import antigravity, hooks
+from craftsman.gate import MAX_CONTINUATIONS
+from craftsman.gatecheck import MAX_ROUNDS
+from craftsman.hooks import COPILOT_PUSH_NOTE, REVIEWER_STOP_REASON, HookInput, HookInputError
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-GIT_GUARD = REPO_ROOT / "scripts" / "git-guard.py"
+from tests.support import EvidenceRepo, coverage_note
+
+CHANGE = "def total(items):\n    return sum(items)\n"
+STARTED = (
+    "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill "
+    '(Stage 0 command: `craftsman gate --init --session-id {sid} --tier {tier} --task "{task}"`); '
+    "the gate will block finishing until `craftsman review check` passes.\n"
+    "Scope: work only inside {root}; see Search scope."
+)
+
+REVIEW_ONLY_VERIFIER = {"agent_id": "v-ro", "agent_type": "craftsman-verifier"}
 
 
-def run_hook(script: Path, payload: dict[str, Any]) -> dict[str, Any]:
-    proc = subprocess.run(
-        [sys.executable, str(script)],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=5,
-        check=True,
-    )
-    parsed = json.loads(proc.stdout.strip())
+def header(continuation: int) -> str:
+    return f"[CRAFTSMAN GATE {continuation}/{MAX_CONTINUATIONS}] "
+
+
+def call_hook(event: str, platform: str, payload: dict[str, Any] | str) -> tuple[dict[str, Any], str]:
+    """Run `craftsman hook` in-process with `payload` on stdin; return (stdout JSON, stderr)."""
+    stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch("sys.stdin", stdin), redirect_stdout(out), redirect_stderr(err):
+        code = hooks.main([event, "--platform", platform])
+    assert code == 0, err.getvalue()
+    parsed = json.loads(out.getvalue())
     assert isinstance(parsed, dict)
-    return parsed
+    return parsed, err.getvalue()
 
 
-class GitGuardHookTests(unittest.TestCase):
-    def test_allows_non_git_commands_mentioning_protected_strings(self) -> None:
-        for cmd in (
-            'grep "Co-authored-by: Claude" README.md',
-            'echo "git push origin main"',
-            "python3 -m unittest discover -s tests",
+def vscode(event_name: str, cwd: Path, **extra: Any) -> dict[str, Any]:
+    return {
+        "timestamp": "2026-10-21T10:00:00.000Z",
+        "hook_event_name": event_name,
+        "cwd": str(cwd),
+        "session_id": "vscode-session",
+        "transcript_path": str(cwd / "no-such-transcript.json"),
+        **extra,
+    }
+
+
+def copilot_cli(cwd: Path, **extra: Any) -> dict[str, Any]:
+    return {"sessionId": "cli-session", "timestamp": 1792576800000, "cwd": str(cwd), **extra}
+
+
+def claude(event_name: str, cwd: Path, **extra: Any) -> dict[str, Any]:
+    return {
+        "session_id": "claude-session",
+        "transcript_path": str(cwd / "no-such-transcript.jsonl"),
+        "cwd": str(cwd),
+        "hook_event_name": event_name,
+        **extra,
+    }
+
+
+class HookTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+        self.repo = EvidenceRepo(self.tmp / "repo")
+        self.root = self.repo.root
+
+    @property
+    def state_file(self) -> Path:
+        return self.repo.ledger_dir / "craftsman_state.json"
+
+    def state(self) -> dict[str, Any]:
+        loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
+        assert isinstance(loaded, dict)
+        return loaded
+
+    def update_state(self, **changes: Any) -> None:
+        self.state_file.write_text(json.dumps({**self.state(), **changes}), encoding="utf-8")
+
+    def init(self, tier: str) -> None:
+        self.repo.cli("gate", "--init", "--tier", tier, "--cwd", ".")
+
+    def ledger(self) -> dict[str, Any]:
+        loaded = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))
+        assert isinstance(loaded, dict)
+        return loaded
+
+    def add_finding(self) -> None:
+        self.repo.cli(
+            "review", "add", "--lens", "contracts", "--file", "cart.py", "--line", "2",
+            "--severity", "major", "--title", "Strings are summed without a check",
+            "--scenario", "total(['a']) raises TypeError instead of a clear error",
+        )  # fmt: skip
+
+
+class InactiveTests(HookTestCase):
+    def test_every_event_allows_without_an_active_state(self) -> None:
+        for event, platform, payload in (
+            ("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False)),
+            ("stop", "copilot", copilot_cli(self.root, stopReason="end_turn")),
+            ("stop", "claude", claude("Stop", self.root, stop_hook_active=False)),
+            ("subagent-start", "copilot", vscode("SubagentStart", self.root, agent_type="craftsman-reviewer")),
+            ("subagent-stop", "claude", claude("SubagentStop", self.root, agent_type="craftsman-reviewer")),
+            ("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="what does /craftsman do?")),
+        ):  # fmt: skip
+            with self.subTest(event=event, platform=platform):
+                self.assertEqual(call_hook(event, platform, payload)[0], {})
+        self.assertFalse(self.state_file.exists())
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+
+    def test_outside_a_git_repository_allows(self) -> None:
+        outside = self.tmp / "plain"
+        outside.mkdir()
+        payload = vscode("UserPromptSubmit", outside, prompt="/craftsman --deep add totals")
+        self.assertEqual(call_hook("prompt", "copilot", payload)[0], {})
+        self.assertEqual(call_hook("stop", "claude", claude("Stop", outside))[0], {})
+
+    def test_unreadable_input_lets_the_agent_go_on_with_a_warning(self) -> None:
+        for event in ("prompt", "stop", "subagent-start", "subagent-stop"):
+            with self.subTest(event=event):
+                out, err = call_hook(event, "copilot", "{not json")
+                self.assertIn("the quality gate was not checked", out["systemMessage"])
+                self.assertIn("unreadable hook input", err)
+
+    def test_input_that_is_not_an_object_is_reported(self) -> None:
+        out, _ = call_hook("stop", "claude", "[1, 2]")
+        self.assertIn("not a JSON object", out["systemMessage"])
+
+    def test_pre_tool_input_without_cwd_asks_the_user(self) -> None:
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "s1"}
+
+        out, _ = call_hook("pre-tool", "claude", payload)
+
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+        self.assertIn("has no `cwd`", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_unreadable_pre_tool_input_asks_the_user(self) -> None:
+        out, _ = call_hook("pre-tool", "claude", "{not json")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_undecodable_shell_tool_args_ask_the_user(self) -> None:
+        payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input='{"command": "git push"')
+        out, _ = call_hook("pre-tool", "claude", payload)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_undecodable_shell_tool_args_are_denied_on_copilot(self) -> None:
+        payload = copilot_cli(
+            self.root, toolName="bash", toolArgs='{"command": "git push origin HEAD:main"'
+        )
+        out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_unreadable_pre_tool_input_is_denied_on_copilot(self) -> None:
+        out, _ = call_hook("pre-tool", "copilot", "{not json")
+        self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_invalid_arguments_block_the_event(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO("{}")), redirect_stdout(out), redirect_stderr(err):
+            code = hooks.main(["finish", "--platform", "copilot"])
+        self.assertEqual((code, out.getvalue()), (2, ""))
+        self.assertIn("craftsman hook error: argument event: invalid choice", err.getvalue())
+
+
+class PromptTests(HookTestCase):
+    def deep_trigger(self) -> dict[str, Any]:
+        payload = vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep add cart totals")
+        return call_hook("prompt", "copilot", payload)[0]
+
+    def test_trigger_briefs_the_agent_with_the_init_command(self) -> None:
+        context = STARTED.format(
+            tier="deep",
+            base=self.repo.base_sha[:7],
+            sid="vscode-session",
+            task="add cart totals",
+            root=self.root.resolve(),
+        )
+        self.assertEqual(
+            self.deep_trigger(),
+            {
+                "additionalContext": context,
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": context,
+                },
+            },
+        )
+
+    def test_trigger_opens_a_gate_owned_by_the_prompting_session(self) -> None:
+        self.deep_trigger()
+        state = self.state()
+        self.assertEqual(
+            {
+                key: state[key]
+                for key in ("active", "tier", "base_sha", "task", "owner", "isolation_evidence")
+            },
+            {
+                "active": True,
+                "tier": "deep",
+                "base_sha": self.repo.base_sha,
+                "task": "add cart totals",
+                "owner": {"platform": "copilot", "session_id": "vscode-session"},
+                "isolation_evidence": "hooks",
+            },
+        )
+
+    def test_copilot_cli_trigger_opens_a_gate(self) -> None:
+        call_hook("prompt", "copilot", copilot_cli(self.root, prompt="ultracraft refactor the cart"))
+        self.assertEqual((self.state()["tier"], self.state()["task"]), ("deep", "refactor the cart"))
+
+    def test_second_trigger_keeps_the_active_task(self) -> None:
+        call_hook("prompt", "copilot", copilot_cli(self.root, prompt="ultracraft refactor the cart"))
+        call_hook("prompt", "copilot", copilot_cli(self.root, prompt="/craftsman --quick other"))
+        self.assertEqual(self.state()["task"], "refactor the cart")
+
+    def test_trigger_after_a_closed_gate_opens_a_new_one(self) -> None:
+        call_hook("prompt", "copilot", copilot_cli(self.root, prompt="ultracraft refactor the cart"))
+        self.update_state(active=False)
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman fix it"))
+        self.assertEqual((self.state()["active"], self.state()["task"]), (True, "fix it"))
+
+    def test_claude_trigger_answers_in_the_claude_dialect(self) -> None:
+        out, _ = call_hook(
+            "prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman fix it")
+        )
+        self.assertEqual(set(out), {"hookSpecificOutput"})
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
+
+    def test_suggested_init_command_drops_shell_active_characters(self) -> None:
+        prompt = '/craftsman fix "$(touch pwned)" and `id` \\'
+        out, _ = call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
+        command = (
+            out["hookSpecificOutput"]["additionalContext"].split("Stage 0 command: `")[1].split("`)")[0]
+        )
+        self.assertEqual(
+            command,
+            'craftsman gate --init --session-id claude-session --tier auto --task "fix (touch pwned) and id "',
+        )
+
+
+class StopTests(HookTestCase):
+    def open_unsatisfied_gate(self, tier: str = "quick") -> None:
+        self.init(tier)
+        self.repo.write("cart.py", CHANGE)
+
+    def test_unsatisfied_gate_blocks_in_the_copilot_dialect(self) -> None:
+        self.open_unsatisfied_gate()
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
+        reason = out["reason"]
+        self.assertEqual(
+            out,
+            {
+                "decision": "block",
+                "reason": reason,
+                "hookSpecificOutput": {"hookEventName": "Stop", "decision": "block", "reason": reason},
+            },
+        )
+
+    def test_unsatisfied_gate_blocks_in_the_claude_dialect(self) -> None:
+        self.open_unsatisfied_gate()
+        out, _ = call_hook("stop", "claude", claude("Stop", self.root))
+        self.assertEqual((set(out), out["decision"]), ({"decision", "reason"}, "block"))
+
+    def test_block_reason_counts_the_continuation(self) -> None:
+        self.open_unsatisfied_gate()
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
+        self.assertTrue(out["reason"].startswith(header(1)))
+
+    def test_stop_hook_active_does_not_end_the_block(self) -> None:
+        self.open_unsatisfied_gate()
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=True))
+        self.assertEqual(out["decision"], "block")
+
+    def test_copilot_cli_stop_without_stop_hook_active_is_blocked(self) -> None:
+        self.open_unsatisfied_gate()
+        out, _ = call_hook("stop", "copilot", copilot_cli(self.root, stopReason="end_turn"))
+        self.assertEqual(out["decision"], "block")
+
+    def test_claude_retry_after_a_block_is_blocked_again(self) -> None:
+        self.open_unsatisfied_gate()
+        call_hook("stop", "claude", claude("Stop", self.root, stop_hook_active=False))
+        out, _ = call_hook("stop", "claude", claude("Stop", self.root, stop_hook_active=True))
+        self.assertTrue(out["reason"].startswith(header(2)))
+
+    def test_passing_ledger_closes_the_gate_at_stop(self) -> None:
+        self.open_unsatisfied_gate()
+        self.repo.record_full_evidence("quick")
+        done, _ = call_hook("stop", "copilot", copilot_cli(self.root, stopReason="end_turn"))
+        self.assertEqual(done, {})
+        self.assertEqual((self.state()["active"], self.state()["stage"]), (False, "completed"))
+
+    def test_cap_answers_with_a_system_message(self) -> None:
+        self.open_unsatisfied_gate()
+        self.update_state(forced_continuations=MAX_CONTINUATIONS)
+        capped, _ = call_hook("stop", "copilot", copilot_cli(self.root))
+        self.assertEqual(set(capped), {"systemMessage"})
+        self.assertIn("Craftsman gate not satisfied", capped["systemMessage"])
+
+    def prepare_unisolated_review(self) -> None:
+        """A standard change with a covered round and a test run, but no reviewer agent."""
+        self.open_unsatisfied_gate("standard")
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cover_all()
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
+
+    def test_hooked_gate_blocks_a_review_without_a_reviewer(self) -> None:
+        self.prepare_unisolated_review()
+        blocked, _ = call_hook("stop", "claude", claude("Stop", self.root))
+        self.assertIn("[no-isolation]", blocked["reason"])
+
+    def test_reviewer_hook_events_prove_the_isolated_review(self) -> None:
+        self.prepare_unisolated_review()
+        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook(
+            "subagent-stop",
+            "claude",
+            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
+        )
+        self.assertEqual(call_hook("stop", "claude", claude("Stop", self.root))[0], {})
+        self.assertEqual(self.state()["stage"], "completed")
+
+    def test_continuation_prompt_keeps_the_streak(self) -> None:
+        self.open_unsatisfied_gate()
+        self.update_state(forced_continuations=4, best_issue_count=2)
+        prompt = header(4) + "1. ..."
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
+        self.assertEqual(self.state()["forced_continuations"], 4)
+
+    def test_user_prompt_starts_a_new_streak(self) -> None:
+        self.open_unsatisfied_gate()
+        self.update_state(forced_continuations=4, best_issue_count=2)
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="Use option B"))
+        state = self.state()
+        self.assertEqual((state["forced_continuations"], state["best_issue_count"]), (0, None))
+
+    def test_user_prompt_ends_the_wait_for_the_user(self) -> None:
+        self.open_unsatisfied_gate()
+        self.repo.cli("gate", "--await-user", "--cwd", ".")
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="Use option B"))
+        self.assertFalse(self.state()["awaiting_user"])
+
+    def test_trigger_during_a_session_raises_the_tier(self) -> None:
+        self.open_unsatisfied_gate()
+        prompt = "/craftsman --deep go"
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
+        self.assertEqual(self.state()["tier"], "deep")
+
+    def test_trigger_during_a_session_never_lowers_the_tier(self) -> None:
+        self.open_unsatisfied_gate("deep")
+        prompt = "/craftsman --quick"
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
+        self.assertEqual(self.state()["tier"], "deep")
+
+    def retry_after_the_round_cap(self) -> dict[str, Any]:
+        self.open_unsatisfied_gate()
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.update_state(stage="needs_human")
+        prompt = "/craftsman retry"
+        out, _ = call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
+        return out
+
+    def test_trigger_after_the_round_cap_restarts_the_gate(self) -> None:
+        self.retry_after_the_round_cap()
+        self.assertEqual((self.state()["stage"], self.state()["task"]), ("implement", "retry"))
+
+    def test_restarted_gate_archives_the_previous_review(self) -> None:
+        self.retry_after_the_round_cap()
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+        self.assertEqual(len(list(self.repo.ledger_dir.glob("ledger-*.json"))), 1)
+
+    def test_awaiting_user_allows(self) -> None:
+        self.open_unsatisfied_gate()
+        self.repo.cli("gate", "--await-user", "--cwd", ".")
+        self.assertEqual(call_hook("stop", "claude", claude("Stop", self.root))[0], {})
+
+    def exceed_the_round_cap(self) -> None:
+        self.init("quick")
+        for revision in range(MAX_ROUNDS + 1):
+            self.repo.write("cart.py", CHANGE + f"# revision {revision}\n")
+            self.repo.cli("review", "prepare", "--tier", "quick")
+
+    def test_round_cap_answers_with_a_system_message(self) -> None:
+        self.exceed_the_round_cap()
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
+        self.assertEqual(set(out), {"systemMessage"})
+        self.assertIn("round cap", out["systemMessage"])
+
+    def test_round_cap_hands_the_gate_to_the_user(self) -> None:
+        self.exceed_the_round_cap()
+        call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
+        self.assertEqual(self.state()["stage"], "needs_human")
+
+    def test_stop_failure_lets_the_agent_stop_with_a_warning(self) -> None:
+        self.open_unsatisfied_gate()
+        with mock.patch("craftsman.gate.evaluate_task", side_effect=RuntimeError("boom")):
+            out, err = call_hook("stop", "copilot", vscode("Stop", self.root))
+        self.assertEqual(set(out), {"systemMessage"})
+        self.assertIn("quality gate was not checked", out["systemMessage"])
+        self.assertIn("RuntimeError: boom", err)
+
+    def test_invalid_gate_state_is_reported_at_stop(self) -> None:
+        self.init("quick")
+        self.update_state(owner=None)
+        out, _ = call_hook("stop", "claude", claude("Stop", self.root))
+        self.assertIn("not a valid gate state", out["systemMessage"])
+
+
+class SubagentTests(HookTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.init("standard")
+        self.repo.write("cart.py", CHANGE)
+
+    def start_reviewer(self) -> dict[str, Any]:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        payload = vscode("SubagentStart", self.root, agent_id="r-1", agent_type="craftsman-reviewer")
+        return call_hook("subagent-start", "copilot", payload)[0]
+
+    def test_reviewer_start_is_briefed_with_its_packet(self) -> None:
+        out = self.start_reviewer()
+        context = out["additionalContext"]
+        self.assertEqual(
+            out["hookSpecificOutput"], {"hookEventName": "SubagentStart", "additionalContext": context}
+        )
+        packet = self.repo.ledger_dir / "packet-1.md"
+        self.assertTrue(context.startswith(f"Craftsman review round 1. Packet: {packet}\n"))
+
+    def test_reviewer_brief_lists_the_hunks_of_each_lens(self) -> None:
+        context = self.start_reviewer()["additionalContext"]
+        self.assertIn("- intent: H1\n", context)
+        self.assertIn("- sweep: H1 (run last)\n", context)
+
+    def test_reviewer_start_is_recorded(self) -> None:
+        self.start_reviewer()
+        events = self.ledger()["agents"]
+        self.assertEqual(
+            [(e["platform"], e["event"], e["agent"], e["agent_id"]) for e in events],
+            [("copilot", "start", "craftsman-reviewer", "r-1")],
+        )
+
+    def test_verifier_brief_lists_findings_without_a_verdict(self) -> None:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.add_finding()
+        out, _ = call_hook(
+            "subagent-start",
+            "copilot",
+            copilot_cli(
+                self.root, agentName="craftsman-verifier", agentDisplayName="Craftsman Verifier"
+            ),
+        )
+        self.assertIn(
+            "Findings without a verdict:\n- F1 (major, cart.py:2): Strings are summed",
+            out["additionalContext"],
+        )
+
+    def test_other_agents_are_recorded_without_a_briefing(self) -> None:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        explore = {"agent_id": "x", "agent_type": "Explore"}
+        started, _ = call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **explore))
+        stopped, _ = call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, **explore))
+        self.assertEqual((started, stopped), ({}, {}))
+        self.assertEqual(
+            [(e["event"], e["agent"]) for e in self.ledger()["agents"]],
+            [("start", "Explore"), ("stop", "Explore")],
+        )
+
+    def test_no_round_means_no_briefing(self) -> None:
+        out, _ = call_hook(
+            "subagent-start",
+            "claude",
+            claude("SubagentStart", self.root, agent_type="craftsman-reviewer"),
+        )
+        self.assertEqual(out, {})
+        self.assertEqual(len(self.ledger()["agents"]), 1)
+
+    def test_reviewer_stop_without_records_is_sent_back_once(self) -> None:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        call_hook("subagent-start", "copilot", copilot_cli(self.root, agentName="craftsman-reviewer"))
+        stop = copilot_cli(self.root, agentId="r-9", agentType="custom", agentName="craftsman-reviewer")
+
+        first, _ = call_hook("subagent-stop", "copilot", stop)
+        second, _ = call_hook("subagent-stop", "copilot", stop)
+
+        self.assertEqual(first, {"decision": "block", "reason": REVIEWER_STOP_REASON})
+        self.assertEqual(second, {})
+        self.assertEqual([e["event"] for e in self.ledger()["agents"]], ["start", "stop", "stop"])
+
+    def test_reviewer_that_recorded_coverage_may_stop(self) -> None:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        reviewer = {"agent_id": "r-2", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "copilot", vscode("SubagentStart", self.root, **reviewer))
+        self.repo.cli(
+            "review", "cover", "--lens", "intent", "--hunks", "H1", "--note", coverage_note(["H1"])
+        )
+
+        out, _ = call_hook(
+            "subagent-stop",
+            "copilot",
+            vscode("SubagentStop", self.root, stop_hook_active=False, **reviewer),
+        )
+
+        self.assertEqual(out, {})
+
+    def stop_verifier_with_a_pending_verdict(self, *, stop_hook_active: bool) -> dict[str, Any]:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.add_finding()
+        verifier = {"agent_id": "v-1", "agent_type": "craftsman-verifier"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **verifier))
+        payload = claude("SubagentStop", self.root, stop_hook_active=stop_hook_active, **verifier)
+        return call_hook("subagent-stop", "claude", payload)[0]
+
+    def test_verifier_stop_with_pending_verdicts_blocks(self) -> None:
+        out = self.stop_verifier_with_a_pending_verdict(stop_hook_active=False)
+        self.assertEqual(out["decision"], "block")
+        self.assertTrue(out["reason"].startswith("Findings still without a verdict: F1. "))
+
+    def test_verifier_sent_back_once_may_stop(self) -> None:
+        out = self.stop_verifier_with_a_pending_verdict(stop_hook_active=True)
+        self.assertEqual(out, {})
+
+    def test_verifier_that_judged_its_findings_may_stop_while_others_wait(self) -> None:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.add_finding()
+        self.add_finding()
+        verifier = {"agent_id": "v-2", "agent_type": "craftsman-verifier"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **verifier))
+        self.repo.cli(
+            "review", "verdict", "F1", "--as", "dismissed",
+            "--evidence", "cart.py:2 only receives numbers from the typed API layer",
+        )  # fmt: skip
+
+        out, _ = call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, **verifier))
+
+        self.assertEqual(out, {})
+
+    def start_review_only_verifier(self) -> dict[str, Any]:
+        """Two findings in review-only mode (no active gate), then the verifier starts."""
+        self.update_state(active=False)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.add_finding()
+        self.add_finding()
+        payload = claude("SubagentStart", self.root, **REVIEW_ONLY_VERIFIER)
+        return call_hook("subagent-start", "claude", payload)[0]
+
+    def test_review_only_verifier_brief_names_uncovered_sweep_hunks(self) -> None:
+        context = self.start_review_only_verifier()["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Uncovered `sweep` hunks", context)
+        self.assertIn(": H1", context.split("Uncovered `sweep` hunks")[1].splitlines()[0])
+
+    def test_merge_does_not_count_as_a_verdict(self) -> None:
+        self.start_review_only_verifier()
+        self.repo.cli("review", "merge", "F1", "F2")
+        payload = claude("SubagentStop", self.root, stop_hook_active=False, **REVIEW_ONLY_VERIFIER)
+        blocked, _ = call_hook("subagent-stop", "claude", payload)
+        self.assertIn("Findings still without a verdict: F1.", blocked["reason"])
+
+    def test_other_agents_outside_a_session_are_not_recorded(self) -> None:
+        self.update_state(active=False)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        agents_before = list(self.ledger()["agents"])
+        for event, extra in (
+            ("subagent-start", {"agent_id": "e-1", "agent_type": "Explore"}),
+            ("subagent-stop", {"agent_id": "e-1", "agent_type": "Explore"}),
+            ("subagent-stop", {"agent_id": "e-1"}),
+            ("subagent-start", {"agent_id": "g-1", "agent_type": "general-purpose"}),
+            ("subagent-stop", {"agent_id": "g-1", "agent_type": "general-purpose"}),
         ):
-            res = run_hook(
-                GIT_GUARD,
-                {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}},
-            )
-            self.assertEqual(res["decision"], "allow", f"Failed for command: {cmd}")
+            with self.subTest(event=event, extra=extra):
+                out, _ = call_hook(event, "claude", claude("Subagent", self.root, **extra))
+                self.assertEqual(out, {})
+                self.assertEqual(self.ledger()["agents"], agents_before)
 
-    def test_allows_clean_atomic_commit(self) -> None:
-        res = run_hook(
-            GIT_GUARD,
-            {
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": 'git add . && git commit -m "feat(hooks): add hard-loop enforcement"'
-                    },
-                }
-            },
-        )
-        self.assertEqual(res["decision"], "allow")
-
-    def test_denies_commit_with_co_authored_by_or_ai_trailers(self) -> None:
-        bad_commands = (
-            'git commit -m "feat: add x\n\nCo-authored-by: Claude <noreply@anthropic.com>"',
-            'git commit -m "fix: bug" -m "Generated by Gemini"',
-            'gh pr create --title "feat" --body "🤖 Generated with Claude Code"',
-            '(git commit -m "feat: subshell\n\nCo-authored-by: Antigravity <ai@google.com>")',
-        )
-        for cmd in bad_commands:
-            res = run_hook(
-                GIT_GUARD,
-                {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}},
-            )
-            self.assertEqual(res["decision"], "deny", f"Expected deny for: {cmd}")
-            self.assertIn("Global Rule #2", res.get("reason", ""))
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            msg_file = Path(tmpdir) / "COMMIT_MSG"
-            msg_file.write_text("feat: test\n\nCo-authored-by: Claude <bot@ai>\n", encoding="utf-8")
-            res_file = run_hook(
-                GIT_GUARD,
-                {
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": f"git commit -F {msg_file}", "Cwd": tmpdir},
-                    }
-                },
-            )
-            self.assertEqual(res_file["decision"], "deny")
-
-    def test_allows_push_to_feature_branch_without_confirmation(self) -> None:
-        res = run_hook(
-            GIT_GUARD,
-            {
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {"CommandLine": "git push -u origin feat/hybrid-hard-loop"},
-                }
-            },
-        )
-        self.assertEqual(res["decision"], "allow")
-
-    def test_allows_dry_run_push_to_main(self) -> None:
-        res = run_hook(
-            GIT_GUARD,
-            {
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {"CommandLine": "git push --dry-run origin main"},
-                }
-            },
-        )
-        self.assertEqual(res["decision"], "allow")
-
-    def test_push_to_main_requires_unconsumed_ask_question_in_transcript(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            # 1. Transcript with NO ask_question -> deny
-            transcript.write_text(
-                json.dumps({"step_index": 1, "type": "USER_INPUT", "tool_calls": []}) + "\n",
-                encoding="utf-8",
-            )
-            res = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push -u origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res["decision"], "deny")
-            self.assertIn("ask_question", res.get("reason", ""))
-
-            # 2. Transcript WITH ask_question -> allow
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 2,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "ask_question",
-                                    "args": {
-                                        "questions": [
-                                            {
-                                                "question": "Should we push directly to main or open a PR?",
-                                                "options": [
-                                                    "Push directly to main",
-                                                    "Push to a feature branch",
-                                                ],
-                                            }
-                                        ]
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
+    def test_craftsman_agents_of_a_stale_round_are_ignored(self) -> None:
+        self.update_state(active=False)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        agents_before = list(self.ledger()["agents"])
+        self.repo.write("cart.py", CHANGE + "# stale round\n")
+        for role_name in ("craftsman-reviewer", "craftsman-verifier"):
+            with self.subTest(agent=role_name):
+                agent = {"agent_id": "stale", "agent_type": role_name}
+                start_out, _ = call_hook(
+                    "subagent-start", "claude", claude("SubagentStart", self.root, **agent)
                 )
-            res2 = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push -u origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res2["decision"], "allow")
-
-            # 3. After a git push to main is recorded, the previous ask_question is consumed -> deny next push
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 3,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "run_command",
-                                    "args": {"CommandLine": '"git push -u origin main"'},
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
+                stop_out, _ = call_hook(
+                    "subagent-stop", "claude", claude("SubagentStop", self.root, **agent)
                 )
-            res3 = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res3["decision"], "deny")
+                self.assertEqual((start_out, stop_out), ({}, {}))
+                self.assertEqual(self.ledger()["agents"], agents_before)
 
-    def test_force_push_to_main_always_triggers_force_ask(self) -> None:
-        res = run_hook(
-            GIT_GUARD,
-            {
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {"CommandLine": "git push --force origin main"},
-                }
-            },
+    def test_a_stop_with_only_an_agent_id_is_matched_to_its_start(self) -> None:
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        start = vscode("SubagentStart", self.root, agent_id="r-7", agent_type="craftsman-reviewer")
+        call_hook("subagent-start", "copilot", start)
+
+        out, _ = call_hook("subagent-stop", "copilot", vscode("SubagentStop", self.root, agent_id="r-7"))
+
+        self.assertEqual(out, {"decision": "block", "reason": REVIEWER_STOP_REASON})
+        self.assertEqual(self.ledger()["agents"][-1]["agent"], "craftsman-reviewer")
+
+
+class PreToolTests(HookTestCase):
+    def deny_reason(self, out: dict[str, Any]) -> str:
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        assert isinstance(reason, str)
+        return reason
+
+    def shell_payloads(self, command: str) -> list[tuple[str, dict[str, Any]]]:
+        """`command` as each platform's shell tool sends it, with a Claude transcript to consult."""
+        transcript = self.tmp / "claude.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        return [
+            ("copilot", vscode("PreToolUse", self.root, tool_name="run_in_terminal", tool_use_id="t1", tool_input={"command": command, "explanation": "push"})),
+            ("copilot", copilot_cli(self.root, toolName="bash", toolArgs=json.dumps({"command": command}))),
+            ("copilot", copilot_cli(self.root, toolName="powershell", toolArgs={"command": command})),
+            ("claude", claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": command}, transcript_path=str(transcript))),
+        ]  # fmt: skip
+
+    def test_unconfirmed_push_to_main_is_denied_for_every_payload_flavor(self) -> None:
+        for platform, payload in self.shell_payloads("git push origin main"):
+            with self.subTest(platform=platform, payload=payload):
+                out, _ = call_hook("pre-tool", platform, payload)
+                reason = self.deny_reason(out)
+                self.assertIn("[CRAFTSMAN GIT-GUARD]", reason)
+                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PreToolUse")
+                if platform == "copilot":
+                    self.assertEqual(out["permissionDecision"], "deny")
+                    self.assertEqual(out["permissionDecisionReason"], reason)
+                else:
+                    self.assertEqual(set(out), {"hookSpecificOutput"})
+
+    def test_harmless_command_is_allowed_for_every_payload_flavor(self) -> None:
+        for platform, payload in self.shell_payloads("git status"):
+            with self.subTest(platform=platform, payload=payload):
+                self.assertEqual(call_hook("pre-tool", platform, payload)[0], {})
+
+    def test_claude_without_a_transcript_asks_the_user(self) -> None:
+        payload = claude(
+            "PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git push origin main"}
         )
-        self.assertEqual(res["decision"], "force_ask")
+        out, _ = call_hook("pre-tool", "claude", payload)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
-
-class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
-    def test_claude_code_bash_payload_is_enforced_by_git_guard(self) -> None:
-        res = run_hook(
-            GIT_GUARD,
-            {
-                "tool_name": "Bash",
-                "tool_input": {
-                    "command": 'git commit -m "feat: x\n\nCo-authored-by: Claude <noreply@anthropic.com>"'
-                },
-            },
+    def test_ai_attribution_in_a_commit_is_denied(self) -> None:
+        commit = 'git commit -m "feat: x" -m "Co-authored-by: Claude <noreply@anthropic.com>"'
+        payload = vscode(
+            "PreToolUse", self.root, tool_name="run_in_terminal", tool_input={"command": commit}
         )
-        self.assertEqual(res["decision"], "deny")
-        self.assertIn("Global Rule #2", res.get("reason", ""))
+        out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertIn("Zero AI Attribution", self.deny_reason(out))
 
-    def test_native_commit_msg_hook_blocks_ai_trailers_and_ignores_comments(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            msg_file = Path(tmpdir) / "COMMIT_EDITMSG"
-
-            # Clean message with commented-out trailer -> exit 0
-            msg_file.write_text(
-                "feat(core): add pipeline\n# Co-authored-by: Claude <noreply@anthropic.com>\n",
-                encoding="utf-8",
-            )
-            ok_proc = subprocess.run(
-                [sys.executable, str(GIT_GUARD), "--git-hook", "commit-msg", str(msg_file)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(ok_proc.returncode, 0)
-
-            # Active AI trailer -> exit 1
-            msg_file.write_text(
-                "feat(core): add pipeline\n\nCo-authored-by: GitHub Copilot <copilot@github.com>\n",
-                encoding="utf-8",
-            )
-            bad_proc = subprocess.run(
-                [sys.executable, str(GIT_GUARD), "--git-hook", "commit-msg", str(msg_file)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(bad_proc.returncode, 1)
-            self.assertIn("Global Rule #2", bad_proc.stderr)
-
-    def test_native_pre_push_hook_enforces_main_protection(self) -> None:
-        import os
-
-        env = dict(os.environ, CRAFTSMAN_NONINTERACTIVE="1", CRAFTSMAN_IGNORE_TRANSCRIPT="1")
-        env.pop("CRAFTSMAN_ALLOW_MAIN_PUSH", None)
-
-        # Feature branch push -> exit 0
-        feat_proc = subprocess.run(
-            [sys.executable, str(GIT_GUARD), "--git-hook", "pre-push", "origin", "https://example.com"],
-            input="refs/heads/feat/x 1111 refs/heads/feat/x 0000\n",
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
+    def test_non_shell_tool_is_not_guarded(self) -> None:
+        edit = vscode(
+            "PreToolUse",
+            self.root,
+            tool_name="editFiles",
+            tool_input={"command": "git push origin main"},
         )
-        self.assertEqual(feat_proc.returncode, 0)
+        self.assertEqual(call_hook("pre-tool", "copilot", edit)[0], {})
 
-        # Unconfirmed push to main -> exit 1
-        main_proc = subprocess.run(
-            [sys.executable, str(GIT_GUARD), "--git-hook", "pre-push", "origin", "https://example.com"],
-            input="refs/heads/main 1111 refs/heads/main 0000\n",
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
+    def test_powershell_tool_in_a_relative_cwd_is_guarded(self) -> None:
+        self.repo.git("checkout", "-q", "-b", "main")
+        (self.root / "sub").mkdir()
+        for tool in ("PowerShell", "pwsh"):
+            with self.subTest(tool=tool):
+                payload = claude(
+                    "PreToolUse", self.root, tool_name=tool,
+                    tool_input={"command": "git push", "cwd": "sub"},
+                )  # fmt: skip
+                out, _ = call_hook("pre-tool", "copilot", payload)
+                self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_shell_commands_mark_the_session_as_hooked(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        self.assertEqual(self.state()["isolation_evidence"], "none")
+        payload = vscode(
+            "PreToolUse", self.root, tool_name="run_in_terminal",
+            tool_input={"command": "craftsman gate --complete"},
+        )  # fmt: skip
+        self.assertEqual(call_hook("pre-tool", "copilot", payload)[0], {})
+        self.assertEqual(self.state()["isolation_evidence"], "hooks")
+
+    def test_guard_failure_asks_the_user(self) -> None:
+        payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git status"})
+        with mock.patch.object(hooks, "evaluate_shell_command", side_effect=RuntimeError("boom")):
+            out, _ = call_hook("pre-tool", "claude", payload)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_guard_failure_is_denied_on_copilot(self) -> None:
+        payload = vscode(
+            "PreToolUse", self.root, tool_name="run_in_terminal", tool_input={"command": "ls"}
         )
-        self.assertEqual(main_proc.returncode, 1)
-        self.assertIn("Global Rule #1", main_proc.stderr)
+        with mock.patch.object(hooks, "evaluate_shell_command", side_effect=RuntimeError("boom")):
+            out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertEqual(out["permissionDecision"], "deny")
 
-        # Confirmed push to main via CRAFTSMAN_ALLOW_MAIN_PUSH=1 -> exit 0
-        env_allowed = dict(env, CRAFTSMAN_ALLOW_MAIN_PUSH="1")
-        allowed_proc = subprocess.run(
-            [sys.executable, str(GIT_GUARD), "--git-hook", "pre-push", "origin", "https://example.com"],
-            input="refs/heads/main 1111 refs/heads/main 0000\n",
-            capture_output=True,
-            text=True,
-            env=env_allowed,
-            check=False,
-        )
-        self.assertEqual(allowed_proc.returncode, 0)
+    def test_failed_check_on_copilot_carries_no_push_advice(self) -> None:
+        self.init("standard")
+        self.update_state(owner=None)
+        payload = vscode("PreToolUse", self.root, tool_name="Grep", tool_input={"pattern": "x"})
+        out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertNotIn(COPILOT_PUSH_NOTE, out["permissionDecisionReason"])
 
-    def test_multi_platform_export_generates_copilot_claude_codex_and_cursor_files(self) -> None:
-        exporter = REPO_ROOT / "scripts" / "copilot-export.py"
-        with tempfile.TemporaryDirectory() as tmpdir:
-            user_prompts = Path(tmpdir) / "user_prompts"
-            workspace = Path(tmpdir) / "ws"
-            claude_dir = Path(tmpdir) / "claude"
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(exporter),
-                    "--repo-dir",
-                    str(REPO_ROOT),
-                    "--user-dir",
-                    str(user_prompts),
-                    "--workspace",
-                    str(workspace),
-                    "--allow-duplicate-scopes",
-                    "--claude-dir",
-                    str(claude_dir),
-                    "--agents-workspace",
-                    str(workspace),
-                ],
-                check=True,
-                env={**os.environ, "HOME": tmpdir, "USERPROFILE": tmpdir},
-            )
-            self.assertFalse((user_prompts / "craftsman.prompt.md").exists())
-            self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
-            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 0)
-            self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
-            self.assertEqual(
-                len(list((workspace / ".github" / "skills").glob("*/SKILL.md"))), SKILL_COUNT
-            )
-            self.assertFalse((workspace / ".github" / "prompts").exists())
-            self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), SKILL_COUNT)
-            self.assertTrue((claude_dir / "rules" / "craftsman-rules.md").is_file())
-            self.assertTrue((workspace / "AGENTS.md").is_file())
-            self.assertTrue((workspace / ".cursor" / "rules" / "craftsman.mdc").is_file())
+    def test_protected_push_on_copilot_leaves_the_push_to_the_user(self) -> None:
+        payload = vscode(
+            "PreToolUse", self.root, tool_name="run_in_terminal",
+            tool_input={"command": "git push origin main"},
+        )  # fmt: skip
+        out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertTrue(out["permissionDecisionReason"].endswith(COPILOT_PUSH_NOTE))
 
-    def test_failed_push_in_compound_command_does_not_consume_ask_question(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            entries = [
-                {
-                    "step_index": 1,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "ask_question",
-                            "args": {
-                                "questions": [
-                                    {
-                                        "question": "Push directly to main?",
-                                        "options": ["Push directly to main", "Feature branch"],
-                                    }
-                                ]
-                            },
-                        }
-                    ],
-                },
-                {
-                    "step_index": 2,
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "content": "Q1: Push directly to main?\nA1: Push directly to main",
-                },
-                {
-                    "step_index": 3,
-                    "type": "PLANNER_RESPONSE",
-                    "status": "DONE",
-                    "tool_calls": [
-                        {"name": "view_file", "args": {"AbsolutePath": "/tmp/a"}},
-                        {
-                            "name": "run_command",
-                            "args": {"CommandLine": "git status --short && git push origin main"},
-                        },
-                    ],
-                },
-                {
-                    "step_index": 3,
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "content": "File contents...",
-                },
-                {
-                    "step_index": 4,
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "content": "The command exited with code 128.\nOutput:\nfatal: The current branch main has no upstream branch.",
-                },
-            ]
-            transcript.write_text(
-                "\n".join(json.dumps(e) for e in entries) + "\n",
-                encoding="utf-8",
-            )
-            res = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push -u origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res["decision"], "allow")
+    def test_invalid_gate_state_asks_before_a_search(self) -> None:
+        self.init("standard")
+        self.update_state(owner=None)
+        payload = claude("PreToolUse", self.root, tool_name="Grep", tool_input={"pattern": "x"})
+        out, _ = call_hook("pre-tool", "claude", payload)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
-    def test_isolated_cd_does_not_bypass_push_to_main_guard(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            repo_dir = Path(tmpdir) / "repo"
-            other_dir = Path(tmpdir) / "other"
-            repo_dir.mkdir()
-            other_dir.mkdir()
-            subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, capture_output=True, check=True)
-            subprocess.run(
-                ["git", "config", "user.email", "dev@example.com"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "config", "user.name", "Dev"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "commit", "--allow-empty", "--no-verify", "-m", "init"],
-                cwd=repo_dir,
-                capture_output=True,
-                check=True,
-            )
-            for cmd in (
-                "(cd /tmp && ls) && git push",
-                "(cd ~ && ls) && git push origin HEAD",
-                f"pushd {other_dir}; popd; git push",
-                "echo `cd /tmp`; git push",
-                "cd /tmp | true; git push",
-                "cd /tmp & git push",
-                "f() { cd /tmp; }; git push",
-                "(case x in a) cd /tmp;; esac); git push",
-            ):
-                with self.subTest(cmd=cmd):
-                    res = run_hook(
-                        GIT_GUARD,
-                        {
-                            "toolCall": {
-                                "name": "run_command",
-                                "args": {"CommandLine": cmd, "Cwd": str(repo_dir)},
-                            },
-                        },
-                    )
-                    self.assertEqual(res["decision"], "force_ask", cmd)
-
-
-class CraftsmanCliAndManifestTests(unittest.TestCase):
-    def test_cli_reports_version_with_doctor_json(self) -> None:
-        ver_proc = subprocess.run(
-            [sys.executable, "-m", "craftsman.cli", "--version"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        self.assertIn("3.2.0", ver_proc.stdout)
-
-        with tempfile.TemporaryDirectory() as fake_home:
-            doc_proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "craftsman.cli",
-                    "doctor",
-                    "--json",
-                    "--repo-dir",
-                    str(REPO_ROOT),
-                ],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-                env={**os.environ, "HOME": fake_home, "USERPROFILE": fake_home},
-            )
-        report = json.loads(doc_proc.stdout)
-        self.assertTrue(report["healthy"])
-        self.assertEqual(report["skills_count"], SKILL_COUNT)
-        self.assertEqual(report["rules_count"], 2)
-
-    def test_skill_cli_shows_bundled_skill_files(self) -> None:
-        import contextlib
-        import io
-
-        from craftsman.cli import main as cli_main
-
-        def run_cli(*args: str) -> tuple[int, str, str]:
-            out = io.StringIO()
-            err = io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = cli_main(list(args))
-            return code, out.getvalue(), err.getvalue()
-
-        code_list, out_list, err_list = run_cli("skill", "list", "--repo-dir", str(REPO_ROOT))
-        self.assertEqual(code_list, 0, err_list)
-        self.assertIn("craftsman", out_list)
-        self.assertIn("code-review", out_list)
-
-        code_json, out_json, _ = run_cli("skill", "list", "--json", "--repo-dir", str(REPO_ROOT))
-        self.assertEqual(code_json, 0)
-        parsed_list = json.loads(out_json)
-        self.assertEqual(len(parsed_list), SKILL_COUNT)
-
-        code_path, out_path, _ = run_cli("skill", "path", "code-review", "--repo-dir", str(REPO_ROOT))
-        self.assertEqual(code_path, 0)
-        self.assertEqual(Path(out_path.strip()), (REPO_ROOT / "skills" / "code-review").resolve())
-
-        code_show, out_show, _ = run_cli("skill", "show", "craftsman", "--repo-dir", str(REPO_ROOT))
-        self.assertEqual(code_show, 0)
-        self.assertIn("name: craftsman", out_show)
-        self.assertNotIn("~/.gemini/config/scripts/craftsman-stop-gate.py", out_show)
-
-        code_lenses, out_lenses, _ = run_cli(
-            "skill", "show", "code-review", "--file", "lenses.md", "--repo-dir", str(REPO_ROOT)
-        )
-        self.assertEqual(code_lenses, 0)
-        self.assertIn("## `intent`", out_lenses)
-
-    def test_skill_cli_rejects_escaping_or_unknown_paths(self) -> None:
-        import contextlib
-        import io
-
-        from craftsman.cli import main as cli_main
-
-        def run_cli(*args: str) -> tuple[int, str, str]:
-            out = io.StringIO()
-            err = io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = cli_main(list(args))
-            return code, out.getvalue(), err.getvalue()
-
-        code_unk, _, err_unk = run_cli("skill", "show", "no-such-skill", "--repo-dir", str(REPO_ROOT))
-        self.assertEqual(code_unk, 2)
-        self.assertIn("unknown skill 'no-such-skill'", err_unk)
-
-        for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
-            code_bad, _, err_bad = run_cli(
-                "skill", "show", "code-review", "--file", bad_file, "--repo-dir", str(REPO_ROOT)
-            )
-            self.assertEqual(code_bad, 2, f"Expected exit 2 for --file={bad_file!r}")
-            self.assertIn("craftsman skill: error:", err_bad)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir).resolve()
-            fake_repo = tmp_path / "repo"
-            skill_dir = fake_repo / "skills" / "code-review"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8"
-            )
-            outside = tmp_path / "secret.md"
-            outside.write_text("top secret\n", encoding="utf-8")
-            (skill_dir / "escape.md").symlink_to(outside)
-
-            code_sym, _, err_sym = run_cli(
-                "skill", "show", "code-review", "--file", "escape.md", "--repo-dir", str(fake_repo)
-            )
-            self.assertEqual(code_sym, 2)
-            self.assertIn("escapes skill directory", err_sym)
-
-    def test_review_show_packet_path_prints_current_round_packet(self) -> None:
-        import contextlib
-        import io
-
-        from craftsman.cli import main as cli_main
-
-        def run_cli(*args: str) -> tuple[int, str, str]:
-            out = io.StringIO()
-            err = io.StringIO()
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = cli_main(list(args))
-            return code, out.getvalue(), err.getvalue()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir).resolve()
-            ev_repo = EvidenceRepo(tmp_path / "ev_repo")
-            ev_repo.write_lines("app.py", 5)
-            code_nopkt, _, err_nopkt = run_cli(
-                "review", "show", "--packet-path", "--cwd", str(ev_repo.root)
-            )
-            self.assertEqual(code_nopkt, 1)
-            self.assertIn("no review round yet", err_nopkt)
-
-            code_prep, _, err_prep = run_cli("review", "prepare", "--cwd", str(ev_repo.root))
-            self.assertEqual(code_prep, 0, err_prep)
-            code_pkt, out_pkt, err_pkt = run_cli(
-                "review", "show", "--packet-path", "--cwd", str(ev_repo.root)
-            )
-            self.assertEqual(code_pkt, 0, err_pkt)
-            pkt_path = Path(out_pkt.strip())
-            self.assertTrue(pkt_path.is_absolute())
-            self.assertTrue(pkt_path.is_file())
-            self.assertEqual(pkt_path.name, "packet-1.md")
-
-    def test_every_manifest_skill_has_frontmatter(self) -> None:
-        manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
-        skill_files = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))
-        self.assertEqual([path.parent.name for path in skill_files], sorted(manifest["skills"]))
-
-        for skill_md in skill_files:
-            content = skill_md.read_text(encoding="utf-8")
-            self.assertTrue(content.startswith("---\n"), f"Missing frontmatter in {skill_md}")
-            parts = content.split("---", 2)
-            self.assertGreaterEqual(len(parts), 3, f"Unclosed frontmatter in {skill_md}")
-            frontmatter = parts[1]
-            self.assertIn("name:", frontmatter, f"Missing name in {skill_md}")
-            self.assertIn("description:", frontmatter, f"Missing description in {skill_md}")
-
-    def test_git_guard_blocks_wrapped_pushes_aliases_and_gh_pr_merge(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps({"step_index": 1, "type": "USER_INPUT", "tool_calls": []}) + "\n",
-                encoding="utf-8",
-            )
-            wrapped_commands = (
-                "bash -c 'git push origin main'",
-                "sh -lc 'git push origin master'",
-                "timeout 30 git push origin main",
-                "timeout -k 5 30 git push origin main",
-                "xargs git push origin <<< main",
-                "eval git push origin main",
-                "git -c alias.p=push p origin main",
-                "gh pr merge 1 --admin --merge",
-            )
-            for cmd in wrapped_commands:
-                res = run_hook(
-                    GIT_GUARD,
-                    {
-                        "transcriptPath": str(transcript),
-                        "toolCall": {
-                            "name": "run_command",
-                            "args": {"CommandLine": cmd, "Cwd": str(REPO_ROOT)},
-                        },
-                    },
+    def test_non_scope_checked_tools_skip_load_scope_policy_subprocesses(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        with mock.patch("craftsman.hooks.load_scope_policy") as mock_policy:
+            for tool in ("Edit", "Write", "editFiles", "replace_string_in_file"):
+                out, _ = call_hook(
+                    "pre-tool",
+                    "copilot",
+                    vscode("PreToolUse", self.root, tool_name=tool, tool_input={"file_path": "a.py"}),
                 )
-                self.assertEqual(res["decision"], "deny", f"Expected deny for wrapper: {cmd}")
+                self.assertEqual(out, {})
+            mock_policy.assert_not_called()
 
-    def test_git_guard_rejects_unrelated_ask_question_and_accepts_push_question(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            # Unrelated design question must NOT unlock push to main
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "step_index": 1,
-                        "type": "PLANNER_RESPONSE",
-                        "tool_calls": [
-                            {
-                                "name": "ask_question",
-                                "args": {
-                                    "questions": [
-                                        {
-                                            "question": "Which naming convention do you prefer?",
-                                            "options": ["snake_case", "camelCase"],
-                                        }
-                                    ]
-                                },
-                            }
-                        ],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            res_deny = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_deny["decision"], "deny")
 
-            # Push / branch confirmation question unlocks push to main
-            with transcript.open("a", encoding="utf-8") as f:
-                f.write(
-                    json.dumps(
-                        {
-                            "step_index": 2,
-                            "type": "PLANNER_RESPONSE",
-                            "tool_calls": [
-                                {
-                                    "name": "ask_question",
-                                    "args": {
-                                        "questions": [
-                                            {
-                                                "question": "How should we push these changes?",
-                                                "options": [
-                                                    "Push to a feature branch for a PR",
-                                                    "Push directly to main",
-                                                ],
-                                            }
-                                        ]
-                                    },
-                                }
-                            ],
-                        }
-                    )
-                    + "\n"
-                )
-            res_allow = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_allow["decision"], "allow")
-
-    def test_claude_code_assistant_transcript_ask_user_question_unlocks_main_push(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "message": {
-                            "content": [
-                                {
-                                    "type": "tool_use",
-                                    "name": "AskUserQuestion",
-                                    "input": {
-                                        "question": "Should we push directly to main or open a PR?"
-                                    },
-                                }
-                            ]
-                        },
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            res = run_hook(
-                GIT_GUARD,
-                {
-                    "transcript_path": str(transcript),
-                    "tool_name": "Bash",
-                    "tool_input": {"command": "git push origin main"},
-                },
-            )
-            self.assertEqual(res["decision"], "allow")
-
-    def test_ai_attribution_blocks_heredoc_and_inline_trailers_allows_subjects_and_scissors(
-        self,
-    ) -> None:
-        from craftsman.guard import run_native_commit_msg_hook
-
-        blocked_commands = (
-            "git commit -m $'feat: x\\n\\nCo-authored-by: Claude <noreply@anthropic.com>'",
-            "cat <<'EOF' | git commit -F -\nfeat: x\n\nCo-authored-by: Claude <noreply@anthropic.com>\nEOF",
-            'git commit --trailer "Co-authored-by: Claude <noreply@anthropic.com>" -m "feat: x"',
-            'gh pr create --title "feat: x" --body "Generated with [Claude Code](https://claude.com/claude-code)"',
-            'git commit -m "Generated by Gemini"',
+class HookInputTests(unittest.TestCase):
+    def test_snake_case_dialect_is_read(self) -> None:
+        hook = HookInput.parse(
+            {"cwd": "/w", "agent_type": "craftsman-reviewer", "agent_id": "a", "stop_hook_active": True,
+             "tool_name": "run_in_terminal", "tool_input": {"command": "ls"}}
+        )  # fmt: skip
+        self.assertEqual(
+            (hook.agent, hook.agent_id, hook.stop_hook_active, hook.tool_input),
+            ("craftsman-reviewer", "a", True, {"command": "ls"}),
         )
-        for cmd in blocked_commands:
-            res = run_hook(
-                GIT_GUARD,
-                {
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": cmd},
-                    }
-                },
-            )
-            self.assertEqual(res["decision"], "deny", f"Expected deny for: {cmd}")
 
-        # Prose subject discussing "Generated by" must be allowed
-        allow_res = run_hook(
-            GIT_GUARD,
-            {
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": 'git commit -m "fix(guard): block Generated by AI trailers"'
-                    },
-                }
-            },
+    def test_camel_case_dialect_is_read(self) -> None:
+        hook = HookInput.parse(
+            {"cwd": "/w", "agentType": "custom", "agentName": "craftsman-reviewer", "agentId": "a",
+             "toolName": "bash", "toolArgs": '{"command": "ls"}'}
+        )  # fmt: skip
+        self.assertEqual(
+            (hook.agent, hook.agent_id, hook.stop_hook_active, hook.tool_input),
+            ("craftsman-reviewer", "a", False, {"command": "ls"}),
         )
-        self.assertEqual(allow_res["decision"], "allow")
 
-        # Native commit-msg hook must strip diff below scissors line (# --- >8 ---)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            msg_file = Path(tmpdir) / "COMMIT_EDITMSG"
-            msg_file.write_text(
-                "fix(guard): update attribution regex\n\n"
-                "# ------------------------ >8 ------------------------\n"
-                "# Do not modify or remove the line above.\n"
-                "diff --git a/guard.py b/guard.py\n"
-                "+Co-authored-by: Claude <noreply@anthropic.com>\n"
-                "+Generated with Claude Code\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(run_native_commit_msg_hook(str(msg_file)), 0)
+    def test_tool_args_that_are_not_json_are_an_error(self) -> None:
+        with self.assertRaises(HookInputError):
+            HookInput.parse({"toolArgs": '{"command": "ls"'})
 
-    def test_ask_question_rejects_empty_args_feature_branch_answer_and_stale_approval(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
+    def test_tool_input_that_is_not_an_object_is_an_error(self) -> None:
+        with self.assertRaises(HookInputError):
+            HookInput.parse({"tool_input": ["git", "push"]})
 
-            # 1. Empty args {} must be rejected
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "step_index": 1,
-                        "type": "PLANNER_RESPONSE",
-                        "tool_calls": [{"name": "ask_question", "args": {}}],
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            res_empty = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_empty["decision"], "deny")
 
-            # 2. User choosing "Feature branch + PR" must deny direct push to main
-            entries_feature_choice = [
-                {
-                    "step_index": 1,
-                    "type": "PLANNER_RESPONSE",
-                    "tool_calls": [
-                        {
-                            "name": "ask_question",
-                            "args": {
-                                "questions": [
-                                    {
-                                        "question": "Should we push directly to main or open a PR?",
-                                        "options": [
-                                            "Push to a feature branch for a PR",
-                                            "Push directly to main",
-                                        ],
-                                    }
-                                ]
-                            },
-                        }
-                    ],
-                },
-                {
-                    "step_index": 2,
-                    "type": "GENERIC",
-                    "status": "DONE",
-                    "content": "Push to a feature branch for a PR",
-                },
-            ]
-            transcript.write_text(
-                "\n".join(json.dumps(e) for e in entries_feature_choice) + "\n",
-                encoding="utf-8",
-            )
-            res_declined = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_declined["decision"], "deny")
-
-            # 3. User choosing "Push directly to main" must allow push to main
-            entries_feature_choice[1]["content"] = "Push directly to main"
-            transcript.write_text(
-                "\n".join(json.dumps(e) for e in entries_feature_choice) + "\n",
-                encoding="utf-8",
-            )
-            res_approved = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_approved["decision"], "allow")
-
-    def test_git_push_option_consuming_dash_n_and_heads_main_blocked(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps({"step_index": 1, "type": "USER_INPUT"}) + "\n",
-                encoding="utf-8",
-            )
-            for cmd in (
-                "git push -o -n origin main",
-                "git push --push-option -n origin main",
-                "git push origin HEAD:heads/main",
-                "git push origin @:refs/heads/main",
-                "git push origin main>/dev/null",
-            ):
-                res = run_hook(
-                    GIT_GUARD,
-                    {
-                        "transcriptPath": str(transcript),
-                        "toolCall": {
-                            "name": "run_command",
-                            "args": {"CommandLine": cmd},
-                        },
-                    },
-                )
-                self.assertEqual(res["decision"], "deny", f"Expected deny for: {cmd}")
-
-    def test_human_co_authored_by_allowed_while_ai_trailers_and_gh_merge_body_blocked(
-        self,
-    ) -> None:
-        # Human co-author trailer must be allowed
-        human_res = run_hook(
-            GIT_GUARD,
-            {
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {
-                        "CommandLine": 'git commit -m "feat: pair work\n\nCo-authored-by: Jan Kowalski <jan@kowalski.pl>"'
-                    },
-                }
-            },
+class SessionOwnershipTests(HookTestCase):
+    def test_non_owner_stops_leave_owner_continuation_budget_intact(self) -> None:
+        call_hook(
+            "prompt",
+            "copilot",
+            vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep build cart"),
         )
-        self.assertEqual(human_res["decision"], "allow")
+        self.repo.write("cart.py", CHANGE)
+        raw_before = self.state_file.read_bytes()
+        state_before = self.state()
+        self.assertEqual(state_before["owner"], {"platform": "copilot", "session_id": "vscode-session"})
 
-        # AI trailers with '=' or Assisted-by or gh pr merge --body must be denied
-        for cmd in (
-            'git commit -m "feat: x" --trailer "Co-authored-by=Claude"',
-            'git commit -m "feat: x\n\nAssisted-by: Claude"',
-            'gh pr merge 1 --squash --body "Co-authored-by: Claude <noreply@anthropic.com>"',
-            'gh pr comment 1 --body "Generated with [Claude Code](https://claude.com)"',
-        ):
-            res = run_hook(
-                GIT_GUARD,
-                {"toolCall": {"name": "run_command", "args": {"CommandLine": cmd}}},
-            )
-            self.assertEqual(res["decision"], "deny", f"Expected deny for: {cmd}")
+        for _ in range(10):
+            out, _ = call_hook("stop", "claude", claude("Stop", self.root))
+            self.assertEqual(out, {})
+            self.assertEqual(self.state_file.read_bytes(), raw_before)
 
-    def test_ask_question_denies_refusals_mentioning_main_and_feature_branch_questions(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            transcript = Path(tmpdir) / "transcript.jsonl"
-            q_entry = {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "tool_calls": [
-                    {
-                        "name": "ask_question",
-                        "args": {
-                            "questions": json.dumps(
-                                [
-                                    {
-                                        "question": "How should I push the changes?",
-                                        "options": [
-                                            "(Recommended) Feature branch + PR to main",
-                                            "Push directly to main",
-                                        ],
-                                    }
-                                ]
-                            )
-                        },
-                    }
-                ],
-            }
-            for refusal_text in (
-                "A1: (Recommended) Feature branch + PR to main",
-                "A1: No, do not push to main",
-                "A1: Nie wypychaj na main, zrób PR",
-                "A1: Open PR, then squash merge",
-            ):
-                transcript.write_text(
-                    json.dumps(q_entry)
-                    + "\n"
-                    + json.dumps({"step_index": 2, "type": "GENERIC", "content": refusal_text})
-                    + "\n",
-                    encoding="utf-8",
-                )
-                res = run_hook(
-                    GIT_GUARD,
-                    {
-                        "transcriptPath": str(transcript),
-                        "toolCall": {
-                            "name": "run_command",
-                            "args": {"CommandLine": "git push origin main"},
-                        },
-                    },
-                )
-                self.assertEqual(res["decision"], "deny", f"Expected deny for refusal: {refusal_text}")
+        antigravity_stop = {
+            "terminationReason": "NO_TOOL_CALL",
+            "artifactDirectoryPath": str(self.tmp / "brain" / "conv-x"),
+            "workspacePaths": [str(self.root)],
+        }
+        self.assertEqual(antigravity.answer(antigravity_stop), {"decision": "allow"})
+        self.assertEqual(self.state_file.read_bytes(), raw_before)
 
-            # Question asking only about feature branch + PR must not unlock push to main
-            pr_only_q = {
-                "step_index": 1,
-                "type": "PLANNER_RESPONSE",
-                "tool_calls": [
-                    {
-                        "name": "ask_question",
-                        "args": {
-                            "questions": [
-                                {
-                                    "question": "Should I push to a feature branch and open a PR?",
-                                    "options": ["Yes", "No"],
-                                }
-                            ]
-                        },
-                    }
-                ],
-            }
-            transcript.write_text(
-                json.dumps(pr_only_q)
-                + "\n"
-                + json.dumps({"step_index": 2, "type": "GENERIC", "content": "A1: Yes"})
-                + "\n",
-                encoding="utf-8",
-            )
-            res_pr_q = run_hook(
-                GIT_GUARD,
-                {
-                    "transcriptPath": str(transcript),
-                    "toolCall": {
-                        "name": "run_command",
-                        "args": {"CommandLine": "git push origin main"},
-                    },
-                },
-            )
-            self.assertEqual(res_pr_q["decision"], "deny")
+        owner_out, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
+        self.assertEqual(owner_out["decision"], "block")
+        self.assertTrue(owner_out["reason"].startswith(header(1)))
+        self.assertEqual(self.state()["forced_continuations"], 1)
+
+    def test_same_platform_different_session_id_is_non_owner(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, session_id="claude-A", prompt="/craftsman fix"),
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("gate", "--await-user", "--cwd", ".", "--session-id", "claude-A")
+        self.update_state(forced_continuations=3)
+        raw_before = self.state_file.read_bytes()
+
+        out_p, _ = call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, session_id="claude-B", prompt="hello"),
+        )
+        self.assertEqual(out_p, {})
+        self.assertEqual(self.state_file.read_bytes(), raw_before)
+
+        self.update_state(awaiting_user=False)
+        raw_unpaused = self.state_file.read_bytes()
+        out_s, _ = call_hook(
+            "stop",
+            "claude",
+            claude("Stop", self.root, session_id="claude-B"),
+        )
+        self.assertEqual(out_s, {})
+        self.assertEqual(self.state_file.read_bytes(), raw_unpaused)
+
+        owner_s, _ = call_hook(
+            "stop",
+            "claude",
+            claude("Stop", self.root, session_id="claude-A"),
+        )
+        self.assertEqual(owner_s["decision"], "block")
+        self.assertTrue(owner_s["reason"].startswith(header(4)))
+
+    def open_claude_gate_from_the_terminal(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".", env_extra={"CLAUDECODE": "1"})
+        self.repo.write("cart.py", CHANGE)
+
+    def test_another_platforms_stop_leaves_the_gate_unclaimed(self) -> None:
+        self.open_claude_gate_from_the_terminal()
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
+        self.assertEqual(out, {})
+        self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": None})
+
+    def test_first_stop_of_the_owning_platform_claims_the_gate(self) -> None:
+        self.open_claude_gate_from_the_terminal()
+        call_hook("stop", "claude", claude("Stop", self.root, session_id="claude-1"))
+        state = self.state()
+        self.assertEqual(
+            (state["owner"], state["isolation_evidence"]),
+            ({"platform": "claude", "session_id": "claude-1"}, "hooks"),
+        )
+
+    def open_antigravity_gate_from_the_terminal(self) -> None:
+        self.repo.cli(
+            "gate", "--init", "--tier", "standard", "--cwd", ".",
+            env_extra={"ANTIGRAVITY_AGENT": "1"},
+        )  # fmt: skip
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+
+    def test_tool_call_of_another_session_does_not_claim_the_gate(self) -> None:
+        self.open_antigravity_gate_from_the_terminal()
+        payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git status"})
+        self.assertEqual(call_hook("pre-tool", "claude", payload)[0], {})
+        self.assertEqual(self.state()["owner"], {"platform": "antigravity", "session_id": None})
+
+    def test_git_guard_protects_a_session_that_does_not_own_the_gate(self) -> None:
+        self.open_antigravity_gate_from_the_terminal()
+        payload = vscode(
+            "PreToolUse", self.root, tool_name="run_in_terminal",
+            tool_input={"command": "git push origin main"},
+        )  # fmt: skip
+        out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_subagent_hooks_ignore_non_owner_sessions(self) -> None:
+        self.open_antigravity_gate_from_the_terminal()
+        sub_out, _ = call_hook(
+            "subagent-start",
+            "claude",
+            claude("SubagentStart", self.root, agent_id="x", agent_type="Explore"),
+        )
+        self.assertEqual(sub_out, {})
+        self.assertEqual(self.ledger()["agents"], [])
+        self.assertEqual(self.state()["isolation_evidence"], "none")
+
+    def test_craftsman_trigger_in_other_session_preserves_owner_gate(self) -> None:
+        call_hook(
+            "prompt",
+            "copilot",
+            vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep original task"),
+        )
+        self.update_state(forced_continuations=2)
+        raw_before = self.state_file.read_bytes()
+
+        out, _ = call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --quick hijack task"),
+        )
+        context = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("already active and owned by another session", context)
+        self.assertIn("copilot (session vscode-session)", context)
+        self.assertIn("git worktree add", context)
+        self.assertIn("--takeover", context)
+        self.assertEqual(self.state_file.read_bytes(), raw_before)
+
+    def test_reviewer_hook_events_let_a_deep_gate_close_as_isolated(self) -> None:
+        self.init("deep")
+        self.repo.write("cart.py", CHANGE)
+        self.repo.record_full_evidence("deep")
+        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook(
+            "subagent-stop",
+            "claude",
+            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
+        )
+
+        completed = self.repo.cli("gate", "--complete", "--cwd", ".", "--session-id", "claude-session")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual((self.state()["active"], self.state()["stage"]), (False, "completed"))
+        report = self.repo.cli("review", "report").stdout
+        self.assertNotIn("SELF-REVIEWED", report)
 
 
 if __name__ == "__main__":

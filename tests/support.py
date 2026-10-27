@@ -393,6 +393,12 @@ class EvidenceRepo(GitRepo):
             self.cli("run", "--kind", "e2e", "--", sys.executable, "-c", "print('e2e ok')")
 
 
+def write_jsonl(path: Path, *entries: dict[str, Any]) -> None:
+    """A transcript of `entries`, one JSON object per line."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+
+
 @dataclass(frozen=True)
 class CliResult:
     code: int

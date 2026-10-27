@@ -10,10 +10,19 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from craftsman import __version__
 from craftsman.cli import main, skill_main
 from craftsman.gate import GateOwner
 
-from tests.support import REPO_ROOT, EvidenceRepo, assert_cli_error, open_gate
+from tests.support import (
+    REPO_ROOT,
+    SKILL_COUNT,
+    CliResult,
+    EvidenceRepo,
+    assert_cli_error,
+    open_gate,
+    run_main,
+)
 
 
 class StatusTests(unittest.TestCase):
@@ -90,15 +99,67 @@ class SkillCommandTests(unittest.TestCase):
 
         self.assertEqual((code, out.getvalue().strip()), (0, str(REPO_ROOT / "skills" / "code-quality")))
 
-    def test_skill_name_with_underscores_is_unknown(self) -> None:
-        with contextlib.redirect_stderr(io.StringIO()) as err:
-            code = skill_main(["show", "code_quality", "--repo-dir", str(REPO_ROOT)])
+    def skill(self, *args: str) -> CliResult:
+        return run_main(skill_main, *args, "--repo-dir", str(REPO_ROOT))
 
-        self.assertEqual(code, 2)
-        self.assertIn("unknown skill 'code_quality'", err.getvalue())
+    def test_list_names_every_skill(self) -> None:
+        result = self.skill("list", "--json")
+
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(len(json.loads(result.out)), SKILL_COUNT)
+
+    def test_show_prints_the_skill(self) -> None:
+        result = self.skill("show", "craftsman")
+
+        self.assertEqual(
+            result.out, (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8")
+        )
+
+    def test_show_prints_a_companion_file(self) -> None:
+        result = self.skill("show", "code-review", "--file", "lenses.md")
+
+        lenses = (REPO_ROOT / "skills" / "code-review" / "lenses.md").read_text(encoding="utf-8")
+        self.assertEqual(result.out, lenses)
+
+    def test_unknown_skill_is_a_usage_error(self) -> None:
+        result = self.skill("show", "no-such-skill")
+
+        self.assertEqual(result.code, 2)
+        self.assertIn("unknown skill 'no-such-skill'", result.err)
+
+    def test_file_outside_the_skill_is_refused(self) -> None:
+        for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
+            with self.subTest(file=bad_file):
+                result = self.skill("show", "code-review", "--file", bad_file)
+                self.assertEqual(result.code, 2)
+                self.assertIn("craftsman skill: error:", result.err)
+
+    def test_file_symlinked_out_of_the_skill_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve() / "repo"
+            skill_dir = repo / "skills" / "code-review"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8"
+            )
+            (repo.parent / "secret.md").write_text("top secret\n", encoding="utf-8")
+            (skill_dir / "escape.md").symlink_to(repo.parent / "secret.md")
+
+            result = run_main(
+                skill_main, "show", "code-review", "--file", "escape.md", "--repo-dir", str(repo)
+            )
+
+        self.assertEqual(result.code, 2)
+        self.assertIn("escapes skill directory", result.err)
 
 
 class DispatchTests(unittest.TestCase):
+    def test_version_names_this_package(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit):
+            main(["--version"])
+
+        self.assertEqual(out.getvalue().strip(), f"craftsman {__version__}")
+
     def test_unknown_command_is_a_usage_error(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
             main(["frobnicate"])

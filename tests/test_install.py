@@ -149,7 +149,7 @@ class AntigravityTests(InstallTestCase):
         self.assertIn("0 backed up", result.out)
         self.assertFalse((self.config_dir / "skills" / BACKUP_DIR_NAME).exists())
 
-    def test_hooks_json_merge_keeps_the_users_entries_and_flags(self) -> None:
+    def test_hooks_json_merge_keeps_what_the_user_set(self) -> None:
         self.config_dir.mkdir(parents=True)
         original = {
             "craftsman-git-guard": {"enabled": False, "PreToolUse": []},

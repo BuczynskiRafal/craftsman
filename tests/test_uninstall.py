@@ -34,7 +34,12 @@ class ArgumentTests(UninstallTestCase):
         )
 
     def test_no_git_hooks_keeps_the_hooks_of_a_full_uninstall(self) -> None:
-        self.assertFalse(parse_uninstall_args(["--no-git-hooks"]).git_hooks)
+        self.assert_ok(self.install("--all"))
+
+        self.assert_ok(self.uninstall("--no-git-hooks"))
+
+        self.assertEqual(self.hooks_path(), str(self.config_dir / "git-hooks"))
+        self.assertFalse((self.claude_dir / "commands").exists())
 
     def test_no_git_hooks_with_a_target_is_rejected(self) -> None:
         result = self.uninstall("--claude", "--no-git-hooks")

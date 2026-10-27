@@ -151,7 +151,7 @@ class AgentRenderingTests(ExportTestCase):
         with self.assertRaisesRegex(ExportError, "role must be one of orchestrator, reviewer, verifier"):
             load_agent_templates(repo)
 
-    def test_include_paths_must_stay_in_the_repository_and_be_well_formed(self) -> None:
+    def test_include_must_be_a_well_formed_repository_path(self) -> None:
         for directive, message in (
             ("{{include ../outside.md}}", "must be a path inside"),
             ("{{include /etc/passwd}}", "must be a path inside"),
@@ -660,6 +660,44 @@ class CommandLineTests(ExportTestCase):
 
         self.assertEqual(result.out.count("[OK] Exported"), 2)
         self.assertIn(f"[OK] Exported {SKILL_COUNT} Copilot Agent Skills -> {skills}", result.out)
+
+    def test_export_script_writes_every_target(self) -> None:
+        exporter = REPO_ROOT / "scripts" / "copilot-export.py"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_prompts = Path(tmpdir) / "user_prompts"
+            workspace = Path(tmpdir) / "ws"
+            claude_dir = Path(tmpdir) / "claude"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(exporter),
+                    "--repo-dir",
+                    str(REPO_ROOT),
+                    "--user-dir",
+                    str(user_prompts),
+                    "--workspace",
+                    str(workspace),
+                    "--allow-duplicate-scopes",
+                    "--claude-dir",
+                    str(claude_dir),
+                    "--agents-workspace",
+                    str(workspace),
+                ],
+                check=True,
+                env={**os.environ, "HOME": tmpdir, "USERPROFILE": tmpdir},
+            )
+            self.assertFalse((user_prompts / "craftsman.prompt.md").exists())
+            self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
+            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 0)
+            self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
+            self.assertEqual(
+                len(list((workspace / ".github" / "skills").glob("*/SKILL.md"))), SKILL_COUNT
+            )
+            self.assertFalse((workspace / ".github" / "prompts").exists())
+            self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), SKILL_COUNT)
+            self.assertTrue((claude_dir / "rules" / "craftsman-rules.md").is_file())
+            self.assertTrue((workspace / "AGENTS.md").is_file())
+            self.assertTrue((workspace / ".cursor" / "rules" / "craftsman.mdc").is_file())
 
 
 class LocationTests(ExportTestCase):

@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from craftsman.cli import main as cli_main
 from craftsman.ledger import open_round
 from craftsman.records import FieldError, Ledger
 from craftsman.review import parse_view_lenses, view_slug
@@ -22,6 +23,7 @@ from tests.support import (
     coverage_note,
     make_hunk,
     make_snap,
+    run_main,
 )
 
 BUGGY_TOTAL = '''def total(items):
@@ -1005,6 +1007,24 @@ class ViewArgumentTests(unittest.TestCase):
 
     def test_slug_without_hunks_names_only_lenses(self) -> None:
         self.assertEqual(view_slug(["intent"], None), "intent")
+
+
+class PacketPathTests(RepoTestCase):
+    def test_packet_path_without_a_round_is_an_error(self) -> None:
+        result = run_main(cli_main, "review", "show", "--packet-path", "--cwd", str(self.repo.root))
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("no review round yet", result.err)
+
+    def test_packet_path_names_the_current_round_packet(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.assertEqual(run_main(cli_main, "review", "prepare", "--cwd", str(self.repo.root)).code, 0)
+
+        result = run_main(cli_main, "review", "show", "--packet-path", "--cwd", str(self.repo.root))
+
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(Path(result.out.strip()).name, "packet-1.md")
+        self.assertTrue(Path(result.out.strip()).is_file())
 
 
 if __name__ == "__main__":

@@ -141,7 +141,7 @@ class PlatformReportTests(DoctorTestCase):
 
         self.assertEqual((code, report["claude"]["hooks"]), (1, "unreadable"))
 
-    def test_text_report_names_the_health_and_the_problems(self) -> None:
+    def test_text_report_lists_the_problems(self) -> None:
         self.install_user_copilot()
         (self.tmp / ".copilot" / "skills" / "code-review" / "lenses.md").unlink()
 
@@ -273,7 +273,7 @@ class CopilotDuplicateTests(DoctorTestCase):
         path.write_text("---\nname: verify\n---\nPrompt\n", encoding="utf-8")
         return path
 
-    def test_skill_and_prompt_of_one_name_are_a_duplicate(self) -> None:
+    def test_prompt_named_like_a_skill_is_a_duplicate(self) -> None:
         claude_skill, prompt = self.claude_skill(), self.user_prompt()
 
         (dup,) = scan_copilot_duplicates(REPO_ROOT, home=self.tmp)

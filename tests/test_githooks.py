@@ -178,7 +178,7 @@ class HookScriptTests(GitHooksTestCase):
         for name in STANDARD_PASSTHROUGH_GIT_HOOKS:
             self.assertEqual((self.hooks_dir / name).read_bytes(), template, name)
 
-    def test_passthrough_forwards_stdin_to_previous_and_local_hooks(self) -> None:
+    def test_passthrough_forwards_stdin_to_every_chained_hook(self) -> None:
         previous = self.tmp / "previous"
         executable(previous / "post-rewrite", f'cat > "{self.tmp / "previous.txt"}"')
         self.git_global("core.hooksPath", str(previous))
