@@ -885,6 +885,96 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertNotIn("gates", payload3)
             self.assertEqual(payload3["ledger"]["rounds"], 0)
 
+    def test_craftsman_skill_cli_and_review_packet_path(self) -> None:
+        import contextlib
+        import io
+
+        from craftsman.cli import main as cli_main
+
+        def run_cli(*args: str) -> tuple[int, str, str]:
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_main(list(args))
+            return code, out.getvalue(), err.getvalue()
+
+        # 1. skill list & skill list --json
+        code_list, out_list, err_list = run_cli("skill", "list", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_list, 0, err_list)
+        self.assertIn("craftsman", out_list)
+        self.assertIn("code-review", out_list)
+
+        code_json, out_json, _ = run_cli("skill", "list", "--json", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_json, 0)
+        parsed_list = json.loads(out_json)
+        self.assertEqual(len(parsed_list), 17)
+
+        # 2. skill path
+        code_path, out_path, _ = run_cli("skill", "path", "code-review", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_path, 0)
+        self.assertEqual(Path(out_path.strip()), (REPO_ROOT / "skills" / "code-review").resolve())
+
+        # 3. skill show <name> and skill show <name> --file lenses.md
+        code_show, out_show, _ = run_cli("skill", "show", "craftsman", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_show, 0)
+        self.assertIn("name: craftsman", out_show)
+        self.assertNotIn("~/.gemini/config/scripts/craftsman-stop-gate.py", out_show)
+
+        code_lenses, out_lenses, _ = run_cli(
+            "skill", "show", "code-review", "--file", "lenses.md", "--repo-dir", str(REPO_ROOT)
+        )
+        self.assertEqual(code_lenses, 0)
+        self.assertIn("## `intent`", out_lenses)
+
+        # 4. Unknown skill -> exit code 2
+        code_unk, _, err_unk = run_cli("skill", "show", "no-such-skill", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_unk, 2)
+        self.assertIn("unknown skill 'no-such-skill'", err_unk)
+
+        # 5. Path traversal / absolute path / missing file / escaping symlink -> exit code 2
+        for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
+            code_bad, _, err_bad = run_cli(
+                "skill", "show", "code-review", "--file", bad_file, "--repo-dir", str(REPO_ROOT)
+            )
+            self.assertEqual(code_bad, 2, f"Expected exit 2 for --file={bad_file!r}")
+            self.assertIn("craftsman skill: error:", err_bad)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir).resolve()
+            fake_repo = tmp_path / "repo"
+            skill_dir = fake_repo / "skills" / "code-review"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8")
+            outside = tmp_path / "secret.md"
+            outside.write_text("top secret\n", encoding="utf-8")
+            (skill_dir / "escape.md").symlink_to(outside)
+
+            code_sym, _, err_sym = run_cli(
+                "skill", "show", "code-review", "--file", "escape.md", "--repo-dir", str(fake_repo)
+            )
+            self.assertEqual(code_sym, 2)
+            self.assertIn("escapes skill directory", err_sym)
+
+            # 6. review show --packet-path
+            ev_repo = EvidenceRepo(tmp_path / "ev_repo")
+            ev_repo.write_lines("app.py", 5)
+            code_nopkt, _, err_nopkt = run_cli(
+                "review", "show", "--packet-path", "--cwd", str(ev_repo.root)
+            )
+            self.assertEqual(code_nopkt, 1)
+            self.assertIn("no review round yet", err_nopkt)
+
+            code_prep, _, err_prep = run_cli("review", "prepare", "--cwd", str(ev_repo.root))
+            self.assertEqual(code_prep, 0, err_prep)
+            code_pkt, out_pkt, err_pkt = run_cli(
+                "review", "show", "--packet-path", "--cwd", str(ev_repo.root)
+            )
+            self.assertEqual(code_pkt, 0, err_pkt)
+            pkt_path = Path(out_pkt.strip())
+            self.assertTrue(pkt_path.is_absolute())
+            self.assertTrue(pkt_path.is_file())
+            self.assertEqual(pkt_path.name, "packet-1.md")
+
     def test_all_17_skills_have_valid_english_frontmatter_and_match_manifest(self) -> None:
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
         skill_files = sorted((REPO_ROOT / "skills").glob("*/SKILL.md"))

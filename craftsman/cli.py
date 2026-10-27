@@ -23,11 +23,14 @@ from craftsman.export import (
     FRONTMATTER_RE,
     HOOKS_FILENAME,
     _resolve_windows_appdata,
+    _rewrite_antigravity_paths,
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
     default_repo_dir,
     default_vscode_prompts_dir,
+    extract_description_and_body,
+    extract_skill_name,
     is_craftsman_hook_command,
     resolve_craftsman_pkg_dir,
     user_home,
@@ -640,6 +643,145 @@ def _describe_ledger(info: dict[str, Any] | None, error: str | None) -> str:
     )
 
 
+def _discover_skill_dirs(repo_dir: Path) -> dict[str, Path]:
+    skills_root = (repo_dir / "skills").resolve()
+    if not skills_root.is_dir():
+        return {}
+    result: dict[str, Path] = {}
+    for skill_md in sorted(skills_root.glob("*/SKILL.md")):
+        skill_dir = skill_md.parent.resolve()
+        if skill_dir.is_relative_to(skills_root):
+            result[skill_md.parent.name] = skill_dir
+    return result
+
+
+def _validate_skill_relative_file(skill_dir: Path, rel_file: str, skill_name: str) -> Path:
+    if not rel_file or not rel_file.strip():
+        raise ValueError(f"--file for skill {skill_name!r} must not be empty")
+    rel_path = Path(rel_file)
+    if (
+        rel_path.is_absolute()
+        or rel_file.startswith(("/", "\\"))
+        or ".." in rel_path.parts
+        or (len(rel_path.parts) > 0 and ":" in rel_path.parts[0])
+    ):
+        raise ValueError(
+            f"--file {rel_file!r} must be a relative path inside skill {skill_name!r} (no '..' or absolute paths)"
+        )
+    cur = skill_dir
+    for part in rel_path.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            resolved_link = cur.resolve()
+            if not resolved_link.is_relative_to(skill_dir):
+                raise ValueError(
+                    f"--file {rel_file!r} escapes skill directory {skill_name!r} via symlink"
+                )
+    resolved = (skill_dir / rel_path).resolve()
+    if resolved == skill_dir or not resolved.is_relative_to(skill_dir):
+        raise ValueError(
+            f"--file {rel_file!r} must resolve inside skill directory {skill_name!r}"
+        )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"file {rel_file!r} not found in skill {skill_name!r}")
+    return resolved
+
+
+def skill_main(argv: list[str] | None = None) -> int:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--repo-dir",
+        type=Path,
+        default=default_repo_dir(),
+        help="Path to the Craftsman repository or bundled assets root.",
+    )
+    parser = argparse.ArgumentParser(
+        prog="craftsman skill",
+        description="Read bundled Craftsman skills and companion files without searching the disk.",
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+
+    show_p = sub.add_parser(
+        "show",
+        parents=[common],
+        help="Print a bundled SKILL.md or companion file (such as lenses.md) to stdout.",
+    )
+    show_p.add_argument("name", help="Skill name (e.g. craftsman, code-review, simplify)")
+    show_p.add_argument(
+        "--file",
+        dest="rel_file",
+        help="Relative file inside the skill directory (e.g. lenses.md)",
+    )
+
+    list_p = sub.add_parser(
+        "list",
+        parents=[common],
+        help="List bundled skill names and their one-sentence descriptions.",
+    )
+    list_p.add_argument("--json", action="store_true", help="Output skill list as JSON.")
+
+    path_p = sub.add_parser(
+        "path",
+        parents=[common],
+        help="Print the resolved directory path of a bundled skill.",
+    )
+    path_p.add_argument("name", help="Skill name (e.g. craftsman, code-review)")
+
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    repo_dir = Path(args.repo_dir).resolve()
+    known = _discover_skill_dirs(repo_dir)
+
+    if args.subcommand == "list":
+        entries: list[dict[str, str]] = []
+        for folder_name, skill_dir in known.items():
+            raw = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+            name = extract_skill_name(raw, folder_name)
+            desc, _ = extract_description_and_body(raw, name)
+            first_sentence = desc.split(". ", 1)[0].rstrip(".") + "." if desc else ""
+            entries.append(
+                {
+                    "name": folder_name,
+                    "description": first_sentence,
+                    "path": str(skill_dir),
+                }
+            )
+        if args.json:
+            sys.stdout.write(json.dumps(entries, indent=2, ensure_ascii=False) + "\n")
+            return 0
+        width = max((len(e["name"]) for e in entries), default=12)
+        for entry in entries:
+            print(f"{entry['name']:<{width}}  {entry['description']}")
+        return 0
+
+    skill_name: str = args.name
+    if skill_name not in known:
+        available = ", ".join(sorted(known)) or "none"
+        sys.stderr.write(
+            f"craftsman skill: error: unknown skill {skill_name!r} (available: {available})\n"
+        )
+        return 2
+
+    skill_dir = known[skill_name]
+    if args.subcommand == "path":
+        print(str(skill_dir))
+        return 0
+
+    rel_file: str | None = args.rel_file
+    try:
+        target = (
+            _validate_skill_relative_file(skill_dir, rel_file, skill_name)
+            if rel_file is not None
+            else (skill_dir / "SKILL.md").resolve()
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        sys.stderr.write(f"craftsman skill: error: {exc}\n")
+        return 2
+
+    content = _rewrite_antigravity_paths(target.read_text(encoding="utf-8"))
+    sys.stdout.write(content if content.endswith("\n") else content + "\n")
+    return 0
+
+
 def _tolerate_unencodable_output() -> None:
     """Print `?` for characters the console cannot encode (legacy Windows code pages) instead of crashing."""
     for stream in (sys.stdout, sys.stderr):
@@ -709,6 +851,10 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser(
         "run", help="Run a command and record its exit code in the evidence ledger."
     )
+    subparsers.add_parser(
+        "skill",
+        help="Read bundled Craftsman skills and companion files without searching the disk.",
+    )
 
     if not args_list:
         parser.print_help()
@@ -731,6 +877,8 @@ def main(argv: list[str] | None = None) -> int:
         return review_main(args_list[1:])
     if cmd == "run":
         return run_main(args_list[1:])
+    if cmd == "skill":
+        return skill_main(args_list[1:])
 
     parsed = parser.parse_args(args_list)
     if parsed.command == "doctor":
