@@ -31,6 +31,7 @@ from craftsman.gate import (
 from craftsman.ledger import (
     DESIGN_LENS,
     RESOLUTIONS,
+    SELF_REVIEWED_BANNER,
     SEVERITIES,
     SWEEP_LENS,
     VERDICTS,
@@ -249,7 +250,7 @@ def _batch_error(index: int, label: str | None, exc: LedgerError) -> LedgerError
 
 def _cover_from_json(args: argparse.Namespace) -> int:
     if any(val is not None for val in (args.lens, args.hunks, args.files, args.note)):
-        raise LedgerError("--from-json cannot be combined with --lens, --hunks, --files or --note")
+        raise LedgerError("--from-json cannot be combined with --lens, --hunks or --note (or --files)")
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
     snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
@@ -369,7 +370,7 @@ def _add_from_json(args: argparse.Namespace) -> int:
     if any(val is not None for val in flags):
         raise LedgerError(
             "--from-json cannot be combined with --lens, --file, --line, --severity, --title, "
-            "--scenario, --suggestion or --signal"
+            "--scenario or --suggestion (or --signal)"
         )
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
@@ -747,6 +748,7 @@ def _check(args: argparse.Namespace) -> int:
 def _report_json(report: GateReport) -> dict[str, Any]:
     return {
         "passed": report.passed,
+        "self_reviewed": report.self_reviewed,
         "issues": [{"code": issue.code, "message": issue.message} for issue in report.issues],
         "warnings": list(report.warnings),
         "summary": report.summary,
@@ -863,8 +865,10 @@ def _report_lines(
     groups: dict[str, list[Finding]],
     runs: Sequence[Run],
 ) -> list[str]:
-    lines = [
-        "# Craftsman review report",
+    lines = ["# Craftsman review report"]
+    if report.self_reviewed:
+        lines.append(f"**{SELF_REVIEWED_BANNER}**")
+    lines += [
         f"- Base `{snap.base_sha[:7]}` · tier `{tier}` · {len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),

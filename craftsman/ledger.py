@@ -33,6 +33,7 @@ Verdict = Literal["proven", "probable", "question", "dismissed"]
 Resolution = Literal["fixed", "accepted"]
 RunKind = Literal["test", "e2e", "repro", "lint", "build", "other"]
 AgentEventKind = Literal["start", "stop"]
+IsolationEvidence = Literal["hooks", "transcript", "none"]
 IssueCode = Literal[
     "no-round",
     "stale-round",
@@ -54,6 +55,10 @@ VERDICTS: tuple[Verdict, ...] = get_args(Verdict)
 RESOLUTIONS: tuple[Resolution, ...] = get_args(Resolution)
 RUN_KINDS: tuple[RunKind, ...] = get_args(RunKind)
 AGENT_EVENT_KINDS: tuple[AgentEventKind, ...] = get_args(AgentEventKind)
+ISOLATION_EVIDENCES: tuple[IsolationEvidence, ...] = get_args(IsolationEvidence)
+SELF_REVIEWED_BANNER = (
+    "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change"
+)
 
 SCHEMA_VERSION = 1
 LEDGER_FILENAME = "ledger.json"
@@ -1786,6 +1791,7 @@ class GateReport:
     warnings: tuple[str, ...]
     summary: str
     review_only: bool = False
+    self_reviewed: bool = False
 
     @property
     def passed(self) -> bool:
@@ -1795,18 +1801,24 @@ class GateReport:
 @dataclass(frozen=True)
 class GatePolicy:
     tier: Tier
-    require_isolation: bool
+    require_isolation: bool = False
     reviewer_agent_markers: tuple[str, ...] = ("craftsman-reviewer",)
     max_rounds: int = 5
+    isolation_evidence: IsolationEvidence = "none"
 
     def __post_init__(self) -> None:
         _require_choice(self.tier, TIERS, "tier")
+        _require_choice(self.isolation_evidence, ISOLATION_EVIDENCES, "isolation_evidence")
         _require(self.max_rounds >= 1, "max_rounds", "must be >= 1")
         _require(
             bool(self.reviewer_agent_markers) and all(m.strip() for m in self.reviewer_agent_markers),
             "reviewer_agent_markers",
             "must contain at least one non-blank marker",
         )
+        if self.require_isolation and self.isolation_evidence == "none":
+            object.__setattr__(self, "isolation_evidence", "hooks")
+        elif self.isolation_evidence != "none" and self.tier != "quick":
+            object.__setattr__(self, "require_isolation", True)
 
 
 def evaluate(
@@ -1841,11 +1853,18 @@ def evaluate(
         *(_isolation_issues(ledger, latest, policy) if latest else ()),
         *_round_cap_issues(ledger, policy),
     ]
+    self_reviewed = bool(
+        latest is not None
+        and policy.tier != "quick"
+        and not policy.require_isolation
+        and not _has_isolated_reviewer_stop(ledger, latest, policy)
+    )
     return GateReport(
         tuple(issues),
         _warnings(ledger, snap, policy, review_only=review_only),
         _summary(ledger, snap),
         review_only=review_only,
+        self_reviewed=self_reviewed,
     )
 
 
@@ -2184,20 +2203,23 @@ def _failing_run_issues(ledger: Ledger) -> list[GateIssue]:
     ]
 
 
-def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
-    if not policy.require_isolation or policy.tier == "quick":
-        return []
+def _has_isolated_reviewer_stop(ledger: Ledger, latest: Round, policy: GatePolicy) -> bool:
     if all(hunk.carried for hunk in latest.hunks):
-        return []  # nothing for a reviewer to read, e.g. a rename-only or binary-only diff
+        return True
     prepared_at = parse_timestamp(latest.prepared_at)
     markers = [marker.lower() for marker in policy.reviewer_agent_markers]
-    reviewed = any(
+    return any(
         event.event == "stop"
         and any(marker in event.agent.lower() for marker in markers)
         and parse_timestamp(event.at) >= prepared_at
         for event in ledger.agents
     )
-    if reviewed:
+
+
+def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
+    if not policy.require_isolation or policy.tier == "quick":
+        return []
+    if _has_isolated_reviewer_stop(ledger, latest, policy):
         return []
     return [
         GateIssue(
@@ -2346,7 +2368,10 @@ def render_report(report: GateReport) -> str:
     else:
         status = "PASSED" if report.passed else f"BLOCKED ({len(report.issues)} open items)"
         header = f"**Craftsman gate: {status}**"
-    lines = [header, "", report.summary]
+    lines = [header]
+    if report.self_reviewed:
+        lines.append(f"**{SELF_REVIEWED_BANNER}**")
+    lines += ["", report.summary]
     if report.issues:
         lines += ["", "**Next actions**", *render_next_actions(report.issues)]
     if report.warnings:

@@ -912,7 +912,21 @@ class GateTests(unittest.TestCase):
 
         reviewed = add_agent_event(ledger, stop("Craftsman-Reviewer#2", T1))
         self.assertTrue(evaluate(reviewed, self.snap, standard).passed)
+        self.assertFalse(evaluate(reviewed, self.snap, standard).self_reviewed)
         self.assertTrue(evaluate(ledger, self.snap, replace(standard, tier="quick")).passed)
+
+    def test_standard_review_without_isolation_is_marked_self_reviewed(self) -> None:
+        unisolated = GatePolicy(tier="standard", require_isolation=False)
+        ledger = fully_reviewed(self.snap, tier="standard")
+
+        report = evaluate(ledger, self.snap, unisolated)
+
+        self.assertTrue(report.passed)
+        self.assertTrue(report.self_reviewed)
+        self.assertIn(
+            "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change",
+            render_report(report),
+        )
 
     def test_round_cap(self) -> None:
         ledger = Ledger()

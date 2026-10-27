@@ -43,6 +43,7 @@ from craftsman.gate import (
     GateOwner,
     _safe_int,
     archive_ledger_for_new_base,
+    complete_gate_for_report,
     continuation_reason,
     default_state,
     evaluate_task,
@@ -50,9 +51,9 @@ from craftsman.gate import (
     get_head_sha,
     is_craftsman_trigger_content,
     load_state,
-    mark_completed,
     owns_gate,
     resolve_cli_state_file,
+    resolve_effective_tier,
     save_state_atomic,
     write_gate_owner,
 )
@@ -324,9 +325,14 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
 
 
 def mark_hooks_seen(session: Session, platform: Platform) -> None:
-    if session.active and session.state is not None and session.state.get("hooks_seen") != platform:
-        session.state["hooks_seen"] = platform
-        session.save()
+    if session.active and session.state is not None:
+        if (
+            session.state.get("hooks_seen") != platform
+            or session.state.get("isolation_evidence") != "hooks"
+        ):
+            session.state["hooks_seen"] = platform
+            session.state["isolation_evidence"] = "hooks"
+            session.save()
 
 
 # --- prompt ---------------------------------------------------------------------------------
@@ -382,6 +388,7 @@ def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
     )
     state["task"] = task_from_prompt(hook.prompt)
     state["hooks_seen"] = reply.platform
+    state["isolation_evidence"] = "hooks"
     if base:
         archive_ledger_for_new_base(root, base)
     save_state_atomic(session.state_file, state)
@@ -425,7 +432,8 @@ def on_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
             "decision; `craftsman review report` lists them. Start `/craftsman` again to restart.",
         )
     if report is not None and report.passed:
-        mark_completed(state, _safe_int(state.get("started_at_step"), 0))
+        eff_tier = resolve_effective_tier(state, str(session.root))
+        complete_gate_for_report(state, _safe_int(state.get("started_at_step"), 0), eff_tier, report)
         session.save()
         return reply.allow()
 

@@ -1012,6 +1012,50 @@ class SessionOwnershipTests(HookTestCase):
         self.assertTrue(out2["reason"].startswith("[CRAFTSMAN GATE 2/6] "))
         self.assertNotIn("owner", self.state())
 
+    def test_standard_review_without_isolation_is_marked_self_reviewed(self) -> None:
+        self.init("standard")
+        self.repo.write("cart.py", CHANGE)
+        self.repo.record_full_evidence("standard")
+
+        completed = self.repo.cli("gate", "--complete", "--cwd", ".")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            (self.state()["active"], self.state()["stage"]),
+            (False, "complete-unisolated"),
+        )
+        report = self.repo.cli("review", "report").stdout
+        self.assertIn(
+            "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change",
+            report,
+        )
+
+    def test_deep_review_without_isolation_evidence_needs_human(self) -> None:
+        self.init("deep")
+        self.repo.write("cart.py", CHANGE)
+        self.repo.record_full_evidence("deep")
+
+        completed = self.repo.cli("gate", "--complete", "--cwd", ".")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.state()["stage"], "needs_human")
+
+    def test_review_with_subagent_hook_events_completes_normally(self) -> None:
+        self.init("deep")
+        self.repo.write("cart.py", CHANGE)
+        self.repo.record_full_evidence("deep")
+        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook(
+            "subagent-stop",
+            "claude",
+            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
+        )
+
+        completed = self.repo.cli("gate", "--complete", "--cwd", ".")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual((self.state()["active"], self.state()["stage"]), (False, "completed"))
+        report = self.repo.cli("review", "report").stdout
+        self.assertNotIn("SELF-REVIEWED", report)
+
 
 if __name__ == "__main__":
     unittest.main()
