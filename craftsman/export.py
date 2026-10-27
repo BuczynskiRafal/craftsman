@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, get_args
 
+from craftsman.lenses import render_reviewer_groups_markdown
+
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 CRAFTSMAN_BEGIN_MARKER = "<!-- craftsman:begin -->"
 CRAFTSMAN_END_MARKER = "<!-- craftsman:end -->"
@@ -431,6 +433,7 @@ def _rewrite_antigravity_paths(body: str) -> str:
     )
     rewritten = rewritten.replace("<artifactDirectoryPath>", dir_expr)
     rewritten = rewritten.replace("<appDataDir>/brain/<conversation-id>", dir_expr)
+    rewritten = rewritten.replace("{{reviewer_groups}}", render_reviewer_groups_markdown())
     return rewritten
 
 
@@ -1086,6 +1089,8 @@ def render_agents_md(repo_dir: Path) -> str:
         "the base commit; the review always covers the whole diff since then (standalone `/code-review` without `--fix` does not start a gate session).",
         "- **Review:** `craftsman review prepare` writes a packet of hunks and lenses; record what each "
         "lens examined with `craftsman review cover` (or `--from-json - <<'EOF'`) and every defect with `craftsman review add` (or `--from-json - <<'EOF'`).",
+        "  Reviewer groups:",
+        *(f"  {line}" for line in render_reviewer_groups_markdown().splitlines()),
         "- **Verify findings:** group unjudged same-root-cause duplicates first with `craftsman review merge <target> <dup>` "
         "(only when one fix removes every consequence), then record verdicts with `craftsman review verdict` (or `--from-json - <<'EOF'`), "
         'fix and `craftsman review resolve <id> --as fixed --note "..."`; prepare a new '

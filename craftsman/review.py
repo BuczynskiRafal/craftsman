@@ -69,7 +69,7 @@ from craftsman.ledger import (
     uncovered_by_lens,
     waive_run,
 )
-from craftsman.lenses import LENS_IDS, TIERS, Tier, select_lenses
+from craftsman.lenses import LENS_IDS, REVIEWER_GROUPS, TIERS, Tier, select_lenses
 from craftsman.packet import collect_context, expand_hunk_spec, render_packet, render_packet_view
 from craftsman.quality import (
     MAX_PRODUCTION_ADDED_LINES,
@@ -250,16 +250,24 @@ def _view_slug(lenses: Sequence[str], hunks_raw: str | None) -> str:
     return f"{lens_slug}.{hunk_slug}" if hunk_slug else lens_slug
 
 
-def _parse_view_lenses(raw: str) -> list[str]:
-    lenses = [item.strip() for item in raw.split(",") if item.strip()]
-    if not lenses:
+def _parse_view_lenses(raw: str, round_lenses: Sequence[str] = ()) -> list[str]:
+    tokens = [item.strip() for item in raw.split(",") if item.strip()]
+    if not tokens:
         raise FieldError("lenses", "must name at least one lens")
-    for lens in lenses:
-        if lens not in LENS_IDS:
+    selected = set(round_lenses)
+    lenses: list[str] = []
+    for token in tokens:
+        if token in REVIEWER_GROUPS:
+            group = REVIEWER_GROUPS[token]
+            active = [item for item in group if item in selected] if selected else list(group)
+            lenses.extend(active or group)
+        elif token in LENS_IDS:
+            lenses.append(token)
+        else:
             raise FieldError(
-                "lenses", f"unknown lens {lens!r} (choose from {', '.join(sorted(LENS_IDS))})"
+                "lenses", f"unknown lens {token!r} (choose from {', '.join(sorted(LENS_IDS))})"
             )
-    return lenses
+    return list(dict.fromkeys(lenses))
 
 
 def _view(args: argparse.Namespace) -> int:
@@ -269,7 +277,7 @@ def _view(args: argparse.Namespace) -> int:
         raise LedgerError("no review round yet; run `craftsman review prepare` first")
     round_ = ledger.rounds[-1]
     snap = snapshot(ws.root, resolve_base(ws, ledger, None))
-    lenses = _parse_view_lenses(args.lenses)
+    lenses = _parse_view_lenses(args.lenses, round_.lenses)
     all_ids = [hunk.id for hunk in snap.hunks]
     open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried and hunk.id in all_ids] or all_ids
     assigned = expand_hunk_spec(args.hunks, all_ids) if args.hunks else tuple(open_ids)
