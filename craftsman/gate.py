@@ -11,7 +11,7 @@ Enforces the 3-Gear Adaptive Quality Gate:
   verification in `transcript.jsonl` that an isolated subagent (`Craftsman Quality Gate
   Auditor`) was invoked via `invoke_subagent` after task start and covers the final code state.
 - Gear 3 (`deep` / Full-Audit Hard-Loop): Activated via `--tier deep` (`/craftsman --deep`
-  or keyword `ultracode`). Always requires the isolated Quality Gate Auditor subagent
+  or keyword `ultracraft`). Always requires the isolated Quality Gate Auditor subagent
   regardless of diff size.
 """
 
@@ -27,8 +27,21 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-REQUIRED_GATES = ("simplified", "reviewed", "verified")
+from craftsman.diffscan import DiffScanError
+from craftsman.evidence import Evaluation, archive_ledger_if_rebased, evaluate_evidence
+from craftsman.ledger import (
+    GatePolicy,
+    GateReport,
+    LedgerError,
+    render_next_actions,
+    render_report,
+)
+from craftsman.lenses import Tier
+
 DEFAULT_MAX_CONTINUATIONS = 3
+MAX_CONTINUATION_REASON_CHARS = 1800
+MAX_ERROR_CHARS = 400
+DEPRECATED_PASS_FLAGS = ("--pass-simplify", "--pass-review", "--pass-verify")
 SMALL_DIFF_MAX_LINES = 40
 SMALL_DIFF_MAX_FILES = 2
 MAX_UNTRACKED_TEXT_FILE_BYTES = 1_048_576  # 1 MiB
@@ -39,7 +52,7 @@ TIER_RANK = {"quick": 0, "auto": 1, "standard": 2, "deep": 3}
 QUALITY_GATE_ROLE_MARKERS = (
     "quality gate",
     "auditor",
-    "code reviewer",
+    "reviewer",  # `craftsman-reviewer`, "Craftsman Reviewer", "code reviewer"
     "audytor",
 )
 QUALITY_GATE_SKILL_MARKERS = ("simplify", "code-review", "verify")
@@ -73,16 +86,16 @@ AUDIT_SECTION_FAIL_RE = re.compile(
 SUBAGENT_ACK_CONV_ID_RE = re.compile(r'"conversationId"\s*:\s*"([^"]+)"')
 
 LEADING_COMMAND_TRIGGER_RE = re.compile(
-    r"(?i)^\s*(?:/[a-z0-9_-]+\s+)*(/craftsman|ultracode)(?=$|[\s.,:;!])"
+    r"(?i)^\s*(?:/[a-z0-9_-]+\s+)*(/craftsman|ultracraft)(?=$|[\s.,:;!])"
 )
 INLINE_TRIGGER_RE = re.compile(
-    r"(?i)(?:^|\s)(/craftsman|ultracode)(?=$|[\s.,!:])"
+    r"(?i)(?:^|\s)(/craftsman|ultracraft)(?=$|[\s.,!:])"
 )
 CRAFTSMAN_FLAG_TIER_RE = re.compile(
     r"(?i)/craftsman(?:\s+--(quick|soft|standard|deep))\b"
 )
 CLAUDE_COMMAND_NAME_RE = re.compile(
-    r"<command-name>\s*/?(craftsman|ultracode)\s*</command-name>", re.IGNORECASE
+    r"<command-name>\s*/?(craftsman|ultracraft)\s*</command-name>", re.IGNORECASE
 )
 CLAUDE_COMMAND_ARGS_RE = re.compile(
     r"<command-args>(.*?)</command-args>", re.DOTALL | re.IGNORECASE
@@ -93,8 +106,8 @@ CONVERSATIONAL_OR_NEGATED_PREFIX_RE = re.compile(
     r"do\s+not|don't\s+want|don't\s+use|not\s+want|without|avoid|never\s+use|"
     r"nie\s+chc[eę]|nie\s+u[żz]ywaj|bez)\b"
 )
-NON_IMPERATIVE_ULTRACODE_RE = re.compile(
-    r"(?i)\bultracode\s+(?:does|is|works|keyword|mode|rule)\b"
+NON_IMPERATIVE_ULTRACRAFT_RE = re.compile(
+    r"(?i)\bultracraft\s+(?:does|is|works|keyword|mode|rule)\b"
 )
 SKILL_METADATA_TRIGGER_RE = re.compile(
     r"<SKILL>[^<]*skills/craftsman/SKILL\.md</SKILL>", re.IGNORECASE
@@ -329,7 +342,7 @@ def requires_subagent_for_state(state: dict[str, Any], fallback_cwd: str | None 
     tier = str(state.get("tier") or "auto").strip().lower()
     mode = str(state.get("mode") or "craftsman").strip().lower()
 
-    if mode == "ultracode" or tier in ("deep", "standard"):
+    if mode == "ultracraft" or tier in ("deep", "standard"):
         return True
     if tier == "quick":
         return False
@@ -348,15 +361,58 @@ def requires_subagent_for_state(state: dict[str, Any], fallback_cwd: str | None 
     return True
 
 
-def resolve_effective_gear_label(state: dict[str, Any], fallback_cwd: str | None = None) -> str:
-    """Return human-readable 3-Gear label consistent with `requires_subagent_for_state`."""
+def resolve_effective_tier(state: dict[str, Any], fallback_cwd: str | None = None) -> Tier:
+    """Concrete review tier of a state; `auto` resolves by the size of the cumulative diff."""
     tier = str(state.get("tier") or "auto").strip().lower()
     mode = str(state.get("mode") or "craftsman").strip().lower()
-    if mode == "ultracode" or tier == "deep":
-        return "deep (Gear 3: Full-Audit Hard-Loop)"
-    if not requires_subagent_for_state(state, fallback_cwd):
-        return "quick (Gear 1: Soft-Loop)"
-    return "standard (Gear 2: Hybrid Hard-Loop)"
+    if mode == "ultracraft" or tier == "deep":
+        return "deep"
+    return "standard" if requires_subagent_for_state(state, fallback_cwd) else "quick"
+
+
+def resolve_effective_gear_label(state: dict[str, Any], fallback_cwd: str | None = None) -> str:
+    """Return human-readable 3-Gear label consistent with `requires_subagent_for_state`."""
+    return {
+        "deep": "deep (Gear 3: Full-Audit Hard-Loop)",
+        "standard": "standard (Gear 2: Hybrid Hard-Loop)",
+        "quick": "quick (Gear 1: Soft-Loop)",
+    }[resolve_effective_tier(state, fallback_cwd)]
+
+
+def gate_policy(state: dict[str, Any], tier: Tier) -> GatePolicy:
+    """The gate policy for a task; the single place that decides whether isolation is required.
+
+    Subagent isolation is only demanded where platform hooks record subagent events, which they
+    announce by setting `hooks_seen` on the active state.
+    """
+    return GatePolicy(tier=tier, require_isolation=bool(state.get("hooks_seen")) and tier != "quick")
+
+
+def evaluate_task(state: dict[str, Any], fallback_cwd: str | None) -> Evaluation:
+    """Evaluate the evidence ledger for the task described by `state`.
+
+    Shared by `gate --complete`, the stop hooks and `craftsman review check` semantics. Raises
+    `DiffScanError` or `LedgerError` when the work tree or the ledger cannot be read.
+    """
+    state_cwd = state.get("cwd")
+    cwd = state_cwd if isinstance(state_cwd, str) and state_cwd else fallback_cwd or os.getcwd()
+    base = state.get("base_sha")
+    tier = resolve_effective_tier(state, cwd)
+    base_ref = base if isinstance(base, str) and base else None
+    return evaluate_evidence(cwd, base_ref, tier, lambda strictest: gate_policy(state, strictest))
+
+
+def needs_transcript_auditor(
+    state: dict[str, Any], entries: list[dict[str, Any]], fallback_cwd: str | None
+) -> bool:
+    """Whether the legacy transcript check for an auditor subagent applies.
+
+    Platform hooks record subagent runs in the ledger, which `gate_policy` then enforces, so the
+    transcript heuristic only applies to sessions without them.
+    """
+    if not entries or state.get("hooks_seen"):
+        return False
+    return requires_subagent_for_state(state, fallback_cwd)
 
 
 def _encode_claude_project_slug(cwd: str) -> str:
@@ -540,13 +596,7 @@ def default_state(
         "awaiting_user": False,
         "subagent_verified": False,
         "auto_detected": auto_detected,
-        "gates": {
-            "simplified": False,
-            "reviewed": False,
-            "verified": False,
-        },
         "forced_continuations": 0,
-        "max_continuations": DEFAULT_MAX_CONTINUATIONS,
     }
 
 
@@ -620,7 +670,7 @@ def is_waiting_on_ask_question_in_entries(entries: list[dict[str, Any]]) -> bool
 
 
 def _extract_craftsman_flag_tier(text: str, trigger_token: str) -> str:
-    if trigger_token.lower() == "ultracode":
+    if trigger_token.lower() == "ultracraft":
         return "deep"
     flag_match = CRAFTSMAN_FLAG_TIER_RE.search(text)
     if flag_match and flag_match.group(1):
@@ -637,7 +687,7 @@ def is_craftsman_trigger_content(content: str) -> tuple[bool, str]:
     claude_cmd = CLAUDE_COMMAND_NAME_RE.search(content)
     if claude_cmd:
         cmd_token = claude_cmd.group(1).lower()
-        if cmd_token == "ultracode":
+        if cmd_token == "ultracraft":
             return True, "deep"
         args_match = CLAUDE_COMMAND_ARGS_RE.search(content)
         args_text = args_match.group(1).strip() if args_match else ""
@@ -654,8 +704,8 @@ def is_craftsman_trigger_content(content: str) -> tuple[bool, str]:
     if leading_match:
         tok = leading_match.group(1)
         first_line = unquoted.splitlines()[0].strip() if unquoted.splitlines() else unquoted
-        if tok.lower() == "ultracode" and (
-            NON_IMPERATIVE_ULTRACODE_RE.search(first_line) or "?" in first_line
+        if tok.lower() == "ultracraft" and (
+            NON_IMPERATIVE_ULTRACRAFT_RE.search(first_line) or "?" in first_line
         ):
             pass
         else:
@@ -676,7 +726,7 @@ def is_craftsman_trigger_content(content: str) -> tuple[bool, str]:
         if CONVERSATIONAL_OR_NEGATED_PREFIX_RE.search(prefix):
             continue
         tok = inline_match.group(1)
-        if tok.lower() == "ultracode" and NON_IMPERATIVE_ULTRACODE_RE.search(line_stripped):
+        if tok.lower() == "ultracraft" and NON_IMPERATIVE_ULTRACRAFT_RE.search(line_stripped):
             continue
         return True, _extract_craftsman_flag_tier(line_stripped, tok)
 
@@ -686,7 +736,7 @@ def is_craftsman_trigger_content(content: str) -> tuple[bool, str]:
 def detect_untracked_craftsman_trigger(
     entries: list[dict[str, Any]], after_step: int
 ) -> tuple[int, str] | None:
-    """If user triggered `/craftsman` or `ultracode` after `after_step`, return (step_index, tier)."""
+    """If user triggered `/craftsman` or `ultracraft` after `after_step`, return (step_index, tier)."""
     found: tuple[int, str] | None = None
     for idx, entry in enumerate(entries, start=1):
         step_idx = _safe_int(entry.get("step_index"), idx)
@@ -1064,7 +1114,7 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
     if completed_at > latest_step:
         completed_at = -1
 
-    # Auto-detect `/craftsman` or `ultracode` from transcript even if agent forgot `--init`
+    # Auto-detect `/craftsman` or `ultracraft` from transcript even if agent forgot `--init`
     if (not state or not state.get("active", False)) and entries:
         trigger_info = detect_untracked_craftsman_trigger(entries, completed_at)
         if trigger_info is not None:
@@ -1077,7 +1127,7 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
             if diff_stats is not None and diff_stats[0] == 0:
                 return "allow", None
             state = default_state(
-                mode="ultracode" if detected_tier == "deep" else "craftsman",
+                mode="ultracraft" if detected_tier == "deep" else "craftsman",
                 tier=detected_tier,
                 cwd=ws_cwd_str,
                 base_sha=auto_base_sha,
@@ -1107,29 +1157,24 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         return "allow", None
 
     since_step = _safe_int(state.get("started_at_step"), 0)
-    needs_subagent = requires_subagent_for_state(state, ws_cwd_str)
-    subagent_ok = bool(state.get("subagent_verified", False))
-    if entries and needs_subagent:
-        subagent_ok = has_quality_gate_subagent_in_entries(entries, since_step)
-        state["subagent_verified"] = subagent_ok
+    missing_subagent = False
+    if needs_transcript_auditor(state, entries, ws_cwd_str):
+        state["subagent_verified"] = has_quality_gate_subagent_in_entries(entries, since_step)
+        missing_subagent = not state["subagent_verified"]
+    report: GateReport | None = None
+    evidence_error: str | None = None
+    try:
+        report = evaluate_task(state, ws_cwd_str).report
+    except (DiffScanError, LedgerError) as exc:
+        evidence_error = str(exc)
 
-    gates = state.get("gates")
-    if not isinstance(gates, dict):
-        gates = {}
+    if report is not None and any(issue.code == "round-cap" for issue in report.issues):
+        state["stage"] = "needs_human"
+        _try_save_state(state_file, state)
+        return "allow", None
 
-    missing = [gate for gate in REQUIRED_GATES if not bool(gates.get(gate, False))]
-    if (
-        entries
-        and needs_subagent
-        and not subagent_ok
-        and "invoke_subagent(Craftsman Quality Gate Auditor)" not in missing
-    ):
-        missing.insert(0, "invoke_subagent(Craftsman Quality Gate Auditor)")
-
-    if not missing:
-        state["active"] = False
-        state["stage"] = "completed"
-        state["completed_at_step"] = get_latest_step_index(entries)
+    if report is not None and report.passed and not missing_subagent:
+        mark_completed(state, get_latest_step_index(entries))
         _try_save_state(state_file, state)
         return "allow", None
 
@@ -1145,28 +1190,39 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     state["forced_continuations"] = forced + 1
     _try_save_state(state_file, state)
+    header = f"[CRAFTSMAN GATE {forced + 1}/{max_cont}]"
+    return "continue", continuation_reason(header, report, evidence_error, missing_subagent)
 
-    base_sha = state.get("base_sha") or "HEAD~1"
-    missing_str = ", ".join(missing)
-    if needs_subagent:
-        return (
-            "continue",
-            f"[CRAFTSMAN HARD-LOOP GATE ({forced + 1}/{max_cont})] "
-            f"Task completion blocked until the Stage 1 Quality Gate is satisfied. "
-            f"Missing requirements: [{missing_str}]. "
-            f"Hybrid Hard-Loop Context Isolation: inline review in the main thread is insufficient. "
-            f"You must invoke 'invoke_subagent' (TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') "
-            f"so an isolated subagent executes /simplify, /code-review, and /verify "
-            f"across the full cumulative diff (git diff {base_sha}), and then run "
-            f"craftsman-stop-gate.py --state-file {state_file} --complete.",
+
+def continuation_reason(
+    header: str, report: GateReport | None, evidence_error: str | None, missing_subagent: bool
+) -> str:
+    """Tell the agent exactly what is missing, within a size the platforms display in full."""
+    lines = [
+        f"{header} Task completion is blocked until the evidence ledger proves the change is "
+        "reviewed and verified."
+    ]
+    if missing_subagent:
+        lines.append(
+            "Missing: an isolated reviewer — run the review lenses in a `craftsman-reviewer` "
+            "subagent (invoke_subagent with Role 'Craftsman Reviewer'); inline review in the main "
+            "thread does not count."
         )
-    return (
-        "continue",
-        f"[CRAFTSMAN SOFT-LOOP GATE ({forced + 1}/{max_cont})] "
-        f"Missing verification steps for Quick Mode: [{missing_str}]. "
-        f"Execute /simplify, /code-review, and /verify, then close the gate via "
-        f"craftsman-stop-gate.py --state-file {state_file} --complete.",
-    )
+    if evidence_error is not None:
+        lines.append(f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}")
+    closing = "Close the gate with `craftsman gate --complete` once `craftsman review check` passes."
+    if report is not None and report.issues:
+        lines.append("Next actions:")
+        more = "… run `craftsman review check` for the remaining actions."
+        budget = MAX_CONTINUATION_REASON_CHARS - sum(len(line) + 1 for line in (*lines, closing, more))
+        for action in render_next_actions(report.issues):
+            if len(action) + 1 > budget:
+                lines.append(more)
+                break
+            lines.append(action)
+            budget -= len(action) + 1
+    lines.append(closing)
+    return "\n".join(lines)
 
 
 def run_cli(argv: list[str]) -> int:
@@ -1184,22 +1240,22 @@ def run_cli(argv: list[str]) -> int:
         "--cwd", help="Repository working directory to capture base_sha and diff stats"
     )
     parser.add_argument("--base-sha", help="Explicit base commit SHA for cumulative diff")
-    parser.add_argument("--mode", default="craftsman", help="Mode name (craftsman or ultracode)")
+    parser.add_argument("--mode", default="craftsman", help="Mode name (craftsman or ultracraft)")
     parser.add_argument(
         "--tier",
         choices=VALID_TIERS,
         help="Gearbox tier: auto (default: <=40 lines & <=2 files -> quick, else standard), quick, standard, or deep",
     )
+    parser.add_argument("--task", help="One-line description of the task (shown in review packets)")
     parser.add_argument("--stage", help="Set current stage name")
     parser.add_argument(
         "--await-user", action="store_true", help="Pause hard-loop while waiting for user input"
     )
     parser.add_argument("--resume", action="store_true", help="Resume hard-loop after user input")
-    parser.add_argument(
-        "--pass-simplify", action="store_true", help="Mark 'simplified' gate as true"
-    )
-    parser.add_argument("--pass-review", action="store_true", help="Mark 'reviewed' gate as true")
-    parser.add_argument("--pass-verify", action="store_true", help="Mark 'verified' gate as true")
+    for flag in DEPRECATED_PASS_FLAGS:
+        parser.add_argument(
+            flag, action="store_true", help="Deprecated: evidence now comes from the ledger"
+        )
     parser.add_argument(
         "--complete", action="store_true", help="Verify quality gate execution and deactivate loop"
     )
@@ -1233,7 +1289,7 @@ def run_cli(argv: list[str]) -> int:
     if (args.init and not args.complete) or state is None or reinit_inactive:
         if args.init and not args.complete:
             start_step = latest_step
-            initial_tier = args.tier or ("deep" if args.mode == "ultracode" else "auto")
+            initial_tier = args.tier or ("deep" if args.mode == "ultracraft" else "auto")
             base_sha = args.base_sha or get_head_sha(hint_cwd)
         else:
             detected = detect_untracked_craftsman_trigger(entries, eff_completed_at)
@@ -1260,9 +1316,18 @@ def run_cli(argv: list[str]) -> int:
         if not existing_was_active or TIER_RANK.get(args.tier, 1) >= TIER_RANK.get(current_tier, 1):
             state["tier"] = args.tier
 
-    gates = state.setdefault("gates", {"simplified": False, "reviewed": False, "verified": False})
+    for flag in DEPRECATED_PASS_FLAGS:
+        if getattr(args, flag.removeprefix("--").replace("-", "_")):
+            sys.stderr.write(
+                f"[craftsman gate] Warning: {flag} no longer satisfies the gate; "
+                "evidence comes from the ledger (`craftsman review check`).\n"
+            )
+    if args.task:
+        state["task"] = args.task
+    if args.init and not args.complete and isinstance(state.get("base_sha"), str):
+        archive_ledger_for_new_base(hint_cwd, state["base_sha"])
     if args.cwd:
-        state["cwd"] = args.cwd
+        state["cwd"] = str(Path(args.cwd).resolve())
     if args.stage:
         state["stage"] = args.stage
     if args.base_sha and (
@@ -1276,46 +1341,74 @@ def run_cli(argv: list[str]) -> int:
     if args.resume:
         state["awaiting_user"] = False
         state["active"] = True
-    if args.pass_simplify:
-        gates["simplified"] = True
-    if args.pass_review:
-        gates["reviewed"] = True
-    if args.pass_verify:
-        gates["verified"] = True
 
+    closed_line: str | None = None
     if args.complete:
         since_step = _safe_int(state.get("started_at_step"), 0)
         effective_cwd = args.cwd or (
             state.get("cwd") if isinstance(state.get("cwd"), str) else None
         )
-        needs_subagent = requires_subagent_for_state(state, effective_cwd)
         subagent_ran = (
             has_quality_gate_subagent_in_entries(entries, since_step) if entries else False
         )
 
-        if entries and needs_subagent:
+        if needs_transcript_auditor(state, entries, effective_cwd):
             if not subagent_ran:
                 sys.stderr.write(
                     "[CRAFTSMAN HARD-LOOP REJECTED] Cannot close quality gate (--complete): "
-                    "transcript.jsonl does not record a valid, up-to-date 'invoke_subagent' call "
-                    "(TypeName: 'self', Role: 'Craftsman Quality Gate Auditor') with a passing verdict "
-                    "covering the final diff. For changes exceeding Quick Mode thresholds (>40 lines "
-                    "or >2 files), spawn the auditor subagent via invoke_subagent to execute /simplify, "
-                    "/code-review, and /verify.\n"
+                    "transcript.jsonl does not record an up-to-date 'invoke_subagent' call for an "
+                    "isolated reviewer (Role: 'Craftsman Reviewer') covering the final diff. For "
+                    "changes beyond the quick limits (>40 lines or >2 files), run the review lenses "
+                    "in reviewer subagents as /code-review describes.\n"
                 )
                 return 1
 
         state["subagent_verified"] = subagent_ran
-        gates["simplified"] = True
-        gates["reviewed"] = True
-        gates["verified"] = True
-        state["awaiting_user"] = False
-        state["active"] = False
-        state["stage"] = "completed"
-        state["completed_at_step"] = latest_step
+        try:
+            evaluation = evaluate_task(state, effective_cwd)
+        except (DiffScanError, LedgerError) as exc:
+            sys.stderr.write(
+                f"[CRAFTSMAN GATE] Cannot complete: cannot evaluate the evidence ledger: {exc}\n"
+            )
+            return 1
+        if not evaluation.report.passed:
+            sys.stderr.write(f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
+            return 1
+        mark_completed(state, latest_step)
+        closed_line = closed_gate_line(evaluation, resolve_effective_tier(state, effective_cwd))
 
     save_state_atomic(state_file, state)
+    if closed_line is not None:
+        print(closed_line)
     return 0
+
+
+def mark_completed(state: dict[str, Any], completed_at_step: int) -> None:
+    state["awaiting_user"] = False
+    state["active"] = False
+    state["stage"] = "completed"
+    state["completed_at_step"] = completed_at_step
+
+
+def closed_gate_line(evaluation: Evaluation, tier: Tier) -> str:
+    findings = evaluation.ledger.findings
+    fixed = sum(finding.resolution == "fixed" for finding in findings)
+    accepted = sum(finding.resolution == "accepted" for finding in findings)
+    return (
+        f"Craftsman gate closed: round {len(evaluation.ledger.rounds)}, tier {tier}, "
+        f"{fixed} findings fixed, {accepted} accepted."
+    )
+
+
+def archive_ledger_for_new_base(cwd: str | None, base_sha: str) -> None:
+    """A new task with a different base commit must not inherit the previous review."""
+    try:
+        archived = archive_ledger_if_rebased(cwd or os.getcwd(), base_sha)
+    except (DiffScanError, LedgerError) as exc:
+        sys.stderr.write(f"[craftsman gate] Warning: evidence ledger not checked: {exc}\n")
+        return
+    for path in archived:
+        sys.stderr.write(f"[craftsman gate] Archived previous review evidence to {path}\n")
 
 
 def main(argv: list[str] | None = None) -> int:

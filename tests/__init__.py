@@ -1,0 +1,1 @@
+"""Craftsman test suite."""

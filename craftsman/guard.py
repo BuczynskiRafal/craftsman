@@ -1076,7 +1076,20 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
 
 def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     command_line, cwd_str = _extract_command_and_cwd(payload)
-    if not isinstance(command_line, str) or not command_line.strip():
+    if not isinstance(command_line, str):
+        return "allow", None
+    return evaluate_shell_command(command_line, cwd_str, resolve_transcript_path(payload))
+
+
+def evaluate_shell_command(
+    command_line: str, cwd_str: str | None, transcript_path: Path | None = None
+) -> tuple[str, str | None]:
+    """Apply the git rules to one shell command line: ("allow" | "deny" | "force_ask", reason).
+
+    `transcript_path` is a readable session transcript in which a push confirmation may be found;
+    without one, a push to a protected branch can only be confirmed by the user directly.
+    """
+    if not command_line.strip():
         return "allow", None
 
     segments = expand_shell_segments(command_line)
@@ -1110,7 +1123,6 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     for segment in segments:
         tokens = tokenize_segment(segment)
         if is_gh_pr_merge(tokens):
-            transcript_path = resolve_transcript_path(payload)
             if transcript_path is not None and was_ask_question_called_since_last_push(
                 transcript_path, cwd_str
             ):
@@ -1136,7 +1148,6 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
                 "Explicit user confirmation is required.",
             )
 
-        transcript_path = resolve_transcript_path(payload)
         if transcript_path is None:
             return (
                 "force_ask",

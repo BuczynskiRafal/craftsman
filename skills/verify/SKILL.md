@@ -1,69 +1,82 @@
 ---
 name: verify
 description: >-
-  End-to-end runtime verification of code changes (/verify). Goes beyond running
-  unit tests or linters — actually executes the modified flow (CLI, script, HTTP
-  server, data pipeline, headless GUI) and observes real runtime behavior and
-  outputs. Use when /verify is invoked or before committing non-trivial
-  production changes.
+  Runtime verification of a change: runs the project's checks and then exercises
+  the changed behavior for real (CLI, script, server request, pipeline run,
+  headless UI), recording every execution in the Craftsman ledger so the gate
+  can see exit codes at the final state of the code. Use when /verify is
+  invoked or as the verification step of /craftsman.
 ---
 
-# Verify (`/verify` — End-to-End Runtime Verification)
+# Verify (`/verify [target]`)
 
-You verify that a code change **actually accomplishes what it was built to do** by exercising it **end-to-end at runtime** and observing real behavior — not merely by running static linters or unit tests in isolation.
+Tests tell you the code agrees with the tests. Verification tells you the change does what it was
+built to do when it actually runs. You need both, and both are recorded: every command goes
+through `craftsman run`, which stores the exit code, duration and output tail against the exact
+diff it ran on.
 
-> **When NOT to use:** If the diff touches only documentation (`*.md`), comments, or test files with zero production runtime surface, state that briefly and finish. Every production code change has a runtime surface that must be exercised.
-
-Include clickable `file://` Markdown links in your verification report.
-
----
-
-## Phase 1 — Identify the Runtime Surface
-
-1. Inspect the current diff (`git diff @{upstream}...HEAD` and `git diff HEAD`, or the target passed to `/verify <target>`).
-2. Check whether the repository defines verification commands or scripts in `GEMINI.md`, `AGENTS.md`, `CLAUDE.md`, `Makefile`, `pyproject.toml`, or `package.json`.
-3. Determine the runtime surface touched by the change:
-   - **CLI Tool / Script / Data Pipeline:** which command, flags, and input data exercise the exact modified code paths?
-   - **Library / Computational Module:** what minimal smoke-test command (`python3 -c "..."`) invokes the modified API on realistic inputs (including boundary conditions from the diff) and asserts output invariants?
-   - **Server / API / Web:** start the server and send a real request (`curl` / test client) hitting the modified endpoint, verifying HTTP status, payload, and logs.
-   - **Desktop / CAD / GIS Plugin:** verify clean module import without errors, invoke controller/session logic in headless mode, or run the package verification script.
-
----
-
-## Phase 2 — Multi-Layer Verification Execution
-
-Execute verification from the fastest static check up to full end-to-end runtime execution:
-
-1. **Layer 1: Static & Import Health**
-   - Verify modified modules compile and import cleanly in the project environment (zero `SyntaxError`, `ImportError`, circular imports, or type errors).
-2. **Layer 2: Automated Test Suite**
-   - Run automated tests covering the modified module (e.g., `pytest <test_path>` or `python3 -m unittest`).
-3. **Layer 3: Live End-to-End Runtime Execution (Core of `/verify`!)**
-   - **Exercise the touched flow live** via `run_command`:
-     - Pass realistic inputs that force execution through **the exact branches (`if/else`, new methods, refactored functions)** modified in the diff.
-     - Test at least **1 primary happy path** and **1 boundary/error path** introduced or modified by the change.
-     - Inspect actual `stdout`, `stderr`, exit code, and generated artifacts to confirm zero hidden warnings, exceptions, or corrupted outputs.
-   - Clean up any temporary files generated during verification.
-
----
-
-## Phase 3 — Verdict & Report
-
-Conclude with a concise verification report:
-
-```markdown
-### Runtime Verification (`/verify`)
-- **Target / Scope:** `<description of verified changes>`
-- **Status:** **PASS (VERIFIED)** / **FAIL** / **PARTIAL (WARNING)**
-
-#### Verification Runs:
-1. **Import & Static Check:** `<command>` → `<result>`
-2. **Unit / Integration Tests:** `<command>` → `<result>`
-3. **End-to-End Runtime Execution:**
-   - **Invocation:** `<exact command / scenario>`
-   - **Observed Behavior:** `<concrete output, exit code, and verified invariants>`
+```bash
+craftsman run --kind <test|e2e|lint|build|repro|other> -- <command and arguments>
 ```
 
-If `/verify` uncovers a runtime defect:
-- Cite the exact cause and line (`[file.ext:L10-L20](file:///...)`),
-- If the fix is clear and within scope, apply it and re-run verification until `PASS (VERIFIED)` is achieved.
+A run only counts for the gate when it happened **after the last code change**, and only if the
+command itself left the files unchanged (a formatter or code generator run does not verify
+anything — run the checks again after it). If you edit code afterwards, run again. A failing
+command that can no longer pass (a typo, a renamed test) is retired with
+`craftsman review waive-run <run id> --reason "<why>"`; the user sees every waiver in the report.
+
+## 1. Find the runtime surface
+
+From the diff (and the `/craftsman` task statement), answer:
+- What can a user or a caller now do differently? Which entry point reaches the changed code —
+  a CLI command, a script, an HTTP route, a job, a library function, a UI action?
+- Which inputs drive execution through the **changed branches** specifically?
+- How does the project run its checks? Look in `Makefile`, `package.json` scripts,
+  `pyproject.toml`/`tox.ini`/`noxfile.py`, CI workflows, and convention files
+  (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md`).
+
+Documentation-only changes have no runtime surface: say so and run only the project's doc or
+link checks if it has any.
+
+## 2. Run the checks, fastest first
+
+1. **Static:** the project's linters and type checkers (`--kind lint`).
+2. **Build / import:** the package builds and the touched modules import (`--kind build`).
+3. **Tests:** the tests for the touched modules first, then the full suite when it is affordable
+   (`--kind test`). A failing test is information: read it before touching code.
+
+## 3. Exercise the change for real (`--kind e2e`)
+
+Run the actual entry point with realistic input:
+- at least one input that takes the main changed path, and
+- at least one input that takes a changed boundary or error path.
+
+Check what really happened — output, exit code, files written, HTTP status and body, log lines —
+against what the change is supposed to do. Prefer the project's real interfaces over calling
+internals; for libraries, a short script that imports the public API is the entry point.
+
+Examples:
+```bash
+craftsman run --kind e2e -- python -m mytool convert tests/data/sample.csv --out <temp-dir>/out.json
+craftsman run --kind e2e -- python scripts/smoke_api.py
+craftsman run --kind e2e -- node scripts/smoke.mjs
+```
+For a server, prefer one self-contained command that starts it, sends the requests, checks the
+answers and stops it (a short script, or the framework's test client) — a server left running
+in the background between tool calls is often killed or hangs the terminal tool. Put temporary
+files in a temp directory and remove them when done. Write each command on one line, and use
+`python` or the project's virtualenv interpreter (`python3` is missing on many Windows machines).
+
+## 4. When something fails
+
+Find the cause in the code (with `file:line`), fix it if it is within the scope of the change,
+and run the same commands again. Never weaken a test or an assertion to make a run pass.
+
+## 5. Report
+
+```markdown
+### Verification
+- Status: PASS | FAIL | PARTIAL (what could not be exercised and why)
+- Checks: `<command>` -> <result> (run id)
+- End-to-end: `<command>` -> <what was observed and why it is correct> (run id)
+```

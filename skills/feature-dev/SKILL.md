@@ -1,75 +1,53 @@
 ---
 name: feature-dev
 description: >-
-  Structured 7-phase process for designing and implementing new features with
-  deep architectural understanding. Use when /feature-dev is invoked or when
-  building non-trivial new functionality.
+  Build a non-trivial feature by first learning how the codebase already solves
+  similar problems, settling open questions with the user, choosing a design on
+  explicit trade-offs, and then implementing it in small verified steps. Use
+  when /feature-dev is invoked or as the feature track of /craftsman.
 ---
 
-# Guided Feature Development (`/feature-dev`)
+# Feature development (`/feature-dev <what to build>`)
 
-You guide the user through a disciplined, 7-phase feature development workflow. Instead of guessing requirements and jumping straight into code, you first explore existing patterns in the repository, resolve ambiguities early, present architectural trade-offs, and implement the chosen design with full verification.
+Most feature bugs are decided before the first line is written: a missed existing helper, an
+unasked question about an edge case, a design that fights the codebase. This workflow front-loads
+those decisions and keeps them visible.
 
-Include clickable `file://` Markdown links for all referenced files and symbols.
+## 1. Frame the feature
+Write two or three sentences: who needs what, and how they will notice it works. Add explicit
+**non-goals**. If you cannot write this without guessing, ask now.
 
----
+## 2. Learn the terrain
+Find out how the codebase already does similar things before designing anything:
+- the closest existing feature — read it end to end, from entry point to storage/output;
+- the layers it crosses, the extension points it uses, the conventions for errors, logging,
+  configuration, naming and tests;
+- helpers you can reuse, and the test utilities and fixtures the project relies on.
 
-## Core Principles
+For a feature that spans several areas, split this exploration between parallel subagents (one
+per area) and merge their summaries. Finish with a short map: files the feature will touch or
+add, and the patterns it must follow.
 
-- **Understand before acting:** Always inspect existing project conventions and abstractions first.
-- **Ask clarifying questions early:** Surface all underspecified requirements and edge cases **after** exploring the codebase (Phase 2), but **before** designing the architecture (Phase 4). Use `ask_question` for architectural and design choices.
-- **Adaptive exploration:** For focused features, explore directly; for multi-module features, launch parallel `research` subagents (`invoke_subagent`).
+## 3. Close the open questions
+List what the request leaves undecided that changes the implementation: edge cases, invalid
+input, error behavior, limits, compatibility with existing data or APIs, permissions, what is out
+of scope. Ask the user the ones that matter, each with your recommended answer first, and wait.
+Do not ask what the codebase already answers.
 
----
+## 4. Choose a design
+Sketch two or three genuinely different approaches (for example: smallest change that reuses
+existing structures vs. a new module with a clean boundary). For each: files touched, how it fits
+the existing patterns, what becomes easy or hard later, risks. Recommend one with a reason and
+get agreement when the choice is not obvious or is expensive to reverse.
 
-## The 7 Phases of `/feature-dev`
+## 5. Build in verified steps
+Implement in small steps that each leave the project working. Write or extend tests alongside
+the code — at least the main path, the edge cases settled in step 3, and one error path. Run them
+through `craftsman run --kind test` as you go.
 
-### Phase 1: Discovery
-1. If the user's goal is initially ambiguous, clarify what problem is being solved, the target behavior, and any constraints.
-2. Summarize the objective in 2–3 sentences and proceed immediately to codebase exploration.
+## 6. Hand over to the quality loop
+Inside `/craftsman`, continue with its Stage 2. Standalone, run `/simplify`, `/code-review`, and
+`/verify` on the result.
 
-### Phase 2: Codebase Exploration (`code-explorer`)
-**Goal:** Understand existing code, conventions, and extension points at both high and low levels.
-1. Search the repository (directly or via 2–3 parallel `research` subagents using `invoke_subagent`) for:
-   - analogous features already implemented in the project,
-   - architectural layers, control flow, and domain models,
-   - error-handling conventions, UI/CLI patterns, and testing utilities.
-2. Read the key identified files (`view_file`).
-3. Present a concise summary of discovered patterns and the primary files (`[file.py](file:///...)`) where the new feature will integrate.
-
-### Phase 3: Clarifying Questions
-**CRITICAL PHASE — DO NOT SKIP WHEN AMBIGUITIES EXIST.**
-1. Based on Phase 2 findings, identify any underspecified aspects:
-   - edge cases and boundary conditions,
-   - error handling and invalid input behavior,
-   - integration points and backward compatibility,
-   - scope boundaries (*what is in scope now vs. out of scope*).
-2. Ask the user via `ask_question` (putting your `(Recommended)` option first) and **wait for their response before moving to Phase 4**.
-
-### Phase 4: Architecture Design (`code-architect`)
-**Goal:** Design and compare implementation approaches.
-1. Formulate **2–3 architectural options**:
-   - **Option A (Minimal changes):** smallest footprint, maximum reuse of existing code,
-   - **Option B (Clean architecture):** cleanest separation of concerns, extensibility, and testability,
-   - **Option C (Pragmatic balance):** sweet spot between simplicity and structural cleanliness.
-2. Present trade-offs, exact files to create/modify, and **your explicit recommendation with rationale**.
-3. Confirm the chosen architecture with the user.
-
-### Phase 5: Implementation
-**DO NOT START WITHOUT ARCHITECTURAL APPROVAL IN PHASE 4.**
-1. Implement the feature strictly following the chosen design and project conventions (`GEMINI.md` / `AGENTS.md` / `CLAUDE.md`).
-2. Add tests covering both the happy path and the edge cases established in Phase 3.
-
-### Phase 6: Quality Review (`/simplify` + `/code-review` + `/verify`)
-1. Review the newly written code for:
-   - simplicity, DRY, and proper abstraction altitude,
-   - functional correctness and zero silent failures,
-   - automated test execution and end-to-end runtime verification (`/verify`).
-2. Fix any defects immediately.
-
-### Phase 7: Summary
-Conclude with a concise report:
-- what was built,
-- key architectural decisions,
-- modified and newly created files with clickable `file://` links,
-- test and runtime verification results.
+## 7. Summarize
+What was built, the design chosen and why, files added or changed, and how it was verified.

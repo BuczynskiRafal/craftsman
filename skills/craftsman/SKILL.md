@@ -1,134 +1,139 @@
 ---
 name: craftsman
 description: >-
-  Master Engineering Orchestrator with a 3-Gear Automatic Gearbox (Quick
-  Soft-Loop, Standard Hybrid Hard-Loop, Deep Full-Audit Hard-Loop). Routes tasks
-  through architecture workflows (/feature-dev, /modernize, /batch) and enforces
-  a transcript-verified Quality Gate (/simplify -> /code-review -> /audit ->
-  /verify -> /high-level-commit-message). Use when /craftsman is invoked.
+  End-to-end engineering loop with an evidence-based quality gate. Captures a
+  baseline, implements the task, then iterates simplify -> lens review in fresh
+  contexts -> adversarial verification -> fix -> delta re-review -> runtime
+  verification until the Craftsman ledger proves the change is reviewed,
+  verified and clean. Gears: --quick, --standard (default), --deep. Use when
+  /craftsman is invoked or the prompt contains `ultracraft`.
 ---
 
-# Craftsman — Master Engineering Orchestrator (`/craftsman`)
+# Craftsman (`/craftsman [--quick | --standard | --deep] <task>`)
 
-You are the **Master Engineering Orchestrator**. Your goal is to guide an engineering task end-to-end from user intent to verified, production-grade code ready for commit, dynamically selecting both the architectural workflow and the **3-Gear Quality Gate**.
+You own this change from request to a verified, reviewed diff that is ready to commit. You are
+done when `craftsman review check` passes — not when the code compiles, and not when you feel
+confident. The gate is enforced by lifecycle hooks where the platform supports them: if you try
+to finish early, you will be sent back with the list of what is missing.
 
-Respond in the user's preferred language while keeping all technical identifiers, code, and commit messages in American English and linking every file reference as `[file.ext:L10-L20](file:///absolute/path/to/file.ext#L10-L20)`.
+Talk to the user in their language; keep code, identifiers and commit messages in American
+English.
 
----
+**How to run the pieces.** A `/name` below means: follow `skills/<name>/SKILL.md` (invoke it as a
+skill or slash command if your platform offers that, otherwise open the file and follow it).
+Subagents are the `craftsman-reviewer` and `craftsman-verifier` agents: custom agents in VS Code
+Copilot, `/agent` or the task tool in the Copilot CLI, the Agent/Task tool in Claude Code,
+`invoke_subagent` in Antigravity. Without any subagent mechanism, play each role yourself, one at a
+time. Write every `craftsman` command on one line (no `\` continuations, which PowerShell and cmd do
+not understand).
 
-## 3-Gear Adaptive Gearbox (`/craftsman [--quick | --standard | --deep]`)
+## Gears
 
-`craftsman-stop-gate.py` automatically selects verification depth based on the **actual cumulative git diff (`git diff --numstat <base_sha>` plus untracked files)** or an explicit user flag:
-
-| Gear (Tier) | Manual Trigger | Automatic Trigger (`--tier auto`) | Stage 1 Quality Gate Mode |
+| Gear | When | Review | Verification |
 | :--- | :--- | :--- | :--- |
-| **Gear 1: `quick` (Soft-Loop)** | `/craftsman --quick [task]` | Cumulative diff `base_sha..HEAD` has **`<= 40` changed lines (`+` and `-` combined) across `<= 2` files** | **Fast Soft-Loop (Inline):** The main agent executes `/simplify` + quick `/code-review` + `/verify` directly in the current thread. The `Stop` hook detects the small diff and **does not require** spawning a subagent. |
-| **Gear 2: `standard` (Hybrid Hard-Loop)** | `/craftsman [task]` *(default)* or `/craftsman --standard [task]` | Cumulative diff `base_sha..HEAD` exceeds **`> 40` lines or `> 2` files** | **Context-Isolated Hard-Loop:** Mandatory invocation of an isolated subagent via `invoke_subagent` (`TypeName: "self"`, `Role: "Craftsman Quality Gate Auditor"`), verified in `transcript.jsonl`. |
-| **Gear 3: `deep` (Full-Audit Hard-Loop)** | `/craftsman --deep [task]` *(or keyword `ultracode`)* | On-demand for critical core modules, security-sensitive paths, or complex algorithms | **Maximum Hard-Loop:** Enforces pre-implementation `ultrathink` analysis plus an isolated subagent running `/simplify`, `/code-review`, the full `/audit all` suite (*errors, tests, types, comments, security*), and `/verify`. |
+| `quick` | `--quick`, or automatic for ≤ 40 changed lines in ≤ 2 files | lenses `intent`, `contracts`, `craft` (+ any triggered by risk signals), done by you inline | one passing test run |
+| `standard` | default | all always-on lenses + triggered ones, done by fresh-context reviewer subagents, plus a final sweep and a verifier | passing test run at the final diff |
+| `deep` | `--deep` or `ultracraft` | every lens, reviewers + sweep + verifier | passing tests **and** an end-to-end run at the final diff |
 
----
+`auto` gear upgrades itself: once the diff outgrows the quick limits, the gate demands the
+standard workflow.
 
-## Workflow Architecture (`/craftsman`)
+## Stage 0 — Baseline
 
-```
-[Stage 0: Dynamic Router + Capture base_sha (craftsman-stop-gate.py --init)]
-   ├── Path A (New Feature)        ──► /feature-dev (Explore -> Clarify -> Architect -> Code)
-   ├── Path B (Legacy / Refactor)  ──► /modernize   (Extract Rules -> Characterization Tests -> Uplift)
-   ├── Path C (Mass Migration)     ──► /batch       (Work Units -> Parallel Subagents)
-   └── Path D (No args / Polish)   ──► Directly to Stage 1 Quality Gate on current git diff
-          │
-          ▼
-[Stage 1: Automatic Cumulative Diff Measurement (git diff <base_sha>)]
-   ├── Small diff (<= 40 lines, <= 2 files) or --quick ──► Gear 1 (Soft-Loop Inline: /simplify + /code-review + /verify)
-   └── Large diff (> 40 lines or > 2 files) or --deep  ──► Gear 2/3 (Isolated Subagent "Craftsman Quality Gate Auditor")
-          │
-          ▼
-[Stage 2: Close craftsman_state.json (--complete) + Sign-Off Card & /high-level-commit-message]
-```
-
----
-
-## Stage 0 — Dynamic Router, Capture `base_sha`, and Implementation
-
-0. **Initialize state and record `base_sha`:**
-   At the very beginning of a `/craftsman` invocation, run:
-   ```bash
-   ~/.gemini/config/scripts/craftsman-stop-gate.py \
-     --state-file "<artifactDirectoryPath>/craftsman_state.json" \
-     --init --tier <auto|quick|standard|deep> --cwd "<repo_path>"
-   ```
-   *(Default to `--tier auto`; use `--tier quick` if `--quick` was passed; use `--tier standard` if `--standard` was passed; use `--tier deep` if `--deep` or `ultracode` was passed).*
-
-1. **Inspect starting context:**
-   Run `git status --short` and `git diff --stat`.
-2. **Select the appropriate architectural track:**
-   - **Path A — New Feature (`Feature Track`):** Follow `/feature-dev` (explore -> clarifying questions via `ask_question` -> architectural options -> implementation), then proceed to Stage 1.
-   - **Path B — Legacy Modernization or Deep Refactor (`Modernize Track`):** Follow `/modernize` (*Given/When/Then* Rule Cards -> characterization tests -> uplift), then proceed to Stage 1.
-   - **Path C — Mass Multi-File Migration (`Batch Track`):** Follow `/batch` (decompose into disjoint *Work Units* -> parallel subagents), then proceed to Stage 1.
-   - **Path D — Polish & Ship Current Changes (`Polish & Ship Track`):** Proceed directly to Stage 1 on the current diff.
-
----
-
-## Stage 1 — Quality Gate (Automatic Selection: Soft-Loop vs. Isolated Subagent)
-
-Once implementation is complete, inspect the cumulative diff size (`git diff --stat <base_sha>`):
-
-### Variant 1A — Gear 1 (`quick` / Soft-Loop: change $\le 40$ lines across $\le 2$ files or `--quick` flag)
-Execute inline in the main thread (without spawning a subagent):
-1. Review the diff across the 4 `/simplify` angles (*Reuse*, *Simplification*, *Efficiency*, *Altitude*) and check boundary conditions (`/code-review`).
-2. Run tests and end-to-end runtime verification (`/verify`).
-3. Proceed directly to Step 1.6 (`--complete`).
-
-### Variant 1B — Gear 2 & 3 (`standard` / `deep` Hard-Loop: change $> 40$ lines or $> 2$ files or `--deep` flag)
-> [!CAUTION]
-> For changes exceeding 40 lines or 2 files (regardless of how many small intermediate commits were made!), **context-isolated subagent verification is mandatory**. The `Stop` hook will block task completion unless an isolated auditor subagent invocation is recorded in `transcript.jsonl`.
-
-Invoke `invoke_subagent` with:
-- **`TypeName`**: `"self"`
-- **`Model`**: `"inherit"`
-- **`Role`**: `"Craftsman Quality Gate Auditor"`
-- **`Prompt`**:
-```markdown
-You are the isolated Craftsman Quality Gate Auditor executing the Stage 1 Hybrid Hard-Loop.
-Working directory: <CWD_REPO>
-Audit scope: THE ENTIRE CUMULATIVE DIFF since the start of the task: `git diff <BASE_SHA>` (covering all commits from <BASE_SHA> to HEAD plus any uncommitted working tree changes).
-
-Execute the following steps without shortcuts:
-1. Read via `view_file` the full instructions for `simplify`, `code-review`, and `verify` (from `~/.gemini/config/skills/` or the repository).
-2. STEP 1 (/simplify): Analyze the entire cumulative diff (`git diff <BASE_SHA>`) across all 4 axes of `/simplify` (Reuse, Simplification, Efficiency, Altitude) and apply simplifications directly to the files.
-3. STEP 2 (/code-review + /audit): Audit the cumulative diff using `/code-review` (Angles A–E) and relevant `/audit-*` skills (`/audit-errors`, `/audit-tests`, `/audit-types`, `/audit-comments`, `/audit-security` — or all of them in `--deep` mode). Fix all CONFIRMED and PLAUSIBLE issues directly in the code.
-4. STEP 3 (/verify): Run the full test suite and perform real end-to-end runtime verification in accordance with `/verify`.
-5. Return a concise 3-section report: Simplify, Code Review & Audits, and Verify, ending with a final line `CRAFTSMAN_VERDICT: PASS` (or `CRAFTSMAN_VERDICT: FAIL` if any issue remains unresolved).
-```
-
-### Step 1.6: Close the Quality Gate (`craftsman_state.json`)
-After completing Variant 1A (for small diffs) or receiving the subagent's report in Variant 1B, run:
 ```bash
-~/.gemini/config/scripts/craftsman-stop-gate.py \
-  --state-file "<artifactDirectoryPath>/craftsman_state.json" \
-  --cwd "<repo_path>" \
-  --complete
+craftsman gate --init --tier <auto|quick|standard|deep> --task "<the user's request in one line>"
 ```
 
----
+This records the base commit; every later review covers the whole cumulative diff since this
+point, including commits you make along the way. Then look at `git status` and the files the
+task touches. (When the user asks only for a review without `--fix`, `/craftsman`, or `ultracraft`,
+do not run `craftsman gate --init`; follow `skills/code-review/SKILL.md` in review-only mode and
+finish with `craftsman review check --review-only` and `craftsman review report --review-only`.)
 
-## Stage 2 — Craftsman Sign-Off Card & Commit Proposal
+For `deep` / `ultracraft`: before writing code, write a short design note in chat — invariants
+that must hold, edge cases, two candidate approaches with trade-offs, the chosen one, and the
+three most likely ways it could fail in production.
 
-```markdown
-### `/craftsman` Engineering Report
-- **Track:** `<Feature | Modernize | Batch | Polish & Ship>`
-- **Quality Gate Gear:** `<Quick (Soft-Loop Inline) | Standard (Hybrid Hard-Loop Subagent) | Deep (Full-Audit Subagent)>`
-- **Cumulative Diff Scope (`<base_sha>..HEAD`):** `<X files, +Y/-Z lines>`
-- **Modified Files:**
-  - [file.py](file:///full/path/to/file.py) — `<concise description of the change>`
+## Stage 1 — Implement
 
-#### Quality Gate Summary:
-1. **Simplify (`/simplify`):** `<what was simplified/optimized or "code was already clean">`
-2. **Code Review & Audits (`/code-review`):** `<bugs caught and fixed or "0 issues found">`
-3. **Verify (`/verify` Runtime):** **PASS (VERIFIED)** — `<exact command/scenario used to verify runtime behavior>`
+Pick the track that fits the task, follow it, then go to Stage 2:
+- **New feature:** `/feature-dev` (understand the codebase -> clarify -> design -> build).
+- **Legacy change or deep refactor:** `/modernize` (pin current behavior with tests first).
+- **Mechanical change across many files:** `/batch`.
+- **Small fix or polishing existing changes:** go straight to Stage 2.
 
-#### Proposed Commit (`/high-level-commit-message`):
-```text
-<type>(<scope>): <concise high-level summary in American English with zero AI attribution>
+When the task is ambiguous in a way that changes what you build, ask the user before building.
+While waiting for an answer, run `craftsman gate --await-user` so the gate does not push you on;
+run `craftsman gate --resume` when the answer arrives.
+
+## Stage 2 — The quality loop
+
+### 2.1 Simplify first
+Run `/simplify` on the cumulative diff so reviewers see the final shape of the code, not a draft.
+If its baseline test run fails because of what you built in Stage 1, fix that first.
+
+### 2.2 Prepare a review round
+```bash
+craftsman review prepare
 ```
+(`--tier <quick|standard|deep>` only to raise the tier; it never goes below the gate's.) Read the
+printed packet completely, and the convention files it lists. Its header shows the tier this round
+resolved to and the lenses it needs. Then write the **intent brief** of `/code-review` Step 1 —
+3–8 bullets: what the change must achieve and which hunk achieves each part.
+
+### 2.3 Review through lenses
+- **quick:** apply the selected lenses yourself, one at a time, `sweep` last if selected.
+- **standard / deep — two waves, never inline while subagents exist** (your context is full of
+  the reasoning that produced the code, which is exactly what hides its defects):
+  1. *Wave 1, in parallel:* `craftsman-reviewer` subagents for every selected lens **except
+     `sweep`**, 1–3 lenses each, for example (`intent`, `contracts`), (`failure`, `ripple`),
+     (`state`, `trust`, `platform`), (`tests`, `model`, `craft`). Give each the packet path, the
+     intent brief and its lenses. On a small fix round (one or two open hunks) one reviewer may
+     take every non-sweep lens.
+  2. *Wave 2, after wave 1 has finished:* one more `craftsman-reviewer` for lens `sweep` only.
+
+### 2.4 Challenge findings
+- **standard / deep:** a `craftsman-verifier` subagent gives every finding a verdict — always, even
+  for one finding. Give it the packet path and the intent brief.
+- **quick:** do `/code-review` Step 3 yourself.
+
+### 2.5 Fix and loop
+For every `proven` and `probable` finding:
+- **fix it at the root cause** (with a regression test where the project has tests), then
+  `craftsman review resolve <id> --as fixed --note "<what changed; which test covers it>"`;
+- or, for a real trade-off, `--as accepted --note "<why; who decided>"` — never for a blocker; for a
+  `major`, ask the user first (`craftsman gate --await-user`, ask, `craftsman gate --resume`).
+
+Go back to **2.2**: the new round contains only the hunks your fixes changed (plus anything that
+mentions a symbol you changed). Repeat until a round ends with no new `proven`/`probable` findings.
+If `craftsman review check` reports `round-cap`, stop iterating: report what remains to the user
+and let them decide — the gate lets you finish in that state.
+
+### 2.6 Verify at runtime
+Follow `/verify`, through the ledger, at the final state of the code:
+- every gear: `craftsman run --kind test -- <the project's test command>`;
+- `deep`, and any change whose behavior unit tests do not reach (a CLI, a server route, a
+  migration): also `craftsman run --kind e2e -- <command that exercises the real entry point>`.
+
+Runs before the last code change do not count. A failing command blocks until the same command
+passes; if it can never pass again (a typo, a test you renamed), retire it with
+`craftsman review waive-run <run id> --reason "<why it no longer applies>"` — the user sees it.
+
+### 2.7 Close the gate
+```bash
+craftsman review check
+craftsman gate --complete
 ```
+`--complete` refuses to close while `check` reports anything. Do what it lists, then try again.
+
+## Stage 3 — Report
+
+Run `craftsman review report` and give the user:
+- what was built (files and one line each);
+- the gear, number of review rounds, lenses applied;
+- findings fixed, findings accepted (with reasons), findings dismissed (count);
+- the verification commands and their results;
+- a proposed commit message from `/high-level-commit-message`.
+
+Never commit, push or open a pull request unless the user asked for it; never push to
+`main`/`master` without asking; never add AI attribution to commits or PRs.
