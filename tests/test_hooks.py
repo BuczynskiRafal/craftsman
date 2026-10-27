@@ -779,7 +779,7 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
             )
             self.assertEqual(res["decision"], "allow")
 
-    def test_subshell_cd_and_pushd_popd_do_not_bypass_push_to_main_guard(self) -> None:
+    def test_isolated_cd_does_not_bypass_push_to_main_guard(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_dir = Path(tmpdir) / "repo"
             other_dir = Path(tmpdir) / "other"
@@ -936,7 +936,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertNotIn("gates", payload3)
             self.assertEqual(payload3["ledger"]["rounds"], 0)
 
-    def test_craftsman_skill_cli_and_review_packet_path(self) -> None:
+    def test_skill_cli_shows_bundled_skill_files(self) -> None:
         import contextlib
         import io
 
@@ -949,7 +949,6 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
                 code = cli_main(list(args))
             return code, out.getvalue(), err.getvalue()
 
-        # 1. skill list & skill list --json
         code_list, out_list, err_list = run_cli("skill", "list", "--repo-dir", str(REPO_ROOT))
         self.assertEqual(code_list, 0, err_list)
         self.assertIn("craftsman", out_list)
@@ -960,12 +959,10 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
         parsed_list = json.loads(out_json)
         self.assertEqual(len(parsed_list), 17)
 
-        # 2. skill path
         code_path, out_path, _ = run_cli("skill", "path", "code-review", "--repo-dir", str(REPO_ROOT))
         self.assertEqual(code_path, 0)
         self.assertEqual(Path(out_path.strip()), (REPO_ROOT / "skills" / "code-review").resolve())
 
-        # 3. skill show <name> and skill show <name> --file lenses.md
         code_show, out_show, _ = run_cli("skill", "show", "craftsman", "--repo-dir", str(REPO_ROOT))
         self.assertEqual(code_show, 0)
         self.assertIn("name: craftsman", out_show)
@@ -977,12 +974,23 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
         self.assertEqual(code_lenses, 0)
         self.assertIn("## `intent`", out_lenses)
 
-        # 4. Unknown skill -> exit code 2
+    def test_skill_cli_rejects_escaping_or_unknown_paths(self) -> None:
+        import contextlib
+        import io
+
+        from craftsman.cli import main as cli_main
+
+        def run_cli(*args: str) -> tuple[int, str, str]:
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_main(list(args))
+            return code, out.getvalue(), err.getvalue()
+
         code_unk, _, err_unk = run_cli("skill", "show", "no-such-skill", "--repo-dir", str(REPO_ROOT))
         self.assertEqual(code_unk, 2)
         self.assertIn("unknown skill 'no-such-skill'", err_unk)
 
-        # 5. Path traversal / absolute path / missing file / escaping symlink -> exit code 2
         for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
             code_bad, _, err_bad = run_cli(
                 "skill", "show", "code-review", "--file", bad_file, "--repo-dir", str(REPO_ROOT)
@@ -1006,7 +1014,21 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertEqual(code_sym, 2)
             self.assertIn("escapes skill directory", err_sym)
 
-            # 6. review show --packet-path
+    def test_review_show_packet_path_prints_current_round_packet(self) -> None:
+        import contextlib
+        import io
+
+        from craftsman.cli import main as cli_main
+
+        def run_cli(*args: str) -> tuple[int, str, str]:
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_main(list(args))
+            return code, out.getvalue(), err.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir).resolve()
             ev_repo = EvidenceRepo(tmp_path / "ev_repo")
             ev_repo.write_lines("app.py", 5)
             code_nopkt, _, err_nopkt = run_cli(

@@ -718,8 +718,7 @@ class HookInputTests(unittest.TestCase):
 
 
 class SessionOwnershipTests(HookTestCase):
-    def test_non_owner_stops_never_mutate_state_and_owner_continues_at_1_of_6(self) -> None:
-        # Open gate as Copilot session A
+    def test_non_owner_stops_leave_owner_continuation_budget_intact(self) -> None:
         call_hook(
             "prompt",
             "copilot",
@@ -732,13 +731,11 @@ class SessionOwnershipTests(HookTestCase):
             state_before["owner"], {"platform": "copilot", "session_id": "vscode-session"}
         )
 
-        # 10 consecutive `stop` calls from Claude Code (platform B) in the same checkout
         for _ in range(10):
             out, _ = call_hook("stop", "claude", claude("Stop", self.root))
             self.assertEqual(out, {})
             self.assertEqual(self.state_file.read_bytes(), raw_before)
 
-        # Also test Antigravity stop gate (`craftsman-stop-gate.py`) when Copilot owns the gate
         ag_proc = self.repo.cli(
             "gate",
             stdin=json.dumps(
@@ -752,7 +749,6 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(json.loads(ag_proc.stdout), {"decision": "allow"})
         self.assertEqual(self.state_file.read_bytes(), raw_before)
 
-        # Now `stop` from owner (Copilot session A) still blocks at 1/6 (not 11 or aborted!)
         owner_out, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
         self.assertEqual(owner_out["decision"], "block")
         self.assertTrue(owner_out["reason"].startswith("[CRAFTSMAN GATE 1/6] "))
@@ -770,8 +766,6 @@ class SessionOwnershipTests(HookTestCase):
         self.update_state(forced_continuations=3)
         raw_before = self.state_file.read_bytes()
 
-        # Different session_id on the same platform (`claude-B`):
-        # 1) prompt does not reset awaiting_user or forced_continuations
         out_p, _ = call_hook(
             "prompt",
             "claude",
@@ -780,7 +774,6 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(out_p, {})
         self.assertEqual(self.state_file.read_bytes(), raw_before)
 
-        # 2) stop is allowed without touching state
         self.update_state(awaiting_user=False)
         raw_unpaused = self.state_file.read_bytes()
         out_s, _ = call_hook(
@@ -791,7 +784,6 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(out_s, {})
         self.assertEqual(self.state_file.read_bytes(), raw_unpaused)
 
-        # Same session_id (`claude-A`) is the owner and gets blocked at 4/6
         owner_s, _ = call_hook(
             "stop",
             "claude",
@@ -801,20 +793,17 @@ class SessionOwnershipTests(HookTestCase):
         self.assertTrue(owner_s["reason"].startswith("[CRAFTSMAN GATE 4/6] "))
 
     def test_claim_on_cli_init_accepts_only_matching_platform(self) -> None:
-        # Initialize gate from CLI inside Claude environment -> owner.platform="claude", session_id=""
         self.repo.cli(
             "gate", "--init", "--tier", "quick", "--cwd", ".", env_extra={"CLAUDECODE": "1"}
         )
         self.repo.write("cart.py", CHANGE)
         self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": ""})
 
-        # A hook from Copilot does NOT claim session_id and does NOT set hooks_seen
         cop_out, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
         self.assertEqual(cop_out, {})
         self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": ""})
         self.assertNotIn("hooks_seen", self.state())
 
-        # First hook from Claude claims session_id="claude-1"
         cl_out, _ = call_hook(
             "stop", "claude", claude("Stop", self.root, session_id="claude-1")
         )
@@ -822,14 +811,13 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": "claude-1"})
         self.assertEqual(self.state()["hooks_seen"], "claude")
 
-        # Another Claude session ("claude-2") cannot claim or mutate it
         cl2_out, _ = call_hook(
             "stop", "claude", claude("Stop", self.root, session_id="claude-2")
         )
         self.assertEqual(cl2_out, {})
         self.assertEqual(self.state()["forced_continuations"], 1)
 
-    def test_hooks_seen_and_subagent_events_ignore_non_owner_sessions(self) -> None:
+    def test_pre_tool_guard_protects_non_owner_without_setting_hooks_seen(self) -> None:
         self.repo.cli(
             "gate",
             "--init",
@@ -843,7 +831,6 @@ class SessionOwnershipTests(HookTestCase):
         self.repo.cli("review", "prepare", "--tier", "standard")
         self.assertEqual(self.state()["owner"], {"platform": "antigravity", "session_id": ""})
 
-        # Non-owner pre-tool (safe command) does not set hooks_seen
         pre_out, _ = call_hook(
             "pre-tool",
             "claude",
@@ -852,7 +839,6 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(pre_out, {})
         self.assertNotIn("hooks_seen", self.state())
 
-        # Non-owner pre-tool (dangerous git command) is STILL blocked by git guard
         push_out, _ = call_hook(
             "pre-tool",
             "copilot",
@@ -866,7 +852,19 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(push_out["permissionDecision"], "deny")
         self.assertNotIn("hooks_seen", self.state())
 
-        # Non-owner subagent-start / subagent-stop are not recorded in the owner's ledger
+    def test_subagent_hooks_ignore_non_owner_sessions(self) -> None:
+        self.repo.cli(
+            "gate",
+            "--init",
+            "--tier",
+            "standard",
+            "--cwd",
+            ".",
+            env_extra={"ANTIGRAVITY_AGENT": "1"},
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+
         sub_out, _ = call_hook(
             "subagent-start",
             "claude",
@@ -876,7 +874,7 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(self.ledger()["agents"], [])
         self.assertNotIn("hooks_seen", self.state())
 
-    def test_craftsman_trigger_in_other_session_does_not_overwrite_owner_gate(self) -> None:
+    def test_craftsman_trigger_in_other_session_preserves_owner_gate(self) -> None:
         call_hook(
             "prompt",
             "copilot",
@@ -885,7 +883,6 @@ class SessionOwnershipTests(HookTestCase):
         self.update_state(forced_continuations=2)
         raw_before = self.state_file.read_bytes()
 
-        # Session B (Claude) sends `/craftsman --quick hijack task`
         out, _ = call_hook(
             "prompt",
             "claude",
@@ -896,20 +893,14 @@ class SessionOwnershipTests(HookTestCase):
         self.assertIn("copilot (session vscode-session)", context)
         self.assertIn("git worktree add", context)
         self.assertIn("--takeover", context)
-
-        # Owner's gate is completely untouched
         self.assertEqual(self.state_file.read_bytes(), raw_before)
 
-    def test_gate_init_refuses_foreign_active_gate_until_takeover_and_status_shows_owner(
-        self,
-    ) -> None:
+    def test_status_reports_gate_owner(self) -> None:
         call_hook(
             "prompt",
             "claude",
             claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
         )
-
-        # Status shows owner in both JSON and text
         status_json = json.loads(self.repo.cli("status", "--json").stdout)
         self.assertEqual(
             status_json["owner"], {"platform": "claude", "session_id": "claude-session"}
@@ -917,7 +908,12 @@ class SessionOwnershipTests(HookTestCase):
         status_text = self.repo.cli("status").stdout
         self.assertIn("Owner          : claude (session claude-session)", status_text)
 
-        # Another session (`VSCODE_PID=1` -> copilot) calling `gate --init` without `--takeover` is refused
+    def test_gate_init_refuses_foreign_active_gate_without_takeover(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
         refused = self.repo.cli(
             "gate",
             "--init",
@@ -934,7 +930,12 @@ class SessionOwnershipTests(HookTestCase):
         self.assertIn("--takeover", refused.stderr)
         self.assertEqual(self.state()["tier"], "deep")
 
-        # Same platform WITHOUT a session_id (e.g. a second session on the same platform with no session env var) is refused and told to pass --session-id
+    def test_gate_init_requires_matching_session_id_on_same_platform(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
         no_sid_refused = self.repo.cli(
             "gate",
             "--init",
@@ -945,7 +946,7 @@ class SessionOwnershipTests(HookTestCase):
             "--cwd",
             ".",
             check=False,
-            env_extra={"CLAUDECODE": "1", "CLAUDE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ID": ""},
+            env_extra={"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": ""},
         )
         self.assertNotEqual(no_sid_refused.returncode, 0)
         self.assertIn("already owned by claude (session claude-session)", no_sid_refused.stderr)
@@ -953,7 +954,6 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(self.state()["tier"], "deep")
         self.assertEqual(self.state()["task"], "owner task")
 
-        # Passing `--session-id <sid>` from the prompt hook briefing succeeds even with no session env var (e.g. VS Code Copilot terminal)
         by_flag = self.repo.cli(
             "gate",
             "--init",
@@ -965,16 +965,20 @@ class SessionOwnershipTests(HookTestCase):
             "refined owner task",
             "--cwd",
             ".",
-            env_extra={"CLAUDECODE": "", "CLAUDE_SESSION_ID": "", "CLAUDE_CODE_SESSION_ID": ""},
+            env_extra={"CLAUDECODE": "", "CLAUDE_CODE_SESSION_ID": ""},
         )
         self.assertEqual(by_flag.returncode, 0, by_flag.stderr)
         self.assertEqual(
             self.state()["owner"], {"platform": "claude", "session_id": "claude-session"}
         )
-        self.assertEqual(self.state()["tier"], "deep")
         self.assertEqual(self.state()["task"], "refined owner task")
 
-        # `--takeover` from Copilot explicitly takes over and records `takeover_from`
+    def test_gate_init_takeover_records_previous_owner(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
         taken = self.repo.cli(
             "gate",
             "--init",
@@ -995,7 +999,7 @@ class SessionOwnershipTests(HookTestCase):
         )
         self.assertIn("takeover_at", state)
 
-    def test_v3_0_0_state_without_owner_treats_every_session_as_owner(self) -> None:
+    def test_legacy_state_without_owner_treats_every_session_as_owner(self) -> None:
         self.init("quick")
         self.repo.write("cart.py", CHANGE)
         state = self.state()

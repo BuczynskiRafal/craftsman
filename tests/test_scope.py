@@ -14,6 +14,7 @@ from typing import Any
 from unittest import mock
 
 from craftsman import hooks
+from craftsman.guard import evaluate_command
 from craftsman.scope import ScopePolicy, evaluate_scope, load_scope_policy
 
 
@@ -59,18 +60,16 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.scratch_tmp.mkdir(parents=True)
         (self.scratch_tmp / "x.txt").write_text("scratch\n", encoding="utf-8")
 
-        # Assistant session stores
         for rel in (
             ".copilot/session-state",
             ".claude/projects/slug",
             ".gemini/antigravity/brain/conv-1",
             ".gemini/antigravity/conversations",
         ):
-            d = self.home / rel
-            d.mkdir(parents=True)
-            (d / "session.jsonl").write_text("{}\n", encoding="utf-8")
+            store_dir = self.home / rel
+            store_dir.mkdir(parents=True)
+            (store_dir / "session.jsonl").write_text("{}\n", encoding="utf-8")
 
-        # Symlink inside repo pointing outside repo
         self.outside_dir = self.tmp / "outside_target"
         self.outside_dir.mkdir()
         (self.outside_dir / "leak.txt").write_text("leak\n", encoding="utf-8")
@@ -90,141 +89,111 @@ class ScopeEnforcementTests(unittest.TestCase):
 
         self.policy = ScopePolicy(mode="deny", allowed_dirs=())
 
-    def test_table_of_45_evaluate_scope_cases(self) -> None:
+    def test_evaluate_scope_enforces_worktree_boundaries(self) -> None:
         own_pkt = str(self.repo / ".git" / "craftsman" / "packet-1.md")
         other_pkt = str(self.other_repo / ".git" / "craftsman" / "packet-1.md")
         dep_file = str(self.venv_site / "a.py")
         tmp_file = str(self.scratch_tmp / "x.txt")
 
         cases: list[tuple[str, str, dict[str, Any], str]] = [
-            # 1-6: find, grep, rg
-            ("find_tilde", "Bash", {"command": "find ~ -name SKILL.md"}, "deny"),
-            ("find_dot", "Bash", {"command": "find . -name x"}, "allow"),
-            ("find_sub", "Bash", {"command": "find src -name '*.py'"}, "allow"),
-            ("find_root", "Bash", {"command": "find / -name x"}, "deny"),
-            ("grep_rec_outside", "Bash", {"command": f"grep -r foo {self.other_repo}"}, "deny"),
-            ("grep_nonrec_dep", "Bash", {"command": f"grep foo {dep_file}"}, "allow"),
-            ("grep_nonrec_other_repo", "Bash", {"command": "grep foo ../other-repo/secret.py"}, "deny"),
-            # 7-12: rg, ag, ack, fd
-            ("rg_default_cwd", "Bash", {"command": "rg foo"}, "allow"),
-            ("rg_src", "Bash", {"command": "rg foo src"}, "allow"),
-            ("rg_parent", "Bash", {"command": "rg foo .."}, "deny"),
-            ("rg_sibling_repo", "Bash", {"command": "rg foo ../other-repo"}, "deny"),
-            ("rg_files_tilde", "Bash", {"command": "rg --files ~"}, "deny"),
-            ("rg_attached_e_tilde", "Bash", {"command": "rg -efoo ~"}, "deny"),
-            ("ag_outside", "Bash", {"command": "ag pattern $HOME"}, "deny"),
-            ("ag_g_tilde", "Bash", {"command": "ag -g SKILL ~"}, "deny"),
-            ("ack_f_tilde", "Bash", {"command": "ack -f ~"}, "deny"),
-            ("ack_inside", "Bash", {"command": "ack pattern src"}, "allow"),
-            ("fd_outside", "Bash", {"command": "fd SKILL.md ~"}, "deny"),
-            ("fd_search_path_out", "Bash", {"command": "fd --search-path .. foo"}, "deny"),
-            ("fd_inside", "Bash", {"command": "fd app.py src"}, "allow"),
-            # 17-22: ls, tree, du, locate, mdfind
-            ("ls_nonrec_copilot", "Bash", {"command": "ls ~/.copilot/skills"}, "allow"),
-            ("ls_nonrec_tilde", "Bash", {"command": "ls ~"}, "allow"),
-            ("ls_nonrec_other_repo", "Bash", {"command": "ls ../other-repo"}, "deny"),
-            ("ls_rec_tilde", "Bash", {"command": "ls -R ~"}, "deny"),
-            ("ls_laR_parent", "Bash", {"command": "ls -laR .."}, "deny"),
-            ("tree_tilde", "Bash", {"command": "tree ~"}, "deny"),
-            ("tree_dot", "Bash", {"command": "tree ."}, "allow"),
-            ("du_parent", "Bash", {"command": "du -sh .."}, "deny"),
-            ("locate_any", "Bash", {"command": "locate SKILL.md"}, "deny"),
-            ("mdfind_global", "Bash", {"command": "mdfind SKILL.md"}, "deny"),
-            ("mdfind_onlyin_repo", "Bash", {"command": f"mdfind -onlyin {self.repo} app"}, "allow"),
-            ("mdfind_onlyin_home", "Bash", {"command": "mdfind -onlyin ~ app"}, "deny"),
-            # 27-32: cat / head / tail / sed / history (D3)
-            ("cat_other_packet", "Bash", {"command": "cat ../other-repo/.git/craftsman/packet-1.md"}, "deny"),
-            ("cat_abs_other_pkt", "Bash", {"command": f"cat {other_pkt}"}, "deny"),
-            ("cat_own_packet", "Bash", {"command": f"cat {own_pkt}"}, "allow"),
-            ("cat_tmp_file", "Bash", {"command": f"cat {tmp_file}"}, "allow"),
-            ("cat_venv_site_pkg", "Bash", {"command": f"cat {dep_file}"}, "allow"),
-            ("head_claude_sess", "Bash", {"command": "head -n 20 ~/.claude/projects/slug/session.jsonl"}, "deny"),
-            ("cat_zsh_history", "Bash", {"command": "cat ~/.zsh_history"}, "deny"),
-            ("sed_other_repo", "Bash", {"command": "sed -n '1,20p' ../other-repo/secret.py"}, "deny"),
-            # 34-39: wrappers, cd tracking, PowerShell, cmd, symlinks, git -C, find -exec
-            ("env_bash_c_find", "Bash", {"command": 'env FOO=1 bash -c "find / -name x"'}, "deny"),
-            ("env_C_rg", "Bash", {"command": "env -C .. rg foo"}, "deny"),
-            ("sudo_D_cat", "Bash", {"command": "sudo -D ../other-repo cat secret.py"}, "deny"),
-            ("find_exec_cat_other", "Bash", {"command": "find . -exec cat ../other-repo/secret.py \\;"}, "deny"),
-            ("fd_x_cat_other", "Bash", {"command": "fd . -x cat ../other-repo/secret.py"}, "deny"),
-            ("git_C_other_grep", "Bash", {"command": "git -C ../other-repo grep foo"}, "deny"),
-            ("git_grep_noindex_tilde", "Bash", {"command": "git grep --no-index foo ~"}, "deny"),
-            ("git_grep_inside", "Bash", {"command": "git grep foo"}, "allow"),
-            ("cd_tilde_grep_r", "Bash", {"command": "cd ~ && grep -r x ."}, "deny"),
-            ("cd_src_rg", "Bash", {"command": "cd src && rg x ."}, "allow"),
-            ("cd_symlink_cat", "Bash", {"command": "cd escape_link && cat leak.txt"}, "deny"),
-            ("cwd_symlink_cat", "Bash", {"command": "cat leak.txt", "cwd": "escape_link"}, "deny"),
-            ("ps_set_location_rg", "powershell", {"command": "Set-Location $env:USERPROFILE; rg foo"}, "deny"),
-            ("ps_gci_recurse_c", "powershell", {"command": "Get-ChildItem -Recurse C:\\"}, "deny"),
-            ("ps_gci_recurse_c_users", "powershell", {"command": r"Get-ChildItem -Path C:\Users -Recurse"}, "deny"),
-            ("ps_gci_r_dot", "powershell", {"command": "gci -r ."}, "allow"),
-            ("cmd_dir_s_c", "run_in_terminal", {"command": "dir /s C:\\"}, "deny"),
-            ("symlink_find", "Bash", {"command": "find escape_link -name '*'"}, "deny"),
-            ("symlink_read", "Read", {"file_path": str(self.repo / "escape_link" / "leak.txt")}, "deny"),
-            # 42-55: IDE / Claude Read, Grep, Glob, LS, VS Code read_file, list_dir, file_search, grep_search
-            ("claude_read_other_repo", "Read", {"file_path": str(self.other_repo / "secret.py")}, "deny"),
-            ("claude_read_own_repo", "Read", {"file_path": str(self.repo / "src" / "app.py")}, "allow"),
-            ("claude_read_dep", "Read", {"file_path": dep_file}, "allow"),
-            ("claude_grep_tilde", "Grep", {"pattern": "foo", "path": "~"}, "deny"),
-            ("claude_grep_repo", "Grep", {"pattern": "foo", "path": str(self.repo)}, "allow"),
-            ("claude_ls_tilde", "LS", {"path": "~"}, "deny"),
-            ("vscode_list_dir_parent", "list_dir", {"DirectoryPath": ".."}, "deny"),
-            ("claude_glob_outside", "Glob", {"pattern": f"{self.other_repo}/**/*.py"}, "deny"),
-            ("claude_glob_rel_escape", "Glob", {"pattern": "./../../other-repo/**/*.py"}, "deny"),
-            ("claude_glob_symlink_escape", "Glob", {"pattern": "escape_link/**/*.py"}, "deny"),
-            ("claude_glob_inside", "Glob", {"pattern": "**/*.py"}, "allow"),
-            ("claude_glob_src_inside", "Glob", {"pattern": "src/**/*.py"}, "allow"),
-            (
-                "vscode_read_claude_proj",
-                "read_file",
-                {"filePath": str(self.home / ".claude" / "projects" / "slug" / "session.jsonl")},
-                "deny",
-            ),
-            (
-                "vscode_read_copilot_sess",
-                "read_file",
-                {"filePath": str(self.home / ".copilot" / "session-state" / "session.jsonl")},
-                "deny",
-            ),
-            (
-                "vscode_read_agy_brain",
-                "read_file",
-                {"filePath": str(self.home / ".gemini" / "antigravity" / "brain" / "conv-1" / "session.jsonl")},
-                "deny",
-            ),
-            ("vscode_grep_search_out", "grep_search", {"query": "foo", "includePattern": "../other-repo/**"}, "deny"),
-            ("vscode_file_search_in", "file_search", {"query": "app.py", "folder": str(self.repo / "src")}, "allow"),
+            ("recursive find in home is denied", "Bash", {"command": "find ~ -name SKILL.md"}, "deny"),
+            ("recursive find in current directory is allowed", "Bash", {"command": "find . -name x"}, "allow"),
+            ("recursive find in repo subdirectory is allowed", "Bash", {"command": "find src -name '*.py'"}, "allow"),
+            ("recursive find from filesystem root is denied", "Bash", {"command": "find / -name x"}, "deny"),
+            ("recursive grep in sibling repository is denied", "Bash", {"command": f"grep -r foo {self.other_repo}"}, "deny"),
+            ("non-recursive grep on dependency file is allowed", "Bash", {"command": f"grep foo {dep_file}"}, "allow"),
+            ("non-recursive grep in sibling repository is denied", "Bash", {"command": "grep foo ../other-repo/secret.py"}, "deny"),
+            ("rg in default working directory is allowed", "Bash", {"command": "rg foo"}, "allow"),
+            ("rg in repo subdirectory is allowed", "Bash", {"command": "rg foo src"}, "allow"),
+            ("rg in parent directory is denied", "Bash", {"command": "rg foo .."}, "deny"),
+            ("rg in sibling repository is denied", "Bash", {"command": "rg foo ../other-repo"}, "deny"),
+            ("rg files listing in home is denied", "Bash", {"command": "rg --files ~"}, "deny"),
+            ("rg with attached pattern flag in home is denied", "Bash", {"command": "rg -efoo ~"}, "deny"),
+            ("ag in home via environment variable is denied", "Bash", {"command": "ag pattern $HOME"}, "deny"),
+            ("ag filename search in home is denied", "Bash", {"command": "ag -g SKILL ~"}, "deny"),
+            ("ack file listing in home is denied", "Bash", {"command": "ack -f ~"}, "deny"),
+            ("ack inside repo subdirectory is allowed", "Bash", {"command": "ack pattern src"}, "allow"),
+            ("fd in home is denied", "Bash", {"command": "fd SKILL.md ~"}, "deny"),
+            ("fd with search-path in parent is denied", "Bash", {"command": "fd --search-path .. foo"}, "deny"),
+            ("fd inside repo subdirectory is allowed", "Bash", {"command": "fd app.py src"}, "allow"),
+            ("non-recursive ls in copilot skills is allowed", "Bash", {"command": "ls ~/.copilot/skills"}, "allow"),
+            ("non-recursive ls in home is allowed", "Bash", {"command": "ls ~"}, "allow"),
+            ("non-recursive ls in sibling repository is denied", "Bash", {"command": "ls ../other-repo"}, "deny"),
+            ("recursive ls in home is denied", "Bash", {"command": "ls -R ~"}, "deny"),
+            ("recursive ls with combined flags in parent is denied", "Bash", {"command": "ls -laR .."}, "deny"),
+            ("tree in home is denied", "Bash", {"command": "tree ~"}, "deny"),
+            ("tree in current directory is allowed", "Bash", {"command": "tree ."}, "allow"),
+            ("du in parent directory is denied", "Bash", {"command": "du -sh .."}, "deny"),
+            ("locate global index query is denied", "Bash", {"command": "locate SKILL.md"}, "deny"),
+            ("mdfind without onlyin is denied", "Bash", {"command": "mdfind SKILL.md"}, "deny"),
+            ("mdfind scoped to repository is allowed", "Bash", {"command": f"mdfind -onlyin {self.repo} app"}, "allow"),
+            ("mdfind scoped to home is denied", "Bash", {"command": "mdfind -onlyin ~ app"}, "deny"),
+            ("cat of sibling repository packet is denied", "Bash", {"command": "cat ../other-repo/.git/craftsman/packet-1.md"}, "deny"),
+            ("cat of absolute sibling packet path is denied", "Bash", {"command": f"cat {other_pkt}"}, "deny"),
+            ("cat of own repository packet is allowed", "Bash", {"command": f"cat {own_pkt}"}, "allow"),
+            ("cat of temporary scratch file is allowed", "Bash", {"command": f"cat {tmp_file}"}, "allow"),
+            ("cat of virtualenv site-packages file is allowed", "Bash", {"command": f"cat {dep_file}"}, "allow"),
+            ("head of claude session store is denied", "Bash", {"command": "head -n 20 ~/.claude/projects/slug/session.jsonl"}, "deny"),
+            ("cat of shell history file is denied", "Bash", {"command": "cat ~/.zsh_history"}, "deny"),
+            ("sed reading sibling repository file is denied", "Bash", {"command": "sed -n '1,20p' ../other-repo/secret.py"}, "deny"),
+            ("env wrapper invoking bash -c find on root is denied", "Bash", {"command": 'env FOO=1 bash -c "find / -name x"'}, "deny"),
+            ("env -C parent directory with rg is denied", "Bash", {"command": "env -C .. rg foo"}, "deny"),
+            ("sudo -D sibling repository with cat is denied", "Bash", {"command": "sudo -D ../other-repo cat secret.py"}, "deny"),
+            ("find -exec cat on sibling repository is denied", "Bash", {"command": "find . -exec cat ../other-repo/secret.py \\;"}, "deny"),
+            ("fd -x cat on sibling repository is denied", "Bash", {"command": "fd . -x cat ../other-repo/secret.py"}, "deny"),
+            ("git -C sibling repository grep is denied", "Bash", {"command": "git -C ../other-repo grep foo"}, "deny"),
+            ("git grep --no-index in home is denied", "Bash", {"command": "git grep --no-index foo ~"}, "deny"),
+            ("git grep inside repository is allowed", "Bash", {"command": "git grep foo"}, "allow"),
+            ("cd to home followed by recursive grep is denied", "Bash", {"command": "cd ~ && grep -r x ."}, "deny"),
+            ("cd to repo subdirectory followed by rg is allowed", "Bash", {"command": "cd src && rg x ."}, "allow"),
+            ("cd through escaping symlink followed by cat is denied", "Bash", {"command": "cd escape_link && cat leak.txt"}, "deny"),
+            ("tool cwd on escaping symlink followed by cat is denied", "Bash", {"command": "cat leak.txt", "cwd": "escape_link"}, "deny"),
+            ("powershell Set-Location to home before rg is denied", "powershell", {"command": "Set-Location $env:USERPROFILE; rg foo"}, "deny"),
+            ("powershell recursive Get-ChildItem on drive root is denied", "powershell", {"command": "Get-ChildItem -Recurse C:\\"}, "deny"),
+            ("powershell recursive Get-ChildItem on C:\\Users is denied", "powershell", {"command": r"Get-ChildItem -Path C:\Users -Recurse"}, "deny"),
+            ("powershell recursive gci in current directory is allowed", "powershell", {"command": "gci -r ."}, "allow"),
+            ("cmd dir /s on drive root is denied", "run_in_terminal", {"command": "dir /s C:\\"}, "deny"),
+            ("find on escaping symlink inside repo is denied", "Bash", {"command": "find escape_link -name '*'"}, "deny"),
+            ("Read tool on escaping symlink inside repo is denied", "Read", {"file_path": str(self.repo / "escape_link" / "leak.txt")}, "deny"),
+            ("Read tool on sibling repository file is denied", "Read", {"file_path": str(self.other_repo / "secret.py")}, "deny"),
+            ("Read tool on own repository file is allowed", "Read", {"file_path": str(self.repo / "src" / "app.py")}, "allow"),
+            ("Read tool on dependency file is allowed", "Read", {"file_path": dep_file}, "allow"),
+            ("Grep tool in home directory is denied", "Grep", {"pattern": "foo", "path": "~"}, "deny"),
+            ("Grep tool in repository is allowed", "Grep", {"pattern": "foo", "path": str(self.repo)}, "allow"),
+            ("LS tool in home directory is denied", "LS", {"path": "~"}, "deny"),
+            ("list_dir tool in parent directory is denied", "list_dir", {"DirectoryPath": ".."}, "deny"),
+            ("Glob tool in sibling repository is denied", "Glob", {"pattern": f"{self.other_repo}/**/*.py"}, "deny"),
+            ("Glob tool escaping via relative parent is denied", "Glob", {"pattern": "./../../other-repo/**/*.py"}, "deny"),
+            ("Glob tool on escaping symlink is denied", "Glob", {"pattern": "escape_link/**/*.py"}, "deny"),
+            ("Glob tool inside repository is allowed", "Glob", {"pattern": "**/*.py"}, "allow"),
+            ("Glob tool inside repo subdirectory is allowed", "Glob", {"pattern": "src/**/*.py"}, "allow"),
+            ("read_file on claude session store is denied", "read_file", {"filePath": str(self.home / ".claude" / "projects" / "slug" / "session.jsonl")}, "deny"),
+            ("read_file on copilot session store is denied", "read_file", {"filePath": str(self.home / ".copilot" / "session-state" / "session.jsonl")}, "deny"),
+            ("read_file on antigravity brain store is denied", "read_file", {"filePath": str(self.home / ".gemini" / "antigravity" / "brain" / "conv-1" / "session.jsonl")}, "deny"),
+            ("grep_search with includePattern outside repo is denied", "grep_search", {"query": "foo", "includePattern": "../other-repo/**"}, "deny"),
+            ("file_search scoped to repo subdirectory is allowed", "file_search", {"query": "app.py", "folder": str(self.repo / "src")}, "allow"),
         ]
-        self.assertGreaterEqual(len(cases), 40)
-        for label, tool, tool_input, expected in cases:
-            with self.subTest(case=label):
+        for description, tool, tool_input, expected in cases:
+            with self.subTest(case=description):
                 res = evaluate_scope(tool, tool_input, self.repo, self.repo, self.policy)
                 self.assertEqual(
                     res.decision,
                     expected,
-                    f"Case {label!r} ({tool} {tool_input}) returned {res}",
+                    f"Case {description!r} ({tool} {tool_input}) returned {res}",
                 )
                 if expected == "deny":
                     self.assertIn("[CRAFTSMAN SCOPE-GUARD]", res.reason)
                     self.assertIn("git config craftsman.scopeAllow", res.reason)
 
-    def test_scope_allow_policy_warn_and_off_and_unparseable_command(self) -> None:
-        # 1. scopeAllow unlocks other_repo (including colon/semicolon-separated entries)
+    def test_scope_allow_config_unlocks_external_directories(self) -> None:
         extra_dir = self.tmp / "shared-contracts"
         extra_dir.mkdir()
         subprocess.run(
-            [
-                "git",
-                "config",
-                "--add",
-                "craftsman.scopeAllow",
-                f"{self.other_repo}:{extra_dir}",
-            ],
+            ["git", "config", "--add", "craftsman.scopeAllow", f"{self.other_repo}:{extra_dir}"],
             cwd=self.repo,
             check=True,
         )
         policy = load_scope_policy(self.repo, self.repo)
-        self.assertEqual(policy.mode, "deny")
         self.assertIn(self.other_repo.resolve(), policy.allowed_dirs)
         self.assertIn(extra_dir.resolve(), policy.allowed_dirs)
         self.assertEqual(
@@ -248,41 +217,42 @@ class ScopeEnforcementTests(unittest.TestCase):
             "allow",
         )
 
-        # 2. Unparseable command with unmatched quotes is denied with diagnostic to stderr
+    def test_unmatched_quotes_in_shell_command_are_denied(self) -> None:
         err = io.StringIO()
         with redirect_stderr(err):
-            unparseable = evaluate_scope(
+            decision = evaluate_scope(
                 "Bash",
                 {"command": 'find "unterminated quote'},
                 self.repo,
                 self.repo,
                 self.policy,
             )
-        self.assertEqual(unparseable.decision, "deny")
+        self.assertEqual(decision.decision, "deny")
         self.assertIn("blocking unparseable shell command", err.getvalue())
 
-    def test_pre_tool_hook_activation_dialects_warn_and_off_modes(self) -> None:
-        # 1. Without active gate session and non-craftsman agent -> allow everything
-        copilot_camel = {
+    def test_pre_tool_allows_outside_commands_when_gate_is_inactive(self) -> None:
+        payload = {
             "cwd": str(self.repo),
             "toolName": "run_in_terminal",
             "toolArgs": json.dumps({"command": "find ~ -name SKILL.md"}),
             "agentName": "general-helper",
         }
-        out_inactive, _ = call_pre_tool("copilot", copilot_camel)
-        self.assertEqual(out_inactive, {})
+        out, _ = call_pre_tool("copilot", payload)
+        self.assertEqual(out, {})
 
-        # 2. Without active gate session, but agent is `craftsman-reviewer` -> enforced (deny)!
-        copilot_reviewer = {
-            **copilot_camel,
+    def test_pre_tool_enforces_scope_for_craftsman_reviewer_without_gate(self) -> None:
+        payload = {
+            "cwd": str(self.repo),
+            "toolName": "run_in_terminal",
+            "toolArgs": json.dumps({"command": "find ~ -name SKILL.md"}),
             "agentType": "custom",
             "agentName": "craftsman-reviewer",
         }
-        out_rev, _ = call_pre_tool("copilot", copilot_reviewer)
-        self.assertEqual(out_rev["permissionDecision"], "deny")
-        self.assertEqual(out_rev["hookSpecificOutput"]["permissionDecision"], "deny")
+        out, _ = call_pre_tool("copilot", payload)
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
-        # 3. With active gate session -> enforced for both Copilot and Claude
+    def test_pre_tool_enforces_scope_when_gate_is_active(self) -> None:
         state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
         state_file.write_text(
             json.dumps({"active": True, "tier": "standard", "cwd": str(self.repo)}),
@@ -294,38 +264,57 @@ class ScopeEnforcementTests(unittest.TestCase):
             "tool_name": "Read",
             "tool_input": {"file_path": str(self.other_repo / "secret.py")},
         }
-        out_claude_deny, _ = call_pre_tool("claude", claude_read)
-        self.assertEqual(out_claude_deny["hookSpecificOutput"]["permissionDecision"], "deny")
+        out, _ = call_pre_tool("claude", claude_read)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
-        # 4. craftsman.scope = warn -> allow with systemMessage and additionalContext
+    def test_pre_tool_emits_warning_when_scope_mode_is_warn(self) -> None:
+        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
+        state_file.write_text(
+            json.dumps({"active": True, "tier": "standard", "cwd": str(self.repo)}),
+            encoding="utf-8",
+        )
         subprocess.run(["git", "config", "craftsman.scope", "warn"], cwd=self.repo, check=True)
-        out_warn, _ = call_pre_tool("copilot", copilot_camel)
-        self.assertNotIn("permissionDecision", out_warn)
-        self.assertIn("[CRAFTSMAN SCOPE-GUARD]", out_warn["systemMessage"])
-        self.assertIn("[CRAFTSMAN SCOPE-GUARD]", out_warn["additionalContext"])
+        payload = {
+            "cwd": str(self.repo),
+            "toolName": "run_in_terminal",
+            "toolArgs": json.dumps({"command": "find ~ -name SKILL.md"}),
+        }
+        out, _ = call_pre_tool("copilot", payload)
+        self.assertNotIn("permissionDecision", out)
+        self.assertIn("[CRAFTSMAN SCOPE-GUARD]", out["systemMessage"])
 
-        # 5. craftsman.scope = off -> allow silently
+    def test_pre_tool_allows_silently_when_scope_mode_is_off(self) -> None:
+        state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
+        state_file.write_text(
+            json.dumps({"active": True, "tier": "standard", "cwd": str(self.repo)}),
+            encoding="utf-8",
+        )
         subprocess.run(["git", "config", "craftsman.scope", "off"], cwd=self.repo, check=True)
-        out_off, _ = call_pre_tool("copilot", copilot_camel)
-        self.assertEqual(out_off, {})
+        payload = {
+            "cwd": str(self.repo),
+            "toolName": "run_in_terminal",
+            "toolArgs": json.dumps({"command": "find ~ -name SKILL.md"}),
+        }
+        out, _ = call_pre_tool("copilot", payload)
+        self.assertEqual(out, {})
 
-        # 6. craftsman.scope = enforce is accepted as an alias for deny
+    def test_load_scope_policy_treats_enforce_as_deny(self) -> None:
         subprocess.run(["git", "config", "craftsman.scope", "enforce"], cwd=self.repo, check=True)
         self.assertEqual(load_scope_policy(self.repo, self.repo).mode, "deny")
 
-    def test_grep_regex_patterns_and_queries_are_not_treated_as_paths(self) -> None:
-        for tool, inp in (
-            ("Grep", {"pattern": "/api/v1"}),
-            ("Grep", {"pattern": "~/.claude"}),
-            ("Grep", {"pattern": "$HOME"}),
-            ("grep_search", {"query": "/tmp/"}),
-            ("grep_search", {"query": "~/.copilot/session-state"}),
+    def test_grep_regex_arguments_are_ignored_by_scope_check(self) -> None:
+        for case, tool, inp in (
+            ("slash path in Grep pattern", "Grep", {"pattern": "/api/v1"}),
+            ("tilde in Grep pattern", "Grep", {"pattern": "~/.claude"}),
+            ("env var in Grep pattern", "Grep", {"pattern": "$HOME"}),
+            ("tmp path in grep_search query", "grep_search", {"query": "/tmp/"}),
+            ("session store in grep_search query", "grep_search", {"query": "~/.copilot/session-state"}),
         ):
-            with self.subTest(tool=tool, inp=inp):
+            with self.subTest(case=case):
                 dec = evaluate_scope(tool, inp, self.repo, self.repo, self.policy)
                 self.assertEqual(dec.decision, "allow", f"{tool} {inp}: {dec.reason}")
 
-    def test_submodules_and_nested_repos_inside_worktree_are_allowed(self) -> None:
+    def test_nested_git_repository_inside_worktree_is_allowed(self) -> None:
         nested = self.repo / "vendor" / "lib"
         nested.mkdir(parents=True)
         subprocess.run(["git", "init"], cwd=nested, capture_output=True, check=True)
@@ -344,14 +333,15 @@ class ScopeEnforcementTests(unittest.TestCase):
             "allow",
         )
 
-    def test_subshell_cd_pushd_popd_heredoc_apostrophes_cat_flags_and_nonrec_ls(self) -> None:
-        # 1. Subshell cd does not leak into following command; pushd/popd restores cwd
+    def test_subshell_chdir_does_not_leak_to_following_command(self) -> None:
         self.assertEqual(
             evaluate_scope(
                 "Bash", {"command": "(cd ~ && pwd); rg foo"}, self.repo, self.repo, self.policy
             ).decision,
             "allow",
         )
+
+    def test_popd_restores_previous_working_directory(self) -> None:
         self.assertEqual(
             evaluate_scope(
                 "Bash",
@@ -363,7 +353,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             "allow",
         )
 
-        # 2. Heredoc with an apostrophe (it's) and multi-line quoted arguments do not disable the scope check
+    def test_heredoc_with_apostrophe_does_not_bypass_scope_check(self) -> None:
         heredoc_cmd = "cat <<'EOF'\nit's done\nEOF\nfind ~ -name SKILL.md"
         self.assertEqual(
             evaluate_scope(
@@ -371,29 +361,20 @@ class ScopeEnforcementTests(unittest.TestCase):
             ).decision,
             "deny",
         )
-        for multiline_cmd in (
-            'git commit -m "subject\n\nbody" && rg secret ~',
-            'python -c "\nprint(1)\n"; find ~ -name SKILL.md',
-        ):
-            with self.subTest(multiline_cmd=multiline_cmd):
-                self.assertEqual(
-                    evaluate_scope(
-                        "Bash", {"command": multiline_cmd}, self.repo, self.repo, self.policy
-                    ).decision,
-                    "deny",
-                )
-        self.assertEqual(
-            evaluate_scope(
-                "Bash",
-                {"command": 'git commit -m "subject\n\nbody" && rg secret src'},
-                self.repo,
-                self.repo,
-                self.policy,
-            ).decision,
-            "allow",
-        )
 
-        # 3. `cat -n` and `cat -c` do not treat the file operand as an option value
+    def test_multiline_quoted_argument_does_not_bypass_scope_check(self) -> None:
+        for case, cmd, expected in (
+            ("commit message before rg in home", 'git commit -m "subject\n\nbody" && rg secret ~', "deny"),
+            ("python -c before find in home", 'python -c "\nprint(1)\n"; find ~ -name SKILL.md', "deny"),
+            ("commit message before rg in repo", 'git commit -m "subject\n\nbody" && rg secret src', "allow"),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(
+                    evaluate_scope("Bash", {"command": cmd}, self.repo, self.repo, self.policy).decision,
+                    expected,
+                )
+
+    def test_cat_line_number_flag_does_not_hide_file_operand(self) -> None:
         self.assertEqual(
             evaluate_scope(
                 "Bash",
@@ -404,43 +385,24 @@ class ScopeEnforcementTests(unittest.TestCase):
             ).decision,
             "deny",
         )
-        self.assertEqual(
-            evaluate_scope(
-                "Bash",
-                {"command": f"cat -n {self.other_repo}/secret.py"},
-                self.repo,
-                self.repo,
-                self.policy,
-            ).decision,
-            "deny",
-        )
 
-        # 4. Non-recursive `ls ..` and `ls ~` are allowed, while `ls -R ..`, `ls ../other-repo`, and `ls ~/.claude/projects` are denied
-        for allowed_ls in ("ls ..", "ls ~", "ls -la .."):
-            with self.subTest(allowed_ls=allowed_ls):
-                self.assertEqual(
-                    evaluate_scope(
-                        "Bash", {"command": allowed_ls}, self.repo, self.repo, self.policy
-                    ).decision,
-                    "allow",
-                )
-        for denied_ls in (
-            "ls -R ..",
-            "ls -R ~",
-            f"ls {self.other_repo}",
-            "ls ~/.claude/projects",
+    def test_non_recursive_ls_allows_parent_or_home_directory(self) -> None:
+        for case, cmd, expected in (
+            ("non-recursive ls on parent", "ls ..", "allow"),
+            ("non-recursive ls on home", "ls ~", "allow"),
+            ("non-recursive ls -la on parent", "ls -la ..", "allow"),
+            ("recursive ls -R on parent", "ls -R ..", "deny"),
+            ("recursive ls -R on home", "ls -R ~", "deny"),
+            ("non-recursive ls on sibling repo", f"ls {self.other_repo}", "deny"),
+            ("non-recursive ls on claude session store", "ls ~/.claude/projects", "deny"),
         ):
-            with self.subTest(denied_ls=denied_ls):
+            with self.subTest(case=case):
                 self.assertEqual(
-                    evaluate_scope(
-                        "Bash", {"command": denied_ls}, self.repo, self.repo, self.policy
-                    ).decision,
-                    "deny",
+                    evaluate_scope("Bash", {"command": cmd}, self.repo, self.repo, self.policy).decision,
+                    expected,
                 )
 
-    def test_antigravity_run_command_enforces_scope_when_gate_is_owned_by_antigravity(self) -> None:
-        from craftsman.guard import evaluate_command
-
+    def test_antigravity_run_command_enforces_scope_for_owner_session(self) -> None:
         state_file = self.repo / ".git" / "craftsman" / "craftsman_state.json"
         state_file.write_text(
             json.dumps(

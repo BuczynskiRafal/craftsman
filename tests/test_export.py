@@ -612,7 +612,7 @@ class DoctorTests(ExportTestCase):
         posix = "'/opt/my python/bin/python3' -m craftsman.cli hook stop --platform copilot"
         self.assertEqual(_command_executables(posix), ["/opt/my python/bin/python3"])
 
-    def test_rendered_prompts_have_no_filesystem_skill_lookups_and_include_search_scope(self) -> None:
+    def test_rendered_prompts_omit_filesystem_skill_lookups(self) -> None:
         import re
 
         user_prompts = self.tmp / "prompts"
@@ -651,7 +651,16 @@ class DoctorTests(ExportTestCase):
                 f"Bare skills/<name>/SKILL.md lookup in {path}",
             )
 
-        # Every rendered agent and craftsman/feature-dev/verify/code-review skill/command contains 'Search scope'
+    def test_rendered_prompts_include_search_scope_rules(self) -> None:
+        copilot_skills = self.tmp / "copilot_skills"
+        copilot_home = self.tmp / "copilot_home"
+        claude_dir = self.tmp / "claude"
+        ws = self.tmp / "ws"
+        export.export_to_copilot_skills(REPO_ROOT, copilot_skills)
+        export.export_copilot_home(REPO_ROOT, copilot_home)
+        export.export_to_claude_user(REPO_ROOT, claude_dir)
+        export.export_to_agents_workspace(REPO_ROOT, ws)
+
         for agent_file in [*copilot_home.glob("agents/*.agent.md"), *claude_dir.glob("agents/*.md")]:
             self.assertIn("Search scope", agent_file.read_text(encoding="utf-8"), str(agent_file))
 
@@ -662,15 +671,16 @@ class DoctorTests(ExportTestCase):
             self.assertIn("## Search scope", claude_cmd.read_text(encoding="utf-8"), str(claude_cmd))
         self.assertIn("## Search scope", (ws / "AGENTS.md").read_text(encoding="utf-8"))
 
-    def test_skill_cli_supports_hyphenated_frontmatter_names_and_noncanonical_duplicates(self) -> None:
-        from craftsman.cli import fix_copilot_duplicates, scan_copilot_duplicates, skill_main
+    def test_skill_cli_resolves_hyphenated_frontmatter_names(self) -> None:
+        from craftsman.cli import skill_main
 
-        # F3: code-quality and extreme-optimizer resolve by both hyphen and underscore names
         for name in ("code-quality", "code_quality", "extreme-optimizer", "extreme_optimizer"):
             self.assertEqual(skill_main(["show", name, "--repo-dir", str(REPO_ROOT)]), 0)
             self.assertEqual(skill_main(["path", name, "--repo-dir", str(REPO_ROOT)]), 0)
 
-        # F4: when no entry is canonical, removable Craftsman prompt file is removed while preserving Claude/user copy
+    def test_fix_duplicates_removes_legacy_prompt_keeping_claude_skill(self) -> None:
+        from craftsman.cli import fix_copilot_duplicates, scan_copilot_duplicates
+
         vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
         vscode_prompts.mkdir(parents=True, exist_ok=True)
         legacy_prompt = vscode_prompts / "verify.prompt.md"
@@ -684,14 +694,23 @@ class DoctorTests(ExportTestCase):
 
         dups = scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
         self.assertEqual(len(dups), 1)
-        self.assertEqual(dups[0]["canonical_path"], str(claude_skill))
-        self.assertEqual(dups[0]["removable_paths"], [str(legacy_prompt)])
+        dup0 = dups[0] if isinstance(dups[0], dict) else dups[0].to_json()
+        self.assertEqual(dup0["canonical_path"], str(claude_skill))
+        self.assertEqual(dup0["removable_paths"], [str(legacy_prompt)])
         removed, _ = fix_copilot_duplicates(REPO_ROOT, home=self.tmp)
         self.assertEqual(removed, [legacy_prompt])
         self.assertFalse(legacy_prompt.exists())
         self.assertTrue(claude_skill.is_file())
 
-        # F9: JSONC comments and trailing commas in VS Code settings.json disable .claude location
+    def test_jsonc_settings_disable_claude_skill_location(self) -> None:
+        from craftsman.cli import scan_copilot_duplicates
+
+        vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
+        vscode_prompts.mkdir(parents=True, exist_ok=True)
+        claude_skill = self.tmp / ".claude" / "skills" / "verify" / "SKILL.md"
+        claude_skill.parent.mkdir(parents=True, exist_ok=True)
+        claude_skill.write_text("---\nname: verify\n---\nClaude skill\n", encoding="utf-8")
+
         settings_json = vscode_prompts.parent / "settings.json"
         settings_json.write_text(
             '{\n  // comment in JSONC\n  "chat.agentSkillsLocations": {\n    "~/.claude/skills": false,\n  },\n}\n',
@@ -700,20 +719,18 @@ class DoctorTests(ExportTestCase):
         export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
         self.assertEqual(scan_copilot_duplicates(REPO_ROOT, home=self.tmp), [])
 
-    def test_env_var_for_home_honors_xdg_outside_home_and_skill_scope_sync(self) -> None:
-        from craftsman.cli import validate_skill_manifests
-
-        # Minor 8: when `home` matches `user_home(None)`, XDG_CONFIG_HOME or CRAFTSMAN_HOME outside $HOME is honored
+    def test_env_var_for_home_honors_xdg_outside_real_home(self) -> None:
         real_home = export.user_home(None)
         with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}, clear=False):
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", real_home), "/opt/cfg")
             self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
-            # When an isolated test `home` different from `user_home(None)` is passed, outside env is ignored
             self.assertEqual(
                 export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated_home"), ""
             )
 
-        # Minor 12: `skills/craftsman/scope.md` and `skills/craftsman/SKILL.md` are in exact sync
+    def test_craftsman_scope_fragment_matches_skill_document(self) -> None:
+        from craftsman.cli import validate_skill_manifests
+
         scope_md = (REPO_ROOT / "skills" / "craftsman" / "scope.md").read_text(encoding="utf-8").strip()
         skill_md = (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn(scope_md, skill_md)
