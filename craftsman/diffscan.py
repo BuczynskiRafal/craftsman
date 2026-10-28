@@ -28,9 +28,6 @@ GIT_TIMEOUT_S = 60.0
 MAX_UNTRACKED_BYTES = 1_048_576  # 1 MiB
 MAX_SOURCE_BYTES = 1_048_576  # files read for scopes, symbols and references
 BINARY_SNIFF_BYTES = 8000  # the prefix git itself checks for NUL bytes
-SCOPE_TEXT_MAX_LINES = 160
-SCOPE_TEXT_HEAD_LINES = 80
-SCOPE_TEXT_TAIL_LINES = 40
 SCOPE_SCAN_MAX_LINES = 200
 BLOCK_SCOPE_RADIUS = 30
 REFERENCE_TEXT_MAX_CHARS = 200
@@ -246,7 +243,7 @@ class DiffSnapshot:
     @property
     def docs_only(self) -> bool:
         renamed_from = (hunk.old_path for hunk in self.hunks if hunk.old_path is not None)
-        return bool(self.files) and all(is_docs(path) for path in (*self.files, *renamed_from))
+        return bool(self.files) and all(is_docs_path(path) for path in (*self.files, *renamed_from))
 
 
 @dataclass(frozen=True)
@@ -904,6 +901,7 @@ class WorktreeIndex:
         self._real_root = self.root.resolve()
         self._sources: dict[str, _Source | None] = {}
         self._untracked: tuple[str, ...] | None = None
+        self._mentions: dict[str, tuple[Reference, ...]] = {}
 
     def scope(self, path: str, line: int) -> Scope | None:
         """Return the innermost function/class around `line` of the work tree file, or a block window.
@@ -915,19 +913,14 @@ class WorktreeIndex:
         return None if source is None else _scope_at(source, line)
 
     def hunk_scope(self, hunk: Hunk) -> Scope | None:
-        """Scope of the hunk's first changed line; for a deletion, of the line now at its place.
+        """Scope of the hunk's first added line; for a pure deletion see `_anchor_line`.
 
-        A deletion at the end of the file uses the line above it. Hunks without content lines
-        (renames, mode changes, binary files) have no scope.
+        Hunks without content lines (renames, mode changes, binary files) have no scope.
         """
-        first = next(((tag, new_no) for tag, _, new_no, _ in _walk(hunk) if tag in ("+", "-")), None)
-        if first is None:
-            return None
-        tag, line = first
-        scope = self.scope(hunk.path, line)
-        if scope is None and tag == "-" and line > 1:
-            scope = self.scope(hunk.path, line - 1)
-        return scope
+        if hunk.added_lines:
+            return self.scope(hunk.path, hunk.added_lines[0][0])
+        lines = _touched_new_lines(hunk)
+        return self.scope(hunk.path, lines[0]) if lines else None
 
     def symbols(self, hunk: Hunk) -> tuple[str, ...]:
         """Names defined on the hunk's changed lines plus the names of the scopes it touches.
@@ -968,14 +961,30 @@ class WorktreeIndex:
         `REFERENCES_PER_FILE` lines. Untracked files are the snapshot's own, so generated tool
         caches and `.craftsmanignore` entries are never searched.
         """
-        if not symbol.strip() or any(char in symbol for char in "\n\r\0"):
-            raise DiffScanError(f"invalid symbol to search for: {symbol!r}")
         if limit < 1:
             raise DiffScanError(f"limit must be at least 1, got {limit}")
+        mentions = self.mentions(symbol)
+        ranked = sorted(dict.fromkeys(ref.path for ref in mentions), key=lambda path: path in defined_in)
+        by_path: dict[str, list[Reference]] = {}
+        for ref in mentions:
+            by_path.setdefault(ref.path, []).append(ref)
+        found = [ref for path in ranked for ref in by_path[path]]
+        return tuple(found[:limit])
+
+    def mentions(self, symbol: str) -> tuple[Reference, ...]:
+        """The first `REFERENCES_PER_FILE` whole-word occurrences of `symbol` in every file that
+        has one, by path; searched once per index."""
+        if not symbol.strip() or any(char in symbol for char in "\n\r\0"):
+            raise DiffScanError(f"invalid symbol to search for: {symbol!r}")
+        if symbol not in self._mentions:
+            self._mentions[symbol] = self._search(symbol)
+        return self._mentions[symbol]
+
+    def _search(self, symbol: str) -> tuple[Reference, ...]:
         word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])")
         candidates = {*self._tracked_files_mentioning(symbol), *self._untracked_paths()}
         found: list[Reference] = []
-        for path in sorted(candidates, key=lambda path: (path in defined_in, path)):
+        for path in sorted(candidates):
             source = self._source(path)
             if source is None:
                 continue
@@ -985,9 +994,7 @@ class WorktreeIndex:
                 if word.search(text)
             )
             found.extend(itertools.islice(matches, REFERENCES_PER_FILE))
-            if len(found) >= limit:
-                break
-        return tuple(found[:limit])
+        return tuple(found)
 
     def _source(self, path: str) -> _Source | None:
         if path not in self._sources:
@@ -1007,23 +1014,6 @@ class WorktreeIndex:
         if code != 0:
             raise DiffScanError(f"`git grep` for {symbol!r} failed (exit {code}): {err.strip()}")
         return [path for path in out.split("\0") if path]
-
-
-def enclosing_scope(cwd: str | Path, path: str, line: int) -> Scope | None:
-    """`WorktreeIndex.scope` for a single lookup."""
-    return WorktreeIndex(cwd).scope(path, line)
-
-
-def defined_symbols(cwd: str | Path, hunk: Hunk) -> tuple[str, ...]:
-    """`WorktreeIndex.symbols` for a single hunk."""
-    return WorktreeIndex(cwd).symbols(hunk)
-
-
-def find_references(
-    cwd: str | Path, symbol: str, *, limit: int = 20, defined_in: Collection[str] = ()
-) -> tuple[Reference, ...]:
-    """`WorktreeIndex.references` for a single symbol."""
-    return WorktreeIndex(cwd).references(symbol, limit=limit, defined_in=defined_in)
 
 
 def _load_source(root: Path, real_root: Path, path: str) -> _Source | None:
@@ -1079,26 +1069,13 @@ def _scope_at(source: _Source, line: int) -> Scope | None:
         start = max(1, line - BLOCK_SCOPE_RADIUS)
         end = min(len(source.lines), line + BLOCK_SCOPE_RADIUS)
         span = _Span(start, end, f"lines {start}-{end}", "block", start)
-    text = _capped_text(source.lines[span.start - 1 : span.end])
+    text = "\n".join(source.lines[span.start - 1 : span.end])
     return Scope(source.path, span.name, span.kind, span.start, span.end, text)
 
 
 def _innermost_span(spans: Sequence[_Span], line: int) -> _Span | None:
     containing = [span for span in spans if span.start <= line <= span.end]
     return max(containing, key=lambda span: (span.start, -span.end), default=None)
-
-
-def _capped_text(lines: Sequence[str]) -> str:
-    if len(lines) <= SCOPE_TEXT_MAX_LINES:
-        return "\n".join(lines)
-    omitted = len(lines) - SCOPE_TEXT_HEAD_LINES - SCOPE_TEXT_TAIL_LINES
-    return "\n".join(
-        [
-            *lines[:SCOPE_TEXT_HEAD_LINES],
-            f"... ({omitted} lines omitted) ...",
-            *lines[-SCOPE_TEXT_TAIL_LINES:],
-        ]
-    )
 
 
 def _indent(text: str) -> int:
@@ -1238,13 +1215,18 @@ def _defined_name(text: str, *, python: bool) -> str | None:
 
 
 def _touched_new_lines(hunk: Hunk) -> tuple[int, ...]:
-    """New-file line numbers of added lines and, for removed lines, of the line just above them."""
-    lines = (
-        new_no if tag == "+" else max(1, new_no - 1)
-        for tag, _, new_no, _ in _walk(hunk)
-        if tag in ("+", "-")
-    )
+    """The new-file line that stands for each changed line, in order, see `_anchor_line`."""
+    lines = (_anchor_line(tag, new_no) for tag, _, new_no, _ in _walk(hunk) if tag in ("+", "-"))
     return tuple(dict.fromkeys(lines))
+
+
+def _anchor_line(tag: str, new_no: int) -> int:
+    """An added line stands for itself; a removed line for the surviving line just above it.
+
+    The line now at a deletion's place may already belong to the next definition, the line above
+    still belongs to the one the deletion was made in.
+    """
+    return new_no if tag == "+" else max(1, new_no - 1)
 
 
 def _is_meaningful_symbol(name: str) -> bool:
@@ -1291,19 +1273,20 @@ def _is_config(path: str) -> bool:
     )
 
 
-def _is_test(path: str) -> bool:
+def is_test_path(path: str) -> bool:
+    """Test code by location or name, e.g. `tests/x.py`, `test_x.py`, `x.spec.ts`, `x_test.go`."""
     posix = PurePosixPath(path)
     return bool(_TEST_DIRS.intersection(posix.parts[:-1])) or _name_matches(posix.name, _TEST_NAME_GLOBS)
 
 
-def is_docs(path: str) -> bool:
+def is_docs_path(path: str) -> bool:
     """Prose by file type alone: a `docs/` folder can hold code (e.g. Sphinx's conf.py)."""
     return PurePosixPath(path).suffix.lower() in _DOCS_SUFFIXES and not _is_config(path)
 
 
 def _is_docs_hunk(hunk: Hunk) -> bool:
     """A rename counts as documentation only when both its old and new paths are documentation."""
-    return is_docs(hunk.path) and (hunk.old_path is None or is_docs(hunk.old_path))
+    return is_docs_path(hunk.path) and (hunk.old_path is None or is_docs_path(hunk.old_path))
 
 
-_PATH_SIGNALS = {"config": _is_config, "tests": _is_test}
+_PATH_SIGNALS = {"config": _is_config, "tests": is_test_path}

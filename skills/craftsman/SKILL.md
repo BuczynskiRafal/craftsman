@@ -24,9 +24,10 @@ your platform offers it; otherwise run `craftsman skill show <name>` and follow 
 search the file system for skill files.
 Subagents are the `craftsman-reviewer` and `craftsman-verifier` agents: custom agents in VS Code
 Copilot, `/agent` or the task tool in the Copilot CLI, the Agent/Task tool in Claude Code,
-`invoke_subagent` in Antigravity. Without any subagent mechanism, play each role yourself, one at a
-time. Write every `craftsman` command on one line (no `\` continuations, which PowerShell and cmd do
-not understand).
+`invoke_subagent` in Antigravity (`TypeName` `self`, `Role` `craftsman-reviewer` or
+`craftsman-verifier`; only the `craftsman-reviewer` role counts as an isolated review). Without
+any subagent mechanism, play each role yourself, one at a time. Write every `craftsman` command
+on one line (no `\` continuations, which PowerShell and cmd do not understand).
 
 ## Search scope
 
@@ -95,12 +96,20 @@ resolved to and the lenses it needs. Then write the **intent brief** of `/code-r
 - **quick:** apply the selected lenses yourself, one at a time, `sweep` last if selected.
 - **standard / deep — two waves, never inline while subagents exist** (your context is full of
   the reasoning that produced the code, which is exactly what hides its defects):
-  1. *Wave 1, in parallel:* `craftsman-reviewer` subagents for every selected lens **except
-     `sweep`**, 1–3 lenses each, for example (`intent`, `contracts`), (`failure`, `ripple`),
-     (`state`, `trust`, `platform`), (`tests`, `model`, `craft`). Give each the packet path, the
-     intent brief and its lenses. On a small fix round (one or two open hunks) one reviewer may
-     take every non-sweep lens.
-  2. *Wave 2, after wave 1 has finished:* one more `craftsman-reviewer` for lens `sweep` only.
+  1. *Wave 1, in parallel:* `craftsman-reviewer` subagents assigned by fixed reviewer groups
+     (`REVIEWER_GROUPS` in `craftsman/lenses.py`), omitting unselected lenses and skipping empty
+     groups:
+     - **R1** (callers & contracts): `intent`, `contracts`, `ripple`, `tests`
+     - **R2** (failure paths & state): `failure`, `state`, `trust`, `model`
+     - **R3** (environment & clarity): `platform`, `craft`
+     - **R4** (whole-change design): `design`
+     Build a packet view for each active reviewer group with
+     `craftsman review view --lenses <group-or-lenses> [--hunks <range>]` and give each its packet
+     view path, the intent brief and its lenses (each reviewer reads your view completely, the full
+     packet only for a hunk outside your view that you need). On a small fix round (one or two open
+     hunks) one reviewer may take every non-sweep lens.
+  2. *Wave 2, after wave 1 has finished:* one more `craftsman-reviewer` for lens `sweep` only,
+     followed by `craftsman-verifier`.
 
 ### 2.4 Challenge findings
 - **standard / deep:** a `craftsman-verifier` subagent gives every finding a verdict — always, even

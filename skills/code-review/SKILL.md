@@ -67,10 +67,12 @@ contract run `craftsman skill show craftsman --file scope.md`).
 craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--task "<what the change is for, one line>"]
 ```
 
-This prints the absolute path of the current review packet. Read the packet completely (if you do
-not have the path, run `craftsman review show` or `craftsman review show --packet-path` in the
-repository root; never search for packet or ledger files, as packets, ledgers, and reports of other
-repositories are never relevant). It contains:
+This prints the absolute path of the current review packet (`packet-N.md`), and
+`craftsman review view --lenses <lenses> [--hunks <range>]` writes and prints a per-reviewer view
+(`packet-N.<slug>.md`). Read your view completely, the full packet only for a hunk outside your view
+that you need (if you do not have the path, run `craftsman review show` or
+`craftsman review show --packet-path` in the repository root; never search for packet or ledger
+files, as packets, ledgers, and reports of other repositories are never relevant). It contains:
 - the round number, diff fingerprint, and statistics;
 - the task statement and commit messages (the *intent*);
 - the project convention files to respect (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`,
@@ -135,8 +137,8 @@ For each selected lens, for each non-carried hunk:
    without a verdict):
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, ordering entries in `AUTHORS` and a missing changelog entry are two separate
-   findings, not one "housekeeping" finding;
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
+   separate findings, not one "housekeeping" finding;
 3. write the coverage note while you probe, then record it for groups of **1–4 hunks per entry**.
    For every hunk id give the inputs you tried and what the code does with them, naming the guard
    or line that makes it safe — "ok" or "checked" is not a note. When recording more than one
@@ -157,8 +159,11 @@ For each selected lens, for each non-carried hunk:
    craftsman review cover --lens contracts --hunks H1,H3 --note "H1 paginate: page=0 -> start=-20 (F2); size=None -> default 20 at catalog.py:14. H3 search_page: q='' rejected by validate_query at api.py:40 before the call"
    ```
 
-`cover` and `add` refuse to record against a round whose code has changed since it was prepared:
-run `craftsman review prepare` again first (unchanged hunks carry their coverage over).
+The `design` lens covers changed files, not hunks: pass `--files cart.py,api.py` (in JSON,
+`"files": ["cart.py"]`).
+
+`cover`, `add` and `view` refuse a round whose code has changed since it was prepared: run
+`craftsman review prepare` again first (unchanged hunks carry their coverage over).
 
 Record candidates generously in this step — a candidate that turns out wrong is dismissed in
 Step 3 at low cost; a real defect you filtered out early is lost for good.
@@ -167,25 +172,30 @@ Step 3 at low cost; a real defect you filtered out early is lost for good.
 - `blocker` — wrong results, data loss, security hole, or crash on a path real users take.
 - `major` — wrong behavior on a plausible path, a broken contract for some caller, or an error
   that is hidden instead of reported.
-- `minor` — a real but low-impact edge case, or a maintainability cost with a concrete future bug.
+- `minor` — a real but low-impact edge case, a maintainability cost with a concrete future bug, or
+  a name or structure that misleads the reader, with the misleading reading stated. Record naming
+  and structure problems when you can state the wrong reading: what a reader would believe from the
+  name, and what the code actually does. 'I don't like it' is not a finding.
 - `nit` — only when a project convention file explicitly requires it.
 
-**Use isolated reviewers when the platform offers them.** On tiers `standard` and `deep`:
-- **Without `--fix` (review-only):** spawn **two `craftsman-reviewer` subagents in parallel**, each
-  assigned half of the round's domain lenses:
-  - reviewer 1: `{intent, contracts, ripple, tests, craft}`
-  - reviewer 2: `{failure, state, trust, platform, model}`
-  (omitting lenses not selected in the round), followed by **one `craftsman-verifier` subagent**
-  that performs the `sweep` pass and duplicate grouping at the start of its run (Step 0) before
-  recording verdicts.
-- **With `--fix` or inside `/craftsman`:** hand the lens passes to fresh-context reviewer
-  subagents (`craftsman-reviewer`), 1–3 lenses each in parallel, then run one more reviewer for
-  the **final sweep** described at the end of `lenses.md`, followed by a separate
-  `craftsman-verifier` subagent.
-- **Keep subagent briefs lean:** pass each subagent only the packet path printed by
-  `craftsman review prepare` or `craftsman review show`, its
-  assigned lenses, and the hunk list — never paste file contents into the prompt. The verifier
-  should read `craftsman review show` and the packet first, then open source files only around the
+**Use isolated reviewers when the platform offers them.** On tiers `standard` and `deep`, hand the
+lens passes to fresh-context `craftsman-reviewer` subagents in parallel using the fixed reviewer
+groups (`REVIEWER_GROUPS` in `craftsman/lenses.py`), omitting lenses not selected in the round and
+skipping any group that has no selected lenses:
+- **R1** (callers & contracts): `intent`, `contracts`, `ripple`, `tests`
+- **R2** (failure paths & state): `failure`, `state`, `trust`, `model`
+- **R3** (environment & clarity): `platform`, `craft`
+- **R4** (whole-change design): `design`
+- **Verifier / sweep**: `sweep` (after all reviewer groups finish; in review-only mode without
+  `--fix`, the `craftsman-verifier` subagent runs `sweep` and duplicate grouping at Step 0 before
+  recording verdicts; with `--fix` or inside `/craftsman`, run a `sweep` reviewer after R1–R4
+  followed by `craftsman-verifier`).
+- **Keep subagent briefs lean:** generate a view per reviewer group with
+  `craftsman review view --lenses <lenses> [--hunks <range>]` (e.g. `craftsman review view --lenses R1`)
+  and pass each reviewer subagent its packet view path (`packet-N.<slug>.md`), its assigned lenses,
+  and the hunk list — never paste file contents into the prompt. Each reviewer reads your view
+  completely, the full packet only for a hunk outside your view that you need. The verifier should
+  read `craftsman review show` and the full packet first, then open source files only around the
   cited `file:line` ranges and callers rather than reading full files top to bottom.
 - When no subagent mechanism exists, do the passes yourself one lens at a time, re-reading the
   packet at the start of each lens.
@@ -212,8 +222,8 @@ only on `quick` or when the platform has no subagents.
    ```
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, ordering entries in `AUTHORS` and a missing changelog entry are two separate
-   findings, not one "housekeeping" finding. A finding that duplicates an already-judged one (for
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
+   separate findings, not one "housekeeping" finding. A finding that duplicates an already-judged one (for
    example in a later round, where `merge` no longer applies) is `dismissed` with a reference to
    the other finding's `file:line`.
 2. **Look for a guard or unreachability.** Check callers, types, validation on load, or tests that
@@ -288,7 +298,7 @@ craftsman review report --review-only
 and present the report output. `--review-only` checks that the round is current, every selected
 lens (including `sweep`) covered all non-carried hunks, and every finding has a verdict, without
 requiring `proven`/`probable` findings to be resolved or a passing test run (reporting
-`**Craftsman review: COMPLETE (review-only)**` / `Review: complete (review-only)`, or
+`**Craftsman review: COMPLETE (review-only)**` / `Review: COMPLETE (review-only)`, or
 `**Craftsman review: INCOMPLETE (N open items)**` while review steps remain open). Running
 `craftsman review check` or `craftsman review report` *without* `--review-only` in review-only mode
 is expected to show `BLOCKED` (because findings are left open for the author and the full test
@@ -319,7 +329,8 @@ ordered by severity; dismissed ones are listed briefly so the reader sees what w
 
 - **Subagents.** GitHub Copilot (VS Code): use the `craftsman-reviewer` / `craftsman-verifier`
   custom agents as subagents. Claude Code: the `Task`/`Agent` tool with those agent names.
-  Antigravity: `invoke_subagent`. Copilot CLI: `/agent` or the task tool. Codex and others:
+  Antigravity: `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
+  `craftsman-verifier`. Copilot CLI: `/agent` or the task tool. Codex and others:
   run the lenses yourself, one at a time.
 - **Shell.** All `craftsman` commands are identical in bash, zsh, PowerShell and cmd. Keep each
   on one line (no `\` continuations). When a note, scenario or evidence quotes code containing `$`

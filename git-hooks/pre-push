@@ -2,27 +2,8 @@
 set -euo pipefail
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-_SCRIPT_DIR="${HOOKS_DIR}"
-if [[ -L "$0" ]]; then
-  _LINK_TARGET="$(readlink "$0" 2>/dev/null || true)"
-  if [[ -n "${_LINK_TARGET}" ]]; then
-    [[ "${_LINK_TARGET}" == /* ]] || _LINK_TARGET="$(dirname "$0")/${_LINK_TARGET}"
-    _SCRIPT_DIR="$(cd "$(dirname "${_LINK_TARGET}")" 2>/dev/null && pwd -P || printf '%s' "${HOOKS_DIR}")"
-  fi
-fi
-
-for _helper in "${HOOKS_DIR}/_passthrough.sh" "${_SCRIPT_DIR}/_passthrough.sh" "${HOOKS_DIR}/applypatch-msg"; do
-  if [[ -f "${_helper}" ]] && grep -q "run_craftsman_guard" "${_helper}" 2>/dev/null; then
-    # shellcheck source=git-hooks/_passthrough.sh
-    source "${_helper}"
-    break
-  fi
-done
-
-if ! declare -F run_craftsman_guard >/dev/null || ! declare -F chain_git_hook >/dev/null; then
-  echo "craftsman git hooks in ${HOOKS_DIR} are out of date (missing _passthrough.sh helpers); run ./install.sh --git-hooks from the Craftsman repo, or bypass once with git -c core.hooksPath= push" >&2
-  exit 1
-fi
+# shellcheck source=git-hooks/_passthrough.sh
+source "${HOOKS_DIR}/_passthrough.sh"
 
 STDIN_DATA="$(cat)"
 printf "%s" "${STDIN_DATA:+${STDIN_DATA}$'\n'}" | run_craftsman_guard "pre-push" "$@"

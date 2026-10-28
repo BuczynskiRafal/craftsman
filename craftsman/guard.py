@@ -20,7 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from craftsman.gate import _encode_claude_project_slug, read_transcript_entries
+from craftsman.export import user_home
+from craftsman.transcript import (
+    QUESTION_TOOLS,
+    Entry,
+    TranscriptError,
+    claude_project_slug,
+    decode_json_text,
+    read_transcript_entries,
+)
 
 PROTECTED_BRANCHES = frozenset(
     {
@@ -53,18 +61,14 @@ AI_ATTRIBUTION_PATTERNS = (
     re.compile(r"(?i)🤖[ \t]*generated[ \t]+with"),
 )
 
-PUSH_ACTION_RE = re.compile(
-    r"(?i)\b(push\w*|wypchn\w*|wrzu[cć]\w*|merge\w*|zmerguj\w*|scal\w*)\b"
-)
+PUSH_ACTION_RE = re.compile(r"(?i)\b(push\w*|wypchn\w*|wrzu[cć]\w*|merge\w*|zmerguj\w*|scal\w*)\b")
 PUSH_TARGET_RE = re.compile(
     r"(?i)(?:\b(?:main|master|protected\s+branch)\b|"
     r"\bchronion\w+\s+gał[aąę][zź]\w*|"
     r"\bgał[aąę][zź]\w*\s+chronion\w*|"
     r"\bpr\s+merge\b|\bmerge\b[^\n]{0,30}\b(?:pr|pull\s+request)\b)"
 )
-DIRECT_MAIN_APPROVAL_RE = re.compile(
-    r"(?i)\b(main|master|merge\w*|zmerguj\w*|scal\w*)\b"
-)
+DIRECT_MAIN_APPROVAL_RE = re.compile(r"(?i)\b(main|master|merge\w*|zmerguj\w*|scal\w*)\b")
 AFFIRMATIVE_SHORT_RE = re.compile(
     r"(?i)^\s*(?:a\d+\s*:\s*)?(?:\(recommended\)\s*)?(?:yes|tak|y|t|ok|okay|confirm\w*|proceed|zatwierd[zź]\w*)\s*[.!]*\s*$"
 )
@@ -84,9 +88,7 @@ USER_CANCELLATION_RE = re.compile(
     r"tool\s+call\s+rejected|user\s+cancelled|user\s+canceled|anulowano)"
 )
 CLAUDE_ANSWER_PAIR_RE = re.compile(r'"((?:[^"\\]|\\.)*)"\s*=\s*"((?:[^"\\]|\\.)*)"')
-HEREDOC_OPEN_RE = re.compile(
-    r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
-)
+HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
 _REDIR_TARGET_PAT = r"[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>]*)"
 UNQUOTED_REDIR_RE = re.compile(
     r"(?:(?:\d+)?[<>]&[ \t]*(?:\d+|-)"
@@ -99,9 +101,7 @@ GIT_GLOBAL_OPTS_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"}
 )
 
-PUSH_OPTS_WITH_VALUE = frozenset(
-    {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
-)
+PUSH_OPTS_WITH_VALUE = frozenset({"--repo", "--receive-pack", "--exec", "-o", "--push-option"})
 
 INLINE_MESSAGE_OPTS = frozenset(
     {"-m", "--message", "--trailer", "-b", "--body", "-t", "--title", "--notes"}
@@ -114,7 +114,24 @@ SIMPLE_WRAPPERS = frozenset(
 SHELL_CONTROL_KEYWORDS = frozenset({"if", "then", "elif", "else", "fi", "do", "done", "while", "until"})
 WRAPPER_OPTS_WITH_VALUE: dict[str, frozenset[str]] = {
     "nice": frozenset({"-n", "--adjustment"}),
-    "sudo": frozenset({"-u", "-g", "-C", "-D", "-R", "-T", "-h", "-p", "-r", "-t", "--user", "--group", "--chdir", "--prompt"}),
+    "sudo": frozenset(
+        {
+            "-u",
+            "-g",
+            "-C",
+            "-D",
+            "-R",
+            "-T",
+            "-h",
+            "-p",
+            "-r",
+            "-t",
+            "--user",
+            "--group",
+            "--chdir",
+            "--prompt",
+        }
+    ),
     "env": frozenset({"-u", "-C", "-S", "--unset", "--chdir", "--split-string"}),
     "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
     "command": frozenset(),
@@ -124,7 +141,9 @@ WRAPPER_OPTS_WITH_VALUE: dict[str, frozenset[str]] = {
     "builtin": frozenset(),
 }
 TIMEOUT_OPTS_WITH_VALUE = frozenset({"-k", "-s", "--kill-after", "--signal"})
-XARGS_OPTS_WITH_VALUE = frozenset({"-n", "-L", "-I", "-P", "-d", "-E", "-a", "--max-args", "--max-procs"})
+XARGS_OPTS_WITH_VALUE = frozenset(
+    {"-n", "-L", "-I", "-P", "-d", "-E", "-a", "--max-args", "--max-procs"}
+)
 
 
 def emit(decision: str, reason: str | None = None) -> None:
@@ -215,11 +234,6 @@ def _split_shell_events(command_line: str) -> list[str]:
     return events
 
 
-def split_shell_segments(command_line: str) -> list[str]:
-    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
-    return [ev for ev in _split_shell_events(command_line) if ev not in ("(", ")")]
-
-
 def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
     """Strip leading env assignments, shell control keywords, and command wrappers (`env`, `nice`, `sudo`, `timeout`, `xargs`, etc.)."""
     idx = 0
@@ -246,7 +260,11 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
                 if cur_tok == "--":
                     idx += 1
                     break
-                if "=" in cur_tok and not cur_tok.startswith("-") and cur_tok.split("=", 1)[0].isidentifier():
+                if (
+                    "=" in cur_tok
+                    and not cur_tok.startswith("-")
+                    and cur_tok.split("=", 1)[0].isidentifier()
+                ):
                     idx += 1
                     continue
                 if cur_tok in opts_with_val:
@@ -363,7 +381,9 @@ def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
             continue
         if quote is None:
             m = _UNQUOTED_WIN_PATH_TOKEN_RE.match(cmd_header, i)
-            if m and (i == 0 or cmd_header[i - 1].isspace() or cmd_header[i - 1] in (";", "|", "&", "(")):
+            if m and (
+                i == 0 or cmd_header[i - 1].isspace() or cmd_header[i - 1] in (";", "|", "&", "(")
+            ):
                 out.append(m.group(0).replace("\\", "\\\\"))
                 i = m.end()
                 continue
@@ -386,10 +406,6 @@ def _tokenize_raw_segment(segment: str) -> list[str]:
         return cmd_header.split()
 
 
-def tokenize_segment(segment: str) -> list[str]:
-    return _strip_wrappers_from_tokens(_tokenize_raw_segment(segment))
-
-
 def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> str | None:
     """If `tokens` invoke `bash -c '...'`, `bash <<EOF`, or `eval ...`, return the inner command string."""
     if not tokens:
@@ -403,7 +419,12 @@ def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> s
             tok = tokens[i]
             if tok == "-c" and i + 1 < len(tokens):
                 return tokens[i + 1]
-            if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:] and i + 1 < len(tokens):
+            if (
+                tok.startswith("-")
+                and not tok.startswith("--")
+                and "c" in tok[1:]
+                and i + 1 < len(tokens)
+            ):
                 return tokens[i + 1]
             if tok.startswith("-"):
                 i += 1
@@ -428,7 +449,7 @@ class SimpleCommand:
 
 def expand_shell_path_token(raw: str) -> str:
     """Expand `~`, `$HOME`, `${HOME}`, `$env:HOME`, `$env:USERPROFILE`, and `%USERPROFILE%` in a shell argument."""
-    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    home = str(user_home())
     expanded = re.sub(
         r"\$(?:HOME|\{HOME\}|env:USERPROFILE|env:HOME)(?=[/\\]|$)|%USERPROFILE%",
         lambda _: home,
@@ -624,11 +645,6 @@ def iter_simple_commands(
     return commands
 
 
-def expand_shell_segments(command_line: str, max_depth: int = 4) -> list[str]:
-    """Split a shell command line and recursively expand `sh/bash/zsh -c`, heredoc shells, and `eval` wrappers."""
-    return [cmd.segment for cmd in iter_simple_commands(command_line, max_depth=max_depth)]
-
-
 def _record_git_config_alias(config_expr: str, aliases: dict[str, list[str]]) -> None:
     if "=" not in config_expr:
         return
@@ -781,7 +797,11 @@ def extract_inline_messages(tokens: list[str]) -> list[str]:
             values.append(tok.split("=", 1)[1])
             i += 1
             continue
-        if (tok.startswith("-m") or tok.startswith("-b") or tok.startswith("-t")) and not tok.startswith("--") and len(tok) > 2:
+        if (
+            (tok.startswith("-m") or tok.startswith("-b") or tok.startswith("-t"))
+            and not tok.startswith("--")
+            and len(tok) > 2
+        ):
             values.append(tok[2:])
             i += 1
             continue
@@ -790,7 +810,8 @@ def extract_inline_messages(tokens: list[str]) -> list[str]:
 
 
 def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
-    """Extract contents of any `-F`, `--file`, or `--body-file` arguments if readable."""
+    """The contents of the files `-F`, `--file` or `--body-file` name; a file that exists but
+    cannot be read is an error, so the caller cannot pass a message it did not check."""
     contents: list[str] = []
     file_flags = {"-F", "--file", "--body-file"}
     base_dir = Path(cwd) if cwd and os.path.isdir(cwd) else Path.cwd()
@@ -817,10 +838,7 @@ def extract_message_files(tokens: list[str], cwd: str | None) -> list[str]:
             if not fpath.is_absolute():
                 fpath = base_dir / fpath
             if fpath.is_file():
-                try:
-                    contents.append(fpath.read_text(encoding="utf-8", errors="replace"))
-                except OSError:
-                    pass
+                contents.append(fpath.read_text(encoding="utf-8", errors="replace"))
     return contents
 
 
@@ -837,9 +855,7 @@ def _matches_ai_attribution_text(text: str) -> bool:
     return False
 
 
-def has_ai_attribution(
-    segment: str, tokens: list[str] | None = None, cwd: str | None = None
-) -> bool:
+def has_ai_attribution(segment: str, tokens: list[str] | None = None, cwd: str | None = None) -> bool:
     if _matches_ai_attribution_text(segment):
         return True
     if tokens:
@@ -1005,15 +1021,11 @@ def resolve_transcript_path(payload: dict[str, Any]) -> Path | None:
 
 
 def _unquote_json_str(val: Any) -> str | None:
+    """A string field, decoded when Antigravity wrote it as JSON text; None for anything else."""
     if not isinstance(val, str):
         return None
-    if val.startswith('"') and val.endswith('"'):
-        try:
-            parsed = json.loads(val)
-            return parsed if isinstance(parsed, str) else val
-        except json.JSONDecodeError:
-            return val
-    return val
+    decoded = decode_json_text(val)
+    return decoded if isinstance(decoded, str) else val
 
 
 PUSH_ERROR_MARKERS = (
@@ -1077,7 +1089,7 @@ def _extract_individual_questions(tc: dict[str, Any]) -> list[str]:
         try:
             raw_questions = json.loads(raw_questions)
         except json.JSONDecodeError:
-            pass
+            raw_questions = None  # questions that cannot be read approve nothing
 
     questions: list[str] = []
     raw_single: Any = args.get("question")
@@ -1108,11 +1120,6 @@ def _extract_individual_questions(tc: dict[str, Any]) -> list[str]:
         questions.append(raw_questions.strip())
 
     return questions
-
-
-def _extract_decoded_question_text(tc: dict[str, Any]) -> str:
-    """Decode `questions` / `question` fields (including JSON-string-encoded arrays) into plain text."""
-    return "\n".join(_extract_individual_questions(tc))
 
 
 def _is_push_target_question_text(question_text: str) -> bool:
@@ -1154,9 +1161,7 @@ def _answer_approves_direct_push(answer: str) -> bool:
     cleaned = BENIGN_NO_PR_CLARIFICATION_RE.sub(" ", answer)
     if PR_BRANCH_REJECTION_RE.search(cleaned):
         return False
-    return bool(
-        DIRECT_MAIN_APPROVAL_RE.search(cleaned) or AFFIRMATIVE_SHORT_RE.search(cleaned)
-    )
+    return bool(DIRECT_MAIN_APPROVAL_RE.search(cleaned) or AFFIRMATIVE_SHORT_RE.search(cleaned))
 
 
 def _is_user_response_approving_main_push(
@@ -1223,13 +1228,25 @@ def _command_pushes_or_merges_protected(cmd: str, cwd: str | None) -> bool:
     return False
 
 
+def _readable_entries(transcript_path: Path) -> list[Entry] | None:
+    """The transcript's entries, or None (reported on stderr) when the file cannot be read."""
+    try:
+        return read_transcript_entries(transcript_path)
+    except TranscriptError as exc:
+        sys.stderr.write(f"[CRAFTSMAN GIT-GUARD] {exc}\n")
+        return None
+
+
 def was_ask_question_called_since_last_push(
     transcript_path: Path,
     fallback_cwd: str | None = None,
     ignore_in_flight_tail: bool = False,
 ) -> bool:
-    """Check if an approved push-confirmation `ask_question` occurred after the most recent `git push`."""
-    entries = read_transcript_entries(transcript_path)
+    """Check if an approved push-confirmation `ask_question` occurred after the most recent `git push`.
+
+    An unreadable transcript proves no approval.
+    """
+    entries = _readable_entries(transcript_path)
     if not entries:
         return False
 
@@ -1242,18 +1259,14 @@ def was_ask_question_called_since_last_push(
         if not isinstance(tool_calls, list):
             continue
 
-        if (
-            ignore_in_flight_tail
-            and idx == len(entries) - 1
-            and entry.get("type") == "PLANNER_RESPONSE"
-        ):
+        if ignore_in_flight_tail and idx == len(entries) - 1 and entry.get("type") == "PLANNER_RESPONSE":
             continue
 
         for tc in reversed(tool_calls):
             if not isinstance(tc, dict):
                 continue
             name = tc.get("name")
-            if name in ("ask_question", "AskUserQuestion"):
+            if name in QUESTION_TOOLS:
                 if _is_push_confirmation_question(tc) and _is_user_response_approving_main_push(
                     entries, idx, has_generic_steps, tc=tc
                 ):
@@ -1296,46 +1309,39 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
     return None, None
 
 
-def _is_active_antigravity_owner(
-    payload: dict[str, Any], effective_cwd: Path
-) -> bool:
-    from craftsman.gate import (
-        GateOwner,
-        _extract_antigravity_session_id,
-        load_state,
-        owns_gate,
-        resolve_cli_state_file,
-    )
+def _is_active_antigravity_owner(payload: dict[str, Any], effective_cwd: Path) -> bool:
+    """Whether the work tree has an active gate that the Antigravity session of `payload` owns."""
+    from craftsman.antigravity import session_id
+    from craftsman.gate import GateOwner, load_state, state_path_for
 
-    caller = GateOwner(platform="antigravity", session_id=_extract_antigravity_session_id(payload))
-    candidates: list[Path] = []
-    raw_artifact_dir = payload.get("artifactDirectoryPath")
-    if isinstance(raw_artifact_dir, str) and raw_artifact_dir.strip():
-        candidates.append(Path(raw_artifact_dir).expanduser() / "craftsman_state.json")
-    candidates.append(resolve_cli_state_file(None, str(effective_cwd)))
-    for state_file in candidates:
-        state = load_state(state_file)
-        if state and state.get("active") and owns_gate(GateOwner.from_state(state), caller):
-            return True
-    return False
+    state = load_state(state_path_for(effective_cwd))
+    caller = GateOwner(platform="antigravity", session_id=session_id(payload))
+    return state is not None and state.active and state.owner.admits(caller)
 
 
 def _evaluate_antigravity_scope(
     payload: dict[str, Any], command_line: str, cwd_str: str | None
 ) -> tuple[str, str | None]:
     """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
+    from craftsman.gate import GateStateError
+
     try:
         from craftsman.diffscan import DiffScanError, worktree_root
-        from craftsman.scope import evaluate_scope, load_scope_policy
+        from craftsman.scope import ScopeConfigError, evaluate_scope, load_scope_policy
 
         effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
         repo_root = worktree_root(effective_cwd)
         if not _is_active_antigravity_owner(payload, effective_cwd):
             return "allow", None
-    except (ImportError, OSError, DiffScanError):
+    except GateStateError as exc:
+        return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
+    except DiffScanError:  # outside a git work tree there is no gate and no scope
         return "allow", None
 
-    policy = load_scope_policy(effective_cwd, repo_root)
+    try:
+        policy = load_scope_policy(effective_cwd, repo_root)
+    except ScopeConfigError as exc:
+        return "force_ask", f"[CRAFTSMAN SCOPE-GUARD] {exc}"
     if policy.mode == "off":
         return "allow", None
     scope_decision = evaluate_scope(
@@ -1354,9 +1360,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     command_line, cwd_str = _extract_command_and_cwd(payload)
     if not isinstance(command_line, str):
         return "allow", None
-    decision, reason = evaluate_shell_command(
-        command_line, cwd_str, resolve_transcript_path(payload)
-    )
+    decision, reason = evaluate_shell_command(command_line, cwd_str, resolve_transcript_path(payload))
     if decision != "allow":
         return decision, reason
     if isinstance(payload.get("toolCall"), dict):
@@ -1364,20 +1368,10 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     return "allow", None
 
 
-def evaluate_shell_command(
-    command_line: str, cwd_str: str | None, transcript_path: Path | None = None
-) -> tuple[str, str | None]:
-    """Apply the git rules to one shell command line: ("allow" | "deny" | "force_ask", reason).
-
-    `transcript_path` is a readable session transcript in which a push confirmation may be found;
-    without one, a push to a protected branch can only be confirmed by the user directly.
-    """
-    if not command_line.strip():
-        return "allow", None
-
-    commands = iter_simple_commands(command_line, cwd_str)
-
-    # 1. Check Rule #2: Zero AI attribution in commits / tags / PRs
+def _ai_attribution_verdict(
+    commands: list[SimpleCommand], command_line: str
+) -> tuple[str, str | None] | None:
+    """Rule #2, zero AI attribution in commits, tags and pull requests: the deny, or None."""
     for cmd in commands:
         segment = cmd.segment
         tokens = cmd.tokens
@@ -1402,6 +1396,28 @@ def evaluate_shell_command(
                 "Commits, tags, and Pull Requests must not contain 'Co-authored-by:' or "
                 "any AI attribution trailers.",
             )
+    return None
+
+
+def evaluate_shell_command(
+    command_line: str, cwd_str: str | None, transcript_path: Path | None = None
+) -> tuple[str, str | None]:
+    """Apply the git rules to one shell command line: ("allow" | "deny" | "force_ask", reason).
+
+    `transcript_path` is a readable session transcript in which a push confirmation may be found;
+    without one, a push to a protected branch can only be confirmed by the user directly.
+    """
+    if not command_line.strip():
+        return "allow", None
+
+    commands = iter_simple_commands(command_line, cwd_str)
+
+    try:
+        attribution = _ai_attribution_verdict(commands, command_line)
+    except OSError as exc:
+        return "force_ask", f"[CRAFTSMAN GIT-GUARD] Cannot read the message file to check it: {exc}"
+    if attribution is not None:
+        return attribution
 
     # 2. Check Rule #1: No unconfirmed push to main / master (or gh pr merge)
     for cmd in commands:
@@ -1470,22 +1486,13 @@ def _path_belongs_to_repo(candidate_str: str, repo_root: Path) -> bool:
 
 
 def _transcript_matches_workspace(transcript_path: Path, repo_root: Path | None) -> bool:
-    """Return True if the session transcript or its state file belongs to `repo_root`."""
+    """Return True if a tool call in the session transcript names a path inside `repo_root`."""
     if repo_root is None:
         return False
 
-    brain_conv_dir = transcript_path.parent.parent.parent
-    state_file = brain_conv_dir / "craftsman_state.json"
-    if state_file.is_file():
-        try:
-            state = json.loads(state_file.read_text(encoding="utf-8"))
-            if isinstance(state, dict) and isinstance(state.get("cwd"), str):
-                if _path_belongs_to_repo(state["cwd"], repo_root):
-                    return True
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    entries = read_transcript_entries(transcript_path)
+    entries = _readable_entries(transcript_path)
+    if entries is None:
+        return False
     path_keys = (
         "Cwd",
         "cwd",
@@ -1520,7 +1527,7 @@ def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600
     now = time.time()
     recent: list[tuple[float, Path]] = []
 
-    brain_dir = Path.home() / ".gemini" / "antigravity" / "brain"
+    brain_dir = user_home() / ".gemini" / "antigravity" / "brain"
     if brain_dir.is_dir():
         for p in brain_dir.glob("*/.system_generated/logs/transcript.jsonl"):
             try:
@@ -1530,7 +1537,7 @@ def _find_recent_workspace_transcripts(cwd: str | None, max_age_sec: float = 600
             if (now - mtime) <= max_age_sec and _transcript_matches_workspace(p, repo_root):
                 recent.append((mtime, p))
 
-    claude_proj = Path.home() / ".claude" / "projects" / _encode_claude_project_slug(str(repo_root))
+    claude_proj = user_home() / ".claude" / "projects" / claude_project_slug(str(repo_root))
     if claude_proj.is_dir():
         for p in claude_proj.glob("*.jsonl"):
             try:
@@ -1575,7 +1582,10 @@ def _has_in_flight_agent_push(cwd: str | None = None) -> bool:
         return True
 
     for transcript in _find_recent_workspace_transcripts(cwd, max_age_sec=60.0):
-        entries = read_transcript_entries(transcript)
+        entries = _readable_entries(transcript)
+        if entries is None:
+            # An unreadable recent transcript cannot rule out an agent's push in flight.
+            return True
         if not entries:
             continue
         last_entry = entries[-1]
@@ -1609,9 +1619,7 @@ def run_native_commit_msg_hook(msg_file_str: str) -> int:
         content = content[: scissors_match.start()]
 
     # Strip git comment lines starting with '#'
-    active_lines = "\n".join(
-        line for line in content.splitlines() if not line.lstrip().startswith("#")
-    )
+    active_lines = "\n".join(line for line in content.splitlines() if not line.lstrip().startswith("#"))
     if has_ai_attribution(active_lines):
         sys.stderr.write(
             "\n[CRAFTSMAN GIT-HOOK] Blocked commit (Global Rule #2 - Zero AI Attribution):\n"
@@ -1685,20 +1693,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    if len(args_list) >= 2 and args_list[0] == "--git-hook":
-        hook_type = args_list[1]
-        if hook_type == "commit-msg" and len(args_list) >= 3:
+    if args_list and args_list[0] == "--git-hook":
+        if args_list[1:2] == ["commit-msg"] and len(args_list) == 3:
             return run_native_commit_msg_hook(args_list[2])
-        if hook_type == "pre-push":
+        if args_list[1:2] == ["pre-push"]:
             return run_native_pre_push_hook()
-        return 0
+        sys.stderr.write("craftsman guard: --git-hook takes `commit-msg <file>` or `pre-push`\n")
+        return 2
+    if args_list:
+        sys.stderr.write(f"craftsman guard: unknown arguments {' '.join(args_list)}\n")
+        return 2
 
     try:
-        raw = sys.stdin.read()
-        loaded = json.loads(raw) if raw.strip() else {}
-        payload = loaded if isinstance(loaded, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        emit("allow")
+        payload = json.loads(sys.stdin.read())
+    except (OSError, ValueError) as exc:
+        emit("deny", f"[CRAFTSMAN GIT-GUARD] Unreadable hook input, so the call was not checked: {exc}")
+        return 0
+    if not isinstance(payload, dict):
+        emit(
+            "deny",
+            "[CRAFTSMAN GIT-GUARD] The hook input is not a JSON object, so the call was not checked.",
+        )
         return 0
 
     decision, reason = evaluate_command(payload)

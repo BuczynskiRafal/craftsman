@@ -1,4 +1,4 @@
-"""Evidence ledger: review rounds, lens coverage, findings, verification runs and agent events.
+"""Evidence ledger: persistence and the operations that record review evidence.
 
 The ledger is one JSON file per worktree (`<git-dir>/craftsman/ledger.json`). Every record is
 bound to the fingerprint of the diff it refers to, so evidence goes stale when the code changes.
@@ -9,739 +9,81 @@ through an agent-facing CLI command: subagent isolation evidence has to come fro
 
 from __future__ import annotations
 
-import ast
 import errno
+import hashlib
 import json
 import os
 import re
-import shlex
 import sys
-import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, TypeVar, get_args
+from typing import TypeVar
 
 from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
-from craftsman.lenses import LENS_IDS, TIERS, Tier
+from craftsman.files import write_text_atomic
+from craftsman.lenses import LENS_IDS, Tier
+from craftsman.records import (
+    DESIGN_LENS,
+    GENERIC_COVERAGE_WORDS,
+    LEDGER_FILENAME,
+    MAX_HUNKS_PER_COVERAGE,
+    MIN_HUNK_NOTE_SEGMENT_CHARS,
+    MIN_SIGNAL_ACK_REASON_CHARS,
+    SEVERITIES,
+    SWEEP_LENS,
+    AgentEvent,
+    Coverage,
+    Fact,
+    FieldError,
+    Finding,
+    HunkRef,
+    Ledger,
+    LedgerError,
+    QualitySignal,
+    Resolution,
+    Round,
+    Run,
+    RunKind,
+    RunWaiver,
+    Severity,
+    SignalAck,
+    SourceRef,
+    Verdict,
+    file_digest,
+    file_reference_in,
+    format_timestamp,
+    next_id,
+    parse_timestamp,
+)
+from craftsman.triviality import is_trivial_run
 
-Severity = Literal["blocker", "major", "minor", "nit"]
-Verdict = Literal["proven", "probable", "question", "dismissed"]
-Resolution = Literal["fixed", "accepted"]
-RunKind = Literal["test", "e2e", "repro", "lint", "build", "other"]
-AgentEventKind = Literal["start", "stop"]
-IssueCode = Literal[
-    "no-round",
-    "stale-round",
-    "tier-too-low",
-    "uncovered",
-    "sweep-too-early",
-    "no-verdict",
-    "unresolved",
-    "no-passing-run",
-    "no-e2e-run",
-    "failing-run",
-    "no-isolation",
-    "round-cap",
-]
-
-SEVERITIES: tuple[Severity, ...] = get_args(Severity)
-VERDICTS: tuple[Verdict, ...] = get_args(Verdict)
-RESOLUTIONS: tuple[Resolution, ...] = get_args(Resolution)
-RUN_KINDS: tuple[RunKind, ...] = get_args(RunKind)
-AGENT_EVENT_KINDS: tuple[AgentEventKind, ...] = get_args(AgentEventKind)
-
-SCHEMA_VERSION = 1
-LEDGER_FILENAME = "ledger.json"
-OUTPUT_TAIL_CHARS = 4000
-MAX_HUNKS_PER_COVERAGE = 4
-MIN_COVERAGE_NOTE_CHARS = 30
-MIN_TITLE_CHARS = 8
-MAX_TITLE_CHARS = 160
-MIN_SCENARIO_CHARS = 20
-MIN_EVIDENCE_CHARS = 20
-SHORT_COMMAND_CHARS = 60
-MIN_RESOLUTION_NOTE_CHARS = 20
-MIN_WAIVER_REASON_CHARS = 20
-QUICK_TIER_MAX_CHANGED_LINES = 40
-MAX_NEXT_ACTIONS = 12
-SUMMARY_RECENT_RUNS = 3
 LOCK_POLL_S = 0.05
-REPLACE_RETRIES = 5
-
-_PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
-_VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
-_TRIVIAL_PROGRAMS = frozenset({"true", ":", "exit", "echo", "printf"})
-_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
-_POWERSHELLS = frozenset({"powershell", "pwsh"})
-_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")"})
-_PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?|py")
-_PYTHON_EXITS = frozenset({"exit", "quit"})
-_WORD_RE = re.compile(r"\w+")
-_EXTENSIONLESS_FILES = (
-    "Makefile|Dockerfile|Jenkinsfile|Gemfile|Rakefile|Procfile|BUILD|WORKSPACE|Vagrantfile|"
-    "Containerfile|Justfile|AUTHORS|CONTRIBUTORS|CHANGELOG|CHANGES|NEWS|HISTORY|README|"
-    "CONTRIBUTING|LICENSE|COPYING|NOTICE|PATENTS|CODEOWNERS|MAINTAINERS|SECURITY|TODO"
-)
-_FILE_REFERENCE_RE = re.compile(
-    r"(?:[\w./\\-]+\.\w+"  # with an extension: app.py:12
-    r"|[\w./\\-]*[/\\][\w.-]+"  # with a directory: bin/tool:12
-    rf"|(?<![\w.-])(?i:{_EXTENSIONLESS_FILES})"  # a well-known extensionless name: Makefile:12
-    r"):\d+"
-)
-_NO_REPRO_PREFIX = "no-repro:"
-_STATIC_PREFIX = "static:"
-_INTENT_PREFIX = "intent:"
+# Of a hunk's coverage-note segment, at least this many characters must be more than praise.
+MIN_SUBSTANTIVE_NOTE_CHARS = 20
+# One note segment may describe at most this many hunks of a lens before it reads as boilerplate.
+MAX_REUSED_NOTE_SEGMENTS = 3
 GROUPED_EVIDENCE_PREFIX = "Grouped into "
-SWEEP_LENS = "sweep"
 COVERAGE_NOTE_EXAMPLE = "H3 parse_cfg: x=None -> L42 TypeError; callers cli.py:19 ok"
-PROBABLE_EVIDENCE_EXAMPLE = (
-    "no-repro: needs a live Postgres; api.py:40 passes None -> db.py:88 calls None.execute()"
+_WORD_RE = re.compile(r"\w+")
+_HUNK_ID_RE = re.compile(r"\bH[1-9]\d*\b")
+_CONCRETE_TOKEN_RE = re.compile(r"(?:->|`[^`]+`|\b\d+\b|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*\.[A-Za-z_]\w*)")
+_GENERIC_WORDS_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in GENERIC_COVERAGE_WORDS) + r")\b",
+    re.IGNORECASE,
 )
-STATIC_EVIDENCE_EXAMPLE = (
-    "static: cart.py:3 divides sum(prices) by len(items) -> total([10, 20]) returns 15.0, "
-    "callers checkout.py:40 expect the sum"
+_CONCRETE_COVERAGE_RE = re.compile(
+    r"(?:->|\bL?\d+\b|['\"`]|\b(?:None|True|False)\b|\[\]|\{\}|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*_[A-Za-z0-9_]*)"
 )
-QUESTION_EVIDENCE_EXAMPLE = (
-    "intent: PR task says '-c sets rootdir to the config file's directory'; "
-    "findpaths.py:182 does exactly that, which changes testpaths for configs outside the project root"
-)
-DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
-_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R")}
 
 T = TypeVar("T")
-S = TypeVar("S", bound=str)
-
-
-class LedgerError(RuntimeError):
-    """Raised for invalid ledger data, rejected operations and ledger I/O failures."""
-
-    def __init__(self, message: str, *, field: str = "") -> None:
-        super().__init__(message)
-        self.field = field
-
-
-class FieldError(LedgerError):
-    """A validation error that knows which (possibly nested) field it concerns."""
-
-    def __init__(self, field: str, problem: str) -> None:
-        super().__init__(" ".join(part for part in (field, problem) if part), field=field)
-        self.problem = problem
-
-    def within(self, parent: str) -> FieldError:
-        return FieldError(f"{parent}.{self.field}" if self.field else parent, self.problem)
-
-
-def format_timestamp(moment: datetime) -> str:
-    """UTC ISO-8601 with millisecond precision and a trailing `Z`, as stored in the ledger."""
-    return moment.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _now() -> str:
     return format_timestamp(datetime.now(timezone.utc))
-
-
-def parse_timestamp(value: str) -> datetime:
-    """Parse an ISO-8601 timestamp that carries a UTC offset or a trailing `Z`."""
-    parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
-    if parsed.tzinfo is None:
-        raise ValueError(f"timestamp {value!r} has no time zone")
-    return parsed
-
-
-# --- field validation -----------------------------------------------------------------------
-
-
-def _require(condition: bool, field: str, problem: str) -> None:
-    if not condition:
-        raise FieldError(field, problem)
-
-
-def _require_text(value: str, field: str, *, min_chars: int = 1, max_chars: int | None = None) -> None:
-    length = len(value.strip())
-    if max_chars is not None:
-        problem = f"must have {min_chars}..{max_chars} characters (got {length})"
-        _require(min_chars <= length <= max_chars, field, problem)
-    elif min_chars == 1:
-        _require(length >= 1, field, "must not be blank")
-    else:
-        _require(length >= min_chars, field, f"must have at least {min_chars} characters (got {length})")
-
-
-def _require_choice(value: str, choices: Sequence[str], field: str) -> None:
-    _require(value in choices, field, f"must be one of {', '.join(choices)} (got {value!r})")
-
-
-def _require_id(value: str, prefix: str, field: str) -> None:
-    _require(
-        _ID_PATTERNS[prefix].fullmatch(value) is not None,
-        field,
-        f"must look like {prefix}1, {prefix}2, ... (got {value!r})",
-    )
-
-
-def _require_timestamp(value: str, field: str) -> None:
-    try:
-        parse_timestamp(value)
-    except ValueError:
-        raise FieldError(
-            field, f"must be an ISO-8601 timestamp with a time zone (got {value!r})"
-        ) from None
-
-
-class _Fields:
-    """Typed accessors over one JSON object; errors name the offending field."""
-
-    def __init__(self, raw: Any) -> None:
-        if not isinstance(raw, dict):
-            raise FieldError("", "must be a JSON object")
-        self._raw: dict[str, Any] = raw
-        self._seen: set[str] = set()
-
-    def _value(self, key: str, expected: type | tuple[type, ...], label: str) -> Any:
-        self._seen.add(key)
-        if key not in self._raw:
-            raise FieldError(key, "is missing")
-        value = self._raw[key]
-        # bool is a subclass of int, so `true` must not pass for a number
-        if not isinstance(value, expected) or (isinstance(value, bool) and expected is not bool):
-            raise FieldError(key, f"must be {label}")
-        return value
-
-    def text(self, key: str) -> str:
-        value: str = self._value(key, str, "a string")
-        return value
-
-    def optional_text(self, key: str) -> str | None:
-        value: str | None = self._value(key, (str, type(None)), "a string or null")
-        return value
-
-    def get_text(self, key: str, default: str = "") -> str:
-        if key not in self._raw or self._raw[key] is None:
-            self._seen.add(key)
-            return default
-        return self.text(key)
-
-    def get_optional_text(self, key: str) -> str | None:
-        if key not in self._raw:
-            self._seen.add(key)
-            return None
-        return self.optional_text(key)
-
-    def integer(self, key: str) -> int:
-        value: int = self._value(key, int, "an integer")
-        return value
-
-    def number(self, key: str) -> float:
-        return float(self._value(key, (int, float), "a number"))
-
-    def flag(self, key: str) -> bool:
-        value: bool = self._value(key, bool, "true or false")
-        return value
-
-    def choice(self, key: str, choices: tuple[S, ...]) -> S:
-        value = self.text(key)
-        for choice in choices:
-            if value == choice:
-                return choice
-        raise FieldError(key, f"must be one of {', '.join(choices)} (got {value!r})")
-
-    def optional_choice(self, key: str, choices: tuple[S, ...]) -> S | None:
-        if key in self._raw and self._raw[key] is None:
-            self._seen.add(key)
-            return None
-        return self.choice(key, choices)
-
-    def texts(self, key: str) -> tuple[str, ...]:
-        values: list[Any] = self._value(key, list, "a list of strings")
-        for index, value in enumerate(values):
-            _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
-        return tuple(values)
-
-    def records(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
-        values: list[Any] = self._value(key, list, "a list")
-        parsed: list[T] = []
-        for index, value in enumerate(values):
-            try:
-                parsed.append(parse(value))
-            except FieldError as exc:
-                raise exc.within(f"{key}[{index}]") from None
-        return tuple(parsed)
-
-    def optional_record(self, key: str, parse: Callable[[Any], T]) -> T | None:
-        value: dict[str, Any] | None = self._value(key, (dict, type(None)), "an object or null")
-        if value is None:
-            return None
-        try:
-            return parse(value)
-        except FieldError as exc:
-            raise exc.within(key) from None
-
-    def done(self, record: T) -> T:
-        """Return `record` once every field of the JSON object has been consumed."""
-        unknown = sorted(set(self._raw) - self._seen)
-        if unknown:
-            raise FieldError(unknown[0], "is not a known field")
-        return record
-
-
-def _record_json(record: Any) -> dict[str, Any]:
-    return {field.name: _json_value(getattr(record, field.name)) for field in fields(record)}
-
-
-def _json_value(value: Any) -> Any:
-    if isinstance(value, tuple):
-        return [_json_value(item) for item in value]
-    if is_dataclass(value) and not isinstance(value, type):
-        return _record_json(value)
-    return value
-
-
-# --- records --------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class HunkRef:
-    id: str
-    path: str
-    digest: str
-    new_start: int
-    new_len: int
-    carried: bool
-    reopened: bool = False  # open again because it mentions a symbol changed since its coverage
-
-    def __post_init__(self) -> None:
-        _require_id(self.id, "H", "id")
-        _require_text(self.path, "path")
-        _require_text(self.digest, "digest")
-        _require(self.new_start >= 0, "new_start", "must be >= 0")
-        _require(self.new_len >= 0, "new_len", "must be >= 0")
-        _require(not (self.carried and self.reopened), "reopened", "must be false for a carried hunk")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> HunkRef:
-        f = _Fields(raw)
-        return f.done(
-            cls(
-                id=f.text("id"),
-                path=f.text("path"),
-                digest=f.text("digest"),
-                new_start=f.integer("new_start"),
-                new_len=f.integer("new_len"),
-                carried=f.flag("carried"),
-                reopened=f.flag("reopened"),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class Round:
-    number: int
-    fingerprint: str
-    base_sha: str
-    tier: Tier
-    prepared_at: str
-    hunks: tuple[HunkRef, ...]
-    lenses: tuple[str, ...]
-    packet_path: str
-
-    def __post_init__(self) -> None:
-        _require(self.number >= 1, "number", "must be >= 1")
-        _require_text(self.fingerprint, "fingerprint")
-        _require_text(self.base_sha, "base_sha")
-        _require_choice(self.tier, TIERS, "tier")
-        _require_timestamp(self.prepared_at, "prepared_at")
-        _require(bool(self.lenses), "lenses", "must name at least one lens")
-        for lens in self.lenses:
-            _require_choice(lens, sorted(LENS_IDS), "lenses")
-        _require(len(set(self.lenses)) == len(self.lenses), "lenses", "must not repeat a lens")
-        hunk_ids = [hunk.id for hunk in self.hunks]
-        _require(len(set(hunk_ids)) == len(hunk_ids), "hunks", "must not repeat a hunk id")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> Round:
-        f = _Fields(raw)
-        return f.done(
-            cls(
-                number=f.integer("number"),
-                fingerprint=f.text("fingerprint"),
-                base_sha=f.text("base_sha"),
-                tier=f.choice("tier", TIERS),
-                prepared_at=f.text("prepared_at"),
-                hunks=f.records("hunks", HunkRef.from_json),
-                lenses=f.texts("lenses"),
-                packet_path=f.text("packet_path"),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class Coverage:
-    round: int
-    lens: str
-    digests: tuple[str, ...]
-    note: str
-    recorded_at: str
-
-    def __post_init__(self) -> None:
-        _require(self.round >= 1, "round", "must be >= 1")
-        _require_choice(self.lens, sorted(LENS_IDS), "lens")
-        _require(
-            1 <= len(self.digests) <= MAX_HUNKS_PER_COVERAGE,
-            "digests",
-            f"must list 1..{MAX_HUNKS_PER_COVERAGE} hunk digests (got {len(self.digests)})",
-        )
-        _require_text(self.note, "note", min_chars=MIN_COVERAGE_NOTE_CHARS)
-        _require_timestamp(self.recorded_at, "recorded_at")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> Coverage:
-        f = _Fields(raw)
-        return f.done(
-            cls(
-                round=f.integer("round"),
-                lens=f.text("lens"),
-                digests=f.texts("digests"),
-                note=f.text("note"),
-                recorded_at=f.text("recorded_at"),
-            )
-        )
-
-
-def _check_verdict_evidence(verdict: Verdict, evidence: str, run_id: str | None) -> None:
-    """Each verdict needs evidence a reader can check; see the module constants for examples."""
-    if verdict == "proven":
-        _require(
-            run_id is not None,
-            "verdict_run",
-            "is required for a 'proven' verdict: pass --run <id> of the run that demonstrates the "
-            "defect (record it with `craftsman run --kind repro -- ...`)",
-        )
-    elif verdict == "probable":
-        stripped = evidence.strip()
-        lower = stripped.lower()
-        if lower.startswith(_NO_REPRO_PREFIX):
-            reason = stripped[len(_NO_REPRO_PREFIX) :].strip()
-            valid = len(reason) >= MIN_EVIDENCE_CHARS
-        elif lower.startswith(_STATIC_PREFIX):
-            reason = stripped[len(_STATIC_PREFIX) :].strip()
-            valid = len(reason) >= MIN_EVIDENCE_CHARS and _FILE_REFERENCE_RE.search(reason) is not None
-        else:
-            valid = False
-        _require(
-            valid,
-            "verdict_evidence",
-            f"for 'probable' must start with '{_NO_REPRO_PREFIX}' or '{_STATIC_PREFIX}' followed "
-            f"by at least {MIN_EVIDENCE_CHARS} characters (and cite file:line for "
-            f"'{_STATIC_PREFIX}'), e.g. \"{PROBABLE_EVIDENCE_EXAMPLE}\" or "
-            f'"{STATIC_EVIDENCE_EXAMPLE}"',
-        )
-    elif verdict == "question":
-        stripped = evidence.strip()
-        reason = stripped[len(_INTENT_PREFIX) :].strip()
-        _require(
-            stripped.lower().startswith(_INTENT_PREFIX)
-            and len(reason) >= MIN_EVIDENCE_CHARS
-            and _FILE_REFERENCE_RE.search(reason) is not None,
-            "verdict_evidence",
-            f"for 'question' must start with '{_INTENT_PREFIX}' followed by at least "
-            f"{MIN_EVIDENCE_CHARS} characters naming the intent source and citing file:line in "
-            f'the code, e.g. "{QUESTION_EVIDENCE_EXAMPLE}"',
-        )
-    else:
-        _require(
-            run_id is not None or _FILE_REFERENCE_RE.search(evidence) is not None,
-            "verdict_evidence",
-            "for 'dismissed' must cite the guard as file:line, or pass --run <id> of a run that "
-            f'shows correct behavior, e.g. "{DISMISSED_EVIDENCE_EXAMPLE}"',
-        )
-
-
-@dataclass(frozen=True)
-class Finding:
-    id: str
-    round: int
-    lens: str
-    path: str
-    line: int
-    severity: Severity
-    title: str
-    scenario: str
-    suggestion: str
-    fingerprint: str
-    verdict: Verdict | None
-    verdict_evidence: str
-    verdict_run: str | None
-    resolution: Resolution | None
-    resolution_note: str
-    recorded_at: str
-    updated_at: str
-
-    def __post_init__(self) -> None:
-        _require_id(self.id, "F", "id")
-        _require(self.round >= 1, "round", "must be >= 1")
-        _require_choice(self.lens, sorted(LENS_IDS), "lens")
-        _require_text(self.path, "path")
-        _require(self.line >= 1, "line", f"must be >= 1 (got {self.line})")
-        _require_choice(self.severity, SEVERITIES, "severity")
-        _require_text(self.title, "title", min_chars=MIN_TITLE_CHARS, max_chars=MAX_TITLE_CHARS)
-        _require_text(self.scenario, "scenario", min_chars=MIN_SCENARIO_CHARS)
-        _require_text(self.fingerprint, "fingerprint")
-        _require_timestamp(self.recorded_at, "recorded_at")
-        _require_timestamp(self.updated_at, "updated_at")
-        if self.verdict is None:
-            _require(self.verdict_run is None, "verdict_run", "must be null without a verdict")
-        else:
-            _require_choice(self.verdict, VERDICTS, "verdict")
-            _require_text(self.verdict_evidence, "verdict_evidence", min_chars=MIN_EVIDENCE_CHARS)
-            _check_verdict_evidence(self.verdict, self.verdict_evidence, self.verdict_run)
-            _require(
-                not (self.severity == "blocker" and self.verdict == "question"),
-                "verdict",
-                "a blocker is a defect, not a design question; prove, dismiss or fix it",
-            )
-        if self.resolution is not None:
-            _require_choice(self.resolution, RESOLUTIONS, "resolution")
-            _require(
-                self.verdict in ("proven", "probable"),
-                "resolution",
-                "is only allowed for proven or probable findings",
-            )
-            _require_text(self.resolution_note, "resolution_note", min_chars=MIN_RESOLUTION_NOTE_CHARS)
-            _require(
-                not (self.severity == "blocker" and self.resolution == "accepted"),
-                "resolution",
-                "'accepted' is not allowed for blocker findings; fix the code",
-            )
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> Finding:
-        f = _Fields(raw)
-        return f.done(
-            cls(
-                id=f.text("id"),
-                round=f.integer("round"),
-                lens=f.text("lens"),
-                path=f.text("path"),
-                line=f.integer("line"),
-                severity=f.choice("severity", SEVERITIES),
-                title=f.text("title"),
-                scenario=f.text("scenario"),
-                suggestion=f.text("suggestion"),
-                fingerprint=f.text("fingerprint"),
-                verdict=f.optional_choice("verdict", VERDICTS),
-                verdict_evidence=f.text("verdict_evidence"),
-                verdict_run=f.optional_text("verdict_run"),
-                resolution=f.optional_choice("resolution", RESOLUTIONS),
-                resolution_note=f.text("resolution_note"),
-                recorded_at=f.text("recorded_at"),
-                updated_at=f.text("updated_at"),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class RunWaiver:
-    """Why a failing run no longer blocks the gate, e.g. a mistyped or since-renamed command."""
-
-    reason: str
-    waived_at: str
-
-    def __post_init__(self) -> None:
-        _require_text(self.reason, "reason", min_chars=MIN_WAIVER_REASON_CHARS)
-        _require_timestamp(self.waived_at, "waived_at")
-
-    @classmethod
-    def from_json(cls, raw: Any) -> RunWaiver:
-        f = _Fields(raw)
-        return f.done(cls(reason=f.text("reason"), waived_at=f.text("waived_at")))
-
-
-@dataclass(frozen=True)
-class Run:
-    id: str  # "" until add_run assigns the next free id
-    kind: RunKind
-    argv: tuple[str, ...]
-    cwd: str
-    exit_code: int
-    duration_s: float
-    fingerprint: str  # the work tree before the command ran
-    started_at: str
-    output_tail: str
-    fingerprint_after: str | None = None  # set when the command changed the work tree
-    waiver: RunWaiver | None = None
-
-    def __post_init__(self) -> None:
-        if self.id:
-            _require_id(self.id, "R", "id")
-        _require_choice(self.kind, RUN_KINDS, "kind")
-        _require(bool(self.argv) and bool(self.argv[0].strip()), "argv", "must name a command")
-        _require(self.duration_s >= 0, "duration_s", "must be >= 0")
-        _require_text(self.fingerprint, "fingerprint")
-        _require_timestamp(self.started_at, "started_at")
-        _require(
-            len(self.output_tail) <= OUTPUT_TAIL_CHARS,
-            "output_tail",
-            f"must keep only the last {OUTPUT_TAIL_CHARS} characters",
-        )
-        if self.fingerprint_after is not None:
-            _require_text(self.fingerprint_after, "fingerprint_after")
-            _require(
-                self.fingerprint_after != self.fingerprint,
-                "fingerprint_after",
-                "must differ from fingerprint (leave it null when the work tree did not change)",
-            )
-        _require(
-            self.waiver is None or self.exit_code != 0, "waiver", "is only allowed for failing runs"
-        )
-
-    @property
-    def counts_as_passing(self) -> bool:
-        """Exited 0 without changing the work tree, so it verified the code it ran against."""
-        return self.exit_code == 0 and self.fingerprint_after is None
-
-    @property
-    def command(self) -> str:
-        return shlex.join(self.argv)
-
-    @property
-    def short_command(self) -> str:
-        """The command shortened for one-line summaries."""
-        command = self.command
-        if len(command) <= SHORT_COMMAND_CHARS:
-            return command
-        return command[: SHORT_COMMAND_CHARS - 1] + "…"
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> Run:
-        f = _Fields(raw)
-        return f.done(
-            cls(
-                id=f.text("id"),
-                kind=f.choice("kind", RUN_KINDS),
-                argv=f.texts("argv"),
-                cwd=f.text("cwd"),
-                exit_code=f.integer("exit_code"),
-                duration_s=f.number("duration_s"),
-                fingerprint=f.text("fingerprint"),
-                started_at=f.text("started_at"),
-                output_tail=f.text("output_tail"),
-                fingerprint_after=f.optional_text("fingerprint_after"),
-                waiver=f.optional_record("waiver", RunWaiver.from_json),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class AgentEvent:
-    platform: str
-    event: AgentEventKind
-    agent: str
-    agent_id: str
-    at: str
-
-    def __post_init__(self) -> None:
-        _require_text(self.platform, "platform")
-        _require_choice(self.event, AGENT_EVENT_KINDS, "event")
-        _require_timestamp(self.at, "at")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> AgentEvent:
-        f = _Fields(raw)
-        return f.done(
-            cls(
-                platform=f.text("platform"),
-                event=f.choice("event", AGENT_EVENT_KINDS),
-                agent=f.text("agent"),
-                agent_id=f.text("agent_id"),
-                at=f.text("at"),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class Ledger:
-    rounds: tuple[Round, ...] = ()
-    coverage: tuple[Coverage, ...] = ()
-    findings: tuple[Finding, ...] = ()
-    runs: tuple[Run, ...] = ()
-    agents: tuple[AgentEvent, ...] = ()
-
-    def __post_init__(self) -> None:
-        for index, round_ in enumerate(self.rounds):
-            _require(round_.number == index + 1, f"rounds[{index}].number", f"must be {index + 1}")
-            _require(
-                round_.base_sha == self.rounds[0].base_sha,
-                f"rounds[{index}].base_sha",
-                "must match the base of round 1",
-            )
-        for index, coverage in enumerate(self.coverage):
-            where = f"coverage[{index}]"
-            _require(coverage.round <= len(self.rounds), f"{where}.round", "references an unknown round")
-            _require(
-                coverage.lens in self.rounds[coverage.round - 1].lenses,
-                f"{where}.lens",
-                f"was not selected in round {coverage.round}",
-            )
-        run_ids = [run.id for run in self.runs]
-        _require(all(run_ids), "runs", "must all have ids")
-        _require(len(set(run_ids)) == len(run_ids), "runs", "must not repeat an id")
-        finding_ids = [finding.id for finding in self.findings]
-        _require(len(set(finding_ids)) == len(finding_ids), "findings", "must not repeat an id")
-        for index, finding in enumerate(self.findings):
-            where = f"findings[{index}]"
-            _require(finding.round <= len(self.rounds), f"{where}.round", "references an unknown round")
-            _require(
-                finding.verdict_run is None or finding.verdict_run in run_ids,
-                f"{where}.verdict_run",
-                f"references an unknown run {finding.verdict_run!r}",
-            )
-
-    def to_json(self) -> dict[str, Any]:
-        return {"schema": SCHEMA_VERSION, **_record_json(self)}
-
-    @classmethod
-    def from_json(cls, raw: Any) -> Ledger:
-        try:
-            f = _Fields(raw)
-            schema = f.integer("schema")
-            _require(
-                schema == SCHEMA_VERSION,
-                "schema",
-                f"{schema} is not supported (expected {SCHEMA_VERSION}); upgrade craftsman",
-            )
-            return f.done(
-                cls(
-                    rounds=f.records("rounds", Round.from_json),
-                    coverage=f.records("coverage", Coverage.from_json),
-                    findings=f.records("findings", Finding.from_json),
-                    runs=f.records("runs", Run.from_json),
-                    agents=f.records("agents", AgentEvent.from_json),
-                )
-            )
-        except FieldError as exc:
-            raise LedgerError(f"{LEDGER_FILENAME}: {exc}") from None
 
 
 # --- persistence ----------------------------------------------------------------------------
@@ -838,35 +180,10 @@ def load(path: Path) -> Ledger:
 
 
 def save(path: Path, ledger: Ledger) -> None:
-    """Write the ledger atomically: a temporary file in the same directory replaces `path`."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, staged_name = tempfile.mkstemp(prefix=".ledger_", suffix=".tmp", dir=path.parent)
+        write_text_atomic(path, json.dumps(ledger.to_json(), indent=2, ensure_ascii=False) + "\n")
     except OSError as exc:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
-    staged = Path(staged_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(ledger.to_json(), handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-        replace_with_retry(staged, path)
-    except BaseException as exc:
-        staged.unlink(missing_ok=True)
-        if isinstance(exc, OSError):
-            raise LedgerError(f"cannot write {path}: {exc}") from exc
-        raise
-
-
-def replace_with_retry(source: Path, target: Path) -> None:
-    """`os.replace`, retried briefly: Windows refuses while another process has the file open."""
-    for attempt in range(REPLACE_RETRIES + 1):
-        try:
-            os.replace(source, target)
-            return
-        except PermissionError:
-            if attempt == REPLACE_RETRIES:
-                raise
-            time.sleep(LOCK_POLL_S)
 
 
 def mutate(path: Path, fn: Callable[[Ledger], tuple[Ledger, T]]) -> T:
@@ -888,12 +205,8 @@ def _latest_round(ledger: Ledger) -> Round:
     return ledger.rounds[-1]
 
 
-def _next_id(prefix: str, existing: Iterable[str]) -> str:
-    return f"{prefix}{max((int(item[1:]) for item in existing), default=0) + 1}"
-
-
-def _covered_pairs(coverage: Iterable[Coverage]) -> set[tuple[str, str]]:
-    return {(record.lens, digest) for record in coverage for digest in record.digests}
+def next_finding_id(ledger: Ledger) -> str:
+    return next_id("F", (item.id for item in ledger.findings))
 
 
 def _find(ledger: Ledger, finding_id: str) -> Finding:
@@ -909,6 +222,23 @@ def _with_finding(ledger: Ledger, updated: Finding) -> tuple[Ledger, Finding]:
     return replace(ledger, findings=findings), updated
 
 
+def _build_hunk_refs(
+    hunks: Sequence[Hunk], carried: frozenset[str], reopened: frozenset[str]
+) -> tuple[HunkRef, ...]:
+    return tuple(
+        HunkRef(
+            hunk.id,
+            hunk.path,
+            hunk.digest,
+            hunk.new_start,
+            hunk.new_len,
+            carried=hunk.id in carried,
+            reopened=hunk.id in reopened,
+        )
+        for hunk in hunks
+    )
+
+
 def open_round(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -916,6 +246,8 @@ def open_round(
     lenses: Sequence[str],
     packet_path: str,
     symbols_by_hunk: Mapping[str, Sequence[str]],
+    *,
+    signals: tuple[QualitySignal, ...],
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op."""
     if ledger.rounds:
@@ -937,42 +269,20 @@ def open_round(
         base_sha=snap.base_sha,
         tier=tier,
         prepared_at=_now(),
-        hunks=tuple(
-            HunkRef(
-                hunk.id,
-                hunk.path,
-                hunk.digest,
-                hunk.new_start,
-                hunk.new_len,
-                carried=hunk.id in carried,
-                reopened=hunk.id in reopened,
-            )
-            for hunk in snap.hunks
-        ),
+        hunks=_build_hunk_refs(snap.hunks, carried, reopened),
         lenses=tuple(lenses),
         packet_path=packet_path,
+        signals=signals,
     )
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
 
 
-def _carry_over(
-    ledger: Ledger,
+def _reopened_hunk_ids(
     hunks: Sequence[Hunk],
-    lenses: Sequence[str],
+    previous: set[str],
+    reviewed: set[str],
     symbols_by_hunk: Mapping[str, Sequence[str]],
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Ids of the hunks of the next round that are carried over, and of those that are reopened.
-
-    A hunk is reopened when it is unchanged since the previous round and was reviewed, but
-    mentions a symbol defined by a hunk that changed since then, directly or through another
-    such hunk; only coverage recorded from then on counts for it. A hunk every lens already
-    covered is carried over unless it is reopened.
-    """
-    if not ledger.rounds:
-        return frozenset(), frozenset()
-    covered = _carryable_coverage(ledger)
-    reviewed = {digest for _, digest in covered}
-    previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
+) -> set[str]:
     mentioned_by: dict[str, list[Hunk]] = {}
     for hunk in hunks:
         if hunk.digest in previous:
@@ -995,11 +305,30 @@ def _carry_over(
             if hunk.id not in affected:
                 affected.add(hunk.id)
                 pending.extend(symbols_by_hunk.get(hunk.id, ()))
-    reopened = {hunk.id for hunk in hunks if hunk.id in affected and hunk.digest in reviewed}
+    return {hunk.id for hunk in hunks if hunk.id in affected and hunk.digest in reviewed}
+
+
+def _carry_over(
+    ledger: Ledger,
+    hunks: Sequence[Hunk],
+    lenses: Sequence[str],
+    symbols_by_hunk: Mapping[str, Sequence[str]],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Ids of the hunks of the next round that are carried over, and of those that are reopened."""
+    if not ledger.rounds:
+        return frozenset(), frozenset()
+    covered = _carryable_coverage(ledger)
+    reviewed = {digest for _, digest in covered}
+    previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
+    reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk)
     carried = {
         hunk.id
         for hunk in hunks
-        if hunk.id not in reopened and all((lens, hunk.digest) in covered for lens in lenses)
+        if hunk.id not in reopened
+        and all(
+            (lens, file_digest(hunks, hunk.path) if lens == DESIGN_LENS else hunk.digest) in covered
+            for lens in lenses
+        )
     }
     return frozenset(carried), frozenset(reopened)
 
@@ -1015,17 +344,14 @@ def _mentioned_words(hunk: Hunk) -> frozenset[str]:
 
 
 def reopened_mentions(
-    coverage: Iterable[Coverage],
-    round_: Round,
-    hunks: Sequence[Hunk],
-    symbols_by_hunk: Mapping[str, Sequence[str]],
+    round_: Round, hunks: Sequence[Hunk], symbols_by_hunk: Mapping[str, Sequence[str]]
 ) -> dict[str, tuple[tuple[str, str], ...]]:
     """Why the reopened hunks of `round_` are open again.
 
     Maps each reopened hunk id to the `(symbol, defining hunk id)` pairs it mentions, where the
-    defining hunk is open in `round_`. `coverage` is not needed any more and is ignored.
+    defining hunk is open in `round_`.
     """
-    open_ids = {hunk.id for hunk in round_.hunks if not hunk.carried}
+    open_ids = set(round_.open_hunk_ids)
     reopened = {hunk.id for hunk in round_.hunks if hunk.reopened}
     defined = [
         (symbol, hunk.id)
@@ -1051,59 +377,175 @@ def reopened_mentions(
     return mentions
 
 
-def add_coverage(
-    ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
-) -> tuple[Ledger, Coverage]:
-    """Record that `lens` reviewed the given hunks of the latest round."""
-    round_ = _latest_round(ledger)
-    if lens not in round_.lenses:
-        if lens not in LENS_IDS:
-            raise LedgerError(
-                f"unknown lens {lens!r}; valid lenses: {', '.join(sorted(LENS_IDS))}",
-                field="lens",
-            )
+def _validate_design_targets(round_: Round, paths: Sequence[str]) -> tuple[str, ...]:
+    files = {file.path: file for file in round_.files}
+    unknown = [path for path in paths if path not in files]
+    if unknown:
         raise LedgerError(
-            f"lens {lens!r} is not selected in round {round_.number}; "
-            f"selected lenses: {', '.join(round_.lenses)}",
-            field="lens",
+            f"unknown files in round {round_.number}: {', '.join(unknown)}; "
+            f"files to cover: {', '.join(round_.open_files) or 'none'}",
+            field="files",
         )
-    if not 1 <= len(hunk_ids) <= MAX_HUNKS_PER_COVERAGE:
+    carried = [path for path in paths if files[path].carried]
+    if carried:
         raise LedgerError(
-            f"cover 1..{MAX_HUNKS_PER_COVERAGE} hunks per call (got {len(hunk_ids)}); "
-            "split the hunks into smaller batches with a note for each",
-            field="digests",
+            f"{', '.join(carried)} already covered in an earlier round (carried over); "
+            "cover only the remaining files",
+            field="files",
         )
-    if len(set(hunk_ids)) != len(hunk_ids):
-        raise LedgerError(f"hunk ids must not repeat: {', '.join(hunk_ids)}", field="digests")
+    return tuple(files[path].digest for path in paths)
+
+
+def _validate_coverage_target(round_: Round, lens: str, targets: Sequence[str]) -> tuple[str, ...]:
+    _require_selected_lens(round_, lens)
+    unit = "files" if lens == DESIGN_LENS else "hunks"
+    if not 1 <= len(targets) <= MAX_HUNKS_PER_COVERAGE:
+        raise LedgerError(
+            f"cover 1..{MAX_HUNKS_PER_COVERAGE} {unit} per call (got {len(targets)}); "
+            f"split the {unit} into smaller batches with a note for each",
+            field=unit,
+        )
+    if len(set(targets)) != len(targets):
+        raise LedgerError(f"{unit} must not repeat: {', '.join(targets)}", field=unit)
+    if lens == DESIGN_LENS:
+        return _validate_design_targets(round_, targets)
+    return _validate_hunk_targets(round_, targets)
+
+
+def _require_selected_lens(round_: Round, lens: str) -> None:
+    if lens in round_.lenses:
+        return
+    if lens not in LENS_IDS:
+        raise LedgerError(
+            f"unknown lens {lens!r}; valid lenses: {', '.join(sorted(LENS_IDS))}", field="lens"
+        )
+    raise LedgerError(
+        f"lens {lens!r} is not selected in round {round_.number}; "
+        f"selected lenses: {', '.join(round_.lenses)}",
+        field="lens",
+    )
+
+
+def _validate_hunk_targets(round_: Round, hunk_ids: Sequence[str]) -> tuple[str, ...]:
     by_id = {hunk.id: hunk for hunk in round_.hunks}
-    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried]
     unknown = [hunk_id for hunk_id in hunk_ids if hunk_id not in by_id]
     if unknown:
         raise LedgerError(
             f"unknown hunk ids in round {round_.number}: {', '.join(unknown)}; "
-            f"hunks to cover: {', '.join(open_ids) or 'none'}",
-            field="digests",
+            f"hunks to cover: {', '.join(round_.open_hunk_ids) or 'none'}",
+            field="hunks",
         )
     carried = [hunk_id for hunk_id in hunk_ids if by_id[hunk_id].carried]
     if carried:
         raise LedgerError(
             f"{', '.join(carried)} already covered in an earlier round (carried over); "
             "cover only the remaining hunks",
-            field="digests",
+            field="hunks",
         )
-    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(rf"\b{hunk_id}\b", note)]
+    return tuple(by_id[hunk_id].digest for hunk_id in hunk_ids)
+
+
+def _target_pattern(target: str) -> str:
+    """`target` as a whole word; a path must also not match inside `src/a.py` or `a.pyc`."""
+    if _HUNK_ID_RE.fullmatch(target):
+        return rf"(?<!\w){re.escape(target)}(?!\w)"
+    return rf"(?<![\w./\\-]){re.escape(target)}(?![\w/\\-]|\.\w)"
+
+
+def _extract_hunk_segments(hunk_ids: Sequence[str], note: str) -> dict[str, str]:
+    spans: list[tuple[int, str]] = []
+    for hid in hunk_ids:
+        match = re.search(_target_pattern(hid), note)
+        if match is not None:
+            spans.append((match.start(), hid))
+    spans.sort()
+    segments: dict[str, str] = {}
+    for index, (start, hid) in enumerate(spans):
+        end = spans[index + 1][0] if index + 1 < len(spans) else len(note)
+        segments[hid] = note[start:end].strip()
+    return segments
+
+
+def _normalize_note_segment(segment: str, target: str = "") -> str:
+    cleaned = re.sub(_target_pattern(target), "", segment) if target else segment
+    without_ids = _HUNK_ID_RE.sub("", cleaned)
+    return re.sub(r"\s+", " ", without_ids.strip().strip(";:,-.")).strip().lower()
+
+
+def _validate_hunk_segment(hid: str, segment: str) -> str:
+    without_id = re.sub(_target_pattern(hid), " ", segment)
+    stripped_generic = _GENERIC_WORDS_RE.sub(" ", without_id)
+    substantive = re.sub(r"[\W_]+", "", stripped_generic)
+    if len(segment) < MIN_HUNK_NOTE_SEGMENT_CHARS or len(substantive) < MIN_SUBSTANTIVE_NOTE_CHARS:
+        raise FieldError(
+            "note",
+            f"needs at least {MIN_HUNK_NOTE_SEGMENT_CHARS} characters per hunk or file, "
+            f"{MIN_SUBSTANTIVE_NOTE_CHARS} of them beyond generic praise; {hid} has too little "
+            f'concrete detail. Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        )
+    if not file_reference_in(without_id) and _CONCRETE_COVERAGE_RE.search(without_id) is None:
+        raise FieldError(
+            "note",
+            f"for {hid} must include a concrete detail (file:line, number/literal, ->, or symbol name). "
+            f'Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        )
+    return _normalize_note_segment(segment, hid)
+
+
+def _validate_coverage_note(
+    ledger: Ledger, round_: Round, lens: str, hunk_ids: Sequence[str], note: str
+) -> None:
+    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(_target_pattern(hunk_id), note)]
     if unnamed:
         raise LedgerError(
             f"the coverage note must name every covered hunk and what was tried on it; missing: "
             f'{", ".join(unnamed)}. Example: "{COVERAGE_NOTE_EXAMPLE}"',
             field="note",
         )
+    segments = _extract_hunk_segments(hunk_ids, note)
+    norm_by_target = _recorded_note_segments(ledger, round_, lens)
+    for hid in hunk_ids:
+        norm_by_target[hid] = _validate_hunk_segment(hid, segments[hid])
+    counts: dict[str, int] = {}
+    for body in norm_by_target.values():
+        counts[body] = counts.get(body, 0) + 1
+        if counts[body] > MAX_REUSED_NOTE_SEGMENTS:
+            raise FieldError(
+                "note",
+                f"reuses the same note segment for more than {MAX_REUSED_NOTE_SEGMENTS} hunks in lens "
+                f'`{lens}`; write a specific note per hunk. Example: "{COVERAGE_NOTE_EXAMPLE}"',
+            )
+
+
+def _recorded_note_segments(ledger: Ledger, round_: Round, lens: str) -> dict[str, str]:
+    """The normalized note segment `lens` already recorded for each hunk (or file) of `round_`."""
+    paths = [file.path for file in round_.files]
+    segments: dict[str, str] = {}
+    for record in ledger.coverage:
+        if record.round != round_.number or record.lens != lens:
+            continue
+        if lens == DESIGN_LENS:
+            targets = [path for path in paths if re.search(_target_pattern(path), record.note)]
+        else:
+            targets = _HUNK_ID_RE.findall(record.note)
+        for target, segment in _extract_hunk_segments(targets, record.note).items():
+            segments[target] = _normalize_note_segment(segment, target)
+    return segments
+
+
+def add_coverage(
+    ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
+) -> tuple[Ledger, Coverage]:
+    """Record that `lens` reviewed the given hunks (or files for `design`) of the latest round."""
+    round_ = _latest_round(ledger)
+    digests = _validate_coverage_target(round_, lens, hunk_ids)
+    _validate_coverage_note(ledger, round_, lens, hunk_ids, note)
     if lens == SWEEP_LENS:
         _require_lenses_before_sweep(ledger, round_)
     record = Coverage(
         round=round_.number,
         lens=lens,
-        digests=tuple(by_id[hunk_id].digest for hunk_id in hunk_ids),
+        digests=digests,
         note=note.strip(),
         recorded_at=_now(),
     )
@@ -1134,12 +576,15 @@ def add_finding(
     title: str,
     scenario: str,
     suggestion: str,
+    signal_id: str | None,
 ) -> tuple[Ledger, Finding]:
     """Record a finding against the latest round and the code it reviewed."""
     round_ = _latest_round(ledger)
+    if signal_id is not None:
+        round_.signal(signal_id)
     now = _now()
     finding = Finding(
-        id=_next_id("F", (item.id for item in ledger.findings)),
+        id=next_finding_id(ledger),
         round=round_.number,
         lens=lens,
         path=path.strip(),
@@ -1156,8 +601,90 @@ def add_finding(
         resolution_note="",
         recorded_at=now,
         updated_at=now,
+        signal_id=signal_id,
     )
     return replace(ledger, findings=(*ledger.findings, finding)), finding
+
+
+def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, SignalAck]:
+    """Acknowledge a quality signal in the latest round with a concrete reason (>= 40 chars)."""
+    round_ = _latest_round(ledger)
+    sig = round_.signal(signal_id)
+    if sig.needs_user:
+        raise LedgerError(
+            f"{signal_id} (`{sig.kind.value}`) cannot be acknowledged by the agent; shrink the "
+            "change or hand the review to the user",
+            field="signal_id",
+        )
+    stripped = reason.strip()
+    if len(stripped) < MIN_SIGNAL_ACK_REASON_CHARS:
+        raise FieldError(
+            "reason",
+            f"must have at least {MIN_SIGNAL_ACK_REASON_CHARS} characters (got {len(stripped)})",
+        )
+    if _CONCRETE_TOKEN_RE.search(stripped) is None and not file_reference_in(stripped):
+        raise FieldError(
+            "reason",
+            "must include a concrete code detail (a file:line, symbol(), `identifier`, number, or ->)",
+        )
+    ack = SignalAck(signal_id, round_.number, round_.fingerprint, stripped, _now())
+    kept = tuple(
+        item
+        for item in ledger.signal_acks
+        if not (item.round == round_.number and item.signal_id == signal_id)
+    )
+    return replace(ledger, signal_acks=(*kept, ack)), ack
+
+
+def file_sha256(root: Path, rel_path: str) -> str | None:
+    """The SHA-256 of a work-tree file, or None when the file does not exist."""
+    target = root / rel_path
+    if not target.is_file():
+        return None
+    try:
+        return hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise LedgerError(f"cannot read {target}: {exc}") from exc
+
+
+def add_fact(
+    ledger: Ledger,
+    *,
+    hunks: Sequence[str],
+    source: SourceRef,
+    text: str,
+    source_digest: str,
+    author_lens: str,
+) -> tuple[Ledger, Fact]:
+    """Record a fact about the source that other reviewers of the named hunks can rely on."""
+    round_ = _latest_round(ledger)
+    known = {hunk.id for hunk in round_.hunks}
+    unknown = [hunk_id for hunk_id in hunks if hunk_id not in known]
+    if unknown:
+        raise FieldError("hunks", f"are not in round {round_.number}: {', '.join(unknown)}")
+    fact = Fact(
+        id=next_id("F-", (item.id for item in ledger.facts)),
+        hunks=tuple(dict.fromkeys(hunks)),
+        source=source,
+        text=text.strip(),
+        file_digest=source_digest,
+        author_lens=author_lens,
+    )
+    return replace(ledger, facts=(*ledger.facts, fact)), fact
+
+
+def valid_facts_for_hunk(ledger: Ledger, root: Path) -> dict[str, tuple[Fact, ...]]:
+    """Facts per hunk id whose source file is unchanged since the fact was recorded."""
+    by_hunk: dict[str, list[Fact]] = {}
+    digest_cache: dict[str, str | None] = {}
+    for fact in ledger.facts:
+        path = fact.source.path
+        if path not in digest_cache:
+            digest_cache[path] = file_sha256(root, path)
+        if digest_cache[path] is not None and digest_cache[path] == fact.file_digest:
+            for hid in fact.hunks:
+                by_hunk.setdefault(hid, []).append(fact)
+    return {hid: tuple(items) for hid, items in by_hunk.items()}
 
 
 def relocate_finding(
@@ -1189,74 +716,78 @@ def merge_findings(
     suggestion: str | None = None,
 ) -> tuple[Ledger, Finding, tuple[Finding, ...]]:
     """Fold duplicate findings that share a root cause into `target_id` before verification."""
-    target = _find(ledger, target_id)
-    _require(
-        bool(duplicate_ids),
-        "duplicate_ids",
-        "must name at least one duplicate finding to merge",
+    target, duplicates = _mergeable(ledger, target_id, duplicate_ids)
+    now = _now()
+    updated_target = replace(
+        target,
+        severity=min((item.severity for item in (target, *duplicates)), key=SEVERITIES.index),
+        title=target.title if title is None else title.strip(),
+        scenario=_merged_scenario(target, duplicates) if scenario is None else scenario.strip(),
+        suggestion=_merged_suggestion(target, duplicates) if suggestion is None else suggestion.strip(),
+        signal_id=_merged_signal(target, duplicates),
+        updated_at=now,
     )
+    evidence = f"{GROUPED_EVIDENCE_PREFIX}{target.id} ({target.path}:{target.line}): same root cause."
+    dismissed = tuple(
+        replace(dup, verdict="dismissed", verdict_evidence=evidence, updated_at=now)
+        for dup in duplicates
+    )
+    by_id = {item.id: item for item in (updated_target, *dismissed)}
+    findings = tuple(by_id.get(item.id, item) for item in ledger.findings)
+    return replace(ledger, findings=findings), updated_target, dismissed
+
+
+def _mergeable(
+    ledger: Ledger, target_id: str, duplicate_ids: Sequence[str]
+) -> tuple[Finding, tuple[Finding, ...]]:
+    if not duplicate_ids:
+        raise LedgerError("name at least one duplicate finding to merge")
     if target_id in duplicate_ids:
         raise LedgerError(f"cannot merge {target_id} into itself")
     if len(set(duplicate_ids)) != len(duplicate_ids):
         raise LedgerError(f"duplicate finding ids must not repeat: {', '.join(duplicate_ids)}")
-    duplicates = [_find(ledger, dup_id) for dup_id in duplicate_ids]
+    target = _find(ledger, target_id)
+    duplicates = tuple(_find(ledger, dup_id) for dup_id in duplicate_ids)
     for item in (target, *duplicates):
-        if item.verdict is not None or item.resolution is not None:
-            state = item.resolution or item.verdict
+        if item.verdict is not None:
             raise LedgerError(
-                f"merge only works on findings without a verdict (before verification); "
-                f"{item.id} already has a verdict or resolution ({state})"
+                "merge only works on findings without a verdict (before verification); "
+                f"{item.id} already has the verdict {item.verdict}"
             )
-    now = _now()
-    best_severity = min((item.severity for item in (target, *duplicates)), key=SEVERITIES.index)
-    if scenario is not None:
-        merged_scenario = scenario.strip()
-    else:
-        seen_raw = {
-            re.sub(r"^\[F\d+/[^\]]+\]\s*", "", part.strip())
-            for part in target.scenario.split("; ")
-            if part.strip()
-        }
-        parts = [target.scenario]
-        for dup in duplicates:
-            if dup.scenario not in seen_raw:
-                seen_raw.add(dup.scenario)
-                parts.append(f"[{dup.id}/{dup.lens}] {dup.scenario}")
-        merged_scenario = "; ".join(parts)
-    if suggestion is not None:
-        merged_suggestion = suggestion.strip()
-    else:
-        merged_suggestion = target.suggestion or next(
-            (dup.suggestion for dup in duplicates if dup.suggestion), ""
+    return target, duplicates
+
+
+def _merged_scenario(target: Finding, duplicates: Sequence[Finding]) -> str:
+    """The target's scenario plus every duplicate consequence it does not already describe."""
+    merged = target.scenario
+    for dup in duplicates:
+        if dup.scenario not in merged:
+            merged += f"; [{dup.id}/{dup.lens}] {dup.scenario}"
+    return merged
+
+
+def _merged_suggestion(target: Finding, duplicates: Sequence[Finding]) -> str:
+    return target.suggestion or next((dup.suggestion for dup in duplicates if dup.suggestion), "")
+
+
+def _merged_signal(target: Finding, duplicates: Sequence[Finding]) -> str | None:
+    """The quality signal the merged finding resolves; it must not resolve two different ones.
+
+    Signal ids are per round, so a signal never moves to a finding of another round.
+    """
+    moved = [dup.id for dup in duplicates if dup.signal_id is not None and dup.round != target.round]
+    if moved:
+        raise LedgerError(
+            f"{', '.join(moved)} resolve a quality signal of another round than {target.id}; "
+            "merge only findings of the same round"
         )
-    updated_target = replace(
-        target,
-        severity=best_severity,
-        title=target.title if title is None else title.strip(),
-        scenario=merged_scenario,
-        suggestion=merged_suggestion,
-        updated_at=now,
-    )
-    evidence = f"{GROUPED_EVIDENCE_PREFIX}{target.id} ({target.path}:{target.line}): same root cause."
-    updated_duplicates = {
-        dup.id: replace(
-            dup,
-            verdict="dismissed",
-            verdict_evidence=evidence,
-            verdict_run=None,
-            resolution=None,
-            resolution_note="",
-            updated_at=now,
+    signals = {item.signal_id for item in (target, *duplicates) if item.signal_id is not None}
+    if len(signals) > 1:
+        raise LedgerError(
+            f"the findings resolve different quality signals ({', '.join(sorted(signals))}); "
+            "merge only findings about the same signal"
         )
-        for dup in duplicates
-    }
-    by_id = {updated_target.id: updated_target, **updated_duplicates}
-    findings = tuple(by_id.get(item.id, item) for item in ledger.findings)
-    return (
-        replace(ledger, findings=findings),
-        updated_target,
-        tuple(updated_duplicates[dup.id] for dup in duplicates),
-    )
+    return next(iter(signals), None)
 
 
 def set_verdict(
@@ -1328,11 +859,33 @@ def waive_run(ledger: Ledger, run_id: str, reason: str) -> tuple[Ledger, Run]:
     return replace(ledger, runs=runs), updated
 
 
-def add_run(ledger: Ledger, run: Run) -> Ledger:
-    """Append a verification run, assigning the next free id when `run.id` is empty."""
-    if not run.id:
-        run = replace(run, id=_next_id("R", (item.id for item in ledger.runs)))
-    return replace(ledger, runs=(*ledger.runs, run))
+def add_run(
+    ledger: Ledger,
+    *,
+    kind: RunKind,
+    argv: Sequence[str],
+    cwd: str,
+    exit_code: int,
+    duration_s: float,
+    fingerprint: str,
+    started_at: str,
+    output_tail: str,
+    fingerprint_after: str | None,
+) -> tuple[Ledger, Run]:
+    """Append a verification run under the next free run id."""
+    run = Run(
+        id=next_id("R", (item.id for item in ledger.runs)),
+        kind=kind,
+        argv=tuple(argv),
+        cwd=cwd,
+        exit_code=exit_code,
+        duration_s=duration_s,
+        fingerprint=fingerprint,
+        started_at=started_at,
+        output_tail=output_tail,
+        fingerprint_after=fingerprint_after,
+    )
+    return replace(ledger, runs=(*ledger.runs, run)), run
 
 
 def add_agent_event(ledger: Ledger, ev: AgentEvent) -> Ledger:
@@ -1340,270 +893,17 @@ def add_agent_event(ledger: Ledger, ev: AgentEvent) -> Ledger:
     return replace(ledger, agents=(*ledger.agents, ev))
 
 
-# --- trivial run detection ------------------------------------------------------------------
-
-
-def is_trivial_run(argv: Sequence[str]) -> bool:
-    """True for commands that prove nothing, such as `true`, `echo ok` or `sh -c 'exit 0'`."""
-    tokens = _without_env_prefix(argv)
-    if not tokens:
-        return True
-    program = _program_name(tokens[0])
-    if program in _TRIVIAL_PROGRAMS:
-        return True
-    if _PYTHON_RE.fullmatch(program):
-        code = _python_inline_code(tokens[1:])
-        return code is not None and _is_trivial_python(code)
-    script = _shell_script(program, tokens[1:])
-    return script is not None and _is_trivial_script(script)
-
-
-def _program_name(token: str) -> str:
-    name = re.split(r"[\\/]", token)[-1].lower()
-    return name.removesuffix(".exe")
-
-
-def _without_env_prefix(argv: Sequence[str]) -> list[str]:
-    tokens = list(argv)
-    if tokens and _program_name(tokens[0]) == "env":
-        tokens.pop(0)
-        while tokens and ("=" in tokens[0] or tokens[0].startswith("-")):
-            tokens.pop(0)
-    return tokens
-
-
-def _python_inline_code(args: Sequence[str]) -> str | None:
-    """The program of `python [options] -c <code>`, or None when Python runs a file or module."""
-    remaining = list(args)
-    while remaining and remaining[0].startswith("-") and not remaining[0].startswith("--"):
-        flags = remaining.pop(0)[1:]
-        for index, flag in enumerate(flags):
-            rest = flags[index + 1 :]
-            if flag == "c":
-                return rest or (remaining[0] if remaining else "")
-            if flag == "m":
-                return None
-            if flag in "WX":  # these take a value: -Wignore or -W ignore
-                if not rest and remaining:
-                    remaining.pop(0)
-                break
-    return None
-
-
-def _is_trivial_python(code: str) -> bool:
-    """Code made only of `pass`, constants, `import sys` and exit calls with constant arguments."""
-    try:
-        statements = ast.parse(code).body
-    except (SyntaxError, ValueError, RecursionError):
-        return False  # Python would reject it, so it is not a trivial pass
-    return all(_is_trivial_statement(statement) for statement in statements)
-
-
-def _is_trivial_statement(statement: ast.stmt) -> bool:
-    if isinstance(statement, ast.Pass):
-        return True
-    if isinstance(statement, ast.Import):
-        return all(alias.name == "sys" and alias.asname is None for alias in statement.names)
-    if not isinstance(statement, ast.Expr):
-        return False
-    value = statement.value
-    if isinstance(value, ast.Constant):
-        return True
-    if not isinstance(value, ast.Call) or value.keywords:
-        return False
-    func = value.func
-    exits = (isinstance(func, ast.Name) and func.id in _PYTHON_EXITS) or (
-        isinstance(func, ast.Attribute)
-        and func.attr == "exit"
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "sys"
-    )
-    return exits and all(isinstance(arg, ast.Constant) for arg in value.args)
-
-
-def _shell_script(program: str, args: Sequence[str]) -> str | None:
-    """The inline script of a shell invocation such as `bash -lc '...'` or `cmd /d /c ...`."""
-    if program in _SHELLS:
-        return _posix_shell_script(args)
-    if program == "cmd":
-        for index, arg in enumerate(args):
-            if arg.lower() in ("/c", "/k"):
-                return " ".join(args[index + 1 :])
-            if not arg.startswith("/"):
-                return None
-        return None
-    if program in _POWERSHELLS:
-        for index, arg in enumerate(args):
-            name = arg[1:].lower() if arg[:1] in ("-", "/") else ""
-            if name and "command".startswith(name):  # -Command, -c
-                return " ".join(args[index + 1 :])
-            if name and ("file".startswith(name) or "encodedcommand".startswith(name) or name == "ec"):
-                return None
-        return None
-    return None
-
-
-def _posix_shell_script(args: Sequence[str]) -> str | None:
-    remaining = list(args)
-    inline = False
-    while remaining and remaining[0][:1] in ("-", "+") and remaining[0] not in ("-", "--"):
-        flags = remaining.pop(0)
-        if flags.startswith("--"):
-            continue  # long options such as --norc or --login take no value we need to skip
-        inline = inline or "c" in flags
-        if ("o" in flags or "O" in flags) and remaining:
-            remaining.pop(0)  # -o pipefail, -O extglob
-    if remaining and remaining[0] == "--":
-        remaining.pop(0)
-    return remaining[0] if inline and remaining else None
-
-
-def _is_trivial_script(script: str) -> bool:
-    lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
-    lexer.whitespace_split = True
-    try:
-        tokens = list(lexer)
-    except ValueError:
-        return False  # unbalanced quotes: the shell would reject it, so it is not a trivial pass
-    segments: list[list[str]] = [[]]
-    for token in tokens:
-        if token in _SHELL_SEPARATORS:
-            segments.append([])
-        else:
-            segments[-1].append(token)
-    return all(is_trivial_run(segment) for segment in segments if segment)
-
-
-# --- gate evaluation ------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class GateIssue:
-    code: IssueCode
-    message: str
-
-
-@dataclass(frozen=True)
-class GateReport:
-    issues: tuple[GateIssue, ...]
-    warnings: tuple[str, ...]
-    summary: str
-    review_only: bool = False
-
-    @property
-    def passed(self) -> bool:
-        return not self.issues
-
-
-@dataclass(frozen=True)
-class GatePolicy:
-    tier: Tier
-    require_isolation: bool
-    reviewer_agent_markers: tuple[str, ...] = ("craftsman-reviewer",)
-    max_rounds: int = 5
-
-    def __post_init__(self) -> None:
-        _require_choice(self.tier, TIERS, "tier")
-        _require(self.max_rounds >= 1, "max_rounds", "must be >= 1")
-        _require(
-            bool(self.reviewer_agent_markers) and all(m.strip() for m in self.reviewer_agent_markers),
-            "reviewer_agent_markers",
-            "must contain at least one non-blank marker",
-        )
-
-
-def evaluate(
-    ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy, *, review_only: bool = False
-) -> GateReport:
-    """Decide whether the evidence in `ledger` covers the current diff `snap`."""
-    if snap.is_empty:
-        summary = f"Nothing to review: the work tree matches base {snap.base_sha[:12]}."
-        return GateReport(
-            () if review_only else tuple(_unresolved_issues(ledger, snap)),
-            (),
-            summary,
-            review_only=review_only,
-        )
-    latest = ledger.rounds[-1] if ledger.rounds else None
-    fix_and_test = (
-        ()
-        if review_only
-        else (
-            *_unresolved_issues(ledger, snap),
-            *_passing_run_issues(ledger, snap, policy),
-            *_failing_run_issues(ledger),
-        )
-    )
-    issues = [
-        *_round_issues(ledger, snap),
-        *(_tier_issues(latest, policy) if latest else ()),
-        *(_coverage_issues(ledger, latest) if latest else ()),
-        *_verdict_issues(ledger),
-        *fix_and_test,
-        *(_isolation_issues(ledger, latest, policy) if latest else ()),
-        *_round_cap_issues(ledger, policy),
-    ]
-    return GateReport(
-        tuple(issues),
-        _warnings(ledger, snap, policy, review_only=review_only),
-        _summary(ledger, snap),
-        review_only=review_only,
-    )
-
-
-def require_current_round(ledger: Ledger, snap: DiffSnapshot) -> Round:
-    """The latest round, provided it was prepared for exactly the diff `snap`."""
-    issues = _round_issues(ledger, snap)
-    if issues:
-        raise LedgerError(issues[0].message)
-    return ledger.rounds[-1]
-
-
-def _round_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
-    if not ledger.rounds:
-        return [
-            GateIssue(
-                "no-round",
-                "No review round yet; run `craftsman review prepare` to snapshot the diff "
-                "and select lenses.",
-            )
-        ]
-    base = ledger.rounds[0].base_sha
-    latest = ledger.rounds[-1]
-    if snap.base_sha != base:
-        message = (
-            f"The base commit changed from {base[:12]} to {snap.base_sha[:12]} since round 1; "
-            "run `craftsman review reset` and start a new review."
-        )
-        return [GateIssue("stale-round", message)]
-    if latest.fingerprint != snap.fingerprint:
-        message = (
-            f"Code changed since round {latest.number} was prepared; "
-            "run `craftsman review prepare` to review the delta."
-        )
-        return [GateIssue("stale-round", message)]
-    return []
-
-
-def _tier_issues(latest: Round, policy: GatePolicy) -> list[GateIssue]:
-    if TIERS.index(latest.tier) >= TIERS.index(policy.tier):
-        return []
-    return [
-        GateIssue(
-            "tier-too-low",
-            f"Round {latest.number} was prepared for the {latest.tier} tier but this task needs "
-            f"{policy.tier}; run `craftsman review prepare --tier {policy.tier}`.",
-        )
-    ]
+# --- coverage accounting -------------------------------------------------------------------
 
 
 def _reopened_in(ledger: Ledger, upto: int) -> dict[str, int]:
-    """Per hunk digest, the latest round up to `upto` that reopened it."""
+    """Per hunk (and file) digest, the latest round up to `upto` that reopened it."""
     latest: dict[str, int] = {}
     for round_ in ledger.rounds[:upto]:
         for hunk in round_.hunks:
             if hunk.reopened:
                 latest[hunk.digest] = round_.number
+                latest[file_digest(round_.hunks, hunk.path)] = round_.number
     return latest
 
 
@@ -1626,21 +926,28 @@ def _lens_coverage(ledger: Ledger, upto: int) -> dict[tuple[str, str], datetime]
 
 
 def _lenses_done_at(ledger: Ledger, round_: Round) -> datetime | None:
-    """When every lens but the sweep had covered every open hunk of `round_`; None if not yet."""
+    """When every lens but the sweep had covered every open hunk/file of `round_`; None if not yet."""
     first = _lens_coverage(ledger, round_.number)
     done = datetime.min.replace(tzinfo=timezone.utc)
-    for hunk in round_.hunks:
-        for lens in round_.lenses:
-            if hunk.carried or lens == SWEEP_LENS:
+    for lens in round_.lenses:
+        if lens == SWEEP_LENS:
+            continue
+        units = (
+            [(file.digest, file.carried) for file in round_.files]
+            if lens == DESIGN_LENS
+            else [(hunk.digest, hunk.carried) for hunk in round_.hunks]
+        )
+        for digest, carried in units:
+            if carried:
                 continue
-            at = first.get((lens, hunk.digest))
+            at = first.get((lens, digest))
             if at is None:
                 return None
             done = max(done, at)
     return done
 
 
-def _counting_sweeps(ledger: Ledger) -> list[Coverage]:
+def counting_sweeps(ledger: Ledger) -> list[Coverage]:
     """Sweep records made once their round's other lenses were complete; earlier ones do not count."""
     swept_rounds = {record.round for record in ledger.coverage if record.lens == SWEEP_LENS}
     done_at = {number: _lenses_done_at(ledger, ledger.rounds[number - 1]) for number in swept_rounds}
@@ -1658,340 +965,36 @@ def _carryable_coverage(ledger: Ledger) -> set[tuple[str, str]]:
     reopened = _reopened_in(ledger, len(ledger.rounds))
     swept = {
         (SWEEP_LENS, digest)
-        for record in _counting_sweeps(ledger)
+        for record in counting_sweeps(ledger)
         for digest in record.digests
         if record.round >= reopened.get(digest, 1)
     }
     return set(_lens_coverage(ledger, len(ledger.rounds))) | swept
 
 
-def uncovered_by_lens(ledger: Ledger, round_: Round) -> dict[str, list[str]]:
-    """Hunk ids of `round_` that each of its lenses still has to cover.
+def open_units(round_: Round, lens: str) -> tuple[str, ...]:
+    """What `lens` has to cover in `round_`: open file paths for `design`, else open hunk ids."""
+    return round_.open_files if lens == DESIGN_LENS else round_.open_hunk_ids
 
-    Lens coverage from earlier rounds counts, except for a hunk reopened because it mentions a
-    changed symbol: from the round that reopened it on, only fresh coverage does. The sweep
-    always has to be recorded in `round_` itself, after its other lenses.
-    """
+
+def uncovered_by_lens(ledger: Ledger, round_: Round) -> dict[str, list[str]]:
+    """Hunk ids (or file paths for `design`) of `round_` that each of its lenses still has to cover."""
     lenses = _lens_coverage(ledger, round_.number)
     swept = {
         digest
-        for record in _counting_sweeps(ledger)
+        for record in counting_sweeps(ledger)
         if record.round == round_.number
         for digest in record.digests
     }
     missing: dict[str, list[str]] = {lens: [] for lens in round_.lenses}
-    for hunk in round_.hunks:
-        for lens in round_.lenses:
+    for lens in round_.lenses:
+        if lens == DESIGN_LENS:
+            for file in round_.files:
+                if not file.carried and (DESIGN_LENS, file.digest) not in lenses:
+                    missing[lens].append(file.path)
+            continue
+        for hunk in round_.hunks:
             covered = hunk.digest in swept if lens == SWEEP_LENS else (lens, hunk.digest) in lenses
             if not hunk.carried and not covered:
                 missing[lens].append(hunk.id)
     return missing
-
-
-def _coverage_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
-    missing = uncovered_by_lens(ledger, latest)
-    sweep_missing = missing.pop(SWEEP_LENS, [])
-    issues = [_uncovered_issue(lens, ids, latest) for lens, ids in missing.items() if ids]
-    premature = _premature_sweep_ids(ledger, latest, sweep_missing)
-    if premature:
-        batch = ",".join(premature[:MAX_HUNKS_PER_COVERAGE])
-        issues.append(
-            GateIssue(
-                "sweep-too-early",
-                f"The final sweep of {', '.join(premature)} was recorded before the other lenses "
-                f"of round {latest.number} were complete, so it does not count; once every other "
-                f"lens is covered, repeat it: "
-                f'`craftsman review cover --lens {SWEEP_LENS} --hunks {batch} --note "..."`.',
-            )
-        )
-    remaining = [hunk_id for hunk_id in sweep_missing if hunk_id not in premature]
-    if remaining and not any(missing.values()):
-        issues.append(_uncovered_issue(SWEEP_LENS, remaining, latest))
-    return issues
-
-
-def _uncovered_issue(lens: str, missing: Sequence[str], round_: Round) -> GateIssue:
-    batch = ",".join(missing[:MAX_HUNKS_PER_COVERAGE])
-    extra = len(missing) - MAX_HUNKS_PER_COVERAGE
-    more = f" (+{extra} more)" if extra > 0 else ""
-    return GateIssue(
-        "uncovered",
-        f"Lens `{lens}` has {len(missing)} uncovered hunk(s) in round {round_.number}: "
-        f"{batch}{more}; review them and run "
-        f'`craftsman review cover --lens {lens} --hunks {batch} --note "..."`.',
-    )
-
-
-def _premature_sweep_ids(ledger: Ledger, round_: Round, sweep_missing: Sequence[str]) -> list[str]:
-    """Still-uncovered hunk ids whose only sweep coverage in `round_` came too early."""
-    counting = _counting_sweeps(ledger)
-    digests = {
-        digest
-        for record in ledger.coverage
-        if record.round == round_.number and record.lens == SWEEP_LENS and record not in counting
-        for digest in record.digests
-    }
-    return [hunk.id for hunk in round_.hunks if hunk.id in sweep_missing and hunk.digest in digests]
-
-
-def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
-    return [
-        GateIssue(
-            "no-verdict",
-            f"Finding {finding.id} ({finding.severity}: {finding.title}) has no verdict; verify it "
-            f"independently and run `craftsman review verdict {finding.id} "
-            '--as proven|probable|question|dismissed --evidence "..."`.',
-        )
-        for finding in ledger.findings
-        if finding.verdict is None
-    ]
-
-
-def _unresolved_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
-    issues: list[GateIssue] = []
-    for finding in ledger.findings:
-        label = f"Finding {finding.id} ({finding.severity}: {finding.title})"
-        if finding.verdict in ("proven", "probable") and finding.resolution is None:
-            alternative = "" if finding.severity == "blocker" else ' (or `--as accepted --note "why"`)'
-            issues.append(
-                GateIssue(
-                    "unresolved",
-                    f"{label} is {finding.verdict} but unresolved; fix the code, then run "
-                    f'`craftsman review resolve {finding.id} --as fixed --note "..."`{alternative}.',
-                )
-            )
-        elif finding.resolution == "fixed" and finding.fingerprint == snap.fingerprint:
-            issues.append(
-                GateIssue(
-                    "unresolved",
-                    f"{label} was resolved as fixed, but the code is back to the code it was "
-                    "recorded at; the fix was reverted, apply it again.",
-                )
-            )
-    return issues
-
-
-def _counting_runs(ledger: Ledger, kinds: Sequence[RunKind]) -> list[Run]:
-    return [run for run in ledger.runs if run.kind in kinds and not is_trivial_run(run.argv)]
-
-
-def _passing_run_issues(ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy) -> list[GateIssue]:
-    passing = [
-        run
-        for run in _counting_runs(ledger, _PASSING_KINDS)
-        if run.counts_as_passing and run.fingerprint == snap.fingerprint
-    ]
-    issues: list[GateIssue] = []
-    if not passing:
-        issues.append(
-            GateIssue(
-                "no-passing-run",
-                "No passing test or e2e run at the current code; "
-                "run `craftsman run --kind test -- <your test command>`.",
-            )
-        )
-    if policy.tier == "deep" and not any(run.kind == "e2e" for run in passing):
-        issues.append(
-            GateIssue(
-                "no-e2e-run",
-                "The deep tier needs a passing end-to-end run at the current code; run "
-                "`craftsman run --kind e2e -- <command that exercises the real flow>`.",
-            )
-        )
-    return issues
-
-
-def _unwaived_failing_runs(ledger: Ledger) -> list[Run]:
-    """Latest non-trivial verifying runs per (cwd, command) that failed without a waiver."""
-    latest = {
-        (run.cwd, run.argv): run
-        for run in _counting_runs(ledger, _VERIFYING_KINDS)
-        if run.exit_code != 0 or run.counts_as_passing
-    }
-    return [run for run in latest.values() if run.exit_code != 0 and run.waiver is None]
-
-
-def _failing_run_issues(ledger: Ledger) -> list[GateIssue]:
-    """The latest run of each command (per working directory) must not fail unless it was waived.
-
-    A passing run that changed the work tree does not clear an earlier failure.
-    """
-    return [
-        GateIssue(
-            "failing-run",
-            f"`{run.command}` ({run.kind}, {run.id}) last exited {run.exit_code}; fix the failure "
-            f"and re-run `craftsman run --kind {run.kind} -- {run.command}`. If the command itself "
-            f"is obsolete (a typo, a renamed test), retire it with "
-            f'`craftsman review waive-run {run.id} --reason "..."`.',
-        )
-        for run in _unwaived_failing_runs(ledger)
-    ]
-
-
-def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
-    if not policy.require_isolation or policy.tier == "quick":
-        return []
-    if all(hunk.carried for hunk in latest.hunks):
-        return []  # nothing for a reviewer to read, e.g. a rename-only or binary-only diff
-    prepared_at = parse_timestamp(latest.prepared_at)
-    markers = [marker.lower() for marker in policy.reviewer_agent_markers]
-    reviewed = any(
-        event.event == "stop"
-        and any(marker in event.agent.lower() for marker in markers)
-        and parse_timestamp(event.at) >= prepared_at
-        for event in ledger.agents
-    )
-    if reviewed:
-        return []
-    return [
-        GateIssue(
-            "no-isolation",
-            f"No independent review finished since round {latest.number} was prepared; spawn the "
-            f"{policy.reviewer_agent_markers[0]} subagent for round {latest.number}.",
-        )
-    ]
-
-
-def _round_cap_issues(ledger: Ledger, policy: GatePolicy) -> list[GateIssue]:
-    # Re-preparing the same diff for a stricter tier is not another iteration.
-    diffs = len({round_.fingerprint for round_ in ledger.rounds})
-    if diffs <= policy.max_rounds:
-        return []
-    return [
-        GateIssue(
-            "round-cap",
-            f"{diffs} review rounds of different diffs exceed the cap of {policy.max_rounds}; stop "
-            "iterating and report the remaining issues to the user.",
-        )
-    ]
-
-
-def _warnings(
-    ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy, *, review_only: bool = False
-) -> tuple[str, ...]:
-    warnings: list[str] = []
-    if review_only:
-        for_author = [
-            finding.id
-            for finding in ledger.findings
-            if finding.verdict in ("proven", "probable") and finding.resolution is None
-        ]
-        if for_author:
-            noun = "finding" if len(for_author) == 1 else "findings"
-            warnings.append(f"{len(for_author)} {noun} for the author: {', '.join(for_author)}.")
-        for run in _unwaived_failing_runs(ledger):
-            warnings.append(
-                f"Failing run {run.id} (`{run.command}`, {run.kind}) exited {run.exit_code}."
-            )
-    accepted = [finding.id for finding in ledger.findings if finding.resolution == "accepted"]
-    if accepted:
-        warnings.append(f"Accepted without a fix: {', '.join(accepted)}; tell the user about them.")
-    questions = [finding.id for finding in ledger.findings if finding.verdict == "question"]
-    if questions:
-        warnings.append(
-            f"Design questions for the author: {', '.join(questions)}; highlight them in the report."
-        )
-    waived = [run.id for run in ledger.runs if run.waiver is not None]
-    if waived:
-        warnings.append(f"Waived failing runs: {', '.join(waived)}; tell the user about them.")
-    changed_lines = snap.added + snap.deleted
-    if policy.tier == "quick" and changed_lines > QUICK_TIER_MAX_CHANGED_LINES:
-        warnings.append(
-            f"The quick tier reviews {changed_lines} changed lines "
-            f"(> {QUICK_TIER_MAX_CHANGED_LINES}); consider the standard tier."
-        )
-    warnings.extend(
-        f"{run.id} (`{run.command}`) is trivial and does not count as verification."
-        for run in ledger.runs
-        if is_trivial_run(run.argv)
-    )
-    return tuple(warnings)
-
-
-def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
-    if not ledger.rounds:
-        round_line = "Round: none prepared yet."
-        coverage_line = "Coverage: n/a."
-    else:
-        latest = ledger.rounds[-1]
-        freshness = "current" if latest.fingerprint == snap.fingerprint else "stale"
-        round_line = (
-            f"Round {latest.number} ({latest.tier}, {len(latest.lenses)} lenses, {freshness}): "
-            f"{len(latest.hunks)} hunks in {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines."
-        )
-        coverage_line = _coverage_summary(ledger, latest)
-    return "\n".join((round_line, coverage_line, _findings_summary(ledger), _runs_summary(ledger, snap)))
-
-
-def _coverage_summary(ledger: Ledger, latest: Round) -> str:
-    missing = uncovered_by_lens(ledger, latest)
-    open_hunks = sum(not hunk.carried for hunk in latest.hunks)
-    total = open_hunks * len(latest.lenses)
-    done = total - sum(len(ids) for ids in missing.values())
-    carried = len(latest.hunks) - open_hunks
-    line = f"Coverage: {done}/{total} lens-hunk pairs; {carried} hunk(s) carried from earlier rounds."
-    lenses_pending = any(ids for lens, ids in missing.items() if lens != SWEEP_LENS)
-    if SWEEP_LENS in latest.lenses and lenses_pending:
-        line += " Sweep pending (runs after every other lens)."
-    return line
-
-
-def _findings_summary(ledger: Ledger) -> str:
-    if not ledger.findings:
-        return "Findings: none."
-    findings = ledger.findings
-    awaiting = sum(finding.verdict is None for finding in findings)
-    dismissed = sum(finding.verdict == "dismissed" for finding in findings)
-    questions = [finding.id for finding in findings if finding.verdict == "question"]
-    unresolved = sum(
-        finding.verdict in ("proven", "probable") and finding.resolution is None for finding in findings
-    )
-    fixed = sum(finding.resolution == "fixed" for finding in findings)
-    accepted = [finding.id for finding in findings if finding.resolution == "accepted"]
-    accepted_detail = f" ({', '.join(accepted)})" if accepted else ""
-    question_part = f", {len(questions)} question(s) ({', '.join(questions)})" if questions else ""
-    return (
-        f"Findings: {len(findings)} total; {awaiting} awaiting verdict, {unresolved} unresolved, "
-        f"{fixed} fixed, {len(accepted)} accepted{accepted_detail}{question_part}, {dismissed} dismissed."
-    )
-
-
-def _runs_summary(ledger: Ledger, snap: DiffSnapshot) -> str:
-    if not ledger.runs:
-        return "Runs: none recorded."
-    recent = ", ".join(
-        f"{run.id} {run.kind} `{run.short_command}` exit {run.exit_code} "
-        f"({'current' if run.fingerprint == snap.fingerprint else 'stale'})"
-        for run in ledger.runs[-SUMMARY_RECENT_RUNS:]
-    )
-    return f"Runs: {len(ledger.runs)} recorded; latest: {recent}."
-
-
-def render_next_actions(issues: Sequence[GateIssue], *, max_items: int = MAX_NEXT_ACTIONS) -> list[str]:
-    """Numbered next-action lines, capped at `max_items` with a trailing count of the rest."""
-    lines = [
-        f"{index}. [{issue.code}] {issue.message}" for index, issue in enumerate(issues[:max_items], 1)
-    ]
-    if len(issues) > max_items:
-        lines.append(f"… and {len(issues) - max_items} more")
-    return lines
-
-
-def render_report(report: GateReport) -> str:
-    """Render a gate report as a compact Markdown block with numbered next actions."""
-    if report.review_only:
-        status = (
-            "COMPLETE (review-only)"
-            if report.passed
-            else f"INCOMPLETE ({len(report.issues)} open items)"
-        )
-        header = f"**Craftsman review: {status}**"
-    else:
-        status = "PASSED" if report.passed else f"BLOCKED ({len(report.issues)} open items)"
-        header = f"**Craftsman gate: {status}**"
-    lines = [header, "", report.summary]
-    if report.issues:
-        lines += ["", "**Next actions**", *render_next_actions(report.issues)]
-    if report.warnings:
-        lines += ["", "**Warnings**", *(f"- {warning}" for warning in report.warnings)]
-    return "\n".join(lines)

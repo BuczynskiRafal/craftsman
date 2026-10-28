@@ -58,13 +58,15 @@ reading full files top to bottom.
    ```
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, ordering entries in `AUTHORS` and a missing changelog entry are two separate
-   findings, not one "housekeeping" finding.
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
+   separate findings, not one "housekeeping" finding.
 
 ## For each remaining finding
 
 1. **Re-read the code yourself.** Open the file around the cited `file:line` range, the enclosing
-   function, and its callers. Do not rely on the finding's description of the code.
+   function, and its callers. Do not rely on the finding's description of the code. If a finding or
+   your verdict relies on a shared fact (`F-1`, `F-2`, …), cite its fact ID in `--evidence` and open
+   the `source` (`path:line`) of every cited fact yourself — a recorded fact is a pointer, not proof.
 2. **Try to break the finding.** Look for, in this order:
    - a guard that makes the trigger impossible (a check in a caller, a type, validation on load,
      a framework guarantee);

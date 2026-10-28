@@ -12,10 +12,10 @@ from unittest import mock
 
 from craftsman import evidence
 from craftsman.evidence import archive_ledger, archive_ledger_if_rebased, packet_path
-from craftsman.ledger import LEDGER_FILENAME, Ledger, ledger_path_for, save
+from craftsman.ledger import ledger_path_for, save
+from craftsman.records import LEDGER_FILENAME, Ledger
 
-from tests.support import EvidenceRepo
-from tests.test_ledger import make_hunk, make_snap, prepared
+from tests.support import EvidenceRepo, make_hunk, make_snap, prepared
 
 STAMP = "20260101T000000.000Z"
 
@@ -36,6 +36,7 @@ class ArchiveTests(unittest.TestCase):
         packet_path(self.path, 1).write_text("packet", encoding="utf-8")
 
     def test_archives_made_in_the_same_millisecond_are_all_kept(self) -> None:
+        # No public path sets the clock, and two real archives rarely share a millisecond.
         with mock.patch.object(evidence, "_archive_stamp", return_value=STAMP):
             for _ in range(2):
                 self.record_review()
