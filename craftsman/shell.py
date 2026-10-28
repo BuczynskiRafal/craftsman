@@ -36,8 +36,27 @@ MAX_NESTING = 8
 WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
     "sudo": frozenset(
-        {"-u", "-g", "-C", "-D", "-R", "-T", "-h", "-p", "-r", "-t", "--user", "--group",
-         "--chdir", "--prompt", "--close-from", "--host", "--role", "--type", "--command-timeout"}
+        {
+            "-u",
+            "-g",
+            "-C",
+            "-D",
+            "-R",
+            "-T",
+            "-h",
+            "-p",
+            "-r",
+            "-t",
+            "--user",
+            "--group",
+            "--chdir",
+            "--prompt",
+            "--close-from",
+            "--host",
+            "--role",
+            "--type",
+            "--command-timeout",
+        }
     ),  # fmt: skip
     "nice": frozenset({"-n", "--adjustment"}),
     "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
@@ -45,8 +64,24 @@ WRAPPER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
     "exec": frozenset({"-a"}),
     "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
     "xargs": frozenset(
-        {"-n", "-L", "-I", "-P", "-d", "-E", "-a", "-s", "--max-args", "--max-procs",
-         "--max-lines", "--delimiter", "--arg-file", "--eof", "--max-chars", "--replace"}
+        {
+            "-n",
+            "-L",
+            "-I",
+            "-P",
+            "-d",
+            "-E",
+            "-a",
+            "-s",
+            "--max-args",
+            "--max-procs",
+            "--max-lines",
+            "--delimiter",
+            "--arg-file",
+            "--eof",
+            "--max-chars",
+            "--replace",
+        }
     ),  # fmt: skip
     "command": frozenset(),
     "builtin": frozenset(),
@@ -318,7 +353,7 @@ class _Lexer:
         if src.startswith(("<(", ">("), pos):
             return self._read_word()
         redirect = _REDIRECT_RE.match(src, pos)
-        if redirect and (char in "<>&" or redirect.group(0)[:-len(redirect.group(1))].isdigit()):
+        if redirect and (char in "<>&" or redirect.group(0)[: -len(redirect.group(1))].isdigit()):
             return self._read_redirect(redirect)
         for op in _OPERATORS:
             if src.startswith(op, pos):
@@ -439,7 +474,9 @@ class _Lexer:
             self._read_dollar(builder, in_double_quotes=False)
         elif char == "`":
             self._read_backticks(builder)
-        elif src.startswith(_USERPROFILE_TOKEN, pos) or src[pos : pos + 13].upper() == _USERPROFILE_TOKEN:
+        elif (
+            src.startswith(_USERPROFILE_TOKEN, pos) or src[pos : pos + 13].upper() == _USERPROFILE_TOKEN
+        ):
             builder.add(home_dir(), quoted=True)
             builder.plain = False
             self.pos += len(_USERPROFILE_TOKEN)
@@ -986,9 +1023,7 @@ class _Parser:
         if redirect.kind is _RedirectKind.HEREDOC and redirect.heredoc is not None:
             heredoc = redirect.heredoc
             cwd = self.dirs.cwd
-            self.deferred.append(
-                (heredoc, lambda _body: self._substitutions(heredoc.nested, cwd=cwd))
-            )
+            self.deferred.append((heredoc, lambda _body: self._substitutions(heredoc.nested, cwd=cwd)))
             return _StdinScript(None, deferred=heredoc)
         return stdin
 
