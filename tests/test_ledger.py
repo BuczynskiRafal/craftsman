@@ -63,7 +63,10 @@ DISMISSED = "guarded by app.py:2, which returns 0 for an empty list"
 
 
 def note_for(hunk_ids: Sequence[str]) -> str:
-    return f"{' '.join(hunk_ids)}: traced empty, single and duplicate inputs through every branch"
+    return "; ".join(
+        f"{hid} f_{hid[1:]}.py:{hid[1:]}: x={hid[1:]} -> returns {int(hid[1:]) + 1} on boundary input"
+        for hid in hunk_ids
+    )
 
 
 def init_repo(root: Path) -> None:
@@ -909,7 +912,21 @@ class GateTests(unittest.TestCase):
 
         reviewed = add_agent_event(ledger, stop("Craftsman-Reviewer#2", T1))
         self.assertTrue(evaluate(reviewed, self.snap, standard).passed)
+        self.assertFalse(evaluate(reviewed, self.snap, standard).self_reviewed)
         self.assertTrue(evaluate(ledger, self.snap, replace(standard, tier="quick")).passed)
+
+    def test_standard_review_without_isolation_is_marked_self_reviewed(self) -> None:
+        unisolated = GatePolicy(tier="standard", require_isolation=False)
+        ledger = fully_reviewed(self.snap, tier="standard")
+
+        report = evaluate(ledger, self.snap, unisolated)
+
+        self.assertTrue(report.passed)
+        self.assertTrue(report.self_reviewed)
+        self.assertIn(
+            "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change",
+            render_report(report),
+        )
 
     def test_round_cap(self) -> None:
         ledger = Ledger()
@@ -947,6 +964,27 @@ class GateTests(unittest.TestCase):
             ),
         )
         self.assertIn("1 accepted (F1)", report.summary)
+
+    def test_process_anomaly_warnings_are_reported_without_blocking(self) -> None:
+        ledger = fully_reviewed(self.snap)
+        for index in range(1, 6):
+            ledger = with_finding(ledger)
+            ledger, _ = set_verdict(ledger, f"F{index}", "probable", PROBABLE, None)
+            ledger, _ = resolve(
+                ledger, f"F{index}", "accepted", f"Accepted reason {index} at a.py:1", fingerprint="fp1"
+            )
+        ledger = add_run(ledger, make_run(("pytest", "-q"), kind="test", exit_code=1))
+        ledger = add_run(ledger, make_run(("env", "FOO=1", "pytest", "-q"), kind="test", exit_code=0))
+
+        report = evaluate(ledger, self.snap, QUICK)
+
+        self.assertIn(
+            "Process anomaly: 5 findings and 0 dismissed (all findings confirmed — typical of self-review).",
+            report.warnings,
+        )
+        self.assertTrue(
+            any("repeated as R3 with a different environment" in w for w in report.warnings)
+        )
 
     def test_render_report_caps_next_actions(self) -> None:
         ledger, _ = prepared(self.snap)

@@ -830,7 +830,7 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
 
 
 class CraftsmanCliAndManifestTests(unittest.TestCase):
-    def test_cli_version_and_doctor_json(self) -> None:
+    def test_cli_reports_version_with_doctor_json(self) -> None:
         ver_proc = subprocess.run(
             [sys.executable, "-m", "craftsman.cli", "--version"],
             cwd=REPO_ROOT,
@@ -838,7 +838,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("3.1.0", ver_proc.stdout)
+        self.assertIn("3.2.0", ver_proc.stdout)
 
         with tempfile.TemporaryDirectory() as fake_home:
             doc_proc = subprocess.run(

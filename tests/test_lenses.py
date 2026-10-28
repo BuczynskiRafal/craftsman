@@ -9,9 +9,12 @@ from craftsman.diffscan import SIGNALS
 from craftsman.lenses import (
     LENS_IDS,
     LENSES,
+    REVIEWER_GROUPS,
     TIERS,
     Tier,
+    assign_reviewer_groups,
     get_lens,
+    render_reviewer_groups_markdown,
     select_lenses,
     strictest_tier,
 )
@@ -22,7 +25,7 @@ def picked_ids(tier: Tier, signals: dict[str, tuple[str, ...]], *, docs_only: bo
 
 
 class LensCatalogTests(unittest.TestCase):
-    def test_catalog_ids_are_unique_and_triggers_are_known_signals(self) -> None:
+    def test_catalog_ids_are_unique_with_known_signal_triggers(self) -> None:
         self.assertEqual(len(LENS_IDS), len(LENSES))
         self.assertEqual(
             [lens.id for lens in LENSES],
@@ -37,6 +40,7 @@ class LensCatalogTests(unittest.TestCase):
                 "platform",
                 "model",
                 "craft",
+                "design",
                 "sweep",
             ],
         )
@@ -59,7 +63,7 @@ class LensSelectionTests(unittest.TestCase):
     def test_standard_tier_adds_its_always_on_lenses(self) -> None:
         self.assertEqual(
             picked_ids("standard", {}),
-            ["intent", "contracts", "failure", "ripple", "tests", "craft", "sweep"],
+            ["intent", "contracts", "failure", "ripple", "tests", "craft", "design", "sweep"],
         )
 
     def test_deep_tier_selects_every_lens(self) -> None:
@@ -113,6 +117,25 @@ class LensSelectionTests(unittest.TestCase):
     def test_unknown_tier_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "valid tiers: quick, standard, deep"):
             select_lenses("auto", {}, docs_only=False)  # type: ignore[arg-type]
+
+    def test_every_selected_lens_belongs_to_exactly_one_reviewer_group(self) -> None:
+        all_grouped = [lens for group in REVIEWER_GROUPS.values() for lens in group]
+        self.assertEqual(len(all_grouped), len(set(all_grouped)))
+        self.assertEqual(set(all_grouped), LENS_IDS - {"sweep"})
+        for tier in TIERS:
+            selected = [lid for lid in picked_ids(tier, {}) if lid != "sweep"]
+            assigned = assign_reviewer_groups(selected)
+            flattened = [lens for group in assigned.values() for lens in group]
+            self.assertEqual(set(flattened), set(selected))
+            self.assertEqual(len(flattened), len(selected))
+
+    def test_reviewer_group_without_selected_lenses_is_skipped(self) -> None:
+        quick_selected = picked_ids("quick", {})
+        assigned = assign_reviewer_groups(quick_selected)
+        self.assertEqual(set(assigned), {"R1", "R3"})
+        self.assertNotIn("R2", assigned)
+        self.assertNotIn("R4", assigned)
+        self.assertIn("- **R1** (callers & contracts):", render_reviewer_groups_markdown())
 
 
 if __name__ == "__main__":

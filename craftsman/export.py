@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, get_args
 
+from craftsman.lenses import render_reviewer_groups_markdown
+
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
 CRAFTSMAN_BEGIN_MARKER = "<!-- craftsman:begin -->"
 CRAFTSMAN_END_MARKER = "<!-- craftsman:end -->"
@@ -431,6 +433,7 @@ def _rewrite_antigravity_paths(body: str) -> str:
     )
     rewritten = rewritten.replace("<artifactDirectoryPath>", dir_expr)
     rewritten = rewritten.replace("<appDataDir>/brain/<conversation-id>", dir_expr)
+    rewritten = rewritten.replace("{{reviewer_groups}}", render_reviewer_groups_markdown())
     return rewritten
 
 
@@ -1067,12 +1070,8 @@ def has_workspace_copilot_install(
     return _has_copilot_install(("workspace",), workspace=workspace_dir, repo_dir=repo_dir)
 
 
-def render_agents_md(repo_dir: Path) -> str:
-    """Render a universal AGENTS.md block for OpenAI Codex, Cursor, Windsurf, and GitHub Copilot."""
-    rules_dir = repo_dir / "rules"
-    skills_dir = repo_dir / "skills"
-
-    lines: list[str] = [
+def _agents_md_loop_lines() -> list[str]:
+    return [
         "# AGENTS.md — Craftsman Adaptive Closed-Loop Engineering Standard",
         "",
         "This repository uses **Craftsman**: every change is reviewed and verified against an evidence "
@@ -1086,6 +1085,8 @@ def render_agents_md(repo_dir: Path) -> str:
         "the base commit; the review always covers the whole diff since then (standalone `/code-review` without `--fix` does not start a gate session).",
         "- **Review:** `craftsman review prepare` writes a packet of hunks and lenses; record what each "
         "lens examined with `craftsman review cover` (or `--from-json - <<'EOF'`) and every defect with `craftsman review add` (or `--from-json - <<'EOF'`).",
+        "  Reviewer groups:",
+        *(f"  {line}" for line in render_reviewer_groups_markdown().splitlines()),
         "- **Verify findings:** group unjudged same-root-cause duplicates first with `craftsman review merge <target> <dup>` "
         "(only when one fix removes every consequence), then record verdicts with `craftsman review verdict` (or `--from-json - <<'EOF'`), "
         'fix and `craftsman review resolve <id> --as fixed --note "..."`; prepare a new '
@@ -1109,15 +1110,19 @@ def render_agents_md(repo_dir: Path) -> str:
         "",
         "## Available Skills",
     ]
+
+
+def render_agents_md(repo_dir: Path) -> str:
+    """Render a universal AGENTS.md block for OpenAI Codex, Cursor, Windsurf, and GitHub Copilot."""
+    rules_dir = repo_dir / "rules"
+    skills_dir = repo_dir / "skills"
+    lines = _agents_md_loop_lines()
     for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
         raw_md = skill_path.read_text(encoding="utf-8")
         skill_name = extract_skill_name(raw_md, skill_path.parent.name)
         desc, _ = extract_description_and_body(raw_md, skill_name)
         lines.append(f"- **`/{skill_name}`**: {desc}")
-
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    lines += ["", "---", ""]
     lines.append(
         _rewrite_antigravity_paths(render_combined_rules(rules_dir, with_frontmatter=False).strip())
     )

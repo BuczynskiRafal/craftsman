@@ -737,6 +737,47 @@ class DoctorTests(ExportTestCase):
         _, errors = validate_skill_manifests(REPO_ROOT)
         self.assertEqual(errors, [])
 
+    def test_reviewer_prompt_allows_findings_about_misleading_names(self) -> None:
+        copilot_home = self.tmp / "copilot_home"
+        antigravity_skills = self.tmp / "antigravity_skills"
+        claude_dir = self.tmp / "claude"
+        export.export_copilot_home(REPO_ROOT, copilot_home)
+        export.export_to_copilot_skills(REPO_ROOT, antigravity_skills)
+        export.export_to_claude_user(REPO_ROOT, claude_dir)
+
+        targets = (
+            ("copilot", copilot_home / "agents" / "craftsman-reviewer.agent.md"),
+            ("antigravity", antigravity_skills / "code-review" / "SKILL.md"),
+            ("claude", claude_dir / "agents" / "craftsman-reviewer.md"),
+        )
+        expected = (
+            "Record naming and structure problems when you can state the wrong reading"
+        )
+        for platform, path in targets:
+            with self.subTest(platform=platform):
+                text = " ".join(path.read_text(encoding="utf-8").split())
+                self.assertIn(expected, text)
+
+    def test_reviewer_prompt_points_to_the_packet_view(self) -> None:
+        copilot_home = self.tmp / "copilot_home"
+        antigravity_skills = self.tmp / "antigravity_skills"
+        claude_dir = self.tmp / "claude"
+        export.export_copilot_home(REPO_ROOT, copilot_home)
+        export.export_to_copilot_skills(REPO_ROOT, antigravity_skills)
+        export.export_to_claude_user(REPO_ROOT, claude_dir)
+
+        targets = (
+            ("copilot", copilot_home / "agents" / "craftsman-reviewer.agent.md"),
+            ("antigravity", antigravity_skills / "code-review" / "SKILL.md"),
+            ("claude", claude_dir / "agents" / "craftsman-reviewer.md"),
+        )
+        expected = "your view completely, the full packet only for a hunk outside your view that you need"
+        for platform, path in targets:
+            with self.subTest(platform=platform):
+                text = " ".join(path.read_text(encoding="utf-8").split())
+                self.assertIn(expected, text)
+                self.assertIn("craftsman review view", text)
+
 
 if __name__ == "__main__":
     unittest.main()

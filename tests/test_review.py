@@ -15,7 +15,7 @@ from unittest import mock
 
 from craftsman import packet, runner
 from craftsman.diffscan import DiffSnapshot, Hunk, Reference, Scope
-from craftsman.ledger import HunkRef, Round
+from craftsman.ledger import GENERIC_COVERAGE_WORDS, HunkRef, Round
 from craftsman.lenses import select_lenses
 from craftsman.packet import PacketContext, render_packet
 
@@ -1124,8 +1124,274 @@ class PacketRenderingTests(unittest.TestCase):
             text = render_packet(ctx)
 
         self.assertIn("Enclosing scope omitted for size — open pkg/a.py:L1–L500", text)
-        self.assertNotIn("line 499", text)
-        self.assertIn("line 499", render_packet(ctx))
+        self.assertNotIn("line 15", text)
+        self.assertIn("line 15", render_packet(ctx))
+
+
+class ReviewSignalTests(RepoTestCase):
+    def test_check_fails_while_a_quality_signal_is_unresolved(self) -> None:
+        body = "\n".join(f"    step_{i} = x + {i}" for i in range(45))
+        self.repo.write("long_mod.py", f"def over_budget(x: int) -> int:\n{body}\n    return step_44\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        packet_text = (self.repo.ledger_dir / "packet-1.md").read_text(encoding="utf-8")
+        self.assertIn("## Quality signals", packet_text)
+        self.assertIn("S1", packet_text)
+
+        self.repo.cover_all()
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "import long_mod")
+        blocked = self.repo.cli("review", "check", check=False)
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("[unresolved-signal]", blocked.stdout)
+        self.assertIn("craftsman review add --signal S1", blocked.stdout)
+        self.assertIn("craftsman review ack S1", blocked.stdout)
+
+    def test_ack_reason_appears_in_final_report(self) -> None:
+        body = "\n".join(f"    step_{i} = x + {i}" for i in range(45))
+        self.repo.write("long_mod.py", f"def over_budget(x: int) -> int:\n{body}\n    return step_44\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cover_all()
+        self.repo.cli(
+            "review",
+            "ack",
+            "S1",
+            "--reason",
+            "over_budget() is a generated dispatch table at long_mod.py:1 with 45 linear steps",
+        )
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "import long_mod")
+
+        self.repo.cli("review", "check")
+        report = self.repo.cli("review", "report").stdout
+        self.assertIn("**Process: COMPLETE**", report)
+        self.assertIn("## Acknowledged quality signals", report)
+        self.assertIn("S1 (`long-function` at `long_mod.py:1`)", report)
+        self.assertIn("generated dispatch table at long_mod.py:1", report)
+        self.assertIn("## Not assessed by the gate", report)
+        self.assertIn("Business requirements fit", report)
+
+    def test_diff_size_signal_cannot_be_acknowledged(self) -> None:
+        lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))
+        for name in ("mod_a.py", "mod_b.py", "mod_c.py"):
+            self.repo.write(name, lines)
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        refused = self.repo.cli(
+            "review",
+            "ack",
+            "S1",
+            "--reason",
+            "mod_a.py:1 adds 900 constants across 3 modules that cannot be split right now",
+            check=False,
+        )
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("diff-size", refused.stderr)
+        self.assertIn("cannot be acknowledged", refused.stderr)
+
+    def test_oversized_diff_sets_needs_human_with_top_files(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))
+        for name in ("mod_a.py", "mod_b.py", "mod_c.py"):
+            self.repo.write(name, lines)
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        state = json.loads((self.repo.ledger_dir / "craftsman_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["stage"], "needs_human")
+        report = self.repo.cli("review", "report").stdout
+        self.assertIn("## Diff size budget exceeded (needs human decision)", report)
+        self.assertIn("Added production lines: 900 (budget: 800)", report)
+        self.assertIn("`mod_a.py` (+300 lines)", report)
+        self.assertIn("Suggested split into smaller changes:", report)
+
+
+class CoverageNoteValidationTests(RepoTestCase):
+    def test_cover_rejects_note_made_of_generic_praise(self) -> None:
+        self.prepare_bug()
+        for word in GENERIC_COVERAGE_WORDS:
+            with self.subTest(word=word):
+                repeated = " ".join([word] * max(2, (45 // len(word)) + 1))
+                proc = self.repo.cli(
+                    "review",
+                    "cover",
+                    "--lens",
+                    "craft",
+                    "--hunks",
+                    "H1",
+                    "--note",
+                    f"H1 {repeated}",
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 1, word)
+                self.assertIn("Example:", proc.stderr)
+
+    def test_cover_rejects_note_missing_a_listed_hunk(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.repo.write("extra.py", "EXTRA = 1\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        proc = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "intent",
+            "--hunks",
+            "H1,H2",
+            "--note",
+            "H1 cart.py:3: items=[] -> raises ZeroDivisionError when cart is empty",
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("missing: H2", proc.stderr)
+
+    def test_cover_rejects_same_note_reused_for_many_hunks(self) -> None:
+        for idx in range(1, 5):
+            self.repo.write(f"m{idx}.py", f"VAL_{idx} = {idx}\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        repeated = "; ".join(
+            f"H{idx} m1.py:1: x=0 -> returns 0 without mutating caller state"
+            for idx in range(1, 5)
+        )
+
+        proc = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "intent",
+            "--hunks",
+            "H1,H2,H3,H4",
+            "--note",
+            repeated,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("reuses the same note segment for more than 3 hunks", proc.stderr)
+
+    def test_cover_accepts_note_with_input_plus_line_reference(self) -> None:
+        self.prepare_bug()
+        proc = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "intent",
+            "--hunks",
+            "H1",
+            "--note",
+            "H1 cart.py:3: items=[{'price': 10}] -> returns 10.0 as expected",
+        )
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("Coverage recorded: `intent` covered H1", proc.stdout)
+
+    def test_design_lens_covers_changed_files(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        wrong_flag = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "design",
+            "--hunks",
+            "H1",
+            "--note",
+            "H1 cart.py:3: items=[] -> raises ZeroDivisionError",
+            check=False,
+        )
+        self.assertEqual(wrong_flag.returncode, 1)
+        self.assertIn("pass --files instead of --hunks", wrong_flag.stderr)
+
+        covered = self.repo.cli(
+            "review",
+            "cover",
+            "--lens",
+            "design",
+            "--files",
+            "cart.py",
+            "--note",
+            "cart.py:1 total(items) adds 3 lines -> minimal shape with no extra abstractions",
+        )
+        self.assertEqual(covered.returncode, 0)
+        self.assertIn("`design` covered cart.py", covered.stdout)
+
+
+class ReviewFactTests(RepoTestCase):
+    def test_fact_with_missing_source_line_is_rejected(self) -> None:
+        self.prepare_bug()
+        proc = self.repo.cli(
+            "review",
+            "fact",
+            "add",
+            "--hunks",
+            "H1",
+            "--source",
+            "cart.py:99",
+            "--text",
+            "total(items) is called from api.py:12 with a list of item dicts",
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("past the end of cart.py", proc.stderr)
+
+    def test_fact_containing_a_judgement_is_rejected(self) -> None:
+        self.prepare_bug()
+        for word in ("bug", "wrong", "issue", "problem", "should", "clean"):
+            with self.subTest(word=word):
+                proc = self.repo.cli(
+                    "review",
+                    "fact",
+                    "add",
+                    "--hunks",
+                    "H1",
+                    "--source",
+                    "cart.py:1",
+                    "--text",
+                    f"total(items) at cart.py:3 has a {word} when callers pass empty lists",
+                    check=False,
+                )
+                self.assertEqual(proc.returncode, 1, word)
+                self.assertIn("without judgement words", proc.stderr)
+
+    def test_fact_disappears_from_view_after_source_file_changes(self) -> None:
+        self.repo.write("caller.py", "from cart import total\nval = total([])\n")
+        self.prepare_bug()
+        added = self.repo.cli(
+            "review",
+            "fact",
+            "add",
+            "--hunks",
+            "H1",
+            "--source",
+            "caller.py:2",
+            "--text",
+            "total is invoked from caller.py:2 with an empty list literal",
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        view_path = Path(self.repo.cli("review", "view", "--lenses", "contracts").stdout.strip())
+        self.assertIn(
+            "Facts: F-1 total is invoked from caller.py:2 with an empty list literal (source caller.py:2)",
+            view_path.read_text(encoding="utf-8"),
+        )
+        self.repo.write("caller.py", "from cart import total\nval = total([{'price': 1}])\n")
+        refreshed = Path(self.repo.cli("review", "view", "--lenses", "contracts").stdout.strip())
+        self.assertNotIn("Facts: F-1", refreshed.read_text(encoding="utf-8"))
+
+    def test_findings_never_appear_in_a_reviewer_view(self) -> None:
+        self.prepare_bug()
+        self.repo.cli(
+            "review",
+            "add",
+            "--lens",
+            "contracts",
+            "--file",
+            "cart.py",
+            "--line",
+            "3",
+            "--severity",
+            "major",
+            "--title",
+            "SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY",
+            "--scenario",
+            "items=[] -> ZeroDivisionError on cart.py:3",
+        )
+        view_path = Path(self.repo.cli("review", "view", "--lenses", "ripple").stdout.strip())
+        view_text = view_path.read_text(encoding="utf-8")
+        self.assertNotIn("SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY", view_text)
 
 
 if __name__ == "__main__":

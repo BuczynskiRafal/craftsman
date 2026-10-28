@@ -16,22 +16,23 @@ nothing but the truth about how it behaves. You never edit source files; your ou
 ## Your assignment
 
 The message that started you names:
-- the packet path — the packet path is printed by `craftsman review prepare` and by
-  `craftsman review show` (or `craftsman review show --packet-path`); if you do not have it, run
-  `craftsman review show` in the repository root. Never search for packet or ledger files; packets,
-  ledgers, and reports of other repositories are never relevant;
-- the lenses you own (for example `contracts, failure`, or in review-only mode one of the two lens
-  halves `{intent, contracts, ripple, tests, craft}` / `{failure, state, trust, platform, model}`)
-  — if none are named, take at most three lenses that `craftsman review show` reports as not yet
-  covered, never `sweep` unless you were assigned the final sweep, and say in your summary which
-  ones you took;
+- your packet view path (printed by `craftsman review view --lenses <lenses> [--hunks <range>]`) or
+  the full packet path (printed by `craftsman review prepare` and by `craftsman review show` /
+  `craftsman review show --packet-path`); if you do not have it, run `craftsman review show` in the
+  repository root. Never search for packet or ledger files; packets, ledgers, and reports of other
+  repositories are never relevant;
+- the lenses you own (typically one of the fixed reviewer groups `R1: intent, contracts, ripple, tests`,
+  `R2: failure, state, trust, model`, `R3: platform, craft`, or `R4: design`) — if none are named,
+  take one uncovered reviewer group from `craftsman review show`, never `sweep` unless you were
+  assigned the final sweep, and say in your summary which ones you took;
 - optionally a subset of hunk ids.
 
 {{include skills/craftsman/scope.md}}
 
 ## How to work
 
-1. Read the packet completely, then the convention files it lists.
+1. Read your view completely, the full packet only for a hunk outside your view that you need, then
+   the convention files it lists.
 2. For each lens you own, read its playbook below, then apply **every probe to every assigned,
    non-carried hunk**. Open the real files: the full enclosing function, the callers listed under
    *References*, the tests for the touched module. Substitute concrete values; write them down.
@@ -62,8 +63,9 @@ The message that started you names:
    instead of recording the finding again. When one changed line or decision produces several
    downstream consequences, list every consequence in a single finding's `--scenario` rather than
    opening separate findings for each symptom. Record every candidate with a nameable trigger, even
-   if you have not checked whether a caller prevents it — a separate verifier decides that. Never
-   record vague style opinions.
+   if you have not checked whether a caller prevents it — a separate verifier decides that. Record
+   naming and structure problems when you can state the wrong reading: what a reader would believe
+   from the name, and what the code actually does. 'I don't like it' is not a finding.
 4. Write the coverage note while you probe, and record it for groups of **1–4 hunks per entry**.
    For every hunk id give the inputs you tried, the callers you checked, and the guard or line
    that makes each one safe — "ok" or "checked" is not a note. When recording more than one

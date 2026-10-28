@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import errno
+import hashlib
 import json
 import os
 import re
@@ -33,12 +34,14 @@ Verdict = Literal["proven", "probable", "question", "dismissed"]
 Resolution = Literal["fixed", "accepted"]
 RunKind = Literal["test", "e2e", "repro", "lint", "build", "other"]
 AgentEventKind = Literal["start", "stop"]
+IsolationEvidence = Literal["hooks", "transcript", "none"]
 IssueCode = Literal[
     "no-round",
     "stale-round",
     "tier-too-low",
     "uncovered",
     "sweep-too-early",
+    "unresolved-signal",
     "no-verdict",
     "unresolved",
     "no-passing-run",
@@ -53,6 +56,10 @@ VERDICTS: tuple[Verdict, ...] = get_args(Verdict)
 RESOLUTIONS: tuple[Resolution, ...] = get_args(Resolution)
 RUN_KINDS: tuple[RunKind, ...] = get_args(RunKind)
 AGENT_EVENT_KINDS: tuple[AgentEventKind, ...] = get_args(AgentEventKind)
+ISOLATION_EVIDENCES: tuple[IsolationEvidence, ...] = get_args(IsolationEvidence)
+SELF_REVIEWED_BANNER = (
+    "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change"
+)
 
 SCHEMA_VERSION = 1
 LEDGER_FILENAME = "ledger.json"
@@ -66,6 +73,41 @@ MIN_EVIDENCE_CHARS = 20
 SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
+MIN_SIGNAL_ACK_REASON_CHARS = 40
+MIN_FACT_TEXT_CHARS = 30
+MIN_HUNK_NOTE_SEGMENT_CHARS = 40
+MIN_SUBSTANTIVE_NOTE_CHARS = 20
+MAX_REUSED_NOTE_SEGMENTS = 3
+GENERIC_COVERAGE_WORDS: tuple[str, ...] = (
+    "looks good",
+    "well-factored",
+    "well factored",
+    "clear structure",
+    "no issues",
+    "nothing to report",
+    "clean",
+    "ok",
+    "okay",
+    "fine",
+    "good",
+    "lgtm",
+    "readable",
+    "clear",
+    "dry",
+    "consistent",
+    "concise",
+    "accurate",
+    "checked",
+    "reviewed",
+)
+FACT_JUDGEMENT_WORDS: tuple[str, ...] = (
+    *GENERIC_COVERAGE_WORDS,
+    "bug",
+    "wrong",
+    "issue",
+    "problem",
+    "should",
+)
 QUICK_TIER_MAX_CHANGED_LINES = 40
 MAX_NEXT_ACTIONS = 12
 SUMMARY_RECENT_RUNS = 3
@@ -96,6 +138,7 @@ _NO_REPRO_PREFIX = "no-repro:"
 _STATIC_PREFIX = "static:"
 _INTENT_PREFIX = "intent:"
 GROUPED_EVIDENCE_PREFIX = "Grouped into "
+DESIGN_LENS = "design"
 SWEEP_LENS = "sweep"
 COVERAGE_NOTE_EXAMPLE = "H3 parse_cfg: x=None -> L42 TypeError; callers cli.py:19 ok"
 PROBABLE_EVIDENCE_EXAMPLE = (
@@ -110,7 +153,19 @@ QUESTION_EVIDENCE_EXAMPLE = (
     "findpaths.py:182 does exactly that, which changes testpaths for configs outside the project root"
 )
 DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
-_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R")}
+_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S", "F-")}
+_CONCRETE_TOKEN_RE = re.compile(r"(?:->|`[^`]+`|\b\d+\b|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*\.[A-Za-z_]\w*)")
+_GENERIC_WORDS_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in GENERIC_COVERAGE_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+_FACT_JUDGEMENT_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in FACT_JUDGEMENT_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+_CONCRETE_COVERAGE_RE = re.compile(
+    r"(?:->|\bL?\d+\b|['\"`]|\b(?:None|True|False)\b|\[\]|\{\}|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*_[A-Za-z0-9_]*)"
+)
 
 T = TypeVar("T")
 S = TypeVar("S", bound=str)
@@ -271,6 +326,12 @@ class _Fields:
                 raise exc.within(f"{key}[{index}]") from None
         return tuple(parsed)
 
+    def get_records(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
+        if key not in self._raw or self._raw[key] is None:
+            self._seen.add(key)
+            return ()
+        return self.records(key, parse)
+
     def optional_record(self, key: str, parse: Callable[[Any], T]) -> T | None:
         value: dict[str, Any] | None = self._value(key, (dict, type(None)), "an object or null")
         if value is None:
@@ -341,6 +402,70 @@ class HunkRef:
 
 
 @dataclass(frozen=True)
+class SignalRef:
+    id: str
+    kind: str
+    file: str
+    line: int
+    detail: str
+
+    def __post_init__(self) -> None:
+        _require_id(self.id, "S", "id")
+        _require_text(self.kind, "kind")
+        _require_text(self.file, "file")
+        _require(self.line >= 1, "line", "must be >= 1")
+        _require_text(self.detail, "detail")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SignalRef:
+        f = _Fields(raw)
+        return f.done(
+            cls(
+                id=f.text("id"),
+                kind=f.text("kind"),
+                file=f.text("file"),
+                line=f.integer("line"),
+                detail=f.text("detail"),
+            )
+        )
+
+
+@dataclass(frozen=True)
+class SignalAck:
+    signal_id: str
+    round: int
+    fingerprint: str
+    reason: str
+    recorded_at: str
+
+    def __post_init__(self) -> None:
+        _require_id(self.signal_id, "S", "signal_id")
+        _require(self.round >= 1, "round", "must be >= 1")
+        _require_text(self.fingerprint, "fingerprint")
+        _require_text(self.reason, "reason", min_chars=MIN_SIGNAL_ACK_REASON_CHARS)
+        _require_timestamp(self.recorded_at, "recorded_at")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SignalAck:
+        f = _Fields(raw)
+        return f.done(
+            cls(
+                signal_id=f.text("signal_id"),
+                round=f.integer("round"),
+                fingerprint=f.text("fingerprint"),
+                reason=f.text("reason"),
+                recorded_at=f.text("recorded_at"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class Round:
     number: int
     fingerprint: str
@@ -350,6 +475,7 @@ class Round:
     hunks: tuple[HunkRef, ...]
     lenses: tuple[str, ...]
     packet_path: str
+    signals: tuple[SignalRef, ...] = ()
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
@@ -363,6 +489,8 @@ class Round:
         _require(len(set(self.lenses)) == len(self.lenses), "lenses", "must not repeat a lens")
         hunk_ids = [hunk.id for hunk in self.hunks]
         _require(len(set(hunk_ids)) == len(hunk_ids), "hunks", "must not repeat a hunk id")
+        sig_ids = [sig.id for sig in self.signals]
+        _require(len(set(sig_ids)) == len(sig_ids), "signals", "must not repeat a signal id")
 
     def to_json(self) -> dict[str, Any]:
         return _record_json(self)
@@ -380,6 +508,7 @@ class Round:
                 hunks=f.records("hunks", HunkRef.from_json),
                 lenses=f.texts("lenses"),
                 packet_path=f.text("packet_path"),
+                signals=f.get_records("signals", SignalRef.from_json),
             )
         )
 
@@ -488,9 +617,12 @@ class Finding:
     resolution_note: str
     recorded_at: str
     updated_at: str
+    signal_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_id(self.id, "F", "id")
+        if self.signal_id is not None:
+            _require_id(self.signal_id, "S", "signal_id")
         _require(self.round >= 1, "round", "must be >= 1")
         _require_choice(self.lens, sorted(LENS_IDS), "lens")
         _require_text(self.path, "path")
@@ -551,6 +683,7 @@ class Finding:
                 resolution_note=f.text("resolution_note"),
                 recorded_at=f.text("recorded_at"),
                 updated_at=f.text("updated_at"),
+                signal_id=f.get_optional_text("signal_id"),
             )
         )
 
@@ -681,12 +814,76 @@ class AgentEvent:
 
 
 @dataclass(frozen=True)
+class SourceRef:
+    path: str
+    line: int
+
+    def __post_init__(self) -> None:
+        _require_text(self.path, "path")
+        _require(self.line >= 1, "line", "must be >= 1")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SourceRef:
+        f = _Fields(raw)
+        return f.done(cls(path=f.text("path"), line=f.integer("line")))
+
+
+@dataclass(frozen=True)
+class Fact:
+    id: str
+    hunks: tuple[str, ...]
+    source: SourceRef
+    text: str
+    file_digest: str
+    author_lens: str
+
+    def __post_init__(self) -> None:
+        _require_id(self.id, "F-", "id")
+        _require(bool(self.hunks), "hunks", "must list at least one hunk id")
+        for hunk_id in self.hunks:
+            _require_id(hunk_id, "H", "hunks")
+        _require_text(self.text, "text", min_chars=MIN_FACT_TEXT_CHARS)
+        match = _FACT_JUDGEMENT_RE.search(self.text)
+        if match is not None:
+            raise FieldError(
+                "text",
+                f"must state a verifiable source fact without judgement words ({match.group(0)!r} found; "
+                "record defects with `craftsman review add`)",
+            )
+        _require_text(self.file_digest, "file_digest")
+        if self.author_lens:
+            _require_choice(self.author_lens, sorted(LENS_IDS), "author_lens")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> Fact:
+        f = _Fields(raw)
+        return f.done(
+            cls(
+                id=f.text("id"),
+                hunks=f.texts("hunks"),
+                source=SourceRef.from_json(f._value("source", dict, "an object")),
+                text=f.text("text"),
+                file_digest=f.text("file_digest"),
+                author_lens=f.text("author_lens"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class Ledger:
     rounds: tuple[Round, ...] = ()
     coverage: tuple[Coverage, ...] = ()
     findings: tuple[Finding, ...] = ()
     runs: tuple[Run, ...] = ()
     agents: tuple[AgentEvent, ...] = ()
+    signal_acks: tuple[SignalAck, ...] = ()
+    facts: tuple[Fact, ...] = ()
 
     def __post_init__(self) -> None:
         for index, round_ in enumerate(self.rounds):
@@ -709,6 +906,8 @@ class Ledger:
         _require(len(set(run_ids)) == len(run_ids), "runs", "must not repeat an id")
         finding_ids = [finding.id for finding in self.findings]
         _require(len(set(finding_ids)) == len(finding_ids), "findings", "must not repeat an id")
+        fact_ids = [fact.id for fact in self.facts]
+        _require(len(set(fact_ids)) == len(fact_ids), "facts", "must not repeat an id")
         for index, finding in enumerate(self.findings):
             where = f"findings[{index}]"
             _require(finding.round <= len(self.rounds), f"{where}.round", "references an unknown round")
@@ -738,6 +937,8 @@ class Ledger:
                     findings=f.records("findings", Finding.from_json),
                     runs=f.records("runs", Run.from_json),
                     agents=f.records("agents", AgentEvent.from_json),
+                    signal_acks=f.get_records("signal_acks", SignalAck.from_json),
+                    facts=f.get_records("facts", Fact.from_json),
                 )
             )
         except FieldError as exc:
@@ -909,6 +1110,30 @@ def _with_finding(ledger: Ledger, updated: Finding) -> tuple[Ledger, Finding]:
     return replace(ledger, findings=findings), updated
 
 
+def _to_signal_ref(sig: Any) -> SignalRef:
+    if isinstance(sig, SignalRef):
+        return sig
+    kind = sig.kind.value if hasattr(sig.kind, "value") else str(sig.kind)
+    return SignalRef(id=sig.id, kind=kind, file=sig.file, line=sig.line, detail=sig.detail)
+
+
+def _build_hunk_refs(
+    hunks: Sequence[Hunk], carried: frozenset[str], reopened: frozenset[str]
+) -> tuple[HunkRef, ...]:
+    return tuple(
+        HunkRef(
+            hunk.id,
+            hunk.path,
+            hunk.digest,
+            hunk.new_start,
+            hunk.new_len,
+            carried=hunk.id in carried,
+            reopened=hunk.id in reopened,
+        )
+        for hunk in hunks
+    )
+
+
 def open_round(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -916,6 +1141,8 @@ def open_round(
     lenses: Sequence[str],
     packet_path: str,
     symbols_by_hunk: Mapping[str, Sequence[str]],
+    *,
+    signals: Sequence[Any] = (),
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op."""
     if ledger.rounds:
@@ -937,42 +1164,20 @@ def open_round(
         base_sha=snap.base_sha,
         tier=tier,
         prepared_at=_now(),
-        hunks=tuple(
-            HunkRef(
-                hunk.id,
-                hunk.path,
-                hunk.digest,
-                hunk.new_start,
-                hunk.new_len,
-                carried=hunk.id in carried,
-                reopened=hunk.id in reopened,
-            )
-            for hunk in snap.hunks
-        ),
+        hunks=_build_hunk_refs(snap.hunks, carried, reopened),
         lenses=tuple(lenses),
         packet_path=packet_path,
+        signals=tuple(_to_signal_ref(sig) for sig in signals),
     )
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
 
 
-def _carry_over(
-    ledger: Ledger,
+def _reopened_hunk_ids(
     hunks: Sequence[Hunk],
-    lenses: Sequence[str],
+    previous: set[str],
+    reviewed: set[str],
     symbols_by_hunk: Mapping[str, Sequence[str]],
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Ids of the hunks of the next round that are carried over, and of those that are reopened.
-
-    A hunk is reopened when it is unchanged since the previous round and was reviewed, but
-    mentions a symbol defined by a hunk that changed since then, directly or through another
-    such hunk; only coverage recorded from then on counts for it. A hunk every lens already
-    covered is carried over unless it is reopened.
-    """
-    if not ledger.rounds:
-        return frozenset(), frozenset()
-    covered = _carryable_coverage(ledger)
-    reviewed = {digest for _, digest in covered}
-    previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
+) -> set[str]:
     mentioned_by: dict[str, list[Hunk]] = {}
     for hunk in hunks:
         if hunk.digest in previous:
@@ -995,13 +1200,48 @@ def _carry_over(
             if hunk.id not in affected:
                 affected.add(hunk.id)
                 pending.extend(symbols_by_hunk.get(hunk.id, ()))
-    reopened = {hunk.id for hunk in hunks if hunk.id in affected and hunk.digest in reviewed}
+    return {hunk.id for hunk in hunks if hunk.id in affected and hunk.digest in reviewed}
+
+
+def _carry_over(
+    ledger: Ledger,
+    hunks: Sequence[Hunk],
+    lenses: Sequence[str],
+    symbols_by_hunk: Mapping[str, Sequence[str]],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Ids of the hunks of the next round that are carried over, and of those that are reopened."""
+    if not ledger.rounds:
+        return frozenset(), frozenset()
+    covered = _carryable_coverage(ledger)
+    reviewed = {digest for _, digest in covered}
+    previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
+    reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk)
     carried = {
         hunk.id
         for hunk in hunks
-        if hunk.id not in reopened and all((lens, hunk.digest) in covered for lens in lenses)
+        if hunk.id not in reopened
+        and all(
+            (lens, _file_digest(hunks, hunk.path) if lens == DESIGN_LENS else hunk.digest) in covered
+            for lens in lenses
+        )
     }
     return frozenset(carried), frozenset(reopened)
+
+
+def _file_digest(hunks: Sequence[Hunk | HunkRef], path: str) -> str:
+    return "file:" + path + ":" + ",".join(h.digest for h in hunks if h.path == path)
+
+
+def _round_files(round_: Round) -> list[tuple[str, str, bool]]:
+    paths = list(dict.fromkeys(h.path for h in round_.hunks))
+    return [
+        (
+            path,
+            _file_digest(round_.hunks, path),
+            all(h.carried for h in round_.hunks if h.path == path),
+        )
+        for path in paths
+    ]
 
 
 def _mentioned_words(hunk: Hunk) -> frozenset[str]:
@@ -1051,11 +1291,29 @@ def reopened_mentions(
     return mentions
 
 
-def add_coverage(
-    ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
-) -> tuple[Ledger, Coverage]:
-    """Record that `lens` reviewed the given hunks of the latest round."""
-    round_ = _latest_round(ledger)
+def _validate_design_targets(round_: Round, targets: Sequence[str]) -> tuple[str, ...]:
+    files_by_path = {path: (digest, carried) for path, digest, carried in _round_files(round_)}
+    by_hunk = {hunk.id: hunk.path for hunk in round_.hunks}
+    resolved = [by_hunk.get(item, item) for item in targets]
+    unknown = [item for item, path in zip(targets, resolved, strict=True) if path not in files_by_path]
+    if unknown:
+        open_files = [path for path, _, carried in _round_files(round_) if not carried]
+        raise LedgerError(
+            f"unknown files in round {round_.number}: {', '.join(unknown)}; "
+            f"files to cover: {', '.join(open_files) or 'none'}",
+            field="digests",
+        )
+    carried = [path for path in resolved if files_by_path[path][1]]
+    if carried:
+        raise LedgerError(
+            f"{', '.join(carried)} already covered in an earlier round (carried over); "
+            "cover only the remaining files",
+            field="digests",
+        )
+    return tuple(files_by_path[path][0] for path in resolved)
+
+
+def _validate_coverage_target(round_: Round, lens: str, hunk_ids: Sequence[str]) -> tuple[str, ...]:
     if lens not in round_.lenses:
         if lens not in LENS_IDS:
             raise LedgerError(
@@ -1075,10 +1333,12 @@ def add_coverage(
         )
     if len(set(hunk_ids)) != len(hunk_ids):
         raise LedgerError(f"hunk ids must not repeat: {', '.join(hunk_ids)}", field="digests")
+    if lens == DESIGN_LENS:
+        return _validate_design_targets(round_, hunk_ids)
     by_id = {hunk.id: hunk for hunk in round_.hunks}
-    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried]
     unknown = [hunk_id for hunk_id in hunk_ids if hunk_id not in by_id]
     if unknown:
+        open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried]
         raise LedgerError(
             f"unknown hunk ids in round {round_.number}: {', '.join(unknown)}; "
             f"hunks to cover: {', '.join(open_ids) or 'none'}",
@@ -1091,19 +1351,104 @@ def add_coverage(
             "cover only the remaining hunks",
             field="digests",
         )
-    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(rf"\b{hunk_id}\b", note)]
+    return tuple(by_id[hunk_id].digest for hunk_id in hunk_ids)
+
+
+def _target_pattern(target: str) -> str:
+    return rf"(?<!\w){re.escape(target)}(?!\w)"
+
+
+def _extract_hunk_segments(hunk_ids: Sequence[str], note: str) -> dict[str, str]:
+    spans: list[tuple[int, str]] = []
+    for hid in hunk_ids:
+        match = re.search(_target_pattern(hid), note)
+        if match is not None:
+            spans.append((match.start(), hid))
+    spans.sort()
+    segments: dict[str, str] = {}
+    for index, (start, hid) in enumerate(spans):
+        end = spans[index + 1][0] if index + 1 < len(spans) else len(note)
+        segments[hid] = note[start:end].strip()
+    return segments
+
+
+def _normalize_note_segment(segment: str, target: str = "") -> str:
+    cleaned = re.sub(_target_pattern(target), "", segment) if target else segment
+    without_ids = re.sub(r"\bH[1-9]\d*\b", "", cleaned)
+    return re.sub(r"\s+", " ", without_ids.strip().strip(";:,-.")).strip().lower()
+
+
+def _validate_hunk_segment(hid: str, segment: str) -> str:
+    without_id = re.sub(_target_pattern(hid), " ", segment)
+    stripped_generic = _GENERIC_WORDS_RE.sub(" ", without_id)
+    substantive = re.sub(r"[\W_]+", "", stripped_generic)
+    if len(segment) < MIN_HUNK_NOTE_SEGMENT_CHARS or len(substantive) < MIN_SUBSTANTIVE_NOTE_CHARS:
+        raise FieldError(
+            "note",
+            f"must have at least {MIN_COVERAGE_NOTE_CHARS} characters (>= {MIN_HUNK_NOTE_SEGMENT_CHARS} "
+            f"chars and >= {MIN_SUBSTANTIVE_NOTE_CHARS} non-generic chars per hunk; {hid} has too little "
+            f'concrete detail). Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        )
+    if (
+        _FILE_REFERENCE_RE.search(without_id) is None
+        and _CONCRETE_COVERAGE_RE.search(without_id) is None
+    ):
+        raise FieldError(
+            "note",
+            f"for {hid} must include a concrete detail (file:line, number/literal, ->, or symbol name). "
+            f'Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        )
+    return _normalize_note_segment(segment, hid)
+
+
+def _validate_coverage_note(
+    ledger: Ledger, round_: Round, lens: str, hunk_ids: Sequence[str], note: str
+) -> None:
+    unnamed = [hunk_id for hunk_id in hunk_ids if not re.search(_target_pattern(hunk_id), note)]
     if unnamed:
         raise LedgerError(
             f"the coverage note must name every covered hunk and what was tried on it; missing: "
             f'{", ".join(unnamed)}. Example: "{COVERAGE_NOTE_EXAMPLE}"',
             field="note",
         )
+    segments = _extract_hunk_segments(hunk_ids, note)
+    norm_by_hunk: dict[str, str] = {}
+    all_files = [path for path, _, _ in _round_files(round_)]
+    for record in ledger.coverage:
+        if record.round == round_.number and record.lens == lens:
+            rec_ids = (
+                [p for p in all_files if re.search(_target_pattern(p), record.note)]
+                if lens == DESIGN_LENS
+                else re.findall(r"\bH[1-9]\d*\b", record.note)
+            )
+            for hid, seg in _extract_hunk_segments(rec_ids, record.note).items():
+                norm_by_hunk[hid] = _normalize_note_segment(seg, hid)
+    for hid in hunk_ids:
+        norm_by_hunk[hid] = _validate_hunk_segment(hid, segments[hid])
+    counts: dict[str, int] = {}
+    for body in norm_by_hunk.values():
+        counts[body] = counts.get(body, 0) + 1
+        if counts[body] > MAX_REUSED_NOTE_SEGMENTS:
+            raise FieldError(
+                "note",
+                f"reuses the same note segment for more than {MAX_REUSED_NOTE_SEGMENTS} hunks in lens "
+                f'`{lens}`; write a specific note per hunk. Example: "{COVERAGE_NOTE_EXAMPLE}"',
+            )
+
+
+def add_coverage(
+    ledger: Ledger, lens: str, hunk_ids: Sequence[str], note: str
+) -> tuple[Ledger, Coverage]:
+    """Record that `lens` reviewed the given hunks (or files for `design`) of the latest round."""
+    round_ = _latest_round(ledger)
+    digests = _validate_coverage_target(round_, lens, hunk_ids)
+    _validate_coverage_note(ledger, round_, lens, hunk_ids, note)
     if lens == SWEEP_LENS:
         _require_lenses_before_sweep(ledger, round_)
     record = Coverage(
         round=round_.number,
         lens=lens,
-        digests=tuple(by_id[hunk_id].digest for hunk_id in hunk_ids),
+        digests=digests,
         note=note.strip(),
         recorded_at=_now(),
     )
@@ -1134,9 +1479,16 @@ def add_finding(
     title: str,
     scenario: str,
     suggestion: str,
+    signal_id: str | None = None,
 ) -> tuple[Ledger, Finding]:
     """Record a finding against the latest round and the code it reviewed."""
     round_ = _latest_round(ledger)
+    if signal_id is not None and all(sig.id != signal_id for sig in round_.signals):
+        known = ", ".join(sig.id for sig in round_.signals) or "none in this round"
+        raise LedgerError(
+            f"unknown quality signal {signal_id!r} in round {round_.number}; known: {known}",
+            field="signal_id",
+        )
     now = _now()
     finding = Finding(
         id=_next_id("F", (item.id for item in ledger.findings)),
@@ -1149,15 +1501,93 @@ def add_finding(
         scenario=scenario.strip(),
         suggestion=suggestion.strip(),
         fingerprint=round_.fingerprint,
-        verdict=None,
-        verdict_evidence="",
-        verdict_run=None,
-        resolution=None,
-        resolution_note="",
-        recorded_at=now,
-        updated_at=now,
+        verdict=None, verdict_evidence="", verdict_run=None,
+        resolution=None, resolution_note="",
+        recorded_at=now, updated_at=now, signal_id=signal_id,
     )
     return replace(ledger, findings=(*ledger.findings, finding)), finding
+
+
+def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, SignalAck]:
+    """Acknowledge a quality signal in the latest round with a concrete reason (>= 40 chars)."""
+    round_ = _latest_round(ledger)
+    sig = next((item for item in round_.signals if item.id == signal_id), None)
+    if sig is None:
+        known = ", ".join(item.id for item in round_.signals) or "none in this round"
+        raise LedgerError(
+            f"unknown quality signal {signal_id!r} in round {round_.number}; known: {known}",
+            field="signal_id",
+        )
+    if sig.kind == "diff-size":
+        raise LedgerError(
+            f"{signal_id} (`diff-size`) cannot be acknowledged by the agent; shrink the change "
+            "or hand the review to the user",
+            field="signal_id",
+        )
+    stripped = reason.strip()
+    _require_text(stripped, "reason", min_chars=MIN_SIGNAL_ACK_REASON_CHARS)
+    if _CONCRETE_TOKEN_RE.search(stripped) is None and _FILE_REFERENCE_RE.search(stripped) is None:
+        raise FieldError(
+            "reason",
+            "must include a concrete code detail (a file:line, symbol(), `identifier`, number, or ->)",
+        )
+    ack = SignalAck(signal_id, round_.number, round_.fingerprint, stripped, _now())
+    kept = tuple(
+        item
+        for item in ledger.signal_acks
+        if not (item.round == round_.number and item.signal_id == signal_id)
+    )
+    return replace(ledger, signal_acks=(*kept, ack)), ack
+
+
+def file_sha256(root: Path, rel_path: str) -> str | None:
+    target = root / rel_path
+    if not target.is_file():
+        return None
+    try:
+        return hashlib.sha256(target.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def add_fact(
+    ledger: Ledger,
+    *,
+    hunks: Sequence[str],
+    source: SourceRef,
+    text: str,
+    file_digest: str,
+    author_lens: str = "contracts",
+) -> tuple[Ledger, Fact]:
+    round_ = _latest_round(ledger)
+    known_hunks = {h.id for h in round_.hunks}
+    clean_hunks = tuple(dict.fromkeys(h.strip() for h in hunks if h.strip()))
+    _require(bool(clean_hunks), "hunks", "must name at least one hunk id")
+    for hid in clean_hunks:
+        _require(hid in known_hunks, "hunks", f"{hid} is not in round {round_.number}")
+    fact_id = _next_id("F-", (item.id for item in ledger.facts))
+    fact = Fact(
+        id=fact_id,
+        hunks=clean_hunks,
+        source=source,
+        text=text.strip(),
+        file_digest=file_digest,
+        author_lens=author_lens,
+    )
+    return replace(ledger, facts=(*ledger.facts, fact)), fact
+
+
+def valid_facts_for_hunk(ledger: Ledger, root: Path) -> dict[str, tuple[Fact, ...]]:
+    by_hunk: dict[str, list[Fact]] = {}
+    digest_cache: dict[str, str | None] = {}
+    for fact in ledger.facts:
+        path = fact.source.path
+        if path not in digest_cache:
+            digest_cache[path] = file_sha256(root, path)
+        if digest_cache[path] is not None and digest_cache[path] == fact.file_digest:
+            for hid in fact.hunks:
+                by_hunk.setdefault(hid, []).append(fact)
+    return {hid: tuple(items) for hid, items in by_hunk.items()}
 
 
 def relocate_finding(
@@ -1489,6 +1919,7 @@ class GateReport:
     warnings: tuple[str, ...]
     summary: str
     review_only: bool = False
+    self_reviewed: bool = False
 
     @property
     def passed(self) -> bool:
@@ -1498,18 +1929,24 @@ class GateReport:
 @dataclass(frozen=True)
 class GatePolicy:
     tier: Tier
-    require_isolation: bool
+    require_isolation: bool = False
     reviewer_agent_markers: tuple[str, ...] = ("craftsman-reviewer",)
     max_rounds: int = 5
+    isolation_evidence: IsolationEvidence = "none"
 
     def __post_init__(self) -> None:
         _require_choice(self.tier, TIERS, "tier")
+        _require_choice(self.isolation_evidence, ISOLATION_EVIDENCES, "isolation_evidence")
         _require(self.max_rounds >= 1, "max_rounds", "must be >= 1")
         _require(
             bool(self.reviewer_agent_markers) and all(m.strip() for m in self.reviewer_agent_markers),
             "reviewer_agent_markers",
             "must contain at least one non-blank marker",
         )
+        if self.require_isolation and self.isolation_evidence == "none":
+            object.__setattr__(self, "isolation_evidence", "hooks")
+        elif self.isolation_evidence != "none" and self.tier != "quick":
+            object.__setattr__(self, "require_isolation", True)
 
 
 def evaluate(
@@ -1518,37 +1955,95 @@ def evaluate(
     """Decide whether the evidence in `ledger` covers the current diff `snap`."""
     if snap.is_empty:
         summary = f"Nothing to review: the work tree matches base {snap.base_sha[:12]}."
-        return GateReport(
-            () if review_only else tuple(_unresolved_issues(ledger, snap)),
-            (),
-            summary,
-            review_only=review_only,
-        )
+        issues = () if review_only else tuple(_unresolved_issues(ledger, snap))
+        return GateReport(issues, (), summary, review_only=review_only)
     latest = ledger.rounds[-1] if ledger.rounds else None
     fix_and_test = (
         ()
         if review_only
-        else (
-            *_unresolved_issues(ledger, snap),
-            *_passing_run_issues(ledger, snap, policy),
-            *_failing_run_issues(ledger),
-        )
+        else (*_unresolved_issues(ledger, snap), *_passing_run_issues(ledger, snap, policy), *_failing_run_issues(ledger))
     )
-    issues = [
+    issues = (
         *_round_issues(ledger, snap),
         *(_tier_issues(latest, policy) if latest else ()),
         *(_coverage_issues(ledger, latest) if latest else ()),
+        *(_signal_issues(ledger, latest) if latest else ()),
         *_verdict_issues(ledger),
         *fix_and_test,
         *(_isolation_issues(ledger, latest, policy) if latest else ()),
         *_round_cap_issues(ledger, policy),
-    ]
+    )
+    self_reviewed = bool(
+        latest is not None
+        and policy.tier != "quick"
+        and not policy.require_isolation
+        and not _has_isolated_reviewer_stop(ledger, latest, policy)
+    )
     return GateReport(
-        tuple(issues),
+        issues,
         _warnings(ledger, snap, policy, review_only=review_only),
         _summary(ledger, snap),
         review_only=review_only,
+        self_reviewed=self_reviewed,
     )
+
+
+def _acknowledged_signal_keys(ledger: Ledger) -> set[tuple[str, str, str]]:
+    by_round_id = {
+        (round_.number, sig.id): (sig.kind, sig.file, sig.detail)
+        for round_ in ledger.rounds
+        for sig in round_.signals
+    }
+    return {
+        key
+        for ack in ledger.signal_acks
+        if (key := by_round_id.get((ack.round, ack.signal_id))) is not None
+    }
+
+
+def _is_signal_resolved(
+    ledger: Ledger, latest: Round, sig: SignalRef, ack_keys: set[tuple[str, str, str]]
+) -> bool:
+    if sig.kind == "diff-size":
+        return False
+    if (sig.kind, sig.file, sig.detail) in ack_keys:
+        return True
+    return any(
+        f.round == latest.number and f.signal_id == sig.id and f.verdict != "dismissed"
+        for f in ledger.findings
+    )
+
+
+def has_unresolved_diff_size(ledger: Ledger, snap: DiffSnapshot | None = None) -> bool:
+    """Return True when the latest round matches `snap` and has an unresolved `diff-size` signal."""
+    if not ledger.rounds:
+        return False
+    latest = ledger.rounds[-1]
+    if snap is not None and (snap.is_empty or latest.fingerprint != snap.fingerprint):
+        return False
+    return any(sig.kind == "diff-size" for sig in latest.signals)
+
+
+def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
+    ack_keys = _acknowledged_signal_keys(ledger)
+    issues: list[GateIssue] = []
+    for sig in latest.signals:
+        if _is_signal_resolved(ledger, latest, sig, ack_keys):
+            continue
+        action = (
+            "shrink the change below the budget or hand the review to the user"
+            if sig.kind == "diff-size"
+            else f"record a finding with `craftsman review add --signal {sig.id} ...` or acknowledge it "
+            f'with `craftsman review ack {sig.id} --reason "<concrete reason, >= 40 chars>"`'
+        )
+        issues.append(
+            GateIssue(
+                "unresolved-signal",
+                f"Quality signal {sig.id} ({sig.kind} at {sig.file}:{sig.line} — {sig.detail}) "
+                f"is unresolved; {action}.",
+            )
+        )
+    return issues
 
 
 def require_current_round(ledger: Ledger, snap: DiffSnapshot) -> Round:
@@ -1598,12 +2093,13 @@ def _tier_issues(latest: Round, policy: GatePolicy) -> list[GateIssue]:
 
 
 def _reopened_in(ledger: Ledger, upto: int) -> dict[str, int]:
-    """Per hunk digest, the latest round up to `upto` that reopened it."""
+    """Per hunk (and file) digest, the latest round up to `upto` that reopened it."""
     latest: dict[str, int] = {}
     for round_ in ledger.rounds[:upto]:
         for hunk in round_.hunks:
             if hunk.reopened:
                 latest[hunk.digest] = round_.number
+                latest[_file_digest(round_.hunks, hunk.path)] = round_.number
     return latest
 
 
@@ -1626,14 +2122,21 @@ def _lens_coverage(ledger: Ledger, upto: int) -> dict[tuple[str, str], datetime]
 
 
 def _lenses_done_at(ledger: Ledger, round_: Round) -> datetime | None:
-    """When every lens but the sweep had covered every open hunk of `round_`; None if not yet."""
+    """When every lens but the sweep had covered every open hunk/file of `round_`; None if not yet."""
     first = _lens_coverage(ledger, round_.number)
     done = datetime.min.replace(tzinfo=timezone.utc)
-    for hunk in round_.hunks:
-        for lens in round_.lenses:
-            if hunk.carried or lens == SWEEP_LENS:
+    for lens in round_.lenses:
+        if lens == SWEEP_LENS:
+            continue
+        units = (
+            [(digest, carried) for _, digest, carried in _round_files(round_)]
+            if lens == DESIGN_LENS
+            else [(hunk.digest, hunk.carried) for hunk in round_.hunks]
+        )
+        for digest, carried in units:
+            if carried:
                 continue
-            at = first.get((lens, hunk.digest))
+            at = first.get((lens, digest))
             if at is None:
                 return None
             done = max(done, at)
@@ -1666,12 +2169,7 @@ def _carryable_coverage(ledger: Ledger) -> set[tuple[str, str]]:
 
 
 def uncovered_by_lens(ledger: Ledger, round_: Round) -> dict[str, list[str]]:
-    """Hunk ids of `round_` that each of its lenses still has to cover.
-
-    Lens coverage from earlier rounds counts, except for a hunk reopened because it mentions a
-    changed symbol: from the round that reopened it on, only fresh coverage does. The sweep
-    always has to be recorded in `round_` itself, after its other lenses.
-    """
+    """Hunk ids (or file paths for `design`) of `round_` that each of its lenses still has to cover."""
     lenses = _lens_coverage(ledger, round_.number)
     swept = {
         digest
@@ -1680,8 +2178,13 @@ def uncovered_by_lens(ledger: Ledger, round_: Round) -> dict[str, list[str]]:
         for digest in record.digests
     }
     missing: dict[str, list[str]] = {lens: [] for lens in round_.lenses}
-    for hunk in round_.hunks:
-        for lens in round_.lenses:
+    for lens in round_.lenses:
+        if lens == DESIGN_LENS:
+            for path, digest, carried in _round_files(round_):
+                if not carried and (DESIGN_LENS, digest) not in lenses:
+                    missing[lens].append(path)
+            continue
+        for hunk in round_.hunks:
             covered = hunk.digest in swept if lens == SWEEP_LENS else (lens, hunk.digest) in lenses
             if not hunk.carried and not covered:
                 missing[lens].append(hunk.id)
@@ -1714,11 +2217,13 @@ def _uncovered_issue(lens: str, missing: Sequence[str], round_: Round) -> GateIs
     batch = ",".join(missing[:MAX_HUNKS_PER_COVERAGE])
     extra = len(missing) - MAX_HUNKS_PER_COVERAGE
     more = f" (+{extra} more)" if extra > 0 else ""
+    unit = "file(s)" if lens == DESIGN_LENS else "hunk(s)"
+    flag = "--files" if lens == DESIGN_LENS else "--hunks"
     return GateIssue(
         "uncovered",
-        f"Lens `{lens}` has {len(missing)} uncovered hunk(s) in round {round_.number}: "
+        f"Lens `{lens}` has {len(missing)} uncovered {unit} in round {round_.number}: "
         f"{batch}{more}; review them and run "
-        f'`craftsman review cover --lens {lens} --hunks {batch} --note "..."`.',
+        f'`craftsman review cover --lens {lens} {flag} {batch} --note "..."`.',
     )
 
 
@@ -1828,20 +2333,23 @@ def _failing_run_issues(ledger: Ledger) -> list[GateIssue]:
     ]
 
 
-def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
-    if not policy.require_isolation or policy.tier == "quick":
-        return []
+def _has_isolated_reviewer_stop(ledger: Ledger, latest: Round, policy: GatePolicy) -> bool:
     if all(hunk.carried for hunk in latest.hunks):
-        return []  # nothing for a reviewer to read, e.g. a rename-only or binary-only diff
+        return True
     prepared_at = parse_timestamp(latest.prepared_at)
     markers = [marker.lower() for marker in policy.reviewer_agent_markers]
-    reviewed = any(
+    return any(
         event.event == "stop"
         and any(marker in event.agent.lower() for marker in markers)
         and parse_timestamp(event.at) >= prepared_at
         for event in ledger.agents
     )
-    if reviewed:
+
+
+def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
+    if not policy.require_isolation or policy.tier == "quick":
+        return []
+    if _has_isolated_reviewer_stop(ledger, latest, policy):
         return []
     return [
         GateIssue(
@@ -1864,6 +2372,65 @@ def _round_cap_issues(ledger: Ledger, policy: GatePolicy) -> list[GateIssue]:
             "iterating and report the remaining issues to the user.",
         )
     ]
+
+
+def _coverage_anomaly_warnings(ledger: Ledger) -> list[str]:
+    warnings: list[str] = []
+    if not ledger.rounds:
+        return warnings
+    latest = ledger.rounds[-1]
+    hunk_lenses = [lens for lens in latest.lenses if lens != DESIGN_LENS]
+    if len(latest.hunks) > 30 and len(hunk_lenses) >= 2:
+        counts = {
+            lens: sum(1 for r in ledger.coverage if r.round == latest.number and r.lens == lens)
+            for lens in hunk_lenses
+        }
+        if all(c > 0 for c in counts.values()) and len(set(counts.values())) == 1:
+            count_val = next(iter(counts.values()))
+            warnings.append(
+                f"Process anomaly: all lenses covered with an identical entry count ({count_val}) "
+                f"across {len(latest.hunks)} hunks (> 30)."
+            )
+    for lens in hunk_lenses:
+        records = [r for r in ledger.coverage if r.round == latest.number and r.lens == lens]
+        digests = sum(len(r.digests) for r in records)
+        if digests > 20 and records:
+            times = [parse_timestamp(r.recorded_at) for r in records]
+            if (max(times) - min(times)).total_seconds() < 120:
+                warnings.append(
+                    f"Process anomaly: {digests} hunks covered in lens `{lens}` in under 2 minutes."
+                )
+    return warnings
+
+
+def _process_anomaly_warnings(ledger: Ledger) -> list[str]:
+    warnings: list[str] = []
+    if len(ledger.findings) >= 5 and all(f.verdict is not None for f in ledger.findings):
+        if sum(1 for f in ledger.findings if f.verdict == "dismissed") == 0:
+            warnings.append(
+                f"Process anomaly: {len(ledger.findings)} findings and 0 dismissed "
+                "(all findings confirmed — typical of self-review)."
+            )
+    warnings.extend(_coverage_anomaly_warnings(ledger))
+    test_runs = [r for r in ledger.runs if r.kind in ("test", "e2e")]
+    for idx, failed in enumerate(test_runs):
+        if failed.exit_code == 0:
+            continue
+        base_cmd = tuple(_without_env_prefix(failed.argv))
+        if not base_cmd:
+            continue
+        for later in test_runs[idx + 1 :]:
+            if (
+                later.fingerprint == failed.fingerprint
+                and tuple(_without_env_prefix(later.argv)) == base_cmd
+                and tuple(later.argv) != tuple(failed.argv)
+            ):
+                warnings.append(
+                    f"Process anomaly: {failed.kind} run {failed.id} failed and was repeated as "
+                    f"{later.id} with a different environment without a code change."
+                )
+                break
+    return warnings
 
 
 def _warnings(
@@ -1905,6 +2472,7 @@ def _warnings(
         for run in ledger.runs
         if is_trivial_run(run.argv)
     )
+    warnings.extend(_process_anomaly_warnings(ledger))
     return tuple(warnings)
 
 
@@ -1926,7 +2494,8 @@ def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
 def _coverage_summary(ledger: Ledger, latest: Round) -> str:
     missing = uncovered_by_lens(ledger, latest)
     open_hunks = sum(not hunk.carried for hunk in latest.hunks)
-    total = open_hunks * len(latest.lenses)
+    open_files = sum(not carried for _, _, carried in _round_files(latest))
+    total = sum(open_files if lens == DESIGN_LENS else open_hunks for lens in latest.lenses)
     done = total - sum(len(ids) for ids in missing.values())
     carried = len(latest.hunks) - open_hunks
     line = f"Coverage: {done}/{total} lens-hunk pairs; {carried} hunk(s) carried from earlier rounds."
@@ -1989,7 +2558,10 @@ def render_report(report: GateReport) -> str:
     else:
         status = "PASSED" if report.passed else f"BLOCKED ({len(report.issues)} open items)"
         header = f"**Craftsman gate: {status}**"
-    lines = [header, "", report.summary]
+    lines = [header]
+    if report.self_reviewed:
+        lines.append(f"**{SELF_REVIEWED_BANNER}**")
+    lines += ["", report.summary]
     if report.issues:
         lines += ["", "**Next actions**", *render_next_actions(report.issues)]
     if report.warnings:

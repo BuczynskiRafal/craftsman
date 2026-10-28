@@ -4,6 +4,40 @@ All notable changes to Craftsman are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] - 2026-10-27
+
+### Added
+
+- **Mechanical code-quality signals (`craftsman/quality.py`)**: the gate now measures function and
+  module size budgets, diff growth (`diff-size`), test-naming hygiene (`test-name`), duplicate logic
+  across AST bodies (`duplicate-logic`), and untyped dictionary domain parameters (`dict-domain`).
+  Every signal appears in the review packet and must be resolved via `craftsman review add --signal
+  S#` or acknowledged with a concrete code reason via `craftsman review ack S# --reason "..."`
+  (shown to the user in the final report; `diff-size` cannot be acknowledged by the agent and hands
+  the review to the user as `needs_human`).
+- **Whole-change `design` lens** (`standard` and `deep`, covered per file with `--files`),
+  **per-reviewer packet views** (`craftsman review view --lenses <group-or-lenses> [--hunks ...]`),
+  **fixed reviewer lens groups (`REVIEWER_GROUPS`: `R1`–`R4`)**, and **source-cited shared facts**
+  (`craftsman review fact add --hunks ... --source path:line --text "..."`, automatically
+  invalidated when the source file changes).
+- **Packet deduplication, scope trimming, and CLI-computed test/run facts**: shared enclosing scopes
+  and symbol references are rendered once per round, scopes longer than 60 lines are trimmed around
+  the hunk, and packets list test files referencing changed symbols plus the latest `test`/`e2e`
+  runs with staleness.
+
+### Changed
+
+- **Coverage notes must be concrete**: `craftsman review cover` rejects notes made of generic praise
+  (`looks good`, `well-factored`, `clean`, `lgtm`, etc.), requires every listed hunk or file to have
+  its own segment naming a concrete input, condition, or `file:line`, and rejects notes reused
+  verbatim across more than 3 hunks.
+- **Reviews without isolation evidence are reported as self-reviewed**: in `deep` mode, missing
+  platform hook or transcript evidence sets `needs_human` instead of completing; in `standard` mode,
+  the gate and report display a `SELF-REVIEWED` banner.
+- **`craftsman review report`** now uses the header `**Process: COMPLETE**`, flags process anomalies
+  (zero findings across large rounds, burst coverage timestamps, environment-bypassed test runs),
+  and ends with a `## Not assessed by the gate` section.
+
 ## [3.1.0] - 2026-10-27
 
 ### Added
@@ -97,5 +131,6 @@ All notable changes to Craftsman are recorded here. The format follows
 - Hook parsers, verdict detection and worktree state handling were hardened (see the v2.1.0
   follow-up fixes).
 
+[3.2.0]: https://github.com/BuczynskiRafal/craftsman/releases/tag/v3.2.0
 [3.1.0]: https://github.com/BuczynskiRafal/craftsman/releases/tag/v3.1.0
 [3.0.0]: https://github.com/BuczynskiRafal/craftsman/releases/tag/v3.0.0

@@ -24,7 +24,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,9 +33,18 @@ from typing import Any, Literal, cast
 from craftsman.diffscan import DiffScanError
 from craftsman.evidence import Evaluation, archive_ledger_if_rebased, evaluate_evidence
 from craftsman.ledger import (
+    AgentEvent,
     GatePolicy,
     GateReport,
+    IsolationEvidence,
     LedgerError,
+    _has_isolated_reviewer_stop,
+    add_agent_event,
+    format_timestamp,
+    has_unresolved_diff_size,
+    ledger_path_for,
+    load,
+    mutate,
     render_next_actions,
     render_report,
 )
@@ -382,13 +391,66 @@ def resolve_effective_gear_label(state: dict[str, Any], fallback_cwd: str | None
     }[resolve_effective_tier(state, fallback_cwd)]
 
 
-def gate_policy(state: dict[str, Any], tier: Tier) -> GatePolicy:
-    """The gate policy for a task; the single place that decides whether isolation is required.
+def resolve_isolation_evidence(state: Mapping[str, Any]) -> IsolationEvidence:
+    """Return the active isolation evidence source (`hooks`, `transcript`, or `none`)."""
+    if state.get("hooks_seen"):
+        return "hooks"
+    raw = str(state.get("isolation_evidence") or "").strip()
+    if raw in ("hooks", "transcript"):
+        return cast(IsolationEvidence, raw)
+    return "none"
 
-    Subagent isolation is only demanded where platform hooks record subagent events, which they
-    announce by setting `hooks_seen` on the active state.
+
+def gate_policy(state: dict[str, Any], tier: Tier) -> GatePolicy:
+    """The gate policy for a task; decides whether isolation is enforced or self-reviewed."""
+    evidence = resolve_isolation_evidence(state)
+    return GatePolicy(
+        tier=tier,
+        require_isolation=evidence != "none" and tier != "quick",
+        isolation_evidence=evidence,
+    )
+
+
+def sync_antigravity_subagent_events(
+    state: MutableMapping[str, Any], entries: Sequence[Mapping[str, Any]], cwd: str | None
+) -> bool:
+    """Sync Antigravity subagent reviewer completions from the session transcript into the ledger.
+
+    Step R finding (2026-10-27, Antigravity 2.0):
+    Each subagent spawned via `invoke_subagent` writes its own transcript under
+    `<appDataDir>/brain/<subagent-id>/.system_generated/logs/transcript.jsonl` with an initial
+    step referencing `sender=<parent-session-id>`, while the parent session's transcript records
+    the `invoke_subagent` tool call, the `conversationId` ACK, and the `<SYSTEM_MESSAGE>`
+    completion notification (`sender=<subagent-id>`). Reading the active session's transcript in
+    `<appDataDir>/brain/` lets the gate record an `AgentEvent` and set
+    `isolation_evidence = "transcript"` without scanning `$HOME`.
     """
-    return GatePolicy(tier=tier, require_isolation=bool(state.get("hooks_seen")) and tier != "quick")
+    if not entries or state.get("hooks_seen"):
+        return False
+    state["isolation_evidence"] = "transcript"
+    since_step = _safe_int(state.get("started_at_step"), 0)
+    if not has_quality_gate_subagent_in_entries(entries, since_step):
+        return False
+    target_cwd = state.get("cwd") if isinstance(state.get("cwd"), str) and state.get("cwd") else cwd
+    if not target_cwd:
+        return True
+    try:
+        lpath = ledger_path_for(target_cwd)
+        ledger = load(lpath)
+        if ledger.rounds and not _has_isolated_reviewer_stop(
+            ledger, ledger.rounds[-1], GatePolicy(tier="standard", require_isolation=True)
+        ):
+            event = AgentEvent(
+                platform="antigravity",
+                event="stop",
+                agent="craftsman-reviewer",
+                agent_id="transcript",
+                at=format_timestamp(datetime.now(timezone.utc)),
+            )
+            mutate(lpath, lambda cur: (add_agent_event(cur, event), None))
+    except (DiffScanError, LedgerError):
+        pass
+    return True
 
 
 def evaluate_task(state: dict[str, Any], fallback_cwd: str | None) -> Evaluation:
@@ -708,6 +770,7 @@ def default_state(
         "completed_at_step": -1,
         "awaiting_user": False,
         "subagent_verified": False,
+        "isolation_evidence": "none",
         "auto_detected": auto_detected,
         "forced_continuations": 0,
     }
@@ -883,7 +946,7 @@ def _is_quality_gate_subagent_spec(sub: dict[str, Any]) -> bool:
     return False
 
 
-def _entry_invokes_quality_gate_subagent(entry: dict[str, Any]) -> bool:
+def _entry_invokes_quality_gate_subagent(entry: Mapping[str, Any]) -> bool:
     if entry.get("status") == "ERROR":
         return False
     tool_calls = entry.get("tool_calls")
@@ -994,7 +1057,7 @@ def _shell_command_mutates_files(cmd: str) -> bool:
     return any(_shell_segment_mutates_files(part.strip()) for part in parts if part.strip())
 
 
-def _count_post_audit_edit_stats(entries: list[dict[str, Any]], after_idx: int) -> tuple[int, int]:
+def _count_post_audit_edit_stats(entries: Sequence[Mapping[str, Any]], after_idx: int) -> tuple[int, int]:
     """Count (modified_files_count, added_or_replaced_lines) in tool calls after `entries[after_idx]`."""
     edited_files: set[str] = set()
     edited_lines = 0
@@ -1061,7 +1124,7 @@ def _evaluate_auditor_report_text(text: str) -> bool:
     return False
 
 
-def _has_audit_failure_after(entries: list[dict[str, Any]], after_idx: int) -> bool:
+def _has_audit_failure_after(entries: Sequence[Mapping[str, Any]], after_idx: int) -> bool:
     """Return True if the auditor response following `entries[after_idx]` is still pending or reports a failure."""
     subagent_conv_ids: set[str] = set()
     ack_seen = False
@@ -1117,7 +1180,7 @@ def _has_audit_failure_after(entries: list[dict[str, Any]], after_idx: int) -> b
 
 
 def has_quality_gate_subagent_in_entries(
-    entries: list[dict[str, Any]], since_step: int
+    entries: Sequence[Mapping[str, Any]], since_step: int
 ) -> bool:
     """Return True if a valid Quality Gate Auditor subagent was invoked after `since_step` and not invalidated."""
     last_auditor_idx: int | None = None
@@ -1288,25 +1351,32 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
         _try_save_state(state_file, state)
         return "allow", None
 
-    since_step = _safe_int(state.get("started_at_step"), 0)
     missing_subagent = False
     if needs_transcript_auditor(state, entries, ws_cwd_str):
-        state["subagent_verified"] = has_quality_gate_subagent_in_entries(entries, since_step)
+        state["subagent_verified"] = sync_antigravity_subagent_events(state, entries, ws_cwd_str)
         missing_subagent = not state["subagent_verified"]
+    elif entries and not state.get("hooks_seen"):
+        sync_antigravity_subagent_events(state, entries, ws_cwd_str)
+    evaluation: Evaluation | None = None
     report: GateReport | None = None
     evidence_error: str | None = None
     try:
-        report = evaluate_task(state, ws_cwd_str).report
+        evaluation = evaluate_task(state, ws_cwd_str)
+        report = evaluation.report
     except (DiffScanError, LedgerError) as exc:
         evidence_error = str(exc)
 
-    if report is not None and any(issue.code == "round-cap" for issue in report.issues):
+    if report is not None and (
+        any(issue.code == "round-cap" for issue in report.issues)
+        or (evaluation is not None and has_unresolved_diff_size(evaluation.ledger, evaluation.snap))
+    ):
         state["stage"] = "needs_human"
         _try_save_state(state_file, state)
         return "allow", None
 
     if report is not None and report.passed and not missing_subagent:
-        mark_completed(state, get_latest_step_index(entries))
+        eff_tier = resolve_effective_tier(state, effective_cwd)
+        complete_gate_for_report(state, get_latest_step_index(entries), eff_tier, report)
         _try_save_state(state_file, state)
         return "allow", None
 
@@ -1522,12 +1592,11 @@ def run_cli(argv: list[str]) -> int:
 
     closed_line: str | None = None
     if args.complete:
-        since_step = _safe_int(state.get("started_at_step"), 0)
         effective_cwd = args.cwd or (
             state.get("cwd") if isinstance(state.get("cwd"), str) else None
         )
         subagent_ran = (
-            has_quality_gate_subagent_in_entries(entries, since_step) if entries else False
+            sync_antigravity_subagent_events(state, entries, effective_cwd) if entries else False
         )
 
         if needs_transcript_auditor(state, entries, effective_cwd):
@@ -1549,11 +1618,20 @@ def run_cli(argv: list[str]) -> int:
                 f"[CRAFTSMAN GATE] Cannot complete: cannot evaluate the evidence ledger: {exc}\n"
             )
             return 1
+        if has_unresolved_diff_size(evaluation.ledger, evaluation.snap):
+            state["stage"] = "needs_human"
+            save_state_atomic(state_file, state)
+            sys.stderr.write(
+                "[CRAFTSMAN GATE] Cannot complete: change exceeds the diff-size budget; "
+                "stage set to needs_human. Run `craftsman review report` for the user.\n"
+            )
+            return 1
         if not evaluation.report.passed:
             sys.stderr.write(f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
             return 1
-        mark_completed(state, latest_step)
-        closed_line = closed_gate_line(evaluation, resolve_effective_tier(state, effective_cwd))
+        eff_tier = resolve_effective_tier(state, effective_cwd)
+        complete_gate_for_report(state, latest_step, eff_tier, evaluation.report)
+        closed_line = closed_gate_line(evaluation, eff_tier)
 
     save_state_atomic(state_file, state)
     if closed_line is not None:
@@ -1561,11 +1639,25 @@ def run_cli(argv: list[str]) -> int:
     return 0
 
 
-def mark_completed(state: dict[str, Any], completed_at_step: int) -> None:
+def mark_completed(state: MutableMapping[str, Any], completed_at_step: int) -> None:
     state["awaiting_user"] = False
     state["active"] = False
     state["stage"] = "completed"
     state["completed_at_step"] = completed_at_step
+
+
+def complete_gate_for_report(
+    state: MutableMapping[str, Any], completed_at_step: int, tier: Tier, report: GateReport
+) -> None:
+    """Transition `state` when the gate passes, accounting for self-reviewed `standard`/`deep` runs."""
+    if report.self_reviewed and tier == "deep":
+        state["awaiting_user"] = False
+        state["stage"] = "needs_human"
+        state["completed_at_step"] = completed_at_step
+        return
+    mark_completed(state, completed_at_step)
+    if report.self_reviewed and tier != "quick":
+        state["stage"] = "complete-unisolated"
 
 
 def closed_gate_line(evaluation: Evaluation, tier: Tier) -> str:

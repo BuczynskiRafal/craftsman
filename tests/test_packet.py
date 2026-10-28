@@ -20,7 +20,7 @@ from craftsman.diffscan import (
     resolve_base_sha,
     snapshot,
 )
-from craftsman.ledger import HunkRef, Ledger, Round
+from craftsman.ledger import HunkRef, Ledger, Round, Run, add_run
 from craftsman.lenses import select_lenses
 from craftsman.packet import PacketContext, collect_context, render_packet
 
@@ -141,6 +141,57 @@ class CollectContextTests(unittest.TestCase):
         self.assertEqual(ctx.symbols["H1"], ("compute_total",))
         self.assertEqual(ctx.references["compute_total"][0].path, "use.py")
 
+    def test_tests_referencing_changed_symbol_are_listed(self) -> None:
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items)\n")
+        self.repo.write("tests/test_calc.py", "from calc import compute_total\ndef test_sum():\n    assert compute_total([1]) == 1\n")
+        base = self.repo.commit()
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items) * 2\n")
+
+        text = render_packet(self.context(base))
+
+        self.assertIn("Tests referencing `compute_total`: `tests/test_calc.py`", text)
+
+    def test_last_test_run_is_shown_with_staleness(self) -> None:
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items)\n")
+        base = self.repo.commit()
+        self.repo.write("calc.py", "def compute_total(items):\n    return sum(items) * 2\n")
+        snap = snapshot(self.repo.root, base)
+        index = WorktreeIndex(self.repo.root)
+        symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
+        picks = tuple(
+            pick
+            for pick in select_lenses("standard", {}, docs_only=False)
+            if pick.lens.id in ("intent", "sweep")
+        )
+        ledger = add_run(
+            Ledger(),
+            Run(
+                id="R1",
+                kind="test",
+                argv=("pytest", "-q"),
+                cwd=".",
+                exit_code=0,
+                duration_s=0.4,
+                fingerprint="stale_fp",
+                started_at=PREPARED_AT,
+                output_tail="1 passed",
+            ),
+        )
+        ctx = collect_context(
+            self.repo.root,
+            snap,
+            round_for(snap),
+            picks,
+            "task",
+            symbols=symbols,
+            ledger=ledger,
+            index=index,
+        )
+
+        text = render_packet(ctx)
+
+        self.assertIn("Last runs: R1 `pytest -q` (test) exit 0 (stale)", text)
+
     def test_conventions_include_contributing_variants_and_changelog_readme(self) -> None:
         self.repo.write("CONTRIBUTING.rst", "How to contribute.\n")
         self.repo.write("CONTRIBUTING.txt", "Text guidelines.\n")
@@ -227,6 +278,94 @@ class RenderTests(unittest.TestCase):
             "`web/b.js:7` ``` x = helper_fn() ``y`` ```",
             text,
         )
+
+    def test_scope_shared_by_two_hunks_is_rendered_once(self) -> None:
+        h1 = Hunk("H1", "pkg/a.py", None, "modified", 2, 1, 2, 1, "", ("-a = 1", "+a = 2"), "d1")
+        h2 = Hunk("H2", "pkg/a.py", None, "modified", 8, 1, 8, 1, "", ("-b = 1", "+b = 2"), "d2")
+        snap = DiffSnapshot("b" * 40, "f" * 64, (h1, h2), ("pkg/a.py",), (), 2, 2)
+        scope = Scope("pkg/a.py", "compute", "function", 1, 10, "def compute():\n    a = 2\n    b = 2")
+        picks = tuple(p for p in select_lenses("standard", {}, docs_only=False) if p.lens.id == "intent")
+        ctx = PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_for(snap),
+            picks=picks,
+            task="",
+            commits=(),
+            conventions=(),
+            scopes={"H1": scope, "H2": scope},
+            symbols={"H1": ("compute",), "H2": ("compute",)},
+            references={"compute": (Reference("pkg/use.py", 4, "compute()"),)},
+            signals_by_hunk={},
+            carried_from={},
+        )
+
+        text = render_packet(ctx)
+
+        self.assertEqual(text.count("Enclosing scope (L1–L10):"), 1)
+        self.assertIn("Scope: `compute` — shown at H1", text)
+
+    def test_long_scope_renders_signature_with_context_around_hunk(self) -> None:
+        body_lines = ["def long_fn(x: int) -> int:"] + [f"    line_{i} = {i}" for i in range(2, 82)]
+        scope = Scope("pkg/a.py", "long_fn", "function", 1, 81, "\n".join(body_lines))
+        hunk = Hunk(
+            "H1", "pkg/a.py", None, "modified", 40, 1, 40, 1, "", ("-    line_40 = 0", "+    line_40 = 40"), "d1"
+        )
+        snap = DiffSnapshot("b" * 40, "f" * 64, (hunk,), ("pkg/a.py",), (), 1, 1)
+        picks = tuple(p for p in select_lenses("standard", {}, docs_only=False) if p.lens.id == "intent")
+        ctx = PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_for(snap),
+            picks=picks,
+            task="",
+            commits=(),
+            conventions=(),
+            scopes={"H1": scope},
+            symbols={"H1": ("long_fn",)},
+            references={},
+            signals_by_hunk={},
+            carried_from={},
+        )
+
+        text = render_packet(ctx)
+
+        self.assertIn("Enclosing scope (pkg/a.py:1-81):", text)
+        self.assertIn("def long_fn(x: int) -> int:", text)
+        self.assertIn("line_40 = 40", text)
+        self.assertNotIn("line_10 = 10", text)
+        self.assertNotIn("line_75 = 75", text)
+
+    def test_view_renders_assigned_hunks_in_full_with_one_line_index(self) -> None:
+        h1 = Hunk("H1", "pkg/a.py", None, "modified", 2, 1, 2, 1, "", ("-a = 1", "+a = 2"), "d1")
+        h2 = Hunk("H2", "pkg/b.py", None, "modified", 8, 1, 8, 1, "", ("-b = 1", "+b = 2"), "d2")
+        snap = DiffSnapshot("b" * 40, "f" * 64, (h1, h2), ("pkg/a.py", "pkg/b.py"), (), 2, 2)
+        scope_a = Scope("pkg/a.py", "alpha", "function", 1, 4, "def alpha():\n    a = 2")
+        scope_b = Scope("pkg/b.py", "beta", "function", 7, 10, "def beta():\n    b = 2")
+        picks = select_lenses("standard", {}, docs_only=False)
+        ctx = PacketContext(
+            root=Path("."),
+            snap=snap,
+            round=round_for(snap),
+            picks=tuple(picks),
+            task="test view",
+            commits=(),
+            conventions=(),
+            scopes={"H1": scope_a, "H2": scope_b},
+            symbols={"H1": ("alpha",), "H2": ("beta",)},
+            references={},
+            signals_by_hunk={},
+            carried_from={},
+        )
+
+        view = packet.render_packet_view(ctx, lenses=("contracts",), assigned_hunks=("H1",))
+
+        self.assertIn("### H1 · `pkg/a.py`", view)
+        self.assertIn("def alpha():", view)
+        self.assertNotIn("### H2 · `pkg/b.py`", view)
+        self.assertNotIn("def beta():", view)
+        self.assertIn("- H2 · pkg/b.py · beta", view)
+        self.assertEqual(packet.expand_hunk_spec("H1-H2", ("H1", "H2")), ("H1", "H2"))
 
 
 if __name__ == "__main__":

@@ -67,10 +67,12 @@ contract run `craftsman skill show craftsman --file scope.md`).
 craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--task "<what the change is for, one line>"]
 ```
 
-This prints the absolute path of the current review packet. Read the packet completely (if you do
-not have the path, run `craftsman review show` or `craftsman review show --packet-path` in the
-repository root; never search for packet or ledger files, as packets, ledgers, and reports of other
-repositories are never relevant). It contains:
+This prints the absolute path of the current review packet (`packet-N.md`), and
+`craftsman review view --lenses <lenses> [--hunks <range>]` writes and prints a per-reviewer view
+(`packet-N.<slug>.md`). Read your view completely, the full packet only for a hunk outside your view
+that you need (if you do not have the path, run `craftsman review show` or
+`craftsman review show --packet-path` in the repository root; never search for packet or ledger
+files, as packets, ledgers, and reports of other repositories are never relevant). It contains:
 - the round number, diff fingerprint, and statistics;
 - the task statement and commit messages (the *intent*);
 - the project convention files to respect (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`,
@@ -167,25 +169,30 @@ Step 3 at low cost; a real defect you filtered out early is lost for good.
 - `blocker` — wrong results, data loss, security hole, or crash on a path real users take.
 - `major` — wrong behavior on a plausible path, a broken contract for some caller, or an error
   that is hidden instead of reported.
-- `minor` — a real but low-impact edge case, or a maintainability cost with a concrete future bug.
+- `minor` — a real but low-impact edge case, a maintainability cost with a concrete future bug, or
+  a name or structure that misleads the reader, with the misleading reading stated. Record naming
+  and structure problems when you can state the wrong reading: what a reader would believe from the
+  name, and what the code actually does. 'I don't like it' is not a finding.
 - `nit` — only when a project convention file explicitly requires it.
 
-**Use isolated reviewers when the platform offers them.** On tiers `standard` and `deep`:
-- **Without `--fix` (review-only):** spawn **two `craftsman-reviewer` subagents in parallel**, each
-  assigned half of the round's domain lenses:
-  - reviewer 1: `{intent, contracts, ripple, tests, craft}`
-  - reviewer 2: `{failure, state, trust, platform, model}`
-  (omitting lenses not selected in the round), followed by **one `craftsman-verifier` subagent**
-  that performs the `sweep` pass and duplicate grouping at the start of its run (Step 0) before
-  recording verdicts.
-- **With `--fix` or inside `/craftsman`:** hand the lens passes to fresh-context reviewer
-  subagents (`craftsman-reviewer`), 1–3 lenses each in parallel, then run one more reviewer for
-  the **final sweep** described at the end of `lenses.md`, followed by a separate
-  `craftsman-verifier` subagent.
-- **Keep subagent briefs lean:** pass each subagent only the packet path printed by
-  `craftsman review prepare` or `craftsman review show`, its
-  assigned lenses, and the hunk list — never paste file contents into the prompt. The verifier
-  should read `craftsman review show` and the packet first, then open source files only around the
+**Use isolated reviewers when the platform offers them.** On tiers `standard` and `deep`, hand the
+lens passes to fresh-context `craftsman-reviewer` subagents in parallel using the fixed reviewer
+groups (`REVIEWER_GROUPS` in `craftsman/lenses.py`), omitting lenses not selected in the round and
+skipping any group that has no selected lenses:
+- **R1** (callers & contracts): `intent`, `contracts`, `ripple`, `tests`
+- **R2** (failure paths & state): `failure`, `state`, `trust`, `model`
+- **R3** (environment & clarity): `platform`, `craft`
+- **R4** (whole-change design): `design`
+- **Verifier / sweep**: `sweep` (after all reviewer groups finish; in review-only mode without
+  `--fix`, the `craftsman-verifier` subagent runs `sweep` and duplicate grouping at Step 0 before
+  recording verdicts; with `--fix` or inside `/craftsman`, run a `sweep` reviewer after R1–R4
+  followed by `craftsman-verifier`).
+- **Keep subagent briefs lean:** generate a view per reviewer group with
+  `craftsman review view --lenses <lenses> [--hunks <range>]` (e.g. `craftsman review view --lenses R1`)
+  and pass each reviewer subagent its packet view path (`packet-N.<slug>.md`), its assigned lenses,
+  and the hunk list — never paste file contents into the prompt. Each reviewer reads your view
+  completely, the full packet only for a hunk outside your view that you need. The verifier should
+  read `craftsman review show` and the full packet first, then open source files only around the
   cited `file:line` ranges and callers rather than reading full files top to bottom.
 - When no subagent mechanism exists, do the passes yourself one lens at a time, re-reading the
   packet at the start of each lens.
