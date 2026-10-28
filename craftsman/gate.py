@@ -24,8 +24,11 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping, MutableMapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from craftsman.diffscan import DiffScanError
 from craftsman.evidence import Evaluation, archive_ledger_if_rebased, evaluate_evidence
@@ -576,6 +579,114 @@ def get_latest_step_index(entries: list[dict[str, Any]]) -> int:
     return len(entries)
 
 
+GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
+VALID_GATE_PLATFORMS: frozenset[str] = frozenset(("copilot", "claude", "antigravity", "cli"))
+
+
+@dataclass(frozen=True)
+class GateOwner:
+    """The agent platform and session that opened an active gate."""
+
+    platform: GatePlatform
+    session_id: str | None = None
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any] | None) -> GateOwner | None:
+        if not isinstance(state, Mapping):
+            return None
+        raw = state.get("owner") if "owner" in state or "active" in state or "tier" in state else state
+        if not isinstance(raw, Mapping):
+            return None
+        platform = str(raw.get("platform") or "").strip()
+        if platform not in VALID_GATE_PLATFORMS:
+            return None
+        session_id = str(raw.get("session_id") or "").strip()
+        return cls(platform=cast(GatePlatform, platform), session_id=session_id or None)
+
+    def to_state(self) -> dict[str, str]:
+        return {"platform": self.platform, "session_id": self.session_id or ""}
+
+
+def detect_cli_platform(env: Mapping[str, str] | None = None) -> GatePlatform:
+    """Infer the active agent platform from environment variables when `craftsman gate --init` runs."""
+    environ = os.environ if env is None else env
+    if environ.get("CLAUDECODE") or environ.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "claude"
+    if environ.get("ANTIGRAVITY_AGENT") or environ.get("AGY_MANAGED_ENV"):
+        return "antigravity"
+    if (
+        environ.get("COPILOT_CLI")
+        or environ.get("GITHUB_COPILOT_CLI")
+        or environ.get("VSCODE_PID")
+        or environ.get("VSCODE_IPC_HOOK")
+        or environ.get("TERM_PROGRAM", "").strip().lower() == "vscode"
+    ):
+        return "copilot"
+    return "cli"
+
+
+def format_gate_owner(owner: GateOwner | Mapping[str, Any] | None) -> str:
+    """Human-readable representation of `GateOwner` or `state['owner']`."""
+    parsed = owner if isinstance(owner, GateOwner) else GateOwner.from_state(owner)
+    if parsed is None:
+        return "unknown"
+    if parsed.session_id:
+        return f"{parsed.platform} (session {parsed.session_id})"
+    return parsed.platform
+
+
+def owns_gate(owner: GateOwner | None, caller: GateOwner) -> bool:
+    """Return True when `owner` is unset, unclaimed `cli`, or matches `caller`."""
+    if owner is None:
+        return True
+    if owner.platform == "cli" and owner.session_id is None:
+        return True
+    if owner.session_id is not None:
+        return (
+            caller.session_id is not None
+            and caller.session_id == owner.session_id
+            and caller.platform in (owner.platform, "cli")
+        )
+    return caller.platform == owner.platform
+
+
+def write_gate_owner(
+    state: MutableMapping[str, Any], caller: GateOwner, *, preserve_unowned: bool = False
+) -> bool:
+    """Write `caller` as the gate owner in `state` (merging with any partial existing owner)."""
+    if preserve_unowned and "owner" not in state:
+        return False
+    existing = GateOwner.from_state(state)
+    platform: GatePlatform = (
+        existing.platform
+        if existing is not None and caller.platform == "cli" and existing.platform != "cli"
+        else caller.platform
+    )
+    session_id = caller.session_id or (
+        existing.session_id
+        if existing is not None and existing.platform in (caller.platform, platform)
+        else None
+    )
+    merged = GateOwner(platform=platform, session_id=session_id).to_state()
+    if state.get("owner") == merged:
+        return False
+    state["owner"] = merged
+    return True
+
+
+def _extract_antigravity_session_id(payload: dict[str, Any]) -> str | None:
+    for key in ("conversation_id", "conversationId", "session_id", "sessionId"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    artifact_dir = payload.get("artifactDirectoryPath")
+    if isinstance(artifact_dir, str) and artifact_dir.strip():
+        path = Path(artifact_dir.strip())
+        if path.parent.name == "brain" and path.name:
+            return path.name
+    return None
+
+
 def default_state(
     mode: str = "craftsman",
     tier: str = "auto",
@@ -583,14 +694,16 @@ def default_state(
     base_sha: str | None = None,
     started_at_step: int = 0,
     auto_detected: bool = False,
+    owner: GateOwner | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    state: dict[str, Any] = {
         "active": True,
         "mode": mode,
         "tier": tier if tier in VALID_TIERS else "auto",
         "cwd": cwd,
         "stage": "implement",
         "base_sha": base_sha,
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "started_at_step": started_at_step,
         "completed_at_step": -1,
         "awaiting_user": False,
@@ -598,6 +711,11 @@ def default_state(
         "auto_detected": auto_detected,
         "forced_continuations": 0,
     }
+    if owner is not None:
+        parsed_owner = owner if isinstance(owner, GateOwner) else GateOwner.from_state(owner)
+        if parsed_owner is not None:
+            write_gate_owner(state, parsed_owner)
+    return state
 
 
 def load_state(state_file: Path) -> dict[str, Any] | None:
@@ -1110,6 +1228,19 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
 
     latest_step = get_latest_step_index(entries)
     state = load_state(state_file)
+    stop_platform: GatePlatform = "claude" if _is_claude_stop_payload(payload) else "antigravity"
+    stop_session_id = (
+        str(payload.get("session_id") or payload.get("sessionId") or "").strip() or None
+        if stop_platform == "claude"
+        else _extract_antigravity_session_id(payload)
+    )
+    caller = GateOwner(platform=stop_platform, session_id=stop_session_id)
+    if state and state.get("active", False):
+        if not owns_gate(GateOwner.from_state(state), caller):
+            return "allow", None
+        if write_gate_owner(state, caller, preserve_unowned=True):
+            _try_save_state(state_file, state)
+
     completed_at = _safe_int(state.get("completed_at_step"), -1) if state else -1
     if completed_at > latest_step:
         completed_at = -1
@@ -1133,6 +1264,7 @@ def evaluate_stop(payload: dict[str, Any]) -> tuple[str, str | None]:
                 base_sha=auto_base_sha,
                 started_at_step=trigger_step,
                 auto_detected=True,
+                owner=caller,
             )
             _try_save_state(state_file, state)
 
@@ -1237,6 +1369,16 @@ def run_cli(argv: list[str]) -> int:
     )
     parser.add_argument("--init", action="store_true", help="Initialize a fresh active state")
     parser.add_argument(
+        "--takeover",
+        action="store_true",
+        help="Take over an active gate owned by another agent session",
+    )
+    parser.add_argument(
+        "--session-id",
+        default=None,
+        help="Explicit session ID of the calling agent session (from the prompt hook briefing)",
+    )
+    parser.add_argument(
         "--cwd", help="Repository working directory to capture base_sha and diff stats"
     )
     parser.add_argument("--base-sha", help="Explicit base commit SHA for cumulative diff")
@@ -1287,7 +1429,30 @@ def run_cli(argv: list[str]) -> int:
     )
 
     if (args.init and not args.complete) or state is None or reinit_inactive:
+        caller = GateOwner(
+            platform=detect_cli_platform(),
+            session_id=(args.session_id or "").strip() or None,
+        )
+        takeover_from: Any = None
         if args.init and not args.complete:
+            if existing_was_active and existing_state is not None:
+                existing_owner = GateOwner.from_state(existing_state)
+                if not owns_gate(existing_owner, caller) and not args.takeover:
+                    owner_desc = format_gate_owner(existing_owner)
+                    since_desc = existing_state.get("started_at") or "unknown time"
+                    sys.stderr.write(
+                        f"[CRAFTSMAN GATE] Refusing to initialize: an active gate in this work tree "
+                        f"is already owned by {owner_desc} (since {since_desc}).\n"
+                        "If you are that session, pass your session ID from the prompt briefing:\n"
+                        "  craftsman gate --init --session-id <session-id> ...\n"
+                        "To work in parallel without interfering with that session, create a separate worktree:\n"
+                        "  git worktree add ../<branch-dir> -b <branch>\n"
+                        "Or, to explicitly take over the existing gate, pass --takeover:\n"
+                        "  craftsman gate --init --takeover ...\n"
+                    )
+                    return 1
+                if args.takeover:
+                    takeover_from = existing_state.get("owner")
             start_step = latest_step
             initial_tier = args.tier or ("deep" if args.mode == "ultracraft" else "auto")
             base_sha = args.base_sha or get_head_sha(hint_cwd)
@@ -1310,6 +1475,19 @@ def run_cli(argv: list[str]) -> int:
             started_at_step=start_step,
             auto_detected=not bool(args.init and not args.complete),
         )
+        if (
+            args.init
+            and not args.complete
+            and existing_was_active
+            and existing_state is not None
+            and not args.takeover
+            and "owner" in existing_state
+        ):
+            state["owner"] = existing_state["owner"]
+        write_gate_owner(state, caller)
+        if takeover_from is not None:
+            state["takeover_from"] = takeover_from
+            state["takeover_at"] = state["started_at"]
     elif args.tier:
         # On an already-active state file, tier is monotonically non-decreasing (cannot downgrade standard/deep -> quick)
         current_tier = str(state.get("tier") or "auto").strip().lower()

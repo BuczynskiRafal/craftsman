@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import importlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,21 +23,36 @@ from craftsman.diffscan import DiffScanError
 from craftsman.evidence import ledger_overview
 from craftsman.export import (
     CLAUDE_HOOK_EVENTS,
+    COPILOT_DISCOVERY,
     FRONTMATTER_RE,
     HOOKS_FILENAME,
+    CopilotClient,
+    CopilotDiscoveryLocation,
     _resolve_windows_appdata,
+    _rewrite_antigravity_paths,
+    craftsman_agent_names,
+    craftsman_entity_names,
+    craftsman_skill_names,
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
     default_repo_dir,
     default_vscode_prompts_dir,
+    extract_description_and_body,
+    extract_skill_name,
+     has_user_copilot_install,
+    has_workspace_copilot_install,
+    is_craftsman_generated_file,
     is_craftsman_hook_command,
+    iter_discovered_files,
     resolve_craftsman_pkg_dir,
+    resolve_discovery_dirs,
     user_home,
 )
 from craftsman.export import main as export_main
 from craftsman.gate import (
     compute_cumulative_diff_summary,
+    format_gate_owner,
     resolve_cli_state_file,
     resolve_effective_gear_label,
 )
@@ -158,6 +176,15 @@ def detect_antigravity_drift(repo_dir: Path, config_dir: Path | None = None) -> 
     return drifted
 
 
+def _check_craftsman_scope_sync(skill_dir: Path, body: str) -> str | None:
+    scope_path = skill_dir / "scope.md"
+    if not scope_path.is_file():
+        return "craftsman: missing companion scope.md"
+    if scope_path.read_text(encoding="utf-8").strip() not in body:
+        return "craftsman: SKILL.md 'Search scope' section is out of sync with scope.md"
+    return None
+
+
 def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
     """Validate all SKILL.md files under repo_dir/skills for frontmatter integrity."""
     skills_dir = repo_dir / "skills"
@@ -173,25 +200,21 @@ def validate_skill_manifests(repo_dir: Path) -> tuple[int, list[str]]:
         except OSError as exc:
             errors.append(f"{folder_name}: unreadable SKILL.md ({exc})")
             continue
-
         match = FRONTMATTER_RE.match(content)
         if not match:
             errors.append(f"{folder_name}: missing YAML frontmatter block")
             continue
-
-        fm_raw, body = match.group(1), match.group(2).strip()
-        fm_lines = fm_raw.splitlines()
-        has_name = any(line.startswith("name:") for line in fm_lines)
-        has_desc = any(line.startswith("description:") for line in fm_lines)
-        if not has_name:
+        fm_lines, body = match.group(1).splitlines(), match.group(2).strip()
+        if not any(line.startswith("name:") for line in fm_lines):
             errors.append(f"{folder_name}: frontmatter missing 'name:' field")
-        if not has_desc:
+        if not any(line.startswith("description:") for line in fm_lines):
             errors.append(f"{folder_name}: frontmatter missing 'description:' field")
         if len(body) < 100:
-            errors.append(
-                f"{folder_name}: SKILL.md body is unexpectedly short ({len(body)} chars)"
-            )
-
+            errors.append(f"{folder_name}: SKILL.md body is unexpectedly short ({len(body)} chars)")
+        if folder_name == "craftsman":
+            sync_err = _check_craftsman_scope_sync(skill_path.parent, body)
+            if sync_err:
+                errors.append(sync_err)
     return len(skill_files), errors
 
 
@@ -362,14 +385,300 @@ def _self_check() -> dict[str, bool]:
     return results
 
 
-def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
+@dataclass(frozen=True)
+class CopilotDuplicate:
+    client: CopilotClient
+    kind: str
+    name: str
+    paths: tuple[str, ...]
+    canonical_path: str
+    removable_paths: tuple[str, ...]
+    preserved_paths: tuple[str, ...]
+    claude_collision: bool = False
+    claude_scope: str | None = None
+    scope_collision: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "client": self.client,
+            "kind": self.kind,
+            "name": self.name,
+            "paths": list(self.paths),
+            "canonical_path": self.canonical_path,
+            "removable_paths": list(self.removable_paths),
+            "preserved_paths": list(self.preserved_paths),
+            "claude_collision": self.claude_collision,
+            "claude_scope": self.claude_scope,
+            "scope_collision": self.scope_collision,
+        }
+
+    to_json = to_dict
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_dict()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_dict().get(key, default)
+
+
+def _loads_jsonc_dict(raw: str) -> dict[str, Any] | None:
+    """Parse a VS Code JSONC file (stripping `//`, `/* */` comments and trailing commas)."""
+    out: list[str] = []
+    in_str = escaped = False
+    i, n = 0, len(raw)
+    while i < n:
+        ch = raw[i]
+        if in_str:
+            out.append(ch)
+            escaped = (not escaped) and ch == "\\"
+            if ch == '"' and not (len(out) >= 2 and out[-2] == "\\" and not escaped):
+                in_str = False
+            i += 1
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+        elif raw[i : i + 2] == "//":
+            nl = raw.find("\n", i + 2)
+            i = n if nl == -1 else nl
+        elif raw[i : i + 2] == "/*":
+            end = raw.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+        else:
+            out.append(ch)
+            i += 1
+    try:
+        data = json.loads(re.sub(r",(\s*[}\]])", r"\1", "".join(out)))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _claude_location_candidates(loc: CopilotDiscoveryLocation, home: Path | None) -> set[str]:
+    if loc.scope == "claude-user":
+        leaf = "agents" if loc.rel_path.endswith("agents") else "skills"
+        return {
+            f"~/.claude/{leaf}",
+            f".claude/{leaf}",
+            str(default_claude_dir(home) / leaf).replace("\\", "/"),
+        }
+    return {loc.rel_path, f"./{loc.rel_path}"}
+
+
+def _is_vscode_location_disabled(
+    loc: CopilotDiscoveryLocation, home: Path | None, profile: Path | None
+) -> bool:
+    """Return True if a `.claude` discovery location is explicitly disabled in VS Code settings."""
+    if loc.scope not in ("claude-user", "claude-workspace"):
+        return False
+    setting_key = (
+        "chat.agentFilesLocations"
+        if loc.rel_path.endswith("agents")
+        else "chat.agentSkillsLocations"
+    )
+    settings_files = [default_vscode_prompts_dir(home).parent / "settings.json"]
+    if profile is not None:
+        settings_files.append(profile / "settings.json")
+    candidates = _claude_location_candidates(loc, home)
+    for settings_path in settings_files:
+        try:
+            data = _loads_jsonc_dict(settings_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        loc_map = data.get(setting_key) if isinstance(data, dict) else None
+        if not isinstance(loc_map, dict):
+            continue
+        for key, val in loc_map.items():
+            if val is False and isinstance(key, str):
+                norm = key.replace("\\", "/")
+                if norm in candidates or norm.removeprefix("./") in candidates:
+                    return True
+    return False
+
+
+def _collect_profile_matches(
+    client: CopilotClient,
+    locations: tuple[CopilotDiscoveryLocation, ...],
+    valid_names: set[str],
+    *,
+    home: Path | None,
+    workspace: Path | None,
+    profile: Path | None,
+) -> dict[str, list[tuple[CopilotDiscoveryLocation, Path]]]:
+    found: dict[str, list[tuple[CopilotDiscoveryLocation, Path]]] = {}
+    for loc in locations:
+        if client == "vscode" and _is_vscode_location_disabled(loc, home, profile):
+            continue
+        for directory in resolve_discovery_dirs(loc, home=home, workspace=workspace, profile=profile):
+            for entity_name, file_path in iter_discovered_files(directory, loc.pattern):
+                if entity_name in valid_names:
+                    found.setdefault(entity_name, []).append((loc, file_path))
+    return found
+
+
+def _build_copilot_duplicate(
+    client: CopilotClient,
+    kind: str,
+    entity_name: str,
+    entries: list[tuple[CopilotDiscoveryLocation, Path]],
+    valid_all: frozenset[str],
+) -> CopilotDuplicate:
+    def _is_removable(loc: CopilotDiscoveryLocation, p: Path) -> bool:
+        return (
+            not loc.canonical
+            and loc.scope not in ("claude-user", "claude-workspace")
+            and is_craftsman_generated_file(p, valid_all)
+        )
+
+    canonical_scopes = {loc.scope for loc, _ in entries if loc.canonical}
+    canonical_entry = next(
+        ((loc, p) for loc, p in entries if loc.canonical),
+        next(((loc, p) for loc, p in entries if not _is_removable(loc, p)), entries[0]),
+    )
+    canonical_path = canonical_entry[1]
+    removable = [str(p) for loc, p in entries if p != canonical_path and _is_removable(loc, p)]
+    preserved = [str(p) for loc, p in entries if p != canonical_path and not _is_removable(loc, p)]
+    claude_scopes = [loc.scope for loc, _ in entries if loc.scope in ("claude-user", "claude-workspace")]
+    return CopilotDuplicate(
+        client=client,
+        kind=kind,
+        name=entity_name,
+        paths=tuple(str(p) for _, p in entries),
+        canonical_path=str(canonical_path),
+        removable_paths=tuple(removable),
+        preserved_paths=tuple(preserved),
+        claude_collision=bool(claude_scopes),
+        claude_scope=claude_scopes[-1] if claude_scopes else None,
+        scope_collision=len(canonical_scopes) > 1,
+    )
+
+
+def scan_copilot_duplicates(
+    repo_dir: Path | None = None,
+    *,
+    home: Path | None = None,
+    workspace: Path | None = None,
+) -> list[CopilotDuplicate]:
+    """Scan `COPILOT_DISCOVERY` locations and return Craftsman entities discoverable >1 time."""
+    valid_agents = set(craftsman_agent_names(repo_dir))
+    valid_skills = set(craftsman_skill_names(repo_dir))
+    valid_all = craftsman_entity_names(repo_dir)
+    profiles: list[Path | None] = [None]
+    profiles_root = default_vscode_prompts_dir(home).parent / "profiles"
+    if profiles_root.is_dir():
+        profiles.extend(p for p in sorted(profiles_root.iterdir()) if p.is_dir())
+
+    by_key: dict[tuple[CopilotClient, str, str], list[tuple[CopilotDiscoveryLocation, Path]]] = {}
+    for client in ("vscode", "copilot-cli"):
+        client_profiles = profiles if client == "vscode" else [None]
+        skill_locs = (*COPILOT_DISCOVERY[(client, "skill")], *COPILOT_DISCOVERY[(client, "prompt")])
+        for kind, locs, names in (
+            ("agent", COPILOT_DISCOVERY[(client, "agent")], valid_agents),
+            ("skill", skill_locs, valid_skills),
+        ):
+            for prof in client_profiles:
+                matches_map = _collect_profile_matches(
+                    client, locs, names, home=home, workspace=workspace, profile=prof
+                )
+                for entity_name, matches in matches_map.items():
+                    if len(matches) > 1:
+                        existing = by_key.setdefault((client, kind, entity_name), [])
+                        seen = {p for _, p in existing}
+                        existing.extend((loc, p) for loc, p in matches if p not in seen and not seen.add(p))  # type: ignore[func-returns-value]
+
+    return [
+        _build_copilot_duplicate(client, kind, name, entries, valid_all)
+        for (client, kind, name), entries in sorted(by_key.items(), key=lambda item: item[0])
+    ]
+
+
+def _format_duplicate_problem(dup: CopilotDuplicate) -> str:
+    paths_str = ", ".join(dup.paths)
+    prefix = f"Duplicate Copilot {dup.kind} '{dup.name}' in {dup.client}: {paths_str}"
+    if dup.claude_collision:
+        setting = "chat.agentFilesLocations" if dup.kind == "agent" else "chat.agentSkillsLocations"
+        leaf = "agents" if dup.kind == "agent" else "skills"
+        loc_key = f"~/.claude/{leaf}" if dup.claude_scope == "claude-user" else f".claude/{leaf}"
+        return (
+            f"{prefix} "
+            f'(VS Code also reads Claude Code directories; set "{setting}": {{"{loc_key}": false}} '
+            "in VS Code settings.json to disable)"
+        )
+    if dup.scope_collision and not dup.removable_paths:
+        return (
+            f"{prefix} "
+            "(both user and workspace scopes are installed; uninstall one scope with "
+            "`craftsman uninstall --copilot` or `craftsman uninstall --copilot-workspace <dir>`)"
+        )
+    if dup.preserved_paths:
+        preserved_str = ", ".join(dup.preserved_paths)
+        return f"{prefix} (unmarked user file preserved: {preserved_str}; rename or remove one copy manually)"
+    return f"{prefix} (run `craftsman doctor --fix-duplicates` to remove obsolete Craftsman copies)"
+
+
+def _unlink_duplicate_file(path: Path) -> None:
+    if path.name == "SKILL.md":
+        skill_dir = path.parent
+        path.unlink()
+        for companion in ("lenses.md", "scope.md"):
+            comp_path = skill_dir / companion
+            if comp_path.is_file():
+                comp_path.unlink()
+        with contextlib.suppress(OSError):
+            skill_dir.rmdir()
+    else:
+        path.unlink()
+
+
+def fix_copilot_duplicates(
+    repo_dir: Path | None = None,
+    *,
+    home: Path | None = None,
+    workspace: Path | None = None,
+) -> tuple[list[Path], list[Path]]:
+    """Remove non-canonical Craftsman-generated Copilot duplicates; preserve unmarked and Claude files."""
+    valid_all = craftsman_entity_names(repo_dir)
+    duplicates = scan_copilot_duplicates(repo_dir, home=home, workspace=workspace)
+    removed: list[Path] = []
+    preserved: list[Path] = []
+    seen_removed: set[Path] = set()
+    seen_preserved: set[Path] = set()
+
+    for dup in duplicates:
+        for p_str in dup.preserved_paths:
+            p = Path(p_str)
+            if p not in seen_preserved:
+                preserved.append(p)
+                seen_preserved.add(p)
+        for p_str in dup.removable_paths:
+            p = Path(p_str)
+            if p in seen_removed or not p.is_file():
+                continue
+            if not is_craftsman_generated_file(p, valid_all):
+                if p not in seen_preserved:
+                    preserved.append(p)
+                    seen_preserved.add(p)
+                continue
+            _unlink_duplicate_file(p)
+            removed.append(p)
+            seen_removed.add(p)
+    return removed, preserved
+
+
+def inspect_platforms(
+    workspace: Path | None,
+    *,
+    repo_dir: Path | None = None,
+    home: Path | None = None,
+) -> dict[str, Any]:
     """Copilot and Claude Code integration status; `problems` lists what breaks the gate."""
-    copilot_home = default_copilot_home()
-    claude_dir = default_claude_dir()
-    skills = [_skills_report(default_copilot_skills_dir())]
+    copilot_home = default_copilot_home(home)
+    claude_dir = default_claude_dir(home)
+    skills = [_skills_report(default_copilot_skills_dir(home))]
     if workspace is not None:
         skills.append(_skills_report(workspace / ".github" / "skills"))
     user_hooks = inspect_copilot_hooks(copilot_home / "hooks" / HOOKS_FILENAME)
+    duplicates = scan_copilot_duplicates(repo_dir, home=home, workspace=workspace)
     report: dict[str, Any] = {
         "copilot": {
             "user_hooks": user_hooks,
@@ -382,6 +691,7 @@ def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
                 ),
             },
             "skills": skills,
+            "duplicates": [d.to_dict() for d in duplicates],
         },
         "claude": {
             "agents": _agents_installed(claude_dir / "agents", CLAUDE_AGENT_NAMES, ".md"),
@@ -399,6 +709,7 @@ def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
             f"{user_hooks['path']} runs missing programs ({', '.join(user_hooks['missing'])}); "
             "re-run `craftsman export --user-dir`"
         )
+    problems.extend(_format_duplicate_problem(dup) for dup in duplicates)
     problems.extend(
         f"craftsman.{module} cannot be imported"
         for module, ok in report["cli_self_check"].items()
@@ -408,8 +719,30 @@ def inspect_platforms(workspace: Path | None) -> dict[str, Any]:
     return report
 
 
-def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = None) -> int:
+def _has_vscode_prompts_target(prompts_dir: Path, *, active_with_user_copilot: bool) -> bool:
+    return (
+        (prompts_dir / "craftsman-rules.instructions.md").is_file()
+        or (prompts_dir / "craftsman.prompt.md").is_file()
+        or active_with_user_copilot
+    )
+
+
+def run_doctor(
+    repo_dir: Path,
+    as_json: bool = False,
+    workspace: Path | None = None,
+    *,
+    fix_duplicates: bool = False,
+) -> int:
     """Inspect repository integrity, Git configuration, drift, and installed agent platforms."""
+    home = user_home()
+    fixed_paths: list[Path] = []
+    if fix_duplicates:
+        fixed_paths, _ = fix_copilot_duplicates(repo_dir, home=home, workspace=workspace)
+        if not as_json:
+            for removed_path in fixed_paths:
+                print(f"  [FIXED] Removed duplicate Craftsman file: {removed_path}")
+
     skill_count, skill_errors = validate_skill_manifests(repo_dir)
     expected_skills = _expected_skill_count(repo_dir)
     rule_files = sorted((repo_dir / "rules").glob("*.md")) if (repo_dir / "rules").is_dir() else []
@@ -429,42 +762,50 @@ def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = N
     git_email = git_config_get("user.email")
     hooks_path = git_config_get("core.hooksPath")
 
-    home = user_home()
-    vscode_prompts = default_vscode_prompts_dir()
-    copilot_skills = default_copilot_skills_dir()
+    vscode_prompts = default_vscode_prompts_dir(home)
+    copilot_skills = default_copilot_skills_dir(home)
+    copilot_home = default_copilot_home(home)
     xdg_cfg = os.environ.get("XDG_CONFIG_HOME", "").strip()
     linux_cfg_root = Path(xdg_cfg) if xdg_cfg else (home / ".config")
     win_appdata_root = _resolve_windows_appdata(home) or (home / "AppData" / "Roaming")
+    mac_prompts = (
+        home / "Library" / "Application Support" / "Code" / "User" / "prompts"
+    )
+    linux_prompts = linux_cfg_root / "Code" / "User" / "prompts"
+    win_prompts = win_appdata_root / "Code" / "User" / "prompts"
+    user_copilot_installed = (
+        (copilot_skills / "craftsman" / "SKILL.md").is_file()
+        or (copilot_home / "agents" / "craftsman.agent.md").is_file()
+        or (vscode_prompts / "craftsman.prompt.md").is_file()
+        or has_user_copilot_install(home, repo_dir)
+    )
+    ws_copilot_installed = workspace is not None and has_workspace_copilot_install(
+        workspace, repo_dir
+    )
     installed_targets = {
         "antigravity": (
             (home / ".gemini" / "config" / "skills" / "craftsman" / "SKILL.md").is_file()
             or (home / ".gemini" / "config" / "plugins" / "craftsman" / "plugin.json").is_file()
         ),
-        "claude_code": (home / ".claude" / "commands" / "craftsman.md").is_file(),
-        "github_copilot": (
-            (vscode_prompts / "craftsman.prompt.md").is_file()
-            or (copilot_skills / "craftsman" / "SKILL.md").is_file()
+        "claude_code": (
+            (home / ".claude" / "commands" / "craftsman.md").is_file()
+            or (home / ".claude" / "agents" / "craftsman-reviewer.md").is_file()
         ),
-        "github_copilot_macos": (
-            home
-            / "Library"
-            / "Application Support"
-            / "Code"
-            / "User"
-            / "prompts"
-            / "craftsman.prompt.md"
-        ).is_file(),
-        "github_copilot_linux": (
-            linux_cfg_root / "Code" / "User" / "prompts" / "craftsman.prompt.md"
-        ).is_file(),
-        "github_copilot_windows": (
-            win_appdata_root / "Code" / "User" / "prompts" / "craftsman.prompt.md"
-        ).is_file(),
+        "github_copilot": user_copilot_installed or ws_copilot_installed,
+        "github_copilot_macos": _has_vscode_prompts_target(
+            mac_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == mac_prompts
+        ),
+        "github_copilot_linux": _has_vscode_prompts_target(
+            linux_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == linux_prompts
+        ),
+        "github_copilot_windows": _has_vscode_prompts_target(
+            win_prompts, active_with_user_copilot=user_copilot_installed and vscode_prompts == win_prompts
+        ),
         "global_git_hooks": bool(hooks_path and Path(hooks_path).expanduser().is_dir()),
     }
 
     config_drift = detect_antigravity_drift(repo_dir)
-    platforms = inspect_platforms(workspace)
+    platforms = inspect_platforms(workspace, repo_dir=repo_dir, home=home)
     platforms["problems"].extend(inspect_git_hooks(hooks_path, repo_dir, home))
 
     healthy = (
@@ -496,6 +837,8 @@ def run_doctor(repo_dir: Path, as_json: bool = False, workspace: Path | None = N
         "installed_targets": installed_targets,
         **platforms,
     }
+    if fix_duplicates:
+        report["fixed_duplicates"] = [str(p) for p in fixed_paths]
 
     if as_json:
         sys.stdout.write(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
@@ -592,6 +935,8 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
     payload: dict[str, Any] = {
         "state_file": str(state_file) if state_file else None,
         "active": bool(state.get("active", False)),
+        "owner": state.get("owner"),
+        "started_at": state.get("started_at"),
         "configured_tier": tier,
         "effective_gear": effective_gear,
         "stage": state.get("stage", "idle"),
@@ -607,8 +952,14 @@ def run_status(state_file: Path | None, cwd: str | None, as_json: bool = False) 
         sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         return 0
 
+    owner_label = (
+        format_gate_owner(state.get("owner"))
+        if state.get("owner") is not None
+        else ("unknown (legacy)" if payload["active"] else "none")
+    )
     print(f"Craftsman Status (v{__version__})")
     print(f"  Active         : {payload['active']}")
+    print(f"  Owner          : {owner_label}")
     print(f"  Effective Gear : {effective_gear}")
     print(f"  Stage          : {payload['stage']}")
     print(f"  Base SHA       : {base_sha or 'HEAD'}")
@@ -638,6 +989,150 @@ def _describe_ledger(info: dict[str, Any] | None, error: str | None) -> str:
         f"no verdict {verdicts['none']}, "
         f"resolved {info['resolved']}); latest runs: {runs or 'none'}"
     )
+
+
+def _discover_skill_dirs(repo_dir: Path) -> dict[str, Path]:
+    skills_root = (repo_dir / "skills").resolve()
+    if not skills_root.is_dir():
+        return {}
+    result: dict[str, Path] = {}
+    for skill_md in sorted(skills_root.glob("*/SKILL.md")):
+        skill_dir = skill_md.parent.resolve()
+        if skill_dir.is_relative_to(skills_root):
+            folder_name = skill_md.parent.name
+            result[folder_name] = skill_dir
+            try:
+                raw = skill_md.read_text(encoding="utf-8")
+                fm_name = extract_skill_name(raw, folder_name)
+                if fm_name:
+                    result.setdefault(fm_name, skill_dir)
+            except OSError:
+                pass
+    return result
+
+
+def _validate_skill_relative_file(skill_dir: Path, rel_file: str, skill_name: str) -> Path:
+    if not rel_file or not rel_file.strip():
+        raise ValueError(f"--file for skill {skill_name!r} must not be empty")
+    rel_path = Path(rel_file)
+    if (
+        rel_path.is_absolute()
+        or rel_file.startswith(("/", "\\"))
+        or ".." in rel_path.parts
+        or (len(rel_path.parts) > 0 and ":" in rel_path.parts[0])
+    ):
+        raise ValueError(
+            f"--file {rel_file!r} must be a relative path inside skill {skill_name!r} (no '..' or absolute paths)"
+        )
+    cur = skill_dir
+    for part in rel_path.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            resolved_link = cur.resolve()
+            if not resolved_link.is_relative_to(skill_dir):
+                raise ValueError(
+                    f"--file {rel_file!r} escapes skill directory {skill_name!r} via symlink"
+                )
+    resolved = (skill_dir / rel_path).resolve()
+    if resolved == skill_dir or not resolved.is_relative_to(skill_dir):
+        raise ValueError(
+            f"--file {rel_file!r} must resolve inside skill directory {skill_name!r}"
+        )
+    if not resolved.is_file():
+        raise FileNotFoundError(f"file {rel_file!r} not found in skill {skill_name!r}")
+    return resolved
+
+
+def _build_skill_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--repo-dir",
+        type=Path,
+        default=default_repo_dir(),
+        help="Path to the Craftsman repository or bundled assets root.",
+    )
+    parser = argparse.ArgumentParser(
+        prog="craftsman skill",
+        description="Read bundled Craftsman skills and companion files without searching the disk.",
+    )
+    sub = parser.add_subparsers(dest="subcommand", required=True)
+    show_p = sub.add_parser(
+        "show",
+        parents=[common],
+        help="Print a bundled SKILL.md or companion file (such as lenses.md) to stdout.",
+    )
+    show_p.add_argument("name", help="Skill name (e.g. craftsman, code-review, simplify)")
+    show_p.add_argument(
+        "--file", dest="rel_file", help="Relative file inside the skill directory (e.g. lenses.md)"
+    )
+    list_p = sub.add_parser(
+        "list",
+        parents=[common],
+        help="List bundled skill names and their one-sentence descriptions.",
+    )
+    list_p.add_argument("--json", action="store_true", help="Output skill list as JSON.")
+    path_p = sub.add_parser(
+        "path", parents=[common], help="Print the resolved directory path of a bundled skill."
+    )
+    path_p.add_argument("name", help="Skill name (e.g. craftsman, code-review)")
+    return parser
+
+
+def _list_skills(known: dict[str, Path], *, as_json: bool) -> int:
+    entries: list[dict[str, str]] = []
+    seen_dirs: set[Path] = set()
+    for folder_name, skill_dir in known.items():
+        if skill_dir in seen_dirs:
+            continue
+        seen_dirs.add(skill_dir)
+        raw = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        name = extract_skill_name(raw, folder_name)
+        desc, _ = extract_description_and_body(raw, name)
+        first_sentence = desc.split(". ", 1)[0].rstrip(".") + "." if desc else ""
+        entries.append({"name": folder_name, "description": first_sentence, "path": str(skill_dir)})
+    if as_json:
+        sys.stdout.write(json.dumps(entries, indent=2, ensure_ascii=False) + "\n")
+        return 0
+    width = max((len(e["name"]) for e in entries), default=12)
+    for entry in entries:
+        print(f"{entry['name']:<{width}}  {entry['description']}")
+    return 0
+
+
+def skill_main(argv: list[str] | None = None) -> int:
+    parser = _build_skill_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    known = _discover_skill_dirs(Path(args.repo_dir).resolve())
+
+    if args.subcommand == "list":
+        return _list_skills(known, as_json=bool(args.json))
+
+    skill_name: str = args.name
+    if skill_name not in known:
+        available = ", ".join(sorted(known)) or "none"
+        sys.stderr.write(
+            f"craftsman skill: error: unknown skill {skill_name!r} (available: {available})\n"
+        )
+        return 2
+
+    skill_dir = known[skill_name]
+    if args.subcommand == "path":
+        print(str(skill_dir))
+        return 0
+
+    try:
+        target = (
+            _validate_skill_relative_file(skill_dir, args.rel_file, skill_name)
+            if args.rel_file is not None
+            else (skill_dir / "SKILL.md").resolve()
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        sys.stderr.write(f"craftsman skill: error: {exc}\n")
+        return 2
+
+    content = _rewrite_antigravity_paths(target.read_text(encoding="utf-8"))
+    sys.stdout.write(content if content.endswith("\n") else content + "\n")
+    return 0
 
 
 def _tolerate_unencodable_output() -> None:
@@ -672,6 +1167,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     doc_parser.add_argument(
         "--workspace", type=Path, help="Also check the Copilot agents and skills of this project."
+    )
+    doc_parser.add_argument(
+        "--fix-duplicates",
+        action="store_true",
+        help="Remove obsolete Craftsman-generated duplicate Copilot agents and commands, keeping the canonical copy.",
     )
 
     stat_parser = subparsers.add_parser(
@@ -709,6 +1209,10 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser(
         "run", help="Run a command and record its exit code in the evidence ledger."
     )
+    subparsers.add_parser(
+        "skill",
+        help="Read bundled Craftsman skills and companion files without searching the disk.",
+    )
 
     if not args_list:
         parser.print_help()
@@ -731,11 +1235,18 @@ def main(argv: list[str] | None = None) -> int:
         return review_main(args_list[1:])
     if cmd == "run":
         return run_main(args_list[1:])
+    if cmd == "skill":
+        return skill_main(args_list[1:])
 
     parsed = parser.parse_args(args_list)
     if parsed.command == "doctor":
         workspace = parsed.workspace.resolve() if parsed.workspace else None
-        return run_doctor(parsed.repo_dir.resolve(), as_json=bool(parsed.json), workspace=workspace)
+        return run_doctor(
+            parsed.repo_dir.resolve(),
+            as_json=bool(parsed.json),
+            workspace=workspace,
+            fix_duplicates=bool(parsed.fix_duplicates),
+        )
     if parsed.command == "status":
         return run_status(parsed.state_file, parsed.cwd, as_json=bool(parsed.json))
 

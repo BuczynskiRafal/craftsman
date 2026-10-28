@@ -196,7 +196,7 @@ class SkillExportTests(ExportTestCase):
 
     def test_single_file_formats_inline_linked_siblings(self) -> None:
         prompts = self.tmp / "prompts"
-        export.export_to_vscode_user(REPO_ROOT, prompts)
+        export.export_to_vscode_user(REPO_ROOT, prompts, prompt_files=True)
         claude = self.tmp / "claude"
         export.export_to_claude_user(REPO_ROOT, claude)
 
@@ -208,14 +208,21 @@ class SkillExportTests(ExportTestCase):
         self.assertNotIn("## Appendix", (prompts / "verify.prompt.md").read_text(encoding="utf-8"))
 
     def test_prompt_files_route_craftsman_to_its_agent(self) -> None:
+        default_prompts = self.tmp / "default_prompts"
+        count, instr = export.export_to_vscode_user(REPO_ROOT, default_prompts)
+        self.assertEqual(count, 0)
+        self.assertTrue(instr.is_file())
+        self.assertEqual(list(default_prompts.glob("*.prompt.md")), [])
+        self.assertEqual(list(default_prompts.glob("*.agent.md")), [])
+
         prompts = self.tmp / "prompts"
-        export.export_to_vscode_user(REPO_ROOT, prompts)
+        export.export_to_vscode_user(REPO_ROOT, prompts, prompt_files=True)
         craftsman = (prompts / "craftsman.prompt.md").read_text(encoding="utf-8")
         verify = (prompts / "verify.prompt.md").read_text(encoding="utf-8")
         self.assertEqual(frontmatter(craftsman)[0], "agent: 'craftsman'")
         self.assertEqual(frontmatter(verify)[0], "agent: 'agent'")
         self.assertNotIn("mode:", "".join(frontmatter(craftsman) + frontmatter(verify)))
-        self.assertTrue((prompts / "craftsman-reviewer.agent.md").is_file())
+        self.assertEqual(list(prompts.glob("*.agent.md")), [])
 
     def test_agents_md_describes_the_v3_loop(self) -> None:
         text = export.render_agents_md(REPO_ROOT)
@@ -433,7 +440,7 @@ class ClaudeSettingsMergeTests(ExportTestCase):
             [
                 *original["hooks"]["PreToolUse"],
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|Read|Grep|Glob|LS",
                     "hooks": [
                         {
                             "type": "command",
@@ -516,7 +523,13 @@ class DoctorTests(ExportTestCase):
             capture_output=True,
             text=True,
             timeout=120,
-            env={**os.environ, "HOME": str(self.tmp), "USERPROFILE": str(self.tmp)},
+            env={
+                **os.environ,
+                "HOME": str(self.tmp),
+                "USERPROFILE": str(self.tmp),
+                "APPDATA": "",
+                "XDG_CONFIG_HOME": "",
+            },
         )
         report = json.loads(proc.stdout)
         assert isinstance(report, dict)
@@ -524,21 +537,34 @@ class DoctorTests(ExportTestCase):
 
     def test_reports_platform_integration(self) -> None:
         ws = self.tmp / "ws"
-        export.export_to_workspace(REPO_ROOT, ws)
         export.export_copilot_home(REPO_ROOT, self.tmp / ".copilot")
         export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
 
-        code, report = self.doctor("--workspace", str(ws))
+        code, report = self.doctor()
 
         self.assertEqual(code, 0, report["problems"])
         self.assertTrue(report["healthy"])
+        self.assertTrue(report["installed_targets"]["github_copilot"])
         self.assertEqual(report["cli_self_check"], {"ledger": True, "diffscan": True})
         copilot = report["copilot"]
         self.assertTrue(copilot["user_hooks"]["exists"])
         self.assertTrue(copilot["user_hooks"]["runnable"])
-        self.assertEqual(copilot["agents"], {"user": True, "workspace": True})
-        self.assertEqual([entry["code_review_lenses"] for entry in copilot["skills"]], [True, True])
+        self.assertEqual(copilot["agents"], {"user": True, "workspace": None})
+        self.assertEqual([entry["code_review_lenses"] for entry in copilot["skills"]], [True])
+        self.assertEqual(copilot["duplicates"], [])
         self.assertEqual(report["claude"], {"agents": False, "hooks_merged": False})
+
+        # Exporting to workspace alongside user install creates duplicate scopes that doctor flags
+        export.export_to_workspace(REPO_ROOT, ws)
+        dup_code, dup_report = self.doctor("--workspace", str(ws))
+        self.assertEqual(dup_code, 1)
+        self.assertFalse(dup_report["healthy"])
+        self.assertEqual(dup_report["copilot"]["agents"], {"user": True, "workspace": True})
+        self.assertEqual(
+            [entry["code_review_lenses"] for entry in dup_report["copilot"]["skills"]],
+            [True, True],
+        )
+        self.assertTrue(dup_report["copilot"]["duplicates"])
 
         export.export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
         text_proc = subprocess.run(
@@ -585,6 +611,131 @@ class DoctorTests(ExportTestCase):
         )
         posix = "'/opt/my python/bin/python3' -m craftsman.cli hook stop --platform copilot"
         self.assertEqual(_command_executables(posix), ["/opt/my python/bin/python3"])
+
+    def test_rendered_prompts_omit_filesystem_skill_lookups(self) -> None:
+        import re
+
+        user_prompts = self.tmp / "prompts"
+        copilot_skills = self.tmp / "copilot_skills"
+        copilot_home = self.tmp / "copilot_home"
+        claude_dir = self.tmp / "claude"
+        ws = self.tmp / "ws"
+        export.export_to_vscode_user(REPO_ROOT, user_prompts)
+        export.export_to_copilot_skills(REPO_ROOT, copilot_skills)
+        export.export_copilot_home(REPO_ROOT, copilot_home)
+        export.export_to_claude_user(REPO_ROOT, claude_dir)
+        export.export_to_agents_workspace(REPO_ROOT, ws)
+
+        rendered_files = [
+            *user_prompts.rglob("*.md"),
+            *copilot_skills.rglob("*.md"),
+            *copilot_home.rglob("*.md"),
+            *claude_dir.rglob("*.md"),
+            ws / "AGENTS.md",
+        ]
+        self.assertGreater(len(rendered_files), 30)
+
+        forbidden_phrases = (
+            "installed next to this agent",
+            "open the file and follow it",
+            "in the `code-review` skill folder (`lenses.md`)",
+        )
+        bare_skill_lookup_re = re.compile(r"skills/[a-z0-9_-]+/SKILL\.md")
+
+        for path in rendered_files:
+            text = path.read_text(encoding="utf-8")
+            for phrase in forbidden_phrases:
+                self.assertNotIn(phrase, text, f"Forbidden phrase {phrase!r} in {path}")
+            self.assertIsNone(
+                bare_skill_lookup_re.search(text),
+                f"Bare skills/<name>/SKILL.md lookup in {path}",
+            )
+
+    def test_rendered_prompts_include_search_scope_rules(self) -> None:
+        copilot_skills = self.tmp / "copilot_skills"
+        copilot_home = self.tmp / "copilot_home"
+        claude_dir = self.tmp / "claude"
+        ws = self.tmp / "ws"
+        export.export_to_copilot_skills(REPO_ROOT, copilot_skills)
+        export.export_copilot_home(REPO_ROOT, copilot_home)
+        export.export_to_claude_user(REPO_ROOT, claude_dir)
+        export.export_to_agents_workspace(REPO_ROOT, ws)
+
+        for agent_file in [*copilot_home.glob("agents/*.agent.md"), *claude_dir.glob("agents/*.md")]:
+            self.assertIn("Search scope", agent_file.read_text(encoding="utf-8"), str(agent_file))
+
+        for skill_name in ("craftsman", "feature-dev", "verify", "code-review", "simplify", "modernize", "batch"):
+            skill_md = copilot_skills / skill_name / "SKILL.md"
+            claude_cmd = claude_dir / "commands" / f"{skill_name}.md"
+            self.assertIn("## Search scope", skill_md.read_text(encoding="utf-8"), str(skill_md))
+            self.assertIn("## Search scope", claude_cmd.read_text(encoding="utf-8"), str(claude_cmd))
+        self.assertIn("## Search scope", (ws / "AGENTS.md").read_text(encoding="utf-8"))
+
+    def test_skill_cli_resolves_hyphenated_frontmatter_names(self) -> None:
+        from craftsman.cli import skill_main
+
+        for name in ("code-quality", "code_quality", "extreme-optimizer", "extreme_optimizer"):
+            self.assertEqual(skill_main(["show", name, "--repo-dir", str(REPO_ROOT)]), 0)
+            self.assertEqual(skill_main(["path", name, "--repo-dir", str(REPO_ROOT)]), 0)
+
+    def test_fix_duplicates_removes_legacy_prompt_keeping_claude_skill(self) -> None:
+        from craftsman.cli import fix_copilot_duplicates, scan_copilot_duplicates
+
+        vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
+        vscode_prompts.mkdir(parents=True, exist_ok=True)
+        legacy_prompt = vscode_prompts / "verify.prompt.md"
+        legacy_prompt.write_text(
+            "---\nname: verify\n---\n<!-- craftsman:generated -->\nLegacy prompt\n",
+            encoding="utf-8",
+        )
+        claude_skill = self.tmp / ".claude" / "skills" / "verify" / "SKILL.md"
+        claude_skill.parent.mkdir(parents=True, exist_ok=True)
+        claude_skill.write_text("---\nname: verify\n---\nClaude skill\n", encoding="utf-8")
+
+        dups = scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
+        self.assertEqual(len(dups), 1)
+        dup0 = dups[0] if isinstance(dups[0], dict) else dups[0].to_json()
+        self.assertEqual(dup0["canonical_path"], str(claude_skill))
+        self.assertEqual(dup0["removable_paths"], [str(legacy_prompt)])
+        removed, _ = fix_copilot_duplicates(REPO_ROOT, home=self.tmp)
+        self.assertEqual(removed, [legacy_prompt])
+        self.assertFalse(legacy_prompt.exists())
+        self.assertTrue(claude_skill.is_file())
+
+    def test_jsonc_settings_disable_claude_skill_location(self) -> None:
+        from craftsman.cli import scan_copilot_duplicates
+
+        vscode_prompts = export.default_vscode_prompts_dir(self.tmp)
+        vscode_prompts.mkdir(parents=True, exist_ok=True)
+        claude_skill = self.tmp / ".claude" / "skills" / "verify" / "SKILL.md"
+        claude_skill.parent.mkdir(parents=True, exist_ok=True)
+        claude_skill.write_text("---\nname: verify\n---\nClaude skill\n", encoding="utf-8")
+
+        settings_json = vscode_prompts.parent / "settings.json"
+        settings_json.write_text(
+            '{\n  // comment in JSONC\n  "chat.agentSkillsLocations": {\n    "~/.claude/skills": false,\n  },\n}\n',
+            encoding="utf-8",
+        )
+        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
+        self.assertEqual(scan_copilot_duplicates(REPO_ROOT, home=self.tmp), [])
+
+    def test_env_var_for_home_honors_xdg_outside_real_home(self) -> None:
+        real_home = export.user_home(None)
+        with unittest.mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}, clear=False):
+            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", real_home), "/opt/cfg")
+            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
+            self.assertEqual(
+                export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated_home"), ""
+            )
+
+    def test_craftsman_scope_fragment_matches_skill_document(self) -> None:
+        from craftsman.cli import validate_skill_manifests
+
+        scope_md = (REPO_ROOT / "skills" / "craftsman" / "scope.md").read_text(encoding="utf-8").strip()
+        skill_md = (REPO_ROOT / "skills" / "craftsman" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(scope_md, skill_md)
+        _, errors = validate_skill_manifests(REPO_ROOT)
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,16 @@ Old code is a specification nobody wrote down. Rewrite it from memory and you lo
 was quietly enforcing. This workflow recovers the rules first and keeps them under test while
 the code changes.
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, or Craftsman's own data via `craftsman …` CLI commands. Never run recursive
+searches of `~`, `/`, or parent directories, and never open other repositories, other projects'
+packets/ledgers/reports, or assistant session stores (run
+`craftsman skill show craftsman --file scope.md` for the full contract).
+
 ## 1. Survey and agree on the goal
 Map the target: entry points, inputs and outputs, dependencies in both directions, existing tests,
 known problems. Agree with the user on the kind of change — **upgrade** (newer language, library or

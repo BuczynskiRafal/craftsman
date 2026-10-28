@@ -691,6 +691,7 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                     str(user_prompts),
                     "--workspace",
                     str(workspace),
+                    "--allow-duplicate-scopes",
                     "--claude-dir",
                     str(claude_dir),
                     "--agents-workspace",
@@ -699,11 +700,12 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
                 check=True,
                 env={**os.environ, "HOME": tmpdir, "USERPROFILE": tmpdir},
             )
-            self.assertTrue((user_prompts / "craftsman.prompt.md").is_file())
+            self.assertFalse((user_prompts / "craftsman.prompt.md").exists())
             self.assertTrue((user_prompts / "craftsman-rules.instructions.md").is_file())
-            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 17)
+            self.assertEqual(len(list(user_prompts.glob("*.prompt.md"))), 0)
             self.assertTrue((workspace / ".github" / "copilot-instructions.md").is_file())
-            self.assertEqual(len(list((workspace / ".github" / "prompts").glob("*.prompt.md"))), 17)
+            self.assertEqual(len(list((workspace / ".github" / "skills").glob("*/SKILL.md"))), 17)
+            self.assertFalse((workspace / ".github" / "prompts").exists())
             self.assertEqual(len(list((claude_dir / "commands").glob("*.md"))), 17)
             self.assertTrue((claude_dir / "rules" / "craftsman-rules.md").is_file())
             self.assertTrue((workspace / "AGENTS.md").is_file())
@@ -777,6 +779,55 @@ class NativeGitHooksAndMultiPlatformExportTests(unittest.TestCase):
             )
             self.assertEqual(res["decision"], "allow")
 
+    def test_isolated_cd_does_not_bypass_push_to_main_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "repo"
+            other_dir = Path(tmpdir) / "other"
+            repo_dir.mkdir()
+            other_dir.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"], cwd=repo_dir, capture_output=True, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "dev@example.com"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Dev"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--allow-empty", "--no-verify", "-m", "init"],
+                cwd=repo_dir,
+                capture_output=True,
+                check=True,
+            )
+            for cmd in (
+                "(cd /tmp && ls) && git push",
+                "(cd ~ && ls) && git push origin HEAD",
+                f"pushd {other_dir}; popd; git push",
+                "echo `cd /tmp`; git push",
+                "cd /tmp | true; git push",
+                "cd /tmp & git push",
+                "f() { cd /tmp; }; git push",
+                "(case x in a) cd /tmp;; esac); git push",
+            ):
+                with self.subTest(cmd=cmd):
+                    res = run_hook(
+                        GIT_GUARD,
+                        {
+                            "toolCall": {
+                                "name": "run_command",
+                                "args": {"CommandLine": cmd, "Cwd": str(repo_dir)},
+                            },
+                        },
+                    )
+                    self.assertEqual(res["decision"], "force_ask", cmd)
+
 
 class CraftsmanCliAndManifestTests(unittest.TestCase):
     def test_cli_version_and_doctor_json(self) -> None:
@@ -787,7 +838,7 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("3.0.0", ver_proc.stdout)
+        self.assertIn("3.1.0", ver_proc.stdout)
 
         with tempfile.TemporaryDirectory() as fake_home:
             doc_proc = subprocess.run(
@@ -884,6 +935,118 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             self.assertIn("deep", payload3["effective_gear"])
             self.assertNotIn("gates", payload3)
             self.assertEqual(payload3["ledger"]["rounds"], 0)
+
+    def test_skill_cli_shows_bundled_skill_files(self) -> None:
+        import contextlib
+        import io
+
+        from craftsman.cli import main as cli_main
+
+        def run_cli(*args: str) -> tuple[int, str, str]:
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_main(list(args))
+            return code, out.getvalue(), err.getvalue()
+
+        code_list, out_list, err_list = run_cli("skill", "list", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_list, 0, err_list)
+        self.assertIn("craftsman", out_list)
+        self.assertIn("code-review", out_list)
+
+        code_json, out_json, _ = run_cli("skill", "list", "--json", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_json, 0)
+        parsed_list = json.loads(out_json)
+        self.assertEqual(len(parsed_list), 17)
+
+        code_path, out_path, _ = run_cli("skill", "path", "code-review", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_path, 0)
+        self.assertEqual(Path(out_path.strip()), (REPO_ROOT / "skills" / "code-review").resolve())
+
+        code_show, out_show, _ = run_cli("skill", "show", "craftsman", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_show, 0)
+        self.assertIn("name: craftsman", out_show)
+        self.assertNotIn("~/.gemini/config/scripts/craftsman-stop-gate.py", out_show)
+
+        code_lenses, out_lenses, _ = run_cli(
+            "skill", "show", "code-review", "--file", "lenses.md", "--repo-dir", str(REPO_ROOT)
+        )
+        self.assertEqual(code_lenses, 0)
+        self.assertIn("## `intent`", out_lenses)
+
+    def test_skill_cli_rejects_escaping_or_unknown_paths(self) -> None:
+        import contextlib
+        import io
+
+        from craftsman.cli import main as cli_main
+
+        def run_cli(*args: str) -> tuple[int, str, str]:
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_main(list(args))
+            return code, out.getvalue(), err.getvalue()
+
+        code_unk, _, err_unk = run_cli("skill", "show", "no-such-skill", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(code_unk, 2)
+        self.assertIn("unknown skill 'no-such-skill'", err_unk)
+
+        for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
+            code_bad, _, err_bad = run_cli(
+                "skill", "show", "code-review", "--file", bad_file, "--repo-dir", str(REPO_ROOT)
+            )
+            self.assertEqual(code_bad, 2, f"Expected exit 2 for --file={bad_file!r}")
+            self.assertIn("craftsman skill: error:", err_bad)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir).resolve()
+            fake_repo = tmp_path / "repo"
+            skill_dir = fake_repo / "skills" / "code-review"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8")
+            outside = tmp_path / "secret.md"
+            outside.write_text("top secret\n", encoding="utf-8")
+            (skill_dir / "escape.md").symlink_to(outside)
+
+            code_sym, _, err_sym = run_cli(
+                "skill", "show", "code-review", "--file", "escape.md", "--repo-dir", str(fake_repo)
+            )
+            self.assertEqual(code_sym, 2)
+            self.assertIn("escapes skill directory", err_sym)
+
+    def test_review_show_packet_path_prints_current_round_packet(self) -> None:
+        import contextlib
+        import io
+
+        from craftsman.cli import main as cli_main
+
+        def run_cli(*args: str) -> tuple[int, str, str]:
+            out = io.StringIO()
+            err = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cli_main(list(args))
+            return code, out.getvalue(), err.getvalue()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir).resolve()
+            ev_repo = EvidenceRepo(tmp_path / "ev_repo")
+            ev_repo.write_lines("app.py", 5)
+            code_nopkt, _, err_nopkt = run_cli(
+                "review", "show", "--packet-path", "--cwd", str(ev_repo.root)
+            )
+            self.assertEqual(code_nopkt, 1)
+            self.assertIn("no review round yet", err_nopkt)
+
+            code_prep, _, err_prep = run_cli("review", "prepare", "--cwd", str(ev_repo.root))
+            self.assertEqual(code_prep, 0, err_prep)
+            code_pkt, out_pkt, err_pkt = run_cli(
+                "review", "show", "--packet-path", "--cwd", str(ev_repo.root)
+            )
+            self.assertEqual(code_pkt, 0, err_pkt)
+            pkt_path = Path(out_pkt.strip())
+            self.assertTrue(pkt_path.is_absolute())
+            self.assertTrue(pkt_path.is_file())
+            self.assertEqual(pkt_path.name, "packet-1.md")
 
     def test_all_17_skills_have_valid_english_frontmatter_and_match_manifest(self) -> None:
         manifest = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
@@ -2110,11 +2273,17 @@ class CraftsmanCliAndManifestTests(unittest.TestCase):
             prof_a = code_user / "profiles" / "work-profile-1"
             prof_a.mkdir(parents=True)
             export_to_vscode_user(REPO_ROOT, code_user / "prompts")
-            self.assertTrue((code_user / "prompts" / "craftsman.prompt.md").is_file())
-            self.assertTrue((prof_a / "prompts" / "craftsman.prompt.md").is_file())
+            self.assertFalse((code_user / "prompts" / "craftsman.prompt.md").exists())
+            self.assertFalse((prof_a / "prompts" / "craftsman.prompt.md").exists())
+            self.assertTrue(
+                (code_user / "prompts" / "craftsman-rules.instructions.md").is_file()
+            )
             self.assertTrue(
                 (prof_a / "prompts" / "craftsman-rules.instructions.md").is_file()
             )
+            export_to_vscode_user(REPO_ROOT, code_user / "prompts", prompt_files=True)
+            self.assertTrue((code_user / "prompts" / "craftsman.prompt.md").is_file())
+            self.assertTrue((prof_a / "prompts" / "craftsman.prompt.md").is_file())
             prompt_content = (code_user / "prompts" / "craftsman.prompt.md").read_text(
                 encoding="utf-8"
             )

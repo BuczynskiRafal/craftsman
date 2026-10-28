@@ -16,6 +16,7 @@ import shlex
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -134,106 +135,89 @@ def emit(decision: str, reason: str | None = None) -> None:
     sys.stdout.flush()
 
 
-def split_shell_segments(command_line: str) -> list[str]:
-    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
-    segments: list[str] = []
+def _consume_heredoc_body(command_line: str, start: int, delim: str) -> tuple[str, int]:
+    i, n = start, len(command_line)
+    chunks: list[str] = []
+    while i < n:
+        line_end = command_line.find("\n", i)
+        if line_end == -1:
+            chunks.append(command_line[i:])
+            return "".join(chunks), n
+        line_str = command_line[i : line_end + 1]
+        chunks.append(line_str)
+        i = line_end + 1
+        if line_str.strip() == delim:
+            break
+    return "".join(chunks), i
+
+
+def _is_standalone_brace(command_line: str, idx: int) -> bool:
+    if command_line[idx] not in ("{", "}"):
+        return False
+    n = len(command_line)
+    sep = (" ", "\t", "\n", ";", "(", ")", "|", "&", "`")
+    prev_ok = idx == 0 or command_line[idx - 1] in sep
+    next_ok = idx + 1 == n or command_line[idx + 1] in sep
+    return prev_ok and next_ok
+
+
+def _is_redirection_ampersand(command_line: str, idx: int) -> bool:
+    n = len(command_line)
+    return command_line[idx] == "&" and (
+        (idx > 0 and command_line[idx - 1] in (">", "<"))
+        or (idx + 1 < n and command_line[idx + 1] == ">")
+    )
+
+
+def _flush_segment(current: list[str], events: list[str]) -> list[str]:
+    seg = "".join(current).strip()
+    if seg:
+        events.append(seg)
+    return []
+
+
+def _split_shell_events(command_line: str) -> list[str]:
+    """Split a shell command line into command segments and subshell boundary tokens `(` and `)`."""
+    events: list[str] = []
     current: list[str] = []
     quote: str | None = None
     escaped = False
-    i = 0
-    n = len(command_line)
-
+    i, n = 0, len(command_line)
     while i < n:
         ch = command_line[i]
-        if escaped:
-            current.append(ch)
-            escaped = False
-            i += 1
-            continue
-        if ch == "\\":
-            if quote == "'":
-                current.append(ch)
-            else:
-                escaped = True
-                current.append(ch)
-            i += 1
-            continue
-        if quote:
-            if ch == quote:
-                quote = None
+        if escaped or ch == "\\":
+            escaped = (not escaped) and ch == "\\" and quote != "'"
             current.append(ch)
             i += 1
-            continue
-        if ch in ("'", '"'):
-            quote = ch
+        elif quote or ch in ("'", '"'):
+            quote = None if quote == ch else (ch if quote is None else quote)
             current.append(ch)
             i += 1
-            continue
-        if ch == "\n":
-            seg_so_far = "".join(current)
-            hd_match = HEREDOC_OPEN_RE.search(seg_so_far)
-            if hd_match:
-                delim = hd_match.group(1) or hd_match.group(2) or hd_match.group(3)
-                current.append(ch)
-                i += 1
-                while i < n:
-                    line_end = command_line.find("\n", i)
-                    if line_end == -1:
-                        line_str = command_line[i:]
-                        current.append(line_str)
-                        i = n
-                        break
-                    line_str = command_line[i : line_end + 1]
-                    current.append(line_str)
-                    i = line_end + 1
-                    if line_str.strip() == delim:
-                        break
-                seg = "".join(current).strip()
-                if seg:
-                    segments.append(seg)
-                current = []
-                continue
-        if ch in (";", "\n", "(", ")", "`") or (
-            ch in ("{", "}")
-            and (
-                i == 0
-                or command_line[i - 1] in (" ", "\t", "\n", ";", "(", ")", "|", "&", "`")
-            )
-            and (
-                i + 1 == n
-                or command_line[i + 1] in (" ", "\t", "\n", ";", "(", ")", "|", "&", "`")
-            )
-        ):
-            seg = "".join(current).strip()
-            if seg:
-                segments.append(seg)
-            current = []
+        elif ch == "\n" and (hd := HEREDOC_OPEN_RE.search("".join(current))):
+            delim = hd.group(1) or hd.group(2) or hd.group(3)
+            body, i = _consume_heredoc_body(command_line, i + 1, delim)
+            current.extend(("\n", body))
+            current = _flush_segment(current, events)
+        elif ch in ("(", ")"):
+            current = _flush_segment(current, events)
+            events.append(ch)
             i += 1
-            continue
-        if ch in ("|", "&"):
-            if ch == "&" and (
-                (i > 0 and command_line[i - 1] in (">", "<"))
-                or (i + 1 < n and command_line[i + 1] == ">")
-            ):
-                current.append(ch)
-                i += 1
-                continue
-            if i + 1 < n and command_line[i + 1] == ch:
-                i += 2
-            else:
-                i += 1
-            seg = "".join(current).strip()
-            if seg:
-                segments.append(seg)
-            current = []
-            continue
-        current.append(ch)
-        i += 1
+        elif ch in (";", "\n", "`") or _is_standalone_brace(command_line, i):
+            current = _flush_segment(current, events)
+            i += 1
+        elif ch in ("|", "&") and not _is_redirection_ampersand(command_line, i):
+            i += 2 if (i + 1 < n and command_line[i + 1] == ch) else 1
+            current = _flush_segment(current, events)
+        else:
+            current.append(ch)
+            i += 1
+    _flush_segment(current, events)
+    return events
 
-    tail = "".join(current).strip()
-    if tail:
-        segments.append(tail)
-    return segments
+
+def split_shell_segments(command_line: str) -> list[str]:
+    """Split a shell command line on unquoted `;`, `|`, `&&`, `||`, subshells, braces, or newlines, preserving heredoc bodies."""
+    return [ev for ev in _split_shell_events(command_line) if ev not in ("(", ")")]
 
 
 def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
@@ -351,17 +335,59 @@ def _separate_unquoted_redirections(cmd_header: str) -> str:
     return "".join(out)
 
 
-def tokenize_segment(segment: str) -> list[str]:
-    cmd_header = segment.split("\n", 1)[0]
-    hd_match = HEREDOC_OPEN_RE.search(cmd_header)
-    if hd_match:
-        cmd_header = cmd_header[: hd_match.start()]
+_UNQUOTED_WIN_PATH_TOKEN_RE = re.compile(
+    r"(?<!\S)(?:[A-Za-z]:|~|\.\.?|%[A-Za-z_][A-Za-z0-9_]*%|\$(?:HOME|\{HOME\}|env:[A-Za-z_][A-Za-z0-9_]*))\\[^\s\"';|&<>()]*"
+)
+CD_COMMANDS = frozenset({"cd", "pushd", "chdir", "set-location", "sl"})
+POPD_COMMANDS = frozenset({"popd", "pop-location"})
+
+
+def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
+    """Double backslashes inside unquoted Windows/tilde/env path tokens before `shlex.split(posix=True)`."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i = 0
+    n = len(cmd_header)
+    while i < n:
+        ch = cmd_header[i]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch if quote is None else (None if quote == ch else quote)
+            out.append(ch)
+            i += 1
+            continue
+        if quote is None:
+            m = _UNQUOTED_WIN_PATH_TOKEN_RE.match(cmd_header, i)
+            if m and (i == 0 or cmd_header[i - 1].isspace() or cmd_header[i - 1] in (";", "|", "&", "(")):
+                out.append(m.group(0).replace("\\", "\\\\"))
+                i = m.end()
+                continue
+        if ch == "\\":
+            escaped = quote != "'"
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _tokenize_raw_segment(segment: str) -> list[str]:
+    first_line = segment.split("\n", 1)[0]
+    hd_match = HEREDOC_OPEN_RE.search(first_line)
+    cmd_header = first_line[: hd_match.start()] if hd_match else segment
     cmd_header = _separate_unquoted_redirections(cmd_header)
+    cmd_header = _preserve_unquoted_windows_backslashes(cmd_header)
     try:
-        tokens = shlex.split(cmd_header, posix=True)
+        return shlex.split(cmd_header, posix=True)
     except ValueError:
-        tokens = cmd_header.split()
-    return _strip_wrappers_from_tokens(tokens)
+        return cmd_header.split()
+
+
+def tokenize_segment(segment: str) -> list[str]:
+    return _strip_wrappers_from_tokens(_tokenize_raw_segment(segment))
 
 
 def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> str | None:
@@ -391,20 +417,216 @@ def _extract_nested_shell_command(tokens: list[str], raw_segment: str = "") -> s
     return None
 
 
+@dataclass(frozen=True)
+class SimpleCommand:
+    """A single tokenized shell segment with its effective working directory."""
+
+    segment: str
+    tokens: list[str]
+    cwd: str | None
+
+
+def expand_shell_path_token(raw: str) -> str:
+    """Expand `~`, `$HOME`, `${HOME}`, `$env:HOME`, `$env:USERPROFILE`, and `%USERPROFILE%` in a shell argument."""
+    home = os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    expanded = re.sub(
+        r"\$(?:HOME|\{HOME\}|env:USERPROFILE|env:HOME)(?=[/\\]|$)|%USERPROFILE%",
+        lambda _: home,
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if expanded == "~" or expanded.startswith("~/") or expanded.startswith("~\\"):
+        return home + expanded[1:]
+    return os.path.expanduser(expanded)
+
+
+def _join_and_normpath(target: str, current_cwd: str | None) -> str:
+    expanded = expand_shell_path_token(target)
+    if os.sep == "/" and not re.match(r"^[A-Za-z]:[/\\]", expanded):
+        expanded = expanded.replace("\\", "/")
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    if current_cwd:
+        return os.path.normpath(os.path.join(current_cwd, expanded))
+    return os.path.normpath(expanded)
+
+
+def _consume_wrapper_chdir_options(
+    exe: str, raw_tokens: list[str], idx: int, eff_cwd: str | None
+) -> tuple[int, str | None]:
+    opts_with_val = WRAPPER_OPTS_WITH_VALUE.get(exe, frozenset())
+    n = len(raw_tokens)
+    while idx < n:
+        cur_tok = raw_tokens[idx]
+        if cur_tok == "--":
+            return idx + 1, eff_cwd
+        if "=" in cur_tok and not cur_tok.startswith("-") and cur_tok.split("=", 1)[0].isidentifier():
+            idx += 1
+        elif (
+            (exe == "env" and cur_tok in ("-C", "--chdir"))
+            or (exe == "sudo" and cur_tok in ("-D", "--chdir"))
+        ) and idx + 1 < n:
+            eff_cwd = _join_and_normpath(raw_tokens[idx + 1], eff_cwd)
+            idx += 2
+        elif exe in ("env", "sudo") and cur_tok.startswith("--chdir="):
+            eff_cwd = _join_and_normpath(cur_tok.split("=", 1)[1], eff_cwd)
+            idx += 1
+        elif cur_tok in opts_with_val:
+            idx += 2
+        elif cur_tok.startswith("-"):
+            idx += 1
+        else:
+            break
+    return idx, eff_cwd
+
+
+def _extract_wrapper_chdir(raw_tokens: list[str], current_cwd: str | None) -> str | None:
+    """Inspect leading `env`/`sudo` wrappers for `-C`, `-D`, or `--chdir` and return the effective cwd."""
+    eff_cwd = current_cwd
+    idx, n = 0, len(raw_tokens)
+    while idx < n:
+        tok = raw_tokens[idx]
+        if tok in SHELL_CONTROL_KEYWORDS:
+            idx += 1
+        elif tok == "for" and idx + 2 < n and raw_tokens[idx + 2] == "in":
+            idx += 3
+            while idx < n and raw_tokens[idx] != "do":
+                idx += 1
+        elif "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+            idx += 1
+        elif (exe := os.path.basename(tok)) in SIMPLE_WRAPPERS:
+            idx, eff_cwd = _consume_wrapper_chdir_options(exe, raw_tokens, idx + 1, eff_cwd)
+        else:
+            break
+    return eff_cwd
+
+
+def _resolve_cd_target(tokens: list[str], current_cwd: str | None) -> str | None:
+    """Return the updated working directory after a `cd`, `pushd`, `chdir`, or `Set-Location`/`sl` command."""
+    if not tokens or tokens[0].lower() not in CD_COMMANDS:
+        return current_cwd
+    cmd = tokens[0].lower()
+    args: list[str] = []
+    idx = 1
+    while idx < len(tokens):
+        tok = tokens[idx]
+        low = tok.lower()
+        if tok == "--":
+            args.extend(tokens[idx + 1 :])
+            break
+        if low in ("-path", "-literalpath") and idx + 1 < len(tokens):
+            args.append(tokens[idx + 1])
+            idx += 2
+            continue
+        if tok.startswith("-") and tok != "-":
+            idx += 1
+            continue
+        args.append(tok)
+        idx += 1
+
+    if not args:
+        if cmd in ("cd", "chdir", "set-location", "sl"):
+            return expand_shell_path_token("~")
+        return current_cwd
+
+    target = args[0]
+    if target == "-":
+        return current_cwd
+
+    return _join_and_normpath(target, current_cwd)
+
+
+def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[list[str]]:
+    """Extract subcommands passed to `find ... -exec/-execdir/-ok/-okdir` or `fd ... -x/--exec/-X/--exec-batch`."""
+    if not tokens:
+        return []
+    exe = os.path.basename(tokens[0]).lower()
+    subcommands: list[list[str]] = []
+    if exe == "find":
+        idx = 1
+        n = len(tokens)
+        while idx < n:
+            if tokens[idx] in ("-exec", "-execdir", "-ok", "-okdir"):
+                idx += 1
+                sub: list[str] = []
+                while idx < n and tokens[idx] not in (";", "\\;", "+"):
+                    sub.append(tokens[idx])
+                    idx += 1
+                cleaned = _strip_wrappers_from_tokens(sub)
+                if cleaned:
+                    subcommands.append(cleaned)
+            idx += 1
+    elif exe in ("fd", "fdfind"):
+        idx = 1
+        n = len(tokens)
+        while idx < n:
+            if tokens[idx] in ("-x", "--exec", "-X", "--exec-batch"):
+                idx += 1
+                sub = []
+                while idx < n and tokens[idx] not in (";", "\\;"):
+                    sub.append(tokens[idx])
+                    idx += 1
+                cleaned = _strip_wrappers_from_tokens(sub)
+                if cleaned:
+                    subcommands.append(cleaned)
+            idx += 1
+    return subcommands
+
+
+def _expand_nested_commands(
+    tokens: list[str], seg: str, cmd_cwd: str | None, max_depth: int
+) -> list[SimpleCommand]:
+    if max_depth <= 0:
+        return []
+    out: list[SimpleCommand] = []
+    nested = _extract_nested_shell_command(tokens, seg)
+    if nested:
+        out.extend(iter_simple_commands(nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
+    for sub_tokens in _extract_find_or_fd_exec_commands(tokens):
+        sub_seg = " ".join(sub_tokens)
+        out.append(SimpleCommand(segment=sub_seg, tokens=sub_tokens, cwd=cmd_cwd))
+        sub_nested = _extract_nested_shell_command(sub_tokens, sub_seg)
+        if sub_nested:
+            out.extend(iter_simple_commands(sub_nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
+    return out
+
+
+def iter_simple_commands(
+    command_line: str, cwd_str: str | None = None, max_depth: int = 4
+) -> list[SimpleCommand]:
+    """Split a shell command line into tokenized segments, tracking `cd`/`pushd`/`popd`, subshell `( ... )` scope, and expanding nested shells."""
+    commands: list[SimpleCommand] = []
+    cur_cwd = cwd_str
+    dir_stack: list[str | None] = []
+    subshell_stack: list[tuple[str | None, list[str | None]]] = []
+
+    for ev in _split_shell_events(command_line):
+        if ev == "(":
+            subshell_stack.append((cur_cwd, list(dir_stack)))
+            continue
+        if ev == ")":
+            if subshell_stack:
+                cur_cwd, dir_stack = subshell_stack.pop()
+            continue
+        raw_tokens = _tokenize_raw_segment(ev)
+        cmd_cwd = _extract_wrapper_chdir(raw_tokens, cur_cwd)
+        tokens = _strip_wrappers_from_tokens(raw_tokens)
+        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd))
+        commands.extend(_expand_nested_commands(tokens, ev, cmd_cwd, max_depth))
+        if tokens:
+            cmd_low = tokens[0].lower()
+            if cmd_low in CD_COMMANDS:
+                if cmd_low == "pushd":
+                    dir_stack.append(cur_cwd)
+                cur_cwd = _resolve_cd_target(tokens, cur_cwd)
+            elif cmd_low in POPD_COMMANDS and dir_stack:
+                cur_cwd = dir_stack.pop()
+    return commands
+
+
 def expand_shell_segments(command_line: str, max_depth: int = 4) -> list[str]:
     """Split a shell command line and recursively expand `sh/bash/zsh -c`, heredoc shells, and `eval` wrappers."""
-    base_segments = split_shell_segments(command_line)
-    if max_depth <= 0:
-        return base_segments
-
-    expanded: list[str] = []
-    for seg in base_segments:
-        expanded.append(seg)
-        tokens = tokenize_segment(seg)
-        nested = _extract_nested_shell_command(tokens, seg)
-        if nested:
-            expanded.extend(expand_shell_segments(nested, max_depth=max_depth - 1))
-    return expanded
+    return [cmd.segment for cmd in iter_simple_commands(command_line, max_depth=max_depth)]
 
 
 def _record_git_config_alias(config_expr: str, aliases: dict[str, list[str]]) -> None:
@@ -989,11 +1211,11 @@ def _is_user_response_approving_main_push(
 
 def _command_pushes_or_merges_protected(cmd: str, cwd: str | None) -> bool:
     """Return True if `cmd` invokes `gh pr merge` or `git push` targeting a protected branch."""
-    for seg in expand_shell_segments(cmd):
-        toks = tokenize_segment(seg)
+    for item in iter_simple_commands(cmd, cwd):
+        toks = item.tokens
         if is_gh_pr_merge(toks):
             return True
-        sub, sub_args, eff_cwd = parse_git_invocation(toks, cwd)
+        sub, sub_args, eff_cwd = parse_git_invocation(toks, item.cwd)
         if sub == "push":
             targets_main, _ = analyze_git_push(sub_args, eff_cwd)
             if targets_main:
@@ -1074,11 +1296,72 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
     return None, None
 
 
+def _is_active_antigravity_owner(
+    payload: dict[str, Any], effective_cwd: Path
+) -> bool:
+    from craftsman.gate import (
+        GateOwner,
+        _extract_antigravity_session_id,
+        load_state,
+        owns_gate,
+        resolve_cli_state_file,
+    )
+
+    caller = GateOwner(platform="antigravity", session_id=_extract_antigravity_session_id(payload))
+    candidates: list[Path] = []
+    raw_artifact_dir = payload.get("artifactDirectoryPath")
+    if isinstance(raw_artifact_dir, str) and raw_artifact_dir.strip():
+        candidates.append(Path(raw_artifact_dir).expanduser() / "craftsman_state.json")
+    candidates.append(resolve_cli_state_file(None, str(effective_cwd)))
+    for state_file in candidates:
+        state = load_state(state_file)
+        if state and state.get("active") and owns_gate(GateOwner.from_state(state), caller):
+            return True
+    return False
+
+
+def _evaluate_antigravity_scope(
+    payload: dict[str, Any], command_line: str, cwd_str: str | None
+) -> tuple[str, str | None]:
+    """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
+    try:
+        from craftsman.diffscan import DiffScanError, worktree_root
+        from craftsman.scope import evaluate_scope, load_scope_policy
+
+        effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
+        repo_root = worktree_root(effective_cwd)
+        if not _is_active_antigravity_owner(payload, effective_cwd):
+            return "allow", None
+    except (ImportError, OSError, DiffScanError):
+        return "allow", None
+
+    policy = load_scope_policy(effective_cwd, repo_root)
+    if policy.mode == "off":
+        return "allow", None
+    scope_decision = evaluate_scope(
+        "run_command",
+        {"CommandLine": command_line, "Cwd": cwd_str},
+        effective_cwd,
+        repo_root,
+        policy,
+    )
+    if scope_decision.decision == "deny" and policy.mode == "deny":
+        return "deny", scope_decision.reason
+    return "allow", None
+
+
 def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     command_line, cwd_str = _extract_command_and_cwd(payload)
     if not isinstance(command_line, str):
         return "allow", None
-    return evaluate_shell_command(command_line, cwd_str, resolve_transcript_path(payload))
+    decision, reason = evaluate_shell_command(
+        command_line, cwd_str, resolve_transcript_path(payload)
+    )
+    if decision != "allow":
+        return decision, reason
+    if isinstance(payload.get("toolCall"), dict):
+        return _evaluate_antigravity_scope(payload, command_line, cwd_str)
+    return "allow", None
 
 
 def evaluate_shell_command(
@@ -1092,12 +1375,13 @@ def evaluate_shell_command(
     if not command_line.strip():
         return "allow", None
 
-    segments = expand_shell_segments(command_line)
+    commands = iter_simple_commands(command_line, cwd_str)
 
     # 1. Check Rule #2: Zero AI attribution in commits / tags / PRs
-    for segment in segments:
-        tokens = tokenize_segment(segment)
-        _, _, effective_cwd = parse_git_invocation(tokens, cwd_str)
+    for cmd in commands:
+        segment = cmd.segment
+        tokens = cmd.tokens
+        _, _, effective_cwd = parse_git_invocation(tokens, cmd.cwd)
         if is_ai_attribution_check_target(tokens) and (
             has_ai_attribution(segment, tokens, effective_cwd)
             or (
@@ -1120,11 +1404,11 @@ def evaluate_shell_command(
             )
 
     # 2. Check Rule #1: No unconfirmed push to main / master (or gh pr merge)
-    for segment in segments:
-        tokens = tokenize_segment(segment)
+    for cmd in commands:
+        tokens = cmd.tokens
         if is_gh_pr_merge(tokens):
             if transcript_path is not None and was_ask_question_called_since_last_push(
-                transcript_path, cwd_str
+                transcript_path, cmd.cwd
             ):
                 continue
             return (
@@ -1134,10 +1418,18 @@ def evaluate_shell_command(
                 "via the 'ask_question' tool.",
             )
 
-        sub, sub_args, effective_cwd = parse_git_invocation(tokens, cwd_str)
+        sub, sub_args, effective_cwd = parse_git_invocation(tokens, cmd.cwd)
         if sub != "push":
             continue
+        _, _, explicit_git_cwd = parse_git_invocation(tokens, None)
         targets_protected, is_force = analyze_git_push(sub_args, effective_cwd)
+        check_cwd = effective_cwd
+        if explicit_git_cwd is None and cwd_str != effective_cwd:
+            start_protected, start_force = analyze_git_push(sub_args, cwd_str)
+            if start_protected and not targets_protected:
+                check_cwd = cwd_str
+            targets_protected = targets_protected or start_protected
+            is_force = is_force or start_force
         if not targets_protected:
             continue
 
@@ -1155,7 +1447,7 @@ def evaluate_shell_command(
                 "Please confirm this operation.",
             )
 
-        if was_ask_question_called_since_last_push(transcript_path, effective_cwd):
+        if was_ask_question_called_since_last_push(transcript_path, check_cwd):
             continue
 
         return (

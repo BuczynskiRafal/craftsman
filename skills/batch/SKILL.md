@@ -10,6 +10,16 @@ description: >-
 
 # Batch change (`/batch <the change to apply everywhere>`)
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, or Craftsman's own data via `craftsman …` CLI commands. Never run recursive
+searches of `~`, `/`, or parent directories, and never open other repositories, other projects'
+packets/ledgers/reports, or assistant session stores (run
+`craftsman skill show craftsman --file scope.md` for the full contract).
+
 ## 1. Measure the change
 Find every occurrence the change applies to (search by name, by pattern, and by behavior). Count
 files and occurrences, and note the odd cases that do not fit the common pattern — they are where

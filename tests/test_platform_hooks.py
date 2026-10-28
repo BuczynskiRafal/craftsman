@@ -19,8 +19,10 @@ from tests.support import EvidenceRepo, coverage_note
 
 CHANGE = "def total(items):\n    return sum(items)\n"
 STARTED = (
-    "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill; "
-    "the gate will block finishing until `craftsman review check` passes."
+    "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill "
+    "(Stage 0 command: `craftsman gate --init --session-id {sid} --tier {tier} --task \"{task}\"`); "
+    "the gate will block finishing until `craftsman review check` passes.\n"
+    "Scope: work only inside {root}; see Search scope."
 )
 
 
@@ -140,7 +142,13 @@ class PromptTests(HookTestCase):
         payload = vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep add cart totals")
         out, _ = call_hook("prompt", "copilot", payload)
 
-        context = STARTED.format(tier="deep", base=self.repo.base_sha[:7])
+        context = STARTED.format(
+            tier="deep",
+            base=self.repo.base_sha[:7],
+            sid="vscode-session",
+            task="add cart totals",
+            root=self.root.resolve(),
+        )
         self.assertEqual(
             out,
             {
@@ -181,7 +189,13 @@ class PromptTests(HookTestCase):
         out, _ = call_hook(
             "prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman fix it")
         )
-        context = STARTED.format(tier="auto", base=self.repo.base_sha[:7])
+        context = STARTED.format(
+            tier="auto",
+            base=self.repo.base_sha[:7],
+            sid="claude-session",
+            task="fix it",
+            root=self.root.resolve(),
+        )
         self.assertEqual(
             out,
             {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}},
@@ -216,10 +230,24 @@ class StopTests(HookTestCase):
         self.assertLessEqual(len(reason), 1800)
         self.assertEqual(self.state()["hooks_seen"], "copilot")
 
-        claude_out, _ = call_hook("stop", "claude", claude("Stop", self.root, stop_hook_active=True))
-        self.assertEqual(set(claude_out), {"decision", "reason"})
-        self.assertTrue(claude_out["reason"].startswith("[CRAFTSMAN GATE 2/6] "))
+        claude_out, _ = call_hook(
+            "stop",
+            "claude",
+            claude("Stop", self.root, stop_hook_active=True),
+        )
+        # Non-owner platform is allowed without incrementing forced_continuations
+        self.assertEqual(claude_out, {})
+        self.assertEqual(self.state()["forced_continuations"], 1)
 
+        # Legacy/unowned state (or after takeover) blocks in Claude dialect too
+        self.update_state(owner={"platform": "claude", "session_id": "claude-session"})
+        claude_block, _ = call_hook(
+            "stop", "claude", claude("Stop", self.root, stop_hook_active=True)
+        )
+        self.assertEqual(set(claude_block), {"decision", "reason"})
+        self.assertTrue(claude_block["reason"].startswith("[CRAFTSMAN GATE 2/6] "))
+
+        self.update_state(owner={"platform": "copilot", "session_id": "cli-session"})
         self.repo.record_full_evidence("quick")
         done, _ = call_hook("stop", "copilot", copilot_cli(self.root, stopReason="end_turn"))
         self.assertEqual(done, {})
@@ -255,6 +283,7 @@ class StopTests(HookTestCase):
 
         out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=True))
         self.assertTrue(out["reason"].startswith("[CRAFTSMAN GATE 3/6] "))
+        self.update_state(owner={"platform": "copilot", "session_id": "cli-session"})
         cli_stop, _ = call_hook("stop", "copilot", copilot_cli(self.root))  # no stop_hook_active
         self.assertTrue(cli_stop["reason"].startswith("[CRAFTSMAN GATE 4/6] "))
 
@@ -286,7 +315,11 @@ class StopTests(HookTestCase):
         self.repo.cli("gate", "--await-user", "--cwd", ".")
         self.update_state(forced_continuations=4, best_issue_count=2)
 
-        call_hook("prompt", "copilot", copilot_cli(self.root, prompt="[CRAFTSMAN GATE 4/6] 1. ..."))
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="[CRAFTSMAN GATE 4/6] 1. ..."),
+        )
         self.assertEqual(self.state()["forced_continuations"], 4)
 
         call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="Use option B"))
@@ -390,6 +423,7 @@ class SubagentTests(HookTestCase):
         )
         self.assertEqual(set(out), {"additionalContext", "hookSpecificOutput"})
 
+        self.update_state(owner={"platform": "claude", "session_id": "claude-session"})
         other, _ = call_hook(
             "subagent-start",
             "claude",
@@ -625,6 +659,18 @@ class PreToolTests(HookTestCase):
         self.assertEqual(call_hook("pre-tool", "copilot", payload)[0], {})
         self.assertEqual(self.state()["hooks_seen"], "copilot")
 
+    def test_non_scope_checked_tools_skip_load_scope_policy_subprocesses(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        with mock.patch("craftsman.hooks.load_scope_policy") as mock_policy:
+            for tool in ("Edit", "Write", "editFiles", "replace_string_in_file"):
+                out, _ = call_hook(
+                    "pre-tool",
+                    "copilot",
+                    vscode("PreToolUse", self.root, tool_name=tool, tool_input={"file_path": "a.py"}),
+                )
+                self.assertEqual(out, {})
+            mock_policy.assert_not_called()
+
 
 class TranscriptReviewerTests(unittest.TestCase):
     def test_antigravity_recognizes_the_craftsman_reviewer_role(self) -> None:
@@ -669,6 +715,302 @@ class HookInputTests(unittest.TestCase):
         )
         self.assertEqual((snake.tool_input, camel.tool_input), ({"command": "ls"}, {"command": "ls"}))
         self.assertEqual(HookInput.parse({"toolArgs": "not json"}).tool_input, {})
+
+
+class SessionOwnershipTests(HookTestCase):
+    def test_non_owner_stops_leave_owner_continuation_budget_intact(self) -> None:
+        call_hook(
+            "prompt",
+            "copilot",
+            vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep build cart"),
+        )
+        self.repo.write("cart.py", CHANGE)
+        raw_before = self.state_file.read_bytes()
+        state_before = self.state()
+        self.assertEqual(
+            state_before["owner"], {"platform": "copilot", "session_id": "vscode-session"}
+        )
+
+        for _ in range(10):
+            out, _ = call_hook("stop", "claude", claude("Stop", self.root))
+            self.assertEqual(out, {})
+            self.assertEqual(self.state_file.read_bytes(), raw_before)
+
+        ag_proc = self.repo.cli(
+            "gate",
+            stdin=json.dumps(
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "workspacePaths": [str(self.root)],
+                    "transcript_path": str(self.root / "no-such.jsonl"),
+                }
+            ),
+        )
+        self.assertEqual(json.loads(ag_proc.stdout), {"decision": "allow"})
+        self.assertEqual(self.state_file.read_bytes(), raw_before)
+
+        owner_out, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
+        self.assertEqual(owner_out["decision"], "block")
+        self.assertTrue(owner_out["reason"].startswith("[CRAFTSMAN GATE 1/6] "))
+        self.assertEqual(self.state()["forced_continuations"], 1)
+        self.assertEqual(self.state()["hooks_seen"], "copilot")
+
+    def test_same_platform_different_session_id_is_non_owner(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, session_id="claude-A", prompt="/craftsman fix"),
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("gate", "--await-user", "--cwd", ".")
+        self.update_state(forced_continuations=3)
+        raw_before = self.state_file.read_bytes()
+
+        out_p, _ = call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, session_id="claude-B", prompt="hello"),
+        )
+        self.assertEqual(out_p, {})
+        self.assertEqual(self.state_file.read_bytes(), raw_before)
+
+        self.update_state(awaiting_user=False)
+        raw_unpaused = self.state_file.read_bytes()
+        out_s, _ = call_hook(
+            "stop",
+            "claude",
+            claude("Stop", self.root, session_id="claude-B"),
+        )
+        self.assertEqual(out_s, {})
+        self.assertEqual(self.state_file.read_bytes(), raw_unpaused)
+
+        owner_s, _ = call_hook(
+            "stop",
+            "claude",
+            claude("Stop", self.root, session_id="claude-A"),
+        )
+        self.assertEqual(owner_s["decision"], "block")
+        self.assertTrue(owner_s["reason"].startswith("[CRAFTSMAN GATE 4/6] "))
+
+    def test_claim_on_cli_init_accepts_only_matching_platform(self) -> None:
+        self.repo.cli(
+            "gate", "--init", "--tier", "quick", "--cwd", ".", env_extra={"CLAUDECODE": "1"}
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": ""})
+
+        cop_out, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
+        self.assertEqual(cop_out, {})
+        self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": ""})
+        self.assertNotIn("hooks_seen", self.state())
+
+        cl_out, _ = call_hook(
+            "stop", "claude", claude("Stop", self.root, session_id="claude-1")
+        )
+        self.assertEqual(cl_out["decision"], "block")
+        self.assertEqual(self.state()["owner"], {"platform": "claude", "session_id": "claude-1"})
+        self.assertEqual(self.state()["hooks_seen"], "claude")
+
+        cl2_out, _ = call_hook(
+            "stop", "claude", claude("Stop", self.root, session_id="claude-2")
+        )
+        self.assertEqual(cl2_out, {})
+        self.assertEqual(self.state()["forced_continuations"], 1)
+
+    def test_pre_tool_guard_protects_non_owner_without_setting_hooks_seen(self) -> None:
+        self.repo.cli(
+            "gate",
+            "--init",
+            "--tier",
+            "standard",
+            "--cwd",
+            ".",
+            env_extra={"ANTIGRAVITY_AGENT": "1"},
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.assertEqual(self.state()["owner"], {"platform": "antigravity", "session_id": ""})
+
+        pre_out, _ = call_hook(
+            "pre-tool",
+            "claude",
+            claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git status"}),
+        )
+        self.assertEqual(pre_out, {})
+        self.assertNotIn("hooks_seen", self.state())
+
+        push_out, _ = call_hook(
+            "pre-tool",
+            "copilot",
+            vscode(
+                "PreToolUse",
+                self.root,
+                tool_name="run_in_terminal",
+                tool_input={"command": "git push origin main"},
+            ),
+        )
+        self.assertEqual(push_out["permissionDecision"], "deny")
+        self.assertNotIn("hooks_seen", self.state())
+
+    def test_subagent_hooks_ignore_non_owner_sessions(self) -> None:
+        self.repo.cli(
+            "gate",
+            "--init",
+            "--tier",
+            "standard",
+            "--cwd",
+            ".",
+            env_extra={"ANTIGRAVITY_AGENT": "1"},
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare", "--tier", "standard")
+
+        sub_out, _ = call_hook(
+            "subagent-start",
+            "claude",
+            claude("SubagentStart", self.root, agent_id="x", agent_type="Explore"),
+        )
+        self.assertEqual(sub_out, {})
+        self.assertEqual(self.ledger()["agents"], [])
+        self.assertNotIn("hooks_seen", self.state())
+
+    def test_craftsman_trigger_in_other_session_preserves_owner_gate(self) -> None:
+        call_hook(
+            "prompt",
+            "copilot",
+            vscode("UserPromptSubmit", self.root, prompt="/craftsman --deep original task"),
+        )
+        self.update_state(forced_continuations=2)
+        raw_before = self.state_file.read_bytes()
+
+        out, _ = call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --quick hijack task"),
+        )
+        context = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("already active and owned by another session", context)
+        self.assertIn("copilot (session vscode-session)", context)
+        self.assertIn("git worktree add", context)
+        self.assertIn("--takeover", context)
+        self.assertEqual(self.state_file.read_bytes(), raw_before)
+
+    def test_status_reports_gate_owner(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
+        status_json = json.loads(self.repo.cli("status", "--json").stdout)
+        self.assertEqual(
+            status_json["owner"], {"platform": "claude", "session_id": "claude-session"}
+        )
+        status_text = self.repo.cli("status").stdout
+        self.assertIn("Owner          : claude (session claude-session)", status_text)
+
+    def test_gate_init_refuses_foreign_active_gate_without_takeover(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
+        refused = self.repo.cli(
+            "gate",
+            "--init",
+            "--tier",
+            "quick",
+            "--cwd",
+            ".",
+            check=False,
+            env_extra={"VSCODE_PID": "999"},
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("already owned by claude (session claude-session)", refused.stderr)
+        self.assertIn("git worktree add", refused.stderr)
+        self.assertIn("--takeover", refused.stderr)
+        self.assertEqual(self.state()["tier"], "deep")
+
+    def test_gate_init_requires_matching_session_id_on_same_platform(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
+        no_sid_refused = self.repo.cli(
+            "gate",
+            "--init",
+            "--tier",
+            "quick",
+            "--task",
+            "hijack task",
+            "--cwd",
+            ".",
+            check=False,
+            env_extra={"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": ""},
+        )
+        self.assertNotEqual(no_sid_refused.returncode, 0)
+        self.assertIn("already owned by claude (session claude-session)", no_sid_refused.stderr)
+        self.assertIn("--session-id", no_sid_refused.stderr)
+        self.assertEqual(self.state()["tier"], "deep")
+        self.assertEqual(self.state()["task"], "owner task")
+
+        by_flag = self.repo.cli(
+            "gate",
+            "--init",
+            "--session-id",
+            "claude-session",
+            "--tier",
+            "deep",
+            "--task",
+            "refined owner task",
+            "--cwd",
+            ".",
+            env_extra={"CLAUDECODE": "", "CLAUDE_CODE_SESSION_ID": ""},
+        )
+        self.assertEqual(by_flag.returncode, 0, by_flag.stderr)
+        self.assertEqual(
+            self.state()["owner"], {"platform": "claude", "session_id": "claude-session"}
+        )
+        self.assertEqual(self.state()["task"], "refined owner task")
+
+    def test_gate_init_takeover_records_previous_owner(self) -> None:
+        call_hook(
+            "prompt",
+            "claude",
+            claude("UserPromptSubmit", self.root, prompt="/craftsman --deep owner task"),
+        )
+        taken = self.repo.cli(
+            "gate",
+            "--init",
+            "--takeover",
+            "--tier",
+            "standard",
+            "--task",
+            "taken over",
+            "--cwd",
+            ".",
+            env_extra={"VSCODE_PID": "999"},
+        )
+        self.assertEqual(taken.returncode, 0, taken.stderr)
+        state = self.state()
+        self.assertEqual(state["owner"], {"platform": "copilot", "session_id": ""})
+        self.assertEqual(
+            state["takeover_from"], {"platform": "claude", "session_id": "claude-session"}
+        )
+        self.assertIn("takeover_at", state)
+
+    def test_legacy_state_without_owner_treats_every_session_as_owner(self) -> None:
+        self.init("quick")
+        self.repo.write("cart.py", CHANGE)
+        state = self.state()
+        state.pop("owner", None)
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        out1, _ = call_hook("stop", "copilot", vscode("Stop", self.root))
+        self.assertTrue(out1["reason"].startswith("[CRAFTSMAN GATE 1/6] "))
+        out2, _ = call_hook("stop", "claude", claude("Stop", self.root))
+        self.assertTrue(out2["reason"].startswith("[CRAFTSMAN GATE 2/6] "))
+        self.assertNotIn("owner", self.state())
 
 
 if __name__ == "__main__":

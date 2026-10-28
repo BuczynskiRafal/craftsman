@@ -555,6 +555,11 @@ def _show(args: argparse.Namespace) -> int:
     ledger = load(ws.ledger_path)
     snap = snapshot(ws.root, resolve_base(ws, ledger, None))
     latest = ledger.rounds[-1] if ledger.rounds else None
+    if getattr(args, "packet_path", False):
+        if latest is None:
+            raise LedgerError("no review round yet; run `craftsman review prepare`")
+        print(str(Path(latest.packet_path).resolve()))
+        return 0
     if args.json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
@@ -568,7 +573,7 @@ def _show(args: argparse.Namespace) -> int:
         print("No review round yet; run `craftsman review prepare`.")
     else:
         print(_round_line(latest, snap))
-        print(f"Packet: {latest.packet_path}")
+        print(f"Packet: {Path(latest.packet_path).resolve()}")
         print("")
         print("Coverage (covered/total non-carried hunks):")
         print("\n".join(_coverage_lines(ledger, latest)))
@@ -974,6 +979,11 @@ def _build_parser() -> argparse.ArgumentParser:
         command = sub.add_parser(name, parents=[common], help=help_text)
         command.add_argument("--json", action="store_true")
         command.set_defaults(handler=handler)
+    sub.choices["show"].add_argument(
+        "--packet-path",
+        action="store_true",
+        help="Print only the resolved absolute path of the current review packet",
+    )
     sub.choices["check"].add_argument("--tier", type=_tier_option)
     for name in ("check", "report"):
         sub.choices[name].add_argument(

@@ -13,6 +13,17 @@ A review looks at a change through many lenses at once; an audit takes **one** c
 through the target exhaustively, building an inventory instead of sampling. Use it for code that
 matters more than average, before a release, or when a review hinted at a systemic problem.
 
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
+directory you created, or Craftsman's own data via `craftsman …` CLI commands (invoke `/audit-*` as
+a skill or run `craftsman skill show <name>`). Never run recursive searches of `~`, `/`, or parent
+directories, and never open other repositories, other projects' packets/ledgers/reports, or
+assistant session stores (run `craftsman skill show craftsman --file scope.md` for the full
+contract).
+
 | Aspect | Skill | Lens it deepens | Selected by `all` when the target… |
 | :--- | :--- | :--- | :--- |
 | `errors` | `/audit-errors` | `failure` | handles errors, does I/O, parsing, subprocesses, network |

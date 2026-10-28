@@ -10,7 +10,16 @@ description: >-
 
 # Test-evidence audit (`/audit-tests [target]`)
 
-Deepens the `tests` lens of `skills/code-review/lenses.md` — read that playbook first.
+Deepens the `tests` lens (run `craftsman skill show code-review --file lenses.md` to read that
+playbook first; never search the file system for `lenses.md`).
+
+## Search scope
+
+Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
+list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
+folder). Never run recursive searches of `~`, `/`, or parent directories, and never open other
+repositories, other projects' packets/ledgers/reports, or assistant session stores (run
+`craftsman skill show craftsman --file scope.md` for the full contract).
 
 Coverage percentages measure which lines ran, not which mistakes would be caught. This audit
 measures the second.
