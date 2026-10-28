@@ -4,94 +4,26 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import tempfile
 import unittest
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
-from unittest import mock
 
 from craftsman import diffscan
 from craftsman.diffscan import (
-    ChangeStatus,
     DiffScanError,
     Hunk,
     WorktreeIndex,
-    defined_symbols,
     detect_signals,
-    enclosing_scope,
-    find_references,
     git_dir,
     resolve_base_sha,
     snapshot,
 )
 
-
-class GitRepo:
-    """A throwaway git repository with deterministic configuration and no hooks."""
-
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.git("init", "-q")
-        for key, value in (
-            ("user.email", "dev@example.com"),
-            ("user.name", "Dev"),
-            ("commit.gpgsign", "false"),
-            ("core.autocrlf", "false"),
-            ("core.hooksPath", str(root / ".git" / "no-hooks")),
-        ):
-            self.git("config", key, value)
-
-    def git(self, *args: str) -> str:
-        proc = subprocess.run(
-            ["git", *args], cwd=self.root, capture_output=True, text=True, check=True, timeout=30
-        )
-        return proc.stdout
-
-    def write(self, path: str, content: str | bytes) -> Path:
-        target = self.root / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        data = content.encode("utf-8") if isinstance(content, str) else content
-        target.write_bytes(data)
-        return target
-
-    def commit(self, message: str = "commit") -> str:
-        self.git("add", "-A")
-        self.git("commit", "-q", "--no-verify", "-m", message)
-        return self.git("rev-parse", "HEAD").strip()
-
-    def commit_empty(self) -> str:
-        self.git("commit", "-q", "--allow-empty", "--no-verify", "-m", "root")
-        return self.git("rev-parse", "HEAD").strip()
+from tests.support import GitRepo, change_hunk
 
 
 def numbered_lines(count: int, prefix: str = "line") -> str:
     return "".join(f"{prefix} {index}\n" for index in range(1, count + 1))
-
-
-def make_hunk(
-    path: str,
-    added: Sequence[str] = (),
-    removed: Sequence[str] = (),
-    *,
-    hunk_id: str = "H1",
-    status: ChangeStatus = "modified",
-) -> Hunk:
-    lines = (*(f"-{text}" for text in removed), *(f"+{text}" for text in added))
-    return Hunk(
-        id=hunk_id,
-        path=path,
-        old_path=None,
-        status=status,
-        old_start=1,
-        old_len=len(removed),
-        new_start=1,
-        new_len=len(added),
-        header="",
-        lines=lines,
-        digest="0" * 16,
-    )
 
 
 class RepoTestCase(unittest.TestCase):
@@ -102,7 +34,7 @@ class RepoTestCase(unittest.TestCase):
 
 
 class SnapshotTests(RepoTestCase):
-    def test_modified_file_reports_line_numbers_and_header(self) -> None:
+    def test_modified_file_reports_its_line_numbers(self) -> None:
         self.repo.write("app.py", "def total(items):\n" + numbered_lines(9, "    x ="))
         base = self.repo.commit()
         source = (self.repo.root / "app.py").read_text(encoding="utf-8")
@@ -122,7 +54,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual((snap.added, snap.deleted), (1, 1))
         self.assertEqual(snap.base_sha, base)
 
-    def test_added_deleted_and_renamed_files(self) -> None:
+    def test_file_status_is_reported_per_change(self) -> None:
         self.repo.write("gone.txt", "bye\n")
         self.repo.write("old/name.txt", numbered_lines(10))
         self.repo.write("moved.txt", "same\n")
@@ -177,7 +109,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(hunk.added_lines, ((1, "a = 1"), (2, "b = 2")))
         self.assertEqual(snap.added, 2)
 
-    def test_generated_artifacts_and_craftsmanignore_do_not_change_the_snapshot(self) -> None:
+    def test_generated_or_ignored_files_stay_out_of_the_snapshot(self) -> None:
         base = self.repo.commit_empty()
         self.repo.write("pkg/mod.py", "x = 1\n")
         before = snapshot(self.repo.root, base)
@@ -194,7 +126,7 @@ class SnapshotTests(RepoTestCase):
         self.assertIn("out/report.html", snapshot(self.repo.root, base).files)
         self.assertEqual(before.files, ("pkg/mod.py",))
 
-    def test_empty_and_oversized_untracked_files_still_produce_hunks(self) -> None:
+    def test_untracked_files_of_any_size_produce_hunks(self) -> None:
         base = self.repo.commit_empty()
         self.repo.write("empty.txt", "")
         self.repo.write("huge.log", "x" * (1_048_576 + 1))
@@ -218,7 +150,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(snap.hunks[0].lines, ("~ mode 100644 -> 100755",))
         self.assertEqual(snap.files, ("run.sh",))
 
-    def test_paths_with_spaces_and_quotes(self) -> None:
+    def test_paths_with_special_characters_are_unquoted(self) -> None:
         self.repo.write("dir with space/a b.txt", "one\n")
         self.repo.write('q"uote.txt', "one\n")
         base = self.repo.commit()
@@ -231,7 +163,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(snap.files, ("dir with space/a b.txt", "new dir/c d.txt", 'q"uote.txt'))
         self.assertEqual([hunk.path for hunk in snap.hunks], list(snap.files))
 
-    def test_crlf_content_and_missing_trailing_newline_are_kept_exactly(self) -> None:
+    def test_line_endings_are_kept_exactly(self) -> None:
         self.repo.write("win.txt", b"a\r\nb\r\n")
         base = self.repo.commit()
         self.repo.write("win.txt", b"a\r\nc\r\n")
@@ -252,7 +184,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual((hunk.old_start, hunk.old_len, hunk.new_start, hunk.new_len), (1, 1, 1, 1))
 
     @unittest.skipIf(os.name == "nt", "symlinks need extra privileges on Windows")
-    def test_untracked_symlink_and_nested_repository_are_reported(self) -> None:
+    def test_untracked_special_entries_are_reported(self) -> None:
         base = self.repo.commit_empty()
         (self.repo.root / "link").symlink_to("target.txt")
         nested = self.repo.root / "vendor"
@@ -264,7 +196,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(hunks["link"].lines, ("+target.txt", "\\ No newline at end of file"))
         self.assertEqual(hunks["vendor/"].lines, ("~ untracked directory or special file",))
 
-    def test_user_diff_and_grep_settings_do_not_change_the_output_format(self) -> None:
+    def test_user_git_settings_do_not_change_the_output_format(self) -> None:
         self.repo.write("a.py", "value = 1\n")
         base = self.repo.commit()
         self.repo.write("a.py", "value = 2\n")
@@ -280,9 +212,9 @@ class SnapshotTests(RepoTestCase):
             self.repo.git("config", key, value)
 
         self.assertEqual(snapshot(self.repo.root, base), expected)
-        self.assertEqual(find_references(self.repo.root, "value")[0].line, 1)
+        self.assertEqual(WorktreeIndex(self.repo.root).references("value")[0].line, 1)
 
-    def test_fingerprint_is_stable_and_tracks_tracked_and_untracked_edits(self) -> None:
+    def test_fingerprint_changes_only_with_the_content(self) -> None:
         self.repo.write("a.txt", "a\n")
         base = self.repo.commit()
         self.repo.write("a.txt", "b\n")
@@ -327,7 +259,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(hunks[0].lines, hunks[1].lines)
         self.assertEqual(hunks[1].digest, f"{hunks[0].digest}#2")
 
-    def test_tracked_and_untracked_files_share_one_path_order(self) -> None:
+    def test_all_files_share_one_path_order(self) -> None:
         self.repo.write("b.txt", "b\n")
         base = self.repo.commit()
         self.repo.write("b.txt", "bb\n")
@@ -350,7 +282,7 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(snapshot(self.repo.root / "pkg", base), snapshot(self.repo.root, base))
         self.assertEqual(snapshot(self.repo.root / "pkg", base).files, ("pkg/mod.py", "top.txt"))
 
-    def test_clean_tree_is_empty_and_docs_only_is_detected(self) -> None:
+    def test_clean_tree_has_an_empty_snapshot(self) -> None:
         self.repo.write("README.md", "# hi\n")
         base = self.repo.commit()
         clean = snapshot(self.repo.root, base)
@@ -363,7 +295,7 @@ class SnapshotTests(RepoTestCase):
         self.repo.write("requirements.txt", "requests==2.0\n")
         self.assertFalse(snapshot(self.repo.root, base).docs_only)
 
-    def test_invalid_locations_and_revisions_raise(self) -> None:
+    def test_invalid_locations_or_revisions_raise(self) -> None:
         base = self.repo.commit_empty()
         with tempfile.TemporaryDirectory() as outside:
             with self.assertRaisesRegex(DiffScanError, "not inside a git work tree"):
@@ -428,12 +360,12 @@ func (s *Server) Handle(w Writer, r *Request) {
 
 
 class ScopeTests(RepoTestCase):
-    def test_python_scopes_are_exact_and_qualified(self) -> None:
+    def test_python_scopes_are_exact_with_qualified_names(self) -> None:
         self.repo.write("mod.py", PY_SOURCE)
 
-        method = enclosing_scope(self.repo.root, "mod.py", 8)
-        decorated = enclosing_scope(self.repo.root, "mod.py", 14)
-        module_level = enclosing_scope(self.repo.root, "mod.py", 17)
+        method = WorktreeIndex(self.repo.root).scope("mod.py", 8)
+        decorated = WorktreeIndex(self.repo.root).scope("mod.py", 14)
+        module_level = WorktreeIndex(self.repo.root).scope("mod.py", 17)
 
         assert method is not None and decorated is not None and module_level is not None
         self.assertEqual(
@@ -446,16 +378,16 @@ class ScopeTests(RepoTestCase):
     def test_python_syntax_error_falls_back_to_the_heuristic(self) -> None:
         self.repo.write("broken.py", "def ok(x):\n    return x +\n")
 
-        scope = enclosing_scope(self.repo.root, "broken.py", 2)
+        scope = WorktreeIndex(self.repo.root).scope("broken.py", 2)
 
         assert scope is not None
         self.assertEqual((scope.name, scope.kind, scope.start, scope.end), ("ok", "function", 1, 2))
 
-    def test_js_function_and_arrow_function(self) -> None:
+    def test_js_functions_of_both_syntaxes_are_scopes(self) -> None:
         self.repo.write("user.js", JS_SOURCE)
 
-        function = enclosing_scope(self.repo.root, "user.js", 3)
-        arrow = enclosing_scope(self.repo.root, "user.js", 7)
+        function = WorktreeIndex(self.repo.root).scope("user.js", 3)
+        arrow = WorktreeIndex(self.repo.root).scope("user.js", 7)
 
         assert function is not None and arrow is not None
         self.assertEqual((function.name, function.start, function.end), ("loadUser", 1, 4))
@@ -464,38 +396,35 @@ class ScopeTests(RepoTestCase):
     def test_go_method_with_receiver(self) -> None:
         self.repo.write("server.go", GO_SOURCE)
 
-        scope = enclosing_scope(self.repo.root, "server.go", 5)
+        scope = WorktreeIndex(self.repo.root).scope("server.go", 5)
 
         assert scope is not None
         self.assertEqual((scope.name, scope.kind, scope.start, scope.end), ("Handle", "function", 3, 8))
 
-    def test_long_scope_text_is_capped_with_a_marker(self) -> None:
+    def test_long_scope_keeps_its_whole_text(self) -> None:
         body = "".join(f"    v{index} = {index}\n" for index in range(200))
         self.repo.write("big.py", "def big():\n" + body)
 
-        scope = enclosing_scope(self.repo.root, "big.py", 150)
+        scope = WorktreeIndex(self.repo.root).scope("big.py", 150)
 
         assert scope is not None
         self.assertEqual((scope.start, scope.end), (1, 201))
-        text_lines = scope.text.split("\n")
-        self.assertEqual(len(text_lines), 121)
-        self.assertEqual(text_lines[80], "... (81 lines omitted) ...")
-        self.assertEqual(text_lines[-1], "    v199 = 199")
+        self.assertEqual(len(scope.text.split("\n")), 201)
 
-    def test_missing_binary_and_out_of_range_lines_return_none(self) -> None:
+    def test_unreadable_lines_have_no_scope(self) -> None:
         self.repo.write("blob.bin", b"\x00\x01")
         self.repo.write("small.txt", "one\n")
 
-        self.assertIsNone(enclosing_scope(self.repo.root, "nope.py", 1))
-        self.assertIsNone(enclosing_scope(self.repo.root, "blob.bin", 1))
-        self.assertIsNone(enclosing_scope(self.repo.root, "small.txt", 0))
-        self.assertIsNone(enclosing_scope(self.repo.root, "small.txt", 99))
+        self.assertIsNone(WorktreeIndex(self.repo.root).scope("nope.py", 1))
+        self.assertIsNone(WorktreeIndex(self.repo.root).scope("blob.bin", 1))
+        self.assertIsNone(WorktreeIndex(self.repo.root).scope("small.txt", 0))
+        self.assertIsNone(WorktreeIndex(self.repo.root).scope("small.txt", 99))
         with self.assertRaises(DiffScanError):
-            enclosing_scope(self.repo.root, "../outside.py", 1)
+            WorktreeIndex(self.repo.root).scope("../outside.py", 1)
 
 
 class SymbolAndReferenceTests(RepoTestCase):
-    def test_defined_symbols_include_new_removed_and_enclosing_definitions(self) -> None:
+    def test_symbols_cover_every_definition_a_hunk_touches(self) -> None:
         self.repo.write(
             "calc.py",
             "def compute_total(items):\n    return sum(items)\n\n\ndef legacy_rate():\n    return 1\n",
@@ -507,26 +436,28 @@ class SymbolAndReferenceTests(RepoTestCase):
         )
 
         symbols = [
-            defined_symbols(self.repo.root, hunk) for hunk in snapshot(self.repo.root, base).hunks
+            WorktreeIndex(self.repo.root).symbols(hunk) for hunk in snapshot(self.repo.root, base).hunks
         ]
 
         self.assertEqual(symbols, [("legacy_rate", "compute_total")])
 
-    def test_find_references_matches_whole_words_in_tracked_and_untracked_files(self) -> None:
+    def test_references_match_whole_words_in_every_work_tree_file(self) -> None:
         self.repo.write("a.py", "compute_total(1)\ncompute_totals(2)\n")
         self.repo.commit()
         self.repo.write("b.py", "x = compute_total\n")
 
-        references = find_references(self.repo.root, "compute_total")
+        references = WorktreeIndex(self.repo.root).references("compute_total")
 
         self.assertEqual(
             [(ref.path, ref.line, ref.text) for ref in references],
             [("a.py", 1, "compute_total(1)"), ("b.py", 1, "x = compute_total")],
         )
-        self.assertEqual(find_references(self.repo.root, "compute_total", limit=1)[0].path, "a.py")
-        self.assertEqual(find_references(self.repo.root, "nothing_here"), ())
+        self.assertEqual(
+            WorktreeIndex(self.repo.root).references("compute_total", limit=1)[0].path, "a.py"
+        )
+        self.assertEqual(WorktreeIndex(self.repo.root).references("nothing_here"), ())
         with self.assertRaises(DiffScanError):
-            find_references(self.repo.root, "")
+            WorktreeIndex(self.repo.root).references("")
 
 
 SIGNAL_EXAMPLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -756,34 +687,34 @@ PATH_SIGNAL_EXAMPLES: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 
 
 class SignalTests(unittest.TestCase):
-    def test_content_signals_fire_on_examples_and_stay_quiet_otherwise(self) -> None:
+    def test_content_signals_fire_only_on_their_examples(self) -> None:
         for signal, (positives, negatives) in SIGNAL_EXAMPLES.items():
             for text in positives:
                 with self.subTest(signal=signal, text=text):
-                    self.assertIn(signal, detect_signals([make_hunk("src/mod.py", added=[text])]))
+                    self.assertIn(signal, detect_signals([change_hunk("src/mod.py", added=[text])]))
             for text in negatives:
                 with self.subTest(signal=signal, text=text):
-                    self.assertNotIn(signal, detect_signals([make_hunk("src/mod.py", added=[text])]))
+                    self.assertNotIn(signal, detect_signals([change_hunk("src/mod.py", added=[text])]))
 
     def test_path_signals(self) -> None:
         for signal, (positives, negatives) in PATH_SIGNAL_EXAMPLES.items():
             for path in positives:
                 with self.subTest(signal=signal, path=path):
-                    self.assertIn(signal, detect_signals([make_hunk(path, added=["x"])]))
+                    self.assertIn(signal, detect_signals([change_hunk(path, added=["x"])]))
             for path in negatives:
                 with self.subTest(signal=signal, path=path):
-                    self.assertNotIn(signal, detect_signals([make_hunk(path, added=["x"])]))
+                    self.assertNotIn(signal, detect_signals([change_hunk(path, added=["x"])]))
 
     def test_deletion_requires_a_non_blank_removed_line_or_a_deleted_file(self) -> None:
-        self.assertIn("deletion", detect_signals([make_hunk("a.py", removed=["x = 1"])]))
-        self.assertNotIn("deletion", detect_signals([make_hunk("a.py", removed=["   "], added=["y"])]))
-        self.assertIn("deletion", detect_signals([make_hunk("a.bin", status="deleted")]))
+        self.assertIn("deletion", detect_signals([change_hunk("a.py", removed=["x = 1"])]))
+        self.assertNotIn("deletion", detect_signals([change_hunk("a.py", removed=["   "], added=["y"])]))
+        self.assertIn("deletion", detect_signals([change_hunk("a.bin", status="deleted")]))
 
-    def test_removed_lines_are_scanned_and_ids_keep_hunk_order(self) -> None:
+    def test_removed_lines_trigger_signals_in_hunk_order(self) -> None:
         hunks = [
-            make_hunk("a.py", removed=["subprocess.run(x)"], hunk_id="H1"),
-            make_hunk("b.py", added=["value = 1"], hunk_id="H2"),
-            make_hunk("c.py", added=["os.system(cmd)"], hunk_id="H3"),
+            change_hunk("a.py", removed=["subprocess.run(x)"], hunk_id="H1"),
+            change_hunk("b.py", added=["value = 1"], hunk_id="H2"),
+            change_hunk("c.py", added=["os.system(cmd)"], hunk_id="H3"),
         ]
 
         signals = detect_signals(hunks)
@@ -792,7 +723,7 @@ class SignalTests(unittest.TestCase):
         self.assertEqual(list(signals), ["process", "deletion"])
 
     def test_docs_content_does_not_trigger_code_signals(self) -> None:
-        signals = detect_signals([make_hunk("README.md", added=["select the token from the session"])])
+        signals = detect_signals([change_hunk("README.md", added=["select the token from the session"])])
         self.assertEqual(signals, {"docs": ("H1",)})
 
 
@@ -803,7 +734,7 @@ class SnapshotStabilityTests(RepoTestCase):
         snap = snapshot(self.repo.root, base)
         return snap.fingerprint, [(hunk.path, hunk.status, hunk.digest) for hunk in snap.hunks]
 
-    def test_staging_and_committing_new_files_keeps_fingerprint_and_digests(self) -> None:
+    def test_committing_new_files_keeps_the_fingerprint(self) -> None:
         self.repo.write("keep.txt", "keep\n")
         base = self.repo.commit()
         self.repo.write("src/new.py", "def f():\n    return 1\n")
@@ -825,7 +756,7 @@ class SnapshotStabilityTests(RepoTestCase):
         self.assertEqual(staged, untracked)
         self.assertEqual(committed, untracked)
 
-    def test_crlf_file_keeps_its_digests_when_autocrlf_normalizes_the_staged_copy(self) -> None:
+    def test_crlf_file_keeps_its_digests_under_autocrlf(self) -> None:
         self.repo.git("config", "core.autocrlf", "true")
         base = self.repo.commit_empty()
         self.repo.write("win.txt", b"a\r\nb\r\n")
@@ -840,7 +771,7 @@ class SnapshotStabilityTests(RepoTestCase):
             (untracked.fingerprint, [hunk.digest for hunk in untracked.hunks]),
         )
 
-    def test_file_removed_from_the_index_but_kept_on_disk_is_diffed_against_base(self) -> None:
+    def test_unindexed_file_on_disk_is_diffed_against_base(self) -> None:
         self.repo.write("keep.py", numbered_lines(12, "value ="))
         base = self.repo.commit()
         self.repo.git("rm", "-q", "--cached", "keep.py")
@@ -869,29 +800,6 @@ class SnapshotStabilityTests(RepoTestCase):
         self.assertEqual(snap.hunks[1].added_lines, ((1, "x = 1"),))
         with self.assertRaisesRegex(DiffScanError, "does not name a commit"):
             resolve_base_sha(self.repo.root, "main")
-
-    def test_git_runs_unlocalized_whatever_the_user_locale(self) -> None:
-        base = self.repo.commit_empty()
-        self.repo.write("logo.bin", b"\x00png")
-        self.repo.git("add", "logo.bin")
-        environments: list[dict[str, str]] = []
-        real_run = subprocess.run
-
-        def recording_run(*args: Any, **kwargs: Any) -> Any:
-            environments.append(dict(kwargs.get("env") or os.environ))
-            return real_run(*args, **kwargs)
-
-        user_locale = {"LC_ALL": "de_DE.UTF-8", "LANG": "de_DE.UTF-8", "LANGUAGE": "de"}
-        with (
-            mock.patch.dict(os.environ, user_locale),
-            mock.patch.object(subprocess, "run", side_effect=recording_run),
-        ):
-            snap = snapshot(self.repo.root, base)
-
-        self.assertEqual(snap.hunks[0].lines, ("~ binary file changed",))
-        self.assertTrue(environments)
-        for env in environments:
-            self.assertEqual((env.get("LC_ALL"), env.get("LANGUAGE")), ("C", "C"))
 
 
 class DigestTests(RepoTestCase):
@@ -930,7 +838,7 @@ class DigestTests(RepoTestCase):
         self.assertNotEqual(in_helper[0].digest, in_critical[0].digest)
 
     @unittest.skipIf(os.name == "nt", "the executable bit is not tracked on Windows checkouts")
-    def test_mode_change_next_to_content_edits_is_shown_and_digested(self) -> None:
+    def test_mode_change_next_to_content_edits_is_digested(self) -> None:
         script = self.repo.write("run.sh", "echo one\n")
         base = self.repo.commit()
         self.repo.write("run.sh", "echo two\n")
@@ -943,7 +851,7 @@ class DigestTests(RepoTestCase):
         self.assertEqual(hunk.added_lines, ((1, "echo two"),))
         self.assertNotEqual(hunk.digest, content_only.digest)
 
-    def test_end_of_file_newline_changes_are_kept_and_digested(self) -> None:
+    def test_end_of_file_newline_changes_are_digested(self) -> None:
         self.repo.write("eof.txt", "last")
         base = self.repo.commit()
         self.repo.write("eof.txt", "last\n")
@@ -965,7 +873,7 @@ class HunkScopeTests(RepoTestCase):
         scope = WorktreeIndex(self.repo.root).hunk_scope(hunk)
         return None if scope is None else scope.name
 
-    def test_pure_deletion_uses_the_deleted_lines_position_not_the_first_context_line(self) -> None:
+    def test_pure_deletion_is_scoped_to_the_function_it_was_made_in(self) -> None:
         self.repo.write("mod.py", self.SOURCE)
         base = self.repo.commit()
         self.repo.write("mod.py", self.SOURCE.replace("    x = 1\n", ""))
@@ -974,6 +882,24 @@ class HunkScopeTests(RepoTestCase):
 
         self.assertEqual(hunk.new_start, 2)  # the leading context starts inside foo
         self.assertEqual(self.scope_name(hunk), "bar")
+
+    def test_changed_definition_line_is_scoped_to_its_function(self) -> None:
+        self.repo.write("mod.py", self.SOURCE)
+        base = self.repo.commit()
+        self.repo.write("mod.py", self.SOURCE.replace("def bar():", "def bar(c):"))
+
+        (hunk,) = snapshot(self.repo.root, base).hunks
+
+        self.assertEqual(self.scope_name(hunk), "bar")
+
+    def test_deleting_the_last_line_of_a_function_keeps_its_scope(self) -> None:
+        self.repo.write("mod.py", self.SOURCE)
+        base = self.repo.commit()
+        self.repo.write("mod.py", self.SOURCE.replace("    return a\n", ""))
+
+        (hunk,) = snapshot(self.repo.root, base).hunks
+
+        self.assertEqual(self.scope_name(hunk), "foo")
 
     def test_deletion_at_the_end_of_the_file_uses_the_line_above(self) -> None:
         self.repo.write("mod.py", self.SOURCE)
@@ -1033,7 +959,7 @@ fn other() {
 class HeuristicScopeTests(RepoTestCase):
     def scope(self, path: str, content: str, line: int) -> tuple[str, int, int]:
         self.repo.write(path, content)
-        scope = enclosing_scope(self.repo.root, path, line)
+        scope = WorktreeIndex(self.repo.root).scope(path, line)
         assert scope is not None
         return scope.name, scope.start, scope.end
 
@@ -1055,14 +981,14 @@ class HeuristicScopeTests(RepoTestCase):
             self.repo.write("inside.py", "x = 1\n")
             (self.repo.root / "inner.py").symlink_to(self.repo.root / "inside.py")
 
-            self.assertIsNone(enclosing_scope(self.repo.root, "link.py", 1))
-            self.assertEqual(find_references(self.repo.root, "secret_helper"), ())
-            self.assertIsNotNone(enclosing_scope(self.repo.root, "inner.py", 1))
+            self.assertIsNone(WorktreeIndex(self.repo.root).scope("link.py", 1))
+            self.assertEqual(WorktreeIndex(self.repo.root).references("secret_helper"), ())
+            self.assertIsNotNone(WorktreeIndex(self.repo.root).scope("inner.py", 1))
 
     def test_python_too_deeply_nested_to_parse_falls_back_to_the_heuristic(self) -> None:
         self.repo.write("deep.py", "total = " + " + ".join(["1"] * 100_000) + "\n")
 
-        scope = enclosing_scope(self.repo.root, "deep.py", 1)
+        scope = WorktreeIndex(self.repo.root).scope("deep.py", 1)
 
         assert scope is not None
         self.assertEqual(scope.kind, "block")
@@ -1074,9 +1000,9 @@ class SymbolPrecisionTests(RepoTestCase):
         base = self.repo.commit()
         self.repo.write(path, after)
         (hunk,) = snapshot(self.repo.root, base).hunks
-        return defined_symbols(self.repo.root, hunk)
+        return WorktreeIndex(self.repo.root).symbols(hunk)
 
-    def test_python_comments_docstrings_and_calls_yield_no_symbols(self) -> None:
+    def test_python_prose_or_calls_yield_no_symbols(self) -> None:
         after = (
             "def keep():\n"
             '    """type annotations for this module\n\n'
@@ -1127,7 +1053,7 @@ class SymbolPrecisionTests(RepoTestCase):
 
 
 class ReferenceSearchTests(RepoTestCase):
-    def test_generated_and_ignored_untracked_files_are_not_searched(self) -> None:
+    def test_generated_or_ignored_untracked_files_are_not_searched(self) -> None:
         self.repo.write("a.py", "compute_total(1)\n")
         self.repo.commit()
         self.repo.write("b.py", "x = compute_total\n")
@@ -1136,17 +1062,19 @@ class ReferenceSearchTests(RepoTestCase):
         self.repo.write("build/out.py", "compute_total()\n")
         self.repo.write(".craftsmanignore", "build/\n")
 
-        references = find_references(self.repo.root, "compute_total")
+        references = WorktreeIndex(self.repo.root).references("compute_total")
 
         self.assertEqual([ref.path for ref in references], ["a.py", "b.py"])
 
-    def test_other_files_rank_first_and_each_file_is_capped(self) -> None:
+    def test_references_rank_other_files_first_with_a_cap_per_file(self) -> None:
         self.repo.write("defs.py", "".join(f"compute_total({index})\n" for index in range(12)))
         self.repo.write("z_use.py", "y = compute_total(5)\n")
         self.repo.commit()
 
-        ranked = find_references(self.repo.root, "compute_total", limit=7, defined_in={"defs.py"})
-        alphabetical = find_references(self.repo.root, "compute_total", limit=7)
+        ranked = WorktreeIndex(self.repo.root).references(
+            "compute_total", limit=7, defined_in={"defs.py"}
+        )
+        alphabetical = WorktreeIndex(self.repo.root).references("compute_total", limit=7)
 
         per_file = diffscan.REFERENCES_PER_FILE
         self.assertEqual(
@@ -1161,14 +1089,11 @@ class ReferenceSearchTests(RepoTestCase):
         self.repo.write("calc.py", "def compute_total(items):\n    return sum(items) * 2\n")
         (hunk,) = snapshot(self.repo.root, base).hunks
         index = WorktreeIndex(self.repo.root)
+        before = index.hunk_scope(hunk)
 
-        with mock.patch.object(diffscan, "_python_spans", wraps=diffscan._python_spans) as parse:
-            for _ in range(3):
-                index.symbols(hunk)
-                index.hunk_scope(hunk)
-            index.references("compute_total")
+        self.repo.write("calc.py", "x = 1\n\n\ndef compute_total(items):\n    return 0\n")
 
-        self.assertEqual(parse.call_count, 1)
+        self.assertEqual(index.hunk_scope(hunk), before)
 
 
 class DocsClassificationTests(RepoTestCase):

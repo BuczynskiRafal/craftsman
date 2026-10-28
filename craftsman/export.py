@@ -2,17 +2,18 @@
 """Multi-platform exporter for Craftsman skills, rules, agents and lifecycle hooks.
 
 Targets:
-1. GitHub Copilot, user level (`--user-dir`, `--copilot-skills-dir`, `--copilot-home`): prompt files
-   and instructions in the VS Code prompts folder (and its profiles), Agent Skills in
-   `~/.copilot/skills/<skill>/`, custom agents in `~/.copilot/agents/` and the prompts folder, and
-   hooks in `~/.copilot/hooks/craftsman.json` that run this interpreter by absolute path.
-2. GitHub Copilot, workspace (`--workspace`): `.github/prompts`, `.github/skills`, `.github/agents`,
+1. GitHub Copilot, user level: the global instructions in the VS Code prompts folder and its
+   profiles (`--user-dir`), Agent Skills in `~/.copilot/skills/<skill>/` (`--copilot-skills-dir`),
+   and custom agents plus hooks that run this interpreter by absolute path in `~/.copilot`
+   (`--copilot-home`).
+2. GitHub Copilot, workspace (`--workspace`): `.github/skills`, `.github/agents`,
    `.github/hooks/craftsman.json` (runs `craftsman` from PATH) and `.github/copilot-instructions.md`.
 3. Claude Code (`--claude-dir`): slash commands, rules, the reviewer/verifier subagents and the
    Craftsman hooks merged into `settings.json` (skip them with `--no-claude-hooks`).
 4. OpenAI Codex / Cursor (`--agents-workspace`): `AGENTS.md` and `.cursor/rules/craftsman.mdc`.
 
-Exporting overwrites files Craftsman generated before and never deletes anything.
+Exporting replaces files Craftsman generated before; a user's file in the way is moved into a
+`.craftsman-backup` folder next to it, so nothing a user wrote is lost.
 """
 
 from __future__ import annotations
@@ -21,15 +22,22 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Collection, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, get_args
 
+from craftsman.files import (
+    copy_once_backup,
+    exists,
+    move_aside,
+    write_bytes_atomic,
+    write_text_atomic,
+)
 from craftsman.lenses import render_reviewer_groups_markdown
 
 FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
@@ -39,7 +47,8 @@ CRAFTSMAN_GENERATED_MARKER = "<!-- craftsman:generated -->"
 INCLUDE_RE = re.compile(r"^\{\{include\s+(\S+)\s*\}\}[ \t]*$", re.MULTILINE)
 MALFORMED_INCLUDE_RE = re.compile(r"^[ \t]*\{\{\s*include\b.*$", re.MULTILINE)
 SIBLING_LINK_RE = re.compile(r"\[[^\]\n]*\]\(([\w.-]+\.md)\)")
-OUR_HOOK_COMMAND_RE = re.compile(r"\bcraftsman(?:\.cli|-cli\.py|\.exe)?[\"']?\s+hook\b")
+REVIEWER_GROUPS_PLACEHOLDER = "{{reviewer_groups}}"
+AGENTS_MD_TEMPLATE = Path("templates") / "AGENTS.md"
 COPY_IGNORED_NAMES = frozenset({"__pycache__", ".DS_Store", "Thumbs.db"})
 
 DUPLICATE_SCOPE_USER_TO_WS_MSG = (
@@ -54,176 +63,114 @@ DUPLICATE_SCOPE_WS_TO_USER_MSG = (
 
 CopilotClient = Literal["vscode", "copilot-cli"]
 CopilotEntityKind = Literal["agent", "skill", "prompt"]
-CopilotLocationScope = Literal[
-    "user", "profile", "workspace", "claude-user", "claude-workspace"
-]
+CopilotLocationScope = Literal["user", "profile", "workspace", "claude-user", "claude-workspace"]
+
+
+class ExportError(RuntimeError):
+    """An export target cannot be written without losing or corrupting data."""
+
+
+# --- Copilot discovery ----------------------------------------------------------------------
+
+
+class DiscoveryRoot(Enum):
+    """A folder Copilot reads agents, skills or prompts from: its scope and where it lives."""
+
+    COPILOT_AGENTS = ("user", ".copilot/agents")
+    COPILOT_SKILLS = ("user", ".copilot/skills")
+    VSCODE_PROMPTS = ("user", "Code/User/prompts")
+    VSCODE_PROFILE_PROMPTS = ("profile", "Code/User/profiles/*/prompts")
+    WORKSPACE_AGENTS = ("workspace", ".github/agents")
+    WORKSPACE_SKILLS = ("workspace", ".github/skills")
+    WORKSPACE_PROMPTS = ("workspace", ".github/prompts")
+    CLAUDE_AGENTS = ("claude-user", ".claude/agents")
+    CLAUDE_SKILLS = ("claude-user", ".claude/skills")
+    WORKSPACE_CLAUDE_AGENTS = ("claude-workspace", ".claude/agents")
+    WORKSPACE_CLAUDE_SKILLS = ("claude-workspace", ".claude/skills")
+
+    @property
+    def scope(self) -> CopilotLocationScope:
+        scope: CopilotLocationScope = self.value[0]
+        return scope
+
+    @property
+    def rel_path(self) -> str:
+        rel_path: str = self.value[1]
+        return rel_path
+
+
+class EntityPattern(str, Enum):
+    SKILL_DIR = "*/SKILL.md"
+    AGENT = "*.agent.md"
+    PROMPT = "*.prompt.md"
+    MARKDOWN = "*.md"
 
 
 @dataclass(frozen=True)
 class CopilotDiscoveryLocation:
-    scope: CopilotLocationScope
-    rel_path: str
-    pattern: str
+    root: DiscoveryRoot
+    pattern: EntityPattern
     canonical: bool
-    source_url: str
-    verified_on: str = "2026-10-27"
+
+    @property
+    def scope(self) -> CopilotLocationScope:
+        return self.root.scope
+
+    @property
+    def rel_path(self) -> str:
+        return self.root.rel_path
 
 
-# Single source of truth for Copilot entity discovery across VS Code and GitHub Copilot CLI.
-# Sources verified on 2026-10-27:
-# - VS Code Custom Agents (`chat.agentFilesLocations`):
-#   https://code.visualstudio.com/docs/copilot/customization/custom-agents
-# - VS Code Agent Skills (`chat.agentSkillsLocations`):
-#   https://code.visualstudio.com/docs/copilot/customization/agent-skills
-# - VS Code Prompt Files (`chat.promptFilesLocations`):
-#   https://code.visualstudio.com/docs/copilot/customization/prompt-files
-# - GitHub Copilot CLI Custom Agents & Agent Skills:
-#   https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli
-#   https://docs.github.com/en/copilot/concepts/agents/about-agent-skills
+def _locations(
+    *entries: tuple[DiscoveryRoot, EntityPattern, bool],
+) -> tuple[CopilotDiscoveryLocation, ...]:
+    return tuple(CopilotDiscoveryLocation(*entry) for entry in entries)
+
+
+_R, _P = DiscoveryRoot, EntityPattern
+# Where VS Code and the Copilot CLI discover each kind of entity; a canonical location is the one
+# Craftsman installs into. Documented at code.visualstudio.com/docs/copilot/customization
+# (custom-agents, agent-skills, prompt-files) and docs.github.com/en/copilot (copilot-cli).
 COPILOT_DISCOVERY: dict[
     tuple[CopilotClient, CopilotEntityKind], tuple[CopilotDiscoveryLocation, ...]
 ] = {
-    ("vscode", "agent"): (
-        CopilotDiscoveryLocation(
-            scope="user",
-            rel_path=".copilot/agents",
-            pattern="*.agent.md",
-            canonical=True,
-            source_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli",
-        ),
-        CopilotDiscoveryLocation(
-            scope="user",
-            rel_path="Code/User/prompts",
-            pattern="*.agent.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
-        ),
-        CopilotDiscoveryLocation(
-            scope="profile",
-            rel_path="Code/User/profiles/*/prompts",
-            pattern="*.agent.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
-        ),
-        CopilotDiscoveryLocation(
-            scope="workspace",
-            rel_path=".github/agents",
-            pattern="*.agent.md",
-            canonical=True,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
-        ),
-        CopilotDiscoveryLocation(
-            scope="claude-user",
-            rel_path=".claude/agents",
-            pattern="*.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
-        ),
-        CopilotDiscoveryLocation(
-            scope="claude-workspace",
-            rel_path=".claude/agents",
-            pattern="*.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/custom-agents",
-        ),
+    ("vscode", "agent"): _locations(
+        (_R.COPILOT_AGENTS, _P.AGENT, True),
+        (_R.VSCODE_PROMPTS, _P.AGENT, False),
+        (_R.VSCODE_PROFILE_PROMPTS, _P.AGENT, False),
+        (_R.WORKSPACE_AGENTS, _P.AGENT, True),
+        (_R.CLAUDE_AGENTS, _P.MARKDOWN, False),
+        (_R.WORKSPACE_CLAUDE_AGENTS, _P.MARKDOWN, False),
     ),
-    ("vscode", "skill"): (
-        CopilotDiscoveryLocation(
-            scope="user",
-            rel_path=".copilot/skills",
-            pattern="*/SKILL.md",
-            canonical=True,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
-        ),
-        CopilotDiscoveryLocation(
-            scope="workspace",
-            rel_path=".github/skills",
-            pattern="*/SKILL.md",
-            canonical=True,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
-        ),
-        CopilotDiscoveryLocation(
-            scope="claude-user",
-            rel_path=".claude/skills",
-            pattern="*/SKILL.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
-        ),
-        CopilotDiscoveryLocation(
-            scope="claude-workspace",
-            rel_path=".claude/skills",
-            pattern="*/SKILL.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/agent-skills",
-        ),
+    ("vscode", "skill"): _locations(
+        (_R.COPILOT_SKILLS, _P.SKILL_DIR, True),
+        (_R.WORKSPACE_SKILLS, _P.SKILL_DIR, True),
+        (_R.CLAUDE_SKILLS, _P.SKILL_DIR, False),
+        (_R.WORKSPACE_CLAUDE_SKILLS, _P.SKILL_DIR, False),
     ),
-    ("vscode", "prompt"): (
-        CopilotDiscoveryLocation(
-            scope="user",
-            rel_path="Code/User/prompts",
-            pattern="*.prompt.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/prompt-files",
-        ),
-        CopilotDiscoveryLocation(
-            scope="profile",
-            rel_path="Code/User/profiles/*/prompts",
-            pattern="*.prompt.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/prompt-files",
-        ),
-        CopilotDiscoveryLocation(
-            scope="workspace",
-            rel_path=".github/prompts",
-            pattern="*.prompt.md",
-            canonical=False,
-            source_url="https://code.visualstudio.com/docs/copilot/customization/prompt-files",
-        ),
+    ("vscode", "prompt"): _locations(
+        (_R.VSCODE_PROMPTS, _P.PROMPT, False),
+        (_R.VSCODE_PROFILE_PROMPTS, _P.PROMPT, False),
+        (_R.WORKSPACE_PROMPTS, _P.PROMPT, False),
     ),
-    ("copilot-cli", "agent"): (
-        CopilotDiscoveryLocation(
-            scope="user",
-            rel_path=".copilot/agents",
-            pattern="*.agent.md",
-            canonical=True,
-            source_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli",
-        ),
-        CopilotDiscoveryLocation(
-            scope="workspace",
-            rel_path=".github/agents",
-            pattern="*.agent.md",
-            canonical=True,
-            source_url="https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/create-custom-agents-for-cli",
-        ),
+    ("copilot-cli", "agent"): _locations(
+        (_R.COPILOT_AGENTS, _P.AGENT, True),
+        (_R.WORKSPACE_AGENTS, _P.AGENT, True),
     ),
-    ("copilot-cli", "skill"): (
-        CopilotDiscoveryLocation(
-            scope="user",
-            rel_path=".copilot/skills",
-            pattern="*/SKILL.md",
-            canonical=True,
-            source_url="https://docs.github.com/en/copilot/concepts/agents/about-agent-skills",
-        ),
-        CopilotDiscoveryLocation(
-            scope="workspace",
-            rel_path=".github/skills",
-            pattern="*/SKILL.md",
-            canonical=True,
-            source_url="https://docs.github.com/en/copilot/concepts/agents/about-agent-skills",
-        ),
+    ("copilot-cli", "skill"): _locations(
+        (_R.COPILOT_SKILLS, _P.SKILL_DIR, True),
+        (_R.WORKSPACE_SKILLS, _P.SKILL_DIR, True),
     ),
-    ("copilot-cli", "prompt"): (),
 }
 
-AgentRole = Literal["orchestrator", "reviewer", "verifier"]
-AGENT_ROLES: tuple[AgentRole, ...] = get_args(AgentRole)
-COPILOT_AGENT_TOOLS: dict[AgentRole, tuple[str, ...]] = {
+TemplateRole = Literal["orchestrator", "reviewer", "verifier"]
+TEMPLATE_ROLES: tuple[TemplateRole, ...] = get_args(TemplateRole)
+COPILOT_AGENT_TOOLS: dict[TemplateRole, tuple[str, ...]] = {
     "orchestrator": ("read", "edit", "search", "execute", "agent", "todo", "web"),
     "reviewer": ("read", "search", "execute"),
     "verifier": ("read", "search", "execute"),
 }
 CLAUDE_AGENT_TOOLS = "Read, Grep, Glob, Bash"
-ORCHESTRATOR_SKILL = "craftsman"
 COPILOT_TERMINAL_NOTE = (
     "Terminal commands run in the integrated terminal; every `craftsman` command works in bash, "
     "zsh and PowerShell."
@@ -257,35 +204,45 @@ HOOKS_FILENAME = "craftsman.json"
 CLI_SHIM = Path("scripts") / "craftsman-cli.py"
 IMPORT_CHECK_TIMEOUT_S = 30
 
+_QUOTED = r'"(?:[^"\\]|\\.)*"'
+_QUOTED_SHIM = r'"(?:[^"\\]|\\.)*craftsman-cli\.py"'
+# Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running
+# `-m craftsman.cli` or the checkout's shim, then `hook <event> --platform claude`.
+OUR_HOOK_COMMAND_RE = re.compile(
+    rf"^{_QUOTED} (?:-m craftsman\.cli|{_QUOTED_SHIM}) hook "
+    rf"(?:{'|'.join(re.escape(event) for event, _ in CLAUDE_HOOK_EVENTS.values())}) "
+    r"--platform claude$"
+)
 
-class ExportError(RuntimeError):
-    """An export target cannot be written without losing or corrupting data."""
+
+_COPILOT_HOOK_RE = re.compile(r" hook [a-z-]+ --platform copilot$")
+
+
+# --- locations ------------------------------------------------------------------------------
 
 
 def user_home(home: Path | None = None) -> Path:
     if home is not None:
         return home
-    env_home = os.environ.get("HOME", "").strip()
+    env_home = os.environ.get("HOME", "").strip() or os.environ.get("USERPROFILE", "").strip()
     if env_home:
         return Path(env_home)
     try:
         return Path.home()
-    except RuntimeError:
-        return Path(".")
+    except RuntimeError as exc:
+        raise ExportError(f"cannot determine the home directory: {exc}") from exc
 
 
 def env_var_for_home(env_key: str, home: Path | None = None) -> str:
+    """`env_key` from the environment, or "" when it points outside an explicitly given `home`."""
     val = os.environ.get(env_key, "").strip()
     if not val:
         return ""
-    if env_key == "APPDATA" and os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", val):
-        return val
     abs_val = Path(os.path.abspath(val))
-    eff_home = user_home(home)
-    abs_home = Path(os.path.abspath(str(eff_home)))
+    abs_home = Path(os.path.abspath(user_home(home)))
     if abs_val == abs_home or abs_home in abs_val.parents:
         return val
-    if abs_home == Path(os.path.abspath(str(user_home(None)))):
+    if abs_home == Path(os.path.abspath(user_home(None))):
         return val
     return ""
 
@@ -295,223 +252,65 @@ def _has_assets(directory: Path) -> bool:
 
 
 def resolve_craftsman_pkg_dir(repo_dir: Path) -> Path:
+    """The `craftsman` package that ships with the assets in `repo_dir`."""
     candidate = repo_dir / "craftsman"
-    if candidate.is_dir() and (candidate / "__init__.py").is_file():
+    if (candidate / "__init__.py").is_file():
         return candidate
     if repo_dir.name == "_assets" and (repo_dir.parent / "__init__.py").is_file():
         return repo_dir.parent
-    return Path(__file__).resolve().parent
+    raise ExportError(f"no craftsman package next to the assets in {repo_dir}")
 
 
 def default_repo_dir() -> Path:
+    """This checkout, or the assets bundled into the installed package."""
     pkg_dir = Path(__file__).resolve().parent
-    repo_root = pkg_dir.parent
-    if _has_assets(repo_root):
-        return repo_root
-    bundled = pkg_dir / "_assets"
-    if _has_assets(bundled):
-        return bundled
-    cfg_dir = user_home() / ".gemini" / "config"
-    if _has_assets(cfg_dir):
-        return cfg_dir
-    return repo_root
+    for candidate in (pkg_dir.parent, pkg_dir / "_assets"):
+        if _has_assets(candidate):
+            return candidate
+    raise ExportError(f"no Craftsman assets (skills/, agents/) next to {pkg_dir}; pass --repo-dir")
 
 
-def _resolve_windows_appdata(home: Path | None = None) -> Path | None:
-    resolved_home = user_home(home)
-    appdata = env_var_for_home("APPDATA", home)
-    win_roaming = resolved_home / "AppData" / "Roaming"
-    if appdata:
-        if os.name != "nt":
-            drive_match = re.match(r"^([A-Za-z]):[\\/](.*)$", appdata)
-            if drive_match:
-                drive = drive_match.group(1).lower()
-                rest = drive_match.group(2).replace("\\", "/")
-                for candidate in (
-                    win_roaming,
-                    Path(f"/{drive}/{rest}"),
-                    Path(f"/mnt/{drive}/{rest}"),
-                ):
-                    if candidate.is_dir():
-                        return candidate
-                return win_roaming
-        return Path(appdata)
-    if sys.platform == "win32" or os.name == "nt" or win_roaming.is_dir():
-        return win_roaming
-    return None
+def default_vscode_user_dir(home: Path | None = None) -> Path:
+    """VS Code's `Code/User` folder in this operating system's layout."""
+    if sys.platform == "win32":
+        appdata = env_var_for_home("APPDATA", home)
+        if not appdata:
+            raise ExportError("APPDATA is not set; cannot locate the VS Code user folder")
+        return Path(appdata) / "Code" / "User"
+    if sys.platform == "darwin":
+        return user_home(home) / "Library" / "Application Support" / "Code" / "User"
+    xdg_config = env_var_for_home("XDG_CONFIG_HOME", home)
+    return (Path(xdg_config) if xdg_config else user_home(home) / ".config") / "Code" / "User"
 
 
 def default_vscode_prompts_dir(home: Path | None = None) -> Path:
-    resolved_home = user_home(home)
-    win_base = _resolve_windows_appdata(home)
-    if win_base is not None:
-        return win_base / "Code" / "User" / "prompts"
-    mac_dir = resolved_home / "Library" / "Application Support" / "Code" / "User" / "prompts"
-    if sys.platform == "darwin" or mac_dir.parent.is_dir():
-        return mac_dir
-    xdg_cfg = env_var_for_home("XDG_CONFIG_HOME", home)
-    cfg_root = Path(xdg_cfg) if xdg_cfg else (resolved_home / ".config")
-    return cfg_root / "Code" / "User" / "prompts"
-
-
-def default_copilot_skills_dir(home: Path | None = None) -> Path:
-    return user_home(home) / ".copilot" / "skills"
-
-
-def default_claude_dir(home: Path | None = None) -> Path:
-    return user_home(home) / ".claude"
+    return default_vscode_user_dir(home) / "prompts"
 
 
 def default_copilot_home(home: Path | None = None) -> Path:
     return user_home(home) / ".copilot"
 
 
-def extract_skill_name(skill_md: str, fallback_name: str) -> str:
-    match = FRONTMATTER_RE.match(skill_md)
-    if not match:
-        return fallback_name
-    for line in match.group(1).splitlines():
-        if line.startswith("name:"):
-            val = _unquote(line.split(":", 1)[1].strip())
-            if val:
-                return val
-    return fallback_name
+def default_copilot_skills_dir(home: Path | None = None) -> Path:
+    return default_copilot_home(home) / "skills"
 
 
-def extract_description_and_body(skill_md: str, fallback_name: str) -> tuple[str, str]:
-    match = FRONTMATTER_RE.match(skill_md)
-    if not match:
-        return f"Craftsman skill /{fallback_name}", skill_md.strip()
-
-    fm_raw, body = match.group(1), match.group(2)
-    desc_lines: list[str] = []
-    in_desc = False
-    for line in fm_raw.splitlines():
-        if line.startswith("description:"):
-            val = line.split(":", 1)[1].strip()
-            if val not in (">-", "|-", "|", ">", ""):
-                desc_lines.append(_unquote(val))
-            in_desc = True
-            continue
-        if in_desc:
-            if line.startswith("  ") or line.startswith("\t"):
-                desc_lines.append(line.strip())
-            else:
-                break
-
-    description = " ".join(desc_lines).strip() or f"Craftsman skill /{fallback_name}"
-    return description, body.strip()
+def default_claude_dir(home: Path | None = None) -> Path:
+    return user_home(home) / ".claude"
 
 
-GATE_SCRIPT_INVOCATION_RE = re.compile(
-    r"(?:python3?\s+)?~/.gemini/config/scripts/craftsman-stop-gate\.py"
-)
-
-
-def _rewrite_antigravity_paths(body: str) -> str:
-    """Rewrite Antigravity-specific script and artifact paths to portable per-worktree CLI equivalents."""
-    state_expr = (
-        "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman/craftsman_state.json"
-    )
-    dir_expr = "$(git rev-parse --git-dir 2>/dev/null || echo .craftsman)/craftsman"
-    rewritten = GATE_SCRIPT_INVOCATION_RE.sub("craftsman gate", body)
-    rewritten = rewritten.replace(
-        '"<artifactDirectoryPath>/craftsman_state.json"',
-        f'"{state_expr}"',
-    )
-    rewritten = rewritten.replace(
-        "<artifactDirectoryPath>/craftsman_state.json",
-        f'"{state_expr}"',
-    )
-    rewritten = rewritten.replace(
-        '"<appDataDir>/brain/<conversation-id>/craftsman_state.json"',
-        f'"{state_expr}"',
-    )
-    rewritten = rewritten.replace(
-        "<appDataDir>/brain/<conversation-id>/craftsman_state.json",
-        f'"{state_expr}"',
-    )
-    rewritten = rewritten.replace("<artifactDirectoryPath>", dir_expr)
-    rewritten = rewritten.replace("<appDataDir>/brain/<conversation-id>", dir_expr)
-    rewritten = rewritten.replace("{{reviewer_groups}}", render_reviewer_groups_markdown())
-    return rewritten
-
-
-def copilot_note(with_subagents: bool) -> str:
-    sentences = (
-        (COPILOT_SUBAGENT_NOTE, COPILOT_TERMINAL_NOTE) if with_subagents else (COPILOT_TERMINAL_NOTE,)
-    )
-    return f"> **GitHub Copilot:** {' '.join(sentences)}\n\n"
-
-
-def adapt_body_for_copilot(body: str, *, with_subagents: bool = True) -> str:
-    """Prefix the generated marker, Copilot platform note, and normalize legacy paths."""
-    return (
-        f"{CRAFTSMAN_GENERATED_MARKER}\n\n"
-        + copilot_note(with_subagents)
-        + _rewrite_antigravity_paths(body)
-        + "\n"
-    )
-
-
-def adapt_body_for_claude(body: str) -> str:
-    """Prefix the Claude Code platform note and normalize legacy paths."""
-    return f"> **Claude Code:** {CLAUDE_SUBAGENT_NOTE}\n\n" + _rewrite_antigravity_paths(body) + "\n"
-
-
-def _single_quoted(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def render_copilot_prompt_file(skill_name: str, skill_md: str) -> str:
-    description, body = extract_description_and_body(skill_md, skill_name)
-    agent = ORCHESTRATOR_SKILL if skill_name == ORCHESTRATOR_SKILL else "agent"
-    adapted = adapt_body_for_copilot(body)
-    return f"---\nagent: '{agent}'\ndescription: {_single_quoted(description)}\n---\n\n{adapted}"
-
-
-def render_copilot_skill_file(skill_name: str, skill_md: str) -> str:
-    description, body = extract_description_and_body(skill_md, skill_name)
-    adapted = adapt_body_for_copilot(body)
-    return f"---\nname: {skill_name}\ndescription: {_single_quoted(description)}\n---\n\n{adapted}"
-
-
-def render_claude_command_file(skill_name: str, skill_md: str) -> str:
-    description, body = extract_description_and_body(skill_md, skill_name)
-    adapted = adapt_body_for_claude(body)
-    return f"---\ndescription: {_single_quoted(description)}\n---\n\n{adapted}"
-
-
-def inline_sibling_links(skill_md: str, skill_dir: Path) -> str:
-    """Append sibling Markdown files that `skill_md` links to, for single-file formats."""
-    appendices: list[str] = []
-    for name in dict.fromkeys(SIBLING_LINK_RE.findall(skill_md)):
-        sibling = skill_dir / name
-        if name == "SKILL.md" or not sibling.is_file():
-            continue
-        appendices.append(
-            f"## Appendix: {name}\n\n{_strip_frontmatter(sibling.read_text(encoding='utf-8'))}"
+def vscode_prompt_dirs(prompts_dir: Path) -> list[Path]:
+    """The prompts folder plus, for a VS Code `User/prompts` folder, those of its profiles."""
+    dirs = [prompts_dir]
+    profiles_dir = prompts_dir.parent / "profiles"
+    if prompts_dir.name == "prompts" and profiles_dir.is_dir():
+        dirs.extend(
+            profile / "prompts" for profile in sorted(profiles_dir.iterdir()) if profile.is_dir()
         )
-    if not appendices:
-        return skill_md
-    return skill_md.rstrip() + "\n\n---\n\n" + "\n\n".join(appendices) + "\n"
+    return dirs
 
 
-def _strip_frontmatter(text: str) -> str:
-    match = FRONTMATTER_RE.match(text)
-    return (match.group(2) if match else text).strip()
-
-
-# --- agents ---------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class AgentTemplate:
-    name: str
-    description: str
-    role: AgentRole
-    subagents: tuple[str, ...]
-    body: str  # with includes expanded
+# --- frontmatter, skills and agents ---------------------------------------------------------
 
 
 def parse_frontmatter(text: str, source: Path) -> tuple[dict[str, str], str]:
@@ -545,6 +344,92 @@ def _unquote(value: str) -> str:
     return value
 
 
+def _required_fields(fields: dict[str, str], source: Path, *names: str) -> None:
+    missing = [name for name in names if not fields.get(name)]
+    if missing:
+        raise ExportError(f"{source}: frontmatter needs {', '.join(f'`{n}`' for n in missing)}")
+
+
+@dataclass(frozen=True)
+class Skill:
+    """A bundled skill: its folder, frontmatter name and description, and the full SKILL.md."""
+
+    name: str
+    description: str
+    body: str
+    text: str
+    directory: Path
+
+
+def read_skill(skill_md: Path) -> Skill:
+    text = skill_md.read_text(encoding="utf-8")
+    fields, body = parse_frontmatter(text, skill_md)
+    _required_fields(fields, skill_md, "name", "description")
+    return Skill(fields["name"], fields["description"], body.strip(), text, skill_md.parent)
+
+
+def iter_skills(repo_dir: Path) -> list[Skill]:
+    """Every `skills/*/SKILL.md` of the repository, by folder."""
+    return [read_skill(path) for path in sorted((repo_dir / "skills").glob("*/SKILL.md"))]
+
+
+def _single_quoted(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def copilot_note(with_subagents: bool) -> str:
+    sentences = (
+        (COPILOT_SUBAGENT_NOTE, COPILOT_TERMINAL_NOTE) if with_subagents else (COPILOT_TERMINAL_NOTE,)
+    )
+    return f"> **GitHub Copilot:** {' '.join(sentences)}\n\n"
+
+
+def adapt_body_for_copilot(body: str, *, with_subagents: bool = True) -> str:
+    """Prefix the generated marker and the Copilot platform note."""
+    return f"{CRAFTSMAN_GENERATED_MARKER}\n\n" + copilot_note(with_subagents) + body + "\n"
+
+
+def adapt_body_for_claude(body: str) -> str:
+    """Prefix the generated marker and the Claude Code platform note."""
+    return f"{CRAFTSMAN_GENERATED_MARKER}\n\n> **Claude Code:** {CLAUDE_SUBAGENT_NOTE}\n\n{body}\n"
+
+
+def render_copilot_skill_file(skill: Skill) -> str:
+    adapted = adapt_body_for_copilot(skill.body)
+    return f"---\nname: {skill.name}\ndescription: {_single_quoted(skill.description)}\n---\n\n{adapted}"
+
+
+def render_claude_command_file(skill: Skill) -> str:
+    adapted = adapt_body_for_claude(_with_inlined_siblings(skill))
+    return f"---\ndescription: {_single_quoted(skill.description)}\n---\n\n{adapted}"
+
+
+def _with_inlined_siblings(skill: Skill) -> str:
+    """The skill body followed by the sibling Markdown files it links to, for one-file formats."""
+    appendices = [
+        f"## Appendix: {name}\n\n{_strip_frontmatter((skill.directory / name).read_text(encoding='utf-8'))}"
+        for name in dict.fromkeys(SIBLING_LINK_RE.findall(skill.body))
+        if name != "SKILL.md" and (skill.directory / name).is_file()
+    ]
+    if not appendices:
+        return skill.body
+    return skill.body.rstrip() + "\n\n---\n\n" + "\n\n".join(appendices)
+
+
+def _strip_frontmatter(text: str) -> str:
+    match = FRONTMATTER_RE.match(text)
+    return (match.group(2) if match else text).strip()
+
+
+@dataclass(frozen=True)
+class AgentTemplate:
+    name: str
+    description: str
+    role: TemplateRole
+    subagents: tuple[str, ...]
+    body: str  # with includes expanded
+
+
 def _parse_list(raw: str) -> tuple[str, ...]:
     inner = raw.strip().removeprefix("[").removesuffix("]")
     return tuple(item.strip().strip("\"'") for item in inner.split(",") if item.strip())
@@ -573,25 +458,41 @@ def load_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
     paths = sorted((repo_dir / "agents").glob("*.md"))
     if not paths:
         raise ExportError(f"no agent templates (agents/*.md) found under {repo_dir}")
-    templates: list[AgentTemplate] = []
-    for path in paths:
-        fields, body = parse_frontmatter(path.read_text(encoding="utf-8"), path)
-        role = fields.get("role", "")
-        name = fields.get("name", "")
-        if not name or not fields.get("description"):
-            raise ExportError(f"{path}: frontmatter needs `name` and `description`")
-        if role not in AGENT_ROLES:
-            raise ExportError(f"{path}: role must be one of {', '.join(AGENT_ROLES)} (got {role!r})")
-        templates.append(
-            AgentTemplate(
-                name=name,
-                description=fields["description"],
-                role=role,
-                subagents=_parse_list(fields.get("subagents", "")),
-                body=expand_includes(body, repo_dir, path).strip(),
-            )
-        )
-    return templates
+    return [_load_agent_template(path, repo_dir) for path in paths]
+
+
+def _load_agent_template(path: Path, repo_dir: Path) -> AgentTemplate:
+    fields, body = parse_frontmatter(path.read_text(encoding="utf-8"), path)
+    _required_fields(fields, path, "name", "description")
+    role = fields.get("role", "")
+    if role not in TEMPLATE_ROLES:
+        raise ExportError(f"{path}: role must be one of {', '.join(TEMPLATE_ROLES)} (got {role!r})")
+    return AgentTemplate(
+        name=fields["name"],
+        description=fields["description"],
+        role=role,
+        subagents=_parse_list(fields.get("subagents", "")),
+        body=expand_includes(body, repo_dir, path).strip(),
+    )
+
+
+def claude_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
+    """The reviewer and verifier subagents; Claude users run the orchestrator as `/craftsman`."""
+    return [t for t in load_agent_templates(repo_dir) if t.role != "orchestrator"]
+
+
+def craftsman_agent_names(repo_dir: Path) -> tuple[str, ...]:
+    return tuple(template.name for template in load_agent_templates(repo_dir))
+
+
+def craftsman_skill_names(repo_dir: Path) -> tuple[str, ...]:
+    return tuple(skill.name for skill in iter_skills(repo_dir))
+
+
+def craftsman_entity_names(repo_dir: Path) -> frozenset[str]:
+    return frozenset(
+        (*craftsman_agent_names(repo_dir), *craftsman_skill_names(repo_dir), "craftsman-rules")
+    )
 
 
 def _yaml_list(items: tuple[str, ...]) -> str:
@@ -618,31 +519,137 @@ def render_claude_agent(template: AgentTemplate) -> str:
     lines = ["---", f"name: {template.name}", f"description: {_single_quoted(template.description)}"]
     if template.role != "orchestrator":
         lines.append(f"tools: {CLAUDE_AGENT_TOOLS}")
-    lines += ["---", ""]
-    return "\n".join(lines) + "\n" + _rewrite_antigravity_paths(template.body) + "\n"
+    lines += ["---", "", CRAFTSMAN_GENERATED_MARKER, ""]
+    return "\n".join(lines) + "\n" + template.body + "\n"
 
 
-def _write_agents(
-    templates: list[AgentTemplate], out_dir: Path, suffix: str, render: Callable[[AgentTemplate], str]
-) -> list[Path]:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
-    for template in templates:
-        target = out_dir / f"{template.name}{suffix}"
-        write_text_atomic(target, render(template))
-        written.append(target)
-    return written
+def render_combined_rules(rules_dir: Path, with_frontmatter: bool) -> str:
+    bodies = [
+        _strip_frontmatter(rule_file.read_text(encoding="utf-8"))
+        for rule_file in sorted(rules_dir.glob("*.md"))
+    ]
+    combined = "\n\n---\n\n".join(bodies) + "\n"
+    if not with_frontmatter:
+        return combined
+    return (
+        "---\napplyTo: '**'\ndescription: 'Craftsman Global Engineering & Git Rules'\n---\n"
+        f"{CRAFTSMAN_GENERATED_MARKER}\n\n{combined}"
+    )
 
 
-def export_copilot_agents(repo_dir: Path, out_dir: Path) -> list[Path]:
-    """Write every agent as `<name>.agent.md` into `out_dir`."""
-    return _write_agents(load_agent_templates(repo_dir), out_dir, ".agent.md", render_copilot_agent)
+def render_agents_md(repo_dir: Path) -> str:
+    """The universal AGENTS.md block for OpenAI Codex, Cursor, Windsurf and GitHub Copilot."""
+    template_path = repo_dir / AGENTS_MD_TEMPLATE
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ExportError(f"cannot read the AGENTS.md template {template_path}: {exc}") from exc
+    if REVIEWER_GROUPS_PLACEHOLDER not in template:
+        raise ExportError(f"{template_path} has no {REVIEWER_GROUPS_PLACEHOLDER} placeholder")
+    groups = "\n".join(f"  {line}" for line in render_reviewer_groups_markdown().splitlines())
+    skills = "\n".join(f"- **`/{skill.name}`**: {skill.description}" for skill in iter_skills(repo_dir))
+    rules = render_combined_rules(repo_dir / "rules", with_frontmatter=False)
+    loop = template.replace(REVIEWER_GROUPS_PLACEHOLDER, groups).strip()
+    return f"{loop}\n{skills}\n\n---\n\n{rules}"
 
 
-def export_claude_agents(repo_dir: Path, agents_dir: Path) -> list[Path]:
-    """Write the reviewer and verifier subagents; Claude users run the orchestrator as `/craftsman`."""
-    templates = [t for t in load_agent_templates(repo_dir) if t.role != "orchestrator"]
-    return _write_agents(templates, agents_dir, ".md", render_claude_agent)
+# --- generated files ------------------------------------------------------------------------
+
+
+def is_craftsman_generated_file(path: Path) -> bool:
+    """Whether `path` carries the marker Craftsman writes into every file it generates."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return CRAFTSMAN_GENERATED_MARKER in text
+
+
+@dataclass(frozen=True)
+class FileChange:
+    """What writing one file did: whether it changed, and where a user's copy was kept."""
+
+    path: Path
+    changed: bool
+    backup: Path | None = None
+
+
+def write_generated(path: Path, text: str, *, owned: Callable[[Path], bool]) -> FileChange:
+    """Write a generated file; a file in the way that `owned` does not claim is moved aside."""
+    backup = None if not exists(path) or owned(path) else move_aside(path, dry_run=False)
+    if backup is None and path.is_file() and not path.is_symlink():
+        if path.read_bytes() == text.encode("utf-8"):
+            return FileChange(path, changed=False)
+    if path.is_symlink():  # never write through a link into the file it points to
+        path.unlink()
+    write_text_atomic(path, text)
+    return FileChange(path, changed=True, backup=backup)
+
+
+def _write_marked(path: Path, text: str) -> FileChange:
+    return write_generated(path, text, owned=is_craftsman_generated_file)
+
+
+def _is_generated_skill_dir(path: Path) -> bool:
+    return path.is_dir() and not path.is_symlink() and is_craftsman_generated_file(path / "SKILL.md")
+
+
+def export_to_copilot_skills(repo_dir: Path, skills_out_dir: Path) -> list[FileChange]:
+    """Native Copilot Agent Skills: `<skills_out_dir>/<skill>/` with every file of the skill."""
+    changes: list[FileChange] = []
+    for skill in iter_skills(repo_dir):
+        dest = skills_out_dir / skill.name
+        in_the_way = exists(dest) and not _is_generated_skill_dir(dest)
+        backup = move_aside(dest, dry_run=False) if in_the_way else None
+        _copy_tree_files(skill.directory, dest)
+        write_text_atomic(dest / "SKILL.md", render_copilot_skill_file(skill))
+        changes.append(FileChange(dest, changed=True, backup=backup))
+    return changes
+
+
+def _copy_tree_files(source: Path, dest: Path) -> None:
+    """Copy every file below `source` but its SKILL.md into `dest`, replacing same-named files."""
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        if (
+            not path.is_file()
+            or relative == Path("SKILL.md")
+            or any(part in COPY_IGNORED_NAMES for part in relative.parts)
+        ):
+            continue
+        target = dest / relative
+        if target.is_symlink():  # never write through a link into the file it points to
+            target.unlink()
+        write_bytes_atomic(target, path.read_bytes())
+
+
+def export_agents(
+    templates: Sequence[AgentTemplate],
+    out_dir: Path,
+    suffix: str,
+    render: Callable[[AgentTemplate], str],
+) -> list[FileChange]:
+    return [_write_marked(out_dir / f"{t.name}{suffix}", render(t)) for t in templates]
+
+
+def export_copilot_agents(repo_dir: Path, out_dir: Path) -> list[FileChange]:
+    """Every agent as `<name>.agent.md` in `out_dir`."""
+    return export_agents(load_agent_templates(repo_dir), out_dir, ".agent.md", render_copilot_agent)
+
+
+def export_claude_agents(repo_dir: Path, agents_dir: Path) -> list[FileChange]:
+    return export_agents(claude_agent_templates(repo_dir), agents_dir, ".md", render_claude_agent)
+
+
+def export_vscode_instructions(repo_dir: Path, prompts_dir: Path) -> list[FileChange]:
+    """The global instructions in the VS Code prompts folder and in each profile's."""
+    rendered = render_combined_rules(repo_dir / "rules", with_frontmatter=True)
+    return [
+        _write_marked(directory / "craftsman-rules.instructions.md", rendered)
+        for directory in vscode_prompt_dirs(prompts_dir)
+    ]
 
 
 # --- hooks ----------------------------------------------------------------------------------
@@ -675,6 +682,7 @@ def cli_shim_for(python: str) -> Path | None:
 
 
 def _imports_package(python: str, package_dir: Path) -> bool:
+    """Whether `python`, run outside this checkout, imports the package in `package_dir`."""
     env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     try:
         proc = subprocess.run(
@@ -686,8 +694,8 @@ def _imports_package(python: str, package_dir: Path) -> bool:
             timeout=IMPORT_CHECK_TIMEOUT_S,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return False
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ExportError(f"cannot run {python} to check which craftsman it imports: {exc}") from exc
     return proc.returncode == 0 and Path(proc.stdout.strip()).resolve().parent == package_dir
 
 
@@ -724,35 +732,57 @@ def render_copilot_hooks(command_prefix_bash: str, command_prefix_powershell: st
     return {"version": 1, "hooks": hooks}
 
 
-def write_copilot_hooks(hooks_dir: Path, bash_prefix: str, powershell_prefix: str) -> Path:
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    target = hooks_dir / HOOKS_FILENAME
+def write_copilot_hooks(hooks_dir: Path, bash_prefix: str, powershell_prefix: str) -> FileChange:
     payload = render_copilot_hooks(bash_prefix, powershell_prefix)
-    write_text_atomic(target, json.dumps(payload, indent=2) + "\n")
-    return target
+    return write_generated(
+        hooks_dir / HOOKS_FILENAME, json.dumps(payload, indent=2) + "\n", owned=is_craftsman_hooks_file
+    )
+
+
+def is_craftsman_hooks_file(path: Path) -> bool:
+    """Whether `path` is a Copilot hooks file Craftsman wrote: JSON has no room for the marker, so
+    it is one whose every command runs `craftsman hook ... --platform copilot`."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        commands = [
+            entry[key]
+            for group in data["hooks"].values()
+            for entry in group
+            for key in ("bash", "powershell")
+        ]
+    except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return bool(commands) and all(_COPILOT_HOOK_RE.search(str(command)) for command in commands)
 
 
 def is_craftsman_hook_command(command: Any) -> bool:
-    return isinstance(command, str) and OUR_HOOK_COMMAND_RE.search(command) is not None
+    return isinstance(command, str) and OUR_HOOK_COMMAND_RE.match(command) is not None
 
 
-def merge_claude_hooks(settings_path: Path, bash_prefix: str) -> bool:
-    """Merge the Craftsman hooks into Claude Code settings; return whether the file changed.
+def read_json_object(path: Path) -> dict[str, Any]:
+    """The JSON object in `path`; anything else is an error, so a user's file is never clobbered."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ExportError(f"refusing to modify {path}: cannot read it as JSON ({exc})") from exc
+    if not isinstance(loaded, dict):
+        raise ExportError(f"refusing to modify {path}: the top level is not a JSON object")
+    return loaded
 
-    Only commands that run `craftsman hook` are replaced; other hooks and settings keep their
-    order. The original file is copied to `settings.json.bak` once, before its first change.
+
+def write_json_object(path: Path, data: dict[str, Any]) -> None:
+    write_text_atomic(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def merge_claude_hooks(settings_path: Path, bash_prefix: str, *, dry_run: bool = False) -> FileChange:
+    """Merge the Craftsman hooks into Claude Code settings.
+
+    Only Craftsman's own commands are replaced; other hooks and settings keep their order. The
+    original file is copied to `settings.json.bak` once, before its first change.
     """
-    original: dict[str, Any] = {}
-    if settings_path.exists():
-        try:
-            loaded = json.loads(settings_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ExportError(
-                f"refusing to modify {settings_path}: cannot read it as JSON ({exc})"
-            ) from exc
-        if not isinstance(loaded, dict):
-            raise ExportError(f"refusing to modify {settings_path}: the top level is not a JSON object")
-        original = loaded
+    original = read_json_object(settings_path) if exists(settings_path) else {}
     hooks = original.get("hooks", {})
     if not isinstance(hooks, dict):
         raise ExportError(f"refusing to modify {settings_path}: `hooks` is not a JSON object")
@@ -761,63 +791,44 @@ def merge_claude_hooks(settings_path: Path, bash_prefix: str) -> bool:
         groups = merged_hooks.get(event, [])
         if not isinstance(groups, list):
             raise ExportError(f"refusing to modify {settings_path}: `hooks.{event}` is not a list")
-        ours: dict[str, Any] = {
-            "hooks": [
-                {
-                    "type": "command",
-                    "command": f"{bash_prefix} hook {hook_event} --platform claude",
-                    "timeout": timeout,
-                }
-            ]
+        entry = {
+            "type": "command",
+            "command": f"{bash_prefix} hook {hook_event} --platform claude",
+            "timeout": timeout,
         }
+        ours: dict[str, Any] = {"hooks": [entry]}
         if event in CLAUDE_HOOK_MATCHERS:
             ours = {"matcher": CLAUDE_HOOK_MATCHERS[event], **ours}
         merged_hooks[event] = _replace_our_group(groups, ours)
     updated = {**original, "hooks": merged_hooks}
-    if updated == original:
-        return False
-    backup = settings_path.with_name(settings_path.name + ".bak")
-    if settings_path.exists() and not backup.exists():
-        shutil.copy2(settings_path, backup)
-    write_text_atomic(settings_path, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
-    return True
+    return _rewrite_json(settings_path, original, updated, backup=exists(settings_path), dry_run=dry_run)
 
 
-def remove_claude_hooks(settings_path: Path, *, create_backup: bool = True) -> bool:
-    """Remove Craftsman hook entries from Claude Code settings; return whether the file changed."""
-    if not settings_path.exists():
-        return False
-    try:
-        loaded = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ExportError(
-            f"refusing to modify {settings_path}: cannot read it as JSON ({exc})"
-        ) from exc
-    if not isinstance(loaded, dict):
-        raise ExportError(f"refusing to modify {settings_path}: the top level is not a JSON object")
-    hooks = loaded.get("hooks")
+def strip_claude_hooks(settings: dict[str, Any]) -> dict[str, Any]:
+    """Claude Code settings without the Craftsman hook entries (and events left empty by that)."""
+    hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
-        return False
-    cleaned_hooks: dict[str, Any] = {}
+        return settings
+    cleaned: dict[str, Any] = {}
     for event, groups in hooks.items():
-        if not isinstance(groups, list):
-            cleaned_hooks[event] = groups
-            continue
-        kept = list(_without_our_hooks(groups))
+        kept = list(_without_our_hooks(groups)) if isinstance(groups, list) else groups
         if kept or not groups:
-            cleaned_hooks[event] = kept
-    updated = dict(loaded)
-    if cleaned_hooks:
-        updated["hooks"] = cleaned_hooks
-    elif hooks:
-        updated.pop("hooks", None)
-    if updated == loaded:
-        return False
-    backup = settings_path.with_name(settings_path.name + ".bak")
-    if create_backup and not backup.exists():
-        shutil.copy2(settings_path, backup)
-    write_text_atomic(settings_path, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
-    return True
+            cleaned[event] = kept
+    updated = {key: value for key, value in settings.items() if key != "hooks"}
+    if cleaned or not hooks:
+        updated["hooks"] = cleaned
+    return updated
+
+
+def _rewrite_json(
+    path: Path, original: dict[str, Any], updated: dict[str, Any], *, backup: bool, dry_run: bool
+) -> FileChange:
+    if updated == original and exists(path):
+        return FileChange(path, changed=False)
+    kept = copy_once_backup(path, dry_run=dry_run) if backup else None
+    if not dry_run:
+        write_json_object(path, updated)
+    return FileChange(path, changed=True, backup=kept)
 
 
 def _replace_our_group(groups: list[Any], ours: dict[str, Any]) -> list[Any]:
@@ -857,118 +868,76 @@ def _without_our_hooks(groups: list[Any]) -> Iterator[Any]:
             yield {**group, "hooks": kept}
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    """Replace `path` atomically; a symlinked file (dotfiles) is updated where it really lives."""
-    path = path.resolve() if path.is_symlink() else path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
-    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-        os.chmod(tmp, mode)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+# --- managed Markdown blocks ----------------------------------------------------------------
 
 
-def render_combined_rules(rules_dir: Path, with_frontmatter: bool) -> str:
-    parts: list[str] = []
-    if with_frontmatter:
-        parts.append(
-            "---\napplyTo: '**'\ndescription: 'Craftsman Global Engineering & Git Rules'\n---\n"
-            f"{CRAFTSMAN_GENERATED_MARKER}\n"
+def find_managed_block(text: str, source: Path) -> tuple[int, int] | None:
+    """The span of the Craftsman block in `text`, its trailing newline included, or None when the
+    text has no markers. Markers that do not form one block are an error: cutting at them could
+    take the user's text with the block."""
+    begins, ends = text.count(CRAFTSMAN_BEGIN_MARKER), text.count(CRAFTSMAN_END_MARKER)
+    if begins == ends == 0:
+        return None
+    begin = text.find(CRAFTSMAN_BEGIN_MARKER)
+    end = text.find(CRAFTSMAN_END_MARKER)
+    if begins != 1 or ends != 1 or end < begin:
+        raise ExportError(
+            f"refusing to modify {source}: its {CRAFTSMAN_BEGIN_MARKER} and {CRAFTSMAN_END_MARKER} "
+            "markers do not enclose one block; fix them by hand"
         )
-
-    for rule_file in sorted(rules_dir.glob("*.md")):
-        raw_rule = rule_file.read_text(encoding="utf-8").strip()
-        fm_match = FRONTMATTER_RE.match(raw_rule + "\n")
-        body = fm_match.group(2).strip() if fm_match else raw_rule
-        parts.append(body)
-        parts.append("\n\n---\n")
-
-    return "\n".join(parts).strip() + "\n"
+    end += len(CRAFTSMAN_END_MARKER)
+    return begin, end + 1 if text[end : end + 1] == "\n" else end
 
 
-def craftsman_agent_names(repo_dir: Path | None = None) -> tuple[str, ...]:
-    root = repo_dir or default_repo_dir()
-    agents_dir = root / "agents"
-    if not agents_dir.is_dir():
-        return ("craftsman", "craftsman-reviewer", "craftsman-verifier")
-    names: list[str] = []
-    for path in sorted(agents_dir.glob("*.md")):
-        try:
-            fields, _ = parse_frontmatter(path.read_text(encoding="utf-8"), path)
-            name = fields.get("name", "") or path.stem
-        except (OSError, UnicodeDecodeError, ExportError):
-            name = path.stem
-        if name and name not in names:
-            names.append(name)
-    return tuple(names) or ("craftsman", "craftsman-reviewer", "craftsman-verifier")
-
-
-def craftsman_skill_names(repo_dir: Path | None = None) -> tuple[str, ...]:
-    root = repo_dir or default_repo_dir()
-    skills_dir = root / "skills"
-    if not skills_dir.is_dir():
-        return ()
-    names: list[str] = []
-    for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
-        try:
-            raw_md = skill_path.read_text(encoding="utf-8")
-            name = extract_skill_name(raw_md, skill_path.parent.name)
-        except (OSError, UnicodeDecodeError):
-            name = skill_path.parent.name
-        if name and name not in names:
-            names.append(name)
-    return tuple(names)
-
-
-def craftsman_entity_names(repo_dir: Path | None = None) -> frozenset[str]:
-    return frozenset(
-        (*craftsman_agent_names(repo_dir), *craftsman_skill_names(repo_dir), "craftsman-rules")
-    )
-
-
-def _entity_name_for_path(path: Path) -> str:
-    if path.name == "SKILL.md":
-        return path.parent.name
-    if path.name.endswith(".agent.md"):
-        return path.name.removesuffix(".agent.md")
-    if path.name.endswith(".prompt.md"):
-        return path.name.removesuffix(".prompt.md")
-    if path.name.endswith(".instructions.md"):
-        return path.name.removesuffix(".instructions.md")
-    if path.name.endswith(".md"):
-        return path.stem
-    return path.name
-
-
-def is_craftsman_generated_file(
-    path: Path, valid_names: Collection[str] | None = None
-) -> bool:
-    """Return True if `path` was generated by Craftsman (via marker or v3.0.0 legacy signature)."""
-    if not path.is_file():
-        return False
+def read_markdown(target_file: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    if CRAFTSMAN_GENERATED_MARKER in text:
-        return True
-    if CRAFTSMAN_BEGIN_MARKER in text and CRAFTSMAN_END_MARKER in text:
-        return True
-    entity_name = _entity_name_for_path(path)
-    allowed = set(valid_names) if valid_names is not None else craftsman_entity_names()
-    if entity_name not in allowed:
-        return False
-    if path.name == "craftsman-rules.instructions.md":
-        return (
-            "description: 'Craftsman Global Engineering & Git Rules'" in text
-            or "# Craftsman Global Engineering" in text
-        )
-    return "> **GitHub Copilot:**" in text
+        return target_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ExportError(f"refusing to modify {target_file}: cannot read it as UTF-8 ({exc})") from exc
+
+
+def require_resolves_within(path: Path, root: Path) -> None:
+    """A symlinked workspace file is updated where it lives, which must be inside `root`."""
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ExportError(f"refusing to modify {path}: it resolves outside {root}")
+
+
+def upsert_managed_markdown(
+    target_file: Path, inner_content: str, *, within: Path, dry_run: bool = False
+) -> FileChange:
+    """Insert or update the Craftsman block, keeping everything else in the file.
+
+    A file without the block gets it appended, after a one-time `.bak` copy of the original.
+    """
+    require_resolves_within(target_file, within)
+    block = f"{CRAFTSMAN_BEGIN_MARKER}\n{inner_content.strip()}\n{CRAFTSMAN_END_MARKER}\n"
+    existing = read_markdown(target_file) if exists(target_file) else None
+    span = find_managed_block(existing, target_file) if existing is not None else None
+    if existing is None:
+        updated = block
+    elif span is not None:
+        updated = existing[: span[0]] + block + existing[span[1] :]
+    else:
+        updated = (f"{existing.rstrip()}\n\n" if existing.strip() else "") + block
+    if updated == existing:
+        return FileChange(target_file, changed=False)
+    kept = copy_once_backup(target_file, dry_run=dry_run) if existing and span is None else None
+    if not dry_run:
+        write_text_atomic(target_file, updated)
+    return FileChange(target_file, changed=True, backup=kept)
+
+
+def strip_managed_block(text: str, source: Path) -> str:
+    """`text` without the Craftsman block, joining what surrounded it."""
+    span = find_managed_block(text, source)
+    if span is None:
+        return text
+    before, after = text[: span[0]].rstrip(), text[span[1] :].strip()
+    joined = "\n\n".join(part for part in (before, after) if part)
+    return f"{joined}\n" if joined else ""
+
+
+# --- discovery ------------------------------------------------------------------------------
 
 
 def resolve_discovery_dirs(
@@ -979,378 +948,156 @@ def resolve_discovery_dirs(
     profile: Path | None = None,
     include_all_profiles: bool = False,
 ) -> list[Path]:
-    """Resolve concrete directories on disk for a `CopilotDiscoveryLocation` entry."""
-    if loc.scope == "user":
-        if loc.rel_path == ".copilot/agents":
-            return [default_copilot_home(home) / "agents"]
-        if loc.rel_path == ".copilot/skills":
-            return [default_copilot_skills_dir(home)]
-        if loc.rel_path == "Code/User/prompts":
-            if profile is not None:
-                return []
-            return [default_vscode_prompts_dir(home)]
-        return [user_home(home) / loc.rel_path]
-    if loc.scope == "profile":
+    """The folders on disk a discovery location stands for."""
+    root = loc.root
+    if root is DiscoveryRoot.VSCODE_PROMPTS:
+        return [] if profile is not None else [default_vscode_prompts_dir(home)]
+    if root is DiscoveryRoot.VSCODE_PROFILE_PROMPTS:
         if profile is not None:
             return [profile / "prompts"]
-        if not include_all_profiles:
-            return []
-        profiles_root = default_vscode_prompts_dir(home).parent / "profiles"
-        if not profiles_root.is_dir():
-            return []
-        return [p / "prompts" for p in sorted(profiles_root.iterdir()) if p.is_dir()]
-    if loc.scope == "workspace":
-        return [workspace / loc.rel_path] if workspace is not None else []
-    if loc.scope == "claude-user":
-        rel = Path(loc.rel_path).relative_to(".claude")
-        return [default_claude_dir(home) / rel]
-    if loc.scope == "claude-workspace":
-        return [workspace / loc.rel_path] if workspace is not None else []
-    return []
+        return vscode_prompt_dirs(default_vscode_prompts_dir(home))[1:] if include_all_profiles else []
+    if root.scope in ("user", "claude-user"):
+        return [user_home(home) / root.rel_path]
+    return [workspace / root.rel_path] if workspace is not None else []
 
 
-def iter_discovered_files(directory: Path, pattern: str) -> Iterator[tuple[str, Path]]:
-    """Yield `(entity_name, file_path)` pairs matching `pattern` directly inside `directory`."""
+def iter_discovered_files(directory: Path, pattern: EntityPattern) -> Iterator[tuple[str, Path]]:
+    """`(entity_name, file_path)` for every file matching `pattern` directly inside `directory`."""
     if not directory.is_dir():
         return
-    if pattern == "*/SKILL.md":
-        for sub in sorted(directory.iterdir()):
-            if not sub.is_dir():
-                continue
-            skill_md = sub / "SKILL.md"
+    if pattern is EntityPattern.SKILL_DIR:
+        for skill_md in sorted(directory.glob(pattern.value)):
             if skill_md.is_file():
-                yield sub.name, skill_md
-    elif pattern == "*.agent.md":
-        for path in sorted(directory.glob("*.agent.md")):
-            if path.is_file():
-                yield path.name.removesuffix(".agent.md"), path
-    elif pattern == "*.prompt.md":
-        for path in sorted(directory.glob("*.prompt.md")):
-            if path.is_file():
-                yield path.name.removesuffix(".prompt.md"), path
-    elif pattern == "*.md":
-        for path in sorted(directory.glob("*.md")):
-            if path.is_file():
-                yield path.stem, path
+                yield skill_md.parent.name, skill_md
+        return
+    suffix = pattern.value.removeprefix("*")
+    for path in sorted(directory.glob(pattern.value)):
+        if path.is_file():
+            yield path.name.removesuffix(suffix), path
 
 
 def _has_copilot_install(
-    scopes: tuple[str, ...],
+    scopes: tuple[CopilotLocationScope, ...],
+    repo_dir: Path,
     *,
     home: Path | None = None,
     workspace: Path | None = None,
-    repo_dir: Path | None = None,
 ) -> bool:
     valid_names = craftsman_entity_names(repo_dir)
-    ws = workspace.resolve() if workspace is not None else None
     for kind in ("agent", "skill", "prompt"):
         for loc in COPILOT_DISCOVERY[("vscode", kind)]:
             if loc.scope not in scopes:
                 continue
             for directory in resolve_discovery_dirs(
-                loc, home=home, workspace=ws, include_all_profiles=True
+                loc, home=home, workspace=workspace, include_all_profiles=True
             ):
                 for name, file_path in iter_discovered_files(directory, loc.pattern):
-                    if name in valid_names and is_craftsman_generated_file(file_path, valid_names):
+                    if name in valid_names and is_craftsman_generated_file(file_path):
                         return True
     return False
 
 
-def has_user_copilot_install(
-    home: Path | None = None, repo_dir: Path | None = None
-) -> bool:
-    """Return True if user-level Copilot files generated by Craftsman exist under `home`."""
-    return _has_copilot_install(("user", "profile"), home=home, repo_dir=repo_dir)
+def has_user_copilot_install(repo_dir: Path, home: Path | None = None) -> bool:
+    """Whether Craftsman-generated user-level Copilot files exist under `home`."""
+    return _has_copilot_install(("user", "profile"), repo_dir, home=home)
 
 
-def has_workspace_copilot_install(
-    workspace_dir: Path, repo_dir: Path | None = None
-) -> bool:
-    """Return True if workspace-level Copilot files generated by Craftsman exist in `workspace_dir`."""
-    return _has_copilot_install(("workspace",), workspace=workspace_dir, repo_dir=repo_dir)
+def has_workspace_copilot_install(workspace_dir: Path, repo_dir: Path) -> bool:
+    """Whether Craftsman-generated workspace-level Copilot files exist in `workspace_dir`."""
+    return _has_copilot_install(("workspace",), repo_dir, workspace=workspace_dir.resolve())
 
 
-def _agents_md_loop_lines() -> list[str]:
-    return [
-        "# AGENTS.md — Craftsman Adaptive Closed-Loop Engineering Standard",
-        "",
-        "This repository uses **Craftsman**: every change is reviewed and verified against an evidence "
-        "ledger before it counts as done.",
-        "",
-        "## The Craftsman loop",
-        "- **Gears:** `quick` (≤ 40 changed lines in ≤ 2 files; lenses applied inline), `standard` "
-        "(default; every always-on lens in fresh-context reviewers, a final sweep and a verifier), "
-        "`deep` (`/craftsman --deep` or `ultracraft`; every lens plus an end-to-end run).",
-        "- **Start (`/craftsman` only):** `craftsman gate --init --tier <auto|quick|standard|deep> --task \"<request>\"` records "
-        "the base commit; the review always covers the whole diff since then (standalone `/code-review` without `--fix` does not start a gate session).",
-        "- **Review:** `craftsman review prepare` writes a packet of hunks and lenses; record what each "
-        "lens examined with `craftsman review cover` (or `--from-json - <<'EOF'`) and every defect with `craftsman review add` (or `--from-json - <<'EOF'`).",
-        "  Reviewer groups:",
-        *(f"  {line}" for line in render_reviewer_groups_markdown().splitlines()),
-        "- **Verify findings:** group unjudged same-root-cause duplicates first with `craftsman review merge <target> <dup>` "
-        "(only when one fix removes every consequence), then record verdicts with `craftsman review verdict` (or `--from-json - <<'EOF'`), "
-        'fix and `craftsman review resolve <id> --as fixed --note "..."`; prepare a new '
-        "round for the changed hunks.",
-        "- **Run checks through the ledger:** `craftsman run --kind test -- <command>` (and `--kind e2e` "
-        "on deep); only runs at the final code count.",
-        "- **Done means** `craftsman review check` passes; then `craftsman gate --complete` and report with "
-        "`craftsman review report` (in standalone review-only `/code-review` without `--fix`, finish with "
-        "`craftsman review check --review-only` and `craftsman review report --review-only`).",
-        "- **Skills & lenses:** invoke `/name` as a skill if your platform offers it; otherwise run "
-        "`craftsman skill show <name>` (and `craftsman skill show code-review --file lenses.md` for "
-        "the review lens playbooks). Never search the file system for skill or lens files.",
-        "",
-        "## Search scope",
-        "- Work only inside this git work tree (`git rev-parse --show-toplevel`): prefer `git ls-files`, "
-        "`git grep`, and editor search scoped to this folder.",
-        "- Outside the work tree you may read only an exact file cited by a stack trace/error, a temp "
-        "directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI commands.",
-        "- Never run recursive searches of `~`, `/`, or parent directories, and never open other "
-        "repositories, other projects' packets/ledgers/reports, or assistant session stores.",
-        "",
-        "## Available Skills",
-    ]
+# --- targets --------------------------------------------------------------------------------
 
 
-def render_agents_md(repo_dir: Path) -> str:
-    """Render a universal AGENTS.md block for OpenAI Codex, Cursor, Windsurf, and GitHub Copilot."""
-    rules_dir = repo_dir / "rules"
-    skills_dir = repo_dir / "skills"
-    lines = _agents_md_loop_lines()
-    for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
-        raw_md = skill_path.read_text(encoding="utf-8")
-        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
-        desc, _ = extract_description_and_body(raw_md, skill_name)
-        lines.append(f"- **`/{skill_name}`**: {desc}")
-    lines += ["", "---", ""]
-    lines.append(
-        _rewrite_antigravity_paths(render_combined_rules(rules_dir, with_frontmatter=False).strip())
-    )
-    lines.append("")
-    return "\n".join(lines)
-
-
-def upsert_managed_markdown(target_file: Path, inner_content: str) -> bool:
-    """Insert or update a `<!-- craftsman:begin -->...<!-- craftsman:end -->` block without destroying user content."""
-    target_file.parent.mkdir(parents=True, exist_ok=True)
-    managed_block = f"{CRAFTSMAN_BEGIN_MARKER}\n{inner_content.strip()}\n{CRAFTSMAN_END_MARKER}\n"
-
-    if not target_file.is_file():
-        write_text_atomic(target_file, managed_block)
-        return True
-
-    try:
-        existing = target_file.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        bak = target_file.with_name(target_file.name + ".bak")
-        if not bak.exists():
-            shutil.copy2(target_file, bak)
-        raise ExportError(
-            f"refusing to modify {target_file}: cannot read it as UTF-8 ({exc}); backed up to {bak}"
-        ) from exc
-    begin_idx = existing.find(CRAFTSMAN_BEGIN_MARKER)
-    end_idx = existing.find(CRAFTSMAN_END_MARKER)
-    if begin_idx != -1 and end_idx != -1 and begin_idx < end_idx:
-        end_pos = end_idx + len(CRAFTSMAN_END_MARKER)
-        if end_pos < len(existing) and existing[end_pos : end_pos + 1] == "\n":
-            end_pos += 1
-        updated = existing[:begin_idx] + managed_block + existing[end_pos:]
-    elif existing.lstrip().startswith(
-        ("# AGENTS.md — Craftsman", "# Craftsman Global Engineering")
-    ):
-        updated = managed_block
-    else:
-        # Preserve existing custom project instructions and append the Craftsman block
-        base = existing.rstrip()
-        prefix = f"{base}\n\n" if base else ""
-        updated = prefix + managed_block
-
-    if updated != existing:
-        write_text_atomic(target_file, updated)
-        return True
-    return False
-
-
-def remove_managed_markdown(target_file: Path) -> bool:
-    """Remove the `<!-- craftsman:begin -->...<!-- craftsman:end -->` block from `target_file`."""
-    if not target_file.is_file():
-        return False
-    try:
-        existing = target_file.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    begin_idx = existing.find(CRAFTSMAN_BEGIN_MARKER)
-    end_idx = existing.find(CRAFTSMAN_END_MARKER)
-    if begin_idx == -1 or end_idx == -1 or begin_idx >= end_idx:
-        return False
-    end_pos = end_idx + len(CRAFTSMAN_END_MARKER)
-    if end_pos < len(existing) and existing[end_pos : end_pos + 1] == "\n":
-        end_pos += 1
-    before = existing[:begin_idx].rstrip()
-    after = existing[end_pos:].lstrip()
-    if before and after:
-        updated = f"{before}\n\n{after}\n"
-    elif before:
-        updated = f"{before}\n"
-    elif after:
-        updated = f"{after}\n"
-    else:
-        updated = ""
-    write_text_atomic(target_file, updated)
-    return True
-
-
-def _render_skill_items(
-    skills_dir: Path,
-    renderer: Callable[[str, str], str],
-    *,
-    inline_siblings: bool,
-) -> list[tuple[str, str]]:
-    items: list[tuple[str, str]] = []
-    for skill_path in sorted(skills_dir.glob("*/SKILL.md")):
-        raw_md = skill_path.read_text(encoding="utf-8")
-        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
-        if inline_siblings:
-            raw_md = inline_sibling_links(raw_md, skill_path.parent)
-        items.append((skill_name, renderer(skill_name, raw_md)))
-    return items
-
-
-def _export_skill_files(
-    skills_dir: Path,
-    out_dir: Path,
-    suffix: str,
-    renderer: Callable[[str, str], str],
-) -> int:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rendered_items = _render_skill_items(skills_dir, renderer, inline_siblings=True)
-    for skill_name, rendered in rendered_items:
-        write_text_atomic(out_dir / f"{skill_name}{suffix}", rendered)
-    return len(rendered_items)
-
-
-def export_to_copilot_skills(repo_dir: Path, skills_out_dir: Path) -> int:
-    """Export native Copilot Agent Skills: `<skills_out_dir>/<skill>/` with every file of the skill."""
-    skills_out_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
-    for skill_path in sorted((repo_dir / "skills").glob("*/SKILL.md")):
-        raw_md = skill_path.read_text(encoding="utf-8")
-        skill_name = extract_skill_name(raw_md, skill_path.parent.name)
-        dest = skills_out_dir / skill_name
-        _copy_tree_files(skill_path.parent, dest)
-        write_text_atomic(dest / "SKILL.md", render_copilot_skill_file(skill_name, raw_md))
-        count += 1
-    return count
-
-
-def _copy_tree_files(source: Path, dest: Path) -> None:
-    """Copy every file below `source` into `dest`, overwriting same-named files only."""
-    for path in sorted(source.rglob("*")):
-        relative = path.relative_to(source)
-        if not path.is_file() or any(part in COPY_IGNORED_NAMES for part in relative.parts):
-            continue
-        target = dest / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.is_symlink():  # never write through a link into the file it points to
-            target.unlink()
-        shutil.copyfile(path, target)
-
-
-def _prompt_dirs(target_dir: Path) -> list[Path]:
-    """The prompts folder plus, for a VS Code `User/prompts` folder, those of its profiles."""
-    dirs = [target_dir]
-    profiles_dir = target_dir.parent / "profiles"
-    if target_dir.name == "prompts" and profiles_dir.is_dir():
-        dirs.extend(
-            profile / "prompts" for profile in sorted(profiles_dir.iterdir()) if profile.is_dir()
-        )
-    return dirs
-
-
-vscode_prompt_dirs = _prompt_dirs
-
-
-def export_to_vscode_user(
-    repo_dir: Path, target_dir: Path, *, prompt_files: bool = False
-) -> tuple[int, Path]:
-    rendered_prompts = (
-        _render_skill_items(repo_dir / "skills", render_copilot_prompt_file, inline_siblings=True)
-        if prompt_files
-        else []
-    )
-    rendered_rules = _rewrite_antigravity_paths(
-        render_combined_rules(repo_dir / "rules", with_frontmatter=True)
-    )
-    for prompts_dir in _prompt_dirs(target_dir):
-        prompts_dir.mkdir(parents=True, exist_ok=True)
-        for skill_name, rendered in rendered_prompts:
-            write_text_atomic(prompts_dir / f"{skill_name}.prompt.md", rendered)
-        write_text_atomic(prompts_dir / "craftsman-rules.instructions.md", rendered_rules)
-    return len(rendered_prompts), target_dir / "craftsman-rules.instructions.md"
+@dataclass(frozen=True)
+class CopilotHomeExport:
+    agents: list[FileChange]
+    hooks: FileChange
 
 
 def export_copilot_home(
-    repo_dir: Path, copilot_home: Path, python: str | None = None
-) -> tuple[list[Path], Path]:
-    """User-level Copilot agents and hooks; the hooks run this interpreter by absolute path."""
+    repo_dir: Path, copilot_home: Path, prefixes: tuple[str, str]
+) -> CopilotHomeExport:
+    """User-level Copilot agents and hooks running the (bash, PowerShell) command `prefixes`,
+    from `absolute_hook_prefixes`."""
     agents = export_copilot_agents(repo_dir, copilot_home / "agents")
-    bash, powershell = absolute_hook_prefixes(python)
-    return agents, write_copilot_hooks(copilot_home / "hooks", bash, powershell)
+    return CopilotHomeExport(agents, write_copilot_hooks(copilot_home / "hooks", *prefixes))
 
 
-def export_to_workspace(
-    repo_dir: Path, workspace_dir: Path, *, prompt_files: bool = False
-) -> tuple[int, Path]:
+@dataclass(frozen=True)
+class WorkspaceExport:
+    skills: list[FileChange]
+    agents: list[FileChange]
+    hooks: FileChange
+    instructions: FileChange
+
+
+def export_to_workspace(repo_dir: Path, workspace_dir: Path) -> WorkspaceExport:
     github_dir = workspace_dir / ".github"
-    if prompt_files:
-        count = _export_skill_files(
-            repo_dir / "skills", github_dir / "prompts", ".prompt.md", render_copilot_prompt_file
-        )
-    else:
-        count = export_to_copilot_skills(repo_dir, github_dir / "skills")
-    export_copilot_agents(repo_dir, github_dir / "agents")
-    write_copilot_hooks(github_dir / "hooks", "craftsman", "craftsman")
-    copilot_instructions = github_dir / "copilot-instructions.md"
-    rules_content = _rewrite_antigravity_paths(
-        render_combined_rules(repo_dir / "rules", with_frontmatter=False)
+    rules = render_combined_rules(repo_dir / "rules", with_frontmatter=False)
+    return WorkspaceExport(
+        skills=export_to_copilot_skills(repo_dir, github_dir / "skills"),
+        agents=export_copilot_agents(repo_dir, github_dir / "agents"),
+        hooks=write_copilot_hooks(github_dir / "hooks", "craftsman", "craftsman"),
+        instructions=upsert_managed_markdown(
+            github_dir / "copilot-instructions.md", rules, within=workspace_dir
+        ),
     )
-    upsert_managed_markdown(copilot_instructions, rules_content)
-    return count, copilot_instructions
 
 
-def export_to_claude_user(repo_dir: Path, claude_dir: Path) -> tuple[int, Path]:
-    rules_out_dir = claude_dir / "rules"
-    rules_out_dir.mkdir(parents=True, exist_ok=True)
-    count = _export_skill_files(
-        repo_dir / "skills", claude_dir / "commands", ".md", render_claude_command_file
+@dataclass(frozen=True)
+class ClaudeExport:
+    commands: list[FileChange]
+    agents: list[FileChange]
+    rules: FileChange
+
+
+def export_to_claude_user(repo_dir: Path, claude_dir: Path) -> ClaudeExport:
+    rules = f"{CRAFTSMAN_GENERATED_MARKER}\n\n" + render_combined_rules(
+        repo_dir / "rules", with_frontmatter=False
     )
-    rules_file = rules_out_dir / "craftsman-rules.md"
-    write_text_atomic(
-        rules_file,
-        _rewrite_antigravity_paths(render_combined_rules(repo_dir / "rules", with_frontmatter=False)),
+    return ClaudeExport(
+        commands=[
+            _write_marked(
+                claude_dir / "commands" / f"{skill.name}.md", render_claude_command_file(skill)
+            )
+            for skill in iter_skills(repo_dir)
+        ],
+        agents=export_claude_agents(repo_dir, claude_dir / "agents"),
+        rules=_write_marked(claude_dir / "rules" / "craftsman-rules.md", rules),
     )
-    export_claude_agents(repo_dir, claude_dir / "agents")
-    return count, rules_file
 
 
-def export_to_agents_workspace(repo_dir: Path, workspace_dir: Path) -> tuple[Path, Path]:
-    workspace_dir.mkdir(parents=True, exist_ok=True)
+CURSOR_RULE_HEADER = (
+    "---\n"
+    "description: Craftsman Agentic Engineering & Git Workflow Rules\n"
+    'globs: "*"\n'
+    "alwaysApply: true\n"
+    "---\n\n"
+    f"{CRAFTSMAN_GENERATED_MARKER}\n\n"
+)
+
+
+@dataclass(frozen=True)
+class AgentsWorkspaceExport:
+    agents_md: FileChange
+    cursor_rule: FileChange
+
+
+def export_to_agents_workspace(repo_dir: Path, workspace_dir: Path) -> AgentsWorkspaceExport:
     agents_content = render_agents_md(repo_dir)
-    agents_md_path = workspace_dir / "AGENTS.md"
-    upsert_managed_markdown(agents_md_path, agents_content)
-
-    cursor_rules_dir = workspace_dir / ".cursor" / "rules"
-    cursor_rules_dir.mkdir(parents=True, exist_ok=True)
-    cursor_mdc = cursor_rules_dir / "craftsman.mdc"
-    cursor_header = (
-        "---\n"
-        "description: Craftsman Agentic Engineering & Git Workflow Rules\n"
-        'globs: "*"\n'
-        "alwaysApply: true\n"
-        "---\n\n"
+    return AgentsWorkspaceExport(
+        agents_md=upsert_managed_markdown(
+            workspace_dir / "AGENTS.md", agents_content, within=workspace_dir
+        ),
+        cursor_rule=_write_marked(
+            workspace_dir / ".cursor" / "rules" / "craftsman.mdc", CURSOR_RULE_HEADER + agents_content
+        ),
     )
-    write_text_atomic(cursor_mdc, cursor_header + agents_content)
-    return agents_md_path, cursor_mdc
+
+
+# --- command line ---------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1358,31 +1105,26 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="craftsman export",
         description="Export Craftsman to GitHub Copilot, Claude Code, OpenAI Codex, and Cursor.",
     )
-    parser.add_argument(
-        "--repo-dir",
-        default=str(default_repo_dir()),
-        help="Path to the craftsman repository root",
-    )
+    parser.add_argument("--repo-dir", type=Path, help="Path to the Craftsman repository root.")
     parser.add_argument(
         "--user-dir",
         nargs="?",
         const="",
-        help="Export global instructions (and legacy prompt files when --copilot-prompt-files is set) "
-        "to a VS Code User prompts directory (defaults to the OS-specific Code/User/prompts); "
-        "when given without a path, also exports Agent Skills, custom agents, and hooks",
+        help="Write the global Copilot instructions into a VS Code User prompts folder and its "
+        "profiles (default: this operating system's Code/User/prompts).",
     )
     parser.add_argument(
         "--copilot-skills-dir",
         nargs="?",
         const="",
-        help="Export native Copilot Agent Skills (defaults to ~/.copilot/skills); also writes the "
-        "user-level Copilot agents and hooks (see --copilot-home)",
+        help="Write the Copilot Agent Skills (default: ~/.copilot/skills).",
     )
     parser.add_argument(
-        "--copilot-prompt-files",
-        action="store_true",
-        help="Export legacy VS Code `.prompt.md` files instead of Agent Skills (`SKILL.md`). "
-        "Mutually exclusive with --copilot-skills-dir.",
+        "--copilot-home",
+        nargs="?",
+        const="",
+        help="Write the Copilot custom agents and hooks/craftsman.json (default: ~/.copilot); "
+        "the hooks run this Python interpreter by absolute path.",
     )
     parser.add_argument(
         "--allow-duplicate-scopes",
@@ -1390,59 +1132,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Allow exporting Copilot files in both user (~/.copilot) and workspace (.github) scopes.",
     )
     parser.add_argument(
-        "--copilot-home",
-        help="Copilot user directory for agents/ and hooks/craftsman.json (default: ~/.copilot); "
-        "the hooks run this Python interpreter by absolute path",
-    )
-    parser.add_argument(
         "--workspace",
-        help="Export to a project workspace (.github/skills, agents, hooks and "
-        "copilot-instructions.md)",
+        type=Path,
+        help="Export to a project workspace (.github/skills, agents, hooks and copilot-instructions.md).",
     )
     parser.add_argument(
         "--claude-dir",
         nargs="?",
         const="",
-        help="Export commands, rules and subagents to a Claude Code directory (defaults to ~/.claude)",
-    )
-    parser.add_argument(
-        "--claude-hooks",
-        action="store_true",
-        help="With --claude-dir: merge the Craftsman hooks into <claude-dir>/settings.json "
-        "(this is the default; other hooks are kept and a settings.json.bak is written before "
-        "the first change)",
+        help="Export commands, rules, subagents and the hooks in settings.json to a Claude Code "
+        "directory (default: ~/.claude); settings.json.bak is written before its first change.",
     )
     parser.add_argument(
         "--no-claude-hooks",
         action="store_true",
-        help="With --claude-dir: do not touch <claude-dir>/settings.json",
+        help="With --claude-dir: do not touch <claude-dir>/settings.json.",
     )
     parser.add_argument(
         "--agents-workspace",
-        help="Export universal AGENTS.md and .cursor/rules/craftsman.mdc into a target project workspace",
+        type=Path,
+        help="Export universal AGENTS.md and .cursor/rules/craftsman.mdc into a project workspace.",
     )
     return parser
 
 
 def _validate_export_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    if (args.claude_hooks or args.no_claude_hooks) and args.claude_dir is None:
-        parser.error("--claude-hooks and --no-claude-hooks require --claude-dir")
-    if args.claude_hooks and args.no_claude_hooks:
-        parser.error("--claude-hooks and --no-claude-hooks are mutually exclusive")
-    if args.copilot_prompt_files and args.copilot_skills_dir is not None:
-        parser.error("--copilot-prompt-files and --copilot-skills-dir are mutually exclusive")
-    has_target = (
-        args.user_dir is not None
-        or args.copilot_skills_dir is not None
-        or args.copilot_home
-        or args.workspace
-        or args.claude_dir is not None
-        or args.agents_workspace
+    if args.no_claude_hooks and args.claude_dir is None:
+        parser.error("--no-claude-hooks requires --claude-dir")
+    targets = (
+        args.user_dir,
+        args.copilot_skills_dir,
+        args.copilot_home,
+        args.workspace,
+        args.claude_dir,
+        args.agents_workspace,
     )
-    if args.copilot_prompt_files and not has_target:
-        args.user_dir = ""
-        has_target = True
-    if not has_target:
+    if all(target is None for target in targets):
         parser.error(
             "Specify at least one target: --user-dir, --copilot-skills-dir, --copilot-home, "
             "--workspace <path>, --claude-dir, or --agents-workspace <path>"
@@ -1452,14 +1177,11 @@ def _validate_export_args(parser: argparse.ArgumentParser, args: argparse.Namesp
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    repo_dir = Path(args.repo_dir).resolve()
     _validate_export_args(parser, args)
-
-    skill_manifests = sorted((repo_dir / "skills").glob("*/SKILL.md"))
-    if not skill_manifests:
-        sys.stderr.write(f"[ERROR] No skill manifests (skills/*/SKILL.md) found under {repo_dir}\n")
-        return 1
     try:
+        repo_dir = (args.repo_dir or default_repo_dir()).resolve()
+        if not iter_skills(repo_dir):
+            raise ExportError(f"no skill manifests (skills/*/SKILL.md) found under {repo_dir}")
         _run_exports(args, repo_dir)
     except (ExportError, OSError) as exc:
         sys.stderr.write(f"[ERROR] {exc}\n")
@@ -1467,86 +1189,62 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _chosen(raw: str | None, default: Callable[[], Path]) -> Path | None:
+    """The folder a `nargs="?"` option names: None when not given, its default when bare."""
+    if raw is None:
+        return None
+    return Path(raw) if raw else default()
+
+
 def _check_copilot_scope_conflict(args: argparse.Namespace, repo_dir: Path) -> None:
-    if bool(getattr(args, "allow_duplicate_scopes", False)):
+    if args.allow_duplicate_scopes:
         return
-    exporting_user = (
-        args.user_dir is not None
-        or args.copilot_skills_dir is not None
-        or bool(args.copilot_home)
-    )
-    exporting_default_user = "" in (args.user_dir, args.copilot_skills_dir) or bool(args.copilot_home)
-    if args.workspace and (exporting_user or has_user_copilot_install(None, repo_dir)):
+    user_options = (args.user_dir, args.copilot_skills_dir, args.copilot_home)
+    if args.workspace and (
+        any(option is not None for option in user_options) or has_user_copilot_install(repo_dir)
+    ):
         raise ExportError(DUPLICATE_SCOPE_USER_TO_WS_MSG)
-    if exporting_default_user and has_workspace_copilot_install(Path.cwd(), repo_dir):
+    if "" in user_options and has_workspace_copilot_install(Path.cwd(), repo_dir):
         raise ExportError(DUPLICATE_SCOPE_WS_TO_USER_MSG)
 
 
-def _run_user_copilot_exports(
-    args: argparse.Namespace, repo_dir: Path, *, prompt_files: bool
-) -> None:
-    if args.user_dir is not None:
-        target = Path(args.user_dir) if args.user_dir else default_vscode_prompts_dir()
-        count, instr = export_to_vscode_user(repo_dir, target, prompt_files=prompt_files)
-        if prompt_files:
-            print(f"[OK] Exported {count} Copilot prompt files -> {target}")
-        print(f"[OK] Exported global Copilot instructions -> {instr}")
-        if not args.user_dir and args.copilot_skills_dir is None and not prompt_files:
-            skills_target = default_copilot_skills_dir()
-            skills_count = export_to_copilot_skills(repo_dir, skills_target)
-            print(f"[OK] Exported {skills_count} Copilot Agent Skills -> {skills_target}")
-
-    if args.copilot_skills_dir is not None:
-        skills_target = (
-            Path(args.copilot_skills_dir) if args.copilot_skills_dir else default_copilot_skills_dir()
-        )
-        skills_count = export_to_copilot_skills(repo_dir, skills_target)
-        print(f"[OK] Exported {skills_count} Copilot Agent Skills -> {skills_target}")
-
-    if args.copilot_home or "" in (args.user_dir, args.copilot_skills_dir):
-        copilot_home = Path(args.copilot_home) if args.copilot_home else default_copilot_home()
-        agents, hooks_file = export_copilot_home(repo_dir, copilot_home)
-        print(f"[OK] Exported {len(agents)} Copilot custom agents -> {copilot_home / 'agents'}")
-        print(f"[OK] Exported Copilot hooks -> {hooks_file}")
+def _report(label: str, target: Path, changes: Sequence[FileChange]) -> None:
+    print(f"[OK] Exported {label} -> {target}")
+    for change in changes:
+        if change.backup is not None:
+            print(f"  ! kept a copy of {change.path} -> {change.backup}")
 
 
 def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
-    prompt_files = bool(getattr(args, "copilot_prompt_files", False))
     _check_copilot_scope_conflict(args, repo_dir)
-    _run_user_copilot_exports(args, repo_dir, prompt_files=prompt_files)
-
-    if args.workspace:
-        ws = Path(args.workspace).resolve()
-        count, instr = export_to_workspace(repo_dir, ws, prompt_files=prompt_files)
-        github = ws / ".github"
-        kind_label = "prompt files" if prompt_files else "Agent Skills"
-        kind_dir = github / ("prompts" if prompt_files else "skills")
-        print(f"[OK] Exported {count} workspace {kind_label} -> {kind_dir}")
-        print(f"[OK] Exported workspace custom agents -> {github / 'agents'}")
-        print(
-            f"[OK] Exported workspace hooks (runs `craftsman` from PATH) -> {github / 'hooks' / HOOKS_FILENAME}"
+    if (prompts := _chosen(args.user_dir, default_vscode_prompts_dir)) is not None:
+        _report("global Copilot instructions", prompts, export_vscode_instructions(repo_dir, prompts))
+    if (skills_dir := _chosen(args.copilot_skills_dir, default_copilot_skills_dir)) is not None:
+        skills = export_to_copilot_skills(repo_dir, skills_dir)
+        _report(f"{len(skills)} Copilot Agent Skills", skills_dir, skills)
+    if (copilot_home := _chosen(args.copilot_home, default_copilot_home)) is not None:
+        home_export = export_copilot_home(repo_dir, copilot_home, absolute_hook_prefixes())
+        _report(
+            "Copilot custom agents and hooks", copilot_home, [*home_export.agents, home_export.hooks]
         )
-        print(f"[OK] Exported workspace Copilot instructions -> {instr}")
-
-    if args.claude_dir is not None:
-        target_claude = Path(args.claude_dir) if args.claude_dir else default_claude_dir()
-        count, rules_file = export_to_claude_user(repo_dir, target_claude)
-        print(f"[OK] Exported {count} Claude Code slash commands -> {target_claude / 'commands'}")
-        print(f"[OK] Exported Claude Code reviewer and verifier subagents -> {target_claude / 'agents'}")
-        print(f"[OK] Exported Claude Code global rules -> {rules_file}")
+    if args.workspace is not None:
+        workspace = export_to_workspace(repo_dir, args.workspace.resolve())
+        changes = [*workspace.skills, *workspace.agents, workspace.hooks, workspace.instructions]
+        _report("workspace skills, agents, hooks and instructions", args.workspace / ".github", changes)
+    if (claude_dir := _chosen(args.claude_dir, default_claude_dir)) is not None:
+        claude = export_to_claude_user(repo_dir, claude_dir)
+        changes = [*claude.commands, *claude.agents, claude.rules]
         if not args.no_claude_hooks:
-            settings = target_claude / "settings.json"
             bash_prefix, _ = absolute_hook_prefixes()
-            changed = merge_claude_hooks(settings, bash_prefix)
-            print(
-                f"[OK] Claude Code hooks {'merged into' if changed else 'already up to date in'} {settings}"
-            )
-
-    if args.agents_workspace:
-        ws = Path(args.agents_workspace).resolve()
-        agents_md, cursor_mdc = export_to_agents_workspace(repo_dir, ws)
-        print(f"[OK] Exported universal AGENTS.md (Codex/Cursor/Windsurf) -> {agents_md}")
-        print(f"[OK] Exported Cursor rule -> {cursor_mdc}")
+            changes.append(merge_claude_hooks(claude_dir / "settings.json", bash_prefix))
+        _report("Claude Code commands, subagents, rules and hooks", claude_dir, changes)
+    if args.agents_workspace is not None:
+        agents = export_to_agents_workspace(repo_dir, args.agents_workspace.resolve())
+        _report(
+            "AGENTS.md and the Cursor rule",
+            args.agents_workspace,
+            [agents.agents_md, agents.cursor_rule],
+        )
 
 
 if __name__ == "__main__":

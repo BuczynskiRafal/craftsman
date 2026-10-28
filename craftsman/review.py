@@ -6,8 +6,8 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -17,65 +17,74 @@ from craftsman.diffscan import (
     DiffSnapshot,
     WorktreeIndex,
     detect_signals,
-    resolve_base_sha,
     snapshot,
-    worktree_root,
 )
 from craftsman.evidence import archive_ledger, effective_tier, packet_path
 from craftsman.gate import (
-    gate_policy,
-    load_state,
-    resolve_cli_state_file,
-    resolve_effective_tier,
-    save_state_atomic,
+    GateState,
+    GateStateError,
+    Stage,
+    current_tier,
+    state_path_for,
+    update_state,
+)
+from craftsman.gatecheck import (
+    SELF_REVIEWED_BANNER,
+    GatePolicy,
+    GateReport,
+    acks_in_force,
+    evaluate,
+    has_unresolved_diff_size,
+    passing_runs,
+    render_report,
+    require_current_round,
 )
 from craftsman.ledger import (
+    ack_signal,
+    add_coverage,
+    add_fact,
+    add_finding,
+    file_sha256,
+    load,
+    merge_findings,
+    mutate,
+    next_finding_id,
+    open_round,
+    open_units,
+    relocate_finding,
+    resolve,
+    set_verdict,
+    uncovered_by_lens,
+    waive_run,
+)
+from craftsman.lenses import LENS_IDS, REVIEWER_GROUPS, TIERS, LensPick, Tier, select_lenses
+from craftsman.packet import (
+    PacketContext,
+    collect_context,
+    expand_hunk_spec,
+    render_packet,
+    render_packet_view,
+)
+from craftsman.quality import MAX_PRODUCTION_ADDED_LINES, collect_quality_signals, production_diff_growth
+from craftsman.records import (
     DESIGN_LENS,
     RESOLUTIONS,
-    SELF_REVIEWED_BANNER,
     SEVERITIES,
     SWEEP_LENS,
     VERDICTS,
     Fact,
     FieldError,
+    Fields,
     Finding,
-    GateReport,
     Ledger,
     LedgerError,
     Round,
     Run,
     SignalAck,
     SourceRef,
-    _Fields,
-    _next_id,
-    ack_signal,
-    add_coverage,
-    add_fact,
-    add_finding,
-    evaluate,
-    file_sha256,
-    has_unresolved_diff_size,
-    is_trivial_run,
-    ledger_path_for,
-    load,
-    merge_findings,
-    mutate,
-    open_round,
-    relocate_finding,
-    render_report,
-    require_current_round,
-    resolve,
-    set_verdict,
-    uncovered_by_lens,
-    waive_run,
+    as_choice,
 )
-from craftsman.lenses import LENS_IDS, REVIEWER_GROUPS, TIERS, Tier, select_lenses
-from craftsman.packet import collect_context, expand_hunk_spec, render_packet, render_packet_view
-from craftsman.quality import (
-    MAX_PRODUCTION_ADDED_LINES,
-    collect_quality_signals,
-    production_diff_growth,
-)
+from craftsman.workspace import Workspace, open_workspace
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
@@ -85,6 +94,7 @@ FIELD_FLAGS = {
     "lens": "--lens",
     "lenses": "--lenses",
     "hunks": "--hunks",
+    "files": "--files",
     "source": "--source",
     "text": "--text",
     "path": "--file",
@@ -94,7 +104,6 @@ FIELD_FLAGS = {
     "scenario": "--scenario",
     "signal_id": "--signal",
     "note": "--note",
-    "digests": "--hunks",
     "verdict": "--as",
     "verdict_evidence": "--evidence",
     "verdict_run": "--run",
@@ -102,47 +111,22 @@ FIELD_FLAGS = {
     "resolution_note": "--note",
     "reason": "--reason",
 }
+S = TypeVar("S", bound=str)
 JSON_FIELD_NAMES = {
     "path": "file",
-    "digests": "hunks",
     "verdict": "as",
     "verdict_evidence": "evidence",
     "verdict_run": "run",
     "signal_id": "signal",
 }
 
-S = TypeVar("S", bound=str)
-
-
-@dataclass(frozen=True)
-class Workspace:
-    root: Path
-    state: dict[str, Any]  # the active craftsman state, or {} outside an active session
-    ledger_path: Path
-
-
-def open_workspace(cwd: str | None) -> Workspace:
-    """Locate the work tree, the active gate state and the ledger for `cwd`."""
-    root = worktree_root(cwd or os.getcwd())
-    loaded = load_state(resolve_cli_state_file(None, str(root)))
-    state = loaded if loaded and loaded.get("active") else {}
-    return Workspace(root=root, state=state, ledger_path=ledger_path_for(root))
-
-
-def resolve_base(ws: Workspace, ledger: Ledger, explicit: str | None) -> str:
-    """`--base`, else the latest round's base, else the active task's base, else HEAD."""
-    state_base = ws.state.get("base_sha")
-    ledger_base = ledger.rounds[-1].base_sha if ledger.rounds else None
-    ref = explicit or ledger_base or (state_base if isinstance(state_base, str) else None)
-    return resolve_base_sha(ws.root, ref)
-
 
 def resolve_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tier:
     """`--tier`, else the active task's effective gear, else the latest round's, else standard."""
     if explicit is not None:
         return explicit
-    if ws.state:
-        return resolve_effective_tier(ws.state, str(ws.root))
+    if ws.state is not None:
+        return current_tier(ws.state, ws.root)
     return ledger.rounds[-1].tier if ledger.rounds else "standard"
 
 
@@ -152,8 +136,8 @@ def evaluation_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tie
     An explicit `--tier` can raise the bar for `check`, never lower it.
     """
     requested = [explicit] if explicit is not None else []
-    if ws.state:
-        requested.append(resolve_effective_tier(ws.state, str(ws.root)))
+    if ws.state is not None:
+        requested.append(current_tier(ws.state, ws.root))
     if not requested:
         return ledger.rounds[-1].tier if ledger.rounds else "standard"
     return effective_tier(ledger, *requested)
@@ -166,62 +150,79 @@ def _prepare(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
     tier = resolve_tier(ws, ledger, args.tier)
-    snap = snapshot(ws.root, resolve_base(ws, ledger, args.base))
+    snap = snapshot(ws.root, ws.base_sha(ledger, args.base))
     if snap.is_empty:
         print(f"Nothing to review: the work tree matches base {snap.base_sha[:12]}.")
         return 0
-    picks = select_lenses(tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
-    lens_ids = [pick.lens.id for pick in picks]
+    lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap)]
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    quality_signals = collect_quality_signals(ws.root, snap)
+    signals = collect_quality_signals(ws.root, snap)
 
     def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
         updated, round_ = open_round(
-            current, snap, tier, lens_ids, str(packet), symbols, signals=quality_signals
+            current, snap, tier, lens_ids, str(packet), symbols, signals=signals
         )
         return updated, (updated, round_, updated is not current)
 
     ledger, round_, created = mutate(ws.ledger_path, open_next)
     packet = Path(round_.packet_path)
     if created or not packet.is_file():
-        task = args.task or str(ws.state.get("task") or "")
-        ctx = collect_context(
-            ws.root,
-            snap,
-            round_,
-            picks,
-            task,
-            symbols=symbols,
-            ledger=ledger,
-            index=index,
-            quality_signals=quality_signals,
-        )
+        ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=args.task or ws.task)
         _write_text(packet, render_packet(ctx))
     _mark_needs_human_if_oversized(ws, ledger)
     _print_prepare_summary(round_, packet, created)
     return 0
 
 
+def _lens_picks(tier: Tier, snap: DiffSnapshot) -> tuple[LensPick, ...]:
+    return select_lenses(tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
+
+
+def _packet_context(
+    ws: Workspace,
+    snap: DiffSnapshot,
+    ledger: Ledger,
+    round_: Round,
+    index: WorktreeIndex,
+    symbols: Mapping[str, tuple[str, ...]],
+    *,
+    task: str,
+) -> PacketContext:
+    """What the packet of `round_` shows, with the lenses the round selected."""
+    picks = tuple(pick for pick in _lens_picks(round_.tier, snap) if pick.lens.id in round_.lenses)
+    return collect_context(
+        ws.root,
+        snap,
+        round_,
+        picks,
+        task,
+        symbols=symbols,
+        ledger=ledger,
+        index=index,
+    )
+
+
 def _mark_needs_human_if_oversized(ws: Workspace, ledger: Ledger) -> None:
-    if not has_unresolved_diff_size(ledger):
+    """An oversized change needs the user's decision; the active gate records that."""
+    if ws.state is None or not has_unresolved_diff_size(ledger):
         return
-    state_file = resolve_cli_state_file(None, str(ws.root))
-    loaded = load_state(state_file)
-    if loaded is not None and loaded.get("stage") != "needs_human":
-        loaded["stage"] = "needs_human"
-        save_state_atomic(state_file, loaded)
+    update_state(state_path_for(ws.root), lambda current: (_needing_human(current), None))
+
+
+def _needing_human(state: GateState | None) -> GateState | None:
+    return replace(state, stage=Stage.NEEDS_HUMAN) if state is not None and state.active else state
 
 
 def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
     if not created:
         print(f"Round {round_.number} unchanged (same diff and tier). Packet: {packet}")
         return
-    carried = sum(hunk.carried for hunk in round_.hunks)
+    carried = len(round_.hunks) - len(round_.open_hunk_ids)
     print(
         f"Round {round_.number} prepared ({round_.tier}): {len(round_.hunks)} hunks, "
-        f"{carried} carried, {len(round_.hunks) - carried} to review."
+        f"{carried} carried, {len(round_.open_hunk_ids)} to review."
     )
     print(f"Lenses: {', '.join(round_.lenses)}")
     print(f"Packet: {packet}")
@@ -240,60 +241,71 @@ def _write_text(path: Path, text: str) -> None:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
 
 
-def _view_slug(lenses: Sequence[str], hunks_raw: str | None) -> str:
+def view_slug(lenses: Sequence[str], hunks_raw: str | None) -> str:
+    """The file-name part of a reviewer view: its lenses, then its hunk selection if any."""
     lens_slug = "-".join(lenses)
-    if not hunks_raw or not hunks_raw.strip():
+    if hunks_raw is None:
         return lens_slug
-    hunk_slug = "".join(
-        ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()
-    ).strip("-")
+    hunk_slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()).strip("-")
     return f"{lens_slug}.{hunk_slug}" if hunk_slug else lens_slug
 
 
-def _parse_view_lenses(raw: str, round_lenses: Sequence[str] = ()) -> list[str]:
+def parse_view_lenses(raw: str, round_: Round) -> list[str]:
+    """Lens ids and reviewer-group ids from `--lenses`, resolved to lenses selected in `round_`."""
     tokens = [item.strip() for item in raw.split(",") if item.strip()]
     if not tokens:
-        raise FieldError("lenses", "must name at least one lens")
-    selected = set(round_lenses)
+        raise FieldError("lenses", "must name at least one lens or reviewer group")
     lenses: list[str] = []
     for token in tokens:
-        if token in REVIEWER_GROUPS:
-            group = REVIEWER_GROUPS[token]
-            active = [item for item in group if item in selected] if selected else list(group)
-            lenses.extend(active or group)
-        elif token in LENS_IDS:
-            lenses.append(token)
-        else:
+        candidates = REVIEWER_GROUPS.get(token, (token,))
+        if token not in REVIEWER_GROUPS and token not in LENS_IDS:
+            known = ", ".join([*REVIEWER_GROUPS, *sorted(LENS_IDS)])
+            raise FieldError("lenses", f"names unknown lens or group {token!r} (choose from {known})")
+        selected = [lens for lens in candidates if lens in round_.lenses]
+        if not selected:
             raise FieldError(
-                "lenses", f"unknown lens {token!r} (choose from {', '.join(sorted(LENS_IDS))})"
+                "lenses",
+                f"{token!r} has no lens selected in round {round_.number} "
+                f"(selected: {', '.join(round_.lenses)})",
             )
+        lenses.extend(selected)
     return list(dict.fromkeys(lenses))
 
 
 def _view(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
-    if not ledger.rounds:
-        raise LedgerError("no review round yet; run `craftsman review prepare` first")
-    round_ = ledger.rounds[-1]
-    snap = snapshot(ws.root, resolve_base(ws, ledger, None))
-    lenses = _parse_view_lenses(args.lenses, round_.lenses)
-    all_ids = [hunk.id for hunk in snap.hunks]
-    open_ids = [hunk.id for hunk in round_.hunks if not hunk.carried and hunk.id in all_ids] or all_ids
-    assigned = expand_hunk_spec(args.hunks, all_ids) if args.hunks else tuple(open_ids)
-    picks = select_lenses(round_.tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
+    snap = snapshot(ws.root, ws.base_sha(ledger))
+    round_ = require_current_round(ledger, snap)
+    lenses = parse_view_lenses(args.lenses, round_)
+    if args.hunks is None:
+        assigned = round_.open_hunk_ids
+    else:
+        assigned = expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks])
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    task = str(ws.state.get("task") or "")
-    ctx = collect_context(
-        ws.root, snap, round_, picks, task,
-        symbols=symbols, ledger=ledger, index=index, quality_signals=round_.signals,
+    ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=ws.task)
+    view_path = Path(round_.packet_path).with_name(
+        f"packet-{round_.number}.{view_slug(lenses, args.hunks)}.md"
     )
-    slug = _view_slug(lenses, args.hunks)
-    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
     _write_text(view_path, render_packet_view(ctx, lenses=lenses, assigned_hunks=assigned))
     print(view_path)
     return 0
+
+
+# --- flag validation ------------------------------------------------------------------------
+
+
+def _require_flags(args: argparse.Namespace, flags: Mapping[str, object]) -> None:
+    missing = [flag for flag, value in flags.items() if value is None]
+    if missing:
+        args.subparser.error(f"the following arguments are required: {', '.join(missing)}")
+
+
+def _reject_flags_with_from_json(flags: Mapping[str, object]) -> None:
+    used = [flag for flag, value in flags.items() if value is not None]
+    if used:
+        raise LedgerError(f"--from-json cannot be combined with {', '.join(used)}")
 
 
 def _load_json_entries(source: str) -> list[Any]:
@@ -301,8 +313,7 @@ def _load_json_entries(source: str) -> list[Any]:
     label = "stdin" if source == "-" else source
     try:
         if source == "-":
-            buf = getattr(sys.stdin, "buffer", None)
-            text = buf.read().decode("utf-8") if buf is not None else sys.stdin.read()
+            text = sys.stdin.buffer.read().decode("utf-8")
         else:
             text = Path(source).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
@@ -318,6 +329,11 @@ def _load_json_entries(source: str) -> list[Any]:
     return raw
 
 
+def _entry_label(raw: Any, key: str) -> str | None:
+    value = raw.get(key) if isinstance(raw, dict) else None
+    return value if isinstance(value, str) else None
+
+
 def _batch_error(index: int, label: str | None, exc: LedgerError) -> LedgerError:
     head = f"entry {index} ({label})" if label else f"entry {index}"
     field = JSON_FIELD_NAMES.get(exc.field, exc.field)
@@ -329,33 +345,61 @@ def _batch_error(index: int, label: str | None, exc: LedgerError) -> LedgerError
     return LedgerError(f"{head}: {exc}")
 
 
+# --- coverage -------------------------------------------------------------------------------
+
+
+def _cover(args: argparse.Namespace) -> int:
+    if args.from_json is not None:
+        return _cover_from_json(args)
+    return _cover_one(args)
+
+
+def _cover_one(args: argparse.Namespace) -> int:
+    _require_flags(args, {"--lens": args.lens})
+    if args.hunks is not None and args.files is not None:
+        raise LedgerError("pass either --hunks or --files, not both")
+    if args.lens == DESIGN_LENS and args.hunks is not None:
+        raise LedgerError(
+            "the `design` lens covers changed files, not hunks; pass --files instead of --hunks"
+        )
+    if args.lens != DESIGN_LENS and args.files is not None:
+        raise LedgerError("--files is only used with `--lens design`; pass --hunks for hunk lenses")
+    target_flag, raw_targets = (
+        ("--files", args.files) if args.lens == DESIGN_LENS else ("--hunks", args.hunks)
+    )
+    _require_flags(args, {target_flag: raw_targets, "--note": args.note})
+    ws = open_workspace(args.cwd)
+    snap = ws.current_snapshot()
+    targets = [item.strip() for item in raw_targets.split(",") if item.strip()]
+
+    def record(current: Ledger) -> tuple[Ledger, str]:
+        return _record_coverage(current, snap, args.lens, targets, args.note)
+
+    print(mutate(ws.ledger_path, record))
+    return 0
+
+
 def _cover_from_json(args: argparse.Namespace) -> int:
-    if any(val is not None for val in (args.lens, args.hunks, args.files, args.note)):
-        raise LedgerError("--from-json cannot be combined with --lens, --hunks or --note (or --files)")
+    _reject_flags_with_from_json(
+        {"--lens": args.lens, "--hunks": args.hunks, "--files": args.files, "--note": args.note}
+    )
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
+    snap = ws.current_snapshot()
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
-        round_ = require_current_round(current, snap)
         lines: list[str] = []
         for index, raw in enumerate(raw_entries, 1):
-            label = raw.get("lens") if isinstance(raw, dict) and isinstance(raw.get("lens"), str) else None
             try:
-                f = _Fields(raw)
+                f = Fields(raw)
                 lens = f.choice("lens", tuple(sorted(LENS_IDS)))
-                key = "files" if isinstance(raw, dict) and "files" in raw else "hunks"
-                targets = [item.strip() for item in f.texts(key) if item.strip()]
+                targets = [item.strip() for item in f.texts(_target_key(lens)) if item.strip()]
                 note = f.text("note")
-                f.done(None)
-                current, _ = add_coverage(current, lens, targets, note)
+                f.reject_unknown()
+                current, line = _record_coverage(current, snap, lens, targets, note)
             except LedgerError as exc:
-                raise _batch_error(index, label, exc) from None
-            left = sum(len(ids) for ids in uncovered_by_lens(current, round_).values())
-            lines.append(
-                f"Coverage recorded: `{lens}` covered {', '.join(targets)} in round "
-                f"{round_.number}; {left} lens-hunk pair(s) left in this round."
-            )
+                raise _batch_error(index, _entry_label(raw, "lens"), exc) from None
+            lines.append(line)
         return current, lines
 
     for line in mutate(ws.ledger_path, record_batch):
@@ -363,136 +407,48 @@ def _cover_from_json(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cover(args: argparse.Namespace) -> int:
-    if args.from_json is not None:
-        return _cover_from_json(args)
-    if args.hunks is not None and args.files is not None:
-        raise LedgerError("pass either --hunks or --files, not both")
-    if args.lens == DESIGN_LENS and args.hunks is not None:
-        raise LedgerError("the `design` lens covers changed files, not hunks; pass --files instead of --hunks")
-    if args.lens != DESIGN_LENS and args.files is not None:
-        raise LedgerError("--files is only used with `--lens design`; pass --hunks for hunk lenses")
-    raw_targets = args.files if args.files is not None else args.hunks
-    target_flag = "--files" if args.lens == DESIGN_LENS else "--hunks"
-    missing = [
-        flag
-        for flag, val in (("--lens", args.lens), (target_flag, raw_targets), ("--note", args.note))
-        if val is None
-    ]
-    if missing:
-        args.subparser.error(f"the following arguments are required: {', '.join(missing)}")
-    ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-    targets = [item.strip() for item in (raw_targets or "").split(",") if item.strip()]
+def _target_key(lens: str) -> str:
+    """The `design` lens covers files; every other lens covers hunks."""
+    return "files" if lens == DESIGN_LENS else "hunks"
 
-    def record(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round]]:
-        require_current_round(current, snap)
-        updated, _ = add_coverage(current, args.lens, targets, args.note)
-        return updated, (updated, updated.rounds[-1])
 
-    ledger, round_ = mutate(ws.ledger_path, record)
-    left = sum(len(ids) for ids in uncovered_by_lens(ledger, round_).values())
-    print(
-        f"Coverage recorded: `{args.lens}` covered {', '.join(targets)} in round {round_.number}; "
-        f"{left} lens-hunk pair(s) left in this round."
+def _record_coverage(
+    current: Ledger, snap: DiffSnapshot, lens: str, targets: Sequence[str], note: str
+) -> tuple[Ledger, str]:
+    round_ = require_current_round(current, snap)
+    updated, _ = add_coverage(current, lens, targets, note)
+    left = sum(len(ids) for ids in uncovered_by_lens(updated, round_).values())
+    return updated, (
+        f"Coverage recorded: `{lens}` covered {', '.join(targets)} in round {round_.number}; "
+        f"{left} lens item(s) left in this round."
     )
-    return 0
 
 
-def _source_lines(root: Path, path: str, line: int) -> list[str] | None:
-    """The cited file's lines (None when the diff deletes it), refusing a line past its end."""
-    source = root / path
-    lines = _git_lines(source) if source.is_file() else None
-    if lines is not None and line > len(lines):
-        raise FieldError("line", f"{line} is past the end of {path}, which has {len(lines)} lines")
-    return lines
-
-
-def _add_one_from_json(
-    ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any
-) -> tuple[Ledger, Finding, list[str] | None]:
-    f = _Fields(raw)
-    lens = f.choice("lens", tuple(sorted(LENS_IDS)))
-    raw_file = f.text("file")
-    line = f.integer("line")
-    severity = f.choice("severity", SEVERITIES)
-    title = f.text("title")
-    scenario = f.text("scenario")
-    suggestion = f.get_text("suggestion")
-    signal_id = f.get_optional_text("signal")
-    f.done(None)
-    path = _finding_path(ws.root, cwd, raw_file, snap)
-    lines = _source_lines(ws.root, path, line)
-    updated, finding = add_finding(
-        current,
-        lens=lens,
-        path=path,
-        line=line,
-        severity=severity,
-        title=title,
-        scenario=scenario,
-        suggestion=suggestion,
-        signal_id=signal_id,
-    )
-    return updated, finding, lines
-
-
-def _add_from_json(args: argparse.Namespace) -> int:
-    flags = (
-        args.lens,
-        args.file,
-        args.line,
-        args.severity,
-        args.title,
-        args.scenario,
-        args.suggestion,
-        args.signal,
-    )
-    if any(val is not None for val in flags):
-        raise LedgerError(
-            "--from-json cannot be combined with --lens, --file, --line, --severity, --title, "
-            "--scenario or --suggestion (or --signal)"
-        )
-    raw_entries = _load_json_entries(args.from_json)
-    ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-    cwd = Path(args.cwd or os.getcwd())
-
-    def record_batch(current: Ledger) -> tuple[Ledger, list[tuple[Finding, list[str] | None]]]:
-        require_current_round(current, snap)
-        results: list[tuple[Finding, list[str] | None]] = []
-        for index, raw in enumerate(raw_entries, 1):
-            next_id = _next_id("F", (item.id for item in current.findings))
-            try:
-                current, finding, lines = _add_one_from_json(ws, cwd, snap, current, raw)
-            except LedgerError as exc:
-                raise _batch_error(index, next_id, exc) from None
-            results.append((finding, lines))
-        return current, results
-
-    for finding, lines in mutate(ws.ledger_path, record_batch):
-        print(f"{finding.id} recorded ({finding.severity}, {finding.lens}, {finding.path}:{finding.line})")
-        print(_cited_line(finding, lines))
-    return 0
+# --- findings -------------------------------------------------------------------------------
 
 
 def _add(args: argparse.Namespace) -> int:
     if args.from_json is not None:
         return _add_from_json(args)
-    required = (
-        ("--lens", args.lens),
-        ("--file", args.file),
-        ("--line", args.line),
-        ("--severity", args.severity),
-        ("--title", args.title),
-        ("--scenario", args.scenario),
-    )
-    missing = [flag for flag, val in required if val is None]
-    if missing:
-        args.subparser.error(f"the following arguments are required: {', '.join(missing)}")
+    return _add_one(args)
+
+
+def _required_finding_flags(args: argparse.Namespace) -> dict[str, object]:
+    return {
+        "--lens": args.lens,
+        "--file": args.file,
+        "--line": args.line,
+        "--severity": args.severity,
+        "--title": args.title,
+        "--scenario": args.scenario,
+    }
+
+
+def _add_one(args: argparse.Namespace) -> int:
+    _require_flags(args, _required_finding_flags(args))
     ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-    path = _finding_path(ws.root, Path(args.cwd or os.getcwd()), args.file, snap)
+    snap = ws.current_snapshot()
+    path = _finding_path(ws.root, _cwd(args), args.file, snap)
     lines = _source_lines(ws.root, path, args.line)
 
     def record(current: Ledger) -> tuple[Ledger, Finding]:
@@ -509,15 +465,86 @@ def _add(args: argparse.Namespace) -> int:
             signal_id=args.signal,
         )
 
-    finding = mutate(ws.ledger_path, record)
+    _print_recorded(mutate(ws.ledger_path, record), lines)
+    return 0
+
+
+def _add_from_json(args: argparse.Namespace) -> int:
+    _reject_flags_with_from_json(
+        {**_required_finding_flags(args), "--suggestion": args.suggestion, "--signal": args.signal}
+    )
+    raw_entries = _load_json_entries(args.from_json)
+    ws = open_workspace(args.cwd)
+    snap = ws.current_snapshot()
+    cwd = _cwd(args)
+
+    def record_batch(current: Ledger) -> tuple[Ledger, list[tuple[Finding, list[str] | None]]]:
+        require_current_round(current, snap)
+        results: list[tuple[Finding, list[str] | None]] = []
+        for index, raw in enumerate(raw_entries, 1):
+            label = next_finding_id(current)
+            try:
+                current, finding, lines = _add_one_from_json(ws, cwd, snap, current, raw)
+            except LedgerError as exc:
+                raise _batch_error(index, label, exc) from None
+            results.append((finding, lines))
+        return current, results
+
+    for finding, lines in mutate(ws.ledger_path, record_batch):
+        _print_recorded(finding, lines)
+    return 0
+
+
+def _add_one_from_json(
+    ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any
+) -> tuple[Ledger, Finding, list[str] | None]:
+    f = Fields(raw)
+    lens = f.choice("lens", tuple(sorted(LENS_IDS)))
+    raw_file = f.text("file")
+    line = f.integer("line")
+    severity = f.choice("severity", SEVERITIES)
+    title = f.text("title")
+    scenario = f.text("scenario")
+    suggestion = f.text_or("suggestion", "")
+    signal_id = f.text_if_present("signal")
+    f.reject_unknown()
+    path = _finding_path(ws.root, cwd, raw_file, snap)
+    lines = _source_lines(ws.root, path, line)
+    updated, finding = add_finding(
+        current,
+        lens=lens,
+        path=path,
+        line=line,
+        severity=severity,
+        title=title,
+        scenario=scenario,
+        suggestion=suggestion,
+        signal_id=signal_id,
+    )
+    return updated, finding, lines
+
+
+def _print_recorded(finding: Finding, lines: Sequence[str] | None) -> None:
     print(f"{finding.id} recorded ({finding.severity}, {finding.lens}, {finding.path}:{finding.line})")
     print(_cited_line(finding, lines))
-    return 0
+
+
+def _cwd(args: argparse.Namespace) -> Path:
+    return Path(args.cwd or os.getcwd())
+
+
+def _source_lines(root: Path, path: str, line: int) -> list[str] | None:
+    """The cited file's lines (None when the diff deletes it), refusing a line past its end."""
+    source = root / path
+    lines = _git_lines(source) if source.is_file() else None
+    if lines is not None and line > len(lines):
+        raise FieldError("line", f"{line} is past the end of {path}, which has {len(lines)} lines")
+    return lines
 
 
 def _ack(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
+    snap = ws.current_snapshot()
 
     def record(current: Ledger) -> tuple[Ledger, SignalAck]:
         require_current_round(current, snap)
@@ -528,12 +555,10 @@ def _ack(args: argparse.Namespace) -> int:
     return 0
 
 
-def _parse_fact_source(
-    ws: Workspace, cwd: Path, raw: str, snap: DiffSnapshot
-) -> tuple[SourceRef, str]:
-    if ":" not in raw:
+def _parse_fact_source(ws: Workspace, cwd: Path, raw: str, snap: DiffSnapshot) -> tuple[SourceRef, str]:
+    raw_path, separator, raw_line = raw.rpartition(":")
+    if not separator:
         raise FieldError("source", "must look like path:line (e.g. pkg/a.py:42)")
-    raw_path, raw_line = raw.rsplit(":", 1)
     try:
         line = int(raw_line)
     except ValueError:
@@ -542,49 +567,40 @@ def _parse_fact_source(
         raise FieldError("source", f"line must be >= 1 (got {line})")
     try:
         rel_path = _finding_path(ws.root, cwd, raw_path, snap)
+        _source_lines(ws.root, rel_path, line)
     except FieldError as exc:
         raise FieldError("source", exc.problem) from None
     digest = file_sha256(ws.root, rel_path)
     if digest is None:
         raise FieldError("source", f"{rel_path} does not exist in the work tree")
-    try:
-        _source_lines(ws.root, rel_path, line)
-    except FieldError as exc:
-        raise FieldError("source", exc.problem) from None
     return SourceRef(path=rel_path, line=line), digest
 
 
 def _fact_add(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-    source, digest = _parse_fact_source(ws, Path(args.cwd or os.getcwd()), args.source, snap)
+    snap = ws.current_snapshot()
+    source, digest = _parse_fact_source(ws, _cwd(args), args.source, snap)
 
     def record(current: Ledger) -> tuple[Ledger, Fact]:
         round_ = require_current_round(current, snap)
-        all_ids = [hunk.id for hunk in round_.hunks]
-        hunks = expand_hunk_spec(args.hunks, all_ids)
         return add_fact(
             current,
-            hunks=hunks,
+            hunks=expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks]),
             source=source,
             text=args.text,
-            file_digest=digest,
+            source_digest=digest,
             author_lens=args.lens,
         )
 
     fact = mutate(ws.ledger_path, record)
-    print(
-        f"{fact.id} recorded ({', '.join(fact.hunks)}, source {fact.source.path}:{fact.source.line})"
-    )
+    print(f"{fact.id} recorded ({', '.join(fact.hunks)}, source {fact.source.path}:{fact.source.line})")
     return 0
 
 
 def _move(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
-    path = None
-    if args.file is not None:
-        path = _finding_path(ws.root, Path(args.cwd or os.getcwd()), args.file, snap)
+    snap = ws.current_snapshot()
+    path = None if args.file is None else _finding_path(ws.root, _cwd(args), args.file, snap)
 
     def record(current: Ledger) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
         updated, finding = relocate_finding(
@@ -621,7 +637,9 @@ def _merge(args: argparse.Namespace) -> int:
 def _cited_line(finding: Finding, lines: Sequence[str] | None) -> str:
     """Echo the cited source line so a wrong `--line` is noticed while the finding is fresh."""
     if lines is None:
-        return f"  ({finding.path} is deleted in the diff; line {finding.line} refers to the base version)"
+        return (
+            f"  ({finding.path} is deleted in the diff; line {finding.line} refers to the base version)"
+        )
     text = lines[finding.line - 1].strip()
     return f"  L{finding.line}: {text[:CITED_LINE_CHARS]}{'…' if len(text) > CITED_LINE_CHARS else ''}"
 
@@ -657,63 +675,62 @@ def _finding_path(root: Path, cwd: Path, raw: str, snap: DiffSnapshot) -> str:
     raise FieldError("path", f"{raw!r} does not exist in the work tree or the diff")
 
 
+# --- verdicts and resolutions ---------------------------------------------------------------
+
+
 def _verdict(args: argparse.Namespace) -> int:
     if args.from_json is not None:
-        if any(val is not None for val in (args.finding_id, args.verdict, args.evidence, args.run)):
-            raise LedgerError("--from-json cannot be combined with ID, --as, --evidence or --run")
-        raw_entries = _load_json_entries(args.from_json)
-        ws = open_workspace(args.cwd)
+        return _verdict_from_json(args)
+    return _verdict_one(args)
 
-        def record_batch(current: Ledger) -> tuple[Ledger, list[Finding]]:
-            judged: list[Finding] = []
-            for index, raw in enumerate(raw_entries, 1):
-                label = (
-                    raw.get("id")
-                    if isinstance(raw, dict) and isinstance(raw.get("id"), str)
-                    else None
-                )
-                try:
-                    f = _Fields(raw)
-                    finding_id = f.text("id")
-                    verdict = f.choice("as", VERDICTS)
-                    evidence = f.text("evidence")
-                    run_id = f.get_optional_text("run")
-                    f.done(None)
-                    current, finding = set_verdict(current, finding_id, verdict, evidence, run_id)
-                except LedgerError as exc:
-                    raise _batch_error(index, label, exc) from None
-                judged.append(finding)
-            return current, judged
 
-        for finding in mutate(ws.ledger_path, record_batch):
-            run = f" (run {finding.verdict_run})" if finding.verdict_run else ""
-            print(f"{finding.id} verdict recorded: {finding.verdict}{run}")
-        return 0
-
-    missing = [
-        flag
-        for flag, val in (
-            ("ID", args.finding_id),
-            ("--as", args.verdict),
-            ("--evidence", args.evidence),
-        )
-        if val is None
-    ]
-    if missing:
-        args.subparser.error(f"the following arguments are required: {', '.join(missing)}")
+def _verdict_one(args: argparse.Namespace) -> int:
+    _require_flags(args, {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence})
     ws = open_workspace(args.cwd)
     finding = mutate(
         ws.ledger_path,
         lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run),
     )
+    _print_verdict(finding)
+    return 0
+
+
+def _verdict_from_json(args: argparse.Namespace) -> int:
+    _reject_flags_with_from_json(
+        {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence, "--run": args.run}
+    )
+    raw_entries = _load_json_entries(args.from_json)
+    ws = open_workspace(args.cwd)
+
+    def record_batch(current: Ledger) -> tuple[Ledger, list[Finding]]:
+        judged: list[Finding] = []
+        for index, raw in enumerate(raw_entries, 1):
+            try:
+                f = Fields(raw)
+                finding_id = f.text("id")
+                verdict = f.choice("as", VERDICTS)
+                evidence = f.text("evidence")
+                run_id = f.text_if_present("run")
+                f.reject_unknown()
+                current, finding = set_verdict(current, finding_id, verdict, evidence, run_id)
+            except LedgerError as exc:
+                raise _batch_error(index, _entry_label(raw, "id"), exc) from None
+            judged.append(finding)
+        return current, judged
+
+    for finding in mutate(ws.ledger_path, record_batch):
+        _print_verdict(finding)
+    return 0
+
+
+def _print_verdict(finding: Finding) -> None:
     run = f" (run {finding.verdict_run})" if finding.verdict_run else ""
     print(f"{finding.id} verdict recorded: {finding.verdict}{run}")
-    return 0
 
 
 def _resolve(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = snapshot(ws.root, resolve_base(ws, load(ws.ledger_path), None))
+    snap = ws.current_snapshot()
     finding = mutate(
         ws.ledger_path,
         lambda current: resolve(
@@ -731,12 +748,15 @@ def _waive_run(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- inspection -----------------------------------------------------------------------------
+
+
 def _show(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
-    snap = snapshot(ws.root, resolve_base(ws, ledger, None))
+    snap = snapshot(ws.root, ws.base_sha(ledger))
     latest = ledger.rounds[-1] if ledger.rounds else None
-    if getattr(args, "packet_path", False):
+    if args.packet_path:
         if latest is None:
             raise LedgerError("no review round yet; run `craftsman review prepare`")
         print(str(Path(latest.packet_path).resolve()))
@@ -756,7 +776,7 @@ def _show(args: argparse.Namespace) -> int:
         print(_round_line(latest, snap))
         print(f"Packet: {Path(latest.packet_path).resolve()}")
         print("")
-        print("Coverage (covered/total non-carried hunks):")
+        print(f"Coverage (covered/total non-carried hunks, files for `{DESIGN_LENS}`):")
         print("\n".join(_coverage_lines(ledger, latest)))
     print("")
     print("\n".join(_findings_table(ledger.findings)))
@@ -766,7 +786,7 @@ def _show(args: argparse.Namespace) -> int:
 
 
 def _round_line(round_: Round, snap: DiffSnapshot) -> str:
-    carried = sum(hunk.carried for hunk in round_.hunks)
+    carried = len(round_.hunks) - len(round_.open_hunk_ids)
     if round_.fingerprint == snap.fingerprint:
         freshness = "current"
     elif snap.is_empty:
@@ -786,20 +806,17 @@ def _round_json(round_: Round, snap: DiffSnapshot) -> dict[str, Any]:
         "prepared_at": round_.prepared_at,
         "current": round_.fingerprint == snap.fingerprint,
         "hunks": len(round_.hunks),
-        "carried": sum(hunk.carried for hunk in round_.hunks),
+        "carried": len(round_.hunks) - len(round_.open_hunk_ids),
         "lenses": list(round_.lenses),
         "packet": round_.packet_path,
     }
 
 
 def _coverage_json(ledger: Ledger, round_: Round) -> dict[str, Any]:
-    open_hunks = sum(not hunk.carried for hunk in round_.hunks)
-    paths = list(dict.fromkeys(h.path for h in round_.hunks))
-    open_files = sum(not all(h.carried for h in round_.hunks if h.path == p) for p in paths)
     return {
         lens: {
-            "covered": (open_files if lens == DESIGN_LENS else open_hunks) - len(missing),
-            "total": open_files if lens == DESIGN_LENS else open_hunks,
+            "covered": len(open_units(round_, lens)) - len(missing),
+            "total": len(open_units(round_, lens)),
             "missing": missing,
         }
         for lens, missing in uncovered_by_lens(ledger, round_).items()
@@ -852,25 +869,22 @@ def _run_lines(runs: Sequence[Run], snap: DiffSnapshot) -> list[str]:
 
 
 def _evaluate(
-    ws: Workspace, tier_override: Tier | None, *, review_only: bool = False
+    ws: Workspace, tier_override: Tier | None, *, review_only: bool
 ) -> tuple[Ledger, DiffSnapshot, Tier, GateReport]:
-    if review_only and ws.state:
+    if review_only and ws.state is not None:
         raise LedgerError(
             "--review-only is not allowed during an active /craftsman gate session; "
             "in /craftsman the full gate applies (run `craftsman review check` without --review-only)"
         )
     ledger = load(ws.ledger_path)
-    _mark_needs_human_if_oversized(ws, ledger)
     tier = evaluation_tier(ws, ledger, tier_override)
-    snap = snapshot(ws.root, resolve_base(ws, ledger, None))
-    policy = gate_policy(ws.state, tier)
+    snap = snapshot(ws.root, ws.base_sha(ledger))
+    policy = GatePolicy(tier=tier, isolation_evidence=ws.isolation_evidence)
     return ledger, snap, tier, evaluate(ledger, snap, policy, review_only=review_only)
 
 
 def _check(args: argparse.Namespace) -> int:
-    _, _, _, report = _evaluate(
-        open_workspace(args.cwd), args.tier, review_only=args.review_only
-    )
+    _, _, _, report = _evaluate(open_workspace(args.cwd), args.tier, review_only=args.review_only)
     if args.json:
         print(json.dumps(_report_json(report), indent=2, ensure_ascii=False))
     else:
@@ -889,11 +903,9 @@ def _report_json(report: GateReport) -> dict[str, Any]:
 
 
 def _report(args: argparse.Namespace) -> int:
-    ledger, snap, tier, report = _evaluate(
-        open_workspace(args.cwd), None, review_only=args.review_only
-    )
+    ledger, snap, tier, report = _evaluate(open_workspace(args.cwd), None, review_only=args.review_only)
     groups = _finding_groups(ledger.findings)
-    runs = _counting_runs(ledger.runs, snap.fingerprint)
+    runs = passing_runs(ledger, snap.fingerprint)
     if args.json:
         payload = {
             **_report_json(report),
@@ -904,7 +916,7 @@ def _report(args: argparse.Namespace) -> int:
             "findings": {name: [f.to_json() for f in items] for name, items in groups.items()},
             "runs": [run.to_json() for run in runs],
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
-            "signal_acks": [ack.to_json() for ack in ledger.signal_acks],
+            "signal_acks": {sid: ack.to_json() for sid, ack in acks_in_force(ledger).items()},
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -932,35 +944,18 @@ def _finding_groups(findings: Sequence[Finding]) -> dict[str, list[Finding]]:
     return groups
 
 
-def _counting_runs(runs: Sequence[Run], fingerprint: str) -> list[Run]:
-    """Non-trivial commands whose latest run at the current code, per directory, passed."""
-    latest = {
-        (run.cwd, run.argv): run
-        for run in runs
-        if run.fingerprint == fingerprint and not is_trivial_run(run.argv)
-    }
-    return [run for run in latest.values() if run.counts_as_passing]
-
-
 def _report_status_line(report: GateReport) -> str:
-    if report.review_only:
-        if report.passed:
-            return "- Review: complete (review-only)"
-        codes = ", ".join(dict.fromkeys(issue.code for issue in report.issues))
-        return (
-            f"- Review: incomplete — {len(report.issues)} open items ({codes}); "
-            "see `craftsman review check --review-only`"
-        )
+    line = f"- {report.subject.capitalize()}: {report.status_label}"
     if report.passed:
-        return "- Gate: PASSED"
-    codes = ", ".join(dict.fromkeys(issue.code for issue in report.issues))
-    return f"- Gate: BLOCKED — {len(report.issues)} open items ({codes}); see `craftsman review check`"
+        return line
+    check = "craftsman review check --review-only" if report.review_only else "craftsman review check"
+    return f"{line} — {report.issue_codes}; see `{check}`"
 
 
 def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> list[str]:
     if not ledger.findings:
         return ["No findings recorded."]
-    detail = {
+    detail: dict[str, Callable[[Finding], str]] = {
         "fixed": lambda f: f"Fix: {f.resolution_note}",
         "accepted": lambda f: f"Accepted because: {f.resolution_note}",
         "open": lambda f: f"Verdict: {f.verdict or 'none yet'}",
@@ -979,58 +974,44 @@ def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> l
 
 
 def _signal_ack_lines(ledger: Ledger) -> list[str]:
-    if not ledger.signal_acks:
+    acks = acks_in_force(ledger)
+    if not acks:
         return []
-    by_round_id = {(r.number, s.id): s for r in ledger.rounds for s in r.signals}
+    latest = ledger.rounds[-1]
     lines = ["", "## Acknowledged quality signals"]
-    for ack in ledger.signal_acks:
-        sig = by_round_id.get((ack.round, ack.signal_id))
-        loc = f" (`{sig.kind}` at `{sig.file}:{sig.line}`)" if sig else ""
-        lines.append(f"- {ack.signal_id}{loc} — {ack.reason}")
+    for signal_id, ack in acks.items():
+        sig = latest.signal(signal_id)
+        lines.append(f"- {signal_id} (`{sig.kind.value}` at `{sig.file}:{sig.line}`) — {ack.reason}")
     return lines
 
 
-def _diff_size_handover_lines(ledger: Ledger, snap: DiffSnapshot) -> list[str]:
+def _diff_size_lines(ledger: Ledger, snap: DiffSnapshot) -> list[str]:
     if not has_unresolved_diff_size(ledger):
         return []
-    total_prod, top = production_diff_growth(snap)
-    lines = [
+    total, top = production_diff_growth(snap)
+    return [
         "",
         "## Diff size budget exceeded (needs human decision)",
-        f"- Added production lines: {total_prod} (budget: {MAX_PRODUCTION_ADDED_LINES})",
+        f"- Added production lines: {total} (budget: {MAX_PRODUCTION_ADDED_LINES})",
         "- Top files by line growth:",
+        *(f"  {index}. `{path}` (+{count} lines)" for index, (path, count) in enumerate(top, 1)),
     ]
-    lines.extend(f"  {idx}. `{path}` (+{count} lines)" for idx, (path, count) in enumerate(top, 1))
-    first = top[0][0] if top else (snap.files[0] if snap.files else "module")
-    rest = ", ".join(f"`{p}`" for p, _ in top[1:3]) or "remaining files"
-    lines += [
-        "- Suggested split into smaller changes:",
-        f"  1. Extract `{first}` and its tests into an initial preparatory change.",
-        f"  2. Land {rest} in a follow-up change once part 1 is reviewed.",
-    ]
-    return lines
 
 
-def _not_assessed_lines(ledger: Ledger, tier: Tier, report: GateReport) -> list[str]:
+def _not_assessed_lines(tier: Tier, report: GateReport) -> list[str]:
     if tier == "quick":
-        iso_line = "quick tier (inline review allowed)"
+        isolation = "quick tier (inline review allowed)"
     elif report.self_reviewed:
-        iso_line = SELF_REVIEWED_BANNER
+        isolation = SELF_REVIEWED_BANNER
     else:
-        iso_line = "verified via subagent stop events in the ledger"
-    acks = (
-        ", ".join(f"{a.signal_id} ({a.reason})" for a in ledger.signal_acks)
-        if ledger.signal_acks
-        else "none"
-    )
+        isolation = "verified via subagent stop events in the ledger"
     return [
         "",
         "## Not assessed by the gate",
         "- Business requirements fit and domain behavior not exercised by recorded runs.",
-        "- Naming quality and domain clarity beyond N1 test-naming rules.",
+        "- Naming quality and domain clarity.",
         "- Architecture and invariants outside the changed files.",
-        f"- Reviewer isolation status: {iso_line}.",
-        f"- Acknowledged quality signals: {acks}.",
+        f"- Reviewer isolation status: {isolation}.",
     ]
 
 
@@ -1042,15 +1023,14 @@ def _report_lines(
     groups: dict[str, list[Finding]],
     runs: Sequence[Run],
 ) -> list[str]:
-    proc_status = "COMPLETE" if report.passed else f"INCOMPLETE ({len(report.issues)} open items)"
-    lines = ["# Craftsman review report", f"**Process: {proc_status}**"]
+    lines = ["# Craftsman review report"]
     if report.self_reviewed:
         lines.append(f"**{SELF_REVIEWED_BANNER}**")
     lines += [
         f"- Base `{snap.base_sha[:7]}` · tier `{tier}` · {len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
-        *_diff_size_handover_lines(ledger, snap),
+        *_diff_size_lines(ledger, snap),
         "",
         "## Findings",
         *_report_finding_lines(ledger, groups),
@@ -1063,7 +1043,7 @@ def _report_lines(
         for run in runs
     )
     if not runs:
-        lines.append("No passing test, e2e, lint or build run at the final code.")
+        lines.append("No passing test or e2e run at the final code.")
     waived = [(run, run.waiver) for run in ledger.runs if run.waiver is not None]
     if waived:
         lines += ["", "## Waived runs"]
@@ -1073,7 +1053,7 @@ def _report_lines(
         )
     if report.warnings:
         lines += ["", "## Warnings", *(f"- {warning}" for warning in report.warnings)]
-    lines.extend(_not_assessed_lines(ledger, tier, report))
+    lines.extend(_not_assessed_lines(tier, report))
     return lines
 
 
@@ -1094,9 +1074,9 @@ def literal_choice(choices: Sequence[S]) -> Callable[[str], S]:
     """argparse `type=` converter that narrows a string to one of the `Literal` choices."""
 
     def parse(value: str) -> S:
-        for choice in choices:
-            if value == choice:
-                return choice
+        chosen = as_choice(value, choices)
+        if chosen is not None:
+            return chosen
         raise argparse.ArgumentTypeError(f"invalid choice {value!r} (choose from {', '.join(choices)})")
 
     return parse
@@ -1106,9 +1086,9 @@ def _tier_option(value: str) -> Tier | None:
     """`--tier`: a concrete tier, or `auto` for the tier the gate resolved for the active task."""
     if value == "auto":
         return None
-    for tier in TIERS:
-        if value == tier:
-            return tier
+    tier = as_choice(value, TIERS)
+    if tier is not None:
+        return tier
     raise argparse.ArgumentTypeError(f"invalid choice {value!r} (choose from auto, {', '.join(TIERS)})")
 
 
@@ -1132,8 +1112,12 @@ def _add_prepare_and_cover_parsers(
     prepare.set_defaults(handler=_prepare)
 
     view = sub.add_parser("view", parents=[common], help="Build a per-reviewer packet view")
-    view.add_argument("--lenses", "--lens", dest="lenses", required=True, help="Comma-separated lens ids")
-    view.add_argument("--hunks", default=None, help="Comma-separated hunk ids or ranges, e.g. H3-H17")
+    view.add_argument(
+        "--lenses", required=True, help="Comma-separated lens ids or reviewer groups, e.g. R1"
+    )
+    view.add_argument(
+        "--hunks", help="Comma-separated hunk ids or ranges, e.g. H3-H17 (default: open hunks)"
+    )
     view.set_defaults(handler=_view)
 
     cover = sub.add_parser("cover", parents=[common], help="Record that a lens reviewed hunks or files")
@@ -1149,9 +1133,7 @@ def _add_prepare_and_cover_parsers(
     cover.set_defaults(handler=_cover, subparser=cover)
 
 
-def _add_finding_parsers(
-    sub: Any, common: argparse.ArgumentParser, lenses: Sequence[str]
-) -> None:
+def _add_finding_parsers(sub: Any, common: argparse.ArgumentParser, lenses: Sequence[str]) -> None:
     add = sub.add_parser("add", parents=[common], help="Record a finding")
     add.add_argument("--lens", choices=lenses)
     add.add_argument("--file")
@@ -1160,7 +1142,9 @@ def _add_finding_parsers(
     add.add_argument("--title")
     add.add_argument("--scenario", help="Trigger -> wrong outcome")
     add.add_argument("--suggestion", default=None)
-    add.add_argument("--signal", default=None, help="Quality signal id resolved by this finding (e.g. S1)")
+    add.add_argument(
+        "--signal", default=None, help="Quality signal id resolved by this finding (e.g. S1)"
+    )
     add.add_argument(
         "--from-json",
         metavar="PATH",
@@ -1180,12 +1164,18 @@ def _add_finding_parsers(
     move.add_argument("--file", help="New file (default: keep the finding's file)")
     move.set_defaults(handler=_move)
 
-    fact = sub.add_parser("fact", parents=[common], help="Record a source-cited fact for other reviewers")
+    fact = sub.add_parser(
+        "fact", parents=[common], help="Record a source-cited fact for other reviewers"
+    )
     fact.add_argument("action", nargs="?", choices=("add",), default="add")
     fact.add_argument("--hunks", required=True, help="Comma-separated hunk ids or ranges, e.g. H3")
-    fact.add_argument("--source", required=True, help="Source file:line in the work tree, e.g. pkg/a.py:42")
+    fact.add_argument(
+        "--source", required=True, help="Source file:line in the work tree, e.g. pkg/a.py:42"
+    )
     fact.add_argument("--text", required=True, help="Verifiable fact (>= 30 chars, no judgement words)")
-    fact.add_argument("--lens", default="contracts", choices=lenses, help="Author lens (default: contracts)")
+    fact.add_argument(
+        "--lens", default="contracts", choices=lenses, help="Author lens (default: contracts)"
+    )
     fact.set_defaults(handler=_fact_add)
 
 
@@ -1198,13 +1188,15 @@ def _add_merge_and_verdict_parsers(sub: Any, common: argparse.ArgumentParser) ->
             "Combine unjudged findings that share a root cause into a single finding "
             "(listing all consequences in its scenario) and dismiss the duplicates. "
             "Merge only when ONE fix removes every consequence. Different fixes are separate "
-            "findings, even on the same line, file, or category (for example, ordering entries "
-            "in AUTHORS and a missing changelog entry are two separate findings, not one "
-            "'housekeeping' finding)."
+            "findings, even on the same line, file, or category (for example, a missing `--json` "
+            "flag in `craftsman status` and a stale README example are two separate findings, not "
+            "one 'housekeeping' finding)."
         ),
     )
     merge.add_argument("target_id", metavar="TARGET_ID", help="Finding id to keep (e.g. F1)")
-    merge.add_argument("duplicate_ids", metavar="DUP_ID", nargs="+", help="Duplicate finding ids to fold into TARGET_ID")
+    merge.add_argument(
+        "duplicate_ids", metavar="DUP_ID", nargs="+", help="Duplicate finding ids to fold into TARGET_ID"
+    )
     merge.add_argument("--title", help="Updated title for the grouped finding")
     merge.add_argument("--scenario", help="Combined root-cause -> consequences scenario")
     merge.add_argument("--suggestion", help="Updated suggestion for the grouped finding")
@@ -1230,9 +1222,13 @@ def _add_resolution_and_status_parsers(sub: Any, common: argparse.ArgumentParser
     resolution.add_argument("--note", required=True)
     resolution.set_defaults(handler=_resolve)
 
-    ack = sub.add_parser("ack", parents=[common], help="Acknowledge a quality signal with a concrete reason")
+    ack = sub.add_parser(
+        "ack", parents=[common], help="Acknowledge a quality signal with a concrete reason"
+    )
     ack.add_argument("signal_id", metavar="ID", help="Quality signal id (e.g. S1)")
-    ack.add_argument("--reason", required=True, help="Why the signal is acceptable (>= 40 chars, concrete)")
+    ack.add_argument(
+        "--reason", required=True, help="Why the signal is acceptable (>= 40 chars, concrete)"
+    )
     ack.set_defaults(handler=_ack)
 
     waiver = sub.add_parser(
@@ -1278,7 +1274,9 @@ def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--cwd", help="Directory inside the repository (default: current)")
     parser = argparse.ArgumentParser(
-        prog=PROG, description="Record and inspect code review evidence in the Craftsman ledger."
+        prog=PROG,
+        description="Record and inspect code review evidence in the Craftsman ledger.",
+        allow_abbrev=False,
     )
     sub = parser.add_subparsers(dest="command", required=True)
     lenses = sorted(LENS_IDS)
@@ -1287,6 +1285,9 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_merge_and_verdict_parsers(sub, common)
     _add_resolution_and_status_parsers(sub, common)
     _add_inspection_parsers(sub, common)
+    # Prefix matching would let `--lens` stand in for `--lenses` and similar near-misses.
+    for command in sub.choices.values():
+        command.allow_abbrev = False
     return parser
 
 
@@ -1294,13 +1295,13 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         result: int = args.handler(args)
-    except (LedgerError, DiffScanError) as exc:
+    except (LedgerError, DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"{PROG}: error: {describe_error(exc)}\n")
         return 1
     return result
 
 
-def describe_error(exc: LedgerError | DiffScanError) -> str:
+def describe_error(exc: LedgerError | DiffScanError | GateStateError) -> str:
     """The error message, naming the command-line flag when a flag's value was rejected."""
     if isinstance(exc, FieldError) and exc.field in FIELD_FLAGS:
         return f"{FIELD_FLAGS[exc.field]} {exc.problem}"

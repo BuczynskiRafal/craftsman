@@ -85,6 +85,8 @@ The message that started you names:
    ```bash
    craftsman review cover --lens failure --hunks H2,H5 --note "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4); HTTP 400 -> retried 3x (F5). H5 checkout: only caller, passes the gateway error up at checkout.py:41"
    ```
+   The `design` lens covers changed files, not hunks: `--files cart.py,api.py`, or
+   `"files": ["cart.py"]` in JSON.
 5. Do not verify or dismiss your own findings, and do not fix anything. Leave the working tree
    exactly as you found it: no `git stash`, `checkout` or `reset` (read old code with
    `git show <base>:<path>`), and no files written inside the repository.
@@ -98,7 +100,7 @@ the `sweep` playbook. Fold unjudged same-root-cause findings before verification
 verdict) and record coverage under the `sweep` lens:
 > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-For example, ordering entries in `AUTHORS` and a missing changelog entry are two separate findings,
+For example, a CLI command missing a documented `--format` option and a stale README example are two separate findings,
 not one "housekeeping" finding.
 
 ## Lens playbooks

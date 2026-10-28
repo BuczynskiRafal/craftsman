@@ -5,29 +5,27 @@ both input dialects (snake_case and camelCase keys) and answers with both output
 JSON object. Platform `claude` reads and answers in the Claude Code format.
 
 Events:
-- `prompt`: a `/craftsman` or `ultracraft` prompt starts a gate session, like `craftsman gate --init`.
-- `stop`: keeps the agent working while the evidence ledger does not pass the gate, at most
-  `max_continuations` times in a row without progress; a new user prompt starts a new streak.
+- `prompt`: a `/craftsman` or `ultracraft` prompt opens a gate, like `craftsman gate --init`.
+- `stop`: keeps the agent working while the evidence ledger does not pass the gate
+  (`craftsman.gate.decide_stop`); a new user prompt starts a new streak of continuations.
 - `subagent-start` / `subagent-stop`: record subagent runs in the ledger (the evidence of reviewer
   isolation), brief Craftsman reviewers and verifiers, and send them back once when they finish
   without recording anything.
-- `pre-tool`: applies the git guard to shell commands.
+- `pre-tool`: applies the git guard to shell commands and the search scope to search tools.
 
-Every event inside an active session records `hooks_seen`, which makes the gate require evidence
-that only hooks can provide (an isolated reviewer) on the `standard` and `deep` tiers.
+The first event of the owning session claims an active gate for the hooks: from then on the gate
+requires an isolated reviewer on the `standard` and `deep` tiers. Events of other sessions leave
+the gate alone.
 
-Hooks fail open: a hook must never break the user's session. Input that is not a JSON object, a
-working directory outside a git repository, or any unexpected exception results in an allow (`{}`
-with exit status 0). An unexpected exception also writes one `craftsman hook error: <type>:
-<message>` line to stderr, and a failing stop hook adds a `systemMessage` so the user can see that
-the gate was not evaluated.
+A hook never crashes the session it serves. When an event cannot be handled, `pre-tool` asks the
+user to confirm the tool call (Copilot denies it), and every other event lets the agent go on with
+a `systemMessage` that says the gate was not checked.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from dataclasses import dataclass, replace
@@ -35,57 +33,51 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, NoReturn, get_args
 
-from craftsman.diffscan import DiffScanError, snapshot, worktree_root
+from craftsman.diffscan import DiffScanError, resolve_base_sha, snapshot, worktree_root
 from craftsman.evidence import archive_ledger, packet_path
 from craftsman.gate import (
-    CLAUDE_COMMAND_ARGS_RE,
-    TIER_RANK,
     GateOwner,
-    _safe_int,
+    GateState,
+    GateTier,
+    Stage,
     archive_ledger_for_new_base,
-    complete_gate_for_report,
-    continuation_reason,
-    default_state,
-    evaluate_task,
-    format_gate_owner,
-    get_head_sha,
-    is_craftsman_trigger_content,
+    decide_stop,
+    is_continuation_prompt,
     load_state,
-    owns_gate,
-    resolve_cli_state_file,
-    resolve_effective_tier,
-    save_state_atomic,
-    write_gate_owner,
+    raised_tier,
+    state_path_for,
+    update_state,
 )
 from craftsman.guard import evaluate_shell_command
 from craftsman.ledger import (
     GROUPED_EVIDENCE_PREFIX,
-    SWEEP_LENS,
-    AgentEvent,
-    AgentEventKind,
-    GateReport,
-    Ledger,
-    LedgerError,
     add_agent_event,
-    format_timestamp,
-    has_unresolved_diff_size,
     ledger_path_for,
     load,
     mutate,
-    parse_timestamp,
     uncovered_by_lens,
 )
 from craftsman.packet import CHEAT_SHEET
+from craftsman.records import (
+    SWEEP_LENS,
+    AgentEvent,
+    AgentEventKind,
+    AgentRole,
+    Ledger,
+    agent_role,
+    format_timestamp,
+    parse_timestamp,
+)
 from craftsman.scope import (
     evaluate_scope,
     is_craftsman_agent,
     is_scope_checked_tool,
     load_scope_policy,
 )
+from craftsman.trigger import detect_trigger, task_from_prompt
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
-Role = Literal["reviewer", "verifier"]
 Output = dict[str, Any]
 
 PLATFORMS: tuple[Platform, ...] = get_args(Platform)
@@ -97,14 +89,11 @@ HOOK_EVENT_NAMES: dict[Event, str] = {
     "subagent-stop": "SubagentStop",
     "pre-tool": "PreToolUse",
 }
-AGENT_ROLES: dict[str, Role] = {"craftsman-reviewer": "reviewer", "craftsman-verifier": "verifier"}
-SHELL_TOOLS = frozenset({"run_in_terminal", "runinterminal", "terminal", "bash", "powershell", "pwsh", "shell"})
-DEFAULT_MAX_CONTINUATIONS = 6
-GATE_HEADER_PREFIX = "[CRAFTSMAN GATE"
-MAX_TASK_CHARS = 300
-TRIGGER_TOKEN_RE = re.compile(
-    r"(?i)(?<![\w/-])(?:/craftsman(?:\s+--(?:quick|soft|standard|deep))?|ultracraft)(?![\w-])"
+SHELL_TOOLS = frozenset(
+    {"run_in_terminal", "runinterminal", "terminal", "bash", "powershell", "pwsh", "shell"}
 )
+# Characters that a shell or PowerShell would interpret inside a double-quoted argument.
+SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
 REVIEWER_STOP_REASON = (
     "Before finishing, record coverage (`craftsman review cover ...`) for every lens you "
     "examined, and a finding (`craftsman review add ...`) for every defect you found."
@@ -116,7 +105,11 @@ COPILOT_PUSH_NOTE = (
 
 
 class UsageError(Exception):
-    """The hook command line is invalid; reported without breaking the session."""
+    """The hook command line is invalid; the event is blocked, since nothing was checked."""
+
+
+class HookInputError(ValueError):
+    """The hook payload carries a field Craftsman cannot read; the event is answered by `failure`."""
 
 
 class _Parser(argparse.ArgumentParser):
@@ -136,12 +129,12 @@ class HookInput:
     tool_name: str
     tool_input: dict[str, Any]
     transcript_path: str
-    session_id: str = ""
+    session_id: str | None = None
 
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> HookInput:
         return cls(
-            cwd=_text(payload, "cwd") or os.getcwd(),
+            cwd=_required_text(payload, "cwd"),
             agent=_agent_name(payload),
             agent_id=_text(payload, "agent_id", "agentId"),
             stop_hook_active=any(
@@ -151,8 +144,15 @@ class HookInput:
             tool_name=_text(payload, "tool_name", "toolName"),
             tool_input=_tool_input(payload),
             transcript_path=_text(payload, "transcript_path", "transcriptPath"),
-            session_id=_text(payload, "session_id", "sessionId", "conversation_id", "conversationId"),
+            session_id=_text(payload, "session_id", "sessionId").strip() or None,
         )
+
+
+def _required_text(payload: dict[str, Any], key: str) -> str:
+    value = _text(payload, key)
+    if not value:
+        raise HookInputError(f"the hook input has no `{key}`")
+    return value
 
 
 def _text(payload: dict[str, Any], *keys: str) -> str:
@@ -170,25 +170,23 @@ def _agent_name(payload: dict[str, Any]) -> str:
         for key in ("agent_type", "agentType", "agentName", "agentDisplayName")
         if isinstance(value := payload.get(key), str) and value.strip()
     ]
-    craftsman = [name for name in names if _role(name) is not None or is_craftsman_agent(name)]
+    craftsman = [name for name in names if is_craftsman_agent(name)]
     return (craftsman or names or [""])[0]
 
 
 def _tool_input(payload: dict[str, Any]) -> dict[str, Any]:
+    """The tool call's arguments; an absent input is empty, an undecodable one an error."""
     raw: Any = next(
         (payload[key] for key in ("tool_input", "toolArgs", "toolInput") if payload.get(key)), {}
     )
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-    return raw if isinstance(raw, dict) else {}
-
-
-def _role(agent: str) -> Role | None:
-    lowered = agent.lower()
-    return next((role for marker, role in AGENT_ROLES.items() if marker in lowered), None)
+        except json.JSONDecodeError as exc:
+            raise HookInputError(f"the tool input is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise HookInputError(f"the tool input is a {type(raw).__name__}, not a JSON object")
+    return raw
 
 
 @dataclass(frozen=True)
@@ -235,9 +233,7 @@ class Reply:
 
     def ask(self, reason: str) -> Output:
         """Ask the user to confirm; Copilot cannot ask reliably, so it denies instead."""
-        if self.platform == "copilot":
-            return self._permission("deny", reason + COPILOT_PUSH_NOTE)
-        return self._permission("ask", reason)
+        return self._permission("deny" if self.platform == "copilot" else "ask", reason)
 
     def _permission(self, decision: str, reason: str) -> Output:
         out: Output = {
@@ -252,231 +248,155 @@ class Reply:
         return out
 
 
-@dataclass
+@dataclass(frozen=True)
 class Session:
-    """The work tree a hook runs in and its gate state file."""
+    """The work tree a hook runs in."""
 
     root: Path
-    state_file: Path
-    state: dict[str, Any] | None
 
     @property
-    def active(self) -> bool:
-        return bool(self.state and self.state.get("active"))
+    def state_path(self) -> Path:
+        return state_path_for(self.root)
 
     @property
     def ledger_path(self) -> Path:
         return ledger_path_for(self.root)
 
-    def save(self) -> None:
-        if self.state is None:
-            return
-        try:
-            save_state_atomic(self.state_file, self.state)
-        except OSError as exc:
-            sys.stderr.write(f"craftsman hook warning: cannot save {self.state_file}: {exc}\n")
-
 
 def open_session(cwd: str) -> Session | None:
     """The session for the work tree containing `cwd`, or None outside a git work tree."""
     try:
-        root = worktree_root(cwd)
+        return Session(worktree_root(cwd))
     except DiffScanError:
         return None
-    state_file = resolve_cli_state_file(None, str(root))
-    return Session(root=root, state_file=state_file, state=load_state(state_file))
 
 
-def _claim_active_session_owner(session: Session, platform: Platform, session_id: str) -> bool:
-    if not session.active or session.state is None:
-        return False
-    caller = GateOwner(platform=platform, session_id=session_id.strip() or None)
-    if not owns_gate(GateOwner.from_state(session.state), caller):
-        return False
-    if write_gate_owner(session.state, caller, preserve_unowned=True):
-        session.save()
-    return True
+def owns_active_gate(state: GateState | None, caller: GateOwner) -> bool:
+    return state is not None and state.active and state.owner.admits(caller)
+
+
+def claim(state: GateState | None, caller: GateOwner) -> GateState | None:
+    """`state` as served by the hooks of `caller`'s session, when that session owns the gate."""
+    if state is None or not owns_active_gate(state, caller):
+        return state
+    return replace(state, owner=state.owner.claimed_by(caller), isolation_evidence="hooks")
 
 
 def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     hook = HookInput.parse(payload)
     reply = Reply(platform, event)
-    if event == "pre-tool":
-        session = open_session(hook.cwd)
-        is_owner = _claim_active_session_owner(session, platform, hook.session_id) if session else False
-        out = on_pre_tool(hook, reply, session, is_owner=is_owner)
-        if session is not None and session.active and is_owner:
-            mark_hooks_seen(session, platform)
-        return out
     session = open_session(hook.cwd)
+    caller = GateOwner(platform, hook.session_id)
+    if event == "pre-tool":
+        return on_pre_tool(hook, reply, session, caller)
     if session is None:
         return reply.allow()
-    if session.active:
-        if not _claim_active_session_owner(session, platform, hook.session_id):
-            if event == "prompt":
-                return on_non_owner_prompt(session, hook, reply)
-            return reply.allow()
-        mark_hooks_seen(session, platform)
+    if not session.state_path.exists() and not (
+        event == "prompt" and detect_trigger(hook.prompt) is not None
+    ):
+        # No gate and none to open: nothing to lock.
+        return serve(event, session, None, hook, reply, caller)[1]
+    return update_state(
+        session.state_path, lambda state: serve(event, session, state, hook, reply, caller)
+    )
+
+
+def serve(
+    event: Event,
+    session: Session,
+    stored: GateState | None,
+    hook: HookInput,
+    reply: Reply,
+    caller: GateOwner,
+) -> tuple[GateState | None, Output]:
+    """Handle one event for the gate `stored`; the gate state afterwards and the hook's answer."""
+    state = claim(stored, caller)
+    if state is not None and state.active and not owns_active_gate(state, caller):
+        return state, on_non_owner_prompt(
+            session, state, hook, reply
+        ) if event == "prompt" else reply.allow()
     if event == "prompt":
-        return on_prompt(session, hook, reply)
+        return on_prompt(session, state, hook, reply, caller)
     if event == "stop":
-        return on_stop(session, hook, reply)
+        return on_stop(session, state, reply)
+    active = state is not None and state.active
     if event == "subagent-start":
-        return on_subagent_start(session, hook, reply)
-    return on_subagent_stop(session, hook, reply)
-
-
-def mark_hooks_seen(session: Session, platform: Platform) -> None:
-    if session.active and session.state is not None:
-        if (
-            session.state.get("hooks_seen") != platform
-            or session.state.get("isolation_evidence") != "hooks"
-        ):
-            session.state["hooks_seen"] = platform
-            session.state["isolation_evidence"] = "hooks"
-            session.save()
+        return state, on_subagent_start(session, active, hook, reply)
+    return state, on_subagent_stop(session, active, hook, reply)
 
 
 # --- prompt ---------------------------------------------------------------------------------
 
 
-def on_non_owner_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
-    triggered, _ = is_craftsman_trigger_content(hook.prompt)
-    if not triggered:
+def on_non_owner_prompt(session: Session, state: GateState, hook: HookInput, reply: Reply) -> Output:
+    if detect_trigger(hook.prompt) is None:
         return reply.allow()
-    owner_desc = format_gate_owner(session.state.get("owner") if session.state else None)
-    since = (session.state or {}).get("started_at") or "unknown time"
     return reply.inject(
-        f"Craftsman gate in {session.root.resolve()} is already active and owned by another session "
-        f"({owner_desc}, since {since}). Your `/craftsman` prompt did not overwrite that gate. "
-        "To run an independent Craftsman session in parallel, create a separate worktree "
-        "(`git worktree add ../<branch-dir> -b <branch>`), or run "
+        f"Craftsman gate in {session.root} is already active and owned by another session "
+        f"({state.owner.describe()}, since {state.started_at}). Your `/craftsman` prompt did not "
+        "overwrite that gate. To run an independent Craftsman session in parallel, create a "
+        "separate worktree (`git worktree add ../<branch-dir> -b <branch>`), or run "
         "`craftsman gate --init --takeover` to take over the gate in this work tree."
     )
 
 
-def _update_active_prompt_state(session: Session, hook: HookInput, triggered: bool, tier: str) -> bool:
-    """Update an active gate on a user prompt; return True when a capped review should restart."""
-    assert session.state is not None
-    state = session.state
-    if not hook.prompt.lstrip().startswith(GATE_HEADER_PREFIX):
-        state["awaiting_user"] = False
-        state["forced_continuations"] = 0
-        state.pop("best_issue_count", None)
-    restart = triggered and state.get("stage") == "needs_human"
-    if triggered and not restart and TIER_RANK.get(tier, 1) > TIER_RANK.get(str(state.get("tier")), 1):
-        state["tier"] = tier
-    session.save()
-    return restart
+def after_user_prompt(state: GateState, prompt: str, tier: GateTier | None) -> GateState:
+    """An active gate after its user wrote `prompt`: a new streak, and the tier can rise."""
+    if not is_continuation_prompt(prompt):
+        state = replace(state, awaiting_user=False, forced_continuations=0, best_issue_count=None)
+    if tier is not None and state.stage is not Stage.NEEDS_HUMAN:
+        state = replace(state, tier=raised_tier(state.tier, tier))
+    return state
 
 
-def on_prompt(session: Session, hook: HookInput, reply: Reply) -> Output:
-    triggered, tier = is_craftsman_trigger_content(hook.prompt)
-    if session.active and session.state is not None:
-        if not _update_active_prompt_state(session, hook, triggered, tier):
-            return reply.allow()
-        archive_ledger(session.ledger_path)  # the capped review needed a human; start over
-    elif not triggered:
-        return reply.allow()
-    root = str(session.root)
-    base = get_head_sha(root)
-    owner = GateOwner(platform=reply.platform, session_id=hook.session_id.strip() or None)
-    state = default_state(
-        mode="ultracraft" if tier == "deep" else "craftsman",
-        tier=tier,
-        cwd=root,
-        base_sha=base,
-        owner=owner,
+def on_prompt(
+    session: Session, state: GateState | None, hook: HookInput, reply: Reply, caller: GateOwner
+) -> tuple[GateState | None, Output]:
+    tier = detect_trigger(hook.prompt)
+    owner = caller
+    if state is not None and state.active:
+        state = after_user_prompt(state, hook.prompt, tier)
+        if tier is None or state.stage is not Stage.NEEDS_HUMAN:
+            return state, reply.allow()
+        archive_ledger(session.ledger_path)  # the review needed a human; a new request starts over
+        owner = state.owner
+    elif tier is None:
+        return state, reply.allow()
+    base_sha = resolve_base_sha(session.root, None)
+    started = GateState.open(
+        owner, base_sha, tier, task_from_prompt(hook.prompt), isolation_evidence="hooks"
     )
-    state["task"] = task_from_prompt(hook.prompt)
-    state["hooks_seen"] = reply.platform
-    state["isolation_evidence"] = "hooks"
-    if base:
-        archive_ledger_for_new_base(root, base)
-    save_state_atomic(session.state_file, state)
-    short_base = base[:7] if base else "none (no commits yet)"
-    sid_flag = f" --session-id {hook.session_id}" if hook.session_id else ""
-    task_arg = state["task"].replace('"', '\\"')
-    init_cmd = f'craftsman gate --init{sid_flag} --tier {state["tier"]} --task "{task_arg}"'
-    return reply.inject(
-        f"Craftsman session started (tier {state['tier']}, base {short_base}). Follow the /craftsman "
-        f"skill (Stage 0 command: `{init_cmd}`); the gate will block finishing until "
-        "`craftsman review check` passes.\n"
-        f"Scope: work only inside {session.root.resolve()}; see Search scope."
+    archive_ledger_for_new_base(session.root, base_sha)
+    return started, reply.inject(
+        f"Craftsman session started (tier {tier}, base {base_sha[:7]}). Follow the /craftsman "
+        f"skill (Stage 0 command: `{init_command(started)}`); the gate will block finishing "
+        "until `craftsman review check` passes.\n"
+        f"Scope: work only inside {session.root}; see Search scope."
     )
 
 
-def task_from_prompt(prompt: str) -> str:
-    """The user's request without the trigger, as a one-line task description."""
-    command_args = CLAUDE_COMMAND_ARGS_RE.search(prompt)
-    text = f"/craftsman {command_args.group(1)}" if command_args else prompt
-    return " ".join(TRIGGER_TOKEN_RE.sub(" ", text).split())[:MAX_TASK_CHARS]
+def init_command(state: GateState) -> str:
+    """The Stage 0 command for `state`, safe to paste into a POSIX shell or PowerShell."""
+    session = f" --session-id {_shell_safe(state.owner.session_id)}" if state.owner.session_id else ""
+    return f'craftsman gate --init{session} --tier {state.tier} --task "{_shell_safe(state.task)}"'
+
+
+def _shell_safe(text: str) -> str:
+    return SHELL_ACTIVE_CHARS_RE.sub("", text)
 
 
 # --- stop -----------------------------------------------------------------------------------
 
 
-def _handle_stop_completion(
-    session: Session, state: dict[str, Any], evaluation: Any, report: GateReport | None, reply: Reply
-) -> Output | None:
-    if evaluation is not None and has_unresolved_diff_size(evaluation.ledger, evaluation.snap):
-        state["stage"] = "needs_human"
-        session.save()
-        return notice(
-            reply,
-            "Craftsman gate: the change exceeds the diff-size budget. The decision belongs to "
-            "the user; `craftsman review report` lists the top files by growth and a split suggestion.",
-        )
-    if report is not None and any(issue.code == "round-cap" for issue in report.issues):
-        state["stage"] = "needs_human"
-        session.save()
-        return notice(
-            reply,
-            "Craftsman gate: the review reached its round cap. The remaining issues need your "
-            "decision; `craftsman review report` lists them. Start `/craftsman` again to restart.",
-        )
-    if report is not None and report.passed:
-        eff_tier = resolve_effective_tier(state, str(session.root))
-        complete_gate_for_report(state, _safe_int(state.get("started_at_step"), 0), eff_tier, report)
-        session.save()
-        return reply.allow()
-    return None
-
-
-def on_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
-    state = session.state
-    if state is None or not session.active or state.get("awaiting_user"):
-        return reply.allow()
-    try:
-        evaluation = evaluate_task(state, str(session.root))
-        report, error = evaluation.report, None
-    except (DiffScanError, LedgerError) as exc:
-        evaluation, report, error = None, None, str(exc)
-
-    completed_out = _handle_stop_completion(session, state, evaluation, report, reply)
-    if completed_out is not None:
-        return completed_out
-
-    issue_count = len(report.issues) if report is not None else 1
-    forced = _safe_int(state.get("forced_continuations"), 0)
-    best = state.get("best_issue_count")
-    if isinstance(best, int) and issue_count < best:
-        forced = 0
-    state["best_issue_count"] = min(best, issue_count) if isinstance(best, int) else issue_count
-    max_continuations = max(1, _safe_int(state.get("max_continuations"), DEFAULT_MAX_CONTINUATIONS))
-    if forced >= max_continuations:
-        state["active"] = False
-        state["stage"] = "aborted_max_continuations"
-        session.save()
-        return notice(
-            reply,
-            f"Craftsman gate not satisfied: the agent stopped after {forced} forced continuations "
-            "without passing `craftsman review check`. Run it to see what is still missing.",
-        )
-    state["forced_continuations"] = forced + 1
-    session.save()
-    header = f"[CRAFTSMAN GATE {forced + 1}/{max_continuations}]"
-    return reply.block(continuation_reason(header, report, error, missing_subagent=False))
+def on_stop(session: Session, state: GateState | None, reply: Reply) -> tuple[GateState | None, Output]:
+    if state is None or not state.active:
+        return state, reply.allow()
+    decision = decide_stop(state, session.root)
+    if decision.block_reason is not None:
+        return decision.state, reply.block(decision.block_reason)
+    if decision.notice is not None:
+        return decision.state, notice(reply, decision.notice)
+    return decision.state, reply.allow()
 
 
 def notice(reply: Reply, message: str) -> Output:
@@ -500,8 +420,11 @@ def record_agent_event(session: Session, hook: HookInput, kind: AgentEventKind, 
     return mutate(session.ledger_path, lambda ledger: (add_agent_event(ledger, event), ledger))
 
 
-def _has_current_round(session: Session, ledger: Ledger) -> bool:
-    """True when `ledger` has a round whose diff fingerprint matches the current work tree."""
+def _has_current_round(session: Session) -> bool:
+    """True when the ledger's latest round reviews the diff the work tree has now."""
+    if not session.ledger_path.is_file():
+        return False
+    ledger = load(session.ledger_path)
     if not ledger.rounds:
         return False
     latest = ledger.rounds[-1]
@@ -511,49 +434,27 @@ def _has_current_round(session: Session, ledger: Ledger) -> bool:
         return False
 
 
-def on_subagent_start(session: Session, hook: HookInput, reply: Reply) -> Output:
-    role = _role(hook.agent)
-    if not session.active:
-        if role is None or not session.ledger_path.is_file():
-            return reply.allow()
-        if not _has_current_round(session, load(session.ledger_path)):
-            return reply.allow()
+def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Reply) -> Output:
+    """Record the start; brief a Craftsman reviewer or verifier about the current round.
+
+    Outside an active gate, only Craftsman agents reviewing the current round are tracked.
+    """
+    role = agent_role(hook.agent)
+    if not active and (role is None or not _has_current_round(session)):
+        return reply.allow()
     ledger = record_agent_event(session, hook, "start", reply.platform)
     if role is None or not ledger.rounds:
         return reply.allow()
-    return reply.inject(
-        briefing(
-            role,
-            ledger,
-            session.ledger_path,
-            review_only=not session.active,
-            repo_root=session.root,
-        )
-    )
+    return reply.inject(briefing(role, ledger, session, review_only=not active))
 
 
-def _infer_repo_root_from_ledger_path(ledger_path: Path) -> Path:
-    resolved = ledger_path.resolve()
-    if resolved.parent.name == "craftsman" and resolved.parent.parent.name in (".git", ".craftsman"):
-        return resolved.parent.parent.parent
-    return resolved.parent
-
-
-def briefing(
-    role: Role,
-    ledger: Ledger,
-    ledger_path: Path,
-    *,
-    review_only: bool = False,
-    repo_root: Path | None = None,
-) -> str:
+def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: bool) -> str:
     """What a Craftsman reviewer or verifier needs to know about the current round."""
     latest = ledger.rounds[-1]
-    effective_root = (repo_root.resolve() if repo_root is not None else _infer_repo_root_from_ledger_path(ledger_path))
     lines = [
         f"Craftsman review round {latest.number}. "
-        f"Packet: {latest.packet_path or packet_path(ledger_path, latest.number)}",
-        f"Scope: work only inside {effective_root}; see Search scope.",
+        f"Packet: {latest.packet_path or packet_path(session.ledger_path, latest.number)}",
+        f"Scope: work only inside {session.root}; see Search scope.",
     ]
     if role == "reviewer":
         missing = {lens: ids for lens, ids in uncovered_by_lens(ledger, latest).items() if ids}
@@ -587,17 +488,15 @@ def briefing(
     return "\n".join(lines)
 
 
-def on_subagent_stop(session: Session, hook: HookInput, reply: Reply) -> Output:
-    if not session.active:
-        if not session.ledger_path.is_file():
-            return reply.allow()
-        hook = _with_started_agent_name(session, hook)
-        if _role(hook.agent) is None or not _has_current_round(session, load(session.ledger_path)):
-            return reply.allow()
-    else:
-        hook = _with_started_agent_name(session, hook)
+def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Reply) -> Output:
+    """Record the stop; send a Craftsman agent back once when it finishes without recording."""
+    if not active and not session.ledger_path.is_file():
+        return reply.allow()
+    hook = _with_started_agent_name(session, hook)
+    if not active and (agent_role(hook.agent) is None or not _has_current_round(session)):
+        return reply.allow()
     before = record_agent_event(session, hook, "stop", reply.platform)
-    role = _role(hook.agent)
+    role = agent_role(hook.agent)
     if role is None or hook.stop_hook_active or not before.rounds:
         return reply.allow()
     since = _run_started_at(before, hook)
@@ -675,31 +574,19 @@ def _check_shell_git_guard(hook: HookInput, reply: Reply) -> Output | None:
     if decision == "deny":
         return reply.deny(reason or "Blocked by the Craftsman git guard.")
     if decision == "force_ask":
-        return reply.ask(reason or "The Craftsman git guard needs your confirmation.")
+        reason = reason or "The Craftsman git guard needs your confirmation."
+        return reply.ask(reason + COPILOT_PUSH_NOTE if reply.platform == "copilot" else reason)
     return None
 
 
-def on_pre_tool(
-    hook: HookInput,
-    reply: Reply,
-    session: Session | None = None,
-    *,
-    is_owner: bool | None = None,
-) -> Output:
-    """Apply the git guard to shell commands, then repository search-scope rules when Craftsman is active."""
+def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
+    """Apply the git guard to shell commands, then the search scope while Craftsman is at work."""
     guard_reply = _check_shell_git_guard(hook, reply)
     if guard_reply is not None:
         return guard_reply
-    if not is_scope_checked_tool(hook.tool_name):
+    if session is None or not is_scope_checked_tool(hook.tool_name):
         return reply.allow()
-    if session is None:
-        session = open_session(hook.cwd)
-    if session is None:
-        return reply.allow()
-    if is_owner is None:
-        caller = GateOwner(platform=reply.platform, session_id=hook.session_id.strip() or None)
-        is_owner = owns_gate(GateOwner.from_state(session.state), caller) if session.active else False
-    if not (session.active and is_owner) and not is_craftsman_agent(hook.agent):
+    if not _serves_owned_gate(session, caller) and not is_craftsman_agent(hook.agent):
         return reply.allow()
     policy = load_scope_policy(Path(hook.cwd), session.root)
     if policy.mode == "off":
@@ -708,8 +595,22 @@ def on_pre_tool(
         hook.tool_name, hook.tool_input, Path(hook.cwd), session.root, policy
     )
     if scope_decision.decision == "deny":
-        return reply.warn(scope_decision.reason) if policy.mode == "warn" else reply.deny(scope_decision.reason)
+        return (
+            reply.warn(scope_decision.reason)
+            if policy.mode == "warn"
+            else reply.deny(scope_decision.reason)
+        )
     return reply.allow()
+
+
+def _serves_owned_gate(session: Session, caller: GateOwner) -> bool:
+    """Whether `caller`'s session owns the active gate; claims it for the hooks on first contact."""
+    state = load_state(session.state_path)
+    if not owns_active_gate(state, caller):
+        return False
+    if claim(state, caller) != state:
+        update_state(session.state_path, lambda current: (claim(current, caller), None))
+    return True
 
 
 # --- entry point ----------------------------------------------------------------------------
@@ -745,32 +646,38 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     except UsageError as exc:
-        sys.stderr.write(f"craftsman hook error: UsageError: {exc}\n")
-        _emit({})
-        return 0
-    event: Event = args.event
-    platform: Platform = args.platform
+        # Exit code 2 makes the platform block the event: an unchecked tool call must not pass.
+        sys.stderr.write(f"craftsman hook error: {exc}\n")
+        return 2
+    reply = Reply(args.platform, args.event)
     try:
-        raw = _read_stdin()
-        payload = json.loads(raw) if raw.strip() else {}
+        payload = json.loads(_read_stdin().strip() or "{}")
     except (OSError, ValueError) as exc:
-        sys.stderr.write(f"craftsman hook: ignoring unreadable hook input: {exc}\n")
-        payload = None
+        _emit(failure(reply, f"unreadable hook input: {exc}"))
+        return 0
     if not isinstance(payload, dict):
-        _emit({})
+        _emit(failure(reply, "the hook input is not a JSON object"))
         return 0
     try:
-        out = handle(event, platform, payload)
-    except Exception as exc:  # fail open by design, see the module docstring
-        sys.stderr.write(f"craftsman hook error: {type(exc).__name__}: {exc}\n")
-        out = {}
-        if event == "stop":
-            out = Reply(platform, event).allow(
-                f"Craftsman gate hook failed ({type(exc).__name__}: {exc}); the quality gate was "
-                "not checked. Run `craftsman review check` yourself."
-            )
+        out = handle(args.event, args.platform, payload)
+    except Exception as exc:  # the platform treats a crashed hook as "allow"; `failure` decides
+        out = failure(reply, f"{type(exc).__name__}: {exc}")
     _emit(out)
     return 0
+
+
+def failure(reply: Reply, problem: str) -> Output:
+    """The answer when an event cannot be handled: confirm a tool call, else go on with a warning."""
+    sys.stderr.write(f"craftsman hook error: {problem}\n")
+    if reply.event == "pre-tool":
+        return reply.ask(
+            f"The Craftsman guard could not check this tool call ({problem}); confirm it only if "
+            "it is safe."
+        )
+    return reply.allow(
+        f"Craftsman {reply.event} hook failed ({problem}); the quality gate was not checked. "
+        "Run `craftsman review check` yourself."
+    )
 
 
 if __name__ == "__main__":

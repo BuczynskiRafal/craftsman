@@ -142,16 +142,6 @@ REVIEWER_GROUP_TITLES: dict[str, str] = {
 _LENSES_BY_ID = {lens.id: lens for lens in LENSES}
 
 
-def assign_reviewer_groups(selected_lenses: Sequence[str]) -> dict[str, tuple[str, ...]]:
-    """Filter `REVIEWER_GROUPS` to `selected_lenses`, skipping any group with no active lenses."""
-    selected = frozenset(selected_lenses)
-    return {
-        group_id: active
-        for group_id, lenses in REVIEWER_GROUPS.items()
-        if (active := tuple(lens for lens in lenses if lens in selected))
-    }
-
-
 def render_reviewer_groups_markdown() -> str:
     """Render the fixed reviewer groups from `REVIEWER_GROUPS` as a Markdown bullet list."""
     lines = [

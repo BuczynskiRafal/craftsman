@@ -137,8 +137,8 @@ For each selected lens, for each non-carried hunk:
    without a verdict):
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, ordering entries in `AUTHORS` and a missing changelog entry are two separate
-   findings, not one "housekeeping" finding;
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
+   separate findings, not one "housekeeping" finding;
 3. write the coverage note while you probe, then record it for groups of **1–4 hunks per entry**.
    For every hunk id give the inputs you tried and what the code does with them, naming the guard
    or line that makes it safe — "ok" or "checked" is not a note. When recording more than one
@@ -159,8 +159,11 @@ For each selected lens, for each non-carried hunk:
    craftsman review cover --lens contracts --hunks H1,H3 --note "H1 paginate: page=0 -> start=-20 (F2); size=None -> default 20 at catalog.py:14. H3 search_page: q='' rejected by validate_query at api.py:40 before the call"
    ```
 
-`cover` and `add` refuse to record against a round whose code has changed since it was prepared:
-run `craftsman review prepare` again first (unchanged hunks carry their coverage over).
+The `design` lens covers changed files, not hunks: pass `--files cart.py,api.py` (in JSON,
+`"files": ["cart.py"]`).
+
+`cover`, `add` and `view` refuse a round whose code has changed since it was prepared: run
+`craftsman review prepare` again first (unchanged hunks carry their coverage over).
 
 Record candidates generously in this step — a candidate that turns out wrong is dismissed in
 Step 3 at low cost; a real defect you filtered out early is lost for good.
@@ -219,8 +222,8 @@ only on `quick` or when the platform has no subagents.
    ```
    > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-   For example, ordering entries in `AUTHORS` and a missing changelog entry are two separate
-   findings, not one "housekeeping" finding. A finding that duplicates an already-judged one (for
+   For example, a CLI command missing a documented `--format` option and a stale README example are two
+   separate findings, not one "housekeeping" finding. A finding that duplicates an already-judged one (for
    example in a later round, where `merge` no longer applies) is `dismissed` with a reference to
    the other finding's `file:line`.
 2. **Look for a guard or unreachability.** Check callers, types, validation on load, or tests that
@@ -295,7 +298,7 @@ craftsman review report --review-only
 and present the report output. `--review-only` checks that the round is current, every selected
 lens (including `sweep`) covered all non-carried hunks, and every finding has a verdict, without
 requiring `proven`/`probable` findings to be resolved or a passing test run (reporting
-`**Craftsman review: COMPLETE (review-only)**` / `Review: complete (review-only)`, or
+`**Craftsman review: COMPLETE (review-only)**` / `Review: COMPLETE (review-only)`, or
 `**Craftsman review: INCOMPLETE (N open items)**` while review steps remain open). Running
 `craftsman review check` or `craftsman review report` *without* `--review-only` in review-only mode
 is expected to show `BLOCKED` (because findings are left open for the author and the full test
@@ -326,7 +329,8 @@ ordered by severity; dismissed ones are listed briefly so the reader sees what w
 
 - **Subagents.** GitHub Copilot (VS Code): use the `craftsman-reviewer` / `craftsman-verifier`
   custom agents as subagents. Claude Code: the `Task`/`Agent` tool with those agent names.
-  Antigravity: `invoke_subagent`. Copilot CLI: `/agent` or the task tool. Codex and others:
+  Antigravity: `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
+  `craftsman-verifier`. Copilot CLI: `/agent` or the task tool. Codex and others:
   run the lenses yourself, one at a time.
 - **Shell.** All `craftsman` commands are identical in bash, zsh, PowerShell and cmd. Keep each
   on one line (no `\` continuations). When a note, scenario or evidence quotes code containing `$`
