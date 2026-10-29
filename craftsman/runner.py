@@ -23,13 +23,14 @@ from enum import Enum
 from pathlib import Path
 from typing import IO
 
-from craftsman.diffscan import DiffScanError, DiffSnapshot, snapshot
+from craftsman.diffscan import DiffScanError, DiffSnapshot
 from craftsman.gate import GateStateError
 from craftsman.ledger import add_run, load, mutate
 from craftsman.records import (
     OUTPUT_TAIL_CHARS,
     RUN_KINDS,
     LedgerError,
+    Run,
     RunKind,
     format_timestamp,
 )
@@ -246,9 +247,8 @@ def main(argv: list[str] | None = None) -> int:
 def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: float) -> int:
     """Run `command` in `cwd` and record the run; the exit status to report to the caller."""
     ws = open_workspace(str(cwd))
-    base = ws.base_sha(load(ws.ledger_path))
-    before = snapshot(ws.root, base)
-    started_at = format_timestamp(datetime.now(timezone.utc))
+    ledger = load(ws.ledger_path)
+    before, started_at = ws.snapshot(ledger), format_timestamp(datetime.now(timezone.utc))
     try:
         outcome = execute(command, cwd, timeout_s)
     except CommandNotStarted as exc:
@@ -257,15 +257,34 @@ def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: f
     if outcome.status is RunStatus.TIMED_OUT:
         sys.stderr.write(f"{PROG}: timed out after {timeout_s:g}s; the command was killed\n")
     try:
-        after = snapshot(ws.root, base)
+        after = ws.snapshot(ledger)
     except KeyboardInterrupt:
         sys.stderr.write(f"{PROG}: interrupted; the run was not recorded\n")
         return EXIT_INTERRUPTED
-    modified = after.fingerprint != before.fingerprint
-    if modified:
+    if modified := (after.fingerprint != before.fingerprint):
         _warn_modified(before, after)
-    run = mutate(
-        ws.ledger_path,
+    run = _persist_run(ws.ledger_path, command, cwd, kind, outcome, before, after, started_at, modified)
+    sys.stderr.write(f"{run.id} recorded ({run.kind}, exit {run.exit_code}, {run.duration_s:.1f}s)\n")
+    if is_trivial_run(run.argv):
+        sys.stderr.write(
+            f"{PROG}: warning: `{run.command}` is trivial and does not count as verification\n"
+        )
+    return EXIT_INTERRUPTED if outcome.status is RunStatus.INTERRUPTED else outcome.exit_code
+
+
+def _persist_run(
+    ledger_path: Path,
+    command: Sequence[str],
+    cwd: Path,
+    kind: RunKind,
+    outcome: Outcome,
+    before: DiffSnapshot,
+    after: DiffSnapshot,
+    started_at: str,
+    modified: bool,
+) -> Run:
+    return mutate(
+        ledger_path,
         lambda current: add_run(
             current,
             kind=kind,
@@ -279,12 +298,6 @@ def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: f
             fingerprint_after=after.fingerprint if modified else None,
         ),
     )
-    sys.stderr.write(f"{run.id} recorded ({run.kind}, exit {run.exit_code}, {run.duration_s:.1f}s)\n")
-    if is_trivial_run(run.argv):
-        sys.stderr.write(
-            f"{PROG}: warning: `{run.command}` is trivial and does not count as verification\n"
-        )
-    return EXIT_INTERRUPTED if outcome.status is RunStatus.INTERRUPTED else outcome.exit_code
 
 
 def _warn_modified(before: DiffSnapshot, after: DiffSnapshot) -> None:

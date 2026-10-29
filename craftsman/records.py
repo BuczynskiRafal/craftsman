@@ -37,7 +37,7 @@ ORCHESTRATOR_AGENT = "craftsman"
 AGENT_ROLES: dict[str, AgentRole] = {REVIEWER_AGENT: "reviewer", VERIFIER_AGENT: "verifier"}
 CRAFTSMAN_AGENTS = frozenset({ORCHESTRATOR_AGENT, *AGENT_ROLES})
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LEDGER_FILENAME = "ledger.json"
 OUTPUT_TAIL_CHARS = 4000
 MAX_HUNKS_PER_COVERAGE = 4
@@ -296,6 +296,16 @@ class Fields:
             _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
         return tuple(values)
 
+    def optional_texts(self, key: str) -> tuple[str, ...] | None:
+        if key in self._raw and self._raw[key] is None:
+            self._seen.add(key)
+            return None
+        values: list[Any] = self._value(key, (list, type(None)), "a list of strings or null")
+        assert isinstance(values, list)
+        for index, value in enumerate(values):
+            _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
+        return tuple(values)
+
     def records(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
         values: list[Any] = self._value(key, list, "a list")
         parsed: list[T] = []
@@ -479,6 +489,28 @@ class RoundFile:
     carried: bool
 
 
+def _is_valid_scope_path(path: str) -> bool:
+    if not path or path.startswith("/") or path.endswith("/") or "\\" in path or "\0" in path:
+        return False
+    parts = path.split("/")
+    has_drive = len(parts[0]) >= 2 and parts[0][1] == ":" and parts[0][0].isalpha()
+    return not has_drive and not any(part in ("", ".", "..") for part in parts)
+
+
+def _require_scope(scope: tuple[str, ...] | None) -> None:
+    if scope is None:
+        return
+    _require(bool(scope), "scope", "must list at least one file path (or be null)")
+    for index, path in enumerate(scope):
+        _require(
+            _is_valid_scope_path(path),
+            f"scope[{index}]",
+            f"must be a normalized relative POSIX file path (got {path!r})",
+        )
+    _require(len(set(scope)) == len(scope), "scope", "must not repeat a path")
+    _require(tuple(sorted(scope)) == scope, "scope", "must be sorted")
+
+
 @dataclass(frozen=True)
 class Round:
     number: int
@@ -490,6 +522,7 @@ class Round:
     lenses: tuple[str, ...]
     packet_path: str
     signals: tuple[QualitySignal, ...]
+    scope: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
@@ -505,6 +538,7 @@ class Round:
         _require(len(set(hunk_ids)) == len(hunk_ids), "hunks", "must not repeat a hunk id")
         sig_ids = [sig.id for sig in self.signals]
         _require(len(set(sig_ids)) == len(sig_ids), "signals", "must not repeat a signal id")
+        _require_scope(self.scope)
 
     @property
     def files(self) -> tuple[RoundFile, ...]:
@@ -554,6 +588,7 @@ class Round:
                 lenses=f.texts("lenses"),
                 packet_path=f.text("packet_path"),
                 signals=f.records("signals", QualitySignal.from_json),
+                scope=f.optional_texts("scope"),
             )
         )
 
@@ -923,6 +958,15 @@ class Fact:
         )
 
 
+def scope_contains(superset: tuple[str, ...] | None, subset: tuple[str, ...] | None) -> bool:
+    """True when `superset` covers every path in `subset` (`None` means the full work tree)."""
+    if superset is None:
+        return True
+    if subset is None:
+        return False
+    return set(subset).issubset(superset)
+
+
 @dataclass(frozen=True)
 class Ledger:
     rounds: tuple[Round, ...] = ()
@@ -933,6 +977,11 @@ class Ledger:
     signal_acks: tuple[SignalAck, ...] = ()
     facts: tuple[Fact, ...] = ()
 
+    @property
+    def current_scope(self) -> tuple[str, ...] | None:
+        """The path scope in force for this ledger (`None` means the full work tree)."""
+        return self.rounds[-1].scope if self.rounds else None
+
     def __post_init__(self) -> None:
         for index, round_ in enumerate(self.rounds):
             _require(round_.number == index + 1, f"rounds[{index}].number", f"must be {index + 1}")
@@ -941,6 +990,20 @@ class Ledger:
                 f"rounds[{index}].base_sha",
                 "must match the base of round 1",
             )
+            if index > 0:
+                prev_scope = self.rounds[index - 1].scope
+                if prev_scope is None:
+                    _require(
+                        round_.scope is None,
+                        f"rounds[{index}].scope",
+                        "cannot narrow a full-worktree review scope",
+                    )
+                else:
+                    _require(
+                        scope_contains(round_.scope, prev_scope),
+                        f"rounds[{index}].scope",
+                        "must include every path from the previous round's scope",
+                    )
         _require_unique([run.id for run in self.runs], "runs")
         _require_unique([finding.id for finding in self.findings], "findings")
         _require_unique([fact.id for fact in self.facts], "facts")
@@ -964,6 +1027,8 @@ class Ledger:
         )
         if coverage.lens == DESIGN_LENS:
             known = {file.digest for file in round_.files}
+        elif round_.tier == "quick":
+            known = {hunk.digest for hunk in round_.hunks} | {file.digest for file in round_.files}
         else:
             known = {hunk.digest for hunk in round_.hunks}
         unknown = [digest for digest in coverage.digests if digest not in known]
@@ -1002,6 +1067,11 @@ class Ledger:
         try:
             f = Fields(raw)
             schema = f.integer("schema")
+            if schema < SCHEMA_VERSION:
+                raise FieldError(
+                    "schema",
+                    f"{schema} is from an older craftsman; run `craftsman review reset` to archive it",
+                )
             _require(
                 schema == SCHEMA_VERSION,
                 "schema",

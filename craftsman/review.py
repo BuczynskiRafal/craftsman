@@ -15,11 +15,14 @@ from craftsman.diffscan import (
     IGNORE_FILE,
     DiffScanError,
     DiffSnapshot,
+    Hunk,
     WorktreeIndex,
     detect_signals,
     snapshot,
+    staged_paths,
+    untracked_paths,
 )
-from craftsman.evidence import archive_ledger, effective_tier, packet_path
+from craftsman.evidence import archive_ledger, effective_tier, packet_path, prune_round_files
 from craftsman.gate import (
     GateState,
     GateStateError,
@@ -40,10 +43,12 @@ from craftsman.gatecheck import (
     require_current_round,
 )
 from craftsman.ledger import (
+    FIXED_SCOPE_ERROR,
+    TargetKind,
     ack_signal,
-    add_coverage,
     add_fact,
     add_finding,
+    add_multi_coverage,
     file_sha256,
     load,
     merge_findings,
@@ -57,13 +62,26 @@ from craftsman.ledger import (
     uncovered_by_lens,
     waive_run,
 )
-from craftsman.lenses import LENS_IDS, REVIEWER_GROUPS, TIERS, LensPick, Tier, select_lenses
+from craftsman.lenses import (
+    LENS_IDS,
+    REVIEW_ONLY_QUICK_MAX_LINES,
+    REVIEWER_GROUPS,
+    TIERS,
+    LensPick,
+    Tier,
+    review_only_tier,
+    select_lenses,
+    strictest_tier,
+)
 from craftsman.packet import (
     PacketContext,
     collect_context,
     expand_hunk_spec,
+    parse_shard_spec,
     render_packet,
     render_packet_view,
+    select_shard,
+    suggested_shard_count,
 )
 from craftsman.quality import MAX_PRODUCTION_ADDED_LINES, collect_quality_signals, production_diff_growth
 from craftsman.records import (
@@ -94,7 +112,10 @@ FIELD_FLAGS = {
     "lens": "--lens",
     "lenses": "--lenses",
     "hunks": "--hunks",
+    "shard": "--shard",
     "files": "--files",
+    "paths": "--paths",
+    "add_paths": "--add-paths",
     "source": "--source",
     "text": "--text",
     "path": "--file",
@@ -121,13 +142,47 @@ JSON_FIELD_NAMES = {
 }
 
 
-def resolve_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tier:
-    """`--tier`, else the active task's effective gear, else the latest round's, else standard."""
+def _auto_tier_reason(snap: DiffSnapshot) -> str:
+    if snap.docs_only:
+        return "docs-only change"
+    if snap.skipped:
+        return f"skipped binary or oversized file ({snap.skipped[0]})"
+    changed = snap.added + snap.deleted
+    op = "<=" if changed <= REVIEW_ONLY_QUICK_MAX_LINES else ">"
+    return f"{changed} changed lines {op} {REVIEW_ONLY_QUICK_MAX_LINES}"
+
+
+def resolve_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None, snap: DiffSnapshot) -> Tier:
+    """`--tier`, else the active task's gear, else size-based review-only tier (never lowered)."""
     if explicit is not None:
         return explicit
     if ws.state is not None:
         return current_tier(ws.state, ws.root)
-    return ledger.rounds[-1].tier if ledger.rounds else "standard"
+    auto = review_only_tier(
+        snap.added + snap.deleted, has_skipped=bool(snap.skipped), docs_only=snap.docs_only
+    )
+    return strictest_tier(ledger.rounds[-1].tier, auto) if ledger.rounds else auto
+
+
+def _tier_reason(
+    ws: Workspace, ledger: Ledger, explicit: Tier | None, snap: DiffSnapshot, tier: Tier
+) -> str:
+    if explicit is not None:
+        return "explicit --tier"
+    if ws.state is not None:
+        return "active /craftsman gate"
+    auto = review_only_tier(
+        snap.added + snap.deleted, has_skipped=bool(snap.skipped), docs_only=snap.docs_only
+    )
+    reason = _auto_tier_reason(snap)
+    if not ledger.rounds:
+        return reason
+    prev = ledger.rounds[-1].tier
+    if TIERS.index(prev) > TIERS.index(auto):
+        return f"kept from round {ledger.rounds[-1].number} ({reason})"
+    if TIERS.index(auto) > TIERS.index(prev):
+        return f"raised from {prev} ({reason})"
+    return reason
 
 
 def evaluation_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tier:
@@ -146,14 +201,42 @@ def evaluation_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None) -> Tie
 # --- subcommands ----------------------------------------------------------------------------
 
 
+MAX_IGNORED_PATHS_SHOWN = 5
+
+
+class _UnmatchedPathError(FieldError):
+    """A syntactically valid `--paths` entry matched no changed files in the current diff."""
+
+
 def _prepare(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
-    tier = resolve_tier(ws, ledger, args.tier)
-    snap = snapshot(ws.root, ws.base_sha(ledger, args.base))
+    base_sha = ws.base_sha(ledger, args.base)
+    full_snap = snapshot(ws.root, base_sha)
+    scope, snap, allow_scope_expansion = _prepare_scope_and_snapshot(
+        ws, ledger, args, base_sha, full_snap
+    )
     if snap.is_empty:
+        if scope is not None and not full_snap.is_empty:
+            ignored = [path for path in full_snap.files if path not in set(scope)]
+            print(
+                f"Nothing to review within the frozen scope (matches base {snap.base_sha[:12]}); "
+                f"changed files outside scope: {_format_path_sample(ignored)}."
+            )
+            print(
+                "Run `craftsman review reset` to archive this review and start a new one "
+                "(or pass `craftsman review prepare --add-paths <paths>` to add files touched by fixes)."
+            )
+            return 0
         print(f"Nothing to review: the work tree matches base {snap.base_sha[:12]}.")
         return 0
+    tier = resolve_tier(ws, ledger, args.tier, snap)
+    if not ledger.rounds or (
+        ledger.rounds[-1].fingerprint,
+        ledger.rounds[-1].tier,
+        ledger.rounds[-1].scope,
+    ) != (snap.fingerprint, tier, scope):
+        print(f"Tier {tier}: {_tier_reason(ws, ledger, args.tier, snap, tier)}")
     lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap)]
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
@@ -162,7 +245,15 @@ def _prepare(args: argparse.Namespace) -> int:
     def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
         updated, round_ = open_round(
-            current, snap, tier, lens_ids, str(packet), symbols, signals=signals
+            current,
+            snap,
+            tier,
+            lens_ids,
+            str(packet),
+            symbols,
+            signals=signals,
+            scope=scope,
+            allow_scope_expansion=allow_scope_expansion,
         )
         return updated, (updated, round_, updated is not current)
 
@@ -173,7 +264,215 @@ def _prepare(args: argparse.Namespace) -> int:
         _write_text(packet, render_packet(ctx))
     _mark_needs_human_if_oversized(ws, ledger)
     _print_prepare_summary(round_, packet, created)
+    _print_scope_summary(ws, ledger, round_, snap, full_snap)
+    if created:
+        prune_round_files(ws.ledger_path.parent, round_.number)
     return 0
+
+
+def _used_scope_flags(args: argparse.Namespace) -> list[str]:
+    return [
+        flag
+        for flag, active in (
+            ("--paths", args.paths is not None),
+            ("--add-paths", args.add_paths is not None),
+            ("--staged", bool(args.staged)),
+            ("--tracked", bool(args.tracked)),
+        )
+        if active
+    ]
+
+
+def _scope_from_hunks(hunks: Sequence[Hunk]) -> tuple[str, ...]:
+    paths: set[str] = set()
+    for hunk in hunks:
+        paths.add(hunk.path)
+        if hunk.old_path is not None:
+            paths.add(hunk.old_path)
+    return tuple(sorted(paths))
+
+
+def _prepare_scope_and_snapshot(
+    ws: Workspace,
+    ledger: Ledger,
+    args: argparse.Namespace,
+    base_sha: str,
+    full_snap: DiffSnapshot,
+) -> tuple[tuple[str, ...] | None, DiffSnapshot, bool]:
+    used = _used_scope_flags(args)
+    if ws.state is not None:
+        if used:
+            raise LedgerError(
+                f"{used[0]} cannot be used during an active /craftsman gate session; "
+                "the gate always reviews the full work tree diff"
+            )
+        return None, full_snap, True
+    if len(used) > 1:
+        raise LedgerError(f"{', '.join(used)} are mutually exclusive; pass at most one scope flag")
+    if ledger.rounds:
+        current_scope = ledger.current_scope
+        if args.add_paths is not None:
+            if current_scope is None:
+                raise LedgerError(
+                    "--add-paths cannot be used when the review already covers the full work tree"
+                )
+            queries = _parse_path_queries(ws.root, _cwd(args), args.add_paths, field="add_paths")
+            added = _match_path_queries(queries, full_snap, base_sha, field="add_paths")
+            expanded = tuple(sorted(set(current_scope) | set(added)))
+            return expanded, snapshot(ws.root, base_sha, expanded), True
+        if used:
+            _require_matching_fixed_scope(ws, args, base_sha, full_snap, current_scope)
+        snap = full_snap if current_scope is None else snapshot(ws.root, base_sha, current_scope)
+        return current_scope, snap, False
+    if args.add_paths is not None:
+        raise LedgerError(
+            "--add-paths extends an existing review scope; in round 1 use --paths (or omit scope flags)"
+        )
+    if not used:
+        if full_snap.is_empty:
+            return None, full_snap, False
+        scope = _scope_from_hunks(full_snap.hunks)
+        return scope, snapshot(ws.root, base_sha, scope), False
+    scope = _resolve_flag_scope(ws, args, base_sha, full_snap)
+    return (scope or None), snapshot(ws.root, base_sha, scope), False
+
+
+def _require_matching_fixed_scope(
+    ws: Workspace,
+    args: argparse.Namespace,
+    base_sha: str,
+    full_snap: DiffSnapshot,
+    fixed_scope: tuple[str, ...] | None,
+) -> None:
+    try:
+        requested = _resolve_flag_scope(ws, args, base_sha, full_snap)
+    except _UnmatchedPathError:
+        raise LedgerError(FIXED_SCOPE_ERROR) from None
+    except FieldError:
+        raise
+    except LedgerError:
+        raise LedgerError(FIXED_SCOPE_ERROR) from None
+    if requested != fixed_scope:
+        raise LedgerError(FIXED_SCOPE_ERROR)
+
+
+def _resolve_flag_scope(
+    ws: Workspace, args: argparse.Namespace, base_sha: str, full_snap: DiffSnapshot
+) -> tuple[str, ...]:
+    if args.paths is not None:
+        queries = _parse_path_queries(ws.root, _cwd(args), args.paths)
+        return _match_path_queries(queries, full_snap, base_sha)
+    if args.staged:
+        staged = staged_paths(ws.root, base_sha)
+        if not staged:
+            raise LedgerError(
+                f"nothing staged against base {base_sha[:12]}; "
+                "stage files with `git add` or omit --staged"
+            )
+        return staged
+    untracked = set(untracked_paths(ws.root))
+    tracked_hunks = [
+        hunk for hunk in full_snap.hunks if not (hunk.status == "added" and hunk.path in untracked)
+    ]
+    return _scope_from_hunks(tracked_hunks)
+
+
+def _parse_path_queries(
+    root: Path, cwd: Path, raw_paths: str, *, field: str = "paths"
+) -> list[tuple[str, tuple[str, ...], bool]]:
+    tokens = [item.strip() for item in raw_paths.split(",") if item.strip()]
+    if not tokens:
+        raise FieldError(field, "must name at least one file or directory")
+    resolved_root = root.resolve()
+    resolved_cwd = cwd.resolve()
+    queries: list[tuple[str, tuple[str, ...], bool]] = []
+    for raw in tokens:
+        dir_only = raw.endswith(("/", "\\"))
+        bases = [Path(raw)] if Path(raw).is_absolute() else [resolved_cwd / raw, resolved_root / raw]
+        relatives: list[str] = []
+        for candidate in bases:
+            try:
+                rel = Path(os.path.normpath(candidate)).relative_to(resolved_root).as_posix()
+            except ValueError:
+                continue
+            if rel not in relatives:
+                relatives.append(rel)
+        if not relatives:
+            raise FieldError(field, f"{raw!r} is outside the repository {resolved_root}")
+        queries.append((raw, tuple(relatives), dir_only))
+    return queries
+
+
+def _hunk_matches_query(hunk: Hunk, relative: str, *, dir_only: bool) -> bool:
+    if relative == ".":
+        return True
+    prefix = f"{relative}/"
+    for candidate in (hunk.path, hunk.old_path):
+        if candidate is None:
+            continue
+        if candidate.startswith(prefix) or (not dir_only and candidate == relative):
+            return True
+    return False
+
+
+def _match_path_queries(
+    queries: Sequence[tuple[str, tuple[str, ...], bool]],
+    full_snap: DiffSnapshot,
+    base_sha: str,
+    *,
+    field: str = "paths",
+) -> tuple[str, ...]:
+    matched_hunks: list[Hunk] = []
+    for raw, relatives, dir_only in queries:
+        hits: list[Hunk] = []
+        for relative in relatives:
+            hits = [
+                hunk
+                for hunk in full_snap.hunks
+                if _hunk_matches_query(hunk, relative, dir_only=dir_only)
+            ]
+            if hits:
+                break
+        if not hits:
+            changed = ", ".join(full_snap.files[:MAX_IGNORED_PATHS_SHOWN]) or "none"
+            raise _UnmatchedPathError(
+                field,
+                f"{raw!r} matched no changed files in the diff since {base_sha[:12]} "
+                f"(changed files: {changed})",
+            )
+        matched_hunks.extend(hits)
+    return _scope_from_hunks(matched_hunks)
+
+
+def _format_path_sample(paths: Sequence[str]) -> str:
+    shown = ", ".join(paths[:MAX_IGNORED_PATHS_SHOWN])
+    extra = len(paths) - MAX_IGNORED_PATHS_SHOWN
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _print_scope_summary(
+    ws: Workspace, ledger: Ledger, round_: Round, snap: DiffSnapshot, full_snap: DiffSnapshot
+) -> None:
+    if round_.scope is None:
+        return
+    rename_sources = {hunk.old_path for hunk in snap.hunks if hunk.old_path is not None}
+    scoped_count = len(set(round_.scope) - rename_sources)
+    print(f"Scope: {scoped_count} file(s), frozen for this review.")
+    in_scope = set(round_.scope)
+    ignored = [path for path in full_snap.files if path not in in_scope]
+    if ignored:
+        print(f"Ignored (outside the review scope): {_format_path_sample(ignored)}")
+        if ws.state is None and evaluate(
+            ledger,
+            snap,
+            GatePolicy(tier=round_.tier, isolation_evidence=ws.isolation_evidence),
+            review_only=True,
+        ).passed:
+            print(
+                f"Hint: round {round_.number} is already complete; run `craftsman review reset` "
+                "to archive it before starting a new review (or `craftsman review prepare "
+                "--add-paths <paths>` to include files added by a fix)."
+            )
 
 
 def _lens_picks(tier: Tier, snap: DiffSnapshot) -> tuple[LensPick, ...]:
@@ -218,6 +517,8 @@ def _needing_human(state: GateState | None) -> GateState | None:
 def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
     if not created:
         print(f"Round {round_.number} unchanged (same diff and tier). Packet: {packet}")
+        if round_.tier in ("standard", "deep"):
+            print(_suggested_shards_line(round_, packet))
         return
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
     print(
@@ -226,11 +527,23 @@ def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
     )
     print(f"Lenses: {', '.join(round_.lenses)}")
     print(f"Packet: {packet}")
+    if round_.tier in ("standard", "deep"):
+        print(_suggested_shards_line(round_, packet))
     sweep_last = "; run the `sweep` lens last" if SWEEP_LENS in round_.lenses else ""
     print(
         "Next: read the packet, apply every lens to each non-carried hunk, and record "
         f"`craftsman review add` / `craftsman review cover`{sweep_last}."
     )
+
+
+def _suggested_shards_line(round_: Round, packet: Path) -> str:
+    try:
+        packet_chars = len(packet.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise LedgerError(f"cannot read {packet}: {exc}") from exc
+    shards = suggested_shard_count(len(round_.open_files), packet_chars)
+    detail = "1 (no sharding needed)" if shards == 1 else str(shards)
+    return f"Suggested reviewer shards: {detail}"
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -241,9 +554,13 @@ def _write_text(path: Path, text: str) -> None:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
 
 
-def view_slug(lenses: Sequence[str], hunks_raw: str | None) -> str:
-    """The file-name part of a reviewer view: its lenses, then its hunk selection if any."""
+def view_slug(
+    lenses: Sequence[str], hunks_raw: str | None = None, *, shard: tuple[int, int] | None = None
+) -> str:
+    """The file-name part of a reviewer view: its lenses, then its shard or hunk selection."""
     lens_slug = "-".join(lenses)
+    if shard is not None:
+        return f"{lens_slug}.shard-{shard[0]}-of-{shard[1]}"
     if hunks_raw is None:
         return lens_slug
     hunk_slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()).strip("-")
@@ -275,20 +592,27 @@ def parse_view_lenses(raw: str, round_: Round) -> list[str]:
 def _view(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
-    snap = snapshot(ws.root, ws.base_sha(ledger))
+    snap = ws.snapshot(ledger)
     round_ = require_current_round(ledger, snap)
     lenses = parse_view_lenses(args.lenses, round_)
-    if args.hunks is None:
-        assigned = round_.open_hunk_ids
-    else:
-        assigned = expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks])
+    if args.shard is not None and args.hunks is not None:
+        raise LedgerError("pass either --shard or --hunks, not both")
+    if args.shard is not None:
+        parse_shard_spec(args.shard, len(round_.open_files))
+    assigned = (
+        round_.open_hunk_ids
+        if args.hunks is None
+        else expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks])
+    )
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=ws.task)
-    view_path = Path(round_.packet_path).with_name(
-        f"packet-{round_.number}.{view_slug(lenses, args.hunks)}.md"
-    )
-    _write_text(view_path, render_packet_view(ctx, lenses=lenses, assigned_hunks=assigned))
+    shard = select_shard(ctx, args.shard) if args.shard is not None else None
+    if shard is not None:
+        assigned = shard.hunk_ids
+    slug = view_slug(lenses, args.hunks, shard=(shard.index, shard.total) if shard else None)
+    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
+    _write_text(view_path, render_packet_view(ctx, lenses=lenses, assigned_hunks=assigned, shard=shard))
     print(view_path)
     return 0
 
@@ -358,25 +682,48 @@ def _cover_one(args: argparse.Namespace) -> int:
     _require_flags(args, {"--lens": args.lens})
     if args.hunks is not None and args.files is not None:
         raise LedgerError("pass either --hunks or --files, not both")
-    if args.lens == DESIGN_LENS and args.hunks is not None:
+    lenses = [item.strip() for item in args.lens.split(",") if item.strip()]
+    if lenses == [DESIGN_LENS] and args.hunks is not None:
         raise LedgerError(
             "the `design` lens covers changed files, not hunks; pass --files instead of --hunks"
         )
-    if args.lens != DESIGN_LENS and args.files is not None:
-        raise LedgerError("--files is only used with `--lens design`; pass --hunks for hunk lenses")
-    target_flag, raw_targets = (
-        ("--files", args.files) if args.lens == DESIGN_LENS else ("--hunks", args.hunks)
-    )
-    _require_flags(args, {target_flag: raw_targets, "--note": args.note})
+    if args.hunks is None and args.files is None:
+        missing_flag = "--files" if lenses == [DESIGN_LENS] else "--hunks"
+        _require_flags(args, {missing_flag: None, "--note": args.note})
+    _require_flags(args, {"--note": args.note})
+    target_kind: TargetKind = "files" if args.files is not None else "hunks"
+    raw_targets = args.files if args.files is not None else args.hunks
+    assert raw_targets is not None
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
     targets = [item.strip() for item in raw_targets.split(",") if item.strip()]
 
     def record(current: Ledger) -> tuple[Ledger, str]:
-        return _record_coverage(current, snap, args.lens, targets, args.note)
+        return _record_coverage(current, snap, lenses, targets, args.note, target_kind=target_kind)
 
     print(mutate(ws.ledger_path, record))
     return 0
+
+
+def _cover_entry_label(raw: Any) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    if isinstance(raw.get("lens"), str):
+        return str(raw["lens"])
+    lenses = raw.get("lenses")
+    if isinstance(lenses, list) and lenses and all(isinstance(item, str) for item in lenses):
+        return ",".join(lenses)
+    return None
+
+
+def _parse_json_lenses(raw: Any, f: Fields) -> tuple[str, ...]:
+    has_lens = isinstance(raw, dict) and "lens" in raw
+    has_lenses = isinstance(raw, dict) and "lenses" in raw
+    if has_lens and has_lenses:
+        raise FieldError("lenses", "cannot be combined with 'lens'; pass one or the other")
+    if has_lenses:
+        return f.texts("lenses")
+    return (f.text("lens"),)
 
 
 def _cover_from_json(args: argparse.Namespace) -> int:
@@ -385,20 +732,23 @@ def _cover_from_json(args: argparse.Namespace) -> int:
     )
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
         lines: list[str] = []
         for index, raw in enumerate(raw_entries, 1):
             try:
                 f = Fields(raw)
-                lens = f.choice("lens", tuple(sorted(LENS_IDS)))
-                targets = [item.strip() for item in f.texts(_target_key(lens)) if item.strip()]
+                lenses = _parse_json_lenses(raw, f)
+                target_key = _target_key(raw, lenses)
+                targets = [item.strip() for item in f.texts(target_key) if item.strip()]
                 note = f.text("note")
                 f.reject_unknown()
-                current, line = _record_coverage(current, snap, lens, targets, note)
+                current, line = _record_coverage(
+                    current, snap, lenses, targets, note, target_kind=target_key
+                )
             except LedgerError as exc:
-                raise _batch_error(index, _entry_label(raw, "lens"), exc) from None
+                raise _batch_error(index, _cover_entry_label(raw), exc) from None
             lines.append(line)
         return current, lines
 
@@ -407,19 +757,30 @@ def _cover_from_json(args: argparse.Namespace) -> int:
     return 0
 
 
-def _target_key(lens: str) -> str:
-    """The `design` lens covers files; every other lens covers hunks."""
-    return "files" if lens == DESIGN_LENS else "hunks"
+def _target_key(raw: Mapping[str, Any], lenses: Sequence[str]) -> TargetKind:
+    """JSON target key for a coverage entry: `design` requires `files`; others accept `hunks` (or `files` in quick)."""
+    if tuple(lenses) == (DESIGN_LENS,):
+        return "files"
+    if "files" in raw and "hunks" in raw:
+        raise LedgerError("pass either 'hunks' or 'files', not both")
+    return "files" if "files" in raw else "hunks"
 
 
 def _record_coverage(
-    current: Ledger, snap: DiffSnapshot, lens: str, targets: Sequence[str], note: str
+    current: Ledger,
+    snap: DiffSnapshot,
+    lenses: Sequence[str],
+    targets: Sequence[str],
+    note: str,
+    *,
+    target_kind: TargetKind | None = None,
 ) -> tuple[Ledger, str]:
     round_ = require_current_round(current, snap)
-    updated, _ = add_coverage(current, lens, targets, note)
+    updated, records = add_multi_coverage(current, lenses, targets, note, target_kind=target_kind)
     left = sum(len(ids) for ids in uncovered_by_lens(updated, round_).values())
+    covered_lenses = ", ".join(f"`{record.lens}`" for record in records)
     return updated, (
-        f"Coverage recorded: `{lens}` covered {', '.join(targets)} in round {round_.number}; "
+        f"Coverage recorded: {covered_lenses} covered {', '.join(targets)} in round {round_.number}; "
         f"{left} lens item(s) left in this round."
     )
 
@@ -447,7 +808,7 @@ def _required_finding_flags(args: argparse.Namespace) -> dict[str, object]:
 def _add_one(args: argparse.Namespace) -> int:
     _require_flags(args, _required_finding_flags(args))
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
     path = _finding_path(ws.root, _cwd(args), args.file, snap)
     lines = _source_lines(ws.root, path, args.line)
 
@@ -475,7 +836,7 @@ def _add_from_json(args: argparse.Namespace) -> int:
     )
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
     cwd = _cwd(args)
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[tuple[Finding, list[str] | None]]]:
@@ -544,7 +905,7 @@ def _source_lines(root: Path, path: str, line: int) -> list[str] | None:
 
 def _ack(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
 
     def record(current: Ledger) -> tuple[Ledger, SignalAck]:
         require_current_round(current, snap)
@@ -578,7 +939,7 @@ def _parse_fact_source(ws: Workspace, cwd: Path, raw: str, snap: DiffSnapshot) -
 
 def _fact_add(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
     source, digest = _parse_fact_source(ws, _cwd(args), args.source, snap)
 
     def record(current: Ledger) -> tuple[Ledger, Fact]:
@@ -599,7 +960,7 @@ def _fact_add(args: argparse.Namespace) -> int:
 
 def _move(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
     path = None if args.file is None else _finding_path(ws.root, _cwd(args), args.file, snap)
 
     def record(current: Ledger) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
@@ -730,7 +1091,7 @@ def _print_verdict(finding: Finding) -> None:
 
 def _resolve(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    snap = ws.current_snapshot()
+    snap = ws.snapshot()
     finding = mutate(
         ws.ledger_path,
         lambda current: resolve(
@@ -752,19 +1113,24 @@ def _waive_run(args: argparse.Namespace) -> int:
 
 
 def _show(args: argparse.Namespace) -> int:
+    if args.packet_path and args.hunks:
+        raise LedgerError("pass either --packet-path or --hunks, not both")
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
-    snap = snapshot(ws.root, ws.base_sha(ledger))
+    snap = ws.snapshot(ledger)
     latest = ledger.rounds[-1] if ledger.rounds else None
     if args.packet_path:
         if latest is None:
             raise LedgerError("no review round yet; run `craftsman review prepare`")
         print(str(Path(latest.packet_path).resolve()))
         return 0
+    if args.hunks:
+        return _show_hunks(ws.root, latest, snap, as_json=args.json)
     if args.json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
             "coverage": _coverage_json(ledger, latest) if latest else {},
+            "hunks": _hunks_json(ws.root, latest, snap) if latest else [],
             "findings": [finding.to_json() for finding in ledger.findings],
             "runs": [run.to_json() for run in ledger.runs[-SHOW_RECENT_RUNS:]],
         }
@@ -783,6 +1149,93 @@ def _show(args: argparse.Namespace) -> int:
     print("")
     print("\n".join(_run_lines(ledger.runs[-SHOW_RECENT_RUNS:], snap)))
     return 0
+
+
+def _show_hunks(root: Path, latest: Round | None, snap: DiffSnapshot, *, as_json: bool) -> int:
+    if as_json:
+        payload = {
+            "round": _round_json(latest, snap) if latest else None,
+            "stale": bool(latest is not None and latest.fingerprint != snap.fingerprint),
+            "hunks": _hunks_json(root, latest, snap) if latest else [],
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    if latest is None:
+        print("No review round yet; run `craftsman review prepare`.")
+        return 0
+    print("\n".join(_hunk_map_lines(root, latest, snap)))
+    return 0
+
+
+def _hunk_span(new_start: int, new_len: int, old_start: int = 0, old_len: int = 0) -> tuple[int, int]:
+    if new_len > 0:
+        return new_start, new_start + new_len - 1
+    if old_len > 0:
+        return old_start, old_start + old_len - 1
+    return 0, 0
+
+
+def _hunks_json(root: Path, round_: Round, snap: DiffSnapshot) -> list[dict[str, Any]]:
+    if round_.fingerprint != snap.fingerprint:
+        return [
+            {
+                "id": ref.id,
+                "path": ref.path,
+                "new_start": ref.new_start,
+                "new_len": ref.new_len,
+                "end_line": ref.new_start + ref.new_len - 1 if ref.new_len > 0 else ref.new_start,
+                "carried": ref.carried,
+            }
+            for ref in round_.hunks
+        ]
+    index = WorktreeIndex(root)
+    by_id = {hunk.id: hunk for hunk in snap.hunks}
+    items: list[dict[str, Any]] = []
+    for ref in round_.hunks:
+        if ref.carried or (hunk := by_id.get(ref.id)) is None:
+            continue
+        scope = index.hunk_scope(hunk)
+        start, end = _hunk_span(hunk.new_start, hunk.new_len, hunk.old_start, hunk.old_len)
+        items.append(
+            {
+                "id": ref.id,
+                "path": ref.path,
+                "new_start": ref.new_start,
+                "new_len": ref.new_len,
+                "start_line": start,
+                "end_line": end,
+                "carried": False,
+                "status": hunk.status,
+                "scope": scope.name if scope is not None and scope.kind != "block" else None,
+            }
+        )
+    return items
+
+
+def _format_span(path: str, start: int, end: int, has_range: bool, *, bare_zero: bool = False) -> str:
+    if has_range:
+        return f"{path}:{start}-{end}"
+    return path if bare_zero else f"{path}:{start}"
+
+
+def _hunk_map_lines(root: Path, round_: Round, snap: DiffSnapshot) -> list[str]:
+    """One compact `H#  path:start-end  scope|status` line per open hunk, or HunkRef fields if stale."""
+    entries = _hunks_json(root, round_, snap)
+    if round_.fingerprint != snap.fingerprint:
+        lines = [
+            f"{e['id']}  {_format_span(e['path'], e['new_start'], e['end_line'], e['new_len'] > 0)}  "
+            f"[{'carried' if e['carried'] else 'open'}]"
+            for e in entries
+        ]
+        lines.append("stale: run `craftsman review prepare`")
+        return lines
+    lines = [
+        f"{e['id']}  "
+        f"{_format_span(e['path'], e['start_line'], e['end_line'], e['end_line'] > 0, bare_zero=True)}  "
+        f"{e['scope'] or e['status']}"
+        for e in entries
+    ]
+    return lines or ["(no open hunks)"]
 
 
 def _round_line(round_: Round, snap: DiffSnapshot) -> str:
@@ -878,7 +1331,7 @@ def _evaluate(
         )
     ledger = load(ws.ledger_path)
     tier = evaluation_tier(ws, ledger, tier_override)
-    snap = snapshot(ws.root, ws.base_sha(ledger))
+    snap = ws.snapshot(ledger)
     policy = GatePolicy(tier=tier, isolation_evidence=ws.isolation_evidence)
     return ledger, snap, tier, evaluate(ledger, snap, policy, review_only=review_only)
 
@@ -895,6 +1348,7 @@ def _check(args: argparse.Namespace) -> int:
 def _report_json(report: GateReport) -> dict[str, Any]:
     return {
         "passed": report.passed,
+        "partial": report.partial,
         "self_reviewed": report.self_reviewed,
         "issues": [{"code": issue.code, "message": issue.message} for issue in report.issues],
         "warnings": list(report.warnings),
@@ -903,7 +1357,13 @@ def _report_json(report: GateReport) -> dict[str, Any]:
 
 
 def _report(args: argparse.Namespace) -> int:
+    if args.partial and not args.review_only:
+        raise LedgerError(
+            "--partial requires --review-only; pass `craftsman review report --review-only --partial`"
+        )
     ledger, snap, tier, report = _evaluate(open_workspace(args.cwd), None, review_only=args.review_only)
+    if args.partial:
+        report = replace(report, partial=True)
     groups = _finding_groups(ledger.findings)
     runs = passing_runs(ledger, snap.fingerprint)
     if args.json:
@@ -913,6 +1373,7 @@ def _report(args: argparse.Namespace) -> int:
             "rounds": len(ledger.rounds),
             "base_sha": snap.base_sha,
             "diff": {"files": len(snap.files), "added": snap.added, "deleted": snap.deleted},
+            "not_covered": _not_covered_by_lens(ledger),
             "findings": {name: [f.to_json() for f in items] for name, items in groups.items()},
             "runs": [run.to_json() for run in runs],
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
@@ -945,11 +1406,37 @@ def _finding_groups(findings: Sequence[Finding]) -> dict[str, list[Finding]]:
 
 
 def _report_status_line(report: GateReport) -> str:
-    line = f"- {report.subject.capitalize()}: {report.status_label}"
+    subject = "Review" if report.partial else report.subject.capitalize()
+    line = f"- {subject}: {report.status_label}"
     if report.passed:
         return line
-    check = "craftsman review check --review-only" if report.review_only else "craftsman review check"
+    check = (
+        "craftsman review check --review-only"
+        if report.review_only or report.partial
+        else "craftsman review check"
+    )
     return f"{line} — {report.issue_codes}; see `{check}`"
+
+
+def _not_covered_by_lens(ledger: Ledger) -> dict[str, list[str]]:
+    if not ledger.rounds:
+        return {}
+    return {
+        lens: ids for lens, ids in uncovered_by_lens(ledger, ledger.rounds[-1]).items() if ids
+    }
+
+
+def _not_covered_lines(ledger: Ledger, snap: DiffSnapshot, report: GateReport) -> list[str]:
+    missing = _not_covered_by_lens(ledger)
+    if missing:
+        return [
+            "",
+            "## Not covered",
+            *(f"- `{lens}`: {', '.join(ids)}" for lens, ids in missing.items()),
+        ]
+    if report.partial and not ledger.rounds and not snap.is_empty:
+        return ["", "## Not covered", "- No review round prepared yet."]
+    return []
 
 
 def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> list[str]:
@@ -958,7 +1445,9 @@ def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> l
     detail: dict[str, Callable[[Finding], str]] = {
         "fixed": lambda f: f"Fix: {f.resolution_note}",
         "accepted": lambda f: f"Accepted because: {f.resolution_note}",
-        "open": lambda f: f"Verdict: {f.verdict or 'none yet'}",
+        "open": lambda f: (
+            f"Verdict: {f.verdict}" if f.verdict is not None else "Verdict: none yet (unverified)"
+        ),
         "question": lambda f: f"Question: {f.verdict_evidence}",
         "dismissed": lambda f: f"Dismissed: {f.verdict_evidence}",
     }
@@ -1015,6 +1504,20 @@ def _not_assessed_lines(tier: Tier, report: GateReport) -> list[str]:
     ]
 
 
+def _waived_run_lines(ledger: Ledger) -> list[str]:
+    waived = [(run, run.waiver) for run in ledger.runs if run.waiver is not None]
+    if not waived:
+        return []
+    return [
+        "",
+        "## Waived runs",
+        *(
+            f"- {run.id} `{run.command}` ({run.kind}, exit {run.exit_code}) — {waiver.reason}"
+            for run, waiver in waived
+        ),
+    ]
+
+
 def _report_lines(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -1023,38 +1526,31 @@ def _report_lines(
     groups: dict[str, list[Finding]],
     runs: Sequence[Run],
 ) -> list[str]:
-    lines = ["# Craftsman review report"]
-    if report.self_reviewed:
-        lines.append(f"**{SELF_REVIEWED_BANNER}**")
-    lines += [
+    banner = [f"**{SELF_REVIEWED_BANNER}**"] if report.self_reviewed else []
+    run_lines = [
+        f"- {run.id} `{run.command}` ({run.kind}) → exit {run.exit_code} in {run.duration_s:.1f}s"
+        for run in runs
+    ] or ["No passing test or e2e run at the final code."]
+    warning_lines = ["", "## Warnings", *(f"- {w}" for w in report.warnings)] if report.warnings else []
+    return [
+        "# Craftsman review report",
+        *banner,
         f"- Base `{snap.base_sha[:7]}` · tier `{tier}` · {len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
         *_diff_size_lines(ledger, snap),
+        *_not_covered_lines(ledger, snap, report),
         "",
         "## Findings",
         *_report_finding_lines(ledger, groups),
         *_signal_ack_lines(ledger),
         "",
         "## Verification at the final code",
+        *run_lines,
+        *_waived_run_lines(ledger),
+        *warning_lines,
+        *_not_assessed_lines(tier, report),
     ]
-    lines.extend(
-        f"- {run.id} `{run.command}` ({run.kind}) → exit {run.exit_code} in {run.duration_s:.1f}s"
-        for run in runs
-    )
-    if not runs:
-        lines.append("No passing test or e2e run at the final code.")
-    waived = [(run, run.waiver) for run in ledger.runs if run.waiver is not None]
-    if waived:
-        lines += ["", "## Waived runs"]
-        lines.extend(
-            f"- {run.id} `{run.command}` ({run.kind}, exit {run.exit_code}) — {waiver.reason}"
-            for run, waiver in waived
-        )
-    if report.warnings:
-        lines += ["", "## Warnings", *(f"- {warning}" for warning in report.warnings)]
-    lines.extend(_not_assessed_lines(tier, report))
-    return lines
 
 
 def _reset(args: argparse.Namespace) -> int:
@@ -1092,9 +1588,7 @@ def _tier_option(value: str) -> Tier | None:
     raise argparse.ArgumentTypeError(f"invalid choice {value!r} (choose from auto, {', '.join(TIERS)})")
 
 
-def _add_prepare_and_cover_parsers(
-    sub: Any, common: argparse.ArgumentParser, lenses: Sequence[str]
-) -> None:
+def _add_prepare_parser(sub: Any, common: argparse.ArgumentParser) -> None:
     prepare = sub.add_parser(
         "prepare",
         parents=[common],
@@ -1109,26 +1603,45 @@ def _add_prepare_and_cover_parsers(
     prepare.add_argument("--tier", type=_tier_option, help="auto (default), quick, standard or deep")
     prepare.add_argument("--base", help="Base commit (default: the active task's base or HEAD)")
     prepare.add_argument("--task", help="One-line description of what the change is for")
+    prepare.add_argument(
+        "--paths", help="Comma-separated file or directory paths to freeze as the review scope"
+    )
+    prepare.add_argument(
+        "--add-paths",
+        help="Comma-separated file or directory paths to add to an existing review scope (e.g. files touched in --fix)",
+    )
+    prepare.add_argument(
+        "--staged",
+        action="store_true",
+        help="Freeze the review scope to paths staged in the index (content still comes from the work tree)",
+    )
+    prepare.add_argument(
+        "--tracked",
+        action="store_true",
+        help="Freeze the review scope to tracked files changed since the base (omit untracked files)",
+    )
     prepare.set_defaults(handler=_prepare)
 
+
+def _add_view_and_cover_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
     view = sub.add_parser("view", parents=[common], help="Build a per-reviewer packet view")
-    view.add_argument(
-        "--lenses", required=True, help="Comma-separated lens ids or reviewer groups, e.g. R1"
-    )
-    view.add_argument(
-        "--hunks", help="Comma-separated hunk ids or ranges, e.g. H3-H17 (default: open hunks)"
-    )
+    view.add_argument("--lenses", required=True, help="Comma-separated lens ids or groups, e.g. R1")
+    view.add_argument("--hunks", help="Comma-separated hunk ids or ranges, e.g. H3-H17")
+    view.add_argument("--shard", help="File-aligned open-hunk shard K/N (1 <= K <= N), e.g. 1/2")
     view.set_defaults(handler=_view)
 
-    cover = sub.add_parser("cover", parents=[common], help="Record that a lens reviewed hunks or files")
-    cover.add_argument("--lens", choices=lenses)
+    cover = sub.add_parser("cover", parents=[common], help="Record that lens(es) reviewed hunks or files")
+    cover.add_argument("--lens", help="Lens id or comma-separated lens ids, e.g. intent,contracts")
     cover.add_argument("--hunks", help="Comma-separated hunk ids, e.g. H1,H3")
-    cover.add_argument("--files", help="Comma-separated file paths for `--lens design`, e.g. pkg/a.py")
+    cover.add_argument(
+        "--files",
+        help="Comma-separated file paths (for `--lens design` or any lens in a quick round), e.g. pkg/a.py",
+    )
     cover.add_argument("--note", help="What you tried on each named hunk or file")
     cover.add_argument(
         "--from-json",
         metavar="PATH",
-        help='Bulk JSON list of {"lens", "hunks"|"files", "note"} objects (use - for stdin)',
+        help='Bulk JSON list of {"lens"|"lenses", "hunks"|"files", "note"} objects (use - for stdin)',
     )
     cover.set_defaults(handler=_cover, subparser=cover)
 
@@ -1259,6 +1772,11 @@ def _add_inspection_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Print only the resolved absolute path of the current review packet",
     )
+    sub.choices["show"].add_argument(
+        "--hunks",
+        action="store_true",
+        help="Print a compact map of open hunks (H# -> file:lines and scope or status)",
+    )
     sub.choices["check"].add_argument("--tier", type=_tier_option)
     for name in ("check", "report"):
         sub.choices[name].add_argument(
@@ -1266,6 +1784,11 @@ def _add_inspection_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
             action="store_true",
             help="Check only review completeness (round, lenses, sweep, verdicts), without requiring fixes or test runs",
         )
+    sub.choices["report"].add_argument(
+        "--partial",
+        action="store_true",
+        help="Render a partial review-only report when some lenses or verdicts could not be completed",
+    )
     reset = sub.add_parser("reset", parents=[common], help="Archive the ledger and packets")
     reset.set_defaults(handler=_reset)
 
@@ -1280,7 +1803,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
     lenses = sorted(LENS_IDS)
-    _add_prepare_and_cover_parsers(sub, common, lenses)
+    _add_prepare_parser(sub, common)
+    _add_view_and_cover_parsers(sub, common)
     _add_finding_parsers(sub, common, lenses)
     _add_merge_and_verdict_parsers(sub, common)
     _add_resolution_and_status_parsers(sub, common)

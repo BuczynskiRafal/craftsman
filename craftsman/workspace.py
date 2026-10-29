@@ -34,9 +34,11 @@ class Workspace:
         task_base = self.state.base_sha if self.state is not None else None
         return resolve_base_sha(self.root, explicit or ledger_base or task_base)
 
-    def current_snapshot(self) -> DiffSnapshot:
+    def snapshot(self, ledger: Ledger | None = None) -> DiffSnapshot:
         """The diff since the base the review (or else the active task) is measured against."""
-        return snapshot(self.root, self.base_sha(load(self.ledger_path)))
+        current = load(self.ledger_path) if ledger is None else ledger
+        scope = None if self.state is not None else current.current_scope
+        return snapshot(self.root, self.base_sha(current), scope)
 
 
 def open_workspace(cwd: str | None) -> Workspace:

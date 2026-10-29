@@ -416,10 +416,40 @@ def _repo_file(root: Path, path: str) -> Path:
 # --- snapshot -------------------------------------------------------------------------------
 
 
-def snapshot(cwd: str | Path, base_sha: str) -> DiffSnapshot:
-    """Capture every change between `base_sha` and the work tree, including untracked files."""
+def _normalize_filter_path(path: str) -> str:
+    if not path or path.startswith("/") or "\\" in path or "\0" in path:
+        raise DiffScanError(f"expected a repository-relative POSIX path, got {path!r}")
+    trailing = "/" if path.endswith("/") else ""
+    core = path[:-1] if trailing else path
+    parts = core.split("/")
+    has_drive = bool(parts) and len(parts[0]) >= 2 and parts[0][1] == ":" and parts[0][0].isalpha()
+    if not core or has_drive or any(part in ("", ".", "..") for part in parts):
+        raise DiffScanError(f"expected a repository-relative POSIX path, got {path!r}")
+    return f"{core}{trailing}"
+
+
+def _normalize_filter_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(_normalize_filter_path(path) for path in paths))
+
+
+def _filter_untracked(untracked: Sequence[str], filters: tuple[str, ...] | None) -> list[str]:
+    if filters is None:
+        return list(untracked)
+    exact = {item for item in filters if not item.endswith("/")}
+    prefixes = tuple(item for item in filters if item.endswith("/"))
+    return [path for path in untracked if path in exact or path.startswith(prefixes)]
+
+
+def snapshot(
+    cwd: str | Path, base_sha: str, paths: Sequence[str] | None = None
+) -> DiffSnapshot:
+    """Capture changes between `base_sha` and the work tree (all of it, or restricted to `paths`)."""
     root = worktree_root(cwd)
     base = _base_revision(root, base_sha)
+    filters = None if paths is None else _normalize_filter_paths(paths)
+    if filters is not None and not filters:
+        return _assemble(base, ())
+    pathspecs = () if filters is None else tuple(f":(literal){path}" for path in filters)
     tracked_text = git_output(
         root,
         "diff",
@@ -434,9 +464,10 @@ def snapshot(cwd: str | Path, base_sha: str) -> DiffSnapshot:
         "--find-renames",
         base,
         "--",
+        *pathspecs,
     )
     tracked = [_parse_file_section(section) for section in _split_file_sections(tracked_text)]
-    untracked = _untracked_paths(root)
+    untracked = _filter_untracked(_untracked_paths(root), filters)
     # `git rm --cached` leaves a file on disk that the diff reports as deleted and ls-files as new.
     deleted = {chunk.path: chunk for chunk in tracked if chunk.status == "deleted"}
     unindexed = {path: deleted[path] for path in untracked if path in deleted}
@@ -752,6 +783,19 @@ def _untracked_paths(root: Path) -> list[str]:
         args.append(f"--exclude-from={IGNORE_FILE}")
     out = git_output(root, *args)
     return [path for path in out.split("\0") if path]
+
+
+def untracked_paths(cwd: str | Path) -> tuple[str, ...]:
+    """Repository-relative paths of untracked, non-ignored files in the work tree."""
+    return tuple(_untracked_paths(worktree_root(cwd)))
+
+
+def staged_paths(cwd: str | Path, base_sha: str) -> tuple[str, ...]:
+    """Repository-relative paths staged in the index relative to `base_sha` (both sides of renames)."""
+    root = worktree_root(cwd)
+    base = _base_revision(root, base_sha)
+    out = git_output(root, "diff", "--cached", "--name-only", "--no-renames", "-z", base, "--")
+    return tuple(sorted({path for path in out.split("\0") if path}))
 
 
 def _untracked_file_diff(root: Path, path: str) -> _FileDiff:

@@ -79,7 +79,11 @@ class SerializationTests(unittest.TestCase):
             (broken({"surprise": 1}), "findings[0].surprise is not a known field"),
             (broken({"verdict_run": "R9"}), "findings[0].verdict_run references an unknown run"),
             (broken({"digest": 5}, "rounds"), "rounds[0].digest is not a known field"),
-            ({**ledger_json(), "schema": 2}, "schema 2 is not supported"),
+            (
+                {**ledger_json(), "schema": 1},
+                "schema 1 is from an older craftsman; run `craftsman review reset` to archive it",
+            ),
+            ({**ledger_json(), "schema": 3}, "schema 3 is not supported"),
             ([], "ledger.json: must be a JSON object"),
         ]
         for raw, message in cases:

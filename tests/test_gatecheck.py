@@ -93,7 +93,7 @@ class RoundTests(unittest.TestCase):
 
         report = evaluate(ledger, two_hunks("fp2"), QUICK)
 
-        self.assertEqual(codes(report), ["stale-round", "uncovered", "uncovered", "no-passing-run"])
+        self.assertEqual(codes(report), ["stale-round", "uncovered", "no-passing-run"])
         self.assertIn("since round 1 was prepared", report.issues[0].message)
 
     def test_changed_base_is_reported_as_stale(self) -> None:
@@ -131,7 +131,7 @@ class RoundTests(unittest.TestCase):
 
 class CoverageTests(unittest.TestCase):
     def test_uncovered_issue_names_the_cover_command(self) -> None:
-        ledger, _ = prepared(two_hunks())
+        ledger, _ = prepared(two_hunks(), tier="standard")
         ledger, _ = add_coverage(ledger, "intent", ["H1"], coverage_note(["H1"]))
 
         report = evaluate(record_run(ledger), two_hunks(), QUICK)
@@ -147,11 +147,11 @@ class CoverageTests(unittest.TestCase):
         ledger = fully_reviewed(make_snap(caller))
         changed = make_hunk("H2", "b.py", ("+def compute_total(items, rate):",))
         snap = make_snap(caller, changed, fingerprint="fp2")
-        ledger, _ = prepared(snap, ledger=ledger, symbols={"H2": ["compute_total"]})
+        ledger, _ = prepared(snap, tier="standard", ledger=ledger, symbols={"H2": ["compute_total"]})
 
         report = evaluate(record_run(ledger, fingerprint="fp2"), snap, QUICK)
 
-        self.assertEqual(codes(report), ["uncovered", "uncovered"])
+        self.assertEqual(codes(report), ["uncovered"])
         self.assertIn("2 uncovered hunk(s) in round 2: H1,H2", report.issues[0].message)
         self.assertIn("Coverage: 0/4 lens items", report.summary)
 
@@ -604,7 +604,7 @@ class ReportRenderingTests(unittest.TestCase):
 
         self.assertIn("12. [no-verdict]", rendered)
         self.assertNotIn("13. ", rendered)
-        self.assertTrue(rendered.endswith("… and 5 more"))
+        self.assertTrue(rendered.endswith("… and 4 more"))
 
 
 class EndToEndTests(unittest.TestCase):
