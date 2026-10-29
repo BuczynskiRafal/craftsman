@@ -39,7 +39,7 @@ class LensCatalogTests(unittest.TestCase):
 
 class LensSelectionTests(unittest.TestCase):
     def test_quick_tier_without_signals_selects_the_core_lenses(self) -> None:
-        self.assertEqual(picked_ids("quick", {}), ["intent", "contracts", "craft"])
+        self.assertEqual(picked_ids("quick", {}), ["intent", "contracts", "failure"])
 
     def test_standard_tier_adds_its_always_on_lenses(self) -> None:
         self.assertEqual(
@@ -53,14 +53,28 @@ class LensSelectionTests(unittest.TestCase):
     def test_signals_add_triggered_lenses_with_a_reason(self) -> None:
         signals = {"process": ("H2", "H5"), "datamodel": ("H1",)}
 
-        picks = {pick.lens.id: pick.reason for pick in select_lenses("quick", signals, docs_only=False)}
+        picks = {
+            pick.lens.id: pick.reason for pick in select_lenses("standard", signals, docs_only=False)
+        }
 
         self.assertEqual(
-            list(picks), ["intent", "contracts", "failure", "trust", "platform", "model", "craft"]
+            list(picks),
+            [
+                "intent",
+                "contracts",
+                "failure",
+                "ripple",
+                "trust",
+                "tests",
+                "model",
+                "craft",
+                "design",
+                "sweep",
+            ],
         )
         self.assertEqual(picks["trust"], "signals: process (H2, H5)")
         self.assertEqual(picks["model"], "signals: datamodel (H1)")
-        self.assertEqual(picks["intent"], "always in quick")
+        self.assertEqual(picks["intent"], "always in standard")
 
     def test_always_selected_lenses_still_name_their_signals(self) -> None:
         picks = {

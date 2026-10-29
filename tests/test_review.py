@@ -107,7 +107,7 @@ class PrepareTests(RepoTestCase):
         out = self.review("prepare", "--tier", "quick", "--task", "Add cart totals").stdout
 
         self.assertIn("Round 1 prepared (quick): 1 hunks, 0 carried, 1 to review.", out)
-        self.assertIn("Lenses: intent, contracts, craft\n", out)
+        self.assertIn("Lenses: intent, contracts, failure\n", out)
         self.assertIn("**Task:** Add cart totals", self.packet())
         self.assertIn("Scope: `total` (function, L1–L3)", self.packet())
 
@@ -525,13 +525,13 @@ class FromJsonTests(RepoTestCase):
     def test_cover_records_every_entry(self) -> None:
         entries = [
             {"lens": lens, "hunks": ["H1"], "note": coverage_note(["H1"])}
-            for lens in ("intent", "contracts", "craft")
+            for lens in ("intent", "contracts", "failure")
         ]
 
         covered = self.from_json("cover", entries)
 
         self.assertEqual(len(covered.stdout.splitlines()), 3)
-        self.assertIn("`craft` covered H1 in round 1; 0 lens item(s) left", covered.stdout)
+        self.assertIn("`failure` covered H1 in round 1; 0 lens item(s) left", covered.stdout)
 
     def test_add_reads_a_file(self) -> None:
         source = self.tmp / "findings.json"
@@ -644,7 +644,7 @@ class InspectionTests(RepoTestCase):
 
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("**Craftsman gate: BLOCKED", blocked.stdout)
-        self.assertIn("[uncovered] Lens `intent`", blocked.stdout)
+        self.assertIn("[uncovered] Lenses `intent`, `contracts`, `failure`", blocked.stdout)
 
     def test_check_passes_with_full_evidence(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
@@ -783,7 +783,7 @@ class ReviewOnlyTests(RepoTestCase):
         report = self.review("report", "--review-only").stdout
 
         self.assertIn(
-            "- Review: INCOMPLETE (3 open items) — uncovered; see `craftsman review check --review-only`",
+            "- Review: INCOMPLETE (1 open items) — uncovered; see `craftsman review check --review-only`",
             report,
         )
 
@@ -844,6 +844,7 @@ class SignalTests(RepoTestCase):
         self.assertEqual(report.count(ACK_REASON), 1)
 
     def test_ack_repeated_in_a_later_round_is_reported_once(self) -> None:
+        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
         self.prepare_long_function()
         self.review("ack", "S1", "--reason", ACK_REASON)
         self.repo.write("notes.py", "LABEL = 'x'\n")
@@ -952,9 +953,9 @@ class ViewTests(RepoTestCase):
     def test_view_is_written_next_to_the_packet(self) -> None:
         self.prepare_bug()
 
-        path = Path(self.review("view", "--lenses", "intent,craft", "--hunks", "H1").stdout.strip())
+        path = Path(self.review("view", "--lenses", "intent,failure", "--hunks", "H1").stdout.strip())
 
-        self.assertEqual(path.name, "packet-1.intent-craft.H1.md")
+        self.assertEqual(path.name, "packet-1.intent-failure.H1.md")
 
     def test_lenses_flag_has_no_abbreviation(self) -> None:
         self.prepare_bug()

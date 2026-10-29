@@ -12,7 +12,7 @@ from typing import Literal
 
 from craftsman.diffscan import DiffSnapshot
 from craftsman.ledger import counting_sweeps, open_units, uncovered_by_lens
-from craftsman.lenses import TIERS, Tier
+from craftsman.lenses import REVIEW_ONLY_QUICK_MAX_LINES, TIERS, Tier
 from craftsman.records import (
     DESIGN_LENS,
     MAX_HUNKS_PER_COVERAGE,
@@ -79,6 +79,7 @@ class GateReport:
     summary: str
     review_only: bool = False
     self_reviewed: bool = False
+    partial: bool = False
 
     @property
     def passed(self) -> bool:
@@ -91,7 +92,11 @@ class GateReport:
 
     @property
     def status_label(self) -> str:
-        """PASSED / BLOCKED for the gate; COMPLETE / INCOMPLETE for a review-only check."""
+        """PASSED / BLOCKED for the gate; COMPLETE / INCOMPLETE / PARTIAL for a review-only check."""
+        if self.partial:
+            if self.issues:
+                return f"PARTIAL (review-only, {len(self.issues)} open items)"
+            return "COMPLETE (review-only)"
         if self.passed:
             return "COMPLETE (review-only)" if self.review_only else "PASSED"
         blocked = "INCOMPLETE" if self.review_only else "BLOCKED"
@@ -285,7 +290,23 @@ def _tier_issues(latest: Round, policy: GatePolicy) -> list[GateIssue]:
 def _coverage_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
     missing = uncovered_by_lens(ledger, latest)
     sweep_missing = missing.pop(SWEEP_LENS, [])
-    issues = [_uncovered_issue(lens, ids, latest) for lens, ids in missing.items() if ids]
+    design_missing = missing.pop(DESIGN_LENS, [])
+    use_files = latest.tier == "quick"
+    path_by_hunk = {hunk.id: hunk.path for hunk in latest.hunks}
+    grouped: dict[tuple[str, ...], list[str]] = {}
+    for lens, ids in missing.items():
+        if not ids:
+            continue
+        targets = (
+            tuple(dict.fromkeys(path_by_hunk[hid] for hid in ids)) if use_files else tuple(ids)
+        )
+        grouped.setdefault(targets, []).append(lens)
+    issues = [
+        _uncovered_issue(lenses, targets, latest, use_files=use_files)
+        for targets, lenses in grouped.items()
+    ]
+    if design_missing:
+        issues.append(_uncovered_issue((DESIGN_LENS,), design_missing, latest, use_files=True))
     premature = _premature_sweep_ids(ledger, latest, sweep_missing)
     if premature:
         batch = ",".join(premature[:MAX_HUNKS_PER_COVERAGE])
@@ -299,22 +320,30 @@ def _coverage_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
             )
         )
     remaining = [hunk_id for hunk_id in sweep_missing if hunk_id not in premature]
-    if remaining and not any(missing.values()):
-        issues.append(_uncovered_issue(SWEEP_LENS, remaining, latest))
+    if remaining and not any(missing.values()) and not design_missing:
+        issues.append(_uncovered_issue((SWEEP_LENS,), remaining, latest, use_files=False))
     return issues
 
 
-def _uncovered_issue(lens: str, missing: Sequence[str], round_: Round) -> GateIssue:
+def _uncovered_issue(
+    lenses: Sequence[str], missing: Sequence[str], round_: Round, *, use_files: bool
+) -> GateIssue:
     batch = ",".join(missing[:MAX_HUNKS_PER_COVERAGE])
     extra = len(missing) - MAX_HUNKS_PER_COVERAGE
     more = f" (+{extra} more)" if extra > 0 else ""
-    unit = "file(s)" if lens == DESIGN_LENS else "hunk(s)"
-    flag = "--files" if lens == DESIGN_LENS else "--hunks"
+    unit = "file(s)" if use_files else "hunk(s)"
+    flag = "--files" if use_files else "--hunks"
+    lens_arg = ",".join(lenses)
+    head = (
+        f"Lens `{lenses[0]}` has"
+        if len(lenses) == 1
+        else f"Lenses {', '.join(f'`{lens}`' for lens in lenses)} have"
+    )
     return GateIssue(
         "uncovered",
-        f"Lens `{lens}` has {len(missing)} uncovered {unit} in round {round_.number}: "
+        f"{head} {len(missing)} uncovered {unit} in round {round_.number}: "
         f"{batch}{more}; review them and run "
-        f'`craftsman review cover --lens {lens} {flag} {batch} --note "..."`.',
+        f'`craftsman review cover --lens {lens_arg} {flag} {batch} --note "..."`.',
     )
 
 
@@ -530,23 +559,27 @@ def _retried_with_other_env_warnings(ledger: Ledger) -> list[str]:
     return warnings
 
 
+def _review_only_warnings(ledger: Ledger) -> list[str]:
+    warnings: list[str] = []
+    for_author = [
+        finding.id
+        for finding in ledger.findings
+        if finding.verdict in ("proven", "probable") and finding.resolution is None
+    ]
+    if for_author:
+        noun = "finding" if len(for_author) == 1 else "findings"
+        warnings.append(f"{len(for_author)} {noun} for the author: {', '.join(for_author)}.")
+    for run in _unwaived_failing_runs(ledger):
+        warnings.append(
+            f"Failing run {run.id} (`{run.command}`, {run.kind}) exited {run.exit_code}."
+        )
+    return warnings
+
+
 def _warnings(
     ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy, *, review_only: bool = False
 ) -> tuple[str, ...]:
-    warnings: list[str] = []
-    if review_only:
-        for_author = [
-            finding.id
-            for finding in ledger.findings
-            if finding.verdict in ("proven", "probable") and finding.resolution is None
-        ]
-        if for_author:
-            noun = "finding" if len(for_author) == 1 else "findings"
-            warnings.append(f"{len(for_author)} {noun} for the author: {', '.join(for_author)}.")
-        for run in _unwaived_failing_runs(ledger):
-            warnings.append(
-                f"Failing run {run.id} (`{run.command}`, {run.kind}) exited {run.exit_code}."
-            )
+    warnings = _review_only_warnings(ledger) if review_only else []
     accepted = [finding.id for finding in ledger.findings if finding.resolution == "accepted"]
     if accepted:
         warnings.append(f"Accepted without a fix: {', '.join(accepted)}; tell the user about them.")
@@ -559,10 +592,11 @@ def _warnings(
     if waived:
         warnings.append(f"Waived failing runs: {', '.join(waived)}; tell the user about them.")
     changed_lines = snap.added + snap.deleted
-    if policy.tier == "quick" and changed_lines > QUICK_TIER_MAX_CHANGED_LINES:
+    quick_max = REVIEW_ONLY_QUICK_MAX_LINES if review_only else QUICK_TIER_MAX_CHANGED_LINES
+    if policy.tier == "quick" and changed_lines > quick_max and not (review_only and snap.docs_only):
         warnings.append(
             f"The quick tier reviews {changed_lines} changed lines "
-            f"(> {QUICK_TIER_MAX_CHANGED_LINES}); consider the standard tier."
+            f"(> {quick_max}); consider the standard tier."
         )
     warnings.extend(
         f"{run.id} (`{run.command}`) is trivial and does not count as verification."

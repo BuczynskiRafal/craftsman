@@ -14,6 +14,8 @@ Tier = Literal["quick", "standard", "deep"]
 
 TIERS: tuple[Tier, ...] = get_args(Tier)
 MAX_REASON_HUNK_IDS = 6
+REVIEW_ONLY_QUICK_MAX_LINES = 250
+QUICK_TRUST_TRIGGERS: frozenset[str] = frozenset({"sql", "deserialization", "auth", "process"})
 
 _ALL_TIERS: frozenset[Tier] = frozenset(TIERS)
 _STANDARD_AND_DEEP: frozenset[Tier] = frozenset({"standard", "deep"})
@@ -55,7 +57,7 @@ LENSES: tuple[Lens, ...] = (
         id="failure",
         title="Failure paths & error handling",
         focus="When an operation fails, does the code fail loudly, precisely and cleanly?",
-        always_in=_STANDARD_AND_DEEP,
+        always_in=_ALL_TIERS,
         triggers=frozenset({"errors", "process", "filesystem", "network", "sql"}),
     ),
     Lens(
@@ -70,16 +72,14 @@ LENSES: tuple[Lens, ...] = (
         title="State, data flow, resources & concurrency",
         focus="Is shared state consistent, are resources released, are repeated runs safe?",
         always_in=_DEEP_ONLY,
-        triggers=frozenset({"concurrency", "filesystem", "time"}),
+        triggers=frozenset({"concurrency", "time"}),
     ),
     Lens(
         id="trust",
         title="Trust boundaries & security",
         focus="Can untrusted input reach a dangerous sink, or a permission check be bypassed?",
         always_in=_DEEP_ONLY,
-        triggers=frozenset(
-            {"process", "sql", "deserialization", "auth", "network", "regex", "filesystem"}
-        ),
+        triggers=frozenset({"process", "sql", "deserialization", "auth", "network", "regex"}),
     ),
     Lens(
         id="tests",
@@ -93,7 +93,7 @@ LENSES: tuple[Lens, ...] = (
         title="Environment & portability",
         focus="Does the change hold on every supported OS, shell, encoding, locale and time zone?",
         always_in=_DEEP_ONLY,
-        triggers=frozenset({"platform", "time", "process", "filesystem"}),
+        triggers=frozenset({"platform", "time"}),
     ),
     Lens(
         id="model",
@@ -106,7 +106,7 @@ LENSES: tuple[Lens, ...] = (
         id="craft",
         title="Clarity, reuse & simplicity",
         focus="Is this the simplest clear code, reusing what exists, at the right abstraction level?",
-        always_in=_ALL_TIERS,
+        always_in=_STANDARD_AND_DEEP,
         triggers=frozenset(),
     ),
     Lens(
@@ -152,6 +152,13 @@ def render_reviewer_groups_markdown() -> str:
     return "\n".join(lines)
 
 
+def review_only_tier(changed_lines: int, *, has_skipped: bool, docs_only: bool) -> Tier:
+    """Default review-only tier: `quick` for docs-only or small diffs without skipped files."""
+    if docs_only or (changed_lines <= REVIEW_ONLY_QUICK_MAX_LINES and not has_skipped):
+        return "quick"
+    return "standard"
+
+
 def strictest_tier(tier: Tier, *others: Tier) -> Tier:
     """The most demanding of the given tiers."""
     return max((tier, *others), key=TIERS.index)
@@ -165,6 +172,14 @@ def get_lens(lens_id: str) -> Lens:
         raise KeyError(f"unknown lens {lens_id!r}; valid lenses: {valid}") from None
 
 
+def _triggers_for(tier: Tier, lens: Lens) -> frozenset[str]:
+    if tier != "quick":
+        return lens.triggers
+    if lens.id == "trust":
+        return QUICK_TRUST_TRIGGERS
+    return lens.triggers if tier in lens.always_in else frozenset()
+
+
 def select_lenses(
     tier: Tier, signals: Mapping[str, Sequence[str]], *, docs_only: bool
 ) -> tuple[LensPick, ...]:
@@ -175,7 +190,7 @@ def select_lenses(
         return tuple(LensPick(get_lens(lens_id), "docs-only change") for lens_id in _DOCS_ONLY_LENSES)
     picks: list[LensPick] = []
     for lens in LENSES:
-        fired = [signal for signal in sorted(lens.triggers) if signals.get(signal)]
+        fired = [signal for signal in sorted(_triggers_for(tier, lens)) if signals.get(signal)]
         detail = ", ".join(f"{signal} ({_format_hunk_ids(signals[signal])})" for signal in fired)
         reasons = [f"always in {tier}"] if tier in lens.always_in else []
         if fired:

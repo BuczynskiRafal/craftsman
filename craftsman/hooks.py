@@ -29,7 +29,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, NoReturn, get_args
 
@@ -38,6 +38,7 @@ from craftsman.evidence import archive_ledger, packet_path
 from craftsman.gate import (
     GateOwner,
     GateState,
+    GateStateError,
     GateTier,
     Stage,
     archive_ledger_for_new_base,
@@ -48,7 +49,7 @@ from craftsman.gate import (
     state_path_for,
     update_state,
 )
-from craftsman.guard import evaluate_shell_command
+from craftsman.guard import evaluate_shell_command, find_worktree_mutation
 from craftsman.ledger import (
     GROUPED_EVIDENCE_PREFIX,
     add_agent_event,
@@ -64,6 +65,7 @@ from craftsman.records import (
     AgentEventKind,
     AgentRole,
     Ledger,
+    LedgerError,
     agent_role,
     format_timestamp,
     parse_timestamp,
@@ -429,7 +431,10 @@ def _has_current_round(session: Session) -> bool:
         return False
     latest = ledger.rounds[-1]
     try:
-        return snapshot(session.root, latest.base_sha).fingerprint == latest.fingerprint
+        return (
+            snapshot(session.root, latest.base_sha, ledger.current_scope).fingerprint
+            == latest.fingerprint
+        )
     except DiffScanError:
         return False
 
@@ -459,7 +464,7 @@ def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: 
     if role == "reviewer":
         missing = {lens: ids for lens, ids in uncovered_by_lens(ledger, latest).items() if ids}
         if missing:
-            lines.append("Lenses with uncovered hunks (take only the lenses you were assigned):")
+            lines.append("Lenses with uncovered items (take only the lenses you were assigned):")
             lines.extend(
                 f"- {lens}: {', '.join(ids)}" + (" (run last)" if lens == SWEEP_LENS else "")
                 for lens, ids in missing.items()
@@ -579,11 +584,71 @@ def _check_shell_git_guard(hook: HookInput, reply: Reply) -> Output | None:
     return None
 
 
+REVIEW_IN_PROGRESS_MAX_AGE = timedelta(hours=12)
+
+
+def _review_in_progress(session: Session) -> int | None:
+    """The latest round number when an open review-only round ran within 12 hours, else None."""
+    try:
+        if not session.ledger_path.is_file():
+            return None
+        state = load_state(session.state_path)
+        if state is not None and state.active:
+            return None
+        ledger = load(session.ledger_path)
+    except (DiffScanError, GateStateError, LedgerError) as exc:
+        sys.stderr.write(f"craftsman hook error: {exc}\n")
+        return None
+    if not ledger.rounds:
+        return None
+    latest = ledger.rounds[-1]
+    if datetime.now(timezone.utc) - parse_timestamp(latest.prepared_at) > REVIEW_IN_PROGRESS_MAX_AGE:
+        return None
+    has_open = any(uncovered_by_lens(ledger, latest).values()) or any(
+        finding.verdict is None for finding in ledger.findings
+    )
+    return latest.number if has_open else None
+
+
+def _check_worktree_guard(hook: HookInput, reply: Reply, session: Session | None) -> Output | None:
+    if hook.tool_name.lower() not in SHELL_TOOLS:
+        return None
+    command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
+    if not isinstance(command, str):
+        return None
+    tool_cwd = hook.tool_input.get("cwd") or hook.tool_input.get("Cwd")
+    cwd = str(Path(hook.cwd, tool_cwd)) if isinstance(tool_cwd, str) and tool_cwd else hook.cwd
+    if agent_role(hook.agent) is not None:
+        mutation = find_worktree_mutation(command, cwd, subagent=True)
+        if mutation is None:
+            return None
+        return reply.deny(
+            "Craftsman reviewers and verifiers must not change the work tree or the index "
+            f"({mutation}). Read an old version with `git show <base>:<path>`; put reproductions "
+            "in a temp directory."
+        )
+    if session is None:
+        return None
+    mutation = find_worktree_mutation(command, cwd, subagent=False)
+    if mutation is None:
+        return None
+    round_number = _review_in_progress(session)
+    if round_number is None:
+        return None
+    return reply.ask(
+        f"A Craftsman review is in progress (round {round_number}); {mutation} would change the "
+        "files under review. Approve only if you mean it."
+    )
+
+
 def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
-    """Apply the git guard to shell commands, then the search scope while Craftsman is at work."""
+    """Guard shell commands against git and work-tree violations, then enforce search scope."""
     guard_reply = _check_shell_git_guard(hook, reply)
     if guard_reply is not None:
         return guard_reply
+    worktree_reply = _check_worktree_guard(hook, reply, session)
+    if worktree_reply is not None:
+        return worktree_reply
     if session is None or not is_scope_checked_tool(hook.tool_name):
         return reply.allow()
     if not _serves_owned_gate(session, caller) and not is_craftsman_agent(hook.agent):

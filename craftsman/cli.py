@@ -24,6 +24,12 @@ from craftsman.hooks import main as hook_main
 from craftsman.install import install_main
 from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens
 from craftsman.manifest import InstallError
+from craftsman.playbooks import (
+    CODE_REVIEW_SKILL,
+    LENSES_FILENAME,
+    expand_playbook_lenses,
+    lens_playbooks,
+)
 from craftsman.records import VERDICTS, Ledger, LedgerError
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
@@ -153,13 +159,28 @@ class StatusReport:
         )
 
 
+def _status_base_and_scope(
+    root: Path, state: GateState | None
+) -> tuple[str | None, tuple[str, ...] | None]:
+    if state is not None and state.active:
+        return state.base_sha, None
+    try:
+        ledger = load(ledger_path_for(root))
+    except LedgerError:
+        ledger = Ledger()
+    if ledger.rounds:
+        return ledger.rounds[-1].base_sha, ledger.current_scope
+    return (state.base_sha if state is not None else None), None
+
+
 def run_status(cwd: str | None, *, as_json: bool) -> int:
     """Show the work tree's gate, its cumulative diff and the evidence ledger."""
     try:
         root = worktree_root(cwd or os.getcwd())
         state_path = state_path_for(root)
         state = load_state(state_path)
-        snap = snapshot(root, resolve_base_sha(root, state.base_sha if state is not None else None))
+        base_ref, scope = _status_base_and_scope(root, state)
+        snap = snapshot(root, resolve_base_sha(root, base_ref), scope)
     except (DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"craftsman status: error: {exc}\n")
         return 1
@@ -247,6 +268,13 @@ def _build_skill_parser() -> argparse.ArgumentParser:
     show_p.add_argument(
         "--file", dest="rel_file", help="Relative file inside the skill directory (e.g. lenses.md)"
     )
+    show_p.add_argument(
+        "--lenses",
+        help=(
+            "Comma-separated lens ids or reviewer groups (code-review only), "
+            "e.g. intent,contracts or R3"
+        ),
+    )
     list_p = sub.add_parser(
         "list",
         parents=[common],
@@ -287,6 +315,27 @@ def _list_skills(known: dict[str, Skill], *, as_json: bool) -> int:
     return 0
 
 
+def _read_skill_show_content(
+    skill_dir: Path, skill_name: str, rel_file: str | None, raw_lenses: str | None
+) -> str:
+    if raw_lenses is None:
+        target = (
+            _validate_skill_relative_file(skill_dir, rel_file, skill_name)
+            if rel_file is not None
+            else (skill_dir / "SKILL.md").resolve()
+        )
+        return target.read_text(encoding="utf-8")
+    if skill_name != CODE_REVIEW_SKILL:
+        raise ValueError(
+            f"--lenses is only supported for skill {CODE_REVIEW_SKILL!r} (got {skill_name!r})"
+        )
+    if rel_file is not None:
+        raise ValueError("--lenses cannot be combined with --file")
+    expanded = expand_playbook_lenses(raw_lenses)
+    target = _validate_skill_relative_file(skill_dir, LENSES_FILENAME, skill_name)
+    return lens_playbooks(target.read_text(encoding="utf-8"), expanded)
+
+
 def skill_main(argv: list[str]) -> int:
     parser = _build_skill_parser()
     args = parser.parse_args(argv)
@@ -313,16 +362,11 @@ def skill_main(argv: list[str]) -> int:
         return 0
 
     try:
-        target = (
-            _validate_skill_relative_file(skill_dir, args.rel_file, skill_name)
-            if args.rel_file is not None
-            else (skill_dir / "SKILL.md").resolve()
-        )
-    except (ValueError, FileNotFoundError) as exc:
+        content = _read_skill_show_content(skill_dir, skill_name, args.rel_file, args.lenses)
+    except (ValueError, OSError) as exc:
         sys.stderr.write(f"craftsman skill: error: {exc}\n")
         return 2
 
-    content = target.read_text(encoding="utf-8")
     sys.stdout.write(content if content.endswith("\n") else content + "\n")
     return 0
 

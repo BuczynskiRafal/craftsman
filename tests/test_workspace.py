@@ -55,10 +55,10 @@ class StateTests(WorkspaceTestCase):
 
         self.assertEqual((workspace.state, workspace.task), (None, ""))
 
-    def test_current_snapshot_measures_from_the_task_base(self) -> None:
+    def test_snapshot_measures_from_the_task_base(self) -> None:
         open_gate(self.repo.root, self.head, task="fix")
 
-        snap = open_workspace(str(self.repo.root)).current_snapshot()
+        snap = open_workspace(str(self.repo.root)).snapshot()
 
         self.assertEqual([hunk.path for hunk in snap.hunks], ["app.py"])
 

@@ -41,9 +41,9 @@ on one line (no `\` continuations, which PowerShell and cmd do not understand).
 
 | Gear | When | Review | Verification |
 | :--- | :--- | :--- | :--- |
-| `quick` | `--quick`, or automatic for ≤ 40 changed lines in ≤ 2 files | lenses `intent`, `contracts`, `craft` (+ any triggered by risk signals), done by you inline | one passing test run |
-| `standard` | default | all always-on lenses + triggered ones, done by fresh-context reviewer subagents, plus a final sweep and a verifier | passing test run at the final diff |
-| `deep` | `--deep` or `ultracraft` | every lens, reviewers + sweep + verifier | passing tests **and** an end-to-end run at the final diff |
+| `quick` | `--quick`, or automatic for ≤ 40 changed lines in ≤ 2 files (no skipped binary/oversized files; or docs-only) | lenses `intent`, `contracts`, `failure` (+ `trust` on security signals; `intent`, `craft` for docs-only), done by you inline with multi-lens `--files` coverage (no `sweep`) | one passing test run |
+| `standard` | default | always-on lenses + narrower signal-triggered lenses, done by 1–2 fresh-context reviewer subagents (or shards) + a final sweep reviewer, plus a verifier when findings exist | passing test run at the final diff |
+| `deep` | `--deep` or `ultracraft` | every lens, shard or `R1`–`R4` reviewers + sweep reviewer, plus a verifier when findings exist | passing tests **and** an end-to-end run at the final diff |
 
 `auto` gear upgrades itself: once the diff outgrows the quick limits, the gate demands the
 standard workflow.
@@ -87,34 +87,59 @@ If its baseline test run fails because of what you built in Stage 1, fix that fi
 ```bash
 craftsman review prepare
 ```
-(`--tier <quick|standard|deep>` only to raise the tier; it never goes below the gate's.) Read the
-printed packet completely, and the convention files it lists. Its header shows the tier this round
-resolved to and the lenses it needs. Then write the **intent brief** of `/code-review` Step 1 —
-3–8 bullets: what the change must achieve and which hunk achieves each part.
+(`--tier <quick|standard|deep>` only to raise the tier; it never goes below the gate's.) Inspect
+the printed summary (`Suggested reviewer shards: N` on `standard`/`deep`), the packet header
+(resolved tier, selected lenses, and any mechanical `Quality signals` `S1..Sn`), and the convention
+files it lists. Every `S#` signal must be closed via `craftsman review add --signal S# ...` or
+`craftsman review ack S# --reason "..."` (`diff-size` hands off to the user). Then write the
+**intent brief** of `/code-review` Step 1 — 3–8 bullets: what the change must achieve and which
+hunk achieves each part.
 
 ### 2.3 Review through lenses
-- **quick:** apply the selected lenses yourself, one at a time, `sweep` last if selected.
+- **quick:** load the round's playbooks via `craftsman skill show code-review --lenses <round-lenses>`,
+  apply the selected lenses inline yourself (opening the real files for enclosing scopes), and
+  record a single multi-lens `--files` coverage entry per batch of 1–4 files
+  (`craftsman review cover --lens intent,contracts,failure --files a.py,b.py --note "..."`, >= 80
+  chars concrete detail per file when >= 2 lenses are combined; there is no `sweep` lens on `quick`).
 - **standard / deep — two waves, never inline while subagents exist** (your context is full of
-  the reasoning that produced the code, which is exactly what hides its defects):
-  1. *Wave 1, in parallel:* `craftsman-reviewer` subagents assigned by fixed reviewer groups
-     (`REVIEWER_GROUPS` in `craftsman/lenses.py`), omitting unselected lenses and skipping empty
-     groups:
-     - **R1** (callers & contracts): `intent`, `contracts`, `ripple`, `tests`
-     - **R2** (failure paths & state): `failure`, `state`, `trust`, `model`
-     - **R3** (environment & clarity): `platform`, `craft`
-     - **R4** (whole-change design): `design`
-     Build a packet view for each active reviewer group with
-     `craftsman review view --lenses <group-or-lenses> [--hunks <range>]` and give each its packet
-     view path, the intent brief and its lenses (each reviewer reads your view completely, the full
-     packet only for a hunk outside your view that you need). On a small fix round (one or two open
-     hunks) one reviewer may take every non-sweep lens.
-  2. *Wave 2, after wave 1 has finished:* one more `craftsman-reviewer` for lens `sweep` only,
-     followed by `craftsman-verifier`.
+  the reasoning that produced the code, which is exactly what hides its defects). Run **at most 2
+  subagents concurrently** (`--parallel 2` default), queuing the rest:
+  1. *Wave 1:* check `Suggested reviewer shards: N` from `craftsman review prepare`:
+     - **When `N > 1` (`standard` or `deep`):** assign `N` `craftsman-reviewer` subagents by **shard**
+       (`craftsman review view --shard K/N --lenses <all-selected-lenses-except-sweep>` for
+       `K = 1..N`), **not** by `R1`–`R4` groups (each shard header lists `Files in this shard: ...`
+       for `design`).
+     - **When `N = 1` on `standard`:** assign **1** `craftsman-reviewer` for all selected
+       non-`sweep` lenses (`craftsman review view --shard 1/1 --lenses <non-sweep-lenses>`), or **2**
+       reviewers splitting lens groups if a single large file pushes the packet past `60k` chars
+       (`MAX_VIEW_CHARS`).
+     - **When `N = 1` on `deep`:** assign `craftsman-reviewer` subagents by fixed reviewer groups
+       (`REVIEWER_GROUPS` in `craftsman/lenses.py`), omitting unselected lenses and skipping empty
+       groups (`craftsman review view --lenses R1`, etc.):
+       - **R1** (callers & contracts): `intent`, `contracts`, `ripple`, `tests`
+       - **R2** (failure paths & state): `failure`, `state`, `trust`, `model`
+       - **R3** (environment & clarity): `platform`, `craft`
+       - **R4** (whole-change design): `design`
+       (On a small delta fix round with 1–2 open hunks, one reviewer may take all non-`sweep` lenses.)
+     Give each reviewer only its view/shard path, the intent brief, and its assigned lenses. Each
+     reviewer loads only its own playbooks (`craftsman skill show code-review --lenses <assigned>`),
+     reads only its view/shard, and flushes findings and multi-lens coverage **incrementally** after
+     every 1–4 hunks or every 2–3 lenses (`"lenses": [...]` for hunk lenses with >= 80 chars per
+     hunk; `"design"` separately on `"files"`).
+  2. *Wave 2, after Wave 1 has finished:* one dedicated `craftsman-reviewer` for lens `sweep` only.
+  - **Subagent failure (rate limit, quota, timeout):** never enter respawn loops. Retry a failed
+    subagent **at most once, sequentially**; if that retry also fails, run
+    `craftsman gate --await-user`, report what failed and what remains uncovered/unverified to the
+    user, and wait for their instruction.
 
-### 2.4 Challenge findings
-- **standard / deep:** a `craftsman-verifier` subagent gives every finding a verdict — always, even
-  for one finding. Give it the packet path and the intent brief.
-- **quick:** do `/code-review` Step 3 yourself.
+### 2.4 Challenge findings (only when unjudged findings exist)
+- **0 findings awaiting a verdict:** skip this step — do **not** spawn `craftsman-verifier` — and
+  proceed to **2.6** (once all `S#` quality signals are resolved or acknowledged).
+- **standard / deep (>= 1 unjudged finding):** spawn a `craftsman-verifier` subagent to deduplicate
+  same-root-cause findings (`review merge`) and record a verdict for every finding. Pass it the
+  intent brief (the verifier uses `craftsman review show`, `craftsman review show --hunks`, and
+  targeted source reads instead of reading `packet-N.md`).
+- **quick (>= 1 unjudged finding):** do `/code-review` Step 3 yourself inline.
 
 ### 2.5 Fix and loop
 For every `proven` and `probable` finding:
