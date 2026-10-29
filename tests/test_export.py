@@ -108,11 +108,13 @@ class AgentRenderingTests(ExportTestCase):
                 )
                 self.assertNotIn("runSubagent", rendered)
 
-    def test_reviewer_includes_the_lens_playbook(self) -> None:
+    def test_reviewer_loads_assigned_lenses_without_inlining_playbook(self) -> None:
         reviewer = render_copilot_agent(self.templates()["craftsman-reviewer"])
         lenses = (REPO_ROOT / "skills" / "code-review" / "lenses.md").read_text(encoding="utf-8")
 
-        self.assertIn(lenses.strip().splitlines()[-1], reviewer)
+        self.assertIn("craftsman skill show code-review --lenses", reviewer)
+        self.assertIn("## Search scope", reviewer)
+        self.assertNotIn(lenses.strip().splitlines()[-1], reviewer)
         self.assertNotIn("{{include", reviewer)
 
     def test_claude_subagents_list_their_tools(self) -> None:
@@ -246,12 +248,31 @@ class SkillExportTests(ExportTestCase):
         self.assertFalse((out / "code-review" / "lenses.md").is_symlink())
 
     def test_claude_commands_inline_linked_siblings(self) -> None:
-        export.export_to_claude_user(REPO_ROOT, self.tmp)
+        synthetic = self.fake_repo("body\n")
+        (synthetic / "rules").mkdir()
+        (synthetic / "rules" / "r.md").write_text("Rule.\n", encoding="utf-8")
+        demo_dir = synthetic / "skills" / "demo"
+        demo_dir.mkdir(parents=True)
+        (demo_dir / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: Demo skill.\n---\nSee [guide.md](guide.md) and [missing](missing.md).\n",
+            encoding="utf-8",
+        )
+        (demo_dir / "guide.md").write_text(
+            "---\nname: guide\n---\n# Guide Heading\n\nGuide body.\n", encoding="utf-8"
+        )
+        export.export_to_claude_user(synthetic, self.tmp / "synthetic-claude")
+        demo_cmd = (self.tmp / "synthetic-claude" / "commands" / "demo.md").read_text(encoding="utf-8")
+        self.assertIn("\n## Appendix: guide.md\n\n# Guide Heading\n\nGuide body.\n", demo_cmd)
+        self.assertNotIn("## Appendix: missing.md", demo_cmd)
 
-        review = (self.tmp / "commands" / "code-review.md").read_text(encoding="utf-8")
-        verify = (self.tmp / "commands" / "verify.md").read_text(encoding="utf-8")
-        self.assertIn("\n## Appendix: lenses.md\n\n# Craftsman Review Lenses\n", review)
+        export.export_to_claude_user(REPO_ROOT, self.tmp / "claude")
+
+        review = (self.tmp / "claude" / "commands" / "code-review.md").read_text(encoding="utf-8")
+        verify = (self.tmp / "claude" / "commands" / "verify.md").read_text(encoding="utf-8")
+        self.assertNotIn("## Appendix: lenses.md", review)
+        self.assertNotIn("## Appendix", review)
         self.assertNotIn("## Appendix", verify)
+        self.assertIn("craftsman skill show code-review --lenses", review)
 
     def test_users_agent_file_is_moved_aside(self) -> None:
         mine = self.tmp / "agents" / "craftsman-reviewer.md"

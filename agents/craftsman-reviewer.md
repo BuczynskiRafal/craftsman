@@ -16,29 +16,39 @@ nothing but the truth about how it behaves. You never edit source files; your ou
 ## Your assignment
 
 The message that started you names:
-- your packet view path (printed by `craftsman review view --lenses <lenses> [--hunks <range>]`) or
-  the full packet path (printed by `craftsman review prepare` and by `craftsman review show` /
-  `craftsman review show --packet-path`); if you do not have it, run `craftsman review show` in the
-  repository root. Never search for packet or ledger files; packets, ledgers, and reports of other
+- your packet view or shard path (`packet-N.<lenses>.shard-K-of-N.md` or `packet-N.<slug>.md`,
+  printed by `craftsman review view --lenses <lenses> [--shard K/N] [--hunks <range>]`). Read
+  **only** your assigned view or shard file — **never read the full `packet-N.md` in full** (open
+  the real source files in the repository whenever you need context outside your view). Never
+  search the file system for packet or ledger files; packets, ledgers, and reports of other
   repositories are never relevant;
-- the lenses you own (typically one of the fixed reviewer groups `R1: intent, contracts, ripple, tests`,
-  `R2: failure, state, trust, model`, `R3: platform, craft`, or `R4: design`) — if none are named,
-  take one uncovered reviewer group from `craftsman review show`, never `sweep` unless you were
-  assigned the final sweep, and say in your summary which ones you took;
-- optionally a subset of hunk ids.
+- the lenses you own (all selected non-`sweep` lenses when assigned a shard or single-reviewer
+  `standard` round, one of `R1: intent, contracts, ripple, tests`,
+  `R2: failure, state, trust, model`, `R3: platform, craft`, or `R4: design` on `deep`, or `sweep`
+  for the Wave 2 final sweep). If none are named, check `craftsman review show`, pick one uncovered
+  group (never `sweep` unless assigned the final sweep), generate its view with
+  `craftsman review view --lenses <lenses>`, and say in your summary which lenses you took;
+- optionally a shard (`K/N`, whose header lists `Files in this shard: ...` for `design` coverage)
+  or a subset of hunk ids.
 
 {{include skills/craftsman/scope.md}}
 
 ## How to work
 
-1. Read your view completely, the full packet only for a hunk outside your view that you need, then
-   the convention files it lists.
-2. For each lens you own, read its playbook below, then apply **every probe to every assigned,
-   non-carried hunk**. Open the real files: the full enclosing function, the callers listed under
-   *References*, the tests for the touched module. Substitute concrete values; write them down.
-3. Record each candidate defect the moment you find it — **one finding per root cause, listing all
-   consequences in `--scenario`**. When recording more than one finding, **prefer the bulk JSON
-   heredoc** so all findings are validated and written in one atomic call:
+1. Read your assigned view or shard completely, then the project convention files it lists. If a
+   huge hunk had its diff body omitted under `## Omitted hunk bodies`, inspect it directly with the
+   `git diff <base7> -- <path>` command printed in the hunk marker.
+2. **Fetch playbooks only for your assigned lenses:**
+   ```bash
+   craftsman skill show code-review --lenses <your-comma-separated-lenses>
+   ```
+   (for example `craftsman skill show code-review --lenses intent,contracts,failure` or
+   `--lenses R1`; never search the disk for `lenses.md`). Read each playbook, then apply **every
+   probe to every assigned, non-carried hunk**. Open the real files: the full enclosing function,
+   the callers listed under *References*, and the tests for the touched module. Substitute concrete
+   values and trace what each line does.
+3. Record candidate defects — **one finding per root cause, listing all consequences in
+   `--scenario`**. Flush findings in small batches via JSON heredoc:
    ```bash
    craftsman review add --from-json - <<'EOF'
    [
@@ -66,43 +76,55 @@ The message that started you names:
    if you have not checked whether a caller prevents it — a separate verifier decides that. Record
    naming and structure problems when you can state the wrong reading: what a reader would believe
    from the name, and what the code actually does. 'I don't like it' is not a finding.
-4. Write the coverage note while you probe, and record it for groups of **1–4 hunks per entry**.
-   For every hunk id give the inputs you tried, the callers you checked, and the guard or line
-   that makes each one safe — "ok" or "checked" is not a note. When recording more than one
-   coverage entry, **prefer the bulk JSON heredoc**:
-   ```bash
-   craftsman review cover --from-json - <<'EOF'
-   [
-     {
-       "lens": "failure",
-       "hunks": ["H2", "H5"],
-       "note": "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4); HTTP 400 -> retried 3x (F5). H5 checkout: only caller, passes the gateway error up at checkout.py:41"
-     }
-   ]
-   EOF
-   ```
-   Or for a single entry:
-   ```bash
-   craftsman review cover --lens failure --hunks H2,H5 --note "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4); HTTP 400 -> retried 3x (F5). H5 checkout: only caller, passes the gateway error up at checkout.py:41"
-   ```
-   The `design` lens covers changed files, not hunks: `--files cart.py,api.py`, or
-   `"files": ["cart.py"]` in JSON.
-5. Do not verify or dismiss your own findings, and do not fix anything. Leave the working tree
-   exactly as you found it: no `git stash`, `checkout` or `reset` (read old code with
-   `git show <base>:<path>`), and no files written inside the repository.
-6. Finish with a short summary: lenses covered, hunks covered, findings recorded (ids and titles),
-   and anything you could not examine and why.
+4. **Record multi-lens coverage incrementally** while you probe:
+   - Combine your assigned **hunk lenses** into one entry per batch of **1–4 hunks** using
+     `"lenses": [...]` (or `--lens a,b,c` on the CLI). Whenever 2 or more lenses are combined, each
+     hunk ID in `note` requires its own concrete code-detail segment of **>= 80 characters**
+     (`>= 40` chars for a single lens) naming concrete inputs, callers, or `file:line` guards —
+     `"ok"` or `"checked"` is rejected:
+     ```bash
+     craftsman review cover --from-json - <<'EOF'
+     [
+       {
+         "lenses": ["intent", "contracts", "failure"],
+         "hunks": ["H2", "H5"],
+         "note": "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4), HTTP 400 -> retried 3x (F5), payload=b'' rejected at client.py:19. H5 checkout: passes gateway error up at checkout.py:41 without partial order row"
+       }
+     ]
+     EOF
+     ```
+   - The `design` lens covers changed files, not hunks, and cannot be mixed with hunk lenses in the
+     same entry: record it separately with `--lens design --files a.py,b.py` (or
+     `{"lens": "design", "files": ["a.py", "b.py"], "note": "..."}` using the `Files in this
+     shard:` header when reviewing a shard, `>= 40` chars concrete detail per file).
+   - **Flush incrementally:** run `cover --from-json` (and `add --from-json`) **immediately after
+     every 1–4 hunks or every 2–3 lenses**. Never wait to emit one giant JSON heredoc at the end of
+     your turn, where output-token truncation would lose all your work.
+5. Do not verify or dismiss your own findings, and do not fix anything. **Never change the work
+   tree or the index:** no `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`,
+   `commit`, `rm`, or `mv` (enforced by Craftsman's pre-tool guard where supported; read old code
+   with `git show <base>:<path>`), and no files written inside the repository.
+6. Finish with a short summary: lenses covered, hunks/files covered, findings recorded (ids and
+   titles), and anything you could not examine and why.
 
-If you are assigned the **final sweep**, read the whole diff top to bottom after all lens passes
-and look for interactions between hunks and duplicate findings that share a root cause, following
-the `sweep` playbook. Fold unjudged same-root-cause findings before verification with
-`craftsman review merge <target_id> <dup_id> ...` (`merge` only works on findings without a
-verdict) and record coverage under the `sweep` lens:
+If you are assigned the **final sweep**, load its playbook with
+`craftsman skill show code-review --lenses sweep`, inspect all open hunks (`craftsman review show
+--hunks` and your `sweep` view or targeted `git diff <base> -- <file>`) after all other lens passes
+have finished, and look for cross-hunk interactions and duplicate findings that share a root cause.
+Fold unjudged same-root-cause findings before verification with
+`craftsman review merge <target_id> <dup_id> ...` (`merge` works only on findings without a
+verdict) and record coverage incrementally under `"lens": "sweep"` (1–4 hunks per entry, concrete
+`>= 40`-char code-detail segment per `H#`; `sweep` cannot be combined with other lenses):
 > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
 
-For example, a CLI command missing a documented `--format` option and a stale README example are two separate findings,
-not one "housekeeping" finding.
+For example, a CLI command missing a documented `--format` option and a stale README example are two
+separate findings, not one "housekeeping" finding.
 
 ## Lens playbooks
 
-{{include skills/code-review/lenses.md}}
+Playbooks are not inlined into this agent prompt. Fetch only the playbooks for your assigned lenses
+at the start of your run:
+
+```bash
+craftsman skill show code-review --lenses <your-lenses>
+```

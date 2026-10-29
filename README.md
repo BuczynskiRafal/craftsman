@@ -1,7 +1,5 @@
 # Craftsman: evidence-gated engineering loop for AI coding agents
 
-**English** · [Polski](README.pl.md)
-
 [![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
 [![mypy --strict](https://img.shields.io/badge/mypy-strict-blue.svg)](pyproject.toml)
@@ -35,7 +33,7 @@ An agent's review of its own change usually fails for three reasons:
 
 ## Benchmark
 
-Pilot from 26 October 2026 on [SWR-Bench](https://doi.org/10.1145/3808144) data (see
+Pilot from October 2026 on [SWR-Bench](https://doi.org/10.1145/3808144) data (see
 [Citation](#citation)). Five pull requests from real projects: three from `pytest`, one each from
 `flask` and `requests`. Each agent reviewed them twice: alone and with the `/code-review` protocol.
 Both runs had the same model, PR description, and output format. The agents did not see the ground
@@ -44,22 +42,23 @@ changelog). Two are labeled clean in the dataset.
 
 | Agent | Model and thinking level | Variant | Defects found | Avg time per PR | Findings reported |
 | :--- | :--- | :--- | :---: | :---: | :---: |
-| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | without Craftsman, 2 repetitions | **22%** (2/9, 2/9) | 4.8 min | 15 |
-| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | with Craftsman, 2 repetitions | **72%** (6/9, 7/9) | 10.8 min | 34 |
+| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | without Craftsman, 3 repetitions | **22%** (2/9, 2/9, 2/9) | 4.9 min | 22 |
+| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | with Craftsman, 3 repetitions | **74%** (6/9, 7/9, 7/9) | 10.6 min | 53 |
 | Claude Code | Claude Sonnet 5.5, high (`claude-sonnet-5-5`) | without Craftsman, 1 repetition | **56%** (5/9) | 0.4 min | 9 |
 | Claude Code | Claude Sonnet 5.5, high (`claude-sonnet-5-5`) | with Craftsman, 1 repetition | **78%** (7/9) | 9.0 min | 19 |
 
-On Antigravity, the agent without Craftsman found the same 2 defects in both repetitions. With
-Craftsman, it found 6 and 7, including both earlier ones. The new catches were mostly mismatches
+On Antigravity, the agent without Craftsman found the same 2 defects in all three repetitions. With
+Craftsman, it found 6, 7, and 7, including both earlier ones. The new catches were mostly mismatches
 between code and docs or changelog, weakened tests, and a timestamp handling bug in `pytest`.
 
 On Claude Code, the variant without Craftsman is a single reply after a few dozen seconds. With
 Craftsman, the agent goes through the lenses and verification.
 
-The verifier dismissed 32 findings: 31 duplicates merged by root cause and one false alarm disproved
-by a reproduction script. No real defect was dismissed. On the clean `pytest-5680`, neither variant
-reported anything. On `requests-764`, also labeled clean, both variants reported comments. The
-dataset does not grade them, so they are not counted in the score.
+The verifier dismissed 60 findings: 58 duplicates merged by root cause, one candidate dismissed
+against existing file conventions, and one false alarm disproved by a reproduction script. No real
+defect was dismissed. On the clean `pytest-5680`, neither variant reported anything. On
+`requests-764`, also labeled clean, both variants reported comments. The dataset does not grade
+them, so they are not counted in the score.
 
 ## How it works
 
@@ -143,23 +142,24 @@ gear and by the risk signals in the diff.
 | :--- | :--- | :--- |
 | `intent` | missing pieces, incomplete change propagation, unrequested changes, fixes in the wrong layer | always |
 | `contracts` | input domains, boundary conditions, truthiness, wrong variable, inconsistent return values | always |
-| `craft` | code reuse, needless complexity, misleading names and comments, wasted work | always |
-| `failure` | swallowed errors, partial side effects, retries, fail-open guards | `standard`+ or error and I/O signals |
+| `failure` | swallowed errors, partial side effects, retries, fail-open guards | always (except `docs-only` changes) |
+| `craft` | code reuse, needless complexity, misleading names and comments, wasted work | `standard`+ and `docs-only` changes |
+| `design` | overall design and size of the change, what can be simplified or removed (file-level `--files` coverage) | `standard`+ |
 | `ripple` | broken callers, removed guarantees, overridden methods, persisted data compatibility | `standard`+ or deletions and config |
 | `tests` | tests that would pass even if the change were wrong | `standard`+ or test files |
-| `state` | aliasing, caches, check-then-act races, `async` bugs, clocks | `deep` or concurrency, filesystem, time signals |
-| `trust` | untrusted data in shells, SQL, paths, deserializers; authorization | `deep` or process, SQL, auth, network signals |
-| `platform` | paths, encodings, shells, versions across operating systems | `deep` or platform signals |
+| `state` | aliasing, caches, check-then-act races, `async` bugs, clocks | `deep` or concurrency and time signals |
+| `trust` | untrusted data in shells, SQL, paths, deserializers; authorization | `deep` or process, SQL, deserialization, auth signals (in `standard` also network and regex) |
+| `platform` | paths, encodings, shells, versions across operating systems | `deep` or platform and time signals |
 | `model` | invalid states allowed by the data model | `deep` or new types |
-| `sweep` | interactions between hunks, at the end, fresh reviewer | `standard`+ |
+| `sweep` | interactions between hunks, at the end | `standard`+ |
 
 ### Gears
 
 | Gear | Trigger | Review | Verification |
 | :--- | :--- | :--- | :--- |
-| `quick` | `--quick` or automatically for ≤ 40 changed lines in ≤ 2 files | `intent`, `contracts`, `craft` + signal-triggered lenses, in the current context | passing tests |
-| `standard` | default | always-on + signal-triggered lenses in subagents, `sweep`, verifier | passing tests on the final code |
-| `deep` | `--deep` or the `ultracraft` keyword | all lenses, reviewers, `sweep`, verifier | passing tests **and** e2e |
+| `quick` | `--quick`, automatically in `/craftsman` for ≤ 40 changed lines in ≤ 2 files, and **by default in standalone `/code-review` (review-only) up to 250 changed lines** (plus `docs-only` changes; skipped binary/oversized files escalate to `standard`) | `intent`, `contracts`, `failure` (+ `trust` on security signals; `intent` and `craft` for `docs-only`), single inline agent (0 subagents), multi-lens `--files` coverage, no `sweep` | in `/craftsman`: passing tests; in review-only: inline static verification only when findings exist (max 3 reproductions) |
+| `standard` | default in `/craftsman`, and above 250 changed lines in review-only | always-on + narrower signal-triggered lenses in 1–2 `craftsman-reviewer` subagents or shards (`review view --shard K/N`, `--parallel` limit 2 by default), `sweep` (inline when 0 findings in review-only), `craftsman-verifier` only when findings exist | in `/craftsman`: passing tests on the final code |
+| `deep` | `--deep` / `--tier deep` or the `ultracraft` keyword | all 12 lenses (shards or `R1`–`R4` groups), `sweep`, `craftsman-verifier` when findings exist | passing tests **and** e2e |
 
 ### Platform enforcement
 
@@ -213,7 +213,7 @@ craftsman export --workspace path/to/repo          # .github/ for a team reposit
 craftsman export --claude-dir                      # ~/.claude (settings.json is merged, a .bak is kept)
 craftsman doctor                                   # installation health, hooks, agents, duplicates, drift
 craftsman skill list                               # list bundled skills without searching the disk
-craftsman skill show code-review --file lenses.md  # print a bundled skill or companion file
+craftsman skill show code-review --lenses intent,contracts,failure  # print selected lens playbooks
 ```
 
 | `craftsman install` / `install.sh` flag | Effect |
@@ -269,22 +269,40 @@ In Copilot Chat or Claude Code:
 ```
 /craftsman add pagination to the catalog search
 /craftsman --deep migrate the session store to Redis
-/code-review                      # review only, findings + verdicts, no fixes
+/code-review                      # review only (quick up to 250 changed lines), frozen scope
+/code-review --staged             # review only files currently staged
+/code-review --paths src/api/     # review only changed files under src/api/
 /code-review --fix                # review, fix, re-review
 ```
 
 - `craftsman status`: gear, round, missing evidence.
-- `craftsman review show`: coverage, findings, runs.
+- `craftsman review show` (`--hunks`): coverage, findings, runs, and a compact map of open hunks
+  (`H# -> file:lines`, used by the verifier and `sweep` without reading the full packet).
+- `craftsman review view --lenses <lenses> [--shard K/N]`: per-reviewer views and file-disjoint
+  shards (`40k`-char budget for `quick` with scope pointers only, `120k` for `standard`/`deep`,
+  `60k` per shard view).
 - `craftsman review report`: final report for the user.
 
-A review without `--fix` finishes with `craftsman review check --review-only` and
-`craftsman review report --review-only`. They check the round, lens and `sweep` coverage, and
-verdicts, without requiring fixes or tests. The result is
-`**Craftsman review: COMPLETE (review-only)**` / `Review: COMPLETE (review-only)` or
-`**Craftsman review: INCOMPLETE (N open items)**`.
+In review-only mode, the first round (`review prepare`, optionally with `--staged`, `--tracked`, or
+`--paths <csv>`) **freezes the list of changed files** (including both old and new paths of renamed
+files). Files created later outside that scope (for instance by a second agent session in the same
+checkout) are reported as `Ignored (outside the review scope): ...` and do not invalidate the round;
+in `--fix` mode, `review prepare --add-paths <csv>` extends the scope when a fix creates or edits
+additional files (such as a new regression test), and after a completed review `prepare` hints to
+run `craftsman review reset` before starting a new review.
 
-Review also works before the first commit, using the empty tree as the base. `craftsman review reset`
-archives the ledger and packets, for instance a ledger that cannot be read.
+A review without `--fix` finishes with `craftsman review check --review-only` and
+`craftsman review report --review-only`. They check the round within the frozen scope, coverage of
+selected lenses (`sweep` only from `standard` up), quality signals (`S#`), and verdicts, without
+requiring fixes or tests (`COMPLETE (review-only)` or `INCOMPLETE (N open items)`). If a subagent
+hits a rate limit or timeout after one sequential retry, the review finishes with
+`craftsman review report --review-only --partial` (`PARTIAL (review-only, N open items)` with a
+`## Not covered` section and `(unverified)` markers).
+
+Review also works before the first commit, using the empty tree as the base. Older views and
+packets in `.git/craftsman` are pruned automatically when new rounds open, and retained archives
+are capped by `CRAFTSMAN_KEEP_ARCHIVES` (default `5`). `craftsman review reset` archives the ledger
+and packets (required when moving from an older v1 ledger schema to v2).
 
 ## Skills
 
@@ -317,6 +335,14 @@ archives the ledger and packets, for instance a ledger that cannot be read.
 - **Git guard** (`craftsman guard`, `craftsman hook pre-tool`, global `pre-push` and `commit-msg`
   hooks): blocks unconfirmed pushes to `main`/`master`, including through `bash -c`, aliases, and
   `gh pr merge`. Rejects commits, tags, and PRs with AI attribution trailers.
+- **Work-tree mutation guard** (`craftsman hook pre-tool`, `find_worktree_mutation`): denies (`deny`)
+  work-tree and index-mutating Git commands for `craftsman-reviewer` and `craftsman-verifier`
+  (`git stash` except `list`/`show`/`create`, `reset`, `checkout`, `switch`, `restore`, `clean`,
+  plus `commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `apply`, `pull`, `rm`, `mv` for
+  subagents), and asks for user confirmation (`ask`) in the main session while a review-only round
+  is open (leaving `/craftsman` gate sessions and work outside review unblocked). Enforced on
+  platforms with `PreToolUse` hooks (Claude Code, VS Code Copilot, Copilot CLI); on Codex and
+  `agy -p` the skill prohibition applies.
 - **Search scope guard** (`craftsman hook pre-tool`, [`craftsman/scope.py`](craftsman/scope.py)):
   confines Craftsman sessions and `craftsman-*` subagents to the current git work tree.
 
@@ -347,9 +373,6 @@ During an active `/craftsman` session (or inside a `craftsman`, `craftsman-revie
   git config craftsman.scope warn
   git config craftsman.scope off
   ```
-
-Guards protect against an agent that rushes or forgets a step. They are not a sandbox: an agent
-that deliberately edits Craftsman's state files will bypass the gate.
 
 ## Development
 
