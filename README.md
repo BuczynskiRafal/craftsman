@@ -4,7 +4,7 @@
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
 [![mypy --strict](https://img.shields.io/badge/mypy-strict-blue.svg)](pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](pyproject.toml)
-[![Version](https://img.shields.io/badge/version-3.2.0-emerald.svg)](plugin.json)
+[![Version](https://img.shields.io/badge/version-3.3.0-emerald.svg)](plugin.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Craftsman is a quality loop for AI coding agents. After implementing a change, the agent simplifies
