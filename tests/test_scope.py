@@ -970,12 +970,16 @@ class ScopeEnforcementTests(unittest.TestCase):
             '[{"lens": "intent", "hunks": ["H1"], "note": "ok"}]\n'
             "'@ | craftsman review cover --from-json -"
         )
-        ps_non_closer_body = "@'\n'@not_a_closer\n'@ | craftsman review cover --from-json -"
+        ps_redirect = "@'\n[]\n'@>out.json\ncraftsman review cover --from-json out.json"
         for tool, cmd, expected in (
             ("Bash", "printf 'ok' foo@'\necho hi'", "allow"),
             ("Bash", 'printf "ok" user@"\nhost"', "allow"),
             ("pwsh", ps_cover, "allow"),
-            ("pwsh", ps_non_closer_body, "allow"),
+            ("pwsh", ps_redirect, "allow"),
+            ("pwsh", "$a = @'\nx\n'@.Trim()", "allow"),
+            ("pwsh", "$a = @'\nx\n'@+(cat ~/.zsh_history)+@'\ny's\n'@", "deny"),
+            ("pwsh", "$a = @'\nx\n'@,(cat ~/.zsh_history),@'\ny's\n'@", "deny"),
+            ("pwsh", "$a = @'\nx\n'@.Trim() + (cat ~/.zsh_history)", "deny"),
         ):
             with self.subTest(cmd=cmd):
                 dec = evaluate_scope(tool, {"command": cmd}, self.repo, self.repo, self.policy)
@@ -988,15 +992,12 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.assertEqual(chained_dec.decision, "deny")
         self.assertNotIn("unmatched quotes", chained_dec.reason)
 
-        for unclosed in ("@'\n[{\"lens\": \"intent\"}]\n", "@'\n'@not_a_closer\n"):
-            with self.subTest(unclosed=unclosed):
-                err = io.StringIO()
-                with redirect_stderr(err):
-                    dec = evaluate_scope(
-                        "pwsh", {"command": unclosed}, self.repo, self.repo, self.policy
-                    )
-                self.assertEqual(dec.decision, "deny")
-                self.assertIn("has unmatched quotes", dec.reason)
+        unclosed = "@'\n[{\"lens\": \"intent\"}]\n"
+        err = io.StringIO()
+        with redirect_stderr(err):
+            dec = evaluate_scope("pwsh", {"command": unclosed}, self.repo, self.repo, self.policy)
+        self.assertEqual(dec.decision, "deny")
+        self.assertIn("has unmatched quotes", dec.reason)
 
     def test_scope_allow_parent_still_denies_other_worktree_git_dirs(self) -> None:
         wt1, _ = self._add_linked_worktree("wt-one")

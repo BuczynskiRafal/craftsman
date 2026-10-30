@@ -170,8 +170,7 @@ def _consume_heredoc_body(command_line: str, start: int, delim: str) -> tuple[st
     return "".join(chunks), i
 
 
-_PS_HERESTRING_OPEN_BOUNDARIES = (" ", "\t", "\n", "\r", "(", "=", ";", "|", "&")
-_PS_HERESTRING_CLOSE_FOLLOWERS = (" ", "\t", "|", ";", ")", "&")
+_PS_HERESTRING_OPEN_BOUNDARIES = (" ", "\t", "\n", "\r", "(", "=", ";", "|", "&", "+", ",", "[", "{")
 
 
 def _consume_ps_herestring_token(command_line: str, idx: int) -> tuple[str, int] | None:
@@ -193,11 +192,7 @@ def _consume_ps_herestring_token(command_line: str, idx: int) -> tuple[str, int]
     while i < n:
         line_end = command_line.find("\n", i)
         raw_line = command_line[i:] if line_end == -1 else command_line[i:line_end]
-        clean_line = raw_line.rstrip("\r")
-        if clean_line.startswith(close_token) and (
-            len(clean_line) == len(close_token)
-            or clean_line[len(close_token)] in _PS_HERESTRING_CLOSE_FOLLOWERS
-        ):
+        if raw_line.startswith(close_token):
             body = "".join(chunks).removesuffix("\n").removesuffix("\r")
             escaped_body = body.replace("'", "'\\''")
             return f"'{escaped_body}'", i + len(close_token)
