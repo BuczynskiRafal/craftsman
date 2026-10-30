@@ -84,14 +84,8 @@ def single_quoted(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-_single_quoted = single_quoted
-
-
 def yaml_list(items: tuple[str, ...]) -> str:
     return "[" + ", ".join(single_quoted(item) for item in items) + "]"
-
-
-_yaml_list = yaml_list
 
 
 def with_inlined_siblings(skill: Skill) -> str:
@@ -104,9 +98,6 @@ def with_inlined_siblings(skill: Skill) -> str:
     if not appendices:
         return skill.body
     return skill.body.rstrip() + "\n\n---\n\n" + "\n\n".join(appendices)
-
-
-_with_inlined_siblings = with_inlined_siblings
 
 
 def _strip_frontmatter(text: str) -> str:

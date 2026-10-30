@@ -55,9 +55,6 @@ def write_marked(path: Path, text: str) -> FileChange:
     return write_generated(path, text, owned=is_craftsman_generated_file)
 
 
-_write_marked = write_marked
-
-
 def read_json_object(path: Path) -> dict[str, Any]:
     """The JSON object in `path`; anything else is an error, so a user's file is never clobbered."""
     try:
@@ -82,9 +79,6 @@ def rewrite_json(
     if not dry_run:
         write_json_object(path, updated)
     return FileChange(path, changed=True, backup=kept)
-
-
-_rewrite_json = rewrite_json
 
 
 def find_managed_block(text: str, source: Path) -> tuple[int, int] | None:

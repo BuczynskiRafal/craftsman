@@ -284,43 +284,48 @@ def upsert_markdown(session: TargetSession, target: Path, content: str) -> None:
 # --- taking merged content out of a user file -----------------------------------------------
 
 
-def _strip_hooks_json(keys: Collection[str]) -> Callable[[dict[str, Any]], dict[str, Any]]:
+def strip_hooks_json(keys: Collection[str]) -> Callable[[dict[str, Any]], dict[str, Any]]:
     return lambda data: {key: value for key, value in data.items() if key not in keys}
 
 
-def revert_modified_file(
-    path: Path, kind: ModifiedKind, target: TargetManifest, tracker: Tracker
-) -> None:
-    """Take Craftsman's part out of a user file; a file Craftsman created and that is left
-    empty by that is removed. A dry run reports exactly what a real run does."""
+def revert_managed_markdown(path: Path, target: TargetManifest, tracker: Tracker) -> None:
+    """Take Craftsman's managed block out of a user Markdown file; a file Craftsman created and
+    that is left empty by that is removed. A dry run reports exactly what a real run does."""
     if not path.is_file():
         return
-    created = path_key(path) in target.created_paths
-    if kind is ModifiedKind.MANAGED_MARKDOWN:
-        text = read_markdown(path)
-        updated_text = strip_managed_block(text, path)
-        if updated_text == text:
-            return
-        _apply(
-            path,
-            tracker,
-            created=created,
-            empty=not updated_text.strip(),
-            write=lambda: write_text_atomic(path, updated_text),
-        )
+    text = read_markdown(path)
+    updated_text = strip_managed_block(text, path)
+    if updated_text == text:
         return
-    if kind is ModifiedKind.CLAUDE_SETTINGS:
-        from craftsman.platforms.claude import strip_claude_hooks
+    _apply(
+        path,
+        tracker,
+        created=path_key(path) in target.created_paths,
+        empty=not updated_text.strip(),
+        write=lambda: write_text_atomic(path, updated_text),
+    )
 
-        strip: Callable[[dict[str, Any]], dict[str, Any]] = strip_claude_hooks
-    else:
-        strip = _strip_hooks_json(target.hooks_json_keys)
+
+def revert_json_file(
+    path: Path,
+    target: TargetManifest,
+    tracker: Tracker,
+    strip: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
+    """Take Craftsman's part out of a user JSON file using `strip`; a file Craftsman created and
+    that is left empty by that is removed. A dry run reports exactly what a real run does."""
+    if not path.is_file():
+        return
     data = read_json_object(path)
     updated = strip(data)
     if updated == data:
         return
     _apply(
-        path, tracker, created=created, empty=not updated, write=lambda: write_json_object(path, updated)
+        path,
+        tracker,
+        created=path_key(path) in target.created_paths,
+        empty=not updated,
+        write=lambda: write_json_object(path, updated),
     )
 
 

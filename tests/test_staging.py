@@ -8,8 +8,17 @@ import unittest
 from pathlib import Path
 
 from craftsman.files import BACKUP_DIR_NAME
-from craftsman.manifest import ModifiedKind, TargetKind, TargetManifest, load_manifest
-from craftsman.staging import EventKind, TargetSession, Tracker, path_key, revert_modified_file
+from craftsman.generated import CRAFTSMAN_BEGIN_MARKER, CRAFTSMAN_END_MARKER
+from craftsman.manifest import TargetKind, TargetManifest, load_manifest
+from craftsman.staging import (
+    EventKind,
+    TargetSession,
+    Tracker,
+    path_key,
+    revert_json_file,
+    revert_managed_markdown,
+    strip_hooks_json,
+)
 
 
 class StagingTestCase(unittest.TestCase):
@@ -85,7 +94,7 @@ class RevertTests(StagingTestCase):
             created_paths=(path_key(path),), hooks_json_keys=("craftsman-stop-gate",)
         )
 
-        revert_modified_file(path, ModifiedKind.HOOKS_JSON, target, Tracker(dry_run=False))
+        revert_json_file(path, target, Tracker(dry_run=False), strip_hooks_json(target.hooks_json_keys))
 
         self.assertFalse(path.exists())
 
@@ -93,23 +102,28 @@ class RevertTests(StagingTestCase):
         path = self.settings({"craftsman-stop-gate": {}, "mine": {}})
         target = TargetManifest(hooks_json_keys=("craftsman-stop-gate",))
 
-        revert_modified_file(path, ModifiedKind.HOOKS_JSON, target, Tracker(dry_run=False))
+        revert_json_file(path, target, Tracker(dry_run=False), strip_hooks_json(target.hooks_json_keys))
 
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"mine": {}})
 
     def test_dry_run_reports_without_writing(self) -> None:
         path = self.settings({"craftsman-stop-gate": {}, "mine": {}})
+        target = TargetManifest(hooks_json_keys=("craftsman-stop-gate",))
         tracker = Tracker(dry_run=True)
 
-        revert_modified_file(
-            path,
-            ModifiedKind.HOOKS_JSON,
-            TargetManifest(hooks_json_keys=("craftsman-stop-gate",)),
-            tracker,
-        )
+        revert_json_file(path, target, tracker, strip_hooks_json(target.hooks_json_keys))
 
         self.assertEqual(tracker.count(EventKind.RESTORED), 1)
         self.assertIn("craftsman-stop-gate", path.read_text(encoding="utf-8"))
+
+    def test_created_markdown_file_left_empty_is_removed(self) -> None:
+        path = self.home / "AGENTS.md"
+        path.write_text(f"{CRAFTSMAN_BEGIN_MARKER}\nrules\n{CRAFTSMAN_END_MARKER}\n", encoding="utf-8")
+        target = TargetManifest(created_paths=(path_key(path),))
+
+        revert_managed_markdown(path, target, Tracker(dry_run=False))
+
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

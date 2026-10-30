@@ -16,6 +16,7 @@ from craftsman.manifest import (
     InstallManifest,
     ModifiedKind,
     TargetKind,
+    TargetManifest,
     load_manifest,
     save_manifest,
 )
@@ -25,13 +26,16 @@ from craftsman.paths import (
     default_vscode_user_dir,
     user_home,
 )
+from craftsman.platforms.claude import strip_claude_hooks
 from craftsman.staging import (
     EventKind,
     Tracker,
     require_within,
-    revert_modified_file,
+    revert_json_file,
+    revert_managed_markdown,
     run_reported,
     stop_roots_for,
+    strip_hooks_json,
 )
 
 
@@ -90,6 +94,18 @@ def plan_base(
             if Path(raw) not in dir_roots:
                 require_within(Path(raw), dir_roots)
     return BasePlan(base_dir, manifest, matching, stop_roots)
+
+
+def revert_modified_file(
+    path: Path, kind: ModifiedKind, target: TargetManifest, tracker: Tracker
+) -> None:
+    """Take Craftsman's part out of a user file recorded in `target.modified_files`."""
+    if kind is ModifiedKind.MANAGED_MARKDOWN:
+        revert_managed_markdown(path, target, tracker)
+    elif kind is ModifiedKind.CLAUDE_SETTINGS:
+        revert_json_file(path, target, tracker, strip_claude_hooks)
+    else:
+        revert_json_file(path, target, tracker, strip_hooks_json(target.hooks_json_keys))
 
 
 def apply_plan(plan: BasePlan, home: Path, tracker: Tracker) -> None:

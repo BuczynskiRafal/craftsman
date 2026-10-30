@@ -37,7 +37,7 @@ from craftsman.staging import (
     created_before,
     path_key,
     report_change,
-    revert_modified_file,
+    revert_json_file,
 )
 
 CLAUDE_AGENT_TOOLS = "Read, Grep, Glob, Bash"
@@ -227,7 +227,7 @@ def install_claude_target(repo_dir: Path, home: Path, *, with_hooks: bool, track
     if bash_prefix is not None:
         _merge_claude_settings(session, settings, bash_prefix)
     elif session.previous is not None and session.previous.modified_files.get(path_key(settings)):
-        revert_modified_file(settings, ModifiedKind.CLAUDE_SETTINGS, session.previous, tracker)
+        revert_json_file(settings, session.previous, tracker, strip_claude_hooks)
     session.finish()
 
 
