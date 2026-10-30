@@ -26,7 +26,6 @@ from craftsman.doctor import (
 )
 from craftsman.export import (
     HOOKS_FILENAME,
-    absolute_hook_prefixes,
     export_copilot_home,
     export_to_claude_user,
     export_to_copilot_skills,
@@ -34,6 +33,7 @@ from craftsman.export import (
     write_copilot_hooks,
 )
 from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
+from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.manifest import MANIFEST_FILENAME
 from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
 

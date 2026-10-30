@@ -33,7 +33,6 @@ from craftsman.export import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
     HOOKS_FILENAME,
-    absolute_hook_prefixes,
     claude_agent_templates,
     export_copilot_agents,
     export_copilot_home,
@@ -58,6 +57,7 @@ from craftsman.generated import (
     write_generated,
     write_json_object,
 )
+from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.legacy_githooks import legacy_git_hooks_bases
 from craftsman.manifest import (
     InstallError,

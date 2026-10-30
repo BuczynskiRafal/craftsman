@@ -30,7 +30,6 @@ from craftsman.export import (
     CopilotDiscoveryLocation,
     DiscoveryRoot,
     EntityPattern,
-    absolute_hook_prefixes,
     claude_agent_templates,
     export_copilot_home,
     export_to_agents_workspace,
@@ -58,6 +57,7 @@ from craftsman.generated import (
     strip_managed_block,
     upsert_managed_markdown,
 )
+from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.paths import (
     default_vscode_prompts_dir,
     default_vscode_user_dir,
@@ -514,7 +514,7 @@ class HookExportTests(ExportTestCase):
     def test_unreachable_package_without_a_shim_is_an_error(self) -> None:
         python = self.fake_python(self.tmp / "py", self.tmp / "elsewhere" / "craftsman" / "__init__.py")
         with (
-            mock.patch.object(export, "CLI_SHIM", Path("scripts") / "no-such-shim.py"),
+            mock.patch("craftsman.hook_command.CLI_SHIM", Path("scripts") / "no-such-shim.py"),
             self.assertRaisesRegex(ExportError, "cannot import craftsman"),
         ):
             absolute_hook_prefixes(python)
