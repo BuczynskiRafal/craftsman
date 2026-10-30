@@ -252,8 +252,8 @@ and the user files it merged its part into. A user's file or folder in the way i
 into (`settings.json`, `hooks.json`, `AGENTS.md`, `copilot-instructions.md`) keeps a one-time `.bak`
 copy; a symlinked one is updated where it points, which must be inside the workspace, and markers
 that do not enclose one block are an error. Files Craftsman merges into are checked before anything
-is written; a target that still fails is not recorded, and a manifest that is not in the current
-format is an error.
+is written; a target that still fails is not recorded, and a manifest that is neither in the current
+format nor a Craftsman 3.x `schema_version: 1` manifest is an error.
 
 `craftsman uninstall` (or `make uninstall`) takes the targets `--all`, `--antigravity`, `--claude`,
 `--copilot`, `--copilot-workspace <dir>` and `--agents-workspace <dir>`, plus `--dry-run`; without a
