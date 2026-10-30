@@ -7,10 +7,10 @@ import os
 import shutil
 import unittest
 
-from craftsman.export import default_vscode_user_dir
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.legacy_githooks import git_config_get, git_config_set, git_config_unset
 from craftsman.manifest import MANIFEST_FILENAME, TargetKind, load_manifest
+from craftsman.paths import default_vscode_user_dir
 from craftsman.staging import Tracker
 from craftsman.uninstall import apply_plan, parse_uninstall_args, plan_base
 

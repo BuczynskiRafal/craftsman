@@ -30,12 +30,6 @@ from craftsman.export import (
     HOOKS_FILENAME,
     absolute_hook_prefixes,
     claude_agent_templates,
-    default_claude_dir,
-    default_copilot_home,
-    default_copilot_skills_dir,
-    default_repo_dir,
-    default_vscode_prompts_dir,
-    default_vscode_user_dir,
     export_copilot_agents,
     export_copilot_home,
     export_to_claude_user,
@@ -48,8 +42,6 @@ from craftsman.export import (
     merge_claude_hooks,
     render_agents_md,
     render_combined_rules,
-    user_home,
-    vscode_prompt_dirs,
     write_copilot_hooks,
 )
 from craftsman.files import (
@@ -69,6 +61,16 @@ from craftsman.manifest import (
     InstallError,
     ModifiedKind,
     TargetKind,
+)
+from craftsman.paths import (
+    default_claude_dir,
+    default_copilot_home,
+    default_copilot_skills_dir,
+    default_repo_dir,
+    default_vscode_prompts_dir,
+    default_vscode_user_dir,
+    user_home,
+    vscode_prompt_dirs,
 )
 from craftsman.staging import (
     EventKind,

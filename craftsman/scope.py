@@ -24,8 +24,8 @@ from typing import Any, Literal, get_args
 
 from craftsman.antigravity import session_id
 from craftsman.diffscan import DiffScanError, worktree_root
-from craftsman.export import user_home
 from craftsman.gate import GateOwner, GateStateError, load_state, state_path_for
+from craftsman.paths import user_home
 from craftsman.records import CRAFTSMAN_AGENTS
 from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 

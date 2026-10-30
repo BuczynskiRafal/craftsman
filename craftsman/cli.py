@@ -17,7 +17,6 @@ from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, sn
 from craftsman.doctor import run_doctor
 from craftsman.export import (
     Skill,
-    default_repo_dir,
     iter_skills,
 )
 from craftsman.export import main as export_main
@@ -28,6 +27,7 @@ from craftsman.hooks import main as hook_main
 from craftsman.install import install_main
 from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens
 from craftsman.manifest import InstallError
+from craftsman.paths import default_repo_dir
 from craftsman.playbooks import (
     CODE_REVIEW_SKILL,
     LENSES_FILENAME,

@@ -14,11 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
 
-from craftsman.export import (
-    COPY_IGNORED_NAMES,
-    env_var_for_home,
-    resolve_craftsman_pkg_dir,
-)
+from craftsman.export import COPY_IGNORED_NAMES
 from craftsman.files import (
     UnsafePathError,
     copy_file,
@@ -48,6 +44,7 @@ from craftsman.manifest import (
     load_manifest,
     save_manifest,
 )
+from craftsman.paths import env_var_for_home, resolve_craftsman_pkg_dir
 
 
 class InstallMode(str, Enum):

@@ -11,7 +11,6 @@ from unittest import mock
 
 from craftsman.doctor import detect_antigravity_drift, scan_copilot_duplicates
 from craftsman.export import (
-    default_vscode_prompts_dir,
     is_craftsman_hook_command,
     iter_skills,
 )
@@ -19,6 +18,7 @@ from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import CRAFTSMAN_BEGIN_MARKER
 from craftsman.install import parse_install_args
 from craftsman.manifest import MANIFEST_FILENAME, TargetKind, load_manifest
+from craftsman.paths import default_vscode_prompts_dir
 from craftsman.staging import InstallMode
 
 from tests.support import REPO_ROOT, IsolatedHomeTestCase, snapshot_tree

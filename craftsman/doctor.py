@@ -23,18 +23,12 @@ from craftsman.export import (
     CopilotDiscoveryLocation,
     craftsman_agent_names,
     craftsman_skill_names,
-    default_claude_dir,
-    default_copilot_home,
-    default_copilot_skills_dir,
-    default_vscode_prompts_dir,
     has_user_copilot_install,
     has_workspace_copilot_install,
     is_craftsman_hook_command,
     iter_discovered_files,
     parse_frontmatter,
-    resolve_craftsman_pkg_dir,
     resolve_discovery_dirs,
-    user_home,
 )
 from craftsman.generated import ExportError
 from craftsman.legacy_githooks import (
@@ -43,6 +37,14 @@ from craftsman.legacy_githooks import (
     legacy_git_hooks_bases,
 )
 from craftsman.manifest import InstallError, TargetKind, load_manifest
+from craftsman.paths import (
+    default_claude_dir,
+    default_copilot_home,
+    default_copilot_skills_dir,
+    default_vscode_prompts_dir,
+    resolve_craftsman_pkg_dir,
+    user_home,
+)
 from craftsman.records import AGENT_ROLES
 
 CLAUDE_AGENT_NAMES = tuple(AGENT_ROLES)

@@ -25,9 +25,6 @@ from craftsman.export import (
     Skill,
     absolute_hook_prefixes,
     claude_agent_templates,
-    default_vscode_prompts_dir,
-    default_vscode_user_dir,
-    env_var_for_home,
     export_copilot_home,
     export_to_agents_workspace,
     export_to_claude_user,
@@ -47,7 +44,6 @@ from craftsman.export import (
     render_combined_rules,
     render_copilot_agent,
     render_copilot_hooks,
-    resolve_craftsman_pkg_dir,
     resolve_discovery_dirs,
     strip_claude_hooks,
 )
@@ -59,6 +55,12 @@ from craftsman.generated import (
     is_craftsman_generated_file,
     strip_managed_block,
     upsert_managed_markdown,
+)
+from craftsman.paths import (
+    default_vscode_prompts_dir,
+    default_vscode_user_dir,
+    env_var_for_home,
+    resolve_craftsman_pkg_dir,
 )
 
 from tests.support import REPO_ROOT, SKILL_COUNT, CliResult, run_main

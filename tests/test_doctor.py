@@ -27,8 +27,6 @@ from craftsman.doctor import (
 from craftsman.export import (
     HOOKS_FILENAME,
     absolute_hook_prefixes,
-    default_vscode_prompts_dir,
-    default_vscode_user_dir,
     export_copilot_home,
     export_to_claude_user,
     export_to_copilot_skills,
@@ -37,6 +35,7 @@ from craftsman.export import (
 )
 from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.manifest import MANIFEST_FILENAME
+from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
 
 from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main
 

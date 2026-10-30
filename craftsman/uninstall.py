@@ -9,12 +9,6 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from craftsman.export import (
-    default_claude_dir,
-    default_copilot_home,
-    default_vscode_user_dir,
-    user_home,
-)
 from craftsman.files import exists, remove_path, require_no_symlinked_parent
 from craftsman.generated import require_resolves_within
 from craftsman.legacy_githooks import craftsman_home_dir, restore_hooks_path
@@ -24,6 +18,12 @@ from craftsman.manifest import (
     TargetKind,
     load_manifest,
     save_manifest,
+)
+from craftsman.paths import (
+    default_claude_dir,
+    default_copilot_home,
+    default_vscode_user_dir,
+    user_home,
 )
 from craftsman.staging import (
     EventKind,

@@ -6,11 +6,8 @@ import os
 import subprocess
 from pathlib import Path
 
-from craftsman.export import (
-    env_var_for_home,
-    user_home,
-)
 from craftsman.manifest import InstallError, TargetManifest
+from craftsman.paths import env_var_for_home, user_home
 from craftsman.staging import EventKind, Tracker
 
 GIT_TIMEOUT_S = 5

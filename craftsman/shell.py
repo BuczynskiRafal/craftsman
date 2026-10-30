@@ -13,7 +13,7 @@ import re
 import shlex
 from dataclasses import dataclass
 
-from craftsman.export import user_home
+from craftsman.paths import user_home
 
 HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
 _REDIR_TARGET_PAT = r"[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>]*)"
