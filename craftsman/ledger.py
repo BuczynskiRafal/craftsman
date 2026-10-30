@@ -591,26 +591,68 @@ def _normalize_note_segment(segment: str, pattern: str = "") -> str:
     return re.sub(r"\s+", " ", without_ids.strip().strip(";:,-.")).strip().lower()
 
 
-def _validate_target_segment(
-    target: str, segment: str, pattern: str, *, min_segment_chars: int
-) -> str:
+def _classify_target_segment(
+    segment: str, pattern: str, *, min_segment_chars: int
+) -> tuple[Literal["too_short", "no_concrete"] | None, str]:
     without_id = re.sub(pattern, " ", segment)
     stripped_generic = _GENERIC_WORDS_RE.sub(" ", without_id)
     substantive = re.sub(r"[\W_]+", "", stripped_generic)
     if len(segment) < min_segment_chars or len(substantive) < MIN_SUBSTANTIVE_NOTE_CHARS:
-        raise FieldError(
-            "note",
-            f"needs at least {min_segment_chars} characters per hunk or file, "
-            f"{MIN_SUBSTANTIVE_NOTE_CHARS} of them beyond generic praise; {target} has too little "
-            f'concrete detail. Example: "{COVERAGE_NOTE_EXAMPLE}"',
-        )
+        return "too_short", ""
     if not file_reference_in(without_id) and _CONCRETE_COVERAGE_RE.search(without_id) is None:
-        raise FieldError(
-            "note",
-            f"for {target} must include a concrete detail (file:line, number/literal, ->, or symbol name). "
-            f'Example: "{COVERAGE_NOTE_EXAMPLE}"',
+        return "no_concrete", ""
+    return None, _normalize_note_segment(segment, pattern)
+
+
+def _raise_note_target_errors(
+    *,
+    unnamed: Sequence[str],
+    too_short: Sequence[str],
+    no_concrete: Sequence[str],
+    noun: str,
+    min_chars: int,
+) -> None:
+    parts: list[str] = []
+    if unnamed:
+        parts.append(
+            f"must name every covered {noun} and what was tried on it; missing: {', '.join(unnamed)}"
         )
-    return _normalize_note_segment(segment, pattern)
+    if too_short:
+        parts.append(
+            f"needs at least {min_chars} characters per hunk or file, "
+            f"{MIN_SUBSTANTIVE_NOTE_CHARS} of them beyond generic praise; "
+            f"too little concrete detail: {', '.join(too_short)}"
+        )
+    if no_concrete:
+        parts.append(
+            "must include a concrete detail (file:line, number/literal, ->, or symbol name): "
+            f"{', '.join(no_concrete)}"
+        )
+    raise FieldError("note", "; ".join(parts), example=COVERAGE_NOTE_EXAMPLE)
+
+
+def _check_reused_note_segments(
+    ledger: Ledger,
+    round_: Round,
+    lenses: Sequence[str],
+    validated: Mapping[str, str],
+    *,
+    unit: TargetKind,
+    noun: str,
+) -> None:
+    for lens in lenses:
+        norm_by_target = _recorded_note_segments(ledger, round_, lens)
+        norm_by_target.update(validated)
+        counts: dict[str, int] = {}
+        for body in norm_by_target.values():
+            counts[body] = counts.get(body, 0) + 1
+            if counts[body] > MAX_REUSED_NOTE_SEGMENTS:
+                raise FieldError(
+                    "note",
+                    f"reuses the same note segment for more than {MAX_REUSED_NOTE_SEGMENTS} {unit} "
+                    f"in lens `{lens}`; write a specific note per {noun}",
+                    example=COVERAGE_NOTE_EXAMPLE,
+                )
 
 
 def _validate_coverage_note(
@@ -624,33 +666,34 @@ def _validate_coverage_note(
 ) -> None:
     patterns = _target_patterns(round_, targets, note, unit=unit)
     unnamed = [target for target, pattern in patterns.items() if not re.search(pattern, note)]
+    unnamed_set = set(unnamed)
+    named = [target for target in targets if target not in unnamed_set]
     noun = "file" if unit == "files" else "hunk"
-    if unnamed:
-        raise LedgerError(
-            f"the coverage note must name every covered {noun} and what was tried on it; missing: "
-            f'{", ".join(unnamed)}. Example: "{COVERAGE_NOTE_EXAMPLE}"',
-            field="note",
-        )
     min_chars = 2 * MIN_HUNK_NOTE_SEGMENT_CHARS if len(lenses) >= 2 else MIN_HUNK_NOTE_SEGMENT_CHARS
-    segments = _extract_target_segments(patterns, note)
-    validated = {
-        target: _validate_target_segment(
-            target, segments[target], patterns[target], min_segment_chars=min_chars
+    named_patterns = {t: patterns[t] for t in named}
+    segments = _extract_target_segments(named_patterns, note)
+    too_short: list[str] = []
+    no_concrete: list[str] = []
+    validated: dict[str, str] = {}
+    for target in named:
+        issue, normalized = _classify_target_segment(
+            segments[target], patterns[target], min_segment_chars=min_chars
         )
-        for target in targets
-    }
-    for lens in lenses:
-        norm_by_target = _recorded_note_segments(ledger, round_, lens)
-        norm_by_target.update(validated)
-        counts: dict[str, int] = {}
-        for body in norm_by_target.values():
-            counts[body] = counts.get(body, 0) + 1
-            if counts[body] > MAX_REUSED_NOTE_SEGMENTS:
-                raise FieldError(
-                    "note",
-                    f"reuses the same note segment for more than {MAX_REUSED_NOTE_SEGMENTS} {unit} "
-                    f'in lens `{lens}`; write a specific note per {noun}. Example: "{COVERAGE_NOTE_EXAMPLE}"',
-                )
+        if issue == "too_short":
+            too_short.append(target)
+        elif issue == "no_concrete":
+            no_concrete.append(target)
+        else:
+            validated[target] = normalized
+    if unnamed or too_short or no_concrete:
+        _raise_note_target_errors(
+            unnamed=unnamed,
+            too_short=too_short,
+            no_concrete=no_concrete,
+            noun=noun,
+            min_chars=min_chars,
+        )
+    _check_reused_note_segments(ledger, round_, lenses, validated, unit=unit, noun=noun)
 
 
 def _recorded_note_segments(ledger: Ledger, round_: Round, lens: str) -> dict[str, str]:
@@ -671,6 +714,53 @@ def _recorded_note_segments(ledger: Ledger, round_: Round, lens: str) -> dict[st
     return segments
 
 
+def _match_open_file(round_: Round, unique_basenames: frozenset[str], target: str) -> str | None:
+    open_paths = [file.path for file in round_.files if not file.carried]
+    if target in open_paths:
+        return target
+    for path in open_paths:
+        name = Path(path).name
+        if name == target and name in unique_basenames:
+            return path
+    return None
+
+
+def coverage_units_for_targets(
+    round_: Round, lenses: Sequence[str], targets: Sequence[str]
+) -> tuple[tuple[str, str], ...]:
+    """Best-effort `(lens, unit_id)` pairs an unrecorded coverage entry tried to cover."""
+    valid_lenses = [
+        cleaned
+        for lens in lenses
+        if (cleaned := lens.strip()) in round_.lenses and cleaned != SWEEP_LENS
+    ]
+    if not valid_lenses:
+        return ()
+    unique = _unique_basenames(round_)
+    open_hunks = {hunk.id for hunk in round_.hunks if not hunk.carried}
+    pairs: list[tuple[str, str]] = []
+    for lens in valid_lenses:
+        for raw in targets:
+            target = raw.strip()
+            if not target:
+                continue
+            if lens == DESIGN_LENS:
+                matched = _match_open_file(round_, unique, target)
+                if matched is not None:
+                    pairs.append((DESIGN_LENS, matched))
+            elif target in open_hunks:
+                pairs.append((lens, target))
+            elif round_.tier == "quick":
+                matched = _match_open_file(round_, unique, target)
+                if matched is not None:
+                    pairs.extend(
+                        (lens, hunk.id)
+                        for hunk in round_.hunks
+                        if hunk.path == matched and not hunk.carried
+                    )
+    return tuple(dict.fromkeys(pairs))
+
+
 def add_multi_coverage(
     ledger: Ledger,
     lenses: Sequence[str],
@@ -678,6 +768,7 @@ def add_multi_coverage(
     note: str,
     *,
     target_kind: TargetKind | None = None,
+    rejected_by: Mapping[tuple[str, str], int] | None = None,
 ) -> tuple[Ledger, tuple[Coverage, ...]]:
     """Record that every lens in `lenses` reviewed `targets` of the latest round."""
     round_ = _latest_round(ledger)
@@ -685,7 +776,7 @@ def add_multi_coverage(
     unit, digests = _validate_coverage_targets(round_, cleaned_lenses, targets, target_kind)
     _validate_coverage_note(ledger, round_, cleaned_lenses, targets, note, unit=unit)
     if SWEEP_LENS in cleaned_lenses:
-        _require_lenses_before_sweep(ledger, round_)
+        _require_lenses_before_sweep(ledger, round_, rejected_by=rejected_by)
     now = _now()
     stripped_note = note.strip()
     records = tuple(
@@ -716,12 +807,26 @@ def add_coverage(
     return updated, record
 
 
-def _require_lenses_before_sweep(ledger: Ledger, round_: Round) -> None:
-    pending = [
-        f"{lens} {','.join(ids)}"
-        for lens, ids in uncovered_by_lens(ledger, round_).items()
-        if lens != SWEEP_LENS and ids
-    ]
+def _require_lenses_before_sweep(
+    ledger: Ledger,
+    round_: Round,
+    *,
+    rejected_by: Mapping[tuple[str, str], int] | None = None,
+) -> None:
+    pending: list[str] = []
+    for lens, ids in uncovered_by_lens(ledger, round_).items():
+        if lens == SWEEP_LENS or not ids:
+            continue
+        groups: dict[int | None, list[str]] = {}
+        for uid in ids:
+            entry_idx = rejected_by.get((lens, uid)) if rejected_by else None
+            groups.setdefault(entry_idx, []).append(uid)
+        for entry_idx, group_ids in groups.items():
+            joined = ",".join(group_ids)
+            if entry_idx is None:
+                pending.append(f"{lens} {joined}")
+            else:
+                pending.append(f"{lens} {joined} (depends on entry {entry_idx})")
     if pending:
         raise LedgerError(
             f"the `{SWEEP_LENS}` lens runs after every other lens; still uncovered in round "

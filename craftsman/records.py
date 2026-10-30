@@ -124,20 +124,60 @@ E = TypeVar("E", bound=Enum)
 class LedgerError(RuntimeError):
     """Raised for invalid ledger data, rejected operations and ledger I/O failures."""
 
-    def __init__(self, message: str, *, field: str = "") -> None:
+    def __init__(self, message: str, *, field: str = "", example: str | None = None) -> None:
         super().__init__(message)
         self.field = field
+        self.example = example
 
 
 class FieldError(LedgerError):
     """A validation error that knows which (possibly nested) field it concerns."""
 
-    def __init__(self, field: str, problem: str) -> None:
-        super().__init__(" ".join(part for part in (field, problem) if part), field=field)
+    def __init__(self, field: str, problem: str, *, example: str | None = None) -> None:
+        super().__init__(
+            " ".join(part for part in (field, problem) if part),
+            field=field,
+            example=example,
+        )
         self.problem = problem
 
     def within(self, parent: str) -> FieldError:
-        return FieldError(f"{parent}.{self.field}" if self.field else parent, self.problem)
+        return FieldError(
+            f"{parent}.{self.field}" if self.field else parent,
+            self.problem,
+            example=self.example,
+        )
+
+
+@dataclass(frozen=True)
+class EntryProblem:
+    """One rejected item inside a `--from-json` batch."""
+
+    index: int
+    label: str | None
+    field: str
+    problem: str
+    example: str | None = None
+
+
+class BatchRejected(LedgerError):
+    """Raised when one or more `--from-json` entries fail validation."""
+
+    def __init__(
+        self,
+        command: str,
+        problems: tuple[EntryProblem, ...],
+        total: int,
+    ) -> None:
+        if not problems:
+            raise ValueError("BatchRejected requires at least one EntryProblem")
+        noun = "entry" if total == 1 else "entries"
+        super().__init__(
+            f"{command}: {len(problems)} of {total} {noun} rejected; nothing was recorded."
+        )
+        self.command = command
+        self.problems = problems
+        self.total = total
 
 
 def format_timestamp(moment: datetime) -> str:

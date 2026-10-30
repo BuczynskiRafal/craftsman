@@ -14,9 +14,12 @@ from unittest import mock
 
 from craftsman import ledger as ledger_module
 from craftsman.ledger import (
+    COVERAGE_NOTE_EXAMPLE,
     ack_signal,
     add_coverage,
     add_fact,
+    add_multi_coverage,
+    coverage_units_for_targets,
     file_sha256,
     ledger_path_for,
     load,
@@ -33,6 +36,8 @@ from craftsman.ledger import (
 )
 from craftsman.records import (
     LEDGER_FILENAME,
+    BatchRejected,
+    EntryProblem,
     FieldError,
     Ledger,
     LedgerError,
@@ -196,11 +201,55 @@ class CoverageTests(unittest.TestCase):
             ("intent", five, coverage_note(five), "got 5"),
             ("intent", ["H1", "H1"], coverage_note(["H1"]), "hunks must not repeat"),
             ("intent", ["H42"], coverage_note(["H42"]), "unknown hunk ids in round 1: H42"),
-            ("intent", ["H1", "H2"], coverage_note(["H1", "H12"]), "missing: H2. Example:"),
+            ("intent", ["H1", "H2"], coverage_note(["H1", "H12"]), "missing: H2"),
         ]
         for lens, ids, note, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 add_coverage(self.ledger, lens, ids, note)
+
+    def test_note_rejection_stores_example_separately(self) -> None:
+        with self.assertRaises(FieldError) as caught:
+            add_coverage(self.ledger, "intent", ["H1", "H2"], coverage_note(["H1", "H12"]))
+
+        self.assertEqual(caught.exception.field, "note")
+        self.assertEqual(caught.exception.example, COVERAGE_NOTE_EXAMPLE)
+        self.assertNotIn("Example:", str(caught.exception))
+
+    def test_note_reports_every_bad_target_in_one_pass(self) -> None:
+        vague = "H3 examined every branch across the whole implementation without finding flaws"
+        note = f"H1 short; {vague}"
+
+        with self.assertRaises(FieldError) as caught:
+            add_coverage(self.ledger, "intent", ["H1", "H2", "H3", "H4"], note)
+
+        exc = caught.exception
+        self.assertEqual(exc.field, "note")
+        self.assertEqual(exc.example, COVERAGE_NOTE_EXAMPLE)
+        self.assertNotIn("Example:", str(exc))
+        self.assertEqual(
+            exc.problem,
+            "must name every covered hunk and what was tried on it; missing: H2, H4; "
+            "needs at least 40 characters per hunk or file, 20 of them beyond generic praise; "
+            "too little concrete detail: H1; "
+            "must include a concrete detail (file:line, number/literal, ->, or symbol name): H3",
+        )
+
+    def test_field_error_within_preserves_example(self) -> None:
+        nested = FieldError("note", "too short", example=COVERAGE_NOTE_EXAMPLE).within("entries[0]")
+
+        self.assertEqual(nested.field, "entries[0].note")
+        self.assertEqual(nested.example, COVERAGE_NOTE_EXAMPLE)
+
+    def test_batch_rejected_tracks_entry_problems(self) -> None:
+        with self.assertRaises(ValueError):
+            BatchRejected("cover", (), 1)
+
+        problem = EntryProblem(2, "intent", "note", "missing: H2", example=COVERAGE_NOTE_EXAMPLE)
+        single = BatchRejected("cover", (problem,), 1)
+        self.assertEqual(str(single), "cover: 1 of 1 entry rejected; nothing was recorded.")
+        plural = BatchRejected("cover", (problem,), 3)
+        self.assertEqual(str(plural), "cover: 1 of 3 entries rejected; nothing was recorded.")
+        self.assertEqual((plural.command, plural.problems, plural.total), ("cover", (problem,), 3))
 
     def test_note_may_follow_a_hunk_id_with_an_arrow(self) -> None:
         note = "H1->L42 total([]) raises ZeroDivisionError at cart.py:9 for an empty cart"
@@ -321,6 +370,69 @@ class CoverageAccountingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(LedgerError, "still uncovered in round 1: intent H1,H2"):
             add_coverage(ledger, "sweep", ["H1", "H2"], coverage_note(["H1", "H2"]))
+
+    def test_sweep_marks_uncovered_targets_from_rejected_entries(self) -> None:
+        snap = make_snap(
+            make_hunk("H1", "a.py"), make_hunk("H2", "b.py"), make_hunk("H3", "c.py")
+        )
+        ledger, _ = prepared(snap, lenses=("intent", "contracts", "craft", "sweep"), tier="standard")
+        ledger, _ = add_coverage(ledger, "intent", ["H1"], coverage_note(["H1"]))
+        rejected_by = {
+            ("intent", "H2"): 2,
+            ("intent", "H3"): 2,
+            ("contracts", "H1"): 4,
+            ("contracts", "H3"): 4,
+        }
+
+        with self.assertRaises(LedgerError) as caught:
+            add_multi_coverage(
+                ledger,
+                ("sweep",),
+                ["H1", "H2", "H3"],
+                coverage_note(["H1", "H2", "H3"]),
+                rejected_by=rejected_by,
+            )
+
+        self.assertIn(
+            "still uncovered in round 1: "
+            "intent H2,H3 (depends on entry 2); "
+            "contracts H1,H3 (depends on entry 4); "
+            "contracts H2; "
+            "craft H1,H2,H3. Cover those first",
+            str(caught.exception),
+        )
+
+    def test_coverage_units_map_open_hunks_or_files_best_effort(self) -> None:
+        snap = make_snap(
+            make_hunk("H1", "src/a.py"),
+            make_hunk("H2", "src/a.py", ("+y = 2",), new_start=10),
+            make_hunk("H3", "pkg1/u.py"),
+            make_hunk("H4", "pkg2/u.py"),
+        )
+        _, std_round = prepared(
+            snap, lenses=("intent", "design", "sweep"), tier="standard"
+        )
+        self.assertEqual(
+            coverage_units_for_targets(std_round, ["intent", "sweep", "nope"], ["H1", "H99", "a.py"]),
+            (("intent", "H1"),),
+        )
+        self.assertEqual(
+            coverage_units_for_targets(std_round, ["design"], ["a.py", "u.py", "pkg1/u.py"]),
+            (("design", "src/a.py"), ("design", "pkg1/u.py")),
+        )
+
+        _, quick_round = prepared(
+            snap, lenses=("intent", "contracts", "failure"), tier="quick"
+        )
+        self.assertEqual(
+            coverage_units_for_targets(quick_round, ["intent", "contracts"], ["a.py", "u.py"]),
+            (
+                ("intent", "H1"),
+                ("intent", "H2"),
+                ("contracts", "H1"),
+                ("contracts", "H2"),
+            ),
+        )
 
     def test_a_tier_upgrade_keeps_lens_coverage_but_needs_a_fresh_sweep(self) -> None:
         ledger, round_ = prepared(two_hunks(), ("intent", "craft", "sweep"), "deep", swept(two_hunks()))
