@@ -162,6 +162,15 @@ class RemovalTests(UninstallTestCase):
                 self.assertFalse(hooks_dir.exists())
                 self.assertIsNone(load_manifest(self.home / ".craftsman"))
 
+    def test_uninstall_from_v1_manifest_restores_previous_hooks_path_or_unsets_it(self) -> None:
+        for previous in (None, "~/my-hooks"):
+            with self.subTest(previous=previous):
+                hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path=previous)
+                self.assert_ok(self.uninstall("--claude"))
+                self.assertEqual(self.hooks_path(), previous)
+                self.assertFalse(hooks_dir.exists())
+                self.assertFalse((self.home / ".craftsman").exists())
+
     def test_uninstall_leaves_user_changed_hooks_path_untouched(self) -> None:
         hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=None)
         self.git_global("core.hooksPath", "/opt/husky")

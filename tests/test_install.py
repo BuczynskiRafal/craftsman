@@ -452,6 +452,87 @@ class LegacyGitHooksUpgradeTests(InstallTestCase):
 
         self.assert_ok(self.install("--claude"))
 
+    def test_upgrade_from_v1_manifest_unsets_hooks_path_and_removes_files(self) -> None:
+        hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path=None)
+
+        result = self.install("--claude")
+
+        self.assert_ok(result)
+        self.assertIn("removed the global git hooks of Craftsman 3.x", result.out)
+        self.assertIsNone(self.hooks_path())
+        self.assertFalse(hooks_dir.exists())
+        self.assertFalse((self.home / ".craftsman").exists())
+
+    def test_upgrade_from_v1_manifest_restores_previous_hooks_path(self) -> None:
+        hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path="~/my-hooks")
+
+        result = self.install("--copilot")
+
+        self.assert_ok(result)
+        self.assertEqual(self.hooks_path(), "~/my-hooks")
+        self.assertFalse(hooks_dir.exists())
+        self.assertIsNone(load_manifest(self.home / ".craftsman"))
+
+    def test_upgrade_from_v1_manifest_leaves_user_changed_hooks_path_untouched(self) -> None:
+        hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path=None)
+        self.git_global("core.hooksPath", "/opt/husky")
+
+        result = self.install("--claude")
+
+        self.assert_ok(result)
+        self.assertEqual(self.hooks_path(), "/opt/husky")
+        self.assertIn("leaving git config --global core.hooksPath (/opt/husky) untouched", result.err)
+        self.assertFalse(hooks_dir.exists())
+
+    def test_upgrade_from_v1_antigravity_and_git_hooks_manifest(self) -> None:
+        self.config_dir.mkdir(parents=True)
+        (self.config_dir / "scripts").mkdir()
+        legacy_guard = self.config_dir / "scripts" / "git-guard.py"
+        legacy_guard.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        hooks_json = self.config_dir / "hooks.json"
+        hooks_json.write_text(
+            json.dumps(
+                {
+                    "craftsman-git-guard": {"enabled": True, "PreToolUse": []},
+                    "craftsman-stop-gate": {"enabled": False, "Stop": []},
+                    "my-hook": {"enabled": True, "Stop": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+        hooks_dir = self.write_legacy_v1_git_hooks(
+            self.config_dir,
+            previous_hooks_path="~/before-craftsman",
+            created_dirs=(),
+            extra_targets={
+                "antigravity": {
+                    "target": "antigravity",
+                    "mode": "copy",
+                    "version": "3.0.0",
+                    "created_paths": [str(legacy_guard)],
+                    "created_dirs": [],
+                    "modified_files": {str(hooks_json): "hooks_json"},
+                }
+            },
+        )
+
+        result = self.install("--antigravity")
+
+        self.assert_ok(result)
+        self.assertEqual(self.hooks_path(), "~/before-craftsman")
+        self.assertFalse(hooks_dir.exists())
+        self.assertFalse(legacy_guard.exists())
+        self.assertTrue((self.config_dir / "scripts" / "craftsman-scope-guard.py").is_file())
+        self.assertTrue((self.config_dir / "scripts" / "craftsman-stop-gate.py").is_file())
+        merged = json.loads(hooks_json.read_text(encoding="utf-8"))
+        self.assertNotIn("craftsman-git-guard", merged)
+        self.assertIn("craftsman-scope-guard", merged)
+        self.assertIs(merged["craftsman-stop-gate"]["enabled"], False)
+        self.assertIn("my-hook", merged)
+        manifest = load_manifest(self.config_dir)
+        assert manifest is not None
+        self.assertEqual(set(manifest.targets), {TargetKind.ANTIGRAVITY})
+
 
 class WorkspaceTests(InstallTestCase):
     def setUp(self) -> None:

@@ -234,6 +234,39 @@ class LegacyV1ManifestTests(ManifestTestCase):
             ("/h/.claude/commands/craftsman.md",),
         )
 
+    def test_schema_v1_standalone_git_hooks_manifest_preserves_previous_hooks_path(self) -> None:
+        self.write(
+            {
+                "schema_version": 1,
+                "version": "3.2.0",
+                "mode": "copy",
+                "created_paths": ["/h/.craftsman/git-hooks/commit-msg"],
+                "created_dirs": [],
+                "previous_hooks_path": "~/my-hooks",
+                "hooks_dir": "/h/.craftsman/git-hooks",
+                "targets": {
+                    "git_hooks": {
+                        "target": "git_hooks",
+                        "mode": "copy",
+                        "version": "3.2.0",
+                        "created_paths": ["/h/.craftsman/git-hooks/commit-msg"],
+                        "created_dirs": [],
+                        "modified_files": {},
+                        "previous_hooks_path": "~/my-hooks",
+                        "hooks_dir": "/h/.craftsman/git-hooks",
+                    }
+                },
+            }
+        )
+
+        manifest = load_manifest(self.base)
+
+        assert manifest is not None
+        git_hooks = manifest.targets[TargetKind.GIT_HOOKS]
+        self.assertEqual(git_hooks.previous_hooks_path, "~/my-hooks")
+        self.assertEqual(git_hooks.hooks_dir, "/h/.craftsman/git-hooks")
+        self.assertEqual(git_hooks.created_dirs, ("/h/.craftsman/git-hooks",))
+
     def test_unsupported_schema_version_is_an_error(self) -> None:
         self.write({"schema_version": 99, "targets": {}})
 
