@@ -2,7 +2,7 @@
 
 Craftsman is an **adaptive closed-loop engineering harness** for AI coding agents. Rather than relying on prompt-only advice ("remember to review and test your changes"), Craftsman couples **budgeted, context-enriched review packets**, a **two-phase review protocol** (high-recall candidate collection decoupled from adversarial verification), **pinned review scopes**, and a **cryptographically fingerprinted evidence ledger** enforced at runtime by IDE/CLI lifecycle hooks.
 
-This reference documents the end-to-end architecture, state machines, data structures, and invariants of the Craftsman v3.3 harness.
+This reference documents the end-to-end architecture, state machines, data structures, and invariants of the Craftsman v4.0 harness.
 
 ---
 
