@@ -49,6 +49,8 @@ SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
 MIN_SIGNAL_ACK_REASON_CHARS = 40
+MIN_LENS_ADDITION_REASON_CHARS = 20
+LENS_ADDITION_EXAMPLE = "trust=ci/Jenkinsfile:12 the sh step interpolates env.DEPLOY_URL"
 MIN_FACT_TEXT_CHARS = 30
 # Every hunk named in a coverage note needs its own segment of at least this many characters.
 MIN_HUNK_NOTE_SEGMENT_CHARS = 40
@@ -124,20 +126,60 @@ E = TypeVar("E", bound=Enum)
 class LedgerError(RuntimeError):
     """Raised for invalid ledger data, rejected operations and ledger I/O failures."""
 
-    def __init__(self, message: str, *, field: str = "") -> None:
+    def __init__(self, message: str, *, field: str = "", example: str | None = None) -> None:
         super().__init__(message)
         self.field = field
+        self.example = example
 
 
 class FieldError(LedgerError):
     """A validation error that knows which (possibly nested) field it concerns."""
 
-    def __init__(self, field: str, problem: str) -> None:
-        super().__init__(" ".join(part for part in (field, problem) if part), field=field)
+    def __init__(self, field: str, problem: str, *, example: str | None = None) -> None:
+        super().__init__(
+            " ".join(part for part in (field, problem) if part),
+            field=field,
+            example=example,
+        )
         self.problem = problem
 
     def within(self, parent: str) -> FieldError:
-        return FieldError(f"{parent}.{self.field}" if self.field else parent, self.problem)
+        return FieldError(
+            f"{parent}.{self.field}" if self.field else parent,
+            self.problem,
+            example=self.example,
+        )
+
+
+@dataclass(frozen=True)
+class EntryProblem:
+    """One rejected item inside a `--from-json` batch."""
+
+    index: int
+    label: str | None
+    field: str
+    problem: str
+    example: str | None = None
+
+
+class BatchRejected(LedgerError):
+    """Raised when one or more `--from-json` entries fail validation."""
+
+    def __init__(
+        self,
+        command: str,
+        problems: tuple[EntryProblem, ...],
+        total: int,
+    ) -> None:
+        if not problems:
+            raise ValueError("BatchRejected requires at least one EntryProblem")
+        noun = "entry" if total == 1 else "entries"
+        super().__init__(
+            f"{command}: {len(problems)} of {total} {noun} rejected; nothing was recorded."
+        )
+        self.command = command
+        self.problems = problems
+        self.total = total
 
 
 def format_timestamp(moment: datetime) -> str:
@@ -305,6 +347,10 @@ class Fields:
         for index, value in enumerate(values):
             _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
         return tuple(values)
+
+    def records_or_empty(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
+        """A list of records; empty when it is left out (a field added without a schema bump)."""
+        return () if self._absent(key) else self.records(key, parse)
 
     def records(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
         values: list[Any] = self._value(key, list, "a list")
@@ -958,6 +1004,52 @@ class Fact:
         )
 
 
+def require_lens_addition(lens: str, reason: str) -> None:
+    """Fail unless `lens` can be added to a review for `reason` (see `LensAddition`)."""
+    _require_choice(lens, sorted(LENS_IDS), "lens")
+    _require(lens != SWEEP_LENS, "lens", f"`{SWEEP_LENS}` is not a risk lens and cannot be added")
+    _require_text(reason, "reason", min_chars=MIN_LENS_ADDITION_REASON_CHARS)
+    _require(
+        file_reference_in(reason),
+        "reason",
+        "must cite the changed code that needs the lens as file:line, "
+        f"e.g. {LENS_ADDITION_EXAMPLE.split('=', 1)[1]!r}",
+    )
+
+
+@dataclass(frozen=True)
+class LensAddition:
+    """A lens the agent added because it saw a risk the deterministic signals missed.
+
+    Every round from `round` on keeps the lens, so the gate requires its coverage like any other.
+    """
+
+    lens: str
+    reason: str
+    round: int
+    recorded_at: str
+
+    def __post_init__(self) -> None:
+        require_lens_addition(self.lens, self.reason)
+        _require(self.round >= 1, "round", "must be >= 1")
+        _require_timestamp(self.recorded_at, "recorded_at")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> LensAddition:
+        f = Fields(raw)
+        return f.done(
+            cls(
+                lens=f.text("lens"),
+                reason=f.text("reason"),
+                round=f.integer("round"),
+                recorded_at=f.text("recorded_at"),
+            )
+        )
+
+
 def scope_contains(superset: tuple[str, ...] | None, subset: tuple[str, ...] | None) -> bool:
     """True when `superset` covers every path in `subset` (`None` means the full work tree)."""
     if superset is None:
@@ -976,6 +1068,12 @@ class Ledger:
     agents: tuple[AgentEvent, ...] = ()
     signal_acks: tuple[SignalAck, ...] = ()
     facts: tuple[Fact, ...] = ()
+    lens_additions: tuple[LensAddition, ...] = ()
+
+    @property
+    def added_lenses(self) -> dict[str, str]:
+        """The lenses the agent added to this review, each with its reason."""
+        return {addition.lens: addition.reason for addition in self.lens_additions}
 
     @property
     def current_scope(self) -> tuple[str, ...] | None:
@@ -1007,6 +1105,10 @@ class Ledger:
         _require_unique([run.id for run in self.runs], "runs")
         _require_unique([finding.id for finding in self.findings], "findings")
         _require_unique([fact.id for fact in self.facts], "facts")
+        added = [addition.lens for addition in self.lens_additions]
+        _require(len(set(added)) == len(added), "lens_additions", "must not repeat a lens")
+        for index, addition in enumerate(self.lens_additions):
+            self._check_lens_addition(addition, f"lens_additions[{index}]")
         for index, coverage in enumerate(self.coverage):
             self._check_coverage(coverage, f"coverage[{index}]")
         for index, finding in enumerate(self.findings):
@@ -1017,6 +1119,15 @@ class Ledger:
     def _round(self, number: int, where: str) -> Round:
         _require(number <= len(self.rounds), f"{where}.round", "references an unknown round")
         return self.rounds[number - 1]
+
+    def _check_lens_addition(self, addition: LensAddition, where: str) -> None:
+        self._round(addition.round, where)
+        for round_ in self.rounds[addition.round - 1 :]:
+            _require(
+                addition.lens in round_.lenses,
+                f"{where}.lens",
+                f"was added in round {addition.round} but is missing from round {round_.number}",
+            )
 
     def _check_coverage(self, coverage: Coverage, where: str) -> None:
         round_ = self._round(coverage.round, where)
@@ -1086,6 +1197,7 @@ class Ledger:
                     agents=f.records("agents", AgentEvent.from_json),
                     signal_acks=f.records("signal_acks", SignalAck.from_json),
                     facts=f.records("facts", Fact.from_json),
+                    lens_additions=f.records_or_empty("lens_additions", LensAddition.from_json),
                 )
             )
         except FieldError as exc:

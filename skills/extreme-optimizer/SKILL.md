@@ -6,9 +6,10 @@ description: >-
   loop requiring benchmarks and strict output isomorphism proof (identical
   observable outputs). Applies algorithmic improvements, zero-copy, inlining,
   buffer reuse, streaming, and SIMD/vectorized layouts across Rust, Python, C++,
-  Go, and TypeScript. Trigger phrases: "extreme optimization", "performance
-  tuning", "benchmark and optimize", "find bottlenecks", "optimize", "speed up",
-  "make it faster".
+  Go, and TypeScript. Use when the user wants code made faster and expects it
+  changed: "optimize", "speed up", "make it faster", "benchmark and optimize",
+  "find bottlenecks". For a review of a Python algorithm without edits, use
+  /leetcode-style-code-reviewer.
 ---
 
 # Extreme Software Optimization (`/extreme-optimizer`)

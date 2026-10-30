@@ -18,7 +18,7 @@ Draft one short commit message in **Conventional Commits** format that explains 
 5. Optionally add a **scope** in parentheses when the change is clearly scoped to one module or area.
 6. Compress related edits into one broader theme.
 7. Draft the final message in American English.
-8. Always generate a matching **branch name** (see Branch Name Format below).
+8. Add a matching **branch name** (see Branch Name Format and Output Modes below).
 
 ## Conventional Commits Format
 
@@ -67,7 +67,6 @@ When the change spans multiple cohesive edits under one theme, use an umbrella p
 - Avoid paraphrasing hunks, line-by-line edits, or low-level implementation details.
 - Avoid dependency minutiae unless they are the primary change.
 - Avoid pretending the scope is cleaner than it is; call out mixed changes when needed.
-- Return only the commit message when the user asks for just the message.
 - Say explicitly when there are no changes to summarize.
 
 ## Heuristics
@@ -75,13 +74,10 @@ When the change spans multiple cohesive edits under one theme, use an umbrella p
 - Prefer short, verb-led phrasing in the subject.
 - Use imperative form by default.
 - Prefer American spelling and phrasing.
-- When the change spans multiple cohesive edits, use an umbrella phrase instead of enumerating subchanges.
-- When the diff mixes unrelated concerns, say so and suggest splitting the commit rather than forcing a misleading one-liner.
-- Always include a **branch name** alongside the commit message (see Branch Name Format).
 
 ## Branch Name Format
 
-Always output a suggested branch name that mirrors the commit type and subject.
+The suggested branch name mirrors the commit type and subject.
 
 **Format**: `<type>/<kebab-case-summary>`
 
@@ -102,7 +98,8 @@ Always output a suggested branch name that mirrors the commit type and subject.
 
 ## Output Modes
 
-- Default: Conventional Commits `type(scope): subject` with optional body, **always followed by a branch name**.
+- Default: Conventional Commits `type(scope): subject` with optional body, followed by a branch name.
+- When the user asks for just the message, return only the message, without a branch name.
 - If asked, provide three variants ordered from most neutral to most descriptive (each with its own branch name).
 - If asked, provide `subject + body` with bullet-point breakdown.
 
@@ -146,9 +143,3 @@ config files must be updated to the new schema.
 ```
 
 Branch: `feat/config-restructure-schema`
-
-## Example Requests
-
-- `Use $high-level-commit-message for the current staged changes.`
-- `Draft a single high-level commit message in American English without listing low-level file edits.`
-- `Use $high-level-commit-message and return 3 variants for this branch.`

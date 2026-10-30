@@ -14,12 +14,13 @@ from craftsman.diffscan import (
     Hunk,
     WorktreeIndex,
     detect_signals,
+    files_without_signal_patterns,
     git_dir,
     resolve_base_sha,
     snapshot,
 )
 
-from tests.support import GitRepo, change_hunk
+from tests.support import GitRepo, change_hunk, make_snap
 
 
 def numbered_lines(count: int, prefix: str = "line") -> str:
@@ -725,6 +726,100 @@ class SignalTests(unittest.TestCase):
     def test_docs_content_does_not_trigger_code_signals(self) -> None:
         signals = detect_signals([change_hunk("README.md", added=["select the token from the session"])])
         self.assertEqual(signals, {"docs": ("H1",)})
+
+
+# Risky calls in languages beyond Python, JS/TS, Go and Java, by the signal they must raise.
+LANGUAGE_SIGNAL_EXAMPLES: dict[str, tuple[tuple[str, str], ...]] = {
+    "process": (
+        ("src/run.cpp", "int rc = system(cmd.c_str());"),
+        ("src/run.cpp", "std::system(cmd);"),
+        ("src/run.c", 'FILE* f = popen(cmd, "r");'),
+        ("src/run.c", "execvp(argv[0], argv);"),
+        ("src/run.cpp", "CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, 0, env, dir, &si, &pi);"),
+        ("Jenkinsfile", 'sh "curl -X POST ${env.DEPLOY_URL}"'),
+        ("Jenkinsfile", "steps { sh 'make' }"),
+        ("Jenkinsfile", "bat(script: 'build.cmd')"),
+        ("ci/build.groovy", 'def proc = "ls ${dir}".execute()'),
+    ),
+    "filesystem": (
+        ("src/io.c", 'FILE* f = fopen(path, "w");'),
+        ("src/io.cpp", "std::ofstream out(path);"),
+        ("src/io.cpp", "std::filesystem::remove_all(dir);"),
+        ("ci/build.groovy", "def f = new File(path)"),
+        ("Jenkinsfile", "writeFile file: 'out.txt', text: data"),
+    ),
+    "network": (
+        ("src/http.cpp", "curl_easy_perform(handle);"),
+        ("src/net.cpp", "boost::asio::ip::tcp::socket sock(io);"),
+        ("Jenkinsfile", "def resp = httpRequest url: target"),
+    ),
+    "deserialization": (
+        ("ci/build.groovy", "evaluate(new File('vars.groovy'))"),
+        ("ci/build.groovy", "new GroovyShell().evaluate(text)"),
+        ("ci/build.groovy", "Eval.me(expression)"),
+    ),
+    "concurrency": (
+        ("src/pool.cpp", "std::thread worker(run);"),
+        ("src/pool.cpp", "std::lock_guard<std::mutex> guard(m);"),
+        ("src/pool.c", "pthread_create(&tid, NULL, run, NULL);"),
+        ("Jenkinsfile", "parallel(failFast: true, linux: { build 'x' })"),
+    ),
+    "time": (
+        ("src/clock.cpp", "auto now = std::chrono::system_clock::now();"),
+        ("src/clock.c", "localtime_r(&t, &tm);"),
+    ),
+    "regex": (
+        ("src/match.cpp", 'std::regex re("v[0-9]+");'),
+        ("ci/build.groovy", "if (tag ==~ /v\\d+/) {"),
+    ),
+}
+# Python lines the new patterns must not misread.
+LANGUAGE_PATTERN_NON_MATCHES: dict[str, tuple[str, ...]] = {
+    "process": ("if platform.system() == 'Windows':", "runner.execute()", "shape = (1, 2)"),
+    "deserialization": ("def evaluate(model, data):", "score = model.evaluate(x)"),
+    "sql": ('def proc = "ls".execute()', "runner.execute()"),
+    "regex": ("x = ~mask",),
+}
+
+
+class LanguagePatternTests(unittest.TestCase):
+    def test_risky_calls_in_c_cpp_and_groovy_raise_their_signal(self) -> None:
+        for signal, examples in LANGUAGE_SIGNAL_EXAMPLES.items():
+            for path, text in examples:
+                with self.subTest(signal=signal, text=text):
+                    self.assertIn(signal, detect_signals([change_hunk(path, added=[text])]))
+
+    def test_new_patterns_do_not_misread_python(self) -> None:
+        for signal, texts in LANGUAGE_PATTERN_NON_MATCHES.items():
+            for text in texts:
+                with self.subTest(signal=signal, text=text):
+                    self.assertNotIn(signal, detect_signals([change_hunk("src/mod.py", added=[text])]))
+
+    def test_build_files_are_config_and_named_tests_are_tests(self) -> None:
+        for path in ("Jenkinsfile", "ci/deploy.Jenkinsfile", "build.gradle", "app/build.gradle.kts",
+                     "cmake/deps.cmake", "conanfile.txt"):  # fmt: skip
+            with self.subTest(path=path):
+                self.assertIn("config", detect_signals([change_hunk(path, added=["x"])]))
+        for path in ("src/parser_test.cpp", "src/parser_unittest.cc", "test_parser.c",
+                     "src/ParserTest.java", "src/ParserSpec.groovy"):  # fmt: skip
+            with self.subTest(path=path):
+                self.assertIn("tests", detect_signals([change_hunk(path, added=["x"])]))
+        self.assertNotIn("tests", detect_signals([change_hunk("src/Contest.java", added=["x"])]))
+
+    def test_files_in_languages_without_patterns_are_listed(self) -> None:
+        snap = make_snap(
+            change_hunk("app.py", added=["x = 1"], hunk_id="H1"),
+            change_hunk("deploy.sh", added=["curl $URL"], hunk_id="H2"),
+            change_hunk("src/lib.rs", added=["let x = 1;"], hunk_id="H3"),
+            change_hunk("Jenkinsfile", added=["sh 'make'"], hunk_id="H4"),
+            change_hunk("src/main.cpp", added=["int x;"], hunk_id="H5"),
+            change_hunk("package.json", added=['"a": 1'], hunk_id="H6"),
+            change_hunk("README.md", added=["text"], hunk_id="H7"),
+            change_hunk("old.rb", removed=["x = 1"], hunk_id="H8"),
+            change_hunk("deploy.sh", added=["rm -rf $DIR"], hunk_id="H9"),
+        )
+
+        self.assertEqual(files_without_signal_patterns(snap), ("deploy.sh", "src/lib.rs"))
 
 
 class SnapshotStabilityTests(RepoTestCase):

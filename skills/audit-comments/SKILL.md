@@ -9,7 +9,7 @@ description: >-
 
 # Comment & docstring audit (`/audit-comments [target]`)
 
-Deepens probe 4 of the `craft` lens (run `craftsman skill show code-review --file lenses.md` to
+Deepens probe 4 of the `craft` lens (run `craftsman skill show code-review --lenses craft` to
 read that playbook first; never search the file system for `lenses.md`).
 
 ## Search scope

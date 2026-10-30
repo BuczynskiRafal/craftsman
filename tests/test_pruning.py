@@ -12,11 +12,17 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from craftsman import evidence, hooks, review
+from craftsman import evidence, gate, hooks, review
 from craftsman.evidence import (
+    INBOX_DIRNAME,
     KEEP_ARCHIVES_ENV,
     archive_ledger,
+    archive_ledger_if_rebased,
+    consume_inbox_file,
+    create_inbox_file,
+    inbox_dir_for,
     packet_path,
+    prune_inbox_files,
     prune_round_files,
 )
 from craftsman.ledger import ledger_path_for, save
@@ -377,6 +383,382 @@ class ArchivePruningTests(unittest.TestCase):
         self.assertTrue((craftsman_dir / "packet-3.md").is_file())
         self.assertIn("Pruned: packet-1.md", err_r3.getvalue())
         self.assertIn("Pruned: packet-2.intent.md", err_r3.getvalue())
+
+
+class _ReparseStat:
+    def __init__(self, inner: os.stat_result, reparse_tag: int) -> None:
+        self._inner = inner
+        self.st_reparse_tag = reparse_tag
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
+class InboxLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.craftsman_dir = self.tmp / "craftsman"
+
+    def test_create_inbox_file_returns_unique_paths(self) -> None:
+        paths = [
+            create_inbox_file(self.craftsman_dir, "cover"),
+            create_inbox_file(self.craftsman_dir, "cover"),
+            create_inbox_file(self.craftsman_dir, "add"),
+            create_inbox_file(self.craftsman_dir, "verdict"),
+        ]
+
+        self.assertEqual(len(set(paths)), 4)
+        for path in paths:
+            self.assertEqual(path.parent, inbox_dir_for(self.craftsman_dir))
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_text(encoding="utf-8"), "")
+            self.assertEqual(path.suffix, ".json")
+
+    def test_create_inbox_file_rejects_invalid_kind_or_symlink_dir(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "unknown inbox kind"):
+            create_inbox_file(self.craftsman_dir, "bogus")  # type: ignore[arg-type]
+
+        real_outside = self.tmp / "outside"
+        real_outside.mkdir()
+        self.craftsman_dir.mkdir()
+        (self.craftsman_dir / INBOX_DIRNAME).symlink_to(real_outside, target_is_directory=True)
+        with self.assertRaises(LedgerError):
+            create_inbox_file(self.craftsman_dir, "cover")
+
+        alias_craftsman = self.tmp / "craftsman-link"
+        alias_craftsman.symlink_to(real_outside, target_is_directory=True)
+        with self.assertRaises(LedgerError):
+            create_inbox_file(alias_craftsman, "cover")
+
+    def test_consume_inbox_file_removes_file_cleaning_empty_inbox(self) -> None:
+        first = create_inbox_file(self.craftsman_dir, "cover")
+        second = create_inbox_file(self.craftsman_dir, "add")
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+
+        self.assertTrue(consume_inbox_file(self.craftsman_dir, str(first)))
+        self.assertFalse(first.exists())
+        self.assertTrue(second.is_file())
+        self.assertTrue(inbox_dir.is_dir())
+
+        self.assertTrue(consume_inbox_file(self.craftsman_dir, str(second.resolve())))
+        self.assertFalse(second.exists())
+        self.assertFalse(inbox_dir.exists())
+
+    def test_consume_inbox_file_ignores_stdin_or_outside_paths(self) -> None:
+        outside = self.tmp / "cover.json"
+        outside.write_text("[]", encoding="utf-8")
+        create_inbox_file(self.craftsman_dir, "cover")
+
+        self.assertFalse(consume_inbox_file(self.craftsman_dir, "-"))
+        self.assertFalse(consume_inbox_file(self.craftsman_dir, str(outside)))
+        self.assertTrue(outside.is_file())
+
+    def test_consume_inbox_file_refuses_symlink_inside_inbox(self) -> None:
+        outside = self.tmp / "secret.json"
+        outside.write_text("[]", encoding="utf-8")
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        inbox_dir.mkdir(parents=True)
+        link = inbox_dir / "cover-link.json"
+        link.symlink_to(outside)
+
+        self.assertFalse(consume_inbox_file(self.craftsman_dir, str(link)))
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(outside.is_file())
+
+    def test_consume_inbox_file_refuses_symlinked_parent_aliases(self) -> None:
+        real_file = create_inbox_file(self.craftsman_dir, "cover")
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        fake_inbox = self.tmp / "fake-inbox"
+        fake_inbox.symlink_to(inbox_dir, target_is_directory=True)
+        fake_craftsman = self.tmp / "fake-craftsman"
+        fake_craftsman.symlink_to(self.craftsman_dir, target_is_directory=True)
+
+        self.assertFalse(consume_inbox_file(self.craftsman_dir, str(fake_inbox / real_file.name)))
+        self.assertFalse(
+            consume_inbox_file(
+                self.craftsman_dir, str(fake_craftsman / INBOX_DIRNAME / real_file.name)
+            )
+        )
+        self.assertFalse(consume_inbox_file(fake_craftsman, str(real_file)))
+        self.assertTrue(real_file.is_file())
+
+    def test_consume_inbox_file_warns_on_unlink_oserror_without_raising(self) -> None:
+        real_file = create_inbox_file(self.craftsman_dir, "cover")
+        err = io.StringIO()
+        with (
+            mock.patch.object(Path, "unlink", side_effect=PermissionError("file in use")),
+            redirect_stderr(err),
+        ):
+            consumed = consume_inbox_file(self.craftsman_dir, str(real_file))
+
+        self.assertFalse(consumed)
+        self.assertIn("craftsman: warning: could not remove inbox file", err.getvalue())
+        self.assertIn("file in use", err.getvalue())
+
+        race_err = io.StringIO()
+        with (
+            mock.patch.object(Path, "unlink", side_effect=FileNotFoundError("gone")),
+            redirect_stderr(race_err),
+        ):
+            self.assertFalse(consume_inbox_file(self.craftsman_dir, str(real_file)))
+        self.assertEqual(race_err.getvalue(), "")
+
+    def test_prune_inbox_files_reports_removed_count_on_stderr(self) -> None:
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        inbox_dir.mkdir(parents=True)
+        second = inbox_dir / "verdict-2.json"
+        first = inbox_dir / "cover-1.json"
+        second.write_text("[]", encoding="utf-8")
+        first.write_text("[]", encoding="utf-8")
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            pruned = prune_inbox_files(self.craftsman_dir)
+
+        self.assertEqual([item.name for item in pruned], ["cover-1.json", "verdict-2.json"])
+        self.assertEqual(
+            err.getvalue(), "Pruned 2 inbox file(s): cover-1.json, verdict-2.json\n"
+        )
+        self.assertFalse(inbox_dir.exists())
+
+    def test_prune_inbox_files_is_silent_when_empty(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertEqual(err.getvalue(), "")
+
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        inbox_dir.mkdir(parents=True)
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertEqual(err.getvalue(), "")
+        self.assertFalse(inbox_dir.exists())
+
+    def test_prune_inbox_files_skips_symlinks_or_subdirectories(self) -> None:
+        outside = self.tmp / "outside.json"
+        outside.write_text("[]", encoding="utf-8")
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        inbox_dir.mkdir(parents=True)
+        real_file = inbox_dir / "add-1.json"
+        real_file.write_text("[]", encoding="utf-8")
+        symlink = inbox_dir / "link.json"
+        symlink.symlink_to(outside)
+        subdir = inbox_dir / "nested"
+        subdir.mkdir()
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            pruned = prune_inbox_files(self.craftsman_dir)
+
+        self.assertEqual(pruned, (real_file,))
+        self.assertEqual(err.getvalue(), "Pruned 1 inbox file(s): add-1.json\n")
+        self.assertTrue(symlink.is_symlink())
+        self.assertTrue(outside.is_file())
+        self.assertTrue(subdir.is_dir())
+
+    def test_archive_ledger_prunes_inbox_files(self) -> None:
+        ledger_path = self.craftsman_dir / LEDGER_FILENAME
+        save(ledger_path, reviewed_ledger())
+        stale = create_inbox_file(self.craftsman_dir, "cover")
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            archive_ledger(ledger_path)
+
+        self.assertFalse(stale.exists())
+        self.assertFalse(inbox_dir_for(self.craftsman_dir).exists())
+        self.assertIn(f"Pruned 1 inbox file(s): {stale.name}", err.getvalue())
+
+    def test_archive_if_rebased_prunes_inbox_only_when_base_changed(self) -> None:
+        repo = EvidenceRepo(self.tmp.resolve() / "rebase-repo")
+        ledger_path = ledger_path_for(repo.root)
+        save(ledger_path, reviewed_ledger("a" * 40))
+        stale = create_inbox_file(ledger_path.parent, "add")
+
+        same_err = io.StringIO()
+        with redirect_stderr(same_err):
+            self.assertEqual(archive_ledger_if_rebased(repo.root, "a" * 40), ())
+        self.assertTrue(stale.is_file())
+        self.assertEqual(same_err.getvalue(), "")
+
+        rebased_err = io.StringIO()
+        with redirect_stderr(rebased_err):
+            archived = archive_ledger_if_rebased(repo.root, "b" * 40)
+        self.assertEqual(len(archived), 1)
+        self.assertFalse(stale.exists())
+        self.assertIn(f"Pruned 1 inbox file(s): {stale.name}", rebased_err.getvalue())
+
+    def test_gate_complete_prunes_inbox_only_on_success(self) -> None:
+        repo = EvidenceRepo(self.tmp.resolve() / "gate-repo")
+        repo.write_lines("app.py", 5)
+        self.assertEqual(
+            gate.run_cli(["--init", "--tier", "quick", "--cwd", str(repo.root)], {}), 0
+        )
+        stale = create_inbox_file(repo.ledger_dir, "cover")
+
+        refused_out, refused_err = io.StringIO(), io.StringIO()
+        with redirect_stdout(refused_out), redirect_stderr(refused_err):
+            refused_code = gate.run_cli(["--complete", "--cwd", str(repo.root)], {})
+        self.assertEqual(refused_code, 1)
+        self.assertTrue(stale.is_file())
+
+        repo.record_full_evidence("quick")
+        stale_at_close = create_inbox_file(repo.ledger_dir, "cover")
+        closed_out, closed_err = io.StringIO(), io.StringIO()
+        with redirect_stdout(closed_out), redirect_stderr(closed_err):
+            closed_code = gate.run_cli(["--complete", "--cwd", str(repo.root)], {})
+        self.assertEqual(closed_code, 0, closed_err.getvalue())
+        self.assertFalse(stale_at_close.exists())
+        self.assertFalse(inbox_dir_for(repo.ledger_dir).exists())
+        self.assertIn(f"Pruned 1 inbox file(s): {stale_at_close.name}", closed_err.getvalue())
+
+    def test_consume_inbox_rejects_zero_inode_external_or_reparse_point(self) -> None:
+        inbox_file = create_inbox_file(self.craftsman_dir, "cover")
+        outside = self.tmp / "external.json"
+        outside.write_text("[]", encoding="utf-8")
+        real_lstat = os.lstat
+
+        def zero_inode_lstat(target: str | os.PathLike[str]) -> os.stat_result:
+            st = real_lstat(target)
+            vals = list(st)
+            vals[1] = 0  # st_ino
+            vals[2] = 0  # st_dev
+            return os.stat_result(vals)
+
+        with mock.patch("craftsman.evidence.os.lstat", side_effect=zero_inode_lstat):
+            self.assertFalse(consume_inbox_file(self.craftsman_dir, str(outside)))
+            self.assertTrue(outside.is_file())
+            self.assertTrue(consume_inbox_file(self.craftsman_dir, str(inbox_file)))
+            self.assertFalse(inbox_file.exists())
+
+        junction_item = create_inbox_file(self.craftsman_dir, "add")
+        with mock.patch("craftsman.evidence._is_symlink_or_junction", return_value=True):
+            self.assertFalse(consume_inbox_file(self.craftsman_dir, str(junction_item)))
+            with self.assertRaisesRegex(LedgerError, "refusing to use symlinked directory"):
+                create_inbox_file(self.craftsman_dir, "add")
+        self.assertTrue(junction_item.is_file())
+
+    def test_prune_inbox_warns_on_locked_file_deleting_others(self) -> None:
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        inbox_dir.mkdir(parents=True)
+        locked = inbox_dir / "add-locked.json"
+        unlocked = inbox_dir / "cover-free.json"
+        locked.write_text("[]", encoding="utf-8")
+        unlocked.write_text("[]", encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def selective_unlink(target: Path, missing_ok: bool = False) -> None:
+            if target == locked:
+                raise PermissionError("sharing violation")
+            real_unlink(target, missing_ok=missing_ok)
+
+        err = io.StringIO()
+        patcher = mock.patch.object(Path, "unlink", autospec=True, side_effect=selective_unlink)
+        with patcher, redirect_stderr(err):
+            pruned = prune_inbox_files(self.craftsman_dir)
+
+        self.assertEqual(pruned, (unlocked,))
+        self.assertFalse(unlocked.exists())
+        self.assertTrue(locked.is_file())
+        self.assertTrue(inbox_dir.is_dir())
+        self.assertIn("warning: could not remove inbox file", err.getvalue())
+        self.assertIn("Pruned 1 inbox file(s): cover-free.json", err.getvalue())
+
+        ledger_path = self.craftsman_dir / LEDGER_FILENAME
+        save(ledger_path, reviewed_ledger())
+        arch_err = io.StringIO()
+        with patcher, redirect_stderr(arch_err):
+            archived = archive_ledger(ledger_path)
+        self.assertEqual(len(archived), 1)
+        self.assertFalse(ledger_path.exists())
+        self.assertTrue(locked.is_file())
+        self.assertIn("warning: could not remove inbox file", arch_err.getvalue())
+
+    def test_prune_inbox_warns_without_raising_on_invalid_inbox(self) -> None:
+        self.craftsman_dir.mkdir()
+        outside = self.tmp / "outside-dir"
+        outside.mkdir()
+        alias_dir = self.tmp / "craftsman-alias"
+        alias_dir.symlink_to(self.craftsman_dir, target_is_directory=True)
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(alias_dir), ())
+        self.assertIn("warning: could not prune symlinked directory", err.getvalue())
+
+        inbox_path = inbox_dir_for(self.craftsman_dir)
+        inbox_path.symlink_to(outside, target_is_directory=True)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertIn("warning: could not prune symlinked inbox", err.getvalue())
+        inbox_path.unlink()
+
+        inbox_path.write_text("not a dir", encoding="utf-8")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertIn("not a directory", err.getvalue())
+        inbox_path.unlink()
+
+        inbox_path.mkdir()
+        err = io.StringIO()
+        with (
+            mock.patch.object(Path, "iterdir", side_effect=PermissionError("denied")),
+            redirect_stderr(err),
+        ):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertIn("warning: could not prune inbox", err.getvalue())
+
+    def test_reparse_tags_block_links_while_allowing_cloud_files(self) -> None:
+        inbox_file = create_inbox_file(self.craftsman_dir, "cover")
+        (self.craftsman_dir / "packet-1.intent.md").write_text("view", encoding="utf-8")
+        (self.craftsman_dir / "packet-1.md").write_text("p1", encoding="utf-8")
+        (self.craftsman_dir / "packet-2.md").write_text("p2", encoding="utf-8")
+        real_lstat = os.lstat
+        active_tag = 0
+
+        def tagged_lstat(target: str | os.PathLike[str]) -> _ReparseStat:
+            return _ReparseStat(real_lstat(target), active_tag)
+
+        with mock.patch("craftsman.evidence.os.lstat", side_effect=tagged_lstat):
+            for link_tag in (0xA000000C, 0xA0000003):
+                active_tag = link_tag
+                self.assertTrue(evidence._is_symlink_or_junction(self.craftsman_dir))
+                with self.assertRaises(LedgerError):
+                    evidence._require_real_folder(self.craftsman_dir)
+                self.assertFalse(consume_inbox_file(self.craftsman_dir, str(inbox_file)))
+                self.assertTrue(inbox_file.is_file())
+
+            active_tag = 0x9000001A
+            self.assertFalse(evidence._is_symlink_or_junction(self.craftsman_dir))
+            evidence._require_real_folder(self.craftsman_dir)
+            with redirect_stderr(io.StringIO()):
+                removed = prune_round_files(self.craftsman_dir, 2)
+            self.assertEqual([item.name for item in removed], ["packet-1.intent.md"])
+            self.assertTrue(consume_inbox_file(self.craftsman_dir, str(inbox_file)))
+            self.assertFalse(inbox_file.exists())
+
+    def test_create_inbox_file_recovers_when_dir_removed_mid_race(self) -> None:
+        real_open = os.open
+        calls = 0
+
+        def racing_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                inbox_dir_for(self.craftsman_dir).rmdir()
+            return real_open(path, flags, mode)
+
+        with mock.patch("craftsman.evidence.os.open", side_effect=racing_open):
+            created = create_inbox_file(self.craftsman_dir, "verdict")
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(inbox_dir_for(self.craftsman_dir).is_dir())
+        self.assertTrue(created.is_file())
+        self.assertEqual(created.parent, inbox_dir_for(self.craftsman_dir))
 
 
 if __name__ == "__main__":

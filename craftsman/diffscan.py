@@ -21,6 +21,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from craftsman.diffscan_signals import CONTENT_SIGNAL_PATTERNS
+
 ChangeStatus = Literal["modified", "added", "deleted", "renamed"]
 ScopeKind = Literal["function", "class", "block"]
 
@@ -76,32 +78,89 @@ _DEF_KEYWORDS = (
     r"function|def)"
 )
 _KEYWORD_DEF_RE = re.compile(
-    rf"^\s*{_MODIFIERS}{_DEF_KEYWORDS}\b\s*(?:<[^>]*>\s*)?(?:\([^)]*\)\s*)?"
-    r"(?P<name>[A-Za-z_$][\w$]*)?"
+    rf"""
+    ^\s*
+    {_MODIFIERS}                                # optional visibility/storage modifiers
+    {_DEF_KEYWORDS}\b\s*                        # declaration keyword (class, def, fn, ...)
+    """
+    r"""
+    (?:<[^>]*>\s*)?                             # optional generic type parameters
+    (?:\([^)]*\)\s*)?                           # optional receiver, e.g. Go `func (r *Repo)`
+    (?P<name>[A-Za-z_$][\w$]*)?                 # optional symbol identifier
+    """,
+    re.VERBOSE,
 )
 # Stricter than _KEYWORD_DEF_RE: the name must be followed by definition syntax, so prose such as
 # "type annotations for this module" or "record the result" never yields a symbol.
 _DEFINITION_RE = re.compile(
-    rf"^\s*{_MODIFIERS}{_DEF_KEYWORDS}(?:<[^>]*>)?\s+(?:\([^)]*\)\s*)?(?:<[^>]*>\s*)?"
-    r"(?P<name>[A-Za-z_$][\w$]*)\s*(?:[(<{=:;]|$|(?:extends|implements)\b)"
+    rf"""
+    ^\s*
+    {_MODIFIERS}                                # optional visibility/storage modifiers
+    {_DEF_KEYWORDS}                             # declaration keyword
+    """
+    r"""
+    (?:<[^>]*>)?\s+                             # optional generics on keyword + required whitespace
+    (?:\([^)]*\)\s*)?                           # optional receiver, e.g. Go `func (r *Repo)`
+    (?:<[^>]*>\s*)?                             # optional generic parameters before symbol name
+    (?P<name>[A-Za-z_$][\w$]*)\s*               # defined symbol identifier
+    (?:[(<{=:;] | $ | (?:extends|implements)\b) # definition punctuation, EOL, or inheritance clause
+    """,
+    re.VERBOSE,
 )
 _PYTHON_DEF_RE = re.compile(
-    r"^\s*(?:(?:async\s+)?def\s+(?P<function>[A-Za-z_]\w*)\s*\(|class\s+(?P<class>[A-Za-z_]\w*)\s*[(:])"
+    r"""
+    ^\s*
+    (?:
+        (?:async\s+)? def\s+ (?P<function>[A-Za-z_]\w*)\s*\(   # Python sync/async function header
+        | class\s+ (?P<class>[A-Za-z_]\w*)\s*[(:]              # Python class header
+    )
+    """,
+    re.VERBOSE,
 )
 _CLASS_KEYWORDS = frozenset(
     {"class", "struct", "impl", "interface", "trait", "type", "enum", "module", "namespace",
      "object", "record"}
 )  # fmt: skip
 _ASSIGNED_FUNCTION_RE = re.compile(
-    r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_$][\w$]*)\s*=\s*(?:async\s+)?"
-    r"(?:function\b|\([^)]*\)\s*(?::[^=]+)?=>|[A-Za-z_$][\w$]*\s*=>)"
+    r"""
+    ^\s*
+    (?:export\s+)?                              # optional JS/TS export prefix
+    (?:const|let|var)\s+                        # variable binding keyword
+    (?P<name>[A-Za-z_$][\w$]*)\s*=\s*           # bound function identifier
+    (?:async\s+)?                               # optional async modifier
+    (?:
+        function\b                              # `function (...)` expression
+        | \([^)]*\)\s*(?::[^=]+)?=>             # parenthesized arrow function (with optional TS return type)
+        | [A-Za-z_$][\w$]*\s*=>                 # single-parameter arrow function
+    )
+    """,
+    re.VERBOSE,
 )
 _MODIFIED_METHOD_RE = re.compile(
-    r"^\s*(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|async|"
-    r"synchronized|suspend)\s+)+(?:[\w<>\[\],.?]+\s+)*?(?P<name>[A-Za-z_]\w*)\s*\("
+    r"""
+    ^\s*
+    (?:
+        (?:
+            public | private | protected | internal | static | final
+            | abstract | override | virtual | async | synchronized | suspend
+        )\s+                                    # one or more Java/C#/Kotlin method modifiers
+    )+
+    (?:[\w<>\[\],.?]+\s+)*?                     # optional return-type tokens (generics, arrays, nullable)
+    (?P<name>[A-Za-z_]\w*)\s*\(                 # method identifier and opening parameter list
+    """,
+    re.VERBOSE,
 )
 _PROPERTY_FUNCTION_RE = re.compile(
-    r"(?P<name>[A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s+)?(?:function\b|\(|[A-Za-z_$][\w$]*\s*=>)"
+    r"""
+    (?P<name>[A-Za-z_$][\w$]*)\s*[:=]\s*        # object property or field name followed by `:` or `=`
+    (?:async\s+)?                               # optional async modifier
+    (?:
+        function\b                              # `key: function(...)`
+        | \(                                    # `key: (...) =>`
+        | [A-Za-z_$][\w$]*\s*=>                 # `key: arg =>`
+    )
+    """,
+    re.VERBOSE,
 )
 _CALLEE_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*$")
 _CONTROL_WORDS = frozenset(
@@ -114,89 +173,34 @@ _CONTROL_WORDS = frozenset(
 _COMMENT_PREFIXES = ("//", "#", "/*", "*", "--", ";")
 _CLOSER_RE = re.compile(r"^(?:end\b|[}\])])")
 _RUST_LIFETIME_RE = re.compile(r"'[A-Za-z_]\w*\b(?!')")
-
-_AUTH_WORDS = (
-    "password", "passwd", "token", "secret", "api_key", "apikey", "credential", "permission",
-    "jwt", "cookie", "session", "csrf", "oauth", "auth", "authn", "authz", "authenticate",
-    "authenticated", "authentication", "authorize", "authorized", "authorization",
+_CONFIG_SUFFIXES = frozenset(
+    {".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".env", ".lock", ".gradle", ".cmake"}
 )  # fmt: skip
-_AUTH_ALTERNATION = "|".join(sorted(_AUTH_WORDS, key=len, reverse=True))
-_AUTH_CAMEL_ALTERNATION = "|".join(
-    word.capitalize() for word in sorted(_AUTH_WORDS, key=len, reverse=True) if "_" not in word
-)
-
-_CONTENT_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
-    "process": re.compile(
-        r"\bsubprocess\.|\bos\.(?:system|popen|exec\w*|spawn\w*)\s*\(|\bshell\s*=\s*True\b"
-        r"|\bchild_process\b|\bexec\.Command(?:Context)?\s*\(|Runtime\.getRuntime\(\)\.exec"
-        r"|\bProcess\.Start\s*\(|\bProcessBuilder\b|\b(?:execSync|spawnSync|execFile)\b"
-    ),
-    "filesystem": re.compile(
-        r"(?<![\w])open\s*\(|\bPath\s*\(|\bos\.path\.|\bshutil\.|\bos\.(?:remove|unlink|rename|"
-        r"replace|makedirs|mkdir|rmdir|chmod|listdir|scandir|walk)\s*\(|\bunlink\s*\(|\brmtree\b"
-        r"|\bfs\.\w|\bFiles?\.\w|\btempfile\.|\.(?:read_text|write_text|read_bytes|write_bytes|"
-        r"touch|mkdir|rmdir)\s*\(|\bos\.(?:Open|Create|ReadFile|WriteFile|Remove|RemoveAll|"
-        r"MkdirAll)\b|\bioutil\."
-    ),
-    "network": re.compile(
-        r"\brequests\.|\bhttpx\.|\burllib\b|\bfetch\s*\(|\baxios\b|\bsocket\.|\baiohttp\b"
-        r"|\bhttp\.(?:Client|Get|Post|NewRequest)\b|\bHttpClient\b|\bWebSocket\b|\burlopen\s*\("
-    ),
-    "sql": re.compile(
-        r"(?i:\bselect\b.+?\bfrom\b|\binsert\s+into\b|\bupdate\s+\w+\s+set\b|\bdelete\s+from\b)"
-        r"|\.execute(?:many)?\s*\(|\bcursor\s*[.(]|\.cursor\s*\(|\.query\s*\("
-    ),
-    "deserialization": re.compile(
-        r"\bpickle\.|\byaml\.(?:load|unsafe_load|full_load)\s*\(|\bmarshal\.|\bshelve\.|\bjsonpickle\b"
-        r"|(?<![\w.])(?:eval|exec)\s*\(|\bJSON\.parse\s*\(|\bObjectInputStream\b"
-    ),
-    "concurrency": re.compile(
-        r"\bthreading\b|\bThread\s*\(|\bR?Lock\s*\(|\bSemaphore\s*\(|\basyncio\b|\bawait\s"
-        r"|\basync\s+def\b|\bPromise\b|\bgo\s+func\b|\bsync\.(?:Mutex|RWMutex|WaitGroup|Once)\b"
-        r"|\bmultiprocessing\b|\bconcurrent\.futures\b|\batomic\b|\bAtomic[A-Z]\w*|\bsynchronized\b"
-    ),
-    "time": re.compile(
-        r"\bdatetime\b|\btime\.(?:time|sleep|monotonic|perf_counter|strftime|localtime|gmtime)\s*\("
-        r"|\btimezone\b|\btzinfo\b|\bzoneinfo\b|\bpytz\b|\bnew\s+Date\s*\(|\bDate\.now\s*\("
-        r"|\butcnow\b|\btime\.(?:Now|Since|Sleep|Duration)\b"
-    ),
-    "regex": re.compile(
-        r"\bre\.(?:compile|match|search|sub|subn|fullmatch|findall|finditer|split)\s*\("
-        r"|\bnew\s+RegExp\s*\(|\bregexp\.(?:MustCompile|Compile|MatchString)\s*\(|\bRegex\s*\("
-        r"|\bPattern\.compile\s*\("
-    ),
-    "auth": re.compile(
-        rf"(?<![A-Za-z])(?i:{_AUTH_ALTERNATION})s?(?![a-z])"
-        rf"|(?<=[a-z0-9])(?:{_AUTH_CAMEL_ALTERNATION})s?(?![a-z])"
-    ),
-    "errors": re.compile(
-        r"(?m:^\s*try\s*:|^\s*finally\s*:)|\bexcept\b|\braise\b|\bcatch\s*[({]|\bthrows?\b"
-        r"|\bpanic\s*\(|\brecover\s*\(|\bResult<|\.unwrap\(\)|\.expect\(|\bif\s+err\s*!=\s*nil\b"
-    ),
-    "datamodel": re.compile(
-        r"\bclass\s+[A-Za-z_]|@dataclass\b|\bTypedDict\b|\bNamedTuple\b|\bBaseModel\b|\bProtocol\b"
-        r"|\bEnum\b|\binterface\s+[A-Za-z_]|(?m:^\s*(?:export\s+)?type\s+\w+(?:<[^>]*>)?\s*=)"
-        r"|\bstruct\s+[A-Za-z_]|\bstruct\s*\{|\benum\s+[A-Za-z_]|\brecord\s+[A-Z]"
-    ),
-    "platform": re.compile(
-        r"\bsys\.platform\b|\bos\.(?:name|sep|pathsep|linesep)\b|\bplatform\.system\s*\("
-        r"|\bwin32\b|\\r\\n|\bencoding\s*=|\.encode\s*\(|\.decode\s*\(|\blocale\b"
-        r"|(?i:\bpowershell\b|\bcmd\.exe\b)|\bAPPDATA\b|\bUSERPROFILE\b|\bHOME\b"
-        r"|\bruntime\.GOOS\b|\bprocess\.platform\b"
-    ),
-}
-_CONFIG_SUFFIXES = frozenset({".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".env", ".lock"})
 _CONFIG_NAMES = frozenset(
     {"Dockerfile", "Makefile", "package.json", "pyproject.toml", "setup.py", "setup.cfg", ".env",
-     "CMakeLists.txt"}
+     "CMakeLists.txt", "Jenkinsfile", "build.gradle.kts", "settings.gradle.kts", "conanfile.txt",
+     "conanfile.py"}
 )  # fmt: skip
-_CONFIG_NAME_GLOBS = ("Dockerfile.*", ".env.*", "requirements*.txt", "constraints*.txt")
+_CONFIG_NAME_GLOBS = (
+    "Dockerfile.*", ".env.*", "requirements*.txt", "constraints*.txt", "Jenkinsfile.*", "*.Jenkinsfile",
+)  # fmt: skip
 _TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "__tests__", "testing"})
 _TEST_NAME_GLOBS = (
     "test_*.py", "*_test.py", "*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx",
     "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.spec.jsx", "*_test.go",
+    "*_test.c", "*_test.cc", "*_test.cpp", "*_test.cxx", "*_unittest.cc", "*_unittest.cpp",
+    "test_*.c", "test_*.cc", "test_*.cpp", "*Test.java", "*Tests.java", "*Test.kt", "*Test.groovy",
+    "*Spec.groovy",
 )  # fmt: skip
 _DOCS_SUFFIXES = frozenset({".md", ".rst", ".txt", ".adoc"})
+# Languages whose risky calls the content patterns above know; changed code in any other language
+# is listed by `files_without_signal_patterns` so the reviewer reads it for risks instead.
+_PATTERN_LANGUAGE_SUFFIXES = frozenset(
+    {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".kt", ".cs",
+     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".groovy", ".gradle"}
+)  # fmt: skip
+_PATTERN_LANGUAGE_NAME_GLOBS = ("Jenkinsfile", "Jenkinsfile.*", "*.Jenkinsfile")
+_DATA_SUFFIXES = frozenset({".json", ".lock", ".toml", ".ini", ".cfg", ".csv", ".tsv", ".svg"})
 
 
 class DiffScanError(RuntimeError):
@@ -1296,7 +1300,7 @@ def _hunk_signals(hunk: Hunk) -> set[str]:
     else:
         content = "\n".join(text for _, text in (*hunk.added_lines, *hunk.removed_lines))
         signals.update(
-            name for name, pattern in _CONTENT_SIGNAL_PATTERNS.items() if pattern.search(content)
+            name for name, pattern in CONTENT_SIGNAL_PATTERNS.items() if pattern.search(content)
         )
     if hunk.status == "deleted" or any(text.strip() for _, text in hunk.removed_lines):
         signals.add("deletion")
@@ -1305,6 +1309,26 @@ def _hunk_signals(hunk: Hunk) -> set[str]:
 
 def _name_matches(name: str, globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(name, glob) for glob in globs)
+
+
+def files_without_signal_patterns(snap: DiffSnapshot) -> tuple[str, ...]:
+    """Changed files that add code in a language the risk-signal patterns were not written for.
+
+    No signal firing for these files says nothing about their risks, e.g. a `curl` in a shell
+    script or a Dockerfile `RUN` step.
+    """
+    paths = dict.fromkeys(
+        hunk.path for hunk in snap.hunks if hunk.added_lines and not _is_docs_hunk(hunk)
+    )
+    return tuple(path for path in paths if _outside_signal_patterns(path))
+
+
+def _outside_signal_patterns(path: str) -> bool:
+    posix = PurePosixPath(path)
+    suffix = posix.suffix.lower()
+    if suffix in _DATA_SUFFIXES or _name_matches(posix.name, _PATTERN_LANGUAGE_NAME_GLOBS):
+        return False
+    return suffix not in _PATTERN_LANGUAGE_SUFFIXES
 
 
 def _is_config(path: str) -> bool:

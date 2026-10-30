@@ -1,5 +1,5 @@
 {
-  "craftsman-git-guard": {
+  "craftsman-scope-guard": {
     "enabled": true,
     "PreToolUse": [
       {
@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./scripts/git-guard.py",
+            "command": "./scripts/craftsman-scope-guard.py",
             "timeout": 10
           }
         ]

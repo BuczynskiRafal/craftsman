@@ -15,7 +15,7 @@ from unittest import mock
 from craftsman import antigravity, hooks
 from craftsman.gate import MAX_CONTINUATIONS
 from craftsman.gatecheck import MAX_ROUNDS
-from craftsman.hooks import COPILOT_PUSH_NOTE, REVIEWER_STOP_REASON, HookInput, HookInputError
+from craftsman.hooks import REVIEWER_STOP_REASON, HookInput, HookInputError
 
 from tests.support import EvidenceRepo, coverage_note
 
@@ -115,7 +115,7 @@ class InactiveTests(HookTestCase):
             ("stop", "claude", claude("Stop", self.root, stop_hook_active=False)),
             ("subagent-start", "copilot", vscode("SubagentStart", self.root, agent_type="craftsman-reviewer")),
             ("subagent-stop", "claude", claude("SubagentStop", self.root, agent_type="craftsman-reviewer")),
-            ("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="what does /craftsman do?")),
+            ("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="what does `/craftsman` do?")),
         ):  # fmt: skip
             with self.subTest(event=event, platform=platform):
                 self.assertEqual(call_hook(event, platform, payload)[0], {})
@@ -614,55 +614,28 @@ class SubagentTests(HookTestCase):
 
 
 class PreToolTests(HookTestCase):
-    def deny_reason(self, out: dict[str, Any]) -> str:
-        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
-        assert isinstance(reason, str)
-        return reason
-
     def shell_payloads(self, command: str) -> list[tuple[str, dict[str, Any]]]:
-        """`command` as each platform's shell tool sends it, with a Claude transcript to consult."""
+        """`command` as each platform's shell tool sends it."""
         transcript = self.tmp / "claude.jsonl"
         transcript.write_text("", encoding="utf-8")
         return [
-            ("copilot", vscode("PreToolUse", self.root, tool_name="run_in_terminal", tool_use_id="t1", tool_input={"command": command, "explanation": "push"})),
+            ("copilot", vscode("PreToolUse", self.root, tool_name="run_in_terminal", tool_use_id="t1", tool_input={"command": command, "explanation": "run"})),
             ("copilot", copilot_cli(self.root, toolName="bash", toolArgs=json.dumps({"command": command}))),
             ("copilot", copilot_cli(self.root, toolName="powershell", toolArgs={"command": command})),
             ("claude", claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": command}, transcript_path=str(transcript))),
         ]  # fmt: skip
-
-    def test_unconfirmed_push_to_main_is_denied_for_every_payload_flavor(self) -> None:
-        for platform, payload in self.shell_payloads("git push origin main"):
-            with self.subTest(platform=platform, payload=payload):
-                out, _ = call_hook("pre-tool", platform, payload)
-                reason = self.deny_reason(out)
-                self.assertIn("[CRAFTSMAN GIT-GUARD]", reason)
-                self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
-                self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-                if platform == "copilot":
-                    self.assertEqual(out["permissionDecision"], "deny")
-                    self.assertEqual(out["permissionDecisionReason"], reason)
-                else:
-                    self.assertEqual(set(out), {"hookSpecificOutput"})
 
     def test_harmless_command_is_allowed_for_every_payload_flavor(self) -> None:
         for platform, payload in self.shell_payloads("git status"):
             with self.subTest(platform=platform, payload=payload):
                 self.assertEqual(call_hook("pre-tool", platform, payload)[0], {})
 
-    def test_claude_without_a_transcript_asks_the_user(self) -> None:
-        payload = claude(
-            "PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git push origin main"}
-        )
-        out, _ = call_hook("pre-tool", "claude", payload)
-        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
-
-    def test_ai_attribution_in_a_commit_is_denied(self) -> None:
+    def test_git_commit_or_push_is_allowed_for_every_payload_flavor(self) -> None:
         commit = 'git commit -m "feat: x" -m "Co-authored-by: Claude <noreply@anthropic.com>"'
-        payload = vscode(
-            "PreToolUse", self.root, tool_name="run_in_terminal", tool_input={"command": commit}
-        )
-        out, _ = call_hook("pre-tool", "copilot", payload)
-        self.assertIn("Zero AI Attribution", self.deny_reason(out))
+        for command in ("git push origin main", commit):
+            for platform, payload in self.shell_payloads(command):
+                with self.subTest(command=command, platform=platform):
+                    self.assertEqual(call_hook("pre-tool", platform, payload)[0], {})
 
     def test_non_shell_tool_is_not_guarded(self) -> None:
         edit = vscode(
@@ -672,18 +645,6 @@ class PreToolTests(HookTestCase):
             tool_input={"command": "git push origin main"},
         )
         self.assertEqual(call_hook("pre-tool", "copilot", edit)[0], {})
-
-    def test_powershell_tool_in_a_relative_cwd_is_guarded(self) -> None:
-        self.repo.git("checkout", "-q", "-b", "main")
-        (self.root / "sub").mkdir()
-        for tool in ("PowerShell", "pwsh"):
-            with self.subTest(tool=tool):
-                payload = claude(
-                    "PreToolUse", self.root, tool_name=tool,
-                    tool_input={"command": "git push", "cwd": "sub"},
-                )  # fmt: skip
-                out, _ = call_hook("pre-tool", "copilot", payload)
-                self.assertEqual(out["permissionDecision"], "deny")
 
     def test_shell_commands_mark_the_session_as_hooked(self) -> None:
         self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
@@ -697,7 +658,7 @@ class PreToolTests(HookTestCase):
 
     def test_guard_failure_asks_the_user(self) -> None:
         payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git status"})
-        with mock.patch.object(hooks, "evaluate_shell_command", side_effect=RuntimeError("boom")):
+        with mock.patch.object(hooks, "find_worktree_mutation", side_effect=RuntimeError("boom")):
             out, _ = call_hook("pre-tool", "claude", payload)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
@@ -705,24 +666,9 @@ class PreToolTests(HookTestCase):
         payload = vscode(
             "PreToolUse", self.root, tool_name="run_in_terminal", tool_input={"command": "ls"}
         )
-        with mock.patch.object(hooks, "evaluate_shell_command", side_effect=RuntimeError("boom")):
+        with mock.patch.object(hooks, "find_worktree_mutation", side_effect=RuntimeError("boom")):
             out, _ = call_hook("pre-tool", "copilot", payload)
         self.assertEqual(out["permissionDecision"], "deny")
-
-    def test_failed_check_on_copilot_carries_no_push_advice(self) -> None:
-        self.init("standard")
-        self.update_state(owner=None)
-        payload = vscode("PreToolUse", self.root, tool_name="Grep", tool_input={"pattern": "x"})
-        out, _ = call_hook("pre-tool", "copilot", payload)
-        self.assertNotIn(COPILOT_PUSH_NOTE, out["permissionDecisionReason"])
-
-    def test_protected_push_on_copilot_leaves_the_push_to_the_user(self) -> None:
-        payload = vscode(
-            "PreToolUse", self.root, tool_name="run_in_terminal",
-            tool_input={"command": "git push origin main"},
-        )  # fmt: skip
-        out, _ = call_hook("pre-tool", "copilot", payload)
-        self.assertTrue(out["permissionDecisionReason"].endswith(COPILOT_PUSH_NOTE))
 
     def test_invalid_gate_state_asks_before_a_search(self) -> None:
         self.init("standard")
@@ -874,11 +820,11 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(call_hook("pre-tool", "claude", payload)[0], {})
         self.assertEqual(self.state()["owner"], {"platform": "antigravity", "session_id": None})
 
-    def test_git_guard_protects_a_session_that_does_not_own_the_gate(self) -> None:
+    def test_worktree_guard_blocks_reviewer_in_a_session_that_does_not_own_the_gate(self) -> None:
         self.open_antigravity_gate_from_the_terminal()
         payload = vscode(
-            "PreToolUse", self.root, tool_name="run_in_terminal",
-            tool_input={"command": "git push origin main"},
+            "PreToolUse", self.root, agent_type="craftsman-reviewer", tool_name="run_in_terminal",
+            tool_input={"command": "git checkout -- ."},
         )  # fmt: skip
         out, _ = call_hook("pre-tool", "copilot", payload)
         self.assertEqual(out["permissionDecision"], "deny")

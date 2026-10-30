@@ -34,7 +34,12 @@ from craftsman.diffscan import (
     snapshot,
     worktree_root,
 )
-from craftsman.evidence import Evaluation, archive_ledger_if_rebased, evaluate_evidence
+from craftsman.evidence import (
+    Evaluation,
+    archive_ledger_if_rebased,
+    evaluate_evidence,
+    prune_inbox_files,
+)
 from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
     QUICK_TIER_MAX_CHANGED_LINES,
@@ -623,21 +628,28 @@ def _updated(state: GateState, args: argparse.Namespace) -> GateState:
     )
 
 
-def _complete(root: Path, path: Path, caller: GateOwner) -> int:
-    def close(current: GateState | None) -> tuple[GateState, tuple[int, str]]:
-        state = require_owned(current, caller, root, "complete")
-        evaluation = evaluate_task(state, root)
-        outcome = judge(evaluation)
-        if outcome in HUMAN_NOTICES:
-            failure = f"[CRAFTSMAN GATE] Cannot complete. {HUMAN_NOTICES[outcome]}\n"
-            return replace(state, stage=Stage.NEEDS_HUMAN), (1, failure)
-        if outcome is Outcome.UNSATISFIED:
-            return state, (1, f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
-        closed = state.closed(evaluation.report, evaluation.tier)
-        return closed, (0, closed_gate_line(evaluation, closed))
+def _close_gate(
+    current: GateState | None, *, root: Path, caller: GateOwner
+) -> tuple[GateState, tuple[int, str]]:
+    state = require_owned(current, caller, root, "complete")
+    evaluation = evaluate_task(state, root)
+    outcome = judge(evaluation)
+    if outcome in HUMAN_NOTICES:
+        failure = f"[CRAFTSMAN GATE] Cannot complete. {HUMAN_NOTICES[outcome]}\n"
+        return replace(state, stage=Stage.NEEDS_HUMAN), (1, failure)
+    if outcome is Outcome.UNSATISFIED:
+        return state, (1, f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
+    closed = state.closed(evaluation.report, evaluation.tier)
+    return closed, (0, closed_gate_line(evaluation, closed))
 
-    code, message = update_state(path, close)
+
+def _complete(root: Path, path: Path, caller: GateOwner) -> int:
+    code, message = update_state(
+        path, lambda current: _close_gate(current, root=root, caller=caller)
+    )
     (sys.stdout if code == 0 else sys.stderr).write(message)
+    if code == 0:
+        prune_inbox_files(path.parent)
     return code
 
 

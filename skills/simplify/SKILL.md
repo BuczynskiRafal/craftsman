@@ -45,7 +45,7 @@ for an edit, do not make it — mention it as a suggestion instead.
    user instead (`craftsman gate --await-user` while you wait for their decision).
 2. **Read the diff and its surroundings.** For each changed function, read the whole function and
    the module it lives in; skim neighboring modules for helpers.
-3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show code-review --file lenses.md` to read the playbook; never search the file system for `lenses.md`):
+3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show code-review --lenses craft` to read the playbook; never search the file system for `lenses.md`):
    - reimplemented helpers, constants or patterns that already exist (search by behavior and by
      likely names, not only the exact name);
    - derivable state, single-use indirection, always-constant flags, deep nesting that guard

@@ -7,23 +7,16 @@ under its base folder and saves the target's manifest entry once the target is c
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
 
-from craftsman.export import (
-    COPY_IGNORED_NAMES,
-    env_var_for_home,
-    read_json_object,
-    read_markdown,
-    resolve_craftsman_pkg_dir,
-    strip_claude_hooks,
-    strip_managed_block,
-    write_json_object,
-)
+from craftsman.assets import COPY_IGNORED_NAMES
 from craftsman.files import (
+    UnsafePathError,
     copy_file,
     copy_once_backup,
     exists,
@@ -32,6 +25,15 @@ from craftsman.files import (
     remove_path,
     require_no_symlinked_parent,
     write_text_atomic,
+)
+from craftsman.generated import (
+    ExportError,
+    FileChange,
+    read_json_object,
+    read_markdown,
+    strip_managed_block,
+    upsert_managed_markdown,
+    write_json_object,
 )
 from craftsman.manifest import (
     InstallError,
@@ -42,6 +44,7 @@ from craftsman.manifest import (
     load_manifest,
     save_manifest,
 )
+from craftsman.paths import env_var_for_home, resolve_craftsman_pkg_dir
 
 
 class InstallMode(str, Enum):
@@ -184,7 +187,7 @@ class TargetSession:
     def modified(self, path: Path, kind: ModifiedKind) -> None:
         self.modified_files[path_key(path)] = kind
 
-    def finish(self, *, previous_hooks_path: str | None = None, hooks_dir: str | None = None) -> None:
+    def finish(self) -> None:
         """Remove what the previous install of this target had and this one no longer has, then
         record the target in the manifest."""
         self._remove_obsolete()
@@ -193,8 +196,6 @@ class TargetSession:
             created_dirs=tuple(self.created_dirs),
             modified_files=self.modified_files,
             hooks_json_keys=self.hooks_json_keys,
-            previous_hooks_path=previous_hooks_path,
-            hooks_dir=hooks_dir,
         )
         manifest = self.manifest or InstallManifest({})
         save_manifest(self.base_dir, manifest.with_target(self.kind, target), dry_run=self.dry_run)
@@ -256,45 +257,75 @@ def install_runtime(session: TargetSession, repo_dir: Path, mode: InstallMode) -
     return [script.name for script in scripts]
 
 
+def created_before(session: TargetSession, path: Path) -> bool:
+    return session.previous is not None and path_key(path) in session.previous.created_paths
+
+
+def report_change(tracker: Tracker, change: FileChange) -> None:
+    if change.backup is not None:
+        tracker.backed_up(change.path, change.backup)
+    tracker.add(EventKind.INSTALLED if change.changed else EventKind.UNCHANGED, change.path)
+
+
+def upsert_markdown(session: TargetSession, target: Path, content: str) -> None:
+    """Merge the Craftsman block into a workspace Markdown file (where a symlink inside the
+    workspace points, as `AGENTS.md -> CLAUDE.md` setups do)."""
+    require_within(target, (session.base_dir,))
+    existed = target.is_file()
+    session.make_dirs(target.parent)
+    change = upsert_managed_markdown(target, content, within=session.base_dir, dry_run=session.dry_run)
+    session.modified(target, ModifiedKind.MANAGED_MARKDOWN)
+    if not existed or created_before(session, target):
+        session.created(target)
+    else:
+        report_change(session.tracker, change)
+
+
 # --- taking merged content out of a user file -----------------------------------------------
 
 
-def _strip_hooks_json(keys: Collection[str]) -> Callable[[dict[str, Any]], dict[str, Any]]:
+def strip_hooks_json(keys: Collection[str]) -> Callable[[dict[str, Any]], dict[str, Any]]:
     return lambda data: {key: value for key, value in data.items() if key not in keys}
 
 
-def revert_modified_file(
-    path: Path, kind: ModifiedKind, target: TargetManifest, tracker: Tracker
-) -> None:
-    """Take Craftsman's part out of a user file; a file Craftsman created and that is left
-    empty by that is removed. A dry run reports exactly what a real run does."""
+def revert_managed_markdown(path: Path, target: TargetManifest, tracker: Tracker) -> None:
+    """Take Craftsman's managed block out of a user Markdown file; a file Craftsman created and
+    that is left empty by that is removed. A dry run reports exactly what a real run does."""
     if not path.is_file():
         return
-    created = path_key(path) in target.created_paths
-    if kind is ModifiedKind.MANAGED_MARKDOWN:
-        text = read_markdown(path)
-        updated_text = strip_managed_block(text, path)
-        if updated_text == text:
-            return
-        _apply(
-            path,
-            tracker,
-            created=created,
-            empty=not updated_text.strip(),
-            write=lambda: write_text_atomic(path, updated_text),
-        )
+    text = read_markdown(path)
+    updated_text = strip_managed_block(text, path)
+    if updated_text == text:
         return
-    strip = (
-        strip_claude_hooks
-        if kind is ModifiedKind.CLAUDE_SETTINGS
-        else _strip_hooks_json(target.hooks_json_keys)
+    _apply(
+        path,
+        tracker,
+        created=path_key(path) in target.created_paths,
+        empty=not updated_text.strip(),
+        write=lambda: write_text_atomic(path, updated_text),
     )
+
+
+def revert_json_file(
+    path: Path,
+    target: TargetManifest,
+    tracker: Tracker,
+    strip: Callable[[dict[str, Any]], dict[str, Any]],
+) -> None:
+    """Take Craftsman's part out of a user JSON file using `strip`; a file Craftsman created and
+    that is left empty by that is removed. A dry run reports exactly what a real run does."""
+    if not path.is_file():
+        return
     data = read_json_object(path)
     updated = strip(data)
     if updated == data:
         return
     _apply(
-        path, tracker, created=created, empty=not updated, write=lambda: write_json_object(path, updated)
+        path,
+        tracker,
+        created=path_key(path) in target.created_paths,
+        empty=not updated,
+        write=lambda: write_json_object(path, updated),
     )
 
 
@@ -316,3 +347,19 @@ def _apply(
 def require_within(path: Path, roots: Collection[Path]) -> None:
     if not any(is_within(path, root) for root in roots):
         raise InstallError(f"refusing to touch {path}: it is outside {', '.join(map(str, roots))}")
+
+
+def run_reported(
+    dry_run: bool, run: Callable[[Tracker], None], summary: Callable[[Tracker], str]
+) -> int:
+    """Run an install or uninstall and print what it did; an error ends it with exit code 1."""
+    tracker = Tracker(dry_run=dry_run)
+    try:
+        run(tracker)
+    except (InstallError, ExportError, UnsafePathError, OSError) as exc:
+        tracker.render(sys.stdout, sys.stderr)  # what was done before the failure
+        sys.stderr.write(f"[ERROR] {exc}\n")
+        return 1
+    tracker.render(sys.stdout, sys.stderr)
+    print(f"{'[DRY-RUN] ' if dry_run else ''}{summary(tracker)}")
+    return 0

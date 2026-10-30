@@ -11,7 +11,7 @@ Events:
 - `subagent-start` / `subagent-stop`: record subagent runs in the ledger (the evidence of reviewer
   isolation), brief Craftsman reviewers and verifiers, and send them back once when they finish
   without recording anything.
-- `pre-tool`: applies the git guard to shell commands and the search scope to search tools.
+- `pre-tool`: guards shell commands against work-tree violations and enforces search scope.
 
 The first event of the owning session claims an active gate for the hooks: from then on the gate
 requires an isolated reviewer on the `standard` and `deep` tiers. Events of other sessions leave
@@ -49,7 +49,6 @@ from craftsman.gate import (
     state_path_for,
     update_state,
 )
-from craftsman.guard import evaluate_shell_command, find_worktree_mutation
 from craftsman.ledger import (
     GROUPED_EVIDENCE_PREFIX,
     add_agent_event,
@@ -77,6 +76,7 @@ from craftsman.scope import (
     load_scope_policy,
 )
 from craftsman.trigger import detect_trigger, task_from_prompt
+from craftsman.worktree_guard import find_worktree_mutation
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
@@ -99,10 +99,6 @@ SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
 REVIEWER_STOP_REASON = (
     "Before finishing, record coverage (`craftsman review cover ...`) for every lens you "
     "examined, and a finding (`craftsman review add ...`) for every defect you found."
-)
-COPILOT_PUSH_NOTE = (
-    " Copilot hooks cannot see the chat, so a confirmation there does not unlock this command: "
-    "ask the user, and if they choose a direct push, they run it themselves."
 )
 
 
@@ -563,27 +559,6 @@ def _stopped_since(ledger: Ledger, hook: HookInput, since: datetime) -> bool:
 # --- pre-tool -------------------------------------------------------------------------------
 
 
-def _check_shell_git_guard(hook: HookInput, reply: Reply) -> Output | None:
-    if hook.tool_name.lower() not in SHELL_TOOLS:
-        return None
-    command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
-    if not isinstance(command, str):
-        return None
-    tool_cwd = hook.tool_input.get("cwd") or hook.tool_input.get("Cwd")
-    cwd = str(Path(hook.cwd, tool_cwd)) if isinstance(tool_cwd, str) and tool_cwd else hook.cwd
-    transcript = None
-    if reply.platform == "claude" and hook.transcript_path:
-        candidate = Path(hook.transcript_path).expanduser()
-        transcript = candidate if candidate.is_file() else None
-    decision, reason = evaluate_shell_command(command, cwd, transcript)
-    if decision == "deny":
-        return reply.deny(reason or "Blocked by the Craftsman git guard.")
-    if decision == "force_ask":
-        reason = reason or "The Craftsman git guard needs your confirmation."
-        return reply.ask(reason + COPILOT_PUSH_NOTE if reply.platform == "copilot" else reason)
-    return None
-
-
 REVIEW_IN_PROGRESS_MAX_AGE = timedelta(hours=12)
 
 
@@ -642,10 +617,7 @@ def _check_worktree_guard(hook: HookInput, reply: Reply, session: Session | None
 
 
 def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
-    """Guard shell commands against git and work-tree violations, then enforce search scope."""
-    guard_reply = _check_shell_git_guard(hook, reply)
-    if guard_reply is not None:
-        return guard_reply
+    """Guard shell commands against work-tree violations, then enforce search scope."""
     worktree_reply = _check_worktree_guard(hook, reply, session)
     if worktree_reply is not None:
         return worktree_reply

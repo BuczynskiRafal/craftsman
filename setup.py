@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Custom build_py step to bundle skills, agents, rules, scripts, git-hooks, templates, and plugin.json into wheels."""
+"""Custom build_py step to bundle skills, agents, rules, scripts, templates, and plugin.json into wheels."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class build_py(_build_py):  # type: ignore[misc]
             shutil.rmtree(assets_dir)
         assets_dir.mkdir(parents=True, exist_ok=True)
 
-        for dirname in ("skills", "agents", "rules", "scripts", "git-hooks", "templates"):
+        for dirname in ("skills", "agents", "rules", "scripts", "templates"):
             src_dir = repo_root / dirname
             if src_dir.is_dir():
                 shutil.copytree(

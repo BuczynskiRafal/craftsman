@@ -26,9 +26,13 @@ Your workspace is the git work tree you were started in (`git rev-parse --show-t
 list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
 folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
 directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI
-commands. Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (for the full
-contract run `craftsman skill show craftsman --file scope.md`).
+commands (never open `.git/craftsman` files by hand except the exact packet path or an inbox file
+path that `craftsman review prepare`, `craftsman review show` or `craftsman review inbox` prints for
+this repository). Batch JSON files go only to `craftsman review inbox` paths; never to `%TEMP%` or
+into the repository; a file you had to create elsewhere must be deleted before you report. Never run
+recursive searches of `~`, `/`, or parent directories, and never open other repositories, other
+projects' packets/ledgers/reports, or assistant session stores (for the full contract run
+`craftsman skill show craftsman --file scope.md`).
 
 ## Arguments
 
@@ -60,8 +64,7 @@ contract run `craftsman skill show craftsman --file scope.md`).
   `deep` (default `2`; queue any remaining shards or reviewer groups).
 - **--fix** — after findings are challenged, fix every `proven`/`probable` one and re-review the
   delta (Step 5).
-- **--comment** — publish the final report on the PR with `gh pr comment`. Never add AI
-  attribution of any kind.
+- **--comment** — publish the final report on the PR with `gh pr comment`.
 
 ## The five rules
 
@@ -82,7 +85,7 @@ contract run `craftsman skill show craftsman --file scope.md`).
 ## Step 0 — Prepare the packet
 
 ```bash
-craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--staged | --tracked | --paths <csv> | --add-paths <csv>] [--task "<what the change is for, one line>"]
+craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--staged | --tracked | --paths <csv> | --add-paths <csv>] [--task "<what the change is for, one line>"] [--add-lens "<lens>=<file:line> <why>" ...]
 ```
 
 This prints:
@@ -93,7 +96,25 @@ This prints:
 - the resolved tier with its reason (e.g. `Tier quick: 120 changed lines <= 250`);
 - in review-only mode, `Scope: N file(s), frozen for this review.` (and `Ignored (outside the
   review scope): ...` when unrelated files exist outside the pinned scope);
-- on `standard` and `deep`, `Suggested reviewer shards: N`.
+- on `standard` and `deep`, `Suggested reviewer shards: N`;
+- `Not scanned for risk signals (...): <files>` when the change touches a language the risk-signal
+  patterns do not know (shell scripts, Dockerfiles, Rust, Ruby, ...).
+
+**Lenses the signals missed.** The signals that select lenses are pattern matches written for a
+few languages, so they are a floor, not a verdict. Before you review, read the diff, in whatever
+language it is written, for risks no selected lens covers: `trust` for running a process, shell or
+CI step, untrusted input reaching a parser, interpreter, query or file path, and credentials;
+`state` for threads, locks, shared state and clocks; `platform` for OS-, locale-, encoding- or
+time-zone-dependent behaviour. Add each missing lens, citing the code that needs it:
+
+```bash
+craftsman review prepare --add-lens "trust=deploy.sh:14 pipes the downloaded installer into sh"
+```
+
+The added lens opens a new round on the same diff that needs only that lens's coverage; it stays
+in every later round, and `craftsman review report` lists it with your reason. You can add lenses,
+never remove them. Re-running `prepare` with a lens that is already selected or already added
+changes nothing.
 
 On `standard` and `deep`, `craftsman review view --lenses <lenses> [--shard K/N] [--hunks <range>]`
 writes and prints a bounded per-reviewer view (`packet-N.<lenses>.shard-K-of-N.md` or
@@ -224,12 +245,12 @@ finding a verdict) or acknowledge it with a concrete code reason (`craftsman rev
 - **Single multi-lens `--files` coverage entry per batch of 1–4 files:** in `quick`, every lens
   accepts `--files`, so record all selected lenses for up to 4 changed files in one call:
   ```bash
-  craftsman review cover --lens intent,contracts,failure --files src/a.py,src/b.py --note "src/a.py: paginate(page=0) -> ValueError at L18, size=None -> DEFAULT_SIZE at L22, callers api.py:44. src/b.py: load_items maps OSError -> ConfigError at L31 without partial state"
+  craftsman review cover --lens intent,contracts,failure --files src/a.py,src/b.py --note "src/a.py: paginate(page=0) -> ValueError at L18, size=None -> DEFAULT_SIZE at L22, callers api.py:44 ok. src/b.py: load_items maps OSError -> ConfigError at L31 without partial state, callers cli.py:19 ok"
   ```
   (or `cover --from-json` with `"lenses": ["intent", "contracts", "failure"]` and `"files": [...]`).
   Name each file (full path, or basename when unique in the round) with a concrete code-detail
-  segment of **>= 80 characters per file** whenever 2 or more lenses are combined (`>= 40` chars
-  for a single lens).
+  segment of **>= 80 characters per file** (20 concrete) whenever 2 or more lenses are combined
+  (`>= 40` chars for a single lens).
 - **No `sweep` lens in `quick`:** `sweep` is not selected on `quick` — never call
   `craftsman review cover --lens sweep`.
 - **Close any `Quality signals` (`S1..Sn`)** via `review ack S# --reason "..."` or
@@ -272,23 +293,31 @@ subagents (when no subagent mechanism exists, run the lenses yourself, loading p
   view/shard (never the full packet).
 - **Multi-lens, incremental coverage:** on `standard` and `deep`, hunk lenses cover `--hunks` while
   `design` covers `--files` (hunk targets and file targets cannot be mixed in one entry, and `sweep`
-  cannot be combined with other lenses). Combine all assigned hunk lenses into one entry per **1–4
-  hunks** with a concrete **>= 80-character** segment per hunk (`>= 40` chars for a single lens),
-  and record `design` separately on `--files`:
+  cannot be combined with other lenses). Combine all assigned hunk lenses onto the same **1–4
+  hunks** in one `"lenses": [...]` entry (never emit separate single-lens entries for the same
+  hunks; `"lens"` is only for single-lens passes like `design` or `sweep`). Combining `>= 2` lenses
+  requires ~2x longer concrete detail per hunk (**`>= 80` characters per hunk, 20 concrete**;
+  `>= 40` chars for a single lens), and `design` is recorded separately on `--files`:
   ```bash
   craftsman review cover --from-json - <<'EOF'
   [
     {
       "lenses": ["intent", "contracts", "failure"],
       "hunks": ["H1", "H3"],
-      "note": "H1 paginate: page=0 -> start=-20 (F2), size=None -> default 20 at catalog.py:14, OSError propagated at L29. H3 search_page: q='' rejected by validate_query at api.py:40 before query_db"
+      "note": "H1 paginate: page=0 -> start=-20 (F2), size=None -> default 20 at catalog.py:14, OSError propagated at L29. H3 search_page: q='' rejected by validate_query at api.py:40 before query_db, callers routes.py:18 ok"
     }
   ]
   EOF
   ```
-  **Flush incrementally:** call `cover --from-json` and `add --from-json` right after every **1–4
-  hunks** (or every **2–3 lenses**). Never buffer one giant JSON heredoc until the end of the turn,
-  where an output-token limit on smaller models loses the entire batch.
+  **Flush incrementally (1–4 hunks per entry) and fix rejected batches at once:** call
+  `cover --from-json` and `add --from-json` right after every **1–4 hunks** (or every **2–3
+  lenses**). Never hoard dozens of entries into one giant end-of-turn batch, where an output-token
+  limit or a late typo rejects the whole batch. When a `--from-json` batch is rejected, nothing in
+  it was recorded:
+  - A rejection lists every entry that needs fixing. Fix all of them in one edit, resend once. Never
+    rerun unchanged input.
+  - If the same entry is rejected twice, rewrite its note from scratch: every hunk id of the entry,
+    each with a concrete detail (`file:line`, value, `->`, symbol).
 - **Concurrency cap (`--parallel`, default `2`):** run at most `--parallel` subagents at the same
   time (default `2`), queuing any remaining shards or groups until a running subagent finishes.
 - **Subagent failure (rate limit, quota, timeout):** **never enter respawn loops**. Retry a failed
@@ -394,7 +423,8 @@ The ledger enforces the evidence: `proven` requires `--run` pointing to the repr
 (saying why it could not be verified deterministically, followed by the chain); `question` is not
 allowed for `blocker` findings and its evidence must start with `intent:` naming the intent source
 and citing `file:line`; `dismissed` needs either `--run` or a `file:line` reference to the guard
-(quote the guard expression).
+(quote the guard expression). A batch rejection records nothing and lists every verdict entry that
+needs fixing — fix all of them in one edit and resend once (never rerun unchanged input).
 
 **Leave the change under review untouched.** Reproductions live in a fresh temporary directory
 outside the repository. Never `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`, or
@@ -454,9 +484,25 @@ ones are listed briefly so the reader sees what was considered.
   Antigravity: `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
   `craftsman-verifier`. Copilot CLI: `/agent` or the task tool. Codex and others:
   run the lenses yourself, one at a time.
-- **Shell.** All `craftsman` commands are identical in bash, zsh, PowerShell and cmd. Keep each
-  on one line (no `\` continuations). When a note, scenario or evidence quotes code containing `$`
-  or backticks, use single quotes so the shell does not expand them. Use the project's Python
-  (`python`, or the virtualenv's); `python3` does not exist on many Windows machines.
+- **Shell.** Keep single-line flag commands on one line (no `\` continuations). In `bash`, `zsh`,
+  and `PowerShell`, single quotes (`'...'`) suppress `$` and backtick expansion (in `PowerShell`,
+  escape an apostrophe inside `'...'` as `''`); in `cmd.exe`, `'` is not a quote character — wrap
+  values in double quotes (`"..."`, escaping inner `"` as `\"`; `cmd` does not expand `$` or
+  backticks, only `%VAR%`). Multi-line `--from-json - <<'EOF'` heredocs are POSIX-shell
+  (`bash`/`zsh`) syntax; in `PowerShell`, pipe a single-quoted here-string (`@'` and `'@` on their
+  own lines, which does not expand `$` or backticks, matching `<<'EOF'`):
+  ```powershell
+  @'
+  [ ...json... ]
+  '@ | craftsman review cover --from-json -
+  ```
+  In Windows PowerShell 5.1, piping to a native executable encodes via `$OutputEncoding` (ASCII by
+  default, turning non-ASCII characters into `?`), so either keep notes in ASCII or write UTF-8 to a
+  managed inbox file: run `craftsman review inbox cover` (or `add` / `verdict`) to print a unique
+  inbox path, write UTF-8 to it (`Set-Content -LiteralPath <path> -Encoding utf8` for read-only
+  subagents without `Edit`), and pass `--from-json <path>` (consumed automatically on success; kept
+  in place on rejection so you can fix every listed entry in one edit and resend once; never write
+  batch JSON files to `%TEMP%` or into the repository). Use the project's Python (`python`, or the
+  virtualenv's); `python3` does not exist on many Windows machines.
 - **No CLI available?** If `craftsman` is not installed, say so explicitly in the report — the
   review then has no gate and must not be presented as gated.

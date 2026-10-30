@@ -22,6 +22,13 @@ from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_pat
 from craftsman.install import install_main
 from craftsman.ledger import add_coverage, add_finding, add_run, open_round
 from craftsman.lenses import Tier
+from craftsman.manifest import (
+    InstallManifest,
+    TargetKind,
+    TargetManifest,
+    load_manifest,
+    save_manifest,
+)
 from craftsman.records import (
     Coverage,
     Ledger,
@@ -478,3 +485,100 @@ class IsolatedHomeTestCase(unittest.TestCase):
 
     def assert_ok(self, result: CliResult) -> None:
         self.assertEqual(result.code, 0, result.err)
+
+    def write_legacy_git_hooks(
+        self,
+        base_dir: Path | None = None,
+        *,
+        previous_hooks_path: str | None = None,
+        set_hooks_path: bool = True,
+    ) -> Path:
+        """Create a Craftsman 3.x `TargetKind.GIT_HOOKS` install under `base_dir` (`~/.craftsman`)."""
+        base = base_dir if base_dir is not None else self.home / ".craftsman"
+        hooks_dir = base / "git-hooks"
+        scripts_dir = base / "scripts"
+        existing = load_manifest(base)
+        created_dirs: list[str] = []
+        for directory in (base, hooks_dir, scripts_dir):
+            if not directory.exists():
+                created_dirs.append(str(directory))
+                directory.mkdir(parents=True, exist_ok=True)
+        hook_files = [hooks_dir / "commit-msg", hooks_dir / "pre-push"]
+        shared_script = scripts_dir / "craftsman-stop-gate.py"
+        for hook_file in hook_files:
+            hook_file.write_text("#!/bin/sh\n", encoding="utf-8")
+        if not shared_script.exists():
+            shared_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        target = TargetManifest(
+            created_paths=tuple(str(p) for p in (*hook_files, shared_script)),
+            created_dirs=tuple(created_dirs),
+            previous_hooks_path=previous_hooks_path,
+            hooks_dir=str(hooks_dir),
+        )
+        manifest = (existing or InstallManifest({})).with_target(TargetKind.GIT_HOOKS, target)
+        save_manifest(base, manifest, dry_run=False)
+        if set_hooks_path:
+            self.git_global("core.hooksPath", str(hooks_dir))
+        return hooks_dir
+
+    def write_legacy_v1_git_hooks(
+        self,
+        base_dir: Path | None = None,
+        *,
+        previous_hooks_path: str | None = None,
+        created_dirs: Sequence[str] | None = None,
+        extra_targets: Mapping[str, Any] | None = None,
+        set_hooks_path: bool = True,
+    ) -> Path:
+        """Create a Craftsman 3.0-3.2 (`schema_version: 1`) `git_hooks` install under `base_dir`."""
+        base = base_dir if base_dir is not None else self.home / ".craftsman"
+        hooks_dir = base / "git-hooks"
+        scripts_dir = base / "scripts"
+        recorded_dirs: list[str] = []
+        for directory in (base, hooks_dir, scripts_dir):
+            if not directory.exists():
+                recorded_dirs.append(str(directory))
+                directory.mkdir(parents=True, exist_ok=True)
+        hook_files = [hooks_dir / "commit-msg", hooks_dir / "pre-push", hooks_dir / ".python_cmd"]
+        for hook_file in hook_files:
+            hook_file.write_text("#!/bin/sh\n", encoding="utf-8")
+        shared_script = scripts_dir / "craftsman-stop-gate.py"
+        if not shared_script.exists():
+            shared_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        git_hooks_paths = [str(p) for p in (*hook_files, shared_script)]
+        git_hooks_dirs = list(recorded_dirs if created_dirs is None else created_dirs)
+        targets: dict[str, Any] = {
+            **(dict(extra_targets) if extra_targets else {}),
+            "git_hooks": {
+                "target": "git_hooks",
+                "mode": "copy",
+                "version": "3.2.0",
+                "created_paths": git_hooks_paths,
+                "created_dirs": git_hooks_dirs,
+                "modified_files": {},
+                "previous_hooks_path": previous_hooks_path,
+                "hooks_dir": str(hooks_dir),
+            },
+        }
+        all_paths = list(
+            dict.fromkeys(p for entry in targets.values() for p in entry.get("created_paths", ()))
+        )
+        all_dirs = list(
+            dict.fromkeys(d for entry in targets.values() for d in entry.get("created_dirs", ()))
+        )
+        raw_manifest = {
+            "schema_version": 1,
+            "version": "3.2.0",
+            "mode": "copy",
+            "created_paths": all_paths,
+            "created_dirs": all_dirs,
+            "previous_hooks_path": previous_hooks_path,
+            "hooks_dir": str(hooks_dir),
+            "targets": targets,
+        }
+        (base / ".craftsman-install.json").write_text(
+            json.dumps(raw_manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        if set_hooks_path:
+            self.git_global("core.hooksPath", str(hooks_dir))
+        return hooks_dir

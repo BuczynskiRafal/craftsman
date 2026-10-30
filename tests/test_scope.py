@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -15,16 +16,17 @@ from unittest import mock
 
 from craftsman import hooks
 from craftsman.gate import GateOwner
-from craftsman.guard import evaluate_command
 from craftsman.scope import (
     ScopeConfigError,
     ScopePolicy,
+    evaluate_antigravity_scope,
     evaluate_scope,
     is_craftsman_agent,
     load_scope_policy,
 )
+from craftsman.scope import main as scope_guard_main
 
-from tests.support import open_gate
+from tests.support import REPO_ROOT, open_gate
 
 # The test repositories have no commit; the scope checks never read the gate's base.
 UNBORN_BASE = "0" * 40
@@ -665,17 +667,441 @@ class ScopeEnforcementTests(unittest.TestCase):
 
     def test_antigravity_run_command_enforces_scope_for_owner_session(self) -> None:
         open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
-        dec, reason = evaluate_command(
-            {
-                "artifactDirectoryPath": str(self.tmp / "brain" / "conv-123"),
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)},
-                },
-            }
+        dec, reason = evaluate_antigravity_scope(
+            {"artifactDirectoryPath": str(self.tmp / "brain" / "conv-123")},
+            "find ~ -name SKILL.md",
+            str(self.repo),
         )
         self.assertEqual(dec, "deny")
         self.assertIn("[CRAFTSMAN SCOPE-GUARD]", reason or "")
+
+        other_dec, _ = evaluate_antigravity_scope(
+            {"artifactDirectoryPath": str(self.tmp / "brain" / "conv-other")},
+            "find ~ -name SKILL.md",
+            str(self.repo),
+        )
+        self.assertEqual(other_dec, "allow")
+
+    def _ensure_initial_commit(self) -> None:
+        head = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+            cwd=self.repo,
+            capture_output=True,
+            check=False,
+        )
+        if head.returncode == 0:
+            return
+        subprocess.run(["git", "add", "src/app.py"], cwd=self.repo, capture_output=True, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "init",
+            ],
+            cwd=self.repo,
+            capture_output=True,
+            check=True,
+        )
+
+    def _add_linked_worktree(self, name: str) -> tuple[Path, Path]:
+        self._ensure_initial_commit()
+        wt = self.tmp / "workspace" / name
+        subprocess.run(
+            ["git", "worktree", "add", "-b", f"branch-{name}", str(wt)],
+            cwd=self.repo,
+            capture_output=True,
+            check=True,
+        )
+        proc = subprocess.run(
+            ["git", "rev-parse", "--absolute-git-dir"],
+            cwd=wt,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        wt_git_dir = Path(proc.stdout.strip()).resolve()
+        (wt_git_dir / "craftsman" / "inbox").mkdir(parents=True, exist_ok=True)
+        return wt.resolve(), wt_git_dir
+
+    def test_linked_worktree_allows_its_own_craftsman_directory(self) -> None:
+        wt1, wt1_git = self._add_linked_worktree("wt-alpha")
+        own_packet = wt1_git / "craftsman" / "packet-1.md"
+        own_inbox_file = wt1_git / "craftsman" / "inbox" / "cover-1.json"
+        own_packet.write_text("# WT1 Packet\n", encoding="utf-8")
+        own_inbox_file.write_text("[]\n", encoding="utf-8")
+
+        for case, tool, inp in (
+            ("Read own packet", "Read", {"file_path": str(own_packet)}),
+            ("Read own inbox file", "Read", {"file_path": str(own_inbox_file)}),
+            ("cat own packet", "Bash", {"command": f"cat {own_packet}"}),
+            ("cat own inbox file", "Bash", {"command": f"cat {own_inbox_file}"}),
+            ("Grep own packet", "Grep", {"pattern": "Packet", "path": str(own_packet)}),
+            ("Glob own inbox", "Glob", {"pattern": f"{wt1_git / 'craftsman' / 'inbox'}/*.json"}),
+            ("Read own worktree source", "Read", {"file_path": str(wt1 / "src" / "app.py")}),
+        ):
+            with self.subTest(case=case):
+                res = evaluate_scope(tool, inp, wt1, wt1, self.policy)
+                self.assertEqual(res.decision, "allow", f"{case}: {res.reason}")
+
+        open_gate(wt1, UNBORN_BASE)
+        out, _ = call_pre_tool(
+            "claude",
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(wt1),
+                "tool_name": "Read",
+                "tool_input": {"file_path": str(own_inbox_file)},
+            },
+        )
+        self.assertNotEqual(out.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
+
+    def test_linked_worktree_denies_other_worktrees_or_main_repo(self) -> None:
+        wt1, wt1_git = self._add_linked_worktree("wt-alpha")
+        wt2, wt2_git = self._add_linked_worktree("wt-beta")
+        wt2_inbox = wt2_git / "craftsman" / "inbox" / "cover-2.json"
+        wt2_inbox.write_text("[]\n", encoding="utf-8")
+        main_inbox = self.repo / ".git" / "craftsman" / "inbox" / "cover-0.json"
+        main_inbox.parent.mkdir(parents=True, exist_ok=True)
+        main_inbox.write_text("[]\n", encoding="utf-8")
+
+        for case, tool, inp, expected_reason in (
+            (
+                "Read sibling worktree inbox",
+                "Read",
+                {"file_path": str(wt2_inbox)},
+                "another git worktree",
+            ),
+            (
+                "cat sibling worktree inbox",
+                "Bash",
+                {"command": f"cat {wt2_inbox}"},
+                "another git worktree",
+            ),
+            (
+                "Read sibling worktree source",
+                "Read",
+                {"file_path": str(wt2 / "src" / "app.py")},
+                "another git repository",
+            ),
+            ("Read main worktree inbox", "Read", {"file_path": str(main_inbox)}, "another git worktree"),
+            (
+                "cat main worktree inbox",
+                "Bash",
+                {"command": f"cat {main_inbox}"},
+                "another git worktree",
+            ),
+            (
+                "Read main git config",
+                "Read",
+                {"file_path": str(self.repo / ".git" / "config")},
+                "another git worktree",
+            ),
+            (
+                "Read own gitdir metadata outside craftsman",
+                "Read",
+                {"file_path": str(wt1_git / "HEAD")},
+                "another git worktree",
+            ),
+            (
+                "Glob across all worktree inboxes",
+                "Glob",
+                {"pattern": f"{self.repo / '.git' / 'worktrees'}/*/craftsman/inbox/*.json"},
+                "another git worktree",
+            ),
+            (
+                "Read main worktree source",
+                "Read",
+                {"file_path": str(self.repo / "src" / "app.py")},
+                "another git repository",
+            ),
+            (
+                "cat main worktree source",
+                "Bash",
+                {"command": f"cat {self.repo / 'src' / 'app.py'}"},
+                "another git repository",
+            ),
+        ):
+            with self.subTest(case=case):
+                res = evaluate_scope(tool, inp, wt1, wt1, self.policy)
+                self.assertEqual(res.decision, "deny", f"{case} unexpectedly allowed")
+                self.assertIn(expected_reason, res.reason)
+
+    def test_main_worktree_denies_linked_worktree_craftsman_files(self) -> None:
+        _, wt1_git = self._add_linked_worktree("wt-alpha")
+        wt1_inbox = wt1_git / "craftsman" / "inbox" / "cover-1.json"
+        wt1_packet = wt1_git / "craftsman" / "packet-1.md"
+        wt1_inbox.write_text("[]\n", encoding="utf-8")
+        wt1_packet.write_text("# WT1\n", encoding="utf-8")
+        main_inbox = self.repo / ".git" / "craftsman" / "inbox" / "cover-0.json"
+        main_inbox.parent.mkdir(parents=True, exist_ok=True)
+        main_inbox.write_text("[]\n", encoding="utf-8")
+
+        self.assertEqual(
+            evaluate_scope(
+                "Read", {"file_path": str(main_inbox)}, self.repo, self.repo, self.policy
+            ).decision,
+            "allow",
+        )
+        for case, tool, inp in (
+            ("Read linked worktree inbox", "Read", {"file_path": str(wt1_inbox)}),
+            ("cat linked worktree inbox", "Bash", {"command": f"cat {wt1_inbox}"}),
+            ("Read linked worktree packet", "Read", {"file_path": str(wt1_packet)}),
+            ("Grep linked worktree gitdir", "Grep", {"pattern": "WT1", "path": str(wt1_git)}),
+        ):
+            with self.subTest(case=case):
+                res = evaluate_scope(tool, inp, self.repo, self.repo, self.policy)
+                self.assertEqual(res.decision, "deny", f"{case} unexpectedly allowed")
+                self.assertIn("another git worktree", res.reason)
+
+    def test_linked_worktree_denies_symlink_escaping_craftsman_inbox(self) -> None:
+        wt1, wt1_git = self._add_linked_worktree("wt-alpha")
+        escape_file = wt1_git / "craftsman" / "inbox" / "escape.json"
+        escape_file.symlink_to(self.outside_dir / "leak.txt")
+
+        for tool, inp in (
+            ("Read", {"file_path": str(escape_file)}),
+            ("Bash", {"command": f"cat {escape_file}"}),
+        ):
+            res = evaluate_scope(tool, inp, wt1, wt1, self.policy)
+            self.assertEqual(res.decision, "deny")
+            self.assertIn("escapes the repository work tree via symlink", res.reason)
+
+        wt2, wt2_git = self._add_linked_worktree("wt-beta")
+        os.rmdir(wt2_git / "craftsman" / "inbox")
+        os.rmdir(wt2_git / "craftsman")
+        (wt2_git / "craftsman").symlink_to(self.outside_dir)
+        symlink_dir_res = evaluate_scope(
+            "Read",
+            {"file_path": str(wt2_git / "craftsman" / "leak.txt")},
+            wt2,
+            wt2,
+            self.policy,
+        )
+        self.assertEqual(symlink_dir_res.decision, "deny")
+        self.assertIn("escapes the repository work tree via symlink", symlink_dir_res.reason)
+
+    def test_relative_gitdir_pointer_resolves_worktree_craftsman_scope(self) -> None:
+        rel_wt = self.tmp / "workspace" / "rel-wt"
+        rel_wt.mkdir(parents=True)
+        rel_git = self.repo / ".git" / "worktrees" / "rel-wt"
+        (rel_git / "craftsman" / "inbox").mkdir(parents=True)
+        rel_inbox = rel_git / "craftsman" / "inbox" / "cover-1.json"
+        rel_inbox.write_text("[]\n", encoding="utf-8")
+        (rel_wt / ".git").write_text("gitdir: ../my-repo/.git/worktrees/rel-wt\n", encoding="utf-8")
+
+        self.assertEqual(
+            evaluate_scope("Read", {"file_path": str(rel_inbox)}, rel_wt, rel_wt, self.policy).decision,
+            "allow",
+        )
+        self.assertEqual(
+            evaluate_scope(
+                "Read",
+                {"file_path": str(self.repo / ".git" / "craftsman" / "packet-1.md")},
+                rel_wt,
+                rel_wt,
+                self.policy,
+            ).decision,
+            "deny",
+        )
+
+        plain_dir = self.tmp / "plain-non-git"
+        plain_dir.mkdir()
+        (plain_dir / "note.txt").write_text("hi\n", encoding="utf-8")
+        self.assertEqual(
+            evaluate_scope(
+                "Read", {"file_path": str(plain_dir / "note.txt")}, plain_dir, plain_dir, self.policy
+            ).decision,
+            "allow",
+        )
+        self.assertEqual(
+            evaluate_scope(
+                "Read",
+                {"file_path": str(self.other_repo / "secret.py")},
+                plain_dir,
+                plain_dir,
+                self.policy,
+            ).decision,
+            "deny",
+        )
+
+    def test_posix_heredoc_with_semicolons_in_json_note_is_allowed(self) -> None:
+        cmd = (
+            "craftsman review cover --from-json - <<'EOF'\n"
+            '[{"lenses": ["intent", "contracts", "failure"], "hunks": ["H1", "H2"], '
+            '"note": "H1 parse_cfg: raw=\'\' -> {}; callers cli.py:19 ok; '
+            'H2 save_cfg: rejects ../outside path -> ConfigError at cfg.py:55"}]\n'
+            "EOF"
+        )
+        decision = evaluate_scope("Bash", {"command": cmd}, self.repo, self.repo, self.policy)
+        self.assertEqual(decision.decision, "allow", decision.reason)
+
+    def test_powershell_herestring_batch_allowed_while_bad_read_denied(self) -> None:
+        inbox = self.repo / ".git" / "craftsman" / "inbox" / "cover-1.json"
+        inbox.parent.mkdir(parents=True, exist_ok=True)
+        for cmd in (
+            "@'\n"
+            '[{"lenses": ["intent", "contracts"], "hunks": ["H1"], '
+            '"note": "H1 fn: caller\'s raw=\'\' -> {}; rejects /etc/passwd at a.py:9"}]\n'
+            "'@ | craftsman review cover --from-json -",
+            "@'\r\n"
+            '[{"lens": "intent", "hunks": ["H1"], "note": "H1 fn: x=1; y=2 -> caller\'s default at a.py:9"}]\r\n'
+            f"'@ | Set-Content -LiteralPath {inbox} -Encoding utf8",
+        ):
+            with self.subTest(cmd=cmd[:40]):
+                dec = evaluate_scope("pwsh", {"command": cmd}, self.repo, self.repo, self.policy)
+                self.assertEqual(dec.decision, "allow", dec.reason)
+
+        unclosed = "@'\n[{\"lens\": \"intent\"}]\n"
+        self.assertEqual(
+            evaluate_scope("pwsh", {"command": unclosed}, self.repo, self.repo, self.policy).decision,
+            "deny",
+        )
+        secret_read = f"cat @'\n{self.other_repo / 'secret.py'}\n'@"
+        self.assertEqual(
+            evaluate_scope("pwsh", {"command": secret_read}, self.repo, self.repo, self.policy).decision,
+            "deny",
+        )
+
+    def test_herestring_token_boundaries_distinguish_bash_mid_word_quotes(self) -> None:
+        ps_cover = (
+            "@'\n"
+            '[{"lens": "intent", "hunks": ["H1"], "note": "ok"}]\n'
+            "'@ | craftsman review cover --from-json -"
+        )
+        ps_redirect = "@'\n[]\n'@>out.json\ncraftsman review cover --from-json out.json"
+        for tool, cmd, expected in (
+            ("Bash", "printf 'ok' foo@'\necho hi'", "allow"),
+            ("Bash", 'printf "ok" user@"\nhost"', "allow"),
+            ("pwsh", ps_cover, "allow"),
+            ("pwsh", ps_redirect, "allow"),
+            ("pwsh", "$a = @'\nx\n'@.Trim()", "allow"),
+            ("pwsh", "$a = @'\nx\n'@+(cat ~/.zsh_history)+@'\ny's\n'@", "deny"),
+            ("pwsh", "$a = @'\nx\n'@,(cat ~/.zsh_history),@'\ny's\n'@", "deny"),
+            ("pwsh", "$a = @'\nx\n'@.Trim() + (cat ~/.zsh_history)", "deny"),
+        ):
+            with self.subTest(cmd=cmd):
+                dec = evaluate_scope(tool, {"command": cmd}, self.repo, self.repo, self.policy)
+                self.assertEqual(dec.decision, expected, dec.reason)
+
+        chained = "printf 'ok' foo@'\necho hi'\nfind ~ -name SKILL.md"
+        chained_dec = evaluate_scope(
+            "Bash", {"command": chained}, self.repo, self.repo, self.policy
+        )
+        self.assertEqual(chained_dec.decision, "deny")
+        self.assertNotIn("unmatched quotes", chained_dec.reason)
+
+        unclosed = "@'\n[{\"lens\": \"intent\"}]\n"
+        err = io.StringIO()
+        with redirect_stderr(err):
+            dec = evaluate_scope("pwsh", {"command": unclosed}, self.repo, self.repo, self.policy)
+        self.assertEqual(dec.decision, "deny")
+        self.assertIn("has unmatched quotes", dec.reason)
+
+    def test_scope_allow_parent_still_denies_other_worktree_git_dirs(self) -> None:
+        wt1, _ = self._add_linked_worktree("wt-one")
+        wt2, wt2_git = self._add_linked_worktree("wt-two")
+        wide_policy = ScopePolicy(mode="deny", allowed_dirs=(self.tmp,))
+        other_inbox = wt2_git / "craftsman" / "inbox" / "c.json"
+        main_inbox = self.repo / ".git" / "craftsman" / "inbox" / "c.json"
+        other_inbox.parent.mkdir(parents=True, exist_ok=True)
+        main_inbox.parent.mkdir(parents=True, exist_ok=True)
+        other_inbox.write_text("[]", encoding="utf-8")
+        main_inbox.write_text("[]", encoding="utf-8")
+        (wt2 / "app.py").write_text("x = 2\n", encoding="utf-8")
+
+        self.assertEqual(
+            evaluate_scope("Read", {"file_path": str(other_inbox)}, wt1, wt1, wide_policy).decision,
+            "deny",
+        )
+        self.assertEqual(
+            evaluate_scope("Read", {"file_path": str(main_inbox)}, wt1, wt1, wide_policy).decision,
+            "deny",
+        )
+        self.assertEqual(
+            evaluate_scope("Read", {"file_path": str(wt2 / "app.py")}, wt1, wt1, wide_policy).decision,
+            "allow",
+        )
+
+    def test_scope_guard_entrypoints_enforce_only_search_scope(self) -> None:
+        open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
+        session_dir = str(self.tmp / "brain" / "conv-123")
+
+        def run_in_proc(raw_stdin: str, argv: list[str] | None = None) -> tuple[int, str, str]:
+            out, err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch("sys.stdin", io.StringIO(raw_stdin)),
+                redirect_stdout(out),
+                redirect_stderr(err),
+            ):
+                code = scope_guard_main(argv or [])
+            return code, out.getvalue(), err.getvalue()
+
+        code, out, _ = run_in_proc("", ["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("craftsman scope-guard", out)
+
+        code, _, err = run_in_proc("{}", ["--bogus"])
+        self.assertEqual(code, 2)
+        self.assertIn("unknown arguments --bogus", err)
+
+        code, out, _ = run_in_proc("{not-json")
+        self.assertEqual(code, 0)
+        bad_json = json.loads(out)
+        self.assertEqual(bad_json["decision"], "deny")
+        self.assertIn("Unreadable hook input", bad_json["reason"])
+
+        code, out, _ = run_in_proc("[1, 2]")
+        self.assertEqual(code, 0)
+        non_obj = json.loads(out)
+        self.assertEqual(non_obj["decision"], "deny")
+        self.assertIn("not a JSON object", non_obj["reason"])
+
+        code, out, _ = run_in_proc(json.dumps({"toolCall": {"name": "view_file", "args": {}}}))
+        self.assertEqual((code, json.loads(out)), (0, {"decision": "allow"}))
+
+        # Git policy commands (push to main, AI trailers) are allowed by scope-guard.
+        for git_cmd in (
+            "git push origin main",
+            'git commit -m "feat: x\n\nCo-authored-by: Claude <noreply@anthropic.com>"',
+        ):
+            payload = {
+                "artifactDirectoryPath": session_dir,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": git_cmd, "Cwd": str(self.repo)},
+                },
+            }
+            code, out, _ = run_in_proc(json.dumps(payload))
+            self.assertEqual((code, json.loads(out)), (0, {"decision": "allow"}), git_cmd)
+
+        # Out-of-scope search via the standalone shim script is denied.
+        script = REPO_ROOT / "scripts" / "craftsman-scope-guard.py"
+        deny_payload = {
+            "artifactDirectoryPath": session_dir,
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)},
+            },
+        }
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            input=json.dumps(deny_payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env={**os.environ, "HOME": str(self.home), "USERPROFILE": str(self.home)},
+        )
+        script_out = json.loads(proc.stdout)
+        self.assertEqual(script_out["decision"], "deny")
+        self.assertIn("[CRAFTSMAN SCOPE-GUARD]", script_out["reason"])
 
 
 if __name__ == "__main__":

@@ -13,17 +13,18 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from craftsman import __version__
+from craftsman.assets import Skill, iter_skills
 from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.doctor import run_doctor
-from craftsman.export import ExportError, Skill, default_repo_dir, iter_skills
 from craftsman.export import main as export_main
 from craftsman.gate import GateState, GateStateError, load_state, state_path_for, task_tier
 from craftsman.gate import main as gate_main
-from craftsman.guard import main as guard_main
+from craftsman.generated import ExportError
 from craftsman.hooks import main as hook_main
 from craftsman.install import install_main
 from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens
 from craftsman.manifest import InstallError
+from craftsman.paths import default_repo_dir
 from craftsman.playbooks import (
     CODE_REVIEW_SKILL,
     LENSES_FILENAME,
@@ -33,6 +34,7 @@ from craftsman.playbooks import (
 from craftsman.records import VERDICTS, Ledger, LedgerError
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
+from craftsman.scope import main as scope_guard_main
 from craftsman.uninstall import uninstall_main
 
 LATEST_RUNS_SHOWN = 3
@@ -417,7 +419,7 @@ COMMANDS: dict[str, tuple[Callable[[list[str]], int], str]] = {
     "status": (status_main, STATUS_HELP),
     "install": (
         install_main,
-        "Install Craftsman skills, rules, agents, hooks, and git guards across platforms.",
+        "Install Craftsman skills, rules, agents, and lifecycle hooks across platforms.",
     ),
     "uninstall": (uninstall_main, "Uninstall the Craftsman files recorded in install manifests."),
     "export": (
@@ -425,10 +427,13 @@ COMMANDS: dict[str, tuple[Callable[[list[str]], int], str]] = {
         "Export skills and rules to Claude Code, GitHub Copilot, Codex, and Cursor.",
     ),
     "gate": (gate_main, "Open, update and close the quality gate of the current work tree."),
-    "guard": (guard_main, "Invoke the Git Guard PreToolUse or native Git hook engine."),
     "hook": (hook_main, "Lifecycle hook for VS Code Copilot, the Copilot CLI and Claude Code."),
     "review": (review_main, "Prepare review rounds and record findings, coverage and verdicts."),
     "run": (run_main, "Run a command and record its exit code in the evidence ledger."),
+    "scope-guard": (
+        scope_guard_main,
+        "Enforce the search scope on Antigravity PreToolUse payloads.",
+    ),
     "skill": (
         skill_main,
         "Read bundled Craftsman skills and companion files without searching the disk.",

@@ -4,9 +4,10 @@ version: 2.0.0
 description: >-
   Clean code architecture analysis: DRY, SOLID, orthogonality, cohesion,
   complexity, and naming hygiene. Use when checking structural code quality,
-  redundancy, or maintainability independent of business logic. Trigger phrases:
-  "code quality", "DRY check", "SOLID check", "clean code", "show redundancies",
-  "can we simplify this structure".
+  redundancy, or maintainability independent of business logic: "code quality",
+  "DRY check", "SOLID check", "clean code", "show redundancies". Reports
+  findings with before/after code; to apply behavior-preserving cleanups to the
+  current diff, use /simplify.
 ---
 
 # Clean Code & Structural Quality Auditor (`/code-quality`)
@@ -121,6 +122,10 @@ A highly cohesive class has methods that all operate on the same core state towa
 ---
 
 ## 6. Complexity & Nesting
+
+Take line counts, complexity and duplication numbers from a tool when the project has one
+(`radon`, `lizard`, `eslint` complexity rules, `jscpd`, `wc -l`) and cite it; otherwise mark
+the values in the report as estimates.
 
 - **Cyclomatic Complexity:** 1–5 clean (`PASS`) | 6–10 moderate (`WARNING`) | 11+ `[REFACTOR]`.
 - **Nesting Depth:** > 3 levels of indentation → flatten with early returns / guard clauses or helper extraction.

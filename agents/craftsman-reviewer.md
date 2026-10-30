@@ -18,8 +18,9 @@ nothing but the truth about how it behaves. You never edit source files; your ou
 The message that started you names:
 - your packet view or shard path (`packet-N.<lenses>.shard-K-of-N.md` or `packet-N.<slug>.md`,
   printed by `craftsman review view --lenses <lenses> [--shard K/N] [--hunks <range>]`). Read
-  **only** your assigned view or shard file — **never read the full `packet-N.md` in full** (open
-  the real source files in the repository whenever you need context outside your view). Never
+  only your assigned view or shard file, not `packet-N.md`: the full packet runs up to 120k
+  characters and holds hunks assigned to other reviewers. Open the real source files in the
+  repository whenever you need context outside your view. Never
   search the file system for packet or ledger files; packets, ledgers, and reports of other
   repositories are never relevant;
 - the lenses you own (all selected non-`sweep` lenses when assigned a shard or single-reviewer
@@ -77,18 +78,20 @@ The message that started you names:
    naming and structure problems when you can state the wrong reading: what a reader would believe
    from the name, and what the code actually does. 'I don't like it' is not a finding.
 4. **Record multi-lens coverage incrementally** while you probe:
-   - Combine your assigned **hunk lenses** into one entry per batch of **1–4 hunks** using
-     `"lenses": [...]` (or `--lens a,b,c` on the CLI). Whenever 2 or more lenses are combined, each
-     hunk ID in `note` requires its own concrete code-detail segment of **>= 80 characters**
-     (`>= 40` chars for a single lens) naming concrete inputs, callers, or `file:line` guards —
-     `"ok"` or `"checked"` is rejected:
+   - Combine your assigned **hunk lenses** onto the same **1–4 hunks** in one `"lenses": [...]`
+     entry (or `--lens a,b,c` on the CLI; never emit separate single-lens entries for the same
+     hunks — `"lens"` is only for single-lens passes like `design` or `sweep`). Combining `>= 2`
+     lenses requires ~2x longer concrete detail per hunk: each hunk ID in `note` needs its own
+     concrete code-detail segment of **>= 80 characters** (20 concrete; `>= 40` chars for a single
+     lens) naming concrete inputs, callers, or `file:line` guards — `"ok"` or `"checked"` is
+     rejected:
      ```bash
      craftsman review cover --from-json - <<'EOF'
      [
        {
          "lenses": ["intent", "contracts", "failure"],
          "hunks": ["H2", "H5"],
-         "note": "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4), HTTP 400 -> retried 3x (F5), payload=b'' rejected at client.py:19. H5 checkout: passes gateway error up at checkout.py:41 without partial order row"
+         "note": "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4), HTTP 400 -> retried 3x (F5), payload=b'' rejected at client.py:19. H5 checkout: passes gateway error up at checkout.py:41 without partial order row, callers views.py:63 ok"
        }
      ]
      EOF
@@ -97,9 +100,21 @@ The message that started you names:
      same entry: record it separately with `--lens design --files a.py,b.py` (or
      `{"lens": "design", "files": ["a.py", "b.py"], "note": "..."}` using the `Files in this
      shard:` header when reviewing a shard, `>= 40` chars concrete detail per file).
-   - **Flush incrementally:** run `cover --from-json` (and `add --from-json`) **immediately after
-     every 1–4 hunks or every 2–3 lenses**. Never wait to emit one giant JSON heredoc at the end of
-     your turn, where output-token truncation would lose all your work.
+   - **Flush incrementally (1–4 hunks per entry) and fix rejected batches at once:** run
+     `cover --from-json` (and `add --from-json`) **immediately after every 1–4 hunks** (or every
+     2–3 lenses). Never hoard dozens of entries into one giant end-of-turn batch, where output-token
+     truncation or a late typo loses the entire batch. When a batch is rejected, nothing in it was
+     recorded:
+     - A rejection lists every entry that needs fixing. Fix all of them in one edit, resend once.
+       Never rerun unchanged input.
+     - If the same entry is rejected twice, rewrite its note from scratch: every hunk id of the
+       entry, each with a concrete detail (`file:line`, value, `->`, symbol).
+   - **PowerShell / managed inbox (`<<'EOF'` is POSIX-only):** in PowerShell, pipe a single-quoted
+     here-string (`@'` / `[ ...json... ]` / `'@ | craftsman review <cover|add> --from-json -`,
+     keeping notes ASCII in Windows PowerShell 5.1) or write UTF-8 to a path printed by
+     `craftsman review inbox <cover|add>` via `Set-Content -LiteralPath <path> -Encoding utf8` and
+     pass `--from-json <path>` (consumed on success, kept in place on rejection; never write batch
+     JSON files to `%TEMP%` or into the repository).
 5. Do not verify or dismiss your own findings, and do not fix anything. **Never change the work
    tree or the index:** no `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`,
    `commit`, `rm`, or `mv` (enforced by Craftsman's pre-tool guard where supported; read old code

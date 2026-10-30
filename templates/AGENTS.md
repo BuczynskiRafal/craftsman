@@ -11,11 +11,12 @@ This repository uses **Craftsman**: every change is reviewed and verified agains
 - **Verify findings:** group unjudged same-root-cause duplicates first with `craftsman review merge <target> <dup>` (only when one fix removes every consequence), then record verdicts with `craftsman review verdict` (or `--from-json - <<'EOF'`), fix and `craftsman review resolve <id> --as fixed --note "..."`; prepare a new round for the changed hunks.
 - **Run checks through the ledger:** `craftsman run --kind test -- <command>` (and `--kind e2e` on deep); only runs at the final code count.
 - **Done means** `craftsman review check` passes; then `craftsman gate --complete` and report with `craftsman review report` (in standalone review-only `/code-review` without `--fix`, finish with `craftsman review check --review-only` and `craftsman review report --review-only`).
-- **Skills & lenses:** invoke `/name` as a skill if your platform offers it; otherwise run `craftsman skill show <name>` (and `craftsman skill show code-review --file lenses.md` for the review lens playbooks). Never search the file system for skill or lens files.
+- **Skills & lenses:** invoke `/name` as a skill if your platform offers it; otherwise run `craftsman skill show <name>` (and `craftsman skill show code-review --lenses <lenses>` for the playbooks of the lenses you apply). Never search the file system for skill or lens files.
 
 ## Search scope
 - Work only inside this git work tree (`git rev-parse --show-toplevel`): prefer `git ls-files`, `git grep`, and editor search scoped to this folder.
-- Outside the work tree you may read only an exact file cited by a stack trace/error, a temp directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI commands.
+- Outside the work tree you may read only an exact file cited by a stack trace/error, a temp directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI commands (never open `.git/craftsman` files by hand except the exact packet path or an inbox file path that `craftsman review prepare`, `craftsman review show` or `craftsman review inbox` prints for this repository).
+- Batch JSON files go only to `craftsman review inbox` paths; never to `%TEMP%` or into the repository; a file you had to create elsewhere must be deleted before you report.
 - Never run recursive searches of `~`, `/`, or parent directories, and never open other repositories, other projects' packets/ledgers/reports, or assistant session stores.
 
 ## Available Skills

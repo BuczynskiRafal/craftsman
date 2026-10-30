@@ -10,7 +10,7 @@ description: >-
 
 # Test-evidence audit (`/audit-tests [target]`)
 
-Deepens the `tests` lens (run `craftsman skill show code-review --file lenses.md` to read that
+Deepens the `tests` lens (run `craftsman skill show code-review --lenses tests` to read that
 playbook first; never search the file system for `lenses.md`).
 
 ## Search scope

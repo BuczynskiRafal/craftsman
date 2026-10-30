@@ -8,8 +8,17 @@ import unittest
 from pathlib import Path
 
 from craftsman.files import BACKUP_DIR_NAME
-from craftsman.manifest import ModifiedKind, TargetKind, TargetManifest, load_manifest
-from craftsman.staging import EventKind, TargetSession, Tracker, path_key, revert_modified_file
+from craftsman.generated import CRAFTSMAN_BEGIN_MARKER, CRAFTSMAN_END_MARKER
+from craftsman.manifest import TargetKind, TargetManifest, load_manifest
+from craftsman.staging import (
+    EventKind,
+    TargetSession,
+    Tracker,
+    path_key,
+    revert_json_file,
+    revert_managed_markdown,
+    strip_hooks_json,
+)
 
 
 class StagingTestCase(unittest.TestCase):
@@ -20,19 +29,19 @@ class StagingTestCase(unittest.TestCase):
         self.base = self.home / ".craftsman"
 
     def session(self, *, dry_run: bool = False) -> TargetSession:
-        return TargetSession.begin(self.base, TargetKind.GIT_HOOKS, self.home, Tracker(dry_run))
+        return TargetSession.begin(self.base, TargetKind.ANTIGRAVITY, self.home, Tracker(dry_run))
 
 
 class SessionTests(StagingTestCase):
     def test_created_folders_are_recorded_up_to_the_first_existing_one(self) -> None:
         session = self.session()
 
-        session.make_dirs(self.base / "git-hooks")
+        session.make_dirs(self.base / "skills")
 
-        self.assertEqual(session.created_dirs, [str(self.base), str(self.base / "git-hooks")])
+        self.assertEqual(session.created_dirs, [str(self.base), str(self.base / "skills")])
 
     def test_users_file_in_the_way_is_moved_aside(self) -> None:
-        target = self.base / "git-hooks" / "commit-msg"
+        target = self.base / "skills" / "SKILL.md"
         target.parent.mkdir(parents=True)
         target.write_text("mine\n", encoding="utf-8")
         session = self.session()
@@ -48,25 +57,27 @@ class SessionTests(StagingTestCase):
         session.make_dirs(self.base)
         session.created(self.base / "a")
 
-        session.finish(hooks_dir=str(self.base / "git-hooks"))
+        session.finish()
 
         manifest = load_manifest(self.base)
         assert manifest is not None
-        self.assertEqual(manifest.targets[TargetKind.GIT_HOOKS].created_paths, (str(self.base / "a"),))
+        self.assertEqual(
+            manifest.targets[TargetKind.ANTIGRAVITY].created_paths, (str(self.base / "a"),)
+        )
 
     def test_reinstall_removes_what_it_no_longer_creates(self) -> None:
         first = self.session()
         first.make_dirs(self.base)
         (self.base / "old").write_text("x", encoding="utf-8")
         first.created(self.base / "old")
-        first.finish(hooks_dir=str(self.base / "git-hooks"))
+        first.finish()
 
-        self.session().finish(hooks_dir=str(self.base / "git-hooks"))
+        self.session().finish()
 
         self.assertFalse((self.base / "old").exists())
 
     def test_dry_run_finish_writes_no_manifest(self) -> None:
-        self.session(dry_run=True).finish(hooks_dir=str(self.base / "git-hooks"))
+        self.session(dry_run=True).finish()
 
         self.assertIsNone(load_manifest(self.base))
 
@@ -83,7 +94,7 @@ class RevertTests(StagingTestCase):
             created_paths=(path_key(path),), hooks_json_keys=("craftsman-stop-gate",)
         )
 
-        revert_modified_file(path, ModifiedKind.HOOKS_JSON, target, Tracker(dry_run=False))
+        revert_json_file(path, target, Tracker(dry_run=False), strip_hooks_json(target.hooks_json_keys))
 
         self.assertFalse(path.exists())
 
@@ -91,23 +102,28 @@ class RevertTests(StagingTestCase):
         path = self.settings({"craftsman-stop-gate": {}, "mine": {}})
         target = TargetManifest(hooks_json_keys=("craftsman-stop-gate",))
 
-        revert_modified_file(path, ModifiedKind.HOOKS_JSON, target, Tracker(dry_run=False))
+        revert_json_file(path, target, Tracker(dry_run=False), strip_hooks_json(target.hooks_json_keys))
 
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"mine": {}})
 
     def test_dry_run_reports_without_writing(self) -> None:
         path = self.settings({"craftsman-stop-gate": {}, "mine": {}})
+        target = TargetManifest(hooks_json_keys=("craftsman-stop-gate",))
         tracker = Tracker(dry_run=True)
 
-        revert_modified_file(
-            path,
-            ModifiedKind.HOOKS_JSON,
-            TargetManifest(hooks_json_keys=("craftsman-stop-gate",)),
-            tracker,
-        )
+        revert_json_file(path, target, tracker, strip_hooks_json(target.hooks_json_keys))
 
         self.assertEqual(tracker.count(EventKind.RESTORED), 1)
         self.assertIn("craftsman-stop-gate", path.read_text(encoding="utf-8"))
+
+    def test_created_markdown_file_left_empty_is_removed(self) -> None:
+        path = self.home / "AGENTS.md"
+        path.write_text(f"{CRAFTSMAN_BEGIN_MARKER}\nrules\n{CRAFTSMAN_END_MARKER}\n", encoding="utf-8")
+        target = TargetManifest(created_paths=(path_key(path),))
+
+        revert_managed_markdown(path, target, Tracker(dry_run=False))
+
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

@@ -53,6 +53,6 @@ jobs:
           test -f "${TMP_HOME}/.gemini/config/skills/craftsman/SKILL.md"
           test -f "${TMP_HOME}/.claude/commands/craftsman.md"
           test -f "${TMP_HOME}/.claude/rules/craftsman-rules.md"
-          test -x "${TMP_HOME}/.gemini/config/git-hooks/commit-msg"
-          test -x "${TMP_HOME}/.gemini/config/git-hooks/pre-push"
+          test -x "${TMP_HOME}/.gemini/config/scripts/craftsman-scope-guard.py"
+          test -x "${TMP_HOME}/.gemini/config/scripts/craftsman-stop-gate.py"
           rm -rf "${TMP_HOME}"

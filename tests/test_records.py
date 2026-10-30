@@ -7,11 +7,13 @@ import unittest
 from dataclasses import replace
 from typing import Any
 
-from craftsman.ledger import ack_signal, add_agent_event, resolve, set_verdict
+from craftsman.ledger import ack_signal, add_agent_event, add_lenses, resolve, set_verdict
 from craftsman.records import (
     AgentEvent,
+    FieldError,
     Ledger,
     LedgerError,
+    LensAddition,
     QualitySignal,
     SignalKind,
 )
@@ -151,6 +153,56 @@ class LedgerConsistencyTests(unittest.TestCase):
         ]
 
         assert_rejected(self, raw, "coverage[0].digests are not in round 1")
+
+
+ADDED_REASON = "Jenkinsfile:12 the sh step interpolates env.DEPLOY_URL"
+
+
+def ledger_with_added_trust() -> Ledger:
+    snap = make_snap(make_hunk("H1", "Jenkinsfile"))
+    ledger, round_ = prepared(snap, lenses=("intent", "trust"))
+    return add_lenses(ledger, round_.number, {"trust": ADDED_REASON})
+
+
+class LensAdditionTests(unittest.TestCase):
+    def test_round_trip_keeps_the_addition(self) -> None:
+        ledger = ledger_with_added_trust()
+
+        self.assertEqual(Ledger.from_json(json.loads(json.dumps(ledger.to_json()))), ledger)
+        self.assertEqual(ledger.added_lenses, {"trust": ADDED_REASON})
+
+    def test_ledger_written_before_lens_additions_still_loads(self) -> None:
+        raw = ledger_json()
+        del raw["lens_additions"]
+
+        self.assertEqual(Ledger.from_json(raw).lens_additions, ())
+
+    def test_addition_must_name_a_risk_lens_and_cite_the_code(self) -> None:
+        cases = [
+            ("security", ADDED_REASON, "lens must be one of"),
+            ("sweep", ADDED_REASON, "`sweep` is not a risk lens"),
+            ("trust", "too short", "reason must have at least 20 characters"),
+            ("trust", "the Jenkinsfile shells out with user input", "reason must cite the changed code"),
+        ]
+        for lens, reason, message in cases:
+            with self.subTest(message=message), self.assertRaises(FieldError) as caught:
+                LensAddition(lens, reason, 1, "2026-01-01T00:00:00.000Z")
+            self.assertIn(message, str(caught.exception))
+
+    def test_added_lens_must_stay_in_every_later_round(self) -> None:
+        ledger = ledger_with_added_trust()
+        snap = make_snap(make_hunk("H1", "Jenkinsfile"), fingerprint="fp2")
+
+        with self.assertRaises(FieldError) as caught:
+            prepared(snap, lenses=("intent",), ledger=ledger)
+
+        self.assertIn("was added in round 1 but is missing from round 2", str(caught.exception))
+
+    def test_a_lens_is_added_once(self) -> None:
+        raw = json.loads(json.dumps(ledger_with_added_trust().to_json()))
+        raw["lens_additions"].append(raw["lens_additions"][0])
+
+        assert_rejected(self, raw, "lens_additions must not repeat a lens")
 
 
 class RunRecordTests(unittest.TestCase):

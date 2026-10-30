@@ -2,7 +2,7 @@
 
 Craftsman is an **adaptive closed-loop engineering harness** for AI coding agents. Rather than relying on prompt-only advice ("remember to review and test your changes"), Craftsman couples **budgeted, context-enriched review packets**, a **two-phase review protocol** (high-recall candidate collection decoupled from adversarial verification), **pinned review scopes**, and a **cryptographically fingerprinted evidence ledger** enforced at runtime by IDE/CLI lifecycle hooks.
 
-This reference documents the end-to-end architecture, state machines, data structures, and invariants of the Craftsman v3.3 harness.
+This reference documents the end-to-end architecture, state machines, data structures, and invariants of the Craftsman v4.0 harness.
 
 ---
 
@@ -19,7 +19,7 @@ npx @excalidraw/cli render docs/diagrams/<name>.excalidraw \
 | :--- | :--- | :--- | :--- |
 | **1. Workflow** | The ten steps from prompt to closed gate, the review loop, and what each tier changes | [`harness-overview.excalidraw`](diagrams/harness-overview.excalidraw) | [`harness-overview.png`](diagrams/harness-overview.png) |
 | **2. Evidence ledger** | What `review prepare` builds, what the ledger records, which hunks the next round re-reviews, and when the gate passes | [`evidence-ledger-flow.excalidraw`](diagrams/evidence-ledger-flow.excalidraw) | [`evidence-ledger-flow.png`](diagrams/evidence-ledger-flow.png) |
-| **3. Install, hooks and git guard** | Where `craftsman install` puts things, what each session hook does, the stop hook's outcomes, and the git/worktree rules | [`lifecycle-hooks-and-guards.excalidraw`](diagrams/lifecycle-hooks-and-guards.excalidraw) | [`lifecycle-hooks-and-guards.png`](diagrams/lifecycle-hooks-and-guards.png) |
+| **3. Install, hooks and runtime guards** | Where `craftsman install` puts things, what each session hook does, the stop hook's outcomes, and the work-tree/scope guards | [`lifecycle-hooks-and-guards.excalidraw`](diagrams/lifecycle-hooks-and-guards.excalidraw) | [`lifecycle-hooks-and-guards.png`](diagrams/lifecycle-hooks-and-guards.png) |
 | **4. Review and verdicts** | Lenses per tier, the two review phases, and the evidence each verdict and resolution needs | [`review-protocol-and-verdicts.excalidraw`](diagrams/review-protocol-and-verdicts.excalidraw) | [`review-protocol-and-verdicts.png`](diagrams/review-protocol-and-verdicts.png) |
 
 ---
@@ -146,6 +146,7 @@ The ledger stores immutable tuple collections:
 3. **`findings: tuple[Finding, ...]`**, **`facts: tuple[Fact, ...]`**, **`signal_acks: tuple[SignalAck, ...]`** — Candidate defects (`F1..Fn`, optionally linked to `--signal S#`), source-cited shared facts (`F-1..F-n`), and concrete `>= 40`-char acknowledgements of mechanical quality signals (`review ack S# --reason "..."`).
 4. **`runs: tuple[Run, ...]`** & **`waivers: tuple[RunWaiver, ...]`** — Recorded executions (`craftsman run --kind <test|e2e|repro|lint|build|other> -- <cmd>`) using the ledger's pinned `scope` for before/after fingerprinting, plus explicit run waivers (`review waive-run`).
 5. **`agents: tuple[AgentEvent, ...]`** — Written exclusively by platform `SubagentStart` / `SubagentStop` hooks.
+6. **`lens_additions: tuple[LensAddition, ...]`** — Lenses the agent added with `review prepare --add-lens "<lens>=<file:line> <why>"` because the pattern-based risk signals missed a risk (for example in a language the patterns do not cover; `prepare` and the packet list such files under `Not scanned for risk signals`). Each records `lens` (any lens but `sweep`), a `>= 20`-char `reason` citing `file:line`, the `round` it joined, and `recorded_at`. Additions are monotonic: `Ledger` validation requires the lens in that round and every later one, so the gate requires its coverage like any policy-selected lens; adding a lens to an unchanged diff opens a new round, as a deeper tier does. Optional on read, so ledgers written before the field existed still load.
 
 ---
 
@@ -180,41 +181,37 @@ When Round `N+1` is prepared after fixes:
 
 ---
 
-## 3. Multi-Platform Lifecycle Hooks, Stop Gate & Defense-in-Depth Git / Worktree Guards
+## 3. Multi-Platform Lifecycle Hooks, Stop Gate & Runtime Worktree / Scope Guards
 
-![Install, session hooks and git guard](diagrams/lifecycle-hooks-and-guards.png)
+![Install, session hooks and runtime guards](diagrams/lifecycle-hooks-and-guards.png)
 
-### Single-Source Multi-Platform Exporter & Installer (`craftsman.export` & `craftsman.install`)
+### Single-Source Multi-Platform Exporter & Installer (`craftsman.platforms.*`, `craftsman.export`, `craftsman.install`)
 
 Craftsman authors skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/code-review/lenses.md`), subagent templates (`agents/craftsman*.md`), and global rules (`rules/*.md`) once, expanding `{{include path}}` directives into native artifacts tracked by `.craftsman-install.json`:
 
 1. **GitHub Copilot (VS Code & Copilot CLI)** — Global instructions (`craftsman-rules.instructions.md`), Agent Skills (`~/.copilot/skills/<skill>/`), custom agents (`~/.copilot/agents/*.agent.md`), and lifecycle hooks (`~/.copilot/hooks/craftsman.json` or `.github/hooks/craftsman.json`).
 2. **Claude Code (`~/.claude`)** — Slash commands (`~/.claude/commands/<skill>.md` — `code-review.md` stays lean without inlining `lenses.md`), subagents (`~/.claude/agents/craftsman-{reviewer,verifier}.md`), combined rules, and `CLAUDE_HOOK_EVENTS` merged into `~/.claude/settings.json`.
-3. **Google Antigravity (`~/.gemini/config`)** — Skills, rules, hook scripts (`scripts/git-guard.py`, `scripts/craftsman-stop-gate.py`), and `hooks.json`, plus transcript verification (`transcript.jsonl`) for `invoke_subagent` reviewer isolation.
+3. **Google Antigravity (`~/.gemini/config`)** — Skills, rules, hook scripts (`scripts/craftsman-scope-guard.py`, `scripts/craftsman-stop-gate.py`), and `hooks.json`, plus transcript verification (`transcript.jsonl`) for `invoke_subagent` reviewer isolation.
 4. **OpenAI Codex, Cursor & Team Repositories** — Managed `<!-- craftsman:begin --> ... <!-- craftsman:end -->` block in `AGENTS.md` and `.cursor/rules/craftsman.mdc`, gated via `craftsman gate --complete`.
 
 ---
 
 ### Lifecycle Hook Engine & Bounded Stop Gate (`craftsman.hooks` & `craftsman.gate`)
 
-- **`prompt` (`UserPromptSubmit` / `userPromptSubmitted`)**: Resumes `--await-user` gates on user reply and initializes `craftsman_state.json` on `/craftsman` or `ultracraft`.
+- **`prompt` (`UserPromptSubmit` / `userPromptSubmitted`)**: Resumes `--await-user` gates on user reply and initializes `craftsman_state.json` when `/craftsman` or `ultracraft` appears as a standalone token outside quotes and backticks (`craftsman.trigger`).
 - **`subagent-start` / `subagent-stop`**: Records `AgentEvent` entries in `ledger.json`, injects concise round/finding briefings (using `latest.scope` for snapshot checks), and blocks once if a reviewer or verifier exits without recording ledger entries.
 - **`stop` (`Stop` / `agentStop`)**: Enforces monotonic progress across up to `MAX_FORCED_CONTINUATIONS = 6` consecutive non-progressing turns and `MAX_ROUNDS = 5` delta rounds.
 
 ---
 
-### Defense-in-Depth Git, Worktree-Mutation & Search-Scope Guards (`craftsman.guard`, `craftsman.scope`, `git-hooks/`)
+### Runtime Worktree-Mutation & Search-Scope Guards (`craftsman.shell`, `craftsman.worktree_guard`, `craftsman.scope`)
 
-Craftsman enforces repository safety through `craftsman hook pre-tool` (and OS-level global Git hooks `pre-push` / `commit-msg` for rules 1 and 2):
+Craftsman enforces review integrity and repository search scope through `craftsman hook pre-tool` (and `craftsman scope-guard` on Google Antigravity):
 
-1. **Shell Command Parser & Wrapper Unwrapper (`guard.iter_simple_commands` & `parse_git_invocation`)**
+1. **Shell Command Parser & Wrapper Unwrapper (`shell.iter_simple_commands` & `parse_git_invocation`)**
    - Unwraps `;`, `|`, `&&`, `||`, subshells, heredocs, `env`, `sudo`, `timeout`, `xargs`, `find -exec`, nested `sh`/`bash`/`zsh -c`, `git -C <dir>`, and inline `-c alias.x=...` definitions.
 
-2. **Global Rule #1: No Unconfirmed Push to `main` / `master`** (`analyze_git_push`, `analyze_gh_pr_merge`) — Prompts (`ask`) or blocks unconfirmed pushes and PR merges targeting `main`/`master`.
-
-3. **Global Rule #2: Zero AI Attribution** (`has_ai_attribution`) — Rejects commits, tags, and PRs carrying AI attribution trailers (`Co-authored-by:`, `Generated by/with`, etc.).
-
-4. **Worktree & Index Mutation Guard During Review (`guard.find_worktree_mutation` in `hooks.on_pre_tool`)**
+2. **Worktree & Index Mutation Guard During Review (`worktree_guard.find_worktree_mutation` in `hooks.on_pre_tool`)**
    - Intercepts Git commands that mutate the work tree or index:
      - `git stash` via a strict **allowlist**: only `stash list`, `stash show`, and `stash create` are permitted; bare `git stash` and flag/path forms (`git stash -u`, `-p`, `-m`, `-- a.py`) are blocked;
      - `reset`, `checkout`, `switch`, `restore`, `clean` (all forms);
@@ -223,10 +220,10 @@ Craftsman enforces repository safety through `craftsman hook pre-tool` (and OS-l
      - **Reviewer and verifier subagents** (`agent_role(hook.agent) is not None`, excluding the main `@craftsman` orchestrator): immediately **denied** (`reply.deny`) with instructions to use `git show <base>:<path>` and a temp directory.
      - **Main session (including `@craftsman` orchestrator) during an active review-only round** (`_review_in_progress`: no active `/craftsman` gate, latest round prepared within the last 12 hours, and uncovered lenses or unjudged findings remain): **prompts the user for confirmation** (`reply.ask`).
      - **Active `/craftsman` gate or no open review**: **allowed**, so normal implementation (`git commit`, `checkout -b`, `mv`, `rm`) proceeds unimpeded.
-   - **Platform limitations**: This runtime guard operates only on platforms that fire `PreToolUse` hooks (**Claude Code**, **VS Code Copilot**, and **Copilot CLI**). On platforms without `PreToolUse` hooks (such as **OpenAI Codex** or **`agy -p`**), the prohibition in the skill prompt is the only protection. If a platform does not pass the subagent's agent identifier in the hook payload, the subagent call falls back to the main-session `ask` rule. Direct `Edit`/`Write` file tools are already excluded from the `craftsman-reviewer` and `craftsman-verifier` tool definitions.
+   - **Platform limitations**: This runtime guard operates only on platforms that fire `craftsman hook pre-tool` (**Claude Code**, **VS Code Copilot**, and **Copilot CLI**). On platforms without `craftsman hook pre-tool` (such as **OpenAI Codex** or **`agy -p`**), the prohibition in the skill prompt is the only protection. If a platform does not pass the subagent's agent identifier in the hook payload, the subagent call falls back to the main-session `ask` rule. Direct `Edit`/`Write` file tools are already excluded from the `craftsman-reviewer` and `craftsman-verifier` tool definitions.
 
-5. **Repository Search-Scope Guard (`craftsman.scope`)**
-   - Blocks recursive directory searches (`find`, `rg`, `grep -r`, `fd`, `Glob`, `Grep`, `LS`, etc.) outside the active git work tree and blocks reading other repositories, shell history, or assistant session stores, directing skill/playbook and packet lookups to `craftsman skill show` and `craftsman review show`.
+3. **Repository Search-Scope Guard (`craftsman.scope`)**
+   - Blocks recursive directory searches (`find`, `rg`, `grep -r`, `fd`, `Glob`, `Grep`, `LS`, etc.) outside the active git work tree and blocks reading other repositories, shell history, or assistant session stores, directing skill/playbook and packet lookups to `craftsman skill show` and `craftsman review show`. Enforced via `craftsman hook pre-tool` on Claude Code / Copilot and `craftsman scope-guard` (`scripts/craftsman-scope-guard.py`) on Google Antigravity `run_command`.
 
 ---
 
@@ -273,14 +270,25 @@ Craftsman enforces repository safety through `craftsman hook pre-tool` (and OS-l
 | [`craftsman/ledger.py`](../craftsman/ledger.py) | OS file locking, atomic persistence, multi-lens/file-level coverage validation, and delta carry-over | `mutate()`, `open_round()`, `add_coverage()`, `uncovered_by_lens()`, `_carry_over()` |
 | [`craftsman/gatecheck.py`](../craftsman/gatecheck.py) | 13-check gate evaluator, multi-lens coverage hints, `review_only` warnings, and partial report labels | `evaluate()`, `GateReport`, `GatePolicy`, `render_report()` |
 | [`craftsman/diffscan.py`](../craftsman/diffscan.py) | Scoped git diff + untracked scanner (literal pathspecs), `WorktreeIndex`, and two-level SHA-256 fingerprinting | `snapshot()`, `DiffSnapshot`, `ChangedFile`, `Hunk`, `WorktreeIndex`, `detect_signals()` |
+| [`craftsman/diffscan_signals.py`](../craftsman/diffscan_signals.py) | Verbose, commented content risk-signal regex catalog across supported languages | `CONTENT_SIGNAL_PATTERNS` |
 | [`craftsman/packet.py`](../craftsman/packet.py) | Budgeted packet renderer (`120k` / `quick 40k`), 3-step progressive trimming ladder, and `60k` deterministic shards | `collect_context()`, `render_packet()`, `render_shard_view()`, `MAX_PACKET_CHARS`, `MAX_QUICK_PACKET_CHARS`, `MAX_VIEW_CHARS` |
 | [`craftsman/lenses.py`](../craftsman/lenses.py) | Leaf catalog of 12 review lenses, `REVIEWER_GROUPS`, `review_only_tier()` (`250`-line threshold), and signal triggers | `LENSES`, `REVIEWER_GROUPS`, `select_lenses()`, `review_only_tier()` |
 | [`craftsman/playbooks.py`](../craftsman/playbooks.py) | On-demand slicer for `skills/code-review/lenses.md` by lens IDs and `R1`–`R4` groups | `lens_playbooks()` |
 | [`craftsman/quality.py`](../craftsman/quality.py) | AST/diff mechanical code-quality signal detectors (`S1..Sn`) | `scan_quality_signals()` |
-| [`craftsman/review.py`](../craftsman/review.py) | CLI handlers for `prepare` (`--staged`/`--tracked`/`--paths`/`--add-paths`), `view` (`--shard`), `cover` (multi-lens), `show` (`--hunks`), `report` (`--partial`), `add`, `ack`, `fact`, `merge`, `verdict`, `resolve`, `check`, `reset` | `run_cli()`, `resolve_tier()` |
+| [`craftsman/review.py`](../craftsman/review.py) | CLI handlers for `prepare` (`--staged`/`--tracked`/`--paths`/`--add-paths`/`--add-lens`), `view` (`--shard`), `cover` (multi-lens), `show` (`--hunks`), `report` (`--partial`), `add`, `ack`, `fact`, `merge`, `verdict`, `resolve`, `check`, `reset` | `run_cli()`, `resolve_tier()` |
 | [`craftsman/runner.py`](../craftsman/runner.py) | Live-streaming command execution wrapper (`craftsman run`) with scope-consistent before/after fingerprinting | `run_cli()` |
-| [`craftsman/hooks.py`](../craftsman/hooks.py) | Multi-platform lifecycle hook adapter (`prompt`, `stop`, `subagent-start`, `subagent-stop`, `pre-tool` worktree guard) | `run_cli()`, `on_pre_tool()`, `_review_in_progress()` |
-| [`craftsman/guard.py`](../craftsman/guard.py) | Shell parser, protected-branch push guard, AI attribution blocker, and worktree/index mutation detector | `find_worktree_mutation()`, `analyze_git_push()`, `has_ai_attribution()` |
-| [`craftsman/export.py`](../craftsman/export.py) | Multi-platform skill/agent/hook compiler | `export_to_copilot_skills()`, `export_copilot_home()`, `export_to_claude_user()`, `export_to_agents_workspace()` |
+| [`craftsman/trigger.py`](../craftsman/trigger.py) | Syntactic `/craftsman` and `ultracraft` prompt trigger detector (ignores tokens inside quotes and backticks) | `detect_trigger()`, `task_from_prompt()` |
+| [`craftsman/hooks.py`](../craftsman/hooks.py) | Multi-platform lifecycle hook adapter (`prompt`, `stop`, `subagent-start`, `subagent-stop`, `pre-tool` work-tree and scope guards) | `run_cli()`, `on_pre_tool()`, `_review_in_progress()` |
+| [`craftsman/shell.py`](../craftsman/shell.py) | Shell command parser, wrapper unwrapper, and `git` invocation analyzer | `iter_simple_commands()`, `parse_git_invocation()`, `SimpleCommand` |
+| [`craftsman/worktree_guard.py`](../craftsman/worktree_guard.py) | Work-tree and index mutation detector during active reviews | `find_worktree_mutation()` |
+| [`craftsman/scope.py`](../craftsman/scope.py) | Repository search-scope guard for tool calls and Antigravity `run_command` (`craftsman scope-guard`) | `check_tool_scope()`, `evaluate_antigravity_scope()`, `main()` |
+| [`craftsman/paths.py`](../craftsman/paths.py) | Platform home, VS Code profile, Copilot, Claude, and asset directory resolution | `user_home()`, `default_repo_dir()`, `resolve_craftsman_pkg_dir()` |
+| [`craftsman/assets.py`](../craftsman/assets.py) | Bundled skill, agent template (`{{include ...}}`), and combined rule loader | `iter_skills()`, `load_agent_templates()`, `render_combined_rules()` |
+| [`craftsman/generated.py`](../craftsman/generated.py) | Craftsman-generated file markers, JSON object writers, and managed Markdown blocks | `write_generated()`, `upsert_managed_markdown()`, `strip_managed_block()` |
+| [`craftsman/hook_command.py`](../craftsman/hook_command.py) | Absolute Python + CLI hook command builder for user-level hooks | `absolute_hook_prefixes()`, `cli_shim_for()` |
+| [`craftsman/platforms/`](../craftsman/platforms/__init__.py) | Per-platform exporters and installers (`copilot.py`, `claude.py`, `antigravity.py`, `agents_md.py`) | `install_copilot_target()`, `install_claude_target()`, `install_antigravity_target()`, `install_agents_workspace_target()` |
+| [`craftsman/export.py`](../craftsman/export.py) | Multi-platform `craftsman export` CLI entrypoint | `main()` |
+| [`craftsman/install.py`](../craftsman/install.py) | Cross-platform installer orchestration (`craftsman install`) and 3.x git-hook upgrade cleanup | `install_main()`, `run_install()` |
+| [`craftsman/uninstall.py`](../craftsman/uninstall.py) | Manifest-driven uninstaller (`craftsman uninstall`) and 3.x git-hook cleanup | `uninstall_main()`, `run_uninstall()` |
+| [`craftsman/legacy_githooks.py`](../craftsman/legacy_githooks.py) | Removal of global git hooks installed by Craftsman 3.x (scheduled for removal in 5.0) | `restore_hooks_path()`, `craftsman_home_dir()` |
 | [`craftsman/doctor.py`](../craftsman/doctor.py) | Repository asset validator and cross-platform installation health/drift/duplicate checker | `build_report()`, `validate_skill_manifests()` |
-| [`craftsman/install.py`](../craftsman/install.py) | Cross-platform installer and uninstaller with `.craftsman-install.json` manifest tracking | `run_install_cli()`, `run_uninstall_cli()` |

@@ -18,19 +18,22 @@ from craftsman.diffscan import (
     Hunk,
     WorktreeIndex,
     detect_signals,
+    files_without_signal_patterns,
     snapshot,
     staged_paths,
     untracked_paths,
 )
-from craftsman.evidence import archive_ledger, effective_tier, packet_path, prune_round_files
-from craftsman.gate import (
-    GateState,
-    GateStateError,
-    Stage,
-    current_tier,
-    state_path_for,
-    update_state,
+from craftsman.evidence import (
+    INBOX_KINDS,
+    archive_ledger,
+    consume_inbox_file,
+    create_inbox_file,
+    effective_tier,
+    packet_path,
+    prune_inbox_files,
+    prune_round_files,
 )
+from craftsman.gate import GateState, GateStateError, Stage, current_tier, state_path_for, update_state
 from craftsman.gatecheck import (
     SELF_REVIEWED_BANNER,
     GatePolicy,
@@ -48,7 +51,9 @@ from craftsman.ledger import (
     ack_signal,
     add_fact,
     add_finding,
+    add_lenses,
     add_multi_coverage,
+    coverage_units_for_targets,
     file_sha256,
     load,
     merge_findings,
@@ -86,10 +91,13 @@ from craftsman.packet import (
 from craftsman.quality import MAX_PRODUCTION_ADDED_LINES, collect_quality_signals, production_diff_growth
 from craftsman.records import (
     DESIGN_LENS,
+    LENS_ADDITION_EXAMPLE,
     RESOLUTIONS,
     SEVERITIES,
     SWEEP_LENS,
     VERDICTS,
+    BatchRejected,
+    EntryProblem,
     Fact,
     FieldError,
     Fields,
@@ -101,12 +109,16 @@ from craftsman.records import (
     SignalAck,
     SourceRef,
     as_choice,
+    require_lens_addition,
 )
 from craftsman.workspace import Workspace, open_workspace
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
 CITED_LINE_CHARS = 120
+MAX_REPORTED_BATCH_PROBLEMS = 20
+MAX_UNSCANNED_PATHS_SHOWN = 8
+UTF8_SAVE_HINT = "save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)"
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
     "lens": "--lens",
@@ -116,6 +128,7 @@ FIELD_FLAGS = {
     "files": "--files",
     "paths": "--paths",
     "add_paths": "--add-paths",
+    "add_lens": "--add-lens",
     "source": "--source",
     "text": "--text",
     "path": "--file",
@@ -133,6 +146,7 @@ FIELD_FLAGS = {
     "reason": "--reason",
 }
 S = TypeVar("S", bound=str)
+R = TypeVar("R")
 JSON_FIELD_NAMES = {
     "path": "file",
     "verdict": "as",
@@ -208,7 +222,26 @@ class _UnmatchedPathError(FieldError):
     """A syntactically valid `--paths` entry matched no changed files in the current diff."""
 
 
+def _print_empty_prepare(
+    scope: tuple[str, ...] | None, snap: DiffSnapshot, full_snap: DiffSnapshot
+) -> int:
+    if scope is not None and not full_snap.is_empty:
+        ignored = [path for path in full_snap.files if path not in set(scope)]
+        print(
+            f"Nothing to review within the frozen scope (matches base {snap.base_sha[:12]}); "
+            f"changed files outside scope: {_format_path_sample(ignored)}."
+        )
+        print(
+            "Run `craftsman review reset` to archive this review and start a new one "
+            "(or pass `craftsman review prepare --add-paths <paths>` to add files touched by fixes)."
+        )
+        return 0
+    print(f"Nothing to review: the work tree matches base {snap.base_sha[:12]}.")
+    return 0
+
+
 def _prepare(args: argparse.Namespace) -> int:
+    requested = _parse_lens_additions(args.add_lens)
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
     base_sha = ws.base_sha(ledger, args.base)
@@ -217,56 +250,48 @@ def _prepare(args: argparse.Namespace) -> int:
         ws, ledger, args, base_sha, full_snap
     )
     if snap.is_empty:
-        if scope is not None and not full_snap.is_empty:
-            ignored = [path for path in full_snap.files if path not in set(scope)]
-            print(
-                f"Nothing to review within the frozen scope (matches base {snap.base_sha[:12]}); "
-                f"changed files outside scope: {_format_path_sample(ignored)}."
-            )
-            print(
-                "Run `craftsman review reset` to archive this review and start a new one "
-                "(or pass `craftsman review prepare --add-paths <paths>` to add files touched by fixes)."
-            )
-            return 0
-        print(f"Nothing to review: the work tree matches base {snap.base_sha[:12]}.")
-        return 0
+        if requested:
+            print("--add-lens ignored: there is no change to review.")
+        return _print_empty_prepare(scope, snap, full_snap)
     tier = resolve_tier(ws, ledger, args.tier, snap)
     if not ledger.rounds or (
-        ledger.rounds[-1].fingerprint,
-        ledger.rounds[-1].tier,
-        ledger.rounds[-1].scope,
+        ledger.rounds[-1].fingerprint, ledger.rounds[-1].tier, ledger.rounds[-1].scope
     ) != (snap.fingerprint, tier, scope):
         print(f"Tier {tier}: {_tier_reason(ws, ledger, args.tier, snap, tier)}")
-    lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap)]
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     signals = collect_quality_signals(ws.root, snap)
 
-    def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
+    def open_next(
+        current: Ledger,
+    ) -> tuple[Ledger, tuple[Ledger, Round, bool, dict[str, str], list[str]]]:
+        new, notes = _new_lens_additions(current, tier, snap, requested)
+        lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap, {**current.added_lenses, **new})]
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
         updated, round_ = open_round(
-            current,
-            snap,
-            tier,
-            lens_ids,
-            str(packet),
-            symbols,
-            signals=signals,
-            scope=scope,
-            allow_scope_expansion=allow_scope_expansion,
+            current, snap, tier, lens_ids, str(packet), symbols,
+            signals=signals, scope=scope, allow_scope_expansion=allow_scope_expansion,
         )
-        return updated, (updated, round_, updated is not current)
+        if new:
+            updated = add_lenses(updated, round_.number, new)
+        return updated, (updated, round_, updated is not current, new, notes)
 
-    ledger, round_, created = mutate(ws.ledger_path, open_next)
+    ledger, round_, created, added, notes = mutate(ws.ledger_path, open_next)
     packet = Path(round_.packet_path)
     if created or not packet.is_file():
         ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=args.task or ws.task)
         _write_text(packet, render_packet(ctx))
     _mark_needs_human_if_oversized(ws, ledger)
+    for note in notes:
+        print(note)
+    for lens, reason in added.items():
+        print(f"Added lens `{lens}`: {reason}")
     _print_prepare_summary(round_, packet, created)
+    _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if created:
         prune_round_files(ws.ledger_path.parent, round_.number)
+        prune_inbox_files(ws.ledger_path.parent)
     return 0
 
 
@@ -475,8 +500,64 @@ def _print_scope_summary(
             )
 
 
-def _lens_picks(tier: Tier, snap: DiffSnapshot) -> tuple[LensPick, ...]:
-    return select_lenses(tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
+def _lens_picks(
+    tier: Tier, snap: DiffSnapshot, added: Mapping[str, str] | None = None
+) -> tuple[LensPick, ...]:
+    return select_lenses(tier, detect_signals(snap.hunks), docs_only=snap.docs_only, added=added)
+
+
+def _parse_lens_additions(values: Sequence[str] | None) -> dict[str, str]:
+    """The `--add-lens LENS=REASON` values as {lens: reason}, each one validated."""
+    reasons: dict[str, str] = {}
+    for value in values or ():
+        lens, separator, reason = value.partition("=")
+        lens, reason = lens.strip(), reason.strip()
+        if not separator:
+            raise FieldError(
+                "add_lens", f"must be LENS=REASON, e.g. {LENS_ADDITION_EXAMPLE!r} (got {value!r})"
+            )
+        if lens in reasons:
+            raise FieldError("add_lens", f"names `{lens}` more than once")
+        try:
+            require_lens_addition(lens, reason)
+        except FieldError as exc:
+            raise FieldError("add_lens", f"{lens}: {exc.field} {exc.problem}") from None
+        reasons[lens] = reason
+    return reasons
+
+
+def _new_lens_additions(
+    ledger: Ledger, tier: Tier, snap: DiffSnapshot, requested: Mapping[str, str]
+) -> tuple[dict[str, str], list[str]]:
+    """The requested lenses that are not in the review yet, and a note for each one skipped."""
+    selected = {pick.lens.id: pick.reason for pick in _lens_picks(tier, snap)}
+    recorded = {addition.lens: addition for addition in ledger.lens_additions}
+    new: dict[str, str] = {}
+    notes: list[str] = []
+    for lens, reason in requested.items():
+        if lens in recorded:
+            earlier = recorded[lens]
+            notes.append(f"Lens `{lens}` was already added in round {earlier.round}: {earlier.reason}")
+        elif lens in selected:
+            notes.append(f"Lens `{lens}` is already selected ({selected[lens]}); nothing to add.")
+        else:
+            new[lens] = reason
+    return new, notes
+
+
+def _print_unscanned_files(snap: DiffSnapshot) -> None:
+    unscanned = files_without_signal_patterns(snap)
+    if not unscanned:
+        return
+    shown = ", ".join(unscanned[:MAX_UNSCANNED_PATHS_SHOWN])
+    more = len(unscanned) - MAX_UNSCANNED_PATHS_SHOWN
+    if more > 0:
+        shown += f" and {more} more"
+    print(
+        f"Not scanned for risk signals (no patterns for their language): {shown}. Read them for "
+        "risks the selected lenses miss and add the matching lens with "
+        '`craftsman review prepare --add-lens "LENS=file:line why"`.'
+    )
 
 
 def _packet_context(
@@ -490,7 +571,11 @@ def _packet_context(
     task: str,
 ) -> PacketContext:
     """What the packet of `round_` shows, with the lenses the round selected."""
-    picks = tuple(pick for pick in _lens_picks(round_.tier, snap) if pick.lens.id in round_.lenses)
+    picks = tuple(
+        pick
+        for pick in _lens_picks(round_.tier, snap, ledger.added_lenses)
+        if pick.lens.id in round_.lenses
+    )
     return collect_context(
         ws.root,
         snap,
@@ -632,16 +717,22 @@ def _reject_flags_with_from_json(flags: Mapping[str, object]) -> None:
         raise LedgerError(f"--from-json cannot be combined with {', '.join(used)}")
 
 
+def _decode_json_bytes(data: bytes, label: str) -> str:
+    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    try:
+        return data.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise LedgerError(f"cannot read {label}: {exc}; {UTF8_SAVE_HINT}") from exc
+
+
 def _load_json_entries(source: str) -> list[Any]:
     """Read and parse a non-empty JSON list of entry objects from `source` (`-` for stdin)."""
     label = "stdin" if source == "-" else source
     try:
-        if source == "-":
-            text = sys.stdin.buffer.read().decode("utf-8")
-        else:
-            text = Path(source).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        data = sys.stdin.buffer.read() if source == "-" else Path(source).read_bytes()
+    except OSError as exc:
         raise LedgerError(f"cannot read {label}: {exc}") from exc
+    text = _decode_json_bytes(data, label)
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -655,18 +746,75 @@ def _load_json_entries(source: str) -> list[Any]:
 
 def _entry_label(raw: Any, key: str) -> str | None:
     value = raw.get(key) if isinstance(raw, dict) else None
-    return value if isinstance(value, str) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def _batch_error(index: int, label: str | None, exc: LedgerError) -> LedgerError:
-    head = f"entry {index} ({label})" if label else f"entry {index}"
+def _entry_problem(index: int, label: str | None, exc: LedgerError) -> EntryProblem:
     field = JSON_FIELD_NAMES.get(exc.field, exc.field)
-    if isinstance(exc, FieldError):
-        detail = f"{field}: {exc.problem}" if field else exc.problem
-        return LedgerError(f"{head}: {detail}")
-    if field:
-        return LedgerError(f"{head}: {field}: {exc}")
-    return LedgerError(f"{head}: {exc}")
+    problem = exc.problem if isinstance(exc, FieldError) else str(exc)
+    return EntryProblem(index=index, label=label, field=field, problem=problem, example=exc.example)
+
+
+def _record_entries(
+    command: str,
+    raw_entries: Sequence[Any],
+    current: Ledger,
+    label_for: Callable[[int, Any], str | None],
+    record_one: Callable[[int, Ledger, Any], tuple[Ledger, R]],
+    on_rejected: Callable[[int, Any], None] | None = None,
+) -> tuple[Ledger, list[R]]:
+    results: list[R] = []
+    problems: list[EntryProblem] = []
+    for index, raw in enumerate(raw_entries, 1):
+        try:
+            current, item = record_one(index, current, raw)
+        except LedgerError as exc:
+            problems.append(_entry_problem(index, label_for(index, raw), exc))
+            if on_rejected is not None:
+                on_rejected(index, raw)
+            continue
+        results.append(item)
+    if problems:
+        raise BatchRejected(f"{PROG} {command}", tuple(problems), len(raw_entries))
+    return current, results
+
+
+def _print_check_passed(count: int) -> int:
+    noun = "entry" if count == 1 else "entries"
+    print(f"Check passed: {count} {noun} valid; nothing was recorded.")
+    return 0
+
+
+def _run_single(
+    ws: Workspace, check: bool, record: Callable[[Ledger], tuple[Ledger, R]], emit: Callable[[R], None]
+) -> int:
+    if check:
+        record(load(ws.ledger_path))
+        return _print_check_passed(1)
+    emit(mutate(ws.ledger_path, record))
+    return 0
+
+
+def _run_batch(
+    ws: Workspace,
+    args: argparse.Namespace,
+    record_batch: Callable[[Ledger], tuple[Ledger, list[R]]],
+    emit: Callable[[R], None],
+) -> int:
+    if args.check:
+        _, checked = record_batch(load(ws.ledger_path))
+        return _print_check_passed(len(checked))
+    recorded = mutate(ws.ledger_path, record_batch)
+    consume_inbox_file(ws.ledger_path.parent, args.from_json)
+    for item in recorded:
+        emit(item)
+    return 0
+
+
+def _inbox(args: argparse.Namespace) -> int:
+    ws = open_workspace(args.cwd)
+    print(create_inbox_file(ws.ledger_path.parent, args.kind).resolve())
+    return 0
 
 
 # --- coverage -------------------------------------------------------------------------------
@@ -699,21 +847,39 @@ def _cover_one(args: argparse.Namespace) -> int:
     targets = [item.strip() for item in raw_targets.split(",") if item.strip()]
 
     def record(current: Ledger) -> tuple[Ledger, str]:
-        return _record_coverage(current, snap, lenses, targets, args.note, target_kind=target_kind)
+        round_ = require_current_round(current, snap)
+        return _record_coverage(current, round_, lenses, targets, args.note, target_kind=target_kind)
 
-    print(mutate(ws.ledger_path, record))
-    return 0
+    return _run_single(ws, bool(args.check), record, print)
 
 
 def _cover_entry_label(raw: Any) -> str | None:
     if not isinstance(raw, dict):
         return None
     if isinstance(raw.get("lens"), str):
-        return str(raw["lens"])
+        cleaned = raw["lens"].strip()
+        return cleaned or None
     lenses = raw.get("lenses")
-    if isinstance(lenses, list) and lenses and all(isinstance(item, str) for item in lenses):
-        return ",".join(lenses)
+    if isinstance(lenses, list) and all(isinstance(item, str) for item in lenses):
+        cleaned_list = [item.strip() for item in lenses if item.strip()]
+        return ",".join(cleaned_list) if cleaned_list else None
     return None
+
+
+def _raw_cover_pairs(round_: Round, raw: Any) -> tuple[tuple[str, str], ...]:
+    if not isinstance(raw, dict):
+        return ()
+    lenses: list[str] = []
+    if isinstance(raw.get("lens"), str):
+        lenses.append(str(raw["lens"]))
+    elif isinstance(raw.get("lenses"), list):
+        lenses.extend(item for item in raw["lenses"] if isinstance(item, str))
+    targets: list[str] = []
+    for key in ("hunks", "files"):
+        items = raw.get(key)
+        if isinstance(items, list):
+            targets.extend(item for item in items if isinstance(item, str))
+    return coverage_units_for_targets(round_, lenses, targets)
 
 
 def _parse_json_lenses(raw: Any, f: Fields) -> tuple[str, ...]:
@@ -726,6 +892,23 @@ def _parse_json_lenses(raw: Any, f: Fields) -> tuple[str, ...]:
     return (f.text("lens"),)
 
 
+def _cover_one_from_json(
+    state: Ledger,
+    round_: Round,
+    raw: Any,
+    rejected_by: Mapping[tuple[str, str], int],
+) -> tuple[Ledger, str]:
+    f = Fields(raw)
+    lenses = _parse_json_lenses(raw, f)
+    target_key = _target_key(raw, lenses)
+    targets = [item.strip() for item in f.texts(target_key) if item.strip()]
+    note = f.text("note")
+    f.reject_unknown()
+    return _record_coverage(
+        state, round_, lenses, targets, note, target_kind=target_key, rejected_by=rejected_by
+    )
+
+
 def _cover_from_json(args: argparse.Namespace) -> int:
     _reject_flags_with_from_json(
         {"--lens": args.lens, "--hunks": args.hunks, "--files": args.files, "--note": args.note}
@@ -735,26 +918,23 @@ def _cover_from_json(args: argparse.Namespace) -> int:
     snap = ws.snapshot()
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
-        lines: list[str] = []
-        for index, raw in enumerate(raw_entries, 1):
-            try:
-                f = Fields(raw)
-                lenses = _parse_json_lenses(raw, f)
-                target_key = _target_key(raw, lenses)
-                targets = [item.strip() for item in f.texts(target_key) if item.strip()]
-                note = f.text("note")
-                f.reject_unknown()
-                current, line = _record_coverage(
-                    current, snap, lenses, targets, note, target_kind=target_key
-                )
-            except LedgerError as exc:
-                raise _batch_error(index, _cover_entry_label(raw), exc) from None
-            lines.append(line)
-        return current, lines
+        round_ = require_current_round(current, snap)
+        rejected_by: dict[tuple[str, str], int] = {}
 
-    for line in mutate(ws.ledger_path, record_batch):
-        print(line)
-    return 0
+        def note_rejected(index: int, raw: Any) -> None:
+            for pair in _raw_cover_pairs(round_, raw):
+                rejected_by.setdefault(pair, index)
+
+        return _record_entries(
+            "cover",
+            raw_entries,
+            current,
+            lambda _index, raw: _cover_entry_label(raw),
+            lambda _index, state, raw: _cover_one_from_json(state, round_, raw, rejected_by),
+            on_rejected=note_rejected,
+        )
+
+    return _run_batch(ws, args, record_batch, print)
 
 
 def _target_key(raw: Mapping[str, Any], lenses: Sequence[str]) -> TargetKind:
@@ -768,15 +948,17 @@ def _target_key(raw: Mapping[str, Any], lenses: Sequence[str]) -> TargetKind:
 
 def _record_coverage(
     current: Ledger,
-    snap: DiffSnapshot,
+    round_: Round,
     lenses: Sequence[str],
     targets: Sequence[str],
     note: str,
     *,
     target_kind: TargetKind | None = None,
+    rejected_by: Mapping[tuple[str, str], int] | None = None,
 ) -> tuple[Ledger, str]:
-    round_ = require_current_round(current, snap)
-    updated, records = add_multi_coverage(current, lenses, targets, note, target_kind=target_kind)
+    updated, records = add_multi_coverage(
+        current, lenses, targets, note, target_kind=target_kind, rejected_by=rejected_by
+    )
     left = sum(len(ids) for ids in uncovered_by_lens(updated, round_).values())
     covered_lenses = ", ".join(f"`{record.lens}`" for record in records)
     return updated, (
@@ -826,8 +1008,7 @@ def _add_one(args: argparse.Namespace) -> int:
             signal_id=args.signal,
         )
 
-    _print_recorded(mutate(ws.ledger_path, record), lines)
-    return 0
+    return _run_single(ws, bool(args.check), record, lambda finding: _print_recorded(finding, lines))
 
 
 def _add_from_json(args: argparse.Namespace) -> int:
@@ -841,24 +1022,21 @@ def _add_from_json(args: argparse.Namespace) -> int:
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[tuple[Finding, list[str] | None]]]:
         require_current_round(current, snap)
-        results: list[tuple[Finding, list[str] | None]] = []
-        for index, raw in enumerate(raw_entries, 1):
-            label = next_finding_id(current)
-            try:
-                current, finding, lines = _add_one_from_json(ws, cwd, snap, current, raw)
-            except LedgerError as exc:
-                raise _batch_error(index, label, exc) from None
-            results.append((finding, lines))
-        return current, results
+        base_number = int(next_finding_id(current)[1:])
+        return _record_entries(
+            "add",
+            raw_entries,
+            current,
+            lambda index, _raw: f"F{base_number + index - 1}",
+            lambda _index, state, raw: _add_one_from_json(ws, cwd, snap, state, raw),
+        )
 
-    for finding, lines in mutate(ws.ledger_path, record_batch):
-        _print_recorded(finding, lines)
-    return 0
+    return _run_batch(ws, args, record_batch, lambda pair: _print_recorded(pair[0], pair[1]))
 
 
 def _add_one_from_json(
     ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any
-) -> tuple[Ledger, Finding, list[str] | None]:
+) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
     f = Fields(raw)
     lens = f.choice("lens", tuple(sorted(LENS_IDS)))
     raw_file = f.text("file")
@@ -882,7 +1060,7 @@ def _add_one_from_json(
         suggestion=suggestion,
         signal_id=signal_id,
     )
-    return updated, finding, lines
+    return updated, (finding, lines)
 
 
 def _print_recorded(finding: Finding, lines: Sequence[str] | None) -> None:
@@ -1048,12 +1226,22 @@ def _verdict(args: argparse.Namespace) -> int:
 def _verdict_one(args: argparse.Namespace) -> int:
     _require_flags(args, {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence})
     ws = open_workspace(args.cwd)
-    finding = mutate(
-        ws.ledger_path,
+    return _run_single(
+        ws,
+        bool(args.check),
         lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run),
+        _print_verdict,
     )
-    _print_verdict(finding)
-    return 0
+
+
+def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
+    f = Fields(raw)
+    finding_id = f.text("id")
+    verdict = f.choice("as", VERDICTS)
+    evidence = f.text("evidence")
+    run_id = f.text_if_present("run")
+    f.reject_unknown()
+    return set_verdict(state, finding_id, verdict, evidence, run_id)
 
 
 def _verdict_from_json(args: argparse.Namespace) -> int:
@@ -1064,24 +1252,15 @@ def _verdict_from_json(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[Finding]]:
-        judged: list[Finding] = []
-        for index, raw in enumerate(raw_entries, 1):
-            try:
-                f = Fields(raw)
-                finding_id = f.text("id")
-                verdict = f.choice("as", VERDICTS)
-                evidence = f.text("evidence")
-                run_id = f.text_if_present("run")
-                f.reject_unknown()
-                current, finding = set_verdict(current, finding_id, verdict, evidence, run_id)
-            except LedgerError as exc:
-                raise _batch_error(index, _entry_label(raw, "id"), exc) from None
-            judged.append(finding)
-        return current, judged
+        return _record_entries(
+            "verdict",
+            raw_entries,
+            current,
+            lambda _index, raw: _entry_label(raw, "id"),
+            lambda _index, state, raw: _verdict_one_from_json(state, raw),
+        )
 
-    for finding in mutate(ws.ledger_path, record_batch):
-        _print_verdict(finding)
-    return 0
+    return _run_batch(ws, args, record_batch, _print_verdict)
 
 
 def _print_verdict(finding: Finding) -> None:
@@ -1129,6 +1308,7 @@ def _show(args: argparse.Namespace) -> int:
     if args.json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
+            "lens_additions": [addition.to_json() for addition in ledger.lens_additions],
             "coverage": _coverage_json(ledger, latest) if latest else {},
             "hunks": _hunks_json(ws.root, latest, snap) if latest else [],
             "findings": [finding.to_json() for finding in ledger.findings],
@@ -1141,6 +1321,8 @@ def _show(args: argparse.Namespace) -> int:
     else:
         print(_round_line(latest, snap))
         print(f"Packet: {Path(latest.packet_path).resolve()}")
+        for line in _lens_addition_lines(ledger):
+            print(line)
         print("")
         print(f"Coverage (covered/total non-carried hunks, files for `{DESIGN_LENS}`):")
         print("\n".join(_coverage_lines(ledger, latest)))
@@ -1361,7 +1543,8 @@ def _report(args: argparse.Namespace) -> int:
         raise LedgerError(
             "--partial requires --review-only; pass `craftsman review report --review-only --partial`"
         )
-    ledger, snap, tier, report = _evaluate(open_workspace(args.cwd), None, review_only=args.review_only)
+    ws = open_workspace(args.cwd)
+    ledger, snap, tier, report = _evaluate(ws, None, review_only=args.review_only)
     if args.partial:
         report = replace(report, partial=True)
     groups = _finding_groups(ledger.findings)
@@ -1378,10 +1561,13 @@ def _report(args: argparse.Namespace) -> int:
             "runs": [run.to_json() for run in runs],
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
             "signal_acks": {sid: ack.to_json() for sid, ack in acks_in_force(ledger).items()},
+            "lens_additions": [addition.to_json() for addition in ledger.lens_additions],
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
-        return 0
-    print("\n".join(_report_lines(ledger, snap, tier, report, groups, runs)))
+    else:
+        print("\n".join(_report_lines(ledger, snap, tier, report, groups, runs)))
+    if args.review_only:
+        prune_inbox_files(ws.ledger_path.parent)
     return 0
 
 
@@ -1416,6 +1602,13 @@ def _report_status_line(report: GateReport) -> str:
         else "craftsman review check"
     )
     return f"{line} — {report.issue_codes}; see `{check}`"
+
+
+def _lens_addition_lines(ledger: Ledger) -> list[str]:
+    return [
+        f"- Lens `{addition.lens}` added by the agent in round {addition.round}: {addition.reason}"
+        for addition in ledger.lens_additions
+    ]
 
 
 def _not_covered_by_lens(ledger: Ledger) -> dict[str, list[str]]:
@@ -1538,6 +1731,7 @@ def _report_lines(
         f"- Base `{snap.base_sha[:7]}` · tier `{tier}` · {len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
+        *_lens_addition_lines(ledger),
         *_diff_size_lines(ledger, snap),
         *_not_covered_lines(ledger, snap, report),
         "",
@@ -1619,6 +1813,15 @@ def _add_prepare_parser(sub: Any, common: argparse.ArgumentParser) -> None:
         "--tracked",
         action="store_true",
         help="Freeze the review scope to tracked files changed since the base (omit untracked files)",
+    )
+    prepare.add_argument(
+        "--add-lens",
+        action="append",
+        metavar="LENS=REASON",
+        help=(
+            "Add a lens the risk signals did not select, citing the code that needs it as file:line "
+            f"(repeatable), e.g. {LENS_ADDITION_EXAMPLE!r}. Added lenses stay in every later round."
+        ),
     )
     prepare.set_defaults(handler=_prepare)
 
@@ -1809,6 +2012,19 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_merge_and_verdict_parsers(sub, common)
     _add_resolution_and_status_parsers(sub, common)
     _add_inspection_parsers(sub, common)
+    for name in ("cover", "add", "verdict"):
+        sub.choices[name].add_argument(
+            "--check",
+            action="store_true",
+            help="Validate without recording to the ledger or consuming an inbox file",
+        )
+    inbox = sub.add_parser(
+        "inbox",
+        parents=[common],
+        help="Create a unique managed JSON file in <git-dir>/craftsman/inbox/ for --from-json",
+    )
+    inbox.add_argument("kind", choices=INBOX_KINDS, help="Batch command the file is for")
+    inbox.set_defaults(handler=_inbox)
     # Prefix matching would let `--lens` stand in for `--lenses` and similar near-misses.
     for command in sub.choices.values():
         command.allow_abbrev = False
@@ -1819,14 +2035,40 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         result: int = args.handler(args)
+    except BatchRejected as exc:
+        sys.stderr.write(f"{format_batch_rejection(exc)}\n")
+        return 1
     except (LedgerError, DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"{PROG}: error: {describe_error(exc)}\n")
         return 1
     return result
 
 
+def format_batch_rejection(exc: BatchRejected) -> str:
+    """Render every rejected batch entry without the `error:` prefix, capped at 20 lines."""
+    lines = [
+        str(exc),
+        "Fix all of them, then send the corrected list once:",
+    ]
+    shown = exc.problems[:MAX_REPORTED_BATCH_PROBLEMS]
+    for item in shown:
+        head = f"entry {item.index} ({item.label})" if item.label else f"entry {item.index}"
+        detail = f"{item.field}: {item.problem}" if item.field else item.problem
+        lines.append(f"  {head}: {detail}")
+    hidden = len(exc.problems) - len(shown)
+    if hidden > 0:
+        lines.append(f"  ... and {hidden} more")
+    for example in dict.fromkeys(item.example for item in exc.problems if item.example):
+        lines.append(f'Note format: "{example}"')
+    return "\n".join(lines)
+
+
 def describe_error(exc: LedgerError | DiffScanError | GateStateError) -> str:
     """The error message, naming the command-line flag when a flag's value was rejected."""
     if isinstance(exc, FieldError) and exc.field in FIELD_FLAGS:
-        return f"{FIELD_FLAGS[exc.field]} {exc.problem}"
-    return str(exc)
+        base = f"{FIELD_FLAGS[exc.field]} {exc.problem}"
+    else:
+        base = str(exc)
+    if isinstance(exc, LedgerError) and exc.example:
+        return f'{base}. Example: "{exc.example}"'
+    return base

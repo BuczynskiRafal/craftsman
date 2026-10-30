@@ -20,6 +20,7 @@ from craftsman.diffscan import (
     WorktreeIndex,
     commit_sha,
     detect_signals,
+    files_without_signal_patterns,
     git_output,
     is_test_path,
 )
@@ -71,6 +72,18 @@ _FENCE_LANGUAGES = {
     ".go": "go",
     ".rs": "rust",
     ".java": "java",
+    ".kt": "kotlin",
+    ".groovy": "groovy",
+    ".gradle": "groovy",
+    ".c": "c",
+    ".h": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".hh": "cpp",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".jenkinsfile": "groovy",
     ".cs": "csharp",
     ".rb": "ruby",
     ".sh": "sh",
@@ -83,18 +96,15 @@ _FENCE_LANGUAGES = {
 }
 _BACKTICK_RUN_RE = re.compile(r"`+")
 CHEAT_SHEET = (
-    "- Cover (1–4 hunks per call; the note names every hunk id and what you tried on it; "
-    "for >1 entry, prefer `--from-json - <<'EOF'`):\n"
-    '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "hunks": ["H1", "H2"], '
-    '"note": "H1 f: x=None -> L42 raises; H2 g: callers a.py:19 ok"}]`, or single:\n'
-    '  `craftsman review cover --lens <lens> --hunks H1,H2 --note "H1 f: x=None -> L42 raises; '
-    'H2 g: callers a.py:19 ok"`; the `design` lens takes `--files a.py` (`"files"` in JSON) '
-    "instead of hunk ids",
-    "- Finding (one per root cause; for >1 entry, prefer `--from-json - <<'EOF'`; group unjudged "
-    "duplicates before verification with `craftsman review merge F1 F2` — Merge only when ONE fix "
-    "removes every consequence. Different fixes are separate findings, even on the same line, file, "
-    "or category, e.g. a missing `--json` flag in `craftsman status` and a stale README example are "
-    "two separate findings, not one 'housekeeping' finding):\n"
+    "- Cover (1–4 hunks per call; combine assigned lenses with `\"lenses\"` — >= 2 lenses need >= 80 "
+    "chars/hunk, 20 concrete; 1 lens >= 40):\n"
+    '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lenses": ["intent", "contracts", '
+    '"failure"], "hunks": ["H1"], "note": "H1 parse_cfg: x=None -> L42 TypeError, raw=\'\' -> '
+    'default {} at cfg.py:18, callers cli.py:19 ok"}]`, or single '
+    '`craftsman review cover --lens intent,contracts --hunks H1 --note "..."`; `design` takes '
+    '`--files a.py` (`"files"` in JSON)',
+    "- Finding (one per root cause; >1 entry via `--from-json - <<'EOF'`; `craftsman review merge "
+    "F1 F2` only when ONE fix removes every consequence — different fixes stay separate findings):\n"
     '  `craftsman review add --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "file": "<path>", '
     '"line": 42, "severity": "major", "title": "...", "scenario": "<root cause -> wrong outcomes>", '
     '"suggestion": "..."}]`, or single:\n'
@@ -107,10 +117,12 @@ CHEAT_SHEET = (
     '`--as probable --evidence "static: <file.py:42 chain>"` (or `"no-repro: <why>; <chain>"`) · '
     '`--as question --evidence "intent: <source>; <file.py:42 trade-off>"` · '
     '`--as dismissed --evidence "<guard at file.py:42>"`',
+    "- PowerShell / rejections: `@'` / `[...]` / `'@ | craftsman review <cmd> --from-json -` (ASCII "
+    "in PS 5.1) or `Set-Content -LiteralPath <path> -Encoding utf8` to `craftsman review inbox "
+    "<cover|add|verdict>`; fix all rejected entries in one edit, resend once",
     "- Run (tests, repro, e2e): `craftsman run --kind test|e2e|repro|lint|build -- <command>`",
     "- Progress: `craftsman review show` · gate status: `craftsman review check` "
-    "(review-only mode without `--fix`: `craftsman review check --review-only` then "
-    "`craftsman review report --review-only`)",
+    "(review-only: `craftsman review check --review-only`, `craftsman review report --review-only`)",
 )
 
 
@@ -131,6 +143,7 @@ class PacketContext:
     test_files_by_symbol: Mapping[str, tuple[str, ...]]
     last_runs: tuple[str, ...]
     facts_by_hunk: Mapping[str, tuple[Fact, ...]]
+    unscanned_files: tuple[str, ...] = ()  # changed code the risk-signal patterns cannot read
 
 
 def collect_context(
@@ -164,6 +177,7 @@ def collect_context(
         test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
         last_runs=_last_runs(ledger, snap),
         facts_by_hunk=valid_facts_for_hunk(ledger, root),
+        unscanned_files=files_without_signal_patterns(snap),
     )
 
 
@@ -542,7 +556,14 @@ def _lenses_section(ctx: PacketContext, only: frozenset[str] | None) -> str:
         if pick.lens.id == SWEEP_LENS:
             reason += " (run after all other lenses)"
         rows.append(f"| `{pick.lens.id}` — {pick.lens.title} | {reason} | {pick.lens.focus} |")
-    return "## Lenses in this round\n" + "\n".join(rows)
+    section = "## Lenses in this round\n" + "\n".join(rows)
+    if ctx.unscanned_files:
+        files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
+        section += (
+            f"\n\nNot scanned for risk signals (no patterns for their language): {files}. "
+            "No signal there does not mean no risk."
+        )
+    return section
 
 
 def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
@@ -704,7 +725,10 @@ def _reference_savings(
 
 
 def _fence_language(path: str) -> str:
-    return _FENCE_LANGUAGES.get(PurePosixPath(path).suffix.lower(), "")
+    posix = PurePosixPath(path)
+    if posix.name == "Jenkinsfile" or posix.name.startswith("Jenkinsfile."):
+        return "groovy"
+    return _FENCE_LANGUAGES.get(posix.suffix.lower(), "")
 
 
 def _inline_code(text: str) -> str:

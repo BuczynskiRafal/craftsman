@@ -15,43 +15,47 @@ from pathlib import Path
 from typing import Any
 
 from craftsman import __version__
-from craftsman.export import (
-    CLAUDE_HOOK_EVENTS,
-    COPILOT_DISCOVERY,
-    HOOKS_FILENAME,
-    CopilotClient,
-    CopilotDiscoveryLocation,
-    ExportError,
-    craftsman_agent_names,
-    craftsman_skill_names,
+from craftsman.assets import craftsman_agent_names, craftsman_skill_names, parse_frontmatter
+from craftsman.generated import ExportError
+from craftsman.legacy_githooks import (
+    git_config_get,
+    is_craftsman_hooks_path,
+    legacy_git_hooks_bases,
+)
+from craftsman.manifest import InstallError, TargetKind, load_manifest
+from craftsman.paths import (
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
     default_vscode_prompts_dir,
-    has_user_copilot_install,
-    has_workspace_copilot_install,
-    is_craftsman_hook_command,
-    iter_discovered_files,
-    parse_frontmatter,
     resolve_craftsman_pkg_dir,
-    resolve_discovery_dirs,
     user_home,
 )
-from craftsman.githooks import (
-    GUARDED_GIT_HOOKS,
-    PASSTHROUGH_TEMPLATE_NAME,
-    PYTHON_CMD_FILE,
-    STANDARD_PASSTHROUGH_GIT_HOOKS,
-    expand_tilde,
-    git_config_get,
+from craftsman.platforms.claude import CLAUDE_HOOK_EVENTS, is_craftsman_hook_command
+from craftsman.platforms.copilot import (
+    COPILOT_DISCOVERY,
+    HOOKS_FILENAME,
+    CopilotClient,
+    CopilotDiscoveryLocation,
+    has_user_copilot_install,
+    has_workspace_copilot_install,
+    iter_discovered_files,
+    resolve_discovery_dirs,
 )
-from craftsman.manifest import InstallError, TargetKind, load_manifest
 from craftsman.records import AGENT_ROLES
 
 CLAUDE_AGENT_NAMES = tuple(AGENT_ROLES)
 AGENT_NAMES = ("craftsman", *CLAUDE_AGENT_NAMES)
-REQUIRED_SCRIPTS = ("git-guard.py", "craftsman-stop-gate.py", "copilot-export.py", "craftsman-cli.py")
-MIN_RULE_FILES = 2
+REQUIRED_SCRIPTS = (
+    "craftsman-scope-guard.py",
+    "craftsman-stop-gate.py",
+    "copilot-export.py",
+    "craftsman-cli.py",
+)
+MIN_RULE_FILES = 1
+LEFTOVER_GIT_HOOKS_PROBLEM = (
+    "leftover git hooks from Craftsman 3.x; run `craftsman install` or `craftsman uninstall`"
+)
 # A SKILL.md body shorter than this is a stub, not a skill.
 MIN_SKILL_BODY_CHARS = 100
 _CLAUDE_SCOPES = ("claude-user", "claude-workspace")
@@ -132,7 +136,6 @@ class InstalledTargets:
     claude_code: bool
     github_copilot: bool
     vscode_instructions: bool
-    global_git_hooks: bool
 
 
 @dataclass(frozen=True)
@@ -226,14 +229,13 @@ def detect_antigravity_drift(repo_dir: Path, cfg: Path) -> list[str]:
     has_plugin = (cfg / "plugins" / "craftsman" / "plugin.json").is_file()
     if not has_skills and not has_plugin:
         return []
-    subdirs = [("scripts", "*.py"), ("craftsman", "*.py"), ("git-hooks", "*")]
+    subdirs = [("scripts", "*.py"), ("craftsman", "**/*.py")]
     if has_skills:
         subdirs = [("skills", "*/SKILL.md"), ("rules", "*.md"), *subdirs]
     drifted: list[str] = []
     for subdir, pattern in subdirs:
         src_base = resolve_craftsman_pkg_dir(repo_dir) if subdir == "craftsman" else repo_dir / subdir
         drifted.extend(_copied_file_drift(src_base, cfg / subdir, subdir, pattern, cfg))
-    drifted.extend(_passthrough_drift(repo_dir / "git-hooks", cfg))
     if has_skills:
         drifted.extend(_hooks_json_drift(repo_dir / "hooks.json", cfg))
     return drifted
@@ -245,28 +247,17 @@ def _copied_file_drift(
     if not src_base.is_dir() or not dst_base.is_dir():
         return
     for src_file in sorted(src_base.glob(pattern)):
-        if not src_file.is_file() or (label == "git-hooks" and src_file.name.startswith(".")):
+        if not src_file.is_file():
             continue
         rel = src_file.relative_to(src_base)
+        if any(part in ("_assets", "__pycache__") for part in rel.parts):
+            continue
         dst_file = dst_base / rel
+        rel_posix = rel.as_posix()
         if not dst_file.is_file():
-            yield f"{label}/{rel} (missing in {cfg})"
+            yield f"{label}/{rel_posix} (missing in {cfg})"
         elif _sha256_file(src_file) != _sha256_file(dst_file):
-            yield f"{label}/{rel}"
-
-
-def _passthrough_drift(src_hooks: Path, cfg: Path) -> Iterator[str]:
-    """Every standard git hook is installed as a copy of `_passthrough.sh`."""
-    template = src_hooks / "_passthrough.sh"
-    if not template.is_file() or not (cfg / "git-hooks").is_dir():
-        return
-    expected = _sha256_file(template)
-    for hook_name in STANDARD_PASSTHROUGH_GIT_HOOKS:
-        installed = cfg / "git-hooks" / hook_name
-        if not installed.is_file():
-            yield f"git-hooks/{hook_name} (missing in {cfg})"
-        elif _sha256_file(installed) != expected:
-            yield f"git-hooks/{hook_name}"
+            yield f"{label}/{rel_posix}"
 
 
 def _hooks_json_drift(src_hooks_json: Path, cfg: Path) -> Iterator[str]:
@@ -586,44 +577,24 @@ def _format_duplicate_problem(dup: CopilotDuplicate) -> str:
     return f"{prefix} (keep {dup.canonical_path}; rename or remove the other copies)"
 
 
-# --- git hooks ------------------------------------------------------------------------------
+# --- legacy git hooks -----------------------------------------------------------------------
 
 
-def inspect_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
-    """Problems of the Craftsman git hooks `core.hooksPath` points to; other hooks are not ours."""
-    if not hooks_path:
-        return []
-    hooks_dir = Path(expand_tilde(hooks_path, home))
-    try:
-        manifest = load_manifest(hooks_dir.parent)
-    except InstallError as exc:
-        return [str(exc)]
-    target = manifest.targets.get(TargetKind.GIT_HOOKS) if manifest else None
-    if (
-        target is None
-        or target.hooks_dir is None
-        or Path(target.hooks_dir).resolve() != hooks_dir.resolve()
-    ):
-        return []
-    needed = [
-        hooks_dir / PASSTHROUGH_TEMPLATE_NAME,
-        hooks_dir / PYTHON_CMD_FILE,
-        *(hooks_dir / name for name in GUARDED_GIT_HOOKS),
-        hooks_dir.parent / "scripts" / "git-guard.py",
-    ]
-    missing = [str(path) for path in needed if not path.is_file()]
-    if missing:
-        return [
-            f"git hooks in {hooks_dir} are incomplete (missing {', '.join(missing)}); "
-            "run 'craftsman install --git-hooks' to repair"
-        ]
-    python = (hooks_dir / PYTHON_CMD_FILE).read_text(encoding="utf-8").strip()
-    if not (Path(python).is_file() and os.access(python, os.X_OK)):
-        return [
-            f"git hooks in {hooks_dir} run {python or 'no Python'}, which is not an executable "
-            "file, so every commit and push is blocked; run 'craftsman install --git-hooks' to repair"
-        ]
-    return []
+def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
+    """Warn when a manifest still lists Craftsman 3.x git hooks or `core.hooksPath` points to them."""
+    problems: list[str] = []
+    has_leftover = is_craftsman_hooks_path(hooks_path, home)
+    for base in legacy_git_hooks_bases(home):
+        try:
+            manifest = load_manifest(base)
+        except InstallError as exc:
+            problems.append(str(exc))
+            continue
+        if manifest is not None and TargetKind.GIT_HOOKS in manifest.targets:
+            has_leftover = True
+    if has_leftover:
+        problems.append(LEFTOVER_GIT_HOOKS_PROBLEM)
+    return problems
 
 
 # --- report ---------------------------------------------------------------------------------
@@ -669,9 +640,7 @@ def _platform_problems(copilot: CopilotReport, claude: ClaudeReport) -> list[str
     return problems
 
 
-def _installed_targets(
-    repo_dir: Path, workspace: Path | None, home: Path, hooks_path: str | None
-) -> InstalledTargets:
+def _installed_targets(repo_dir: Path, workspace: Path | None, home: Path) -> InstalledTargets:
     copilot_home = default_copilot_home(home)
     gemini = home / ".gemini" / "config"
     user_copilot = (
@@ -688,7 +657,6 @@ def _installed_targets(
         or (home / ".claude" / "agents" / "craftsman-reviewer.md").is_file(),
         github_copilot=user_copilot or workspace_copilot,
         vscode_instructions=instructions.is_file(),
-        global_git_hooks=bool(hooks_path and Path(expand_tilde(hooks_path, home)).is_dir()),
     )
 
 
@@ -733,7 +701,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
     problems = (
         *git_problems,
         *_platform_problems(copilot, claude),
-        *inspect_git_hooks(git.hooks_path, home),
+        *inspect_legacy_git_hooks(git.hooks_path, home),
     )
     healthy = (
         skill_count == expected_skills
@@ -755,7 +723,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         missing_scripts=missing_scripts,
         config_drift=config_drift,
         git_config=git,
-        installed_targets=_installed_targets(repo_dir, workspace, home, git.hooks_path),
+        installed_targets=_installed_targets(repo_dir, workspace, home),
         copilot=copilot,
         claude=claude,
         problems=tuple(problems),

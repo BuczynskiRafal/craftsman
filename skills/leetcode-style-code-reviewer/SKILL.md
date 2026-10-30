@@ -1,6 +1,6 @@
 ---
 name: leetcode-style-code-reviewer
-description: Brutally rigorous code review for Python code, focused on raw performance, in the style of a top-tier competitive programmer (LeetCode top 10 / ICPC finalist). Use this skill when the user asks for an algorithmic or hot-path performance review, optimization pass, "make this faster", "is this efficient", or critique of an algorithm in Python, NumPy, pandas, or PyTorch.
+description: Brutally rigorous code review for Python code, focused on raw performance, in the style of a top-tier competitive programmer (LeetCode top 10 / ICPC finalist). Use this skill when the user asks for a review or critique of an algorithm or hot path in Python, NumPy, pandas, or PyTorch ("is this efficient", "review this for performance"). It reviews and proposes changes without editing files; when the user wants the code changed and benchmarked, use /extreme-optimizer.
 ---
 
 # LeetCode-Style Code Reviewer (Python edition)
@@ -303,6 +303,9 @@ Start with the verdict (section 1) and end on the last sentence of section 5, wi
 ---
 
 ## Worked example
+
+Illustrative only: it shows the section order and the depth of a finding. Size each review to
+the code in front of you, not to this example.
 
 User submits:
 ```python
