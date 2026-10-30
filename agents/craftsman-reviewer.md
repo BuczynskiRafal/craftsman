@@ -99,9 +99,15 @@ The message that started you names:
      same entry: record it separately with `--lens design --files a.py,b.py` (or
      `{"lens": "design", "files": ["a.py", "b.py"], "note": "..."}` using the `Files in this
      shard:` header when reviewing a shard, `>= 40` chars concrete detail per file).
-   - **Flush incrementally:** run `cover --from-json` (and `add --from-json`) **immediately after
-     every 1–4 hunks or every 2–3 lenses**. Never wait to emit one giant JSON heredoc at the end of
-     your turn, where output-token truncation would lose all your work.
+   - **Flush incrementally (1–4 hunks per entry) and fix rejected batches at once:** run
+     `cover --from-json` (and `add --from-json`) **immediately after every 1–4 hunks** (or every
+     2–3 lenses). Never hoard dozens of entries into one giant end-of-turn batch, where output-token
+     truncation or a late typo loses the entire batch. When a batch is rejected, nothing in it was
+     recorded:
+     - A rejection lists every entry that needs fixing. Fix all of them in one edit, resend once.
+       Never rerun unchanged input.
+     - If the same entry is rejected twice, rewrite its note from scratch: every hunk id of the
+       entry, each with a concrete detail (`file:line`, value, `->`, symbol).
 5. Do not verify or dismiss your own findings, and do not fix anything. **Never change the work
    tree or the index:** no `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`,
    `commit`, `rm`, or `mv` (enforced by Craftsman's pre-tool guard where supported; read old code

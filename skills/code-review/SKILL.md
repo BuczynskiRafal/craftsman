@@ -288,9 +288,15 @@ subagents (when no subagent mechanism exists, run the lenses yourself, loading p
   ]
   EOF
   ```
-  **Flush incrementally:** call `cover --from-json` and `add --from-json` right after every **1–4
-  hunks** (or every **2–3 lenses**). Never buffer one giant JSON heredoc until the end of the turn,
-  where an output-token limit on smaller models loses the entire batch.
+  **Flush incrementally (1–4 hunks per entry) and fix rejected batches at once:** call
+  `cover --from-json` and `add --from-json` right after every **1–4 hunks** (or every **2–3
+  lenses**). Never hoard dozens of entries into one giant end-of-turn batch, where an output-token
+  limit or a late typo rejects the whole batch. When a `--from-json` batch is rejected, nothing in
+  it was recorded:
+  - A rejection lists every entry that needs fixing. Fix all of them in one edit, resend once. Never
+    rerun unchanged input.
+  - If the same entry is rejected twice, rewrite its note from scratch: every hunk id of the entry,
+    each with a concrete detail (`file:line`, value, `->`, symbol).
 - **Concurrency cap (`--parallel`, default `2`):** run at most `--parallel` subagents at the same
   time (default `2`), queuing any remaining shards or groups until a running subagent finishes.
 - **Subagent failure (rate limit, quota, timeout):** **never enter respawn loops**. Retry a failed
@@ -396,7 +402,8 @@ The ledger enforces the evidence: `proven` requires `--run` pointing to the repr
 (saying why it could not be verified deterministically, followed by the chain); `question` is not
 allowed for `blocker` findings and its evidence must start with `intent:` naming the intent source
 and citing `file:line`; `dismissed` needs either `--run` or a `file:line` reference to the guard
-(quote the guard expression).
+(quote the guard expression). A batch rejection records nothing and lists every verdict entry that
+needs fixing — fix all of them in one edit and resend once (never rerun unchanged input).
 
 **Leave the change under review untouched.** Reproductions live in a fresh temporary directory
 outside the repository. Never `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`, or

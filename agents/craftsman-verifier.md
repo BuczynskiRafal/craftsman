@@ -46,7 +46,8 @@ Do **not** read the full review packet (`packet-N.md`):
    cross-hunk interactions (two hunks that disagree on format/name/steps, a decision implemented
    differently in two places, or code/config/docs that contradict each other). Record any new
    cross-hunk findings with `craftsman review add --lens sweep ...` (or `--from-json - <<'EOF'`),
-   and record `sweep` coverage incrementally for every open hunk (1–4 hunks per entry). **Every
+   and record `sweep` coverage incrementally for every open hunk (1–4 hunks per entry — flush right
+   after every 1–4 hunks instead of hoarding dozens of entries until the end of your turn). **Every
    `H#` in `note` must have its own concrete `>= 40`-character segment citing real code details**
    (`--stat` summaries or generic `"no cross-hunk conflict"` text will fail coverage validation):
    ```bash
@@ -60,6 +61,10 @@ Do **not** read the full review packet (`packet-N.md`):
    ]
    EOF
    ```
+   If a `cover` or `add` batch is rejected, nothing in it was recorded: a rejection lists every
+   entry that needs fixing — fix all of them in one edit, resend once, and never rerun unchanged
+   input (if the same `cover` entry is rejected twice, rewrite its note from scratch naming every
+   hunk id of the entry, each with a concrete detail: `file:line`, value, `->`, symbol).
 2. **Group duplicate findings by root cause (before any verdict):** `craftsman review merge` only
    works on findings without a verdict, before verification. When two or more unjudged findings
    trace back to the same changed line or decision (producing multiple downstream consequences),
@@ -143,6 +148,10 @@ Do **not** read the full review packet (`packet-N.md`):
    behavior. If you think the severity is wrong, start the evidence with `[severity: <new>]` and
    say why; the orchestrator decides. A finding that duplicates an already-judged one (where
    `merge` no longer applies) is `dismissed` with a reference to the other finding's `file:line`.
+   - **Batch rejections:** a rejection records nothing and lists every verdict entry that needs
+     fixing. Fix all of them in one edit, resend once. Never rerun unchanged input. If the same
+     verdict entry is rejected twice, rewrite its `evidence` from scratch with concrete `file:line`
+     references (and the required `static:`, `no-repro:`, or `intent:` prefix, or `--run R#`).
 
 Finish with a table: finding id, verdict, one-line reason (in review-only mode without `--fix`, the
 orchestrator then runs `craftsman review check --review-only` and `craftsman review report --review-only`).
