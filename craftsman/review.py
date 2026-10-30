@@ -103,6 +103,7 @@ from craftsman.workspace import Workspace, open_workspace
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
 CITED_LINE_CHARS = 120
+MAX_REPORTED_BATCH_PROBLEMS = 20
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
     "lens": "--lens",
@@ -1877,21 +1878,38 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     try:
         result: int = args.handler(args)
+    except BatchRejected as exc:
+        sys.stderr.write(f"{format_batch_rejection(exc)}\n")
+        return 1
     except (LedgerError, DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"{PROG}: error: {describe_error(exc)}\n")
         return 1
     return result
 
 
+def format_batch_rejection(exc: BatchRejected) -> str:
+    """Render every rejected batch entry without the `error:` prefix, capped at 20 lines."""
+    noun = "entry" if exc.total == 1 else "entries"
+    head_cmd = exc.command if exc.command.startswith(PROG) else f"{PROG} {exc.command}"
+    lines = [
+        f"{head_cmd}: {len(exc.problems)} of {exc.total} {noun} rejected; nothing was recorded.",
+        "Fix all of them, then send the corrected list once:",
+    ]
+    shown = exc.problems[:MAX_REPORTED_BATCH_PROBLEMS]
+    for item in shown:
+        head = f"entry {item.index} ({item.label})" if item.label else f"entry {item.index}"
+        detail = f"{item.field}: {item.problem}" if item.field else item.problem
+        lines.append(f"  {head}: {detail}")
+    hidden = len(exc.problems) - len(shown)
+    if hidden > 0:
+        lines.append(f"  ... and {hidden} more")
+    for example in dict.fromkeys(item.example for item in exc.problems if item.example):
+        lines.append(f'Note format: "{example}"')
+    return "\n".join(lines)
+
+
 def describe_error(exc: LedgerError | DiffScanError | GateStateError) -> str:
     """The error message, naming the command-line flag when a flag's value was rejected."""
-    if isinstance(exc, BatchRejected):
-        lines = [str(exc)]
-        for item in exc.problems:
-            head = f"entry {item.index} ({item.label})" if item.label else f"entry {item.index}"
-            detail = f"{item.field}: {item.problem}" if item.field else item.problem
-            lines.append(f"  {head}: {detail}")
-        return "\n".join(lines)
     if isinstance(exc, FieldError) and exc.field in FIELD_FLAGS:
         base = f"{FIELD_FLAGS[exc.field]} {exc.problem}"
     else:

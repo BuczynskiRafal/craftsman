@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from craftsman.cli import main as cli_main
 from craftsman.ledger import open_round
@@ -18,6 +20,7 @@ from craftsman.review import parse_view_lenses, view_slug
 
 from tests.support import (
     REPO_ROOT,
+    CliResult,
     EvidenceRepo,
     assert_cli_error,
     coverage_note,
@@ -1026,6 +1029,149 @@ class PacketPathTests(RepoTestCase):
         self.assertEqual(result.code, 0, result.err)
         self.assertEqual(Path(result.out.strip()).name, "packet-1.md")
         self.assertTrue(Path(result.out.strip()).is_file())
+
+
+class FastCliTestCase(RepoTestCase):
+    def cli_fast(self, *args: str, stdin_bytes: bytes | None = None) -> CliResult:
+        if stdin_bytes is None:
+            return run_main(cli_main, *args, "--cwd", str(self.repo.root))
+        fake_stdin = mock.MagicMock()
+        fake_stdin.buffer = io.BytesIO(stdin_bytes)
+        with mock.patch("sys.stdin", fake_stdin):
+            return run_main(cli_main, *args, "--cwd", str(self.repo.root))
+
+    def prepare_multi_hunk(self, count: int, tier: str = "standard") -> None:
+        for index in range(1, count + 1):
+            self.repo.write(f"mod_{index}.py", f"def fn_{index}(x):\n    return x + {index}\n")
+        res = self.cli_fast("review", "prepare", "--tier", tier, "--task", "Multi-hunk change")
+        self.assertEqual(res.code, 0, res.err)
+
+
+class BatchRejectionTests(FastCliTestCase):
+    def test_batch_reports_three_bad_entries_in_one_pass(self) -> None:
+        self.prepare_multi_hunk(14, tier="deep")
+        lenses = ("intent", "contracts", "failure")
+        entries: list[dict[str, object]] = [
+            {"lens": lenses[i % 3], "hunks": [f"H{(i % 14) + 1}"], "note": coverage_note([f"H{(i % 14) + 1}"])}
+            for i in range(42)
+        ]
+        entries[39] = {"lens": "trust", "hunks": ["H13", "H14"], "note": coverage_note(["H13"])}
+        entries[40] = {"lens": "contracts", "hunks": ["H13", "H14"], "note": coverage_note(["H13"])}
+        entries[41] = {"lens": "failure", "hunks": ["H13"], "note": "H13 looks good"}
+
+        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+
+        self.assertEqual(res.code, 1)
+        self.assertNotIn("error:", res.err)
+        self.assertIn("craftsman review cover: 3 of 42 entries rejected; nothing was recorded.", res.err)
+        self.assertIn("entry 40 (trust): note:", res.err)
+        self.assertIn("entry 41 (contracts): note:", res.err)
+        self.assertIn("entry 42 (failure): note:", res.err)
+        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
+        for index, lens in ((39, "trust"), (40, "contracts"), (41, "failure")):
+            entries[index] = {"lens": lens, "hunks": ["H13", "H14"], "note": coverage_note(["H13", "H14"])}
+        fixed = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+        self.assertEqual(fixed.code, 0, fixed.err)
+
+    def test_four_hunk_entry_reports_missing_plus_weak_targets(self) -> None:
+        self.prepare_multi_hunk(4, tier="quick")
+        note = f"{coverage_note(['H1'])}; H2 looks clean"
+        entries = [{"lens": "intent", "hunks": ["H1", "H2", "H3", "H4"], "note": note}]
+
+        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+
+        self.assertEqual(res.code, 1)
+        self.assertIn("missing: H3, H4", res.err)
+        self.assertIn("too little concrete detail: H2", res.err)
+
+    def test_stale_or_missing_round_reports_one_state_error(self) -> None:
+        entries = [
+            {"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])},
+            {"lens": "contracts", "hunks": ["H1"], "note": coverage_note(["H1"])},
+        ]
+        payload = json.dumps(entries).encode()
+        missing = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=payload)
+        self.assertEqual(missing.code, 1)
+        self.assertIn("craftsman review: error:", missing.err)
+        self.assertNotIn("entry 1", missing.err)
+
+        self.prepare_bug()
+        self.repo.write("cart.py", BUGGY_TOTAL + "# changed\n")
+        stale = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=payload)
+        self.assertEqual(stale.code, 1)
+        self.assertIn("craftsman review: error: Code changed since round 1 was prepared", stale.err)
+        self.assertNotIn("entry 1", stale.err)
+
+    def test_rejected_findings_receive_distinct_prospective_ids(self) -> None:
+        self.prepare_bug()
+        bad_one = {
+            "lens": "contracts",
+            "file": "cart.py",
+            "line": 3,
+            "severity": "urgent",
+            "title": "Empty list crashes on len(items)",
+            "scenario": "total([]) divides by zero at len(items) and raises ZeroDivisionError",
+        }
+        bad_two = {**bad_one, "line": 0, "severity": "major"}
+
+        res = self.cli_fast(
+            "review", "add", "--from-json", "-", stdin_bytes=json.dumps([bad_one, bad_two]).encode()
+        )
+
+        self.assertEqual(res.code, 1)
+        self.assertIn("entry 1 (F1): severity:", res.err)
+        self.assertIn("entry 2 (F2): line:", res.err)
+
+    def test_sweep_annotates_only_lenses_rejected_in_same_batch(self) -> None:
+        self.prepare_multi_hunk(1, tier="standard")
+        design_note = "mod_1.py:1 fn_1(x) adds 2 lines -> single pure helper with no extra layers"
+        self.assertEqual(
+            self.cli_fast("review", "cover", "--lens", "design", "--files", "mod_1.py", "--note", design_note).code,
+            0,
+        )
+        entries = [
+            {"lens": "intent", "hunks": ["H1"], "note": "H1 looks good"},
+            {"lens": "sweep", "hunks": ["H1"], "note": coverage_note(["H1"])},
+        ]
+
+        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+
+        self.assertEqual(res.code, 1)
+        self.assertIn("intent H1 (depends on entry 1)", res.err)
+        self.assertIn("contracts H1;", res.err)
+        self.assertNotIn("contracts H1 (depends on", res.err)
+
+    def test_note_format_shown_once_for_notes_omitted_elsewhere(self) -> None:
+        self.prepare_bug()
+        bad_notes = [
+            {"lens": "intent", "hunks": ["H1"], "note": "H1 ok"},
+            {"lens": "contracts", "hunks": ["H1"], "note": "short"},
+        ]
+        note_res = self.cli_fast(
+            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(bad_notes).encode()
+        )
+        self.assertEqual(note_res.err.count("Note format:"), 1)
+
+        self.add()
+        verdict_entries = [{"id": "F1", "as": "proven", "evidence": "Reproduced crash at cart.py:3"}]
+        verdict_res = self.cli_fast(
+            "review", "verdict", "--from-json", "-", stdin_bytes=json.dumps(verdict_entries).encode()
+        )
+        self.assertEqual(verdict_res.code, 1)
+        self.assertNotIn("Note format:", verdict_res.err)
+
+    def test_batch_rejection_caps_output_at_twenty_items(self) -> None:
+        self.prepare_bug()
+        entries = [{"lens": "intent", "hunks": ["H1"], "note": "H1 ok"} for _ in range(23)]
+
+        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+
+        self.assertEqual(res.code, 1)
+        self.assertIn("23 of 23 entries rejected", res.err)
+        self.assertIn("entry 20 (intent):", res.err)
+        self.assertNotIn("entry 21 (intent):", res.err)
+        self.assertIn("  ... and 3 more", res.err)
+        self.assertEqual(res.err.count("Note format:"), 1)
 
 
 if __name__ == "__main__":
