@@ -494,7 +494,7 @@ class InboxLifecycleTests(unittest.TestCase):
             consumed = consume_inbox_file(self.craftsman_dir, str(real_file))
 
         self.assertFalse(consumed)
-        self.assertIn("craftsman review: warning: could not remove inbox file", err.getvalue())
+        self.assertIn("craftsman: warning: could not remove inbox file", err.getvalue())
         self.assertIn("file in use", err.getvalue())
 
         race_err = io.StringIO()

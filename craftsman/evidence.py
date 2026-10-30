@@ -97,7 +97,7 @@ def _has_real_inode(st: os.stat_result) -> bool:
 
 
 def _warn_inbox(detail: str) -> None:
-    sys.stderr.write(f"craftsman review: warning: {detail}\n")
+    sys.stderr.write(f"craftsman: warning: {detail}\n")
 
 
 def _prepare_inbox_dir(craftsman_dir: Path) -> Path:
