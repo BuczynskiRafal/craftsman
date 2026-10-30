@@ -19,6 +19,7 @@ from craftsman.records import FieldError, Ledger
 from craftsman.review import parse_view_lenses, view_slug
 
 from tests.support import (
+    AMBIENT_PLATFORM_ENV_VARS,
     REPO_ROOT,
     CliResult,
     EvidenceRepo,
@@ -1172,6 +1173,61 @@ class BatchRejectionTests(FastCliTestCase):
         self.assertNotIn("entry 21 (intent):", res.err)
         self.assertIn("  ... and 3 more", res.err)
         self.assertEqual(res.err.count("Note format:"), 1)
+
+
+class JsonEncodingTests(FastCliTestCase):
+    def _pipe_subproc(self, raw_bytes: bytes) -> subprocess.CompletedProcess[bytes]:
+        env = {k: v for k, v in os.environ.items() if k not in AMBIENT_PLATFORM_ENV_VARS}
+        env["PYTHONPATH"] = str(REPO_ROOT)
+        return subprocess.run(
+            [sys.executable, "-m", "craftsman.cli", "review", "cover", "--from-json", "-"],
+            cwd=self.repo.root,
+            env=env,
+            input=raw_bytes,
+            capture_output=True,
+            timeout=30,
+        )
+
+    def _payload(self, lens: str) -> str:
+        return json.dumps(
+            [{"lens": lens, "hunks": ["H1"], "note": f"{coverage_note(['H1'])} — żółć"}],
+            ensure_ascii=False,
+        )
+
+    def test_from_json_decodes_bom_inputs_from_file_or_stdin(self) -> None:
+        for codec in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be"):
+            with self.subTest(codec=codec):
+                self.prepare_bug()
+                file_bytes = self._payload("intent").encode("utf-16" if codec == "utf-16-le" else codec)
+                if codec == "utf-16-be":
+                    file_bytes = b"\xfe\xff" + self._payload("intent").encode("utf-16-be")
+                json_file = self.tmp / f"batch-{codec}.json"
+                json_file.write_bytes(file_bytes)
+                res = self.cli_fast("review", "cover", "--from-json", str(json_file))
+                self.assertEqual(res.code, 0, res.err)
+
+                stdin_bytes = self._payload("contracts").encode("utf-16" if codec == "utf-16-le" else codec)
+                if codec == "utf-16-be":
+                    stdin_bytes = b"\xfe\xff" + self._payload("contracts").encode("utf-16-be")
+                piped = self._pipe_subproc(stdin_bytes)
+                self.assertEqual(piped.returncode, 0, piped.stderr.decode("utf-8", errors="replace"))
+                self.cli_fast("review", "reset")
+
+    def test_from_json_rejects_cp1250_with_utf8_save_hint(self) -> None:
+        self.prepare_bug()
+        cp1250_bytes = json.dumps(
+            [{"lens": "intent", "hunks": ["H1"], "note": f"{coverage_note(['H1'])} źdźbło"}],
+            ensure_ascii=False,
+        ).encode("cp1250")
+        json_file = self.tmp / "cp1250.json"
+        json_file.write_bytes(cp1250_bytes)
+
+        from_file = self.cli_fast("review", "cover", "--from-json", str(json_file))
+        from_stdin = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=cp1250_bytes)
+
+        for result in (from_file, from_stdin):
+            self.assertEqual(result.code, 1)
+            self.assertIn("save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)", result.err)
 
 
 if __name__ == "__main__":

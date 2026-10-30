@@ -104,6 +104,7 @@ PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
 CITED_LINE_CHARS = 120
 MAX_REPORTED_BATCH_PROBLEMS = 20
+UTF8_SAVE_HINT = "save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)"
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
     "lens": "--lens",
@@ -625,16 +626,22 @@ def _reject_flags_with_from_json(flags: Mapping[str, object]) -> None:
         raise LedgerError(f"--from-json cannot be combined with {', '.join(used)}")
 
 
+def _decode_json_bytes(data: bytes, label: str) -> str:
+    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    try:
+        return data.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise LedgerError(f"cannot read {label}: {exc}; {UTF8_SAVE_HINT}") from exc
+
+
 def _load_json_entries(source: str) -> list[Any]:
     """Read and parse a non-empty JSON list of entry objects from `source` (`-` for stdin)."""
     label = "stdin" if source == "-" else source
     try:
-        if source == "-":
-            text = sys.stdin.buffer.read().decode("utf-8")
-        else:
-            text = Path(source).read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+        data = sys.stdin.buffer.read() if source == "-" else Path(source).read_bytes()
+    except OSError as exc:
         raise LedgerError(f"cannot read {label}: {exc}") from exc
+    text = _decode_json_bytes(data, label)
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
