@@ -463,9 +463,24 @@ ones are listed briefly so the reader sees what was considered.
   Antigravity: `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
   `craftsman-verifier`. Copilot CLI: `/agent` or the task tool. Codex and others:
   run the lenses yourself, one at a time.
-- **Shell.** All `craftsman` commands are identical in bash, zsh, PowerShell and cmd. Keep each
-  on one line (no `\` continuations). When a note, scenario or evidence quotes code containing `$`
-  or backticks, use single quotes so the shell does not expand them. Use the project's Python
-  (`python`, or the virtualenv's); `python3` does not exist on many Windows machines.
+- **Shell.** Single-line flag commands have no shell expansion when single-quoted and work
+  identically in `bash`, `zsh`, `PowerShell`, and `cmd`: keep each on one line (no `\`
+  continuations), and use single quotes whenever a note, scenario, or evidence quotes `$` or
+  backticks. Multi-line `--from-json - <<'EOF'` heredocs are POSIX-shell (`bash`/`zsh`) syntax; in
+  `PowerShell`, pipe a single-quoted here-string (`@'` and `'@` on their own lines, which does not
+  expand `$` or backticks, matching `<<'EOF'`):
+  ```powershell
+  @'
+  [ ...json... ]
+  '@ | craftsman review cover --from-json -
+  ```
+  In Windows PowerShell 5.1, piping to a native executable encodes via `$OutputEncoding` (ASCII by
+  default, turning non-ASCII characters into `?`), so either keep notes in ASCII or write UTF-8 to a
+  managed inbox file: run `craftsman review inbox cover` (or `add` / `verdict`) to print a unique
+  inbox path, write UTF-8 to it (`Set-Content -LiteralPath <path> -Encoding utf8` for read-only
+  subagents without `Edit`), and pass `--from-json <path>` (consumed automatically on success; kept
+  in place on rejection so you can fix every listed entry in one edit and resend once; never write
+  batch JSON files to `%TEMP%` or into the repository). Use the project's Python (`python`, or the
+  virtualenv's); `python3` does not exist on many Windows machines.
 - **No CLI available?** If `craftsman` is not installed, say so explicitly in the report — the
   review then has no gate and must not be presented as gated.

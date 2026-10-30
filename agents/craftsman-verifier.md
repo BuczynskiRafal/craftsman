@@ -152,6 +152,12 @@ Do **not** read the full review packet (`packet-N.md`):
      fixing. Fix all of them in one edit, resend once. Never rerun unchanged input. If the same
      verdict entry is rejected twice, rewrite its `evidence` from scratch with concrete `file:line`
      references (and the required `static:`, `no-repro:`, or `intent:` prefix, or `--run R#`).
+   - **PowerShell / managed inbox (`<<'EOF'` is POSIX-only):** in PowerShell, pipe a single-quoted
+     here-string (`@'` / `[ ...json... ]` / `'@ | craftsman review <verdict|cover|add> --from-json -`,
+     keeping text ASCII in Windows PowerShell 5.1) or write UTF-8 to a path printed by
+     `craftsman review inbox <verdict|cover|add>` via `Set-Content -LiteralPath <path> -Encoding utf8`
+     and pass `--from-json <path>` (consumed on success, kept in place on rejection; never write
+     batch JSON files to `%TEMP%` or into the repository).
 
 Finish with a table: finding id, verdict, one-line reason (in review-only mode without `--fix`, the
 orchestrator then runs `craftsman review check --review-only` and `craftsman review report --review-only`).

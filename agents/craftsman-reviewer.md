@@ -108,6 +108,12 @@ The message that started you names:
        Never rerun unchanged input.
      - If the same entry is rejected twice, rewrite its note from scratch: every hunk id of the
        entry, each with a concrete detail (`file:line`, value, `->`, symbol).
+   - **PowerShell / managed inbox (`<<'EOF'` is POSIX-only):** in PowerShell, pipe a single-quoted
+     here-string (`@'` / `[ ...json... ]` / `'@ | craftsman review <cover|add> --from-json -`,
+     keeping notes ASCII in Windows PowerShell 5.1) or write UTF-8 to a path printed by
+     `craftsman review inbox <cover|add>` via `Set-Content -LiteralPath <path> -Encoding utf8` and
+     pass `--from-json <path>` (consumed on success, kept in place on rejection; never write batch
+     JSON files to `%TEMP%` or into the repository).
 5. Do not verify or dismiss your own findings, and do not fix anything. **Never change the work
    tree or the index:** no `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`,
    `commit`, `rm`, or `mv` (enforced by Craftsman's pre-tool guard where supported; read old code

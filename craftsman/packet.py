@@ -104,6 +104,9 @@ CHEAT_SHEET = (
     '`--as probable --evidence "static: <file.py:42 chain>"` (or `"no-repro: <why>; <chain>"`) · '
     '`--as question --evidence "intent: <source>; <file.py:42 trade-off>"` · '
     '`--as dismissed --evidence "<guard at file.py:42>"`',
+    "- PowerShell / rejections: `@'` / `[...]` / `'@ | craftsman review <cmd> --from-json -` (ASCII "
+    "in PS 5.1) or `Set-Content -LiteralPath <path> -Encoding utf8` to `craftsman review inbox "
+    "<cover|add|verdict>`; fix all rejected entries in one edit, resend once",
     "- Run (tests, repro, e2e): `craftsman run --kind test|e2e|repro|lint|build -- <command>`",
     "- Progress: `craftsman review show` · gate status: `craftsman review check` "
     "(review-only: `craftsman review check --review-only`, `craftsman review report --review-only`)",
