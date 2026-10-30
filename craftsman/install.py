@@ -26,7 +26,6 @@ from craftsman.assets import (
     render_combined_rules,
 )
 from craftsman.export import (
-    CURSOR_RULE_HEADER,
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
     HOOKS_FILENAME,
@@ -36,7 +35,6 @@ from craftsman.export import (
     export_vscode_instructions,
     has_user_copilot_install,
     has_workspace_copilot_install,
-    render_agents_md,
     write_copilot_hooks,
 )
 from craftsman.files import (
@@ -44,8 +42,6 @@ from craftsman.files import (
 )
 from craftsman.generated import (
     ExportError,
-    is_craftsman_generated_file,
-    write_generated,
 )
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.legacy_githooks import legacy_git_hooks_bases
@@ -62,6 +58,7 @@ from craftsman.paths import (
     user_home,
     vscode_prompt_dirs,
 )
+from craftsman.platforms.agents_md import install_agents_workspace_target
 from craftsman.platforms.antigravity import detect_antigravity, install_antigravity_target
 from craftsman.platforms.claude import detect_claude, install_claude_target
 from craftsman.staging import (
@@ -138,19 +135,6 @@ def install_copilot_workspace_target(
         write_copilot_hooks(github_dir / "hooks", "craftsman", "craftsman")
     rules = render_combined_rules(repo_dir / "rules", with_frontmatter=False)
     upsert_markdown(session, github_dir / "copilot-instructions.md", rules)
-    session.finish()
-
-def install_agents_workspace_target(
-    repo_dir: Path, workspace: Path, home: Path, tracker: Tracker
-) -> None:
-    session = TargetSession.begin(workspace, TargetKind.AGENTS_WORKSPACE, home, tracker, workspace)
-    cursor_rule = workspace / ".cursor" / "rules" / "craftsman.mdc"
-    session.make_dirs(cursor_rule.parent)
-    session.stage(cursor_rule)
-    content = render_agents_md(repo_dir)
-    if not tracker.dry_run:
-        write_generated(cursor_rule, CURSOR_RULE_HEADER + content, owned=is_craftsman_generated_file)
-    upsert_markdown(session, workspace / "AGENTS.md", content)
     session.finish()
 
 def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) -> InstallConfig:

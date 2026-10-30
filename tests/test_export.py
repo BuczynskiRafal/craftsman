@@ -26,17 +26,14 @@ from craftsman.assets import (
     render_combined_rules,
 )
 from craftsman.export import (
-    REVIEWER_GROUPS_PLACEHOLDER,
     CopilotDiscoveryLocation,
     DiscoveryRoot,
     EntityPattern,
     export_copilot_home,
-    export_to_agents_workspace,
     export_to_copilot_skills,
     export_to_workspace,
     export_vscode_instructions,
     iter_discovered_files,
-    render_agents_md,
     render_copilot_agent,
     render_copilot_hooks,
     resolve_discovery_dirs,
@@ -56,6 +53,11 @@ from craftsman.paths import (
     default_vscode_user_dir,
     env_var_for_home,
     resolve_craftsman_pkg_dir,
+)
+from craftsman.platforms.agents_md import (
+    REVIEWER_GROUPS_PLACEHOLDER,
+    export_to_agents_workspace,
+    render_agents_md,
 )
 from craftsman.platforms.claude import (
     claude_agent_templates,
