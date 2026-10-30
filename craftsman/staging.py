@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, TextIO
 
-from craftsman.export import COPY_IGNORED_NAMES
+from craftsman.assets import COPY_IGNORED_NAMES
 from craftsman.files import (
     UnsafePathError,
     copy_file,

@@ -9,11 +9,9 @@ import unittest
 from typing import Any
 from unittest import mock
 
+from craftsman.assets import iter_skills
 from craftsman.doctor import detect_antigravity_drift, scan_copilot_duplicates
-from craftsman.export import (
-    is_craftsman_hook_command,
-    iter_skills,
-)
+from craftsman.export import is_craftsman_hook_command
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import CRAFTSMAN_BEGIN_MARKER
 from craftsman.install import parse_install_args

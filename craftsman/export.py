@@ -28,9 +28,23 @@ import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path, PurePosixPath
-from typing import Any, Literal, get_args
+from pathlib import Path
+from typing import Any, Literal
 
+from craftsman.assets import (
+    COPY_IGNORED_NAMES,
+    AgentTemplate,
+    Skill,
+    TemplateRole,
+    _single_quoted,
+    _with_inlined_siblings,
+    _yaml_list,
+    craftsman_entity_names,
+    export_agents,
+    iter_skills,
+    load_agent_templates,
+    render_combined_rules,
+)
 from craftsman.files import (
     exists,
     move_aside,
@@ -59,13 +73,8 @@ from craftsman.paths import (
     vscode_prompt_dirs,
 )
 
-FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)$", re.DOTALL)
-INCLUDE_RE = re.compile(r"^\{\{include\s+(\S+)\s*\}\}[ \t]*$", re.MULTILINE)
-MALFORMED_INCLUDE_RE = re.compile(r"^[ \t]*\{\{\s*include\b.*$", re.MULTILINE)
-SIBLING_LINK_RE = re.compile(r"\[[^\]\n]*\]\(([\w.-]+\.md)\)")
 REVIEWER_GROUPS_PLACEHOLDER = "{{reviewer_groups}}"
 AGENTS_MD_TEMPLATE = Path("templates") / "AGENTS.md"
-COPY_IGNORED_NAMES = frozenset({"__pycache__", ".DS_Store", "Thumbs.db"})
 
 DUPLICATE_SCOPE_USER_TO_WS_MSG = (
     "Craftsman is already installed for your user in ~/.copilot; a workspace copy would show "
@@ -177,8 +186,6 @@ COPILOT_DISCOVERY: dict[
     ),
 }
 
-TemplateRole = Literal["orchestrator", "reviewer", "verifier"]
-TEMPLATE_ROLES: tuple[TemplateRole, ...] = get_args(TemplateRole)
 COPILOT_AGENT_TOOLS: dict[TemplateRole, tuple[str, ...]] = {
     "orchestrator": ("read", "edit", "search", "execute", "agent", "todo", "web"),
     "reviewer": ("read", "search", "execute"),
@@ -266,68 +273,18 @@ _COPILOT_HOOK_RE = re.compile(r" hook [a-z-]+ --platform copilot$")
 # --- frontmatter, skills and agents ---------------------------------------------------------
 
 
-def parse_frontmatter(text: str, source: Path) -> tuple[dict[str, str], str]:
-    """Split simple YAML frontmatter (scalars, folded `>-` blocks, `[a, b]` lists) from the body."""
-    match = FRONTMATTER_RE.match(text)
-    if not match:
-        raise ExportError(f"{source}: missing frontmatter block")
-    fields: dict[str, str] = {}
-    key: str | None = None
-    for line in match.group(1).splitlines():
-        if key is not None and line[:1] in (" ", "\t"):
-            fields[key] = f"{fields[key]} {line.strip()}".strip()
-            continue
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        name, sep, value = line.partition(":")
-        if not sep or not name.strip():
-            raise ExportError(f"{source}: cannot parse frontmatter line {line!r}")
-        key = name.strip()
-        value = value.strip()
-        fields[key] = "" if value in (">-", ">", "|", "|-") else _unquote(value)
-    return fields, match.group(2)
 
 
-def _unquote(value: str) -> str:
-    """A YAML scalar without its enclosing quote pair; quotes inside the text are kept."""
-    if len(value) >= 2 and value[0] == value[-1] == "'":
-        return value[1:-1].replace("''", "'")
-    if len(value) >= 2 and value[0] == value[-1] == '"':
-        return value[1:-1].replace('\\"', '"')
-    return value
 
 
-def _required_fields(fields: dict[str, str], source: Path, *names: str) -> None:
-    missing = [name for name in names if not fields.get(name)]
-    if missing:
-        raise ExportError(f"{source}: frontmatter needs {', '.join(f'`{n}`' for n in missing)}")
 
 
-@dataclass(frozen=True)
-class Skill:
-    """A bundled skill: its folder, frontmatter name and description, and the full SKILL.md."""
-
-    name: str
-    description: str
-    body: str
-    text: str
-    directory: Path
 
 
-def read_skill(skill_md: Path) -> Skill:
-    text = skill_md.read_text(encoding="utf-8")
-    fields, body = parse_frontmatter(text, skill_md)
-    _required_fields(fields, skill_md, "name", "description")
-    return Skill(fields["name"], fields["description"], body.strip(), text, skill_md.parent)
 
 
-def iter_skills(repo_dir: Path) -> list[Skill]:
-    """Every `skills/*/SKILL.md` of the repository, by folder."""
-    return [read_skill(path) for path in sorted((repo_dir / "skills").glob("*/SKILL.md"))]
 
 
-def _single_quoted(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
 
 
 def copilot_note(with_subagents: bool) -> str:
@@ -357,76 +314,18 @@ def render_claude_command_file(skill: Skill) -> str:
     return f"---\ndescription: {_single_quoted(skill.description)}\n---\n\n{adapted}"
 
 
-def _with_inlined_siblings(skill: Skill) -> str:
-    """The skill body followed by the sibling Markdown files it links to, for one-file formats."""
-    appendices = [
-        f"## Appendix: {name}\n\n{_strip_frontmatter((skill.directory / name).read_text(encoding='utf-8'))}"
-        for name in dict.fromkeys(SIBLING_LINK_RE.findall(skill.body))
-        if name != "SKILL.md" and (skill.directory / name).is_file()
-    ]
-    if not appendices:
-        return skill.body
-    return skill.body.rstrip() + "\n\n---\n\n" + "\n\n".join(appendices)
 
 
-def _strip_frontmatter(text: str) -> str:
-    match = FRONTMATTER_RE.match(text)
-    return (match.group(2) if match else text).strip()
 
 
-@dataclass(frozen=True)
-class AgentTemplate:
-    name: str
-    description: str
-    role: TemplateRole
-    subagents: tuple[str, ...]
-    body: str  # with includes expanded
 
 
-def _parse_list(raw: str) -> tuple[str, ...]:
-    inner = raw.strip().removeprefix("[").removesuffix("]")
-    return tuple(item.strip().strip("\"'") for item in inner.split(",") if item.strip())
 
 
-def expand_includes(body: str, repo_dir: Path, source: Path) -> str:
-    """Replace `{{include <repo-relative path>}}` lines with that file's body."""
-
-    def include(match: re.Match[str]) -> str:
-        relative = PurePosixPath(match.group(1))
-        # Checked lexically: an installed copy may symlink skills/ to a checkout elsewhere.
-        if relative.is_absolute() or ".." in relative.parts:
-            raise ExportError(f"{source}: include {match.group(1)} must be a path inside {repo_dir}")
-        target = repo_dir / relative
-        if not target.is_file():
-            raise ExportError(f"{source}: included file not found: {target}")
-        return _strip_frontmatter(target.read_text(encoding="utf-8"))
-
-    expanded = INCLUDE_RE.sub(include, body)
-    if leftover := MALFORMED_INCLUDE_RE.search(expanded):
-        raise ExportError(f"{source}: malformed include directive {leftover.group(0).strip()!r}")
-    return expanded
 
 
-def load_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
-    paths = sorted((repo_dir / "agents").glob("*.md"))
-    if not paths:
-        raise ExportError(f"no agent templates (agents/*.md) found under {repo_dir}")
-    return [_load_agent_template(path, repo_dir) for path in paths]
 
 
-def _load_agent_template(path: Path, repo_dir: Path) -> AgentTemplate:
-    fields, body = parse_frontmatter(path.read_text(encoding="utf-8"), path)
-    _required_fields(fields, path, "name", "description")
-    role = fields.get("role", "")
-    if role not in TEMPLATE_ROLES:
-        raise ExportError(f"{path}: role must be one of {', '.join(TEMPLATE_ROLES)} (got {role!r})")
-    return AgentTemplate(
-        name=fields["name"],
-        description=fields["description"],
-        role=role,
-        subagents=_parse_list(fields.get("subagents", "")),
-        body=expand_includes(body, repo_dir, path).strip(),
-    )
 
 
 def claude_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
@@ -434,22 +333,12 @@ def claude_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
     return [t for t in load_agent_templates(repo_dir) if t.role != "orchestrator"]
 
 
-def craftsman_agent_names(repo_dir: Path) -> tuple[str, ...]:
-    return tuple(template.name for template in load_agent_templates(repo_dir))
 
 
-def craftsman_skill_names(repo_dir: Path) -> tuple[str, ...]:
-    return tuple(skill.name for skill in iter_skills(repo_dir))
 
 
-def craftsman_entity_names(repo_dir: Path) -> frozenset[str]:
-    return frozenset(
-        (*craftsman_agent_names(repo_dir), *craftsman_skill_names(repo_dir), "craftsman-rules")
-    )
 
 
-def _yaml_list(items: tuple[str, ...]) -> str:
-    return "[" + ", ".join(_single_quoted(item) for item in items) + "]"
 
 
 def render_copilot_agent(template: AgentTemplate) -> str:
@@ -476,18 +365,6 @@ def render_claude_agent(template: AgentTemplate) -> str:
     return "\n".join(lines) + "\n" + template.body + "\n"
 
 
-def render_combined_rules(rules_dir: Path, with_frontmatter: bool) -> str:
-    bodies = [
-        _strip_frontmatter(rule_file.read_text(encoding="utf-8"))
-        for rule_file in sorted(rules_dir.glob("*.md"))
-    ]
-    combined = "\n\n---\n\n".join(bodies) + "\n"
-    if not with_frontmatter:
-        return combined
-    return (
-        "---\napplyTo: '**'\ndescription: 'Craftsman Global Engineering Rules'\n---\n"
-        f"{CRAFTSMAN_GENERATED_MARKER}\n\n{combined}"
-    )
 
 
 def render_agents_md(repo_dir: Path) -> str:
@@ -550,13 +427,6 @@ def _copy_tree_files(source: Path, dest: Path) -> None:
         write_bytes_atomic(target, path.read_bytes())
 
 
-def export_agents(
-    templates: Sequence[AgentTemplate],
-    out_dir: Path,
-    suffix: str,
-    render: Callable[[AgentTemplate], str],
-) -> list[FileChange]:
-    return [_write_marked(out_dir / f"{t.name}{suffix}", render(t)) for t in templates]
 
 
 def export_copilot_agents(repo_dir: Path, out_dir: Path) -> list[FileChange]:

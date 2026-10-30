@@ -13,12 +13,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from craftsman import __version__
+from craftsman.assets import Skill, iter_skills
 from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.doctor import run_doctor
-from craftsman.export import (
-    Skill,
-    iter_skills,
-)
 from craftsman.export import main as export_main
 from craftsman.gate import GateState, GateStateError, load_state, state_path_for, task_tier
 from craftsman.gate import main as gate_main
