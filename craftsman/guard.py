@@ -170,6 +170,32 @@ def _consume_heredoc_body(command_line: str, start: int, delim: str) -> tuple[st
     return "".join(chunks), i
 
 
+def _consume_ps_herestring_token(command_line: str, idx: int) -> tuple[str, int] | None:
+    """If `idx` opens a PowerShell `@'\\n...\\n'@` / `@\"\\n...\\n\"@` here-string, return `(token, next_idx)`."""
+    if command_line[idx] != "@" or idx + 2 >= len(command_line) or command_line[idx + 1] not in ("'", '"'):
+        return None
+    quote_char = command_line[idx + 1]
+    nl_len = 2 if command_line[idx + 2 : idx + 4] == "\r\n" else (1 if command_line[idx + 2] == "\n" else 0)
+    if nl_len == 0:
+        return None
+    close_token = f"{quote_char}@"
+    i, n = idx + 2 + nl_len, len(command_line)
+    chunks: list[str] = []
+    while i < n:
+        line_end = command_line.find("\n", i)
+        raw_line = command_line[i:] if line_end == -1 else command_line[i:line_end]
+        if raw_line.startswith(close_token):
+            body = "".join(chunks).removesuffix("\n").removesuffix("\r")
+            escaped_body = body.replace("'", "'\\''")
+            return f"'{escaped_body}'", i + len(close_token)
+        if line_end == -1:
+            break
+        chunks.append(command_line[i : line_end + 1])
+        i = line_end + 1
+    unclosed = command_line[idx + 2 + nl_len :].replace("'", "'\\''")
+    return f"'{unclosed}", n
+
+
 def _is_standalone_brace(command_line: str, idx: int) -> bool:
     if command_line[idx] not in ("{", "}"):
         return False
@@ -208,6 +234,9 @@ def _split_shell_events(command_line: str) -> list[str]:
             escaped = (not escaped) and ch == "\\" and quote != "'"
             current.append(ch)
             i += 1
+        elif quote is None and (hs := _consume_ps_herestring_token(command_line, i)) is not None:
+            current.append(hs[0])
+            i = hs[1]
         elif quote or ch in ("'", '"'):
             quote = None if quote == ch else (ch if quote is None else quote)
             current.append(ch)

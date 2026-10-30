@@ -3,9 +3,10 @@
 Models scope checks as candidate paths against forbidden zones:
 1. Extract candidate paths from shell commands (any non-flag argument that looks like a path or
    exists on disk after `~` and environment-variable expansion) or structured IDE tool inputs.
-2. Allow paths that resolve inside the active git work tree or `craftsman.scopeAllow`.
+2. Allow paths that resolve inside the active git work tree, its own `<git-dir>/craftsman`
+   directory, or `craftsman.scopeAllow` (excluding other worktrees' git directories).
 3. Outside those roots, deny recursive searches and deny non-recursive reads targeting session
-   stores, shell histories, other git repositories, or symlinks escaping the work tree.
+   stores, shell histories, other git repositories/worktrees, or symlinks escaping the work tree.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 from craftsman.export import user_home
-from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands
+from craftsman.guard import HEREDOC_OPEN_RE, _split_shell_events, iter_simple_commands
 from craftsman.records import CRAFTSMAN_AGENTS
 
 ScopeMode = Literal["deny", "warn", "off"]
@@ -201,20 +202,93 @@ def _is_in_other_git_repo(resolved: Path, allowed_roots: Sequence[Path]) -> bool
     return False
 
 
+@dataclass(frozen=True)
+class _WorktreeGitScope:
+    own_git_dir: Path | None = None
+    own_craftsman_dir: Path | None = None
+    forbidden_git_dirs: tuple[Path, ...] = ()
+
+
+def _read_git_pointer(path: Path, prefix: str = "") -> str | None:
+    with path.open("rb") as fh:
+        line = fh.readline(4096).decode("utf-8", errors="replace").rstrip("\r\n")
+    if not line.startswith(prefix):
+        return None
+    return line[len(prefix) :].strip() or None
+
+
+def _worktree_git_scope(resolved_repo: Path) -> _WorktreeGitScope:
+    dot_git = resolved_repo / ".git"
+    try:
+        if dot_git.is_dir():
+            own_git = dot_git.resolve()
+        elif dot_git.is_file() and (raw_git := _read_git_pointer(dot_git, "gitdir:")) is not None:
+            own_git = (resolved_repo / raw_git).resolve()
+        else:
+            return _WorktreeGitScope()
+        commondir = own_git / "commondir"
+        if commondir.is_file() and (raw_common := _read_git_pointer(commondir)) is not None:
+            common_git = (own_git / raw_common).resolve()
+        elif dot_git.is_file() and own_git.parent.name == "worktrees":
+            common_git = own_git.parent.parent
+        else:
+            common_git = own_git
+        craftsman_dir = own_git / "craftsman"
+        own_craftsman = None if craftsman_dir.is_symlink() else craftsman_dir.resolve()
+        worktrees_dir = (common_git / "worktrees").resolve()
+        extra_forbidden = (
+            (common_git, own_git)
+            if common_git != own_git
+            else (own_git,)
+            if not _is_within(own_git, resolved_repo)
+            else ()
+        )
+        return _WorktreeGitScope(own_git, own_craftsman, (worktrees_dir, *extra_forbidden))
+    except (OSError, RuntimeError):
+        return _WorktreeGitScope()
+
+
+def _escapes_via_symlink(candidate: Path, roots: Sequence[Path]) -> bool:
+    abs_cand = Path(os.path.abspath(str(candidate)))
+    if any(_is_within(abs_cand, root) for root in roots):
+        return True
+    for parent in abs_cand.parents:
+        try:
+            resolved_parent = parent.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if any(_is_within(resolved_parent, root) for root in roots):
+            return True
+    return False
+
+
 def _check_target(
     candidate: Path, *, is_recursive: bool, repo_root: Path, policy: ScopePolicy, label: str
 ) -> ScopeDecision:
     if _is_forbidden_store(candidate):
         return _deny(label, "targets a protected session store or shell history")
     resolved_repo = repo_root.resolve()
-    allowed_roots = (resolved_repo, *(d.resolve() for d in policy.allowed_dirs))
+    resolved_extras = tuple(d.resolve() for d in policy.allowed_dirs)
+    git_scope = _worktree_git_scope(resolved_repo)
     resolved = candidate.resolve()
-    if any(_is_within(resolved, root) for root in allowed_roots):
+    if git_scope.own_craftsman_dir is not None and _is_within(resolved, git_scope.own_craftsman_dir):
+        return ScopeDecision("allow")
+    if any(_is_within(resolved, d) for d in git_scope.forbidden_git_dirs):
+        return _deny(label, "belongs to another git worktree")
+    if any(_is_within(resolved, extra) for extra in resolved_extras):
+        return ScopeDecision("allow")
+    if _is_within(resolved, resolved_repo):
         return ScopeDecision("allow")
     if is_recursive:
         return _deny(label)
-    if _is_within(Path(os.path.abspath(str(candidate))), resolved_repo):
+    escape_roots = (resolved_repo, *((git_scope.own_git_dir,) if git_scope.own_git_dir else ()))
+    if _escapes_via_symlink(candidate, escape_roots):
         return _deny(label, "escapes the repository work tree via symlink")
+    allowed_roots = (
+        resolved_repo,
+        *resolved_extras,
+        *((git_scope.own_craftsman_dir,) if git_scope.own_craftsman_dir else ()),
+    )
     if _is_in_other_git_repo(resolved, allowed_roots):
         return _deny(label, "belongs to another git repository")
     return ScopeDecision("allow")
@@ -276,7 +350,9 @@ def _extract_path_candidates(args: Sequence[str], base_cwd: Path) -> list[Path]:
 
 
 def _has_unmatched_quotes(command_line: str) -> bool:
-    for seg in re.split(r";|&&|\|\|", command_line):
+    for seg in _split_shell_events(command_line):
+        if seg in ("(", ")"):
+            continue
         first_line = seg.split("\n", 1)[0]
         hd_match = HEREDOC_OPEN_RE.search(first_line)
         try:

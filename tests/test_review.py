@@ -17,6 +17,7 @@ from craftsman.cli import main as cli_main
 from craftsman.ledger import open_round
 from craftsman.records import FieldError, Ledger
 from craftsman.review import parse_view_lenses, view_slug
+from craftsman.scope import ScopePolicy, evaluate_scope
 
 from tests.support import (
     AMBIENT_PLATFORM_ENV_VARS,
@@ -1344,6 +1345,28 @@ class InboxCliTests(FastCliTestCase):
         self.assertEqual(completed.code, 0, completed.err)
         self.assertFalse(orphan.exists())
         self.assertIn("Pruned 1 inbox file(s):", completed.err)
+
+    def test_linked_worktree_inbox_passes_scope_then_consumes(self) -> None:
+        wt = self.tmp / "wt-linked"
+        self.repo.git("worktree", "add", "-q", "-b", "wt-branch", str(wt))
+        (wt / "cart.py").write_text(BUGGY_TOTAL, encoding="utf-8")
+        prep = run_main(cli_main, "review", "prepare", "--tier", "quick", "--cwd", str(wt))
+        self.assertEqual(prep.code, 0, prep.err)
+
+        inbox_file = self._new_inbox_path("cover", cwd=wt)
+        policy = ScopePolicy(mode="deny")
+        allowed = evaluate_scope("Read", {"file_path": str(inbox_file)}, wt, wt, policy)
+        denied = evaluate_scope("Read", {"file_path": str(inbox_file)}, self.repo.root, self.repo.root, policy)
+        self.assertEqual(allowed.decision, "allow", allowed.reason)
+        self.assertEqual(denied.decision, "deny")
+
+        inbox_file.write_text(
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            encoding="utf-8",
+        )
+        res = run_main(cli_main, "review", "cover", "--from-json", str(inbox_file), "--cwd", str(wt))
+        self.assertEqual(res.code, 0, res.err)
+        self.assertFalse(inbox_file.exists())
 
 
 if __name__ == "__main__":
