@@ -35,7 +35,7 @@ def read_transcript_entries(transcript_path: Path | None) -> list[Entry]:
     No path or a missing file yields no entries: the session has not written one yet. A last line
     without its newline is one the agent is still writing and is left out; any other line that is
     not a JSON object, or a file that cannot be read, raises `TranscriptError`, since a skipped
-    entry could hide what the guard must see.
+    entry could hide what the stop hook must see.
     """
     if transcript_path is None:
         return []
@@ -127,15 +127,6 @@ def _claude_assistant_entry(content: Any, line_number: int) -> Entry:
                 arguments = item.get("input") if isinstance(item.get("input"), dict) else {}
                 calls.append({"name": item.get("name"), "input": arguments, "args": arguments})
     return {"step_index": line_number, "type": "PLANNER_RESPONSE", "tool_calls": calls}
-
-
-def claude_project_slug(cwd: str) -> str:
-    """The directory name Claude Code gives the project rooted at `cwd` under `~/.claude/projects`."""
-    try:
-        resolved = str(Path(cwd).expanduser().resolve())
-    except OSError:
-        resolved = cwd
-    return re.sub(r"[^A-Za-z0-9-]", "-", resolved)
 
 
 def step_of(entry: Entry, position: int) -> int:

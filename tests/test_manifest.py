@@ -20,13 +20,16 @@ from craftsman.manifest import (
 )
 
 HOOKS = TargetManifest(
-    created_paths=("/h/.craftsman/git-hooks/commit-msg", "/h/.craftsman/scripts/git-guard.py"),
+    created_paths=(
+        "/h/.craftsman/git-hooks/commit-msg",
+        "/h/.craftsman/scripts/craftsman-stop-gate.py",
+    ),
     created_dirs=("/h/.craftsman/git-hooks",),
     previous_hooks_path="~/hooks",
     hooks_dir="/h/.craftsman/git-hooks",
 )
 ANTIGRAVITY = TargetManifest(
-    created_paths=("/h/.craftsman/scripts/git-guard.py", "/h/.craftsman/rules/a.md"),
+    created_paths=("/h/.craftsman/scripts/craftsman-stop-gate.py", "/h/.craftsman/rules/a.md"),
     created_dirs=("/h/.craftsman/rules",),
     modified_files={"/h/.craftsman/hooks.json": ModifiedKind.HOOKS_JSON},
     hooks_json_keys=("craftsman-stop-gate",),

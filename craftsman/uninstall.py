@@ -17,8 +17,7 @@ from craftsman.export import (
     user_home,
 )
 from craftsman.files import exists, remove_path, require_no_symlinked_parent
-from craftsman.githooks import craftsman_home_dir, restore_hooks_path
-from craftsman.install import run_reported
+from craftsman.legacy_githooks import craftsman_home_dir, restore_hooks_path
 from craftsman.manifest import (
     InstallManifest,
     ModifiedKind,
@@ -26,7 +25,14 @@ from craftsman.manifest import (
     load_manifest,
     save_manifest,
 )
-from craftsman.staging import EventKind, Tracker, require_within, revert_modified_file, stop_roots_for
+from craftsman.staging import (
+    EventKind,
+    Tracker,
+    require_within,
+    revert_modified_file,
+    run_reported,
+    stop_roots_for,
+)
 
 
 @dataclass(frozen=True)
@@ -34,7 +40,6 @@ class UninstallConfig:
     antigravity: bool
     claude: bool
     copilot: bool
-    git_hooks: bool
     copilot_workspace: Path | None
     agents_workspace: Path | None
     dry_run: bool
@@ -134,11 +139,11 @@ def _plans(config: UninstallConfig, home: Path) -> Iterator[BasePlan | None]:
     config_dir = home / ".gemini" / "config"
     gemini_kinds = [
         *([TargetKind.ANTIGRAVITY] if config.antigravity else []),
-        *([TargetKind.GIT_HOOKS] if config.git_hooks else []),
+        TargetKind.GIT_HOOKS,
     ]
     yield plan_base(config_dir, gemini_kinds, home, roots=(config_dir,))
     craftsman_home = craftsman_home_dir(home)
-    if config.git_hooks and craftsman_home.resolve() != config_dir.resolve():
+    if craftsman_home.resolve() != config_dir.resolve():
         yield plan_base(craftsman_home, [TargetKind.GIT_HOOKS], home, roots=(craftsman_home,))
     if config.claude:
         claude_dir = default_claude_dir(home)
@@ -160,12 +165,10 @@ def _plans(config: UninstallConfig, home: Path) -> Iterator[BasePlan | None]:
 def _build_uninstall_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="craftsman uninstall",
-        description="Remove what the Craftsman install manifests record and restore core.hooksPath. "
+        description="Remove what the Craftsman install manifests record and restore any 3.x core.hooksPath. "
         "Without a target, every user-level target is uninstalled.",
     )
-    parser.add_argument(
-        "--all", action="store_true", help="Every user-level target, git hooks included."
-    )
+    parser.add_argument("--all", action="store_true", help="Every user-level target.")
     parser.add_argument(
         "--antigravity", action="store_true", help="The Antigravity install in ~/.gemini/config."
     )
@@ -176,13 +179,6 @@ def _build_uninstall_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--agents-workspace", type=Path, metavar="<path>", help="A workspace's AGENTS.md install."
-    )
-    hooks = parser.add_mutually_exclusive_group()
-    hooks.add_argument("--git-hooks", action="store_true", help="The global git hooks.")
-    hooks.add_argument(
-        "--no-git-hooks",
-        action="store_true",
-        help="Keep the global git hooks when uninstalling every target.",
     )
     parser.add_argument(
         "--dry-run",
@@ -200,18 +196,14 @@ def parse_uninstall_args(argv: Sequence[str]) -> UninstallConfig:
         or args.antigravity
         or args.claude
         or args.copilot
-        or args.git_hooks
         or args.copilot_workspace is not None
         or args.agents_workspace is not None
     )
-    if args.no_git_hooks and explicit:
-        parser.error("--no-git-hooks applies only when no target is given")
     every = args.all or not explicit
     return UninstallConfig(
         antigravity=every or args.antigravity,
         claude=every or args.claude,
         copilot=every or args.copilot,
-        git_hooks=args.all or args.git_hooks or (not explicit and not args.no_git_hooks),
         copilot_workspace=args.copilot_workspace,
         agents_workspace=args.agents_workspace,
         dry_run=args.dry_run,

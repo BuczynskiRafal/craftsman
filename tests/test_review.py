@@ -1308,7 +1308,7 @@ class JsonEncodingTests(FastCliTestCase):
 
     def _payload(self, lens: str) -> str:
         return json.dumps(
-            [{"lens": lens, "hunks": ["H1"], "note": f"{coverage_note(['H1'])} — żółć"}],
+            [{"lens": lens, "hunks": ["H1"], "note": f"{coverage_note(['H1'])} — Größe & naïve"}],
             ensure_ascii=False,
         )
 
@@ -1336,7 +1336,7 @@ class JsonEncodingTests(FastCliTestCase):
     def test_from_json_rejects_cp1250_with_utf8_save_hint(self) -> None:
         self.prepare_bug()
         cp1250_bytes = json.dumps(
-            [{"lens": "intent", "hunks": ["H1"], "note": f"{coverage_note(['H1'])} źdźbło"}],
+            [{"lens": "intent", "hunks": ["H1"], "note": f"{coverage_note(['H1'])} Größe"}],
             ensure_ascii=False,
         ).encode("cp1250")
         json_file = self.tmp / "cp1250.json"

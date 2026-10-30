@@ -1029,7 +1029,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             "allow",
         )
 
-    def test_scope_guard_cli_and_script_enforce_only_search_scope(self) -> None:
+    def test_scope_guard_entrypoints_enforce_only_search_scope(self) -> None:
         open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
         session_dir = str(self.tmp / "brain" / "conv-123")
 

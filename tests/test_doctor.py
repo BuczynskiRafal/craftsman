@@ -12,19 +12,31 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from craftsman import cli, export
+from craftsman import cli
 from craftsman.doctor import (
+    LEFTOVER_GIT_HOOKS_PROBLEM,
     build_report,
     command_executables,
     detect_antigravity_drift,
-    inspect_git_hooks,
+    inspect_legacy_git_hooks,
     loads_jsonc_dict,
     plugin_skill_names,
     scan_copilot_duplicates,
     validate_skill_manifests,
 )
-from craftsman.export import CRAFTSMAN_GENERATED_MARKER, ExportError
-from craftsman.githooks import PASSTHROUGH_TEMPLATE_NAME
+from craftsman.export import (
+    CRAFTSMAN_GENERATED_MARKER,
+    HOOKS_FILENAME,
+    ExportError,
+    absolute_hook_prefixes,
+    default_vscode_prompts_dir,
+    default_vscode_user_dir,
+    export_copilot_home,
+    export_to_claude_user,
+    export_to_copilot_skills,
+    export_to_workspace,
+    write_copilot_hooks,
+)
 from craftsman.manifest import MANIFEST_FILENAME
 
 from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main
@@ -60,9 +72,9 @@ class DoctorTestCase(unittest.TestCase):
         return proc.returncode, report
 
     def install_user_copilot(self) -> None:
-        prefixes = export.absolute_hook_prefixes()
-        export.export_copilot_home(REPO_ROOT, self.tmp / ".copilot", prefixes)
-        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
+        prefixes = absolute_hook_prefixes()
+        export_copilot_home(REPO_ROOT, self.tmp / ".copilot", prefixes)
+        export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
 
 
 class PlatformReportTests(DoctorTestCase):
@@ -78,7 +90,7 @@ class PlatformReportTests(DoctorTestCase):
     def test_copilot_installed_in_both_scopes_is_a_duplicate(self) -> None:
         self.install_user_copilot()
         workspace = self.tmp / "ws"
-        export.export_to_workspace(REPO_ROOT, workspace)
+        export_to_workspace(REPO_ROOT, workspace)
 
         code, report = self.doctor("--workspace", str(workspace))
 
@@ -97,7 +109,7 @@ class PlatformReportTests(DoctorTestCase):
     def test_hooks_running_a_missing_interpreter_are_broken(self) -> None:
         self.install_user_copilot()
         hooks_dir = self.tmp / ".copilot" / "hooks"
-        export.write_copilot_hooks(hooks_dir, '"/no/such/python3" -m craftsman.cli', "& x")
+        write_copilot_hooks(hooks_dir, '"/no/such/python3" -m craftsman.cli', "& x")
 
         _, report = self.doctor()
 
@@ -106,7 +118,7 @@ class PlatformReportTests(DoctorTestCase):
 
     def test_hooks_without_this_platforms_command_are_broken(self) -> None:
         self.install_user_copilot()
-        hooks_file = self.tmp / ".copilot" / "hooks" / export.HOOKS_FILENAME
+        hooks_file = self.tmp / ".copilot" / "hooks" / HOOKS_FILENAME
         key = "powershell" if os.name == "nt" else "bash"
         data = json.loads(hooks_file.read_text(encoding="utf-8"))
         for group in data["hooks"].values():
@@ -125,7 +137,7 @@ class PlatformReportTests(DoctorTestCase):
     def test_hook_command_with_unbalanced_quotes_is_broken(self) -> None:
         self.install_user_copilot()
         hooks_dir = self.tmp / ".copilot" / "hooks"
-        export.write_copilot_hooks(hooks_dir, '"/usr/bin/python3 -m craftsman.cli', '& "x')
+        write_copilot_hooks(hooks_dir, '"/usr/bin/python3 -m craftsman.cli', '& "x')
 
         _, report = self.doctor()
 
@@ -152,7 +164,7 @@ class PlatformReportTests(DoctorTestCase):
         self.assertIn("has no lenses.md", proc.stderr)
 
     def test_claude_agents_without_hooks_are_reported(self) -> None:
-        export.export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
+        export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
 
         _, report = self.doctor()
 
@@ -226,13 +238,13 @@ class DriftTests(DoctorTestCase):
         config = self.tmp / "config"
         (config / "skills" / "craftsman").mkdir(parents=True)
         (config / "skills" / "craftsman" / "SKILL.md").write_text("drifted\n", encoding="utf-8")
-        (config / "craftsman").mkdir()
-        (config / "craftsman" / "guard.py").write_text("# stale guard\n", encoding="utf-8")
+        (config / "craftsman").mkdir(parents=True)
+        (config / "craftsman" / "scope.py").write_text("# stale scope\n", encoding="utf-8")
 
         drifted = detect_antigravity_drift(REPO_ROOT, config)
 
         self.assertIn("skills/craftsman/SKILL.md", drifted)
-        self.assertIn("craftsman/guard.py", drifted)
+        self.assertIn("craftsman/scope.py", drifted)
 
 
 class JsoncTests(unittest.TestCase):
@@ -267,7 +279,7 @@ class CopilotDuplicateTests(DoctorTestCase):
         return path
 
     def user_prompt(self) -> Path:
-        prompts = export.default_vscode_prompts_dir(self.tmp)
+        prompts = default_vscode_prompts_dir(self.tmp)
         prompts.mkdir(parents=True, exist_ok=True)
         path = prompts / "verify.prompt.md"
         path.write_text("---\nname: verify\n---\nPrompt\n", encoding="utf-8")
@@ -282,22 +294,22 @@ class CopilotDuplicateTests(DoctorTestCase):
 
     def test_location_disabled_in_jsonc_settings_is_no_duplicate(self) -> None:
         self.claude_skill()
-        settings = export.default_vscode_prompts_dir(self.tmp).parent / "settings.json"
+        settings = default_vscode_prompts_dir(self.tmp).parent / "settings.json"
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(
             '{\n  // comment\n  "chat.agentSkillsLocations": {\n    "~/.claude/skills": false,\n  },\n}\n',
             encoding="utf-8",
         )
-        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
+        export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
 
         self.assertEqual(scan_copilot_duplicates(REPO_ROOT, home=self.tmp), [])
 
     def test_malformed_vscode_settings_are_an_error(self) -> None:
         self.claude_skill()
-        settings = export.default_vscode_prompts_dir(self.tmp).parent / "settings.json"
+        settings = default_vscode_prompts_dir(self.tmp).parent / "settings.json"
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text('{"chat.agentSkillsLocations": ', encoding="utf-8")
-        export.export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
+        export_to_copilot_skills(REPO_ROOT, self.tmp / ".copilot" / "skills")
 
         with self.assertRaisesRegex(ExportError, "cannot read VS Code settings"):
             scan_copilot_duplicates(REPO_ROOT, home=self.tmp)
@@ -329,7 +341,7 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
     def test_marked_agent_in_the_prompts_folder_is_a_duplicate(self) -> None:
         self.assert_ok(self.install("--copilot"))
         self.marked(
-            export.default_vscode_prompts_dir(self.home) / "craftsman.agent.md", "name: craftsman"
+            default_vscode_prompts_dir(self.home) / "craftsman.agent.md", "name: craftsman"
         )
 
         code, report = self.report()
@@ -340,7 +352,7 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
 
     def test_duplicate_names_the_installed_copy_to_keep(self) -> None:
         self.assert_ok(self.install("--copilot"))
-        prompt = export.default_vscode_prompts_dir(self.home) / "simplify.prompt.md"
+        prompt = default_vscode_prompts_dir(self.home) / "simplify.prompt.md"
         prompt.write_text("---\nagent: 'agent'\n---\nMy prompt.\n", encoding="utf-8")
 
         result = self.doctor()
@@ -361,7 +373,7 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
     def test_claude_agents_disabled_in_vscode_are_no_duplicates(self) -> None:
         self.assert_ok(self.install("--copilot"))
         self.assert_ok(self.install("--claude", "--no-claude-hooks"))
-        settings = export.default_vscode_user_dir(self.home) / "settings.json"
+        settings = default_vscode_user_dir(self.home) / "settings.json"
         settings.write_text(
             json.dumps({"chat.agentFilesLocations": {"~/.claude/agents": False}}), encoding="utf-8"
         )
@@ -382,37 +394,36 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
         self.assertIn("both user and workspace scopes are installed", result.err)
 
 
-class GitHooksInspectionTests(IsolatedHomeTestCase):
+class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.hooks_dir = self.home / ".craftsman" / "git-hooks"
 
-    def test_installed_hooks_have_no_problems(self) -> None:
-        self.assert_ok(self.install("--git-hooks"))
+    def test_leftover_git_hooks_manifest_warns(self) -> None:
+        self.write_legacy_git_hooks(set_hooks_path=False)
 
-        self.assertEqual(inspect_git_hooks(str(self.hooks_dir), self.home), [])
+        self.assertEqual(
+            inspect_legacy_git_hooks(None, self.home), [LEFTOVER_GIT_HOOKS_PROBLEM]
+        )
 
-    def test_missing_helpers_are_a_problem(self) -> None:
-        self.assert_ok(self.install("--git-hooks"))
-        (self.hooks_dir / PASSTHROUGH_TEMPLATE_NAME).unlink()
+    def test_craftsman_hooks_path_without_manifest_warns(self) -> None:
+        self.assertEqual(
+            inspect_legacy_git_hooks(str(self.hooks_dir), self.home), [LEFTOVER_GIT_HOOKS_PROBLEM]
+        )
 
-        (problem,) = inspect_git_hooks(str(self.hooks_dir), self.home)
+    def test_uninstall_clears_leftover_git_hooks_warning(self) -> None:
+        self.write_legacy_git_hooks()
 
-        self.assertIn(f"missing {self.hooks_dir / PASSTHROUGH_TEMPLATE_NAME}", problem)
-        self.assertIn("craftsman install --git-hooks", problem)
+        self.assert_ok(self.uninstall())
 
-    def test_python_that_is_gone_is_a_problem(self) -> None:
-        self.assert_ok(self.install("--git-hooks"))
-        (self.hooks_dir / ".python_cmd").write_text("/no/such/python\n", encoding="utf-8")
+        result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(json.loads(result.out)["problems"], [])
 
-        (problem,) = inspect_git_hooks(str(self.hooks_dir), self.home)
-
-        self.assertIn("every commit and push is blocked", problem)
-
-    def test_hooks_of_another_tool_are_not_inspected(self) -> None:
+    def test_hooks_of_another_tool_are_not_flagged(self) -> None:
         (self.tmp / "husky").mkdir()
 
-        self.assertEqual(inspect_git_hooks(str(self.tmp / "husky"), self.home), [])
+        self.assertEqual(inspect_legacy_git_hooks(str(self.tmp / "husky"), self.home), [])
 
     def test_unreadable_git_config_is_a_problem(self) -> None:
         self.git_config.write_text("[core\n", encoding="utf-8")
@@ -424,10 +435,10 @@ class GitHooksInspectionTests(IsolatedHomeTestCase):
         self.assertTrue(any("git config --global --get user.name failed" in p for p in problems))
 
     def test_corrupt_manifest_is_a_problem(self) -> None:
-        self.assert_ok(self.install("--git-hooks"))
+        self.hooks_dir.parent.mkdir(parents=True)
         (self.hooks_dir.parent / MANIFEST_FILENAME).write_text("{", encoding="utf-8")
 
-        (problem,) = inspect_git_hooks(str(self.hooks_dir), self.home)
+        (problem,) = inspect_legacy_git_hooks(None, self.home)
 
         self.assertIn("cannot read install manifest", problem)
 

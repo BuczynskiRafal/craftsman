@@ -44,19 +44,17 @@ class InstallTestCase(IsolatedHomeTestCase):
 
 
 class ArgumentTests(InstallTestCase):
-    def test_no_target_auto_detects_with_git_hooks(self) -> None:
+    def test_no_target_auto_detects(self) -> None:
         config = parse_install_args([])
 
-        self.assertEqual(
-            (config.auto_detect, config.git_hooks, config.mode), (True, True, InstallMode.COPY)
-        )
+        self.assertEqual((config.auto_detect, config.mode), (True, InstallMode.COPY))
 
     def test_named_target_installs_only_that_target(self) -> None:
         config = parse_install_args(["--claude", "--symlink"])
 
         self.assertEqual(
-            (config.auto_detect, config.claude, config.antigravity, config.git_hooks, config.mode),
-            (False, True, False, False, InstallMode.SYMLINK),
+            (config.auto_detect, config.claude, config.antigravity, config.mode),
+            (False, True, False, InstallMode.SYMLINK),
         )
 
     def test_two_modes_are_rejected(self) -> None:
@@ -65,14 +63,10 @@ class ArgumentTests(InstallTestCase):
         self.assertEqual(result.code, 2)
         self.assertIn("not allowed with argument", result.err)
 
-    def test_no_git_hooks_with_git_hooks_is_rejected(self) -> None:
-        self.assertEqual(self.install("--git-hooks", "--no-git-hooks").code, 2)
-
-    def test_no_git_hooks_with_all_is_rejected(self) -> None:
-        result = self.install("--all", "--no-git-hooks")
-
-        self.assertEqual(result.code, 2)
-        self.assertIn("--no-git-hooks cannot be combined with --all", result.err)
+    def test_removed_git_hooks_flags_are_rejected(self) -> None:
+        for flag in ("--git-hooks", "--no-git-hooks"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.install(flag).code, 2)
 
     def test_no_claude_hooks_without_the_claude_target_is_rejected(self) -> None:
         self.assertEqual(self.install("--copilot", "--no-claude-hooks").code, 2)
@@ -83,7 +77,7 @@ class AutoDetectionTests(InstallTestCase):
         (self.home / ".gemini" / "antigravity").mkdir(parents=True)
         self.claude_dir.mkdir()
 
-        result = self.install("--no-git-hooks")
+        result = self.install()
 
         self.assert_ok(result)
         self.assertIn("Detected: Google Antigravity", result.out)
@@ -94,7 +88,7 @@ class AutoDetectionTests(InstallTestCase):
 
     def test_nothing_detected_installs_for_copilot(self) -> None:
         with mock.patch("shutil.which", return_value=None):
-            result = self.install("--no-git-hooks")
+            result = self.install()
 
         self.assert_ok(result)
         self.assertIn("installing for GitHub Copilot", result.out)
@@ -113,7 +107,12 @@ class AntigravityTests(InstallTestCase):
     def test_symlink_mode_links_to_the_checkout(self) -> None:
         self.assert_ok(self.install("--antigravity", "--symlink"))
 
-        for path in ("skills/craftsman", "rules/git_workflow.md", "scripts/git-guard.py", "craftsman"):
+        for path in (
+            "skills/craftsman",
+            "rules/ultra_mode.md",
+            "scripts/craftsman-scope-guard.py",
+            "craftsman",
+        ):
             self.assertTrue((self.config_dir / path).is_symlink(), path)
 
     def test_plugin_mode_replaces_a_copy_install(self) -> None:
@@ -204,6 +203,28 @@ class AntigravityTests(InstallTestCase):
         self.assertIs(merged["craftsman-stop-gate"]["enabled"], False)
         self.assertEqual(merged["my-hook"], legacy_hooks["my-hook"])
 
+    def test_upgrade_from_pre_manifest_3x_removes_git_guard_from_hooks_json(self) -> None:
+        self.config_dir.mkdir(parents=True)
+        hooks_path = self.config_dir / "hooks.json"
+        hooks_path.write_text(
+            json.dumps(
+                {
+                    "craftsman-git-guard": {"enabled": True, "PreToolUse": []},
+                    "craftsman-stop-gate": {"enabled": False, "Stop": []},
+                    "my-hook": {"enabled": True, "Stop": []},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assert_ok(self.install("--antigravity"))
+
+        merged = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertNotIn("craftsman-git-guard", merged)
+        self.assertIn("craftsman-scope-guard", merged)
+        self.assertIs(merged["craftsman-stop-gate"]["enabled"], False)
+        self.assertIn("my-hook", merged)
+
     def test_corrupt_hooks_json_stops_the_install_before_any_write(self) -> None:
         self.config_dir.mkdir(parents=True)
         (self.config_dir / "hooks.json").write_text("{broken", encoding="utf-8")
@@ -213,15 +234,6 @@ class AntigravityTests(InstallTestCase):
         self.assertEqual(result.code, 1)
         self.assertIn("cannot read it as JSON", result.err)
         self.assertEqual(sorted(p.name for p in self.config_dir.iterdir()), ["hooks.json"])
-
-    def test_antigravity_install_leaves_installed_git_hooks_alone(self) -> None:
-        self.assert_ok(self.install("--antigravity", "--git-hooks"))
-        hook = self.config_dir / "git-hooks" / "commit-msg"
-        hook.write_text("#!/bin/sh\n# edited\n", encoding="utf-8")
-
-        self.assert_ok(self.install("--antigravity"))
-
-        self.assertEqual(hook.read_text(encoding="utf-8"), "#!/bin/sh\n# edited\n")
 
     def test_plugin_switch_keeps_a_created_hooks_json_the_user_edited(self) -> None:
         self.assert_ok(self.install("--antigravity"))
@@ -379,14 +391,62 @@ class CopilotTests(InstallTestCase):
         self.assert_ok(self.install("--copilot-workspace", str(workspace), "--allow-duplicate-scopes"))
 
 
-class GitHooksPlacementTests(InstallTestCase):
-    def test_hooks_stay_where_the_manifest_records_them(self) -> None:
-        self.assert_ok(self.install("--git-hooks"))
-        (self.home / ".gemini" / "antigravity").mkdir(parents=True)
+class LegacyGitHooksUpgradeTests(InstallTestCase):
+    def test_upgrade_retires_craftsman_hooks_path_with_its_files(self) -> None:
+        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=None)
 
-        self.assert_ok(self.install("--no-claude-hooks"))
+        result = self.install("--claude")
 
-        self.assertEqual(self.hooks_path(), str(self.home / ".craftsman" / "git-hooks"))
+        self.assert_ok(result)
+        self.assertIn("removed the global git hooks of Craftsman 3.x", result.out)
+        self.assertIsNone(self.hooks_path())
+        self.assertFalse(hooks_dir.exists())
+        self.assertIsNone(load_manifest(self.home / ".craftsman"))
+
+    def test_upgrade_restores_previous_hooks_path(self) -> None:
+        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path="~/my-hooks")
+
+        result = self.install("--copilot")
+
+        self.assert_ok(result)
+        self.assertEqual(self.hooks_path(), "~/my-hooks")
+        self.assertFalse(hooks_dir.exists())
+
+    def test_upgrade_leaves_user_changed_hooks_path_untouched(self) -> None:
+        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=None)
+        self.git_global("core.hooksPath", "/opt/husky")
+
+        result = self.install("--claude")
+
+        self.assert_ok(result)
+        self.assertEqual(self.hooks_path(), "/opt/husky")
+        self.assertIn("leaving git config --global core.hooksPath (/opt/husky) untouched", result.err)
+        self.assertFalse(hooks_dir.exists())
+
+    def test_upgrade_keeps_shared_runtime_needed_by_antigravity(self) -> None:
+        self.assert_ok(self.install("--antigravity"))
+        hooks_dir = self.write_legacy_git_hooks(self.config_dir)
+
+        result = self.install("--claude")
+
+        self.assert_ok(result)
+        self.assertIsNone(self.hooks_path())
+        self.assertFalse(hooks_dir.exists())
+        self.assertTrue((self.config_dir / "scripts" / "craftsman-stop-gate.py").is_file())
+        manifest = load_manifest(self.config_dir)
+        assert manifest is not None
+        self.assertNotIn(TargetKind.GIT_HOOKS, manifest.targets)
+        self.assertIn(TargetKind.ANTIGRAVITY, manifest.targets)
+
+    def test_dry_run_upgrade_leaves_legacy_git_hooks_untouched(self) -> None:
+        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path="~/prev")
+        before = snapshot_tree(self.home)
+
+        result = self.install("--claude", "--dry-run")
+
+        self.assert_ok(result)
+        self.assertEqual(snapshot_tree(self.home), before)
+        self.assertEqual(self.hooks_path(), str(hooks_dir))
 
     def test_corrupt_git_hooks_manifest_does_not_block_other_targets(self) -> None:
         (self.home / ".craftsman").mkdir()
@@ -459,9 +519,7 @@ class DryRunTests(InstallTestCase):
 
 class BootstrapTests(InstallTestCase):
     def test_install_sh_installs_everything_then_uninstall_empties_home(self) -> None:
-        modes = {
-            p: p.stat().st_mode for d in ("scripts", "git-hooks") for p in (REPO_ROOT / d).iterdir()
-        }
+        modes = {p: p.stat().st_mode for p in (REPO_ROOT / "scripts").iterdir()}
 
         proc = subprocess.run(
             ["bash", str(REPO_ROOT / "install.sh"), "--all"],

@@ -26,10 +26,9 @@ Craftsman Universal Agentic Engineering Framework — Scope & Attribution Notice
 
 This license covers all files in the Craftsman repository, including:
 1. Multi-platform orchestration & export scripts (`scripts/craftsman-stop-gate.py`,
-   `scripts/git-guard.py`, `scripts/copilot-export.py`, and `install.sh`).
-2. Deterministic Git & lifecycle hook definitions (`hooks.json`, `git-hooks/commit-msg`,
-   and `git-hooks/pre-push`).
-3. Global engineering rules (`rules/git_workflow.md`, `rules/ultra_mode.md`) and all
+   `scripts/craftsman-scope-guard.py`, `scripts/copilot-export.py`, and `install.sh`).
+2. Deterministic lifecycle hook definitions (`hooks.json`).
+3. Global engineering rules (`rules/ultra_mode.md`) and all
    17 core software engineering skill specifications (`skills/*/SKILL.md`).
 4. Behavioral and integration test suites (`tests/test_hooks.py`).
 

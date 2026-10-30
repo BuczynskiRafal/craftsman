@@ -64,8 +64,7 @@ projects' packets/ledgers/reports, or assistant session stores (for the full con
   `deep` (default `2`; queue any remaining shards or reviewer groups).
 - **--fix** — after findings are challenged, fix every `proven`/`probable` one and re-review the
   delta (Step 5).
-- **--comment** — publish the final report on the PR with `gh pr comment`. Never add AI
-  attribution of any kind.
+- **--comment** — publish the final report on the PR with `gh pr comment`.
 
 ## The five rules
 

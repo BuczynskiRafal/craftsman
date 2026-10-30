@@ -180,5 +180,4 @@ Run `craftsman review report` and give the user:
 - the verification commands and their results;
 - a proposed commit message from `/high-level-commit-message`.
 
-Never commit, push or open a pull request unless the user asked for it; never push to
-`main`/`master` without asking; never add AI attribution to commits or PRs.
+Never commit, push or open a pull request unless the user asked for it.

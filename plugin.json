@@ -28,7 +28,6 @@
     "craftsman-verifier"
   ],
   "rules": [
-    "git_workflow.md",
     "ultra_mode.md"
   ]
 }

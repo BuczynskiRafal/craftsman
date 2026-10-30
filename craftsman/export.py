@@ -538,7 +538,7 @@ def render_combined_rules(rules_dir: Path, with_frontmatter: bool) -> str:
     if not with_frontmatter:
         return combined
     return (
-        "---\napplyTo: '**'\ndescription: 'Craftsman Global Engineering & Git Rules'\n---\n"
+        "---\napplyTo: '**'\ndescription: 'Craftsman Global Engineering Rules'\n---\n"
         f"{CRAFTSMAN_GENERATED_MARKER}\n\n{combined}"
     )
 
@@ -1077,7 +1077,7 @@ def export_to_claude_user(repo_dir: Path, claude_dir: Path) -> ClaudeExport:
 
 CURSOR_RULE_HEADER = (
     "---\n"
-    "description: Craftsman Agentic Engineering & Git Workflow Rules\n"
+    "description: Craftsman Agentic Engineering Rules\n"
     'globs: "*"\n'
     "alwaysApply: true\n"
     "---\n\n"

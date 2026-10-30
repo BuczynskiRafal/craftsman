@@ -13,7 +13,7 @@ from typing import Any
 from unittest import mock
 
 from craftsman import hooks
-from craftsman.hooks import COPILOT_PUSH_NOTE, Session, _review_in_progress
+from craftsman.hooks import Session, _review_in_progress
 from craftsman.records import format_timestamp
 from craftsman.worktree_guard import find_worktree_mutation
 
@@ -250,7 +250,6 @@ class WorktreeGuardHookTests(unittest.TestCase):
         copilot_out, _ = call_hook("pre-tool", "copilot", copilot_shell(self.root, "git stash"))
         self.assertEqual(copilot_out["permissionDecision"], "deny")
         self.assertEqual(copilot_out["permissionDecisionReason"], expected)
-        self.assertNotIn(COPILOT_PUSH_NOTE, copilot_out["permissionDecisionReason"])
 
     def test_unverified_finding_keeps_review_in_progress(self) -> None:
         self.prepare_review()

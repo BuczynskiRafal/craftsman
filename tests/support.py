@@ -22,6 +22,13 @@ from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_pat
 from craftsman.install import install_main
 from craftsman.ledger import add_coverage, add_finding, add_run, open_round
 from craftsman.lenses import Tier
+from craftsman.manifest import (
+    InstallManifest,
+    TargetKind,
+    TargetManifest,
+    load_manifest,
+    save_manifest,
+)
 from craftsman.records import (
     Coverage,
     Ledger,
@@ -478,3 +485,38 @@ class IsolatedHomeTestCase(unittest.TestCase):
 
     def assert_ok(self, result: CliResult) -> None:
         self.assertEqual(result.code, 0, result.err)
+
+    def write_legacy_git_hooks(
+        self,
+        base_dir: Path | None = None,
+        *,
+        previous_hooks_path: str | None = None,
+        set_hooks_path: bool = True,
+    ) -> Path:
+        """Create a Craftsman 3.x `TargetKind.GIT_HOOKS` install under `base_dir` (`~/.craftsman`)."""
+        base = base_dir if base_dir is not None else self.home / ".craftsman"
+        hooks_dir = base / "git-hooks"
+        scripts_dir = base / "scripts"
+        existing = load_manifest(base)
+        created_dirs: list[str] = []
+        for directory in (base, hooks_dir, scripts_dir):
+            if not directory.exists():
+                created_dirs.append(str(directory))
+                directory.mkdir(parents=True, exist_ok=True)
+        hook_files = [hooks_dir / "commit-msg", hooks_dir / "pre-push"]
+        shared_script = scripts_dir / "craftsman-stop-gate.py"
+        for hook_file in hook_files:
+            hook_file.write_text("#!/bin/sh\n", encoding="utf-8")
+        if not shared_script.exists():
+            shared_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        target = TargetManifest(
+            created_paths=tuple(str(p) for p in (*hook_files, shared_script)),
+            created_dirs=tuple(created_dirs),
+            previous_hooks_path=previous_hooks_path,
+            hooks_dir=str(hooks_dir),
+        )
+        manifest = (existing or InstallManifest({})).with_target(TargetKind.GIT_HOOKS, target)
+        save_manifest(base, manifest, dry_run=False)
+        if set_hooks_path:
+            self.git_global("core.hooksPath", str(hooks_dir))
+        return hooks_dir

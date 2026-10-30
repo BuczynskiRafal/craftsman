@@ -20,24 +20,39 @@ from craftsman.export import (
     CRAFTSMAN_BEGIN_MARKER,
     CRAFTSMAN_GENERATED_MARKER,
     REVIEWER_GROUPS_PLACEHOLDER,
+    AgentTemplate,
+    CopilotDiscoveryLocation,
     DiscoveryRoot,
     EntityPattern,
     ExportError,
     Skill,
+    absolute_hook_prefixes,
     claude_agent_templates,
+    default_vscode_prompts_dir,
     default_vscode_user_dir,
+    env_var_for_home,
+    export_copilot_home,
+    export_to_agents_workspace,
+    export_to_claude_user,
+    export_to_copilot_skills,
+    export_to_workspace,
+    export_vscode_instructions,
     is_craftsman_generated_file,
     is_craftsman_hook_command,
     iter_discovered_files,
+    iter_skills,
     load_agent_templates,
     merge_claude_hooks,
     parse_frontmatter,
     read_skill,
+    render_agents_md,
     render_claude_agent,
     render_claude_command_file,
     render_combined_rules,
     render_copilot_agent,
     render_copilot_hooks,
+    resolve_craftsman_pkg_dir,
+    resolve_discovery_dirs,
     strip_claude_hooks,
     strip_managed_block,
     upsert_managed_markdown,
@@ -82,7 +97,7 @@ class ExportTestCase(unittest.TestCase):
 
 
 class AgentRenderingTests(ExportTestCase):
-    def templates(self) -> dict[str, export.AgentTemplate]:
+    def templates(self) -> dict[str, AgentTemplate]:
         return {template.name: template for template in load_agent_templates(REPO_ROOT)}
 
     def test_copilot_orchestrator_may_delegate_to_subagents(self) -> None:
@@ -212,7 +227,7 @@ class SkillExportTests(ExportTestCase):
         (out / "code-review" / "SKILL.md").write_text(CRAFTSMAN_GENERATED_MARKER, encoding="utf-8")
         (out / "code-review" / "mine.md").write_text("user file\n", encoding="utf-8")
 
-        export.export_to_copilot_skills(REPO_ROOT, out)
+        export_to_copilot_skills(REPO_ROOT, out)
 
         self.assertEqual(
             (out / "code-review" / "lenses.md").read_bytes(),
@@ -227,7 +242,7 @@ class SkillExportTests(ExportTestCase):
         (out / "verify").mkdir(parents=True)
         (out / "verify" / "SKILL.md").write_text("my verify\n", encoding="utf-8")
 
-        changes = export.export_to_copilot_skills(REPO_ROOT, out)
+        changes = export_to_copilot_skills(REPO_ROOT, out)
 
         (backup,) = [change.backup for change in changes if change.backup is not None]
         self.assertEqual(backup.parent, out / BACKUP_DIR_NAME)
@@ -242,7 +257,7 @@ class SkillExportTests(ExportTestCase):
         (out / "code-review" / "SKILL.md").write_text(CRAFTSMAN_GENERATED_MARKER, encoding="utf-8")
         (out / "code-review" / "lenses.md").symlink_to(source_copy)
 
-        export.export_to_copilot_skills(REPO_ROOT, out)
+        export_to_copilot_skills(REPO_ROOT, out)
 
         self.assertEqual(source_copy.read_text(encoding="utf-8"), "original\n")
         self.assertFalse((out / "code-review" / "lenses.md").is_symlink())
@@ -260,12 +275,12 @@ class SkillExportTests(ExportTestCase):
         (demo_dir / "guide.md").write_text(
             "---\nname: guide\n---\n# Guide Heading\n\nGuide body.\n", encoding="utf-8"
         )
-        export.export_to_claude_user(synthetic, self.tmp / "synthetic-claude")
+        export_to_claude_user(synthetic, self.tmp / "synthetic-claude")
         demo_cmd = (self.tmp / "synthetic-claude" / "commands" / "demo.md").read_text(encoding="utf-8")
         self.assertIn("\n## Appendix: guide.md\n\n# Guide Heading\n\nGuide body.\n", demo_cmd)
         self.assertNotIn("## Appendix: missing.md", demo_cmd)
 
-        export.export_to_claude_user(REPO_ROOT, self.tmp / "claude")
+        export_to_claude_user(REPO_ROOT, self.tmp / "claude")
 
         review = (self.tmp / "claude" / "commands" / "code-review.md").read_text(encoding="utf-8")
         verify = (self.tmp / "claude" / "commands" / "verify.md").read_text(encoding="utf-8")
@@ -279,7 +294,7 @@ class SkillExportTests(ExportTestCase):
         mine.parent.mkdir()
         mine.write_text("my reviewer\n", encoding="utf-8")
 
-        export.export_to_claude_user(REPO_ROOT, self.tmp)
+        export_to_claude_user(REPO_ROOT, self.tmp)
 
         (backup,) = (self.tmp / "agents" / BACKUP_DIR_NAME).iterdir()
         self.assertEqual(backup.read_text(encoding="utf-8"), "my reviewer\n")
@@ -290,7 +305,7 @@ class SkillExportTests(ExportTestCase):
         profile = self.tmp / "Code" / "User" / "profiles" / "work"
         profile.mkdir(parents=True)
 
-        export.export_vscode_instructions(REPO_ROOT, prompts)
+        export_vscode_instructions(REPO_ROOT, prompts)
 
         self.assertTrue((prompts / "craftsman-rules.instructions.md").is_file())
         self.assertTrue((profile / "prompts" / "craftsman-rules.instructions.md").is_file())
@@ -299,7 +314,7 @@ class SkillExportTests(ExportTestCase):
         unrelated = self.tmp / "profiles" / "unrelated"
         unrelated.mkdir(parents=True)
 
-        export.export_vscode_instructions(REPO_ROOT, self.tmp / "out")
+        export_vscode_instructions(REPO_ROOT, self.tmp / "out")
 
         self.assertFalse((unrelated / "prompts").exists())
 
@@ -316,15 +331,15 @@ class SkillExportTests(ExportTestCase):
 
 class AgentsMdTests(ExportTestCase):
     def test_reviewer_groups_replace_the_placeholder(self) -> None:
-        text = export.render_agents_md(REPO_ROOT)
+        text = render_agents_md(REPO_ROOT)
 
         self.assertNotIn(REVIEWER_GROUPS_PLACEHOLDER, text)
         self.assertIn("  Reviewer groups:\n  ", text)
 
     def test_every_skill_is_listed(self) -> None:
-        text = export.render_agents_md(REPO_ROOT)
+        text = render_agents_md(REPO_ROOT)
 
-        for skill in export.iter_skills(REPO_ROOT):
+        for skill in iter_skills(REPO_ROOT):
             self.assertIn(f"- **`/{skill.name}`**: ", text)
 
     def test_template_without_placeholder_is_an_error(self) -> None:
@@ -333,10 +348,10 @@ class AgentsMdTests(ExportTestCase):
         (repo / "templates" / "AGENTS.md").write_text("# AGENTS.md\n", encoding="utf-8")
 
         with self.assertRaisesRegex(ExportError, "has no \\{\\{reviewer_groups\\}\\} placeholder"):
-            export.render_agents_md(repo)
+            render_agents_md(repo)
 
     def test_cursor_rule_applies_to_every_file(self) -> None:
-        workspace = export.export_to_agents_workspace(REPO_ROOT, self.tmp / "ws")
+        workspace = export_to_agents_workspace(REPO_ROOT, self.tmp / "ws")
 
         rule = workspace.cursor_rule.path.read_text(encoding="utf-8")
         self.assertIn('globs: "*"', frontmatter(rule))
@@ -435,7 +450,7 @@ class HookExportTests(ExportTestCase):
         )
 
     def test_workspace_hooks_run_craftsman_from_path(self) -> None:
-        export.export_to_workspace(REPO_ROOT, self.tmp)
+        export_to_workspace(REPO_ROOT, self.tmp)
 
         hooks = json.loads(
             (self.tmp / ".github" / "hooks" / "craftsman.json").read_text(encoding="utf-8")
@@ -467,7 +482,7 @@ class HookExportTests(ExportTestCase):
         folder = self.tmp / "py $HOME" / '"x"'
         python = self.fake_python(folder, Path(export.__file__))
 
-        bash, powershell = export.absolute_hook_prefixes(python)
+        bash, powershell = absolute_hook_prefixes(python)
 
         quoted = str(folder).replace("$", "\\$").replace('"', '\\"')
         self.assertEqual(bash, f'"{quoted}/python3" -m craftsman.cli')
@@ -485,7 +500,7 @@ class HookExportTests(ExportTestCase):
     def test_interpreter_without_this_package_runs_the_shim(self) -> None:
         python = self.fake_python(self.tmp / "py", self.tmp / "elsewhere" / "craftsman" / "__init__.py")
 
-        bash, _ = export.absolute_hook_prefixes(python)
+        bash, _ = absolute_hook_prefixes(python)
 
         shim = str(REPO_ROOT / "scripts" / "craftsman-cli.py")
         self.assertEqual(shlex.split(bash), [python, shim])
@@ -496,11 +511,11 @@ class HookExportTests(ExportTestCase):
             mock.patch.object(export, "CLI_SHIM", Path("scripts") / "no-such-shim.py"),
             self.assertRaisesRegex(ExportError, "cannot import craftsman"),
         ):
-            export.absolute_hook_prefixes(python)
+            absolute_hook_prefixes(python)
 
     def test_interpreter_that_cannot_run_is_an_error(self) -> None:
         with self.assertRaisesRegex(ExportError, "cannot run"):
-            export.absolute_hook_prefixes(str(self.tmp / "no-such-python"))
+            absolute_hook_prefixes(str(self.tmp / "no-such-python"))
 
     def test_shim_runs_this_checkout(self) -> None:
         proc = subprocess.run(
@@ -756,12 +771,12 @@ class LocationTests(ExportTestCase):
 
     def test_setting_outside_an_explicit_home_is_ignored(self) -> None:
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}):
-            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
-            self.assertEqual(export.env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated"), "")
+            self.assertEqual(env_var_for_home("XDG_CONFIG_HOME", None), "/opt/cfg")
+            self.assertEqual(env_var_for_home("XDG_CONFIG_HOME", self.tmp / "isolated"), "")
 
     def test_assets_without_a_package_are_an_error(self) -> None:
         with self.assertRaisesRegex(ExportError, "no craftsman package next to the assets"):
-            export.resolve_craftsman_pkg_dir(self.tmp)
+            resolve_craftsman_pkg_dir(self.tmp)
 
 
 class DiscoveryTests(ExportTestCase):
@@ -782,14 +797,14 @@ class DiscoveryTests(ExportTestCase):
         self.assertEqual(found, [("craftsman", self.tmp / "craftsman.agent.md")])
 
     def test_profile_prompts_are_found_for_every_profile(self) -> None:
-        location = export.CopilotDiscoveryLocation(
+        location = CopilotDiscoveryLocation(
             DiscoveryRoot.VSCODE_PROFILE_PROMPTS, EntityPattern.PROMPT, canonical=False
         )
-        profiles = export.default_vscode_prompts_dir(self.tmp).parent / "profiles"
+        profiles = default_vscode_prompts_dir(self.tmp).parent / "profiles"
         (profiles / "a").mkdir(parents=True)
         (profiles / "b").mkdir()
 
-        found = export.resolve_discovery_dirs(location, home=self.tmp, include_all_profiles=True)
+        found = resolve_discovery_dirs(location, home=self.tmp, include_all_profiles=True)
 
         self.assertEqual(found, [profiles / "a" / "prompts", profiles / "b" / "prompts"])
 
@@ -811,11 +826,11 @@ class RenderedTextTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         cls.addClassCleanup(tmp.cleanup)
         cls.root = Path(tmp.name)
-        export.export_vscode_instructions(REPO_ROOT, cls.root / "prompts")
-        export.export_to_copilot_skills(REPO_ROOT, cls.root / "skills")
-        export.export_copilot_home(REPO_ROOT, cls.root / "copilot", ("craftsman", "craftsman"))
-        export.export_to_claude_user(REPO_ROOT, cls.root / "claude")
-        export.export_to_agents_workspace(REPO_ROOT, cls.root / "ws")
+        export_vscode_instructions(REPO_ROOT, cls.root / "prompts")
+        export_to_copilot_skills(REPO_ROOT, cls.root / "skills")
+        export_copilot_home(REPO_ROOT, cls.root / "copilot", ("craftsman", "craftsman"))
+        export_to_claude_user(REPO_ROOT, cls.root / "claude")
+        export_to_agents_workspace(REPO_ROOT, cls.root / "ws")
         cls.files = {path: path.read_text(encoding="utf-8") for path in cls.root.rglob("*.md")}
 
     def test_no_file_looks_skills_up_on_disk(self) -> None:

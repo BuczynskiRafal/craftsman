@@ -29,7 +29,7 @@ class TargetKind(str, Enum):
     COPILOT = "copilot"
     COPILOT_WORKSPACE = "copilot_workspace"
     AGENTS_WORKSPACE = "agents_workspace"
-    GIT_HOOKS = "git_hooks"
+    GIT_HOOKS = "git_hooks"  # legacy: read only to remove Craftsman < 4.0 git hooks
 
 
 class ModifiedKind(str, Enum):
@@ -46,8 +46,8 @@ class TargetManifest:
     created_dirs: tuple[str, ...] = ()
     modified_files: Mapping[str, ModifiedKind] = field(default_factory=dict)
     hooks_json_keys: tuple[str, ...] = ()  # the Antigravity hooks.json entries Craftsman added
-    previous_hooks_path: str | None = None  # git hooks: the core.hooksPath to restore
-    hooks_dir: str | None = None  # git hooks: the core.hooksPath Craftsman set
+    previous_hooks_path: str | None = None  # legacy: read only to remove Craftsman < 4.0 git hooks
+    hooks_dir: str | None = None  # legacy: read only to remove Craftsman < 4.0 git hooks
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "modified_files", MappingProxyType(dict(self.modified_files)))
