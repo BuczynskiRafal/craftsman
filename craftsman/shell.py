@@ -15,11 +15,43 @@ from dataclasses import dataclass
 
 from craftsman.paths import user_home
 
-HEREDOC_OPEN_RE = re.compile(r"(?<!<)<<(?!<)-?\s*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
-_REDIR_TARGET_PAT = r"[ \t]*(?:'[^']*'|\"[^\"]*\"|[^\s;&|()<>]*)"
+HEREDOC_OPEN_RE = re.compile(
+    r"""
+    (?<!<) << (?!<)                     # `<<` heredoc operator (not `<` or `<<<` here-string)
+    -? \s*                              # optional `-` tab-stripping modifier and whitespace
+    (?:
+        '([^']+)'                       # single-quoted delimiter (group 1)
+        | "([^"]+)"                     # double-quoted delimiter (group 2)
+        | ([A-Za-z_][A-Za-z0-9_]*)      # bare identifier delimiter (group 3)
+    )
+    """,
+    re.VERBOSE,
+)
+_REDIR_TARGET_PAT = r"""
+    [ \t]*                              # optional horizontal whitespace before target
+    (?:
+        '[^']*'                         # single-quoted path
+        | "[^"]*"                       # double-quoted path
+        | [^\s;&|()<>]*                 # unquoted non-operator token
+    )
+"""
 UNQUOTED_REDIR_RE = re.compile(
-    r"(?:(?:\d+)?[<>]&[ \t]*(?:\d+|-)"
-    r"|(?:\d+)?(?:&>>?|>>?|>\|" + r"|<(?!<<|\())" + _REDIR_TARGET_PAT + r")"
+    r"""
+    (?:
+        (?:\d+)? [<>]& [ \t]* (?:\d+|-)             # fd duplication or close, e.g. `2>&1`, `<&-`
+        | (?:\d+)?                                  # optional source file descriptor
+          (?:
+              &>>?                                  # bash combined stdout/stderr redirect (`&>`, `&>>`)
+              | >>?                                 # stdout write or append (`>`, `>>`)
+              | >\|                                 # noclobber override (`>|`)
+              | < (?! << | \( )                     # stdin redirect `<` (excluding `<<<` and `<(...)`)
+          )
+    """
+    + _REDIR_TARGET_PAT
+    + r"""
+    )
+    """,
+    re.VERBOSE,
 )
 
 GIT_GLOBAL_OPTS_WITH_VALUE = frozenset(
@@ -302,7 +334,22 @@ def _separate_unquoted_redirections(cmd_header: str) -> str:
 
 
 _UNQUOTED_WIN_PATH_TOKEN_RE = re.compile(
-    r"(?<!\S)(?:[A-Za-z]:|~|\.\.?|%[A-Za-z_][A-Za-z0-9_]*%|\$(?:HOME|\{HOME\}|env:[A-Za-z_][A-Za-z0-9_]*))\\[^\s\"';|&<>()]*"
+    r"""
+    (?<!\S)                                     # token start (BOL or preceded by whitespace)
+    (?:
+        [A-Za-z]:                               # Windows drive prefix, e.g. `C:`
+        | ~                                     # home-directory tilde prefix, e.g. `~\dir`
+        | \.\.?                                 # relative `.` or `..` prefix, e.g. `..\dir`
+        | %[A-Za-z_][A-Za-z0-9_]*%              # cmd.exe `%VAR%` environment prefix
+        | \$(?:                                 # POSIX / PowerShell home or env prefix:
+            HOME                                #   `$HOME\dir`
+            | \{HOME\}                          #   `${HOME}\dir`
+            | env:[A-Za-z_][A-Za-z0-9_]*        #   `$env:USERPROFILE\dir`
+          )
+    )
+    \\ [^\s"';|&<>()]*                          # backslash path separator and unquoted tail
+    """,
+    re.VERBOSE,
 )
 CD_COMMANDS = frozenset({"cd", "pushd", "chdir", "set-location", "sl"})
 POPD_COMMANDS = frozenset({"popd", "pop-location"})

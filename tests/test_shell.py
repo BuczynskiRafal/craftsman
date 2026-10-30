@@ -22,7 +22,7 @@ class RedirectionTokenizationTests(unittest.TestCase):
                 self.assertEqual(len(cmds), 1)
                 self.assertEqual(cmds[0].tokens, ["git", "push", "origin", "main"])
 
-    def test_redirection_glued_to_a_token_ends_the_token_without_consuming_digit_suffix(self) -> None:
+    def test_glued_redirection_ends_token_without_consuming_digit_suffix(self) -> None:
         cmds_digit = iter_simple_commands("git push origin main2>/dev/null")
         self.assertEqual(cmds_digit[0].tokens, ["git", "push", "origin", "main2"])
 
@@ -71,7 +71,7 @@ class WorkingDirectoryTrackingTests(unittest.TestCase):
 
 
 class WrapperAndNestedShellTests(unittest.TestCase):
-    def test_wrappers_and_nested_shells_expose_inner_git_commands(self) -> None:
+    def test_wrapped_or_nested_shells_expose_inner_git_commands(self) -> None:
         cases: tuple[tuple[str, tuple[str | None, list[str]]], ...] = (
             ("bash -c 'git push origin main'", ("push", ["origin", "main"])),
             ("sh -lc 'git push origin master'", ("push", ["origin", "master"])),
@@ -109,7 +109,7 @@ class WrapperAndNestedShellTests(unittest.TestCase):
 
 
 class HeredocAndPathExpansionTests(unittest.TestCase):
-    def test_split_shell_events_preserves_heredocs_and_powershell_herestrings(self) -> None:
+    def test_split_shell_events_preserves_multiline_here_constructs(self) -> None:
         events = split_shell_events("cat <<'EOF'\na; b | c\nEOF\necho done")
         self.assertEqual(len(events), 2)
         self.assertTrue(events[0].startswith("cat <<'EOF'\n"))
@@ -120,7 +120,7 @@ class HeredocAndPathExpansionTests(unittest.TestCase):
         self.assertEqual(ps_events[0], "'x; y'")
         self.assertEqual(ps_events[1], "Set-Content out.txt")
 
-    def test_windows_backslashes_and_home_tokens_are_preserved(self) -> None:
+    def test_windows_backslash_paths_stay_intact(self) -> None:
         with mock.patch.dict(
             os.environ,
             {"HOME": "/Users/alice", "USERPROFILE": "/Users/alice"},
