@@ -8,67 +8,29 @@ base folder; `craftsman uninstall` works from those manifests alone.
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import sys
-from collections.abc import (
-    Sequence,
-)
-from dataclasses import (
-    dataclass,
-    replace,
-)
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from craftsman.assets import (
-    iter_skills,
-    load_agent_templates,
-    render_combined_rules,
-)
-from craftsman.export import (
-    DUPLICATE_SCOPE_USER_TO_WS_MSG,
-    DUPLICATE_SCOPE_WS_TO_USER_MSG,
-    HOOKS_FILENAME,
-    export_copilot_agents,
-    export_copilot_home,
-    export_to_copilot_skills,
-    export_vscode_instructions,
-    has_user_copilot_install,
-    has_workspace_copilot_install,
-    write_copilot_hooks,
-)
-from craftsman.files import (
-    UnsafePathError,
-)
-from craftsman.generated import (
-    ExportError,
-)
-from craftsman.hook_command import absolute_hook_prefixes
+from craftsman.files import UnsafePathError
+from craftsman.generated import ExportError
 from craftsman.legacy_githooks import legacy_git_hooks_bases
-from craftsman.manifest import (
-    InstallError,
-    TargetKind,
-)
-from craftsman.paths import (
-    default_copilot_home,
-    default_copilot_skills_dir,
-    default_repo_dir,
-    default_vscode_prompts_dir,
-    default_vscode_user_dir,
-    user_home,
-    vscode_prompt_dirs,
-)
+from craftsman.manifest import InstallError, TargetKind
+from craftsman.paths import default_repo_dir, user_home
 from craftsman.platforms.agents_md import install_agents_workspace_target
 from craftsman.platforms.antigravity import detect_antigravity, install_antigravity_target
 from craftsman.platforms.claude import detect_claude, install_claude_target
-from craftsman.staging import (
-    EventKind,
-    InstallMode,
-    TargetSession,
-    Tracker,
-    run_reported,
-    upsert_markdown,
+from craftsman.platforms.copilot import (
+    DUPLICATE_SCOPE_USER_TO_WS_MSG,
+    DUPLICATE_SCOPE_WS_TO_USER_MSG,
+    detect_vscode_copilot,
+    has_user_copilot_install,
+    has_workspace_copilot_install,
+    install_copilot_target,
+    install_copilot_workspace_target,
 )
+from craftsman.staging import EventKind, InstallMode, Tracker, run_reported
 from craftsman.uninstall import apply_plan, plan_base
 
 
@@ -86,56 +48,6 @@ class InstallConfig:
     agents_workspace: Path | None
     dry_run: bool
 
-
-
-def detect_vscode_copilot(home: Path) -> bool:
-    return (
-        default_copilot_home(home).is_dir()
-        or os.environ.get("TERM_PROGRAM") == "vscode"
-        or bool(os.environ.get("VSCODE_PID"))
-        or bool(os.environ.get("VSCODE_IPC_HOOK_CLI"))
-        or default_vscode_user_dir(home).is_dir()
-        or shutil.which("code") is not None
-    )
-
-def install_copilot_target(repo_dir: Path, home: Path, tracker: Tracker) -> None:
-    copilot_home = default_copilot_home(home)
-    prompts = default_vscode_prompts_dir(home)
-    prefixes = absolute_hook_prefixes()  # a failure here stops the install before any write
-    session = TargetSession.begin(copilot_home, TargetKind.COPILOT, home, tracker)
-    for prompts_dir in vscode_prompt_dirs(prompts):
-        session.make_dirs(prompts_dir)
-        session.stage(prompts_dir / "craftsman-rules.instructions.md")
-    _stage_copilot_files(session, repo_dir, copilot_home)
-    if not tracker.dry_run:
-        export_vscode_instructions(repo_dir, prompts)
-        export_to_copilot_skills(repo_dir, default_copilot_skills_dir(home))
-        export_copilot_home(repo_dir, copilot_home, prefixes)
-    session.finish()
-
-def _stage_copilot_files(session: TargetSession, repo_dir: Path, root: Path) -> None:
-    """Skills, agents and the hooks file below `root` (`~/.copilot` or a workspace's `.github`)."""
-    for sub in ("skills", "agents", "hooks"):
-        session.make_dirs(root / sub)
-    for skill in iter_skills(repo_dir):
-        session.stage(root / "skills" / skill.name)
-    for template in load_agent_templates(repo_dir):
-        session.stage(root / "agents" / f"{template.name}.agent.md")
-    session.stage(root / "hooks" / HOOKS_FILENAME)
-
-def install_copilot_workspace_target(
-    repo_dir: Path, workspace: Path, home: Path, tracker: Tracker
-) -> None:
-    session = TargetSession.begin(workspace, TargetKind.COPILOT_WORKSPACE, home, tracker, workspace)
-    github_dir = workspace / ".github"
-    _stage_copilot_files(session, repo_dir, github_dir)
-    if not tracker.dry_run:
-        export_to_copilot_skills(repo_dir, github_dir / "skills")
-        export_copilot_agents(repo_dir, github_dir / "agents")
-        write_copilot_hooks(github_dir / "hooks", "craftsman", "craftsman")
-    rules = render_combined_rules(repo_dir / "rules", with_frontmatter=False)
-    upsert_markdown(session, github_dir / "copilot-instructions.md", rules)
-    session.finish()
 
 def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) -> InstallConfig:
     """Add the detected platforms to the requested ones; GitHub Copilot when none is found."""

@@ -25,19 +25,6 @@ from craftsman.assets import (
     read_skill,
     render_combined_rules,
 )
-from craftsman.export import (
-    CopilotDiscoveryLocation,
-    DiscoveryRoot,
-    EntityPattern,
-    export_copilot_home,
-    export_to_copilot_skills,
-    export_to_workspace,
-    export_vscode_instructions,
-    iter_discovered_files,
-    render_copilot_agent,
-    render_copilot_hooks,
-    resolve_discovery_dirs,
-)
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import (
     CRAFTSMAN_BEGIN_MARKER,
@@ -67,6 +54,19 @@ from craftsman.platforms.claude import (
     render_claude_agent,
     render_claude_command_file,
     strip_claude_hooks,
+)
+from craftsman.platforms.copilot import (
+    CopilotDiscoveryLocation,
+    DiscoveryRoot,
+    EntityPattern,
+    export_copilot_home,
+    export_to_copilot_skills,
+    export_to_workspace,
+    export_vscode_instructions,
+    iter_discovered_files,
+    render_copilot_agent,
+    render_copilot_hooks,
+    resolve_discovery_dirs,
 )
 
 from tests.support import REPO_ROOT, SKILL_COUNT, CliResult, run_main

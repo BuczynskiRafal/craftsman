@@ -24,18 +24,18 @@ from craftsman.doctor import (
     scan_copilot_duplicates,
     validate_skill_manifests,
 )
-from craftsman.export import (
+from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
+from craftsman.hook_command import absolute_hook_prefixes
+from craftsman.manifest import MANIFEST_FILENAME
+from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
+from craftsman.platforms.claude import export_to_claude_user
+from craftsman.platforms.copilot import (
     HOOKS_FILENAME,
     export_copilot_home,
     export_to_copilot_skills,
     export_to_workspace,
     write_copilot_hooks,
 )
-from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
-from craftsman.hook_command import absolute_hook_prefixes
-from craftsman.manifest import MANIFEST_FILENAME
-from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
-from craftsman.platforms.claude import export_to_claude_user
 
 from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main
 
@@ -236,13 +236,17 @@ class DriftTests(DoctorTestCase):
         config = self.tmp / "config"
         (config / "skills" / "craftsman").mkdir(parents=True)
         (config / "skills" / "craftsman" / "SKILL.md").write_text("drifted\n", encoding="utf-8")
-        (config / "craftsman").mkdir(parents=True)
+        (config / "craftsman" / "platforms").mkdir(parents=True)
         (config / "craftsman" / "scope.py").write_text("# stale scope\n", encoding="utf-8")
+        (config / "craftsman" / "platforms" / "copilot.py").write_text(
+            "# stale copilot\n", encoding="utf-8"
+        )
 
         drifted = detect_antigravity_drift(REPO_ROOT, config)
 
         self.assertIn("skills/craftsman/SKILL.md", drifted)
         self.assertIn("craftsman/scope.py", drifted)
+        self.assertIn("craftsman/platforms/copilot.py", drifted)
 
 
 class JsoncTests(unittest.TestCase):
