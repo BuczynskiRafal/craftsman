@@ -187,7 +187,7 @@ class TargetSession:
     def modified(self, path: Path, kind: ModifiedKind) -> None:
         self.modified_files[path_key(path)] = kind
 
-    def finish(self, *, previous_hooks_path: str | None = None, hooks_dir: str | None = None) -> None:
+    def finish(self) -> None:
         """Remove what the previous install of this target had and this one no longer has, then
         record the target in the manifest."""
         self._remove_obsolete()
@@ -196,8 +196,6 @@ class TargetSession:
             created_dirs=tuple(self.created_dirs),
             modified_files=self.modified_files,
             hooks_json_keys=self.hooks_json_keys,
-            previous_hooks_path=previous_hooks_path,
-            hooks_dir=hooks_dir,
         )
         manifest = self.manifest or InstallManifest({})
         save_manifest(self.base_dir, manifest.with_target(self.kind, target), dry_run=self.dry_run)
