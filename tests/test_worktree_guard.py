@@ -1,4 +1,4 @@
-"""Acceptance tests for the PreToolUse work-tree mutation guard (`guard.py` and `hooks.py`)."""
+"""Acceptance tests for the PreToolUse work-tree mutation guard (`worktree_guard.py` and `hooks.py`)."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from typing import Any
 from unittest import mock
 
 from craftsman import hooks
-from craftsman.guard import find_worktree_mutation
 from craftsman.hooks import COPILOT_PUSH_NOTE, Session, _review_in_progress
 from craftsman.records import format_timestamp
+from craftsman.worktree_guard import find_worktree_mutation
 
 from tests.support import EvidenceRepo
 

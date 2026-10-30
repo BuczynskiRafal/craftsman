@@ -49,7 +49,7 @@ from craftsman.gate import (
     state_path_for,
     update_state,
 )
-from craftsman.guard import evaluate_shell_command, find_worktree_mutation
+from craftsman.guard import evaluate_shell_command
 from craftsman.ledger import (
     GROUPED_EVIDENCE_PREFIX,
     add_agent_event,
@@ -77,6 +77,7 @@ from craftsman.scope import (
     load_scope_policy,
 )
 from craftsman.trigger import detect_trigger, task_from_prompt
+from craftsman.worktree_guard import find_worktree_mutation
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
