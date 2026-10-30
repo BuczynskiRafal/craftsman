@@ -21,7 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+from craftsman.antigravity import session_id
+from craftsman.diffscan import DiffScanError, worktree_root
 from craftsman.export import user_home
+from craftsman.gate import GateOwner, GateStateError, load_state, state_path_for
 from craftsman.records import CRAFTSMAN_AGENTS
 from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 
@@ -442,3 +445,42 @@ def evaluate_scope(
                 if dec.decision == "deny":
                     return dec
     return ScopeDecision("allow")
+
+
+def _is_active_antigravity_owner(payload: Mapping[str, Any], effective_cwd: Path) -> bool:
+    """Whether the work tree has an active gate that the Antigravity session of `payload` owns."""
+    state = load_state(state_path_for(effective_cwd))
+    caller = GateOwner(platform="antigravity", session_id=session_id(payload))
+    return state is not None and state.active and state.owner.admits(caller)
+
+
+def evaluate_antigravity_scope(
+    payload: Mapping[str, Any], command_line: str, cwd_str: str | None
+) -> tuple[str, str | None]:
+    """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
+    try:
+        effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
+        repo_root = worktree_root(effective_cwd)
+        if not _is_active_antigravity_owner(payload, effective_cwd):
+            return "allow", None
+    except GateStateError as exc:
+        return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
+    except DiffScanError:  # outside a git work tree there is no gate and no scope
+        return "allow", None
+
+    try:
+        policy = load_scope_policy(effective_cwd, repo_root)
+    except ScopeConfigError as exc:
+        return "force_ask", f"[CRAFTSMAN SCOPE-GUARD] {exc}"
+    if policy.mode == "off":
+        return "allow", None
+    scope_decision = evaluate_scope(
+        "run_command",
+        {"CommandLine": command_line, "Cwd": cwd_str},
+        effective_cwd,
+        repo_root,
+        policy,
+    )
+    if scope_decision.decision == "deny" and policy.mode == "deny":
+        return "deny", scope_decision.reason
+    return "allow", None

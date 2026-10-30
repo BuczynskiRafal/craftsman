@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from craftsman.export import user_home
+from craftsman.scope import evaluate_antigravity_scope
 from craftsman.shell import SimpleCommand, iter_simple_commands, parse_git_invocation
 from craftsman.transcript import (
     QUESTION_TOOLS,
@@ -693,53 +694,6 @@ def _extract_command_and_cwd(payload: dict[str, Any]) -> tuple[str | None, str |
     return None, None
 
 
-def _is_active_antigravity_owner(payload: dict[str, Any], effective_cwd: Path) -> bool:
-    """Whether the work tree has an active gate that the Antigravity session of `payload` owns."""
-    from craftsman.antigravity import session_id
-    from craftsman.gate import GateOwner, load_state, state_path_for
-
-    state = load_state(state_path_for(effective_cwd))
-    caller = GateOwner(platform="antigravity", session_id=session_id(payload))
-    return state is not None and state.active and state.owner.admits(caller)
-
-
-def _evaluate_antigravity_scope(
-    payload: dict[str, Any], command_line: str, cwd_str: str | None
-) -> tuple[str, str | None]:
-    """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
-    from craftsman.gate import GateStateError
-
-    try:
-        from craftsman.diffscan import DiffScanError, worktree_root
-        from craftsman.scope import ScopeConfigError, evaluate_scope, load_scope_policy
-
-        effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
-        repo_root = worktree_root(effective_cwd)
-        if not _is_active_antigravity_owner(payload, effective_cwd):
-            return "allow", None
-    except GateStateError as exc:
-        return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
-    except DiffScanError:  # outside a git work tree there is no gate and no scope
-        return "allow", None
-
-    try:
-        policy = load_scope_policy(effective_cwd, repo_root)
-    except ScopeConfigError as exc:
-        return "force_ask", f"[CRAFTSMAN SCOPE-GUARD] {exc}"
-    if policy.mode == "off":
-        return "allow", None
-    scope_decision = evaluate_scope(
-        "run_command",
-        {"CommandLine": command_line, "Cwd": cwd_str},
-        effective_cwd,
-        repo_root,
-        policy,
-    )
-    if scope_decision.decision == "deny" and policy.mode == "deny":
-        return "deny", scope_decision.reason
-    return "allow", None
-
-
 def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     command_line, cwd_str = _extract_command_and_cwd(payload)
     if not isinstance(command_line, str):
@@ -748,7 +702,7 @@ def evaluate_command(payload: dict[str, Any]) -> tuple[str, str | None]:
     if decision != "allow":
         return decision, reason
     if isinstance(payload.get("toolCall"), dict):
-        return _evaluate_antigravity_scope(payload, command_line, cwd_str)
+        return evaluate_antigravity_scope(payload, command_line, cwd_str)
     return "allow", None
 
 

@@ -15,10 +15,10 @@ from unittest import mock
 
 from craftsman import hooks
 from craftsman.gate import GateOwner
-from craftsman.guard import evaluate_command
 from craftsman.scope import (
     ScopeConfigError,
     ScopePolicy,
+    evaluate_antigravity_scope,
     evaluate_scope,
     is_craftsman_agent,
     load_scope_policy,
@@ -665,17 +665,20 @@ class ScopeEnforcementTests(unittest.TestCase):
 
     def test_antigravity_run_command_enforces_scope_for_owner_session(self) -> None:
         open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
-        dec, reason = evaluate_command(
-            {
-                "artifactDirectoryPath": str(self.tmp / "brain" / "conv-123"),
-                "toolCall": {
-                    "name": "run_command",
-                    "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)},
-                },
-            }
+        dec, reason = evaluate_antigravity_scope(
+            {"artifactDirectoryPath": str(self.tmp / "brain" / "conv-123")},
+            "find ~ -name SKILL.md",
+            str(self.repo),
         )
         self.assertEqual(dec, "deny")
         self.assertIn("[CRAFTSMAN SCOPE-GUARD]", reason or "")
+
+        other_dec, _ = evaluate_antigravity_scope(
+            {"artifactDirectoryPath": str(self.tmp / "brain" / "conv-other")},
+            "find ~ -name SKILL.md",
+            str(self.repo),
+        )
+        self.assertEqual(other_dec, "allow")
 
     def _ensure_initial_commit(self) -> None:
         head = subprocess.run(
