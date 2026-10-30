@@ -17,14 +17,11 @@ from unittest import mock
 
 from craftsman import __version__, export
 from craftsman.export import (
-    CRAFTSMAN_BEGIN_MARKER,
-    CRAFTSMAN_GENERATED_MARKER,
     REVIEWER_GROUPS_PLACEHOLDER,
     AgentTemplate,
     CopilotDiscoveryLocation,
     DiscoveryRoot,
     EntityPattern,
-    ExportError,
     Skill,
     absolute_hook_prefixes,
     claude_agent_templates,
@@ -37,7 +34,6 @@ from craftsman.export import (
     export_to_copilot_skills,
     export_to_workspace,
     export_vscode_instructions,
-    is_craftsman_generated_file,
     is_craftsman_hook_command,
     iter_discovered_files,
     iter_skills,
@@ -54,10 +50,16 @@ from craftsman.export import (
     resolve_craftsman_pkg_dir,
     resolve_discovery_dirs,
     strip_claude_hooks,
+)
+from craftsman.files import BACKUP_DIR_NAME
+from craftsman.generated import (
+    CRAFTSMAN_BEGIN_MARKER,
+    CRAFTSMAN_GENERATED_MARKER,
+    ExportError,
+    is_craftsman_generated_file,
     strip_managed_block,
     upsert_managed_markdown,
 )
-from craftsman.files import BACKUP_DIR_NAME
 
 from tests.support import REPO_ROOT, SKILL_COUNT, CliResult, run_main
 

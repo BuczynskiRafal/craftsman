@@ -16,7 +16,6 @@ from craftsman import __version__
 from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.doctor import run_doctor
 from craftsman.export import (
-    ExportError,
     Skill,
     default_repo_dir,
     iter_skills,
@@ -24,6 +23,7 @@ from craftsman.export import (
 from craftsman.export import main as export_main
 from craftsman.gate import GateState, GateStateError, load_state, state_path_for, task_tier
 from craftsman.gate import main as gate_main
+from craftsman.generated import ExportError
 from craftsman.hooks import main as hook_main
 from craftsman.install import install_main
 from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens

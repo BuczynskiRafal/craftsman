@@ -13,10 +13,10 @@ from craftsman.export import (
     default_claude_dir,
     default_copilot_home,
     default_vscode_user_dir,
-    require_resolves_within,
     user_home,
 )
 from craftsman.files import exists, remove_path, require_no_symlinked_parent
+from craftsman.generated import require_resolves_within
 from craftsman.legacy_githooks import craftsman_home_dir, restore_hooks_path
 from craftsman.manifest import (
     InstallManifest,

@@ -21,7 +21,6 @@ from craftsman.export import (
     HOOKS_FILENAME,
     CopilotClient,
     CopilotDiscoveryLocation,
-    ExportError,
     craftsman_agent_names,
     craftsman_skill_names,
     default_claude_dir,
@@ -37,6 +36,7 @@ from craftsman.export import (
     resolve_discovery_dirs,
     user_home,
 )
+from craftsman.generated import ExportError
 from craftsman.legacy_githooks import (
     git_config_get,
     is_craftsman_hooks_path,

@@ -28,7 +28,6 @@ from craftsman.export import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
     HOOKS_FILENAME,
-    ExportError,
     absolute_hook_prefixes,
     claude_agent_templates,
     default_claude_dir,
@@ -44,23 +43,26 @@ from craftsman.export import (
     export_vscode_instructions,
     has_user_copilot_install,
     has_workspace_copilot_install,
-    is_craftsman_generated_file,
     iter_skills,
     load_agent_templates,
     merge_claude_hooks,
-    read_json_object,
     render_agents_md,
     render_combined_rules,
     user_home,
     vscode_prompt_dirs,
     write_copilot_hooks,
-    write_generated,
-    write_json_object,
 )
 from craftsman.files import (
     UnsafePathError,
     copy_once_backup,
     exists,
+)
+from craftsman.generated import (
+    ExportError,
+    is_craftsman_generated_file,
+    read_json_object,
+    write_generated,
+    write_json_object,
 )
 from craftsman.legacy_githooks import legacy_git_hooks_bases
 from craftsman.manifest import (
