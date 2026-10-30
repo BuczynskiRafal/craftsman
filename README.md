@@ -233,7 +233,7 @@ craftsman skill show code-review --lenses intent,contracts,failure  # print sele
 
 #### GitHub Copilot discovery locations ("one name = one location")
 
-VS Code Copilot and the GitHub Copilot CLI scan multiple directories at once and merge discovered items without deduplication. To ensure every Craftsman agent and `/skill` slash command appears **exactly once**, Craftsman installs into a single canonical location per scope (`COPILOT_DISCOVERY` in [`craftsman/export.py`](craftsman/export.py)):
+VS Code Copilot and the GitHub Copilot CLI scan multiple directories at once and merge discovered items without deduplication. To ensure every Craftsman agent and `/skill` slash command appears **exactly once**, Craftsman installs into a single canonical location per scope (`COPILOT_DISCOVERY` in [`craftsman/platforms/copilot.py`](craftsman/platforms/copilot.py)):
 
 | Entity | User scope (`--copilot`, canonical) | Workspace scope (`--copilot-workspace`, canonical) | Other locations VS Code scans (`doctor` reports duplicates there) |
 | :--- | :--- | :--- | :--- |

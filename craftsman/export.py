@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-platform exporter for Craftsman skills, rules, agents and lifecycle hooks.
+"""Command-line entrypoint for `craftsman export`.
 
 Targets:
 1. GitHub Copilot, user level: the global instructions in the VS Code prompts folder and its
@@ -11,9 +11,6 @@ Targets:
 3. Claude Code (`--claude-dir`): slash commands, rules, the reviewer/verifier subagents and the
    Craftsman hooks merged into `settings.json` (skip them with `--no-claude-hooks`).
 4. OpenAI Codex / Cursor (`--agents-workspace`): `AGENTS.md` and `.cursor/rules/craftsman.mdc`.
-
-Exporting replaces files Craftsman generated before; a user's file in the way is moved into a
-`.craftsman-backup` folder next to it, so nothing a user wrote is lost.
 """
 
 from __future__ import annotations
@@ -24,10 +21,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from craftsman.assets import iter_skills
-from craftsman.generated import (
-    ExportError,
-    FileChange,
-)
+from craftsman.generated import ExportError, FileChange
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.paths import (
     default_claude_dir,
@@ -37,15 +31,10 @@ from craftsman.paths import (
     default_vscode_prompts_dir,
 )
 from craftsman.platforms.agents_md import export_to_agents_workspace
-from craftsman.platforms.claude import (
-    export_to_claude_user,
-    merge_claude_hooks,
-)
+from craftsman.platforms.claude import export_to_claude_user, merge_claude_hooks
 from craftsman.platforms.copilot import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
-    DiscoveryRoot,
-    EntityPattern,
     export_copilot_home,
     export_to_copilot_skills,
     export_to_workspace,
@@ -53,225 +42,6 @@ from craftsman.platforms.copilot import (
     has_user_copilot_install,
     has_workspace_copilot_install,
 )
-
-# --- Copilot discovery ----------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-_R, _P = DiscoveryRoot, EntityPattern
-# Where VS Code and the Copilot CLI discover each kind of entity; a canonical location is the one
-# Craftsman installs into. Documented at code.visualstudio.com/docs/copilot/customization
-# (custom-agents, agent-skills, prompt-files) and docs.github.com/en/copilot (copilot-cli).
-
-# Copilot CLI event name -> `craftsman hook` event, with the timeout in seconds.
-# Claude Code runs a PreToolUse hook for matched tools; pre-tool enforces both the git guard
-# (on Bash) and the repository search scope (on Bash, Read, Grep, Glob, and LS).
-
-# Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running
-# `-m craftsman.cli` or the checkout's shim, then `hook <event> --platform claude`.
-
-
-
-
-# --- locations ------------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- frontmatter, skills and agents ---------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- generated files ------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- hooks ----------------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- managed Markdown blocks ----------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-# --- discovery ------------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-# --- targets --------------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- command line ---------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:

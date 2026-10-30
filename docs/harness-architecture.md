@@ -185,7 +185,7 @@ When Round `N+1` is prepared after fixes:
 
 ![Install, session hooks and runtime guards](diagrams/lifecycle-hooks-and-guards.png)
 
-### Single-Source Multi-Platform Exporter & Installer (`craftsman.export` & `craftsman.install`)
+### Single-Source Multi-Platform Exporter & Installer (`craftsman.platforms.*`, `craftsman.export`, `craftsman.install`)
 
 Craftsman authors skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/code-review/lenses.md`), subagent templates (`agents/craftsman*.md`), and global rules (`rules/*.md`) once, expanding `{{include path}}` directives into native artifacts tracked by `.craftsman-install.json`:
 
@@ -281,7 +281,12 @@ Craftsman enforces review integrity and repository search scope through `craftsm
 | [`craftsman/shell.py`](../craftsman/shell.py) | Shell command parser, wrapper unwrapper, and `git` invocation analyzer | `iter_simple_commands()`, `parse_git_invocation()`, `SimpleCommand` |
 | [`craftsman/worktree_guard.py`](../craftsman/worktree_guard.py) | Work-tree and index mutation detector during active reviews | `find_worktree_mutation()` |
 | [`craftsman/scope.py`](../craftsman/scope.py) | Repository search-scope guard for tool calls and Antigravity `run_command` (`craftsman scope-guard`) | `check_tool_scope()`, `evaluate_antigravity_scope()`, `main()` |
-| [`craftsman/export.py`](../craftsman/export.py) | Multi-platform skill/agent/hook compiler | `export_to_copilot_skills()`, `export_copilot_home()`, `export_to_claude_user()`, `export_to_agents_workspace()` |
+| [`craftsman/paths.py`](../craftsman/paths.py) | Platform home, VS Code profile, Copilot, Claude, and asset directory resolution | `user_home()`, `default_repo_dir()`, `resolve_craftsman_pkg_dir()` |
+| [`craftsman/assets.py`](../craftsman/assets.py) | Bundled skill, agent template (`{{include ...}}`), and combined rule loader | `iter_skills()`, `load_agent_templates()`, `render_combined_rules()` |
+| [`craftsman/generated.py`](../craftsman/generated.py) | Craftsman-generated file markers, JSON object writers, and managed Markdown blocks | `write_generated()`, `upsert_managed_markdown()`, `strip_managed_block()` |
+| [`craftsman/hook_command.py`](../craftsman/hook_command.py) | Absolute Python + CLI hook command builder for user-level hooks | `absolute_hook_prefixes()`, `cli_shim_for()` |
+| [`craftsman/platforms/`](../craftsman/platforms/__init__.py) | Per-platform exporters and installers (`copilot.py`, `claude.py`, `antigravity.py`, `agents_md.py`) | `install_copilot_target()`, `install_claude_target()`, `install_antigravity_target()`, `install_agents_workspace_target()` |
+| [`craftsman/export.py`](../craftsman/export.py) | Multi-platform `craftsman export` CLI entrypoint | `main()` |
 | [`craftsman/install.py`](../craftsman/install.py) | Cross-platform installer orchestration (`craftsman install`) and 3.x git-hook upgrade cleanup | `install_main()`, `run_install()` |
 | [`craftsman/uninstall.py`](../craftsman/uninstall.py) | Manifest-driven uninstaller (`craftsman uninstall`) and 3.x git-hook cleanup | `uninstall_main()`, `run_uninstall()` |
 | [`craftsman/legacy_githooks.py`](../craftsman/legacy_githooks.py) | Removal of global git hooks installed by Craftsman 3.x (scheduled for removal in 5.0) | `restore_hooks_path()`, `craftsman_home_dir()` |
