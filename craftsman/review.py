@@ -239,7 +239,9 @@ def _prepare(args: argparse.Namespace) -> int:
     ledger = load(ws.ledger_path)
     base_sha = ws.base_sha(ledger, args.base)
     full_snap = snapshot(ws.root, base_sha)
-    scope, snap, allow_scope_expansion = _prepare_scope_and_snapshot(ws, ledger, args, base_sha, full_snap)
+    scope, snap, allow_scope_expansion = _prepare_scope_and_snapshot(
+        ws, ledger, args, base_sha, full_snap
+    )
     if snap.is_empty:
         return _print_empty_prepare(scope, snap, full_snap)
     tier = resolve_tier(ws, ledger, args.tier, snap)
@@ -694,7 +696,7 @@ def _record_entries(
             continue
         results.append(item)
     if problems:
-        raise BatchRejected(command, tuple(problems), len(raw_entries))
+        raise BatchRejected(f"{PROG} {command}", tuple(problems), len(raw_entries))
     return current, results
 
 
@@ -947,9 +949,7 @@ def _add_from_json(args: argparse.Namespace) -> int:
             raw_entries,
             current,
             lambda index, _raw: f"F{base_number + index - 1}",
-            lambda _index, state, raw: (
-                lambda res: (res[0], (res[1], res[2]))
-            )(_add_one_from_json(ws, cwd, snap, state, raw)),
+            lambda _index, state, raw: _add_one_from_json(ws, cwd, snap, state, raw),
         )
 
     return _run_batch(ws, args, record_batch, lambda pair: _print_recorded(pair[0], pair[1]))
@@ -957,7 +957,7 @@ def _add_from_json(args: argparse.Namespace) -> int:
 
 def _add_one_from_json(
     ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any
-) -> tuple[Ledger, Finding, list[str] | None]:
+) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
     f = Fields(raw)
     lens = f.choice("lens", tuple(sorted(LENS_IDS)))
     raw_file = f.text("file")
@@ -981,7 +981,7 @@ def _add_one_from_json(
         suggestion=suggestion,
         signal_id=signal_id,
     )
-    return updated, finding, lines
+    return updated, (finding, lines)
 
 
 def _print_recorded(finding: Finding, lines: Sequence[str] | None) -> None:
@@ -1946,10 +1946,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def format_batch_rejection(exc: BatchRejected) -> str:
     """Render every rejected batch entry without the `error:` prefix, capped at 20 lines."""
-    noun = "entry" if exc.total == 1 else "entries"
-    head_cmd = exc.command if exc.command.startswith(PROG) else f"{PROG} {exc.command}"
     lines = [
-        f"{head_cmd}: {len(exc.problems)} of {exc.total} {noun} rejected; nothing was recorded.",
+        str(exc),
         "Fix all of them, then send the corrected list once:",
     ]
     shown = exc.problems[:MAX_REPORTED_BATCH_PROBLEMS]
