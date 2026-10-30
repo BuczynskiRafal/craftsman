@@ -172,8 +172,10 @@ COPILOT_AGENT_TOOLS: dict[TemplateRole, tuple[str, ...]] = {
 }
 CLAUDE_AGENT_TOOLS = "Read, Grep, Glob, Bash"
 COPILOT_TERMINAL_NOTE = (
-    "Terminal commands run in the integrated terminal: single-line `craftsman` commands work "
-    "across bash, zsh, and PowerShell, while for `--from-json` batches in PowerShell use "
+    "Terminal commands run in the integrated terminal: keep single-line `craftsman` commands on "
+    "one line (`'...'` in bash, zsh, and PowerShell, escaping inner `'` as `''` in PowerShell; "
+    '`"..."` with `\\"` in `cmd.exe`, where `\'` is not a quote character), while for '
+    "`--from-json` batches in PowerShell use "
     "`@' ... '@ | craftsman review <cover|add|verdict> --from-json -` (ASCII notes in Windows "
     "PowerShell 5.1, with `@'` and `'@` on their own lines) or a path from "
     "`craftsman review inbox <cover|add|verdict>` written with "

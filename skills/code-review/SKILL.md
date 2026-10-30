@@ -467,12 +467,13 @@ ones are listed briefly so the reader sees what was considered.
   Antigravity: `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
   `craftsman-verifier`. Copilot CLI: `/agent` or the task tool. Codex and others:
   run the lenses yourself, one at a time.
-- **Shell.** Single-line flag commands have no shell expansion when single-quoted and work
-  identically in `bash`, `zsh`, `PowerShell`, and `cmd`: keep each on one line (no `\`
-  continuations), and use single quotes whenever a note, scenario, or evidence quotes `$` or
-  backticks. Multi-line `--from-json - <<'EOF'` heredocs are POSIX-shell (`bash`/`zsh`) syntax; in
-  `PowerShell`, pipe a single-quoted here-string (`@'` and `'@` on their own lines, which does not
-  expand `$` or backticks, matching `<<'EOF'`):
+- **Shell.** Keep single-line flag commands on one line (no `\` continuations). In `bash`, `zsh`,
+  and `PowerShell`, single quotes (`'...'`) suppress `$` and backtick expansion (in `PowerShell`,
+  escape an apostrophe inside `'...'` as `''`); in `cmd.exe`, `'` is not a quote character — wrap
+  values in double quotes (`"..."`, escaping inner `"` as `\"`; `cmd` does not expand `$` or
+  backticks, only `%VAR%`). Multi-line `--from-json - <<'EOF'` heredocs are POSIX-shell
+  (`bash`/`zsh`) syntax; in `PowerShell`, pipe a single-quoted here-string (`@'` and `'@` on their
+  own lines, which does not expand `$` or backticks, matching `<<'EOF'`):
   ```powershell
   @'
   [ ...json... ]
