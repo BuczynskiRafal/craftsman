@@ -15,7 +15,8 @@ This repository uses **Craftsman**: every change is reviewed and verified agains
 
 ## Search scope
 - Work only inside this git work tree (`git rev-parse --show-toplevel`): prefer `git ls-files`, `git grep`, and editor search scoped to this folder.
-- Outside the work tree you may read only an exact file cited by a stack trace/error, a temp directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI commands.
+- Outside the work tree you may read only an exact file cited by a stack trace/error, a temp directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI commands (never open `.git/craftsman` files by hand except the exact packet path or an inbox file path that `craftsman review prepare`, `craftsman review show` or `craftsman review inbox` prints for this repository).
+- Batch JSON files go only to `craftsman review inbox` paths; never to `%TEMP%` or into the repository; a file you had to create elsewhere must be deleted before you report.
 - Never run recursive searches of `~`, `/`, or parent directories, and never open other repositories, other projects' packets/ledgers/reports, or assistant session stores.
 
 ## Available Skills

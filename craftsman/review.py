@@ -22,7 +22,16 @@ from craftsman.diffscan import (
     staged_paths,
     untracked_paths,
 )
-from craftsman.evidence import archive_ledger, effective_tier, packet_path, prune_round_files
+from craftsman.evidence import (
+    INBOX_KINDS,
+    archive_ledger,
+    consume_inbox_file,
+    create_inbox_file,
+    effective_tier,
+    packet_path,
+    prune_inbox_files,
+    prune_round_files,
+)
 from craftsman.gate import GateState, GateStateError, Stage, current_tier, state_path_for, update_state
 from craftsman.gatecheck import (
     SELF_REVIEWED_BANNER,
@@ -261,6 +270,7 @@ def _prepare(args: argparse.Namespace) -> int:
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if created:
         prune_round_files(ws.ledger_path.parent, round_.number)
+        prune_inbox_files(ws.ledger_path.parent)
     return 0
 
 
@@ -690,12 +700,20 @@ def _record_entries(
 
 def _run_batch(
     ws: Workspace,
-    _args: argparse.Namespace,
+    args: argparse.Namespace,
     record_batch: Callable[[Ledger], tuple[Ledger, list[R]]],
     emit: Callable[[R], None],
 ) -> int:
-    for item in mutate(ws.ledger_path, record_batch):
+    recorded = mutate(ws.ledger_path, record_batch)
+    consume_inbox_file(ws.ledger_path.parent, args.from_json)
+    for item in recorded:
         emit(item)
+    return 0
+
+
+def _inbox(args: argparse.Namespace) -> int:
+    ws = open_workspace(args.cwd)
+    print(create_inbox_file(ws.ledger_path.parent, args.kind).resolve())
     return 0
 
 
@@ -1448,6 +1466,8 @@ def _report(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print("\n".join(_report_lines(ledger, snap, tier, report, groups, runs)))
+    if args.review_only:
+        prune_inbox_files(ws.ledger_path.parent)
     return 0
 
 
@@ -1875,6 +1895,13 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_merge_and_verdict_parsers(sub, common)
     _add_resolution_and_status_parsers(sub, common)
     _add_inspection_parsers(sub, common)
+    inbox = sub.add_parser(
+        "inbox",
+        parents=[common],
+        help="Create a unique managed JSON file in <git-dir>/craftsman/inbox/ for --from-json",
+    )
+    inbox.add_argument("kind", choices=INBOX_KINDS, help="Batch command the file is for")
+    inbox.set_defaults(handler=_inbox)
     # Prefix matching would let `--lens` stand in for `--lenses` and similar near-misses.
     for command in sub.choices.values():
         command.allow_abbrev = False

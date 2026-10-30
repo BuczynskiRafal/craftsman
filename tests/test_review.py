@@ -1230,5 +1230,121 @@ class JsonEncodingTests(FastCliTestCase):
             self.assertIn("save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)", result.err)
 
 
+class InboxCliTests(FastCliTestCase):
+    def _new_inbox_path(self, kind: str = "cover", cwd: Path | None = None) -> Path:
+        target_cwd = str(cwd or self.repo.root)
+        res = run_main(cli_main, "review", "inbox", kind, "--cwd", target_cwd)
+        self.assertEqual(res.code, 0, res.err)
+        return Path(res.out.strip())
+
+    def test_inbox_creates_unique_paths_consumed_on_success(self) -> None:
+        self.prepare_bug()
+        first = self._new_inbox_path("cover")
+        second = self._new_inbox_path("cover")
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.is_file())
+        self.assertTrue(second.is_file())
+
+        first.write_text(json.dumps([{"lens": "intent", "hunks": ["H1"], "note": "H1 weak"}]), encoding="utf-8")
+        rejected = self.cli_fast("review", "cover", "--from-json", str(first))
+        self.assertEqual(rejected.code, 1)
+        self.assertTrue(first.is_file())
+
+        first.write_text(
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            encoding="utf-8",
+        )
+        recorded = self.cli_fast("review", "cover", "--from-json", str(first))
+        self.assertEqual(recorded.code, 0, recorded.err)
+        self.assertFalse(first.exists())
+        self.assertTrue(second.is_file())
+
+    def test_external_file_or_inbox_symlink_is_never_deleted(self) -> None:
+        self.prepare_bug()
+        outside = self.tmp / "outside-cover.json"
+        outside.write_text(
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.cli_fast("review", "cover", "--from-json", str(outside)).code, 0)
+        self.assertTrue(outside.is_file())
+
+        target = self.tmp / "symlink-target.json"
+        target.write_text(
+            json.dumps([{"lens": "contracts", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            encoding="utf-8",
+        )
+        inbox_dir = self.repo.ledger_dir / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+        link = inbox_dir / "cover-link.json"
+        link.symlink_to(target)
+        self.assertEqual(self.cli_fast("review", "cover", "--from-json", str(link)).code, 0)
+        self.assertTrue(link.is_symlink())
+        self.assertTrue(target.is_file())
+
+    def test_inbox_unlink_oserror_warns_without_failing(self) -> None:
+        self.prepare_bug()
+        inbox_file = self._new_inbox_path("cover")
+        inbox_file.write_text(
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            encoding="utf-8",
+        )
+        real_unlink = Path.unlink
+
+        def fail_inbox_unlink(path_obj: Path, missing_ok: bool = False) -> None:
+            if path_obj.resolve() == inbox_file.resolve():
+                raise PermissionError("locked by antivirus")
+            real_unlink(path_obj, missing_ok=missing_ok)
+
+        with mock.patch.object(Path, "unlink", fail_inbox_unlink):
+            res = self.cli_fast("review", "cover", "--from-json", str(inbox_file))
+
+        self.assertEqual(res.code, 0)
+        self.assertIn("warning: could not remove inbox file", res.err)
+        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 1)
+
+    def test_inbox_pruned_by_new_round_reset_or_review_only(self) -> None:
+        self.prepare_bug()
+        orphan = self._new_inbox_path("cover")
+        same_round = self.cli_fast("review", "prepare", "--tier", "quick")
+        self.assertEqual(same_round.code, 0)
+        self.assertTrue(orphan.is_file())
+
+        self.repo.write("cart.py", BUGGY_TOTAL + "# next round\n")
+        next_round = self.cli_fast("review", "prepare", "--tier", "quick")
+        self.assertEqual(next_round.code, 0)
+        self.assertFalse(orphan.exists())
+        self.assertIn("Pruned 1 inbox file(s):", next_round.err)
+
+        second_orphan = self._new_inbox_path("add")
+        report_ro = self.cli_fast("review", "report", "--review-only")
+        self.assertEqual(report_ro.code, 0)
+        self.assertFalse(second_orphan.exists())
+        self.assertIn("Pruned 1 inbox file(s):", report_ro.err)
+
+        third_orphan = self._new_inbox_path("verdict")
+        reset = self.cli_fast("review", "reset")
+        self.assertEqual(reset.code, 0)
+        self.assertFalse(third_orphan.exists())
+        self.assertIn("Pruned 1 inbox file(s):", reset.err)
+
+    def test_inbox_pruned_when_gate_complete_succeeds(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.assertEqual(self.cli_fast("gate", "--init", "--tier", "quick").code, 0)
+        self.assertEqual(self.cli_fast("review", "prepare", "--tier", "quick").code, 0)
+        orphan = self._new_inbox_path("cover")
+
+        blocked = self.cli_fast("gate", "--complete")
+        self.assertEqual(blocked.code, 1)
+        self.assertTrue(orphan.is_file())
+
+        self.repo.cover_all()
+        self.run_tests()
+        completed = self.cli_fast("gate", "--complete")
+        self.assertEqual(completed.code, 0, completed.err)
+        self.assertFalse(orphan.exists())
+        self.assertIn("Pruned 1 inbox file(s):", completed.err)
+
+
 if __name__ == "__main__":
     unittest.main()
