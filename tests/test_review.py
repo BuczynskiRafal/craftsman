@@ -1368,6 +1368,61 @@ class InboxCliTests(FastCliTestCase):
         self.assertEqual(res.code, 0, res.err)
         self.assertFalse(inbox_file.exists())
 
+    def test_check_flag_validates_without_recording_or_consuming(self) -> None:
+        self.prepare_bug()
+        inbox_file = self._new_inbox_path("cover")
+        inbox_file.write_text(
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.cli_fast("review", "cover", "--check", "--from-json", str(inbox_file)).code, 0)
+        self.assertEqual(
+            self.cli_fast(
+                "review", "cover", "--check", "--lens", "intent", "--hunks", "H1", "--note", coverage_note(["H1"])
+            ).code,
+            0,
+        )
+        self.assertTrue(inbox_file.is_file())
+        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
+
+        add_inbox = self._new_inbox_path("add")
+        add_inbox.write_text(
+            json.dumps([{
+                "lens": "contracts", "file": "cart.py", "line": 3, "severity": "major",
+                "title": "Empty cart divides by zero",
+                "scenario": "total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError",
+            }]),
+            encoding="utf-8",
+        )
+        self.assertEqual(self.cli_fast("review", "add", "--check", "--from-json", str(add_inbox)).code, 0)
+        self.assertTrue(add_inbox.is_file())
+        self.assertEqual(
+            self.cli_fast("review", "add", "--check", "--file", "cart.py", "--line", "0", *FINDING_FLAGS).code,
+            1,
+        )
+        self.assertEqual(
+            self.cli_fast("review", "add", "--check", "--file", "cart.py", "--line", "3", *FINDING_FLAGS).code,
+            0,
+        )
+        self.assertEqual(self.repo.show()["findings"], [])
+
+        self.add()
+        verdict_inbox = self._new_inbox_path("verdict")
+        verdict_inbox.write_text(
+            json.dumps([{"id": "F1", "as": "probable", "evidence": STATIC_EVIDENCE}]), encoding="utf-8"
+        )
+        self.assertEqual(
+            self.cli_fast("review", "verdict", "--check", "--from-json", str(verdict_inbox)).code, 0
+        )
+        self.assertTrue(verdict_inbox.is_file())
+        self.assertEqual(
+            self.cli_fast(
+                "review", "verdict", "--check", "F1", "--as", "probable", "--evidence", STATIC_EVIDENCE
+            ).code,
+            0,
+        )
+        self.assertIsNone(self.repo.show()["findings"][0]["verdict"])
+
 
 if __name__ == "__main__":
     unittest.main()

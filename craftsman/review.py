@@ -698,12 +698,31 @@ def _record_entries(
     return current, results
 
 
+def _print_check_passed(count: int) -> int:
+    noun = "entry" if count == 1 else "entries"
+    print(f"Check passed: {count} {noun} valid; nothing was recorded.")
+    return 0
+
+
+def _run_single(
+    ws: Workspace, check: bool, record: Callable[[Ledger], tuple[Ledger, R]], emit: Callable[[R], None]
+) -> int:
+    if check:
+        record(load(ws.ledger_path))
+        return _print_check_passed(1)
+    emit(mutate(ws.ledger_path, record))
+    return 0
+
+
 def _run_batch(
     ws: Workspace,
     args: argparse.Namespace,
     record_batch: Callable[[Ledger], tuple[Ledger, list[R]]],
     emit: Callable[[R], None],
 ) -> int:
+    if args.check:
+        _, checked = record_batch(load(ws.ledger_path))
+        return _print_check_passed(len(checked))
     recorded = mutate(ws.ledger_path, record_batch)
     consume_inbox_file(ws.ledger_path.parent, args.from_json)
     for item in recorded:
@@ -750,8 +769,7 @@ def _cover_one(args: argparse.Namespace) -> int:
         round_ = require_current_round(current, snap)
         return _record_coverage(current, round_, lenses, targets, args.note, target_kind=target_kind)
 
-    print(mutate(ws.ledger_path, record))
-    return 0
+    return _run_single(ws, bool(args.check), record, print)
 
 
 def _cover_entry_label(raw: Any) -> str | None:
@@ -909,8 +927,7 @@ def _add_one(args: argparse.Namespace) -> int:
             signal_id=args.signal,
         )
 
-    _print_recorded(mutate(ws.ledger_path, record), lines)
-    return 0
+    return _run_single(ws, bool(args.check), record, lambda finding: _print_recorded(finding, lines))
 
 
 def _add_from_json(args: argparse.Namespace) -> int:
@@ -1130,12 +1147,12 @@ def _verdict(args: argparse.Namespace) -> int:
 def _verdict_one(args: argparse.Namespace) -> int:
     _require_flags(args, {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence})
     ws = open_workspace(args.cwd)
-    finding = mutate(
-        ws.ledger_path,
+    return _run_single(
+        ws,
+        bool(args.check),
         lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run),
+        _print_verdict,
     )
-    _print_verdict(finding)
-    return 0
 
 
 def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
@@ -1895,6 +1912,12 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_merge_and_verdict_parsers(sub, common)
     _add_resolution_and_status_parsers(sub, common)
     _add_inspection_parsers(sub, common)
+    for name in ("cover", "add", "verdict"):
+        sub.choices[name].add_argument(
+            "--check",
+            action="store_true",
+            help="Validate without recording to the ledger or consuming an inbox file",
+        )
     inbox = sub.add_parser(
         "inbox",
         parents=[common],
