@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 from craftsman.export import user_home
-from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 from craftsman.records import CRAFTSMAN_AGENTS
+from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 
 ScopeMode = Literal["deny", "warn", "off"]
 SHELL_TOOL_NAMES = frozenset(
