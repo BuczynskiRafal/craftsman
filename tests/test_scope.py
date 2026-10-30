@@ -964,6 +964,40 @@ class ScopeEnforcementTests(unittest.TestCase):
             "deny",
         )
 
+    def test_herestring_token_boundaries_distinguish_bash_mid_word_quotes(self) -> None:
+        ps_cover = (
+            "@'\n"
+            '[{"lens": "intent", "hunks": ["H1"], "note": "ok"}]\n'
+            "'@ | craftsman review cover --from-json -"
+        )
+        ps_non_closer_body = "@'\n'@not_a_closer\n'@ | craftsman review cover --from-json -"
+        for tool, cmd, expected in (
+            ("Bash", "printf 'ok' foo@'\necho hi'", "allow"),
+            ("Bash", 'printf "ok" user@"\nhost"', "allow"),
+            ("pwsh", ps_cover, "allow"),
+            ("pwsh", ps_non_closer_body, "allow"),
+        ):
+            with self.subTest(cmd=cmd):
+                dec = evaluate_scope(tool, {"command": cmd}, self.repo, self.repo, self.policy)
+                self.assertEqual(dec.decision, expected, dec.reason)
+
+        chained = "printf 'ok' foo@'\necho hi'\nfind ~ -name SKILL.md"
+        chained_dec = evaluate_scope(
+            "Bash", {"command": chained}, self.repo, self.repo, self.policy
+        )
+        self.assertEqual(chained_dec.decision, "deny")
+        self.assertNotIn("unmatched quotes", chained_dec.reason)
+
+        for unclosed in ("@'\n[{\"lens\": \"intent\"}]\n", "@'\n'@not_a_closer\n"):
+            with self.subTest(unclosed=unclosed):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    dec = evaluate_scope(
+                        "pwsh", {"command": unclosed}, self.repo, self.repo, self.policy
+                    )
+                self.assertEqual(dec.decision, "deny")
+                self.assertIn("has unmatched quotes", dec.reason)
+
     def test_scope_allow_parent_still_denies_other_worktree_git_dirs(self) -> None:
         wt1, _ = self._add_linked_worktree("wt-one")
         wt2, wt2_git = self._add_linked_worktree("wt-two")

@@ -170,12 +170,21 @@ def _consume_heredoc_body(command_line: str, start: int, delim: str) -> tuple[st
     return "".join(chunks), i
 
 
+_PS_HERESTRING_OPEN_BOUNDARIES = (" ", "\t", "\n", "\r", "(", "=", ";", "|", "&")
+_PS_HERESTRING_CLOSE_FOLLOWERS = (" ", "\t", "|", ";", ")", "&")
+
+
 def _consume_ps_herestring_token(command_line: str, idx: int) -> tuple[str, int] | None:
-    """If `idx` opens a PowerShell `@'\\n...\\n'@` / `@\"\\n...\\n\"@` here-string, return `(token, next_idx)`."""
-    if command_line[idx] != "@" or idx + 2 >= len(command_line) or command_line[idx + 1] not in ("'", '"'):
+    """Consume a PowerShell `@'\\n...\\n'@` or `@\"\\n...\\n\"@` here-string starting at `idx`."""
+    if (
+        command_line[idx] != "@"
+        or (idx > 0 and command_line[idx - 1] not in _PS_HERESTRING_OPEN_BOUNDARIES)
+        or idx + 2 >= len(command_line)
+        or command_line[idx + 1] not in ("'", '"')
+    ):
         return None
     quote_char = command_line[idx + 1]
-    nl_len = 2 if command_line[idx + 2 : idx + 4] == "\r\n" else (1 if command_line[idx + 2] == "\n" else 0)
+    nl_len = 2 if command_line[idx + 2 : idx + 4] == "\r\n" else int(command_line[idx + 2] == "\n")
     if nl_len == 0:
         return None
     close_token = f"{quote_char}@"
@@ -184,7 +193,11 @@ def _consume_ps_herestring_token(command_line: str, idx: int) -> tuple[str, int]
     while i < n:
         line_end = command_line.find("\n", i)
         raw_line = command_line[i:] if line_end == -1 else command_line[i:line_end]
-        if raw_line.startswith(close_token):
+        clean_line = raw_line.rstrip("\r")
+        if clean_line.startswith(close_token) and (
+            len(clean_line) == len(close_token)
+            or clean_line[len(close_token)] in _PS_HERESTRING_CLOSE_FOLLOWERS
+        ):
             body = "".join(chunks).removesuffix("\n").removesuffix("\r")
             escaped_body = body.replace("'", "'\\''")
             return f"'{escaped_body}'", i + len(close_token)
@@ -221,7 +234,7 @@ def _flush_segment(current: list[str], events: list[str]) -> list[str]:
     return []
 
 
-def _split_shell_events(command_line: str) -> list[str]:
+def split_shell_events(command_line: str) -> list[str]:
     """Split a shell command line into command segments and subshell boundary tokens `(` and `)`."""
     events: list[str] = []
     current: list[str] = []
@@ -650,7 +663,7 @@ def iter_simple_commands(
     dir_stack: list[str | None] = []
     subshell_stack: list[tuple[str | None, list[str | None]]] = []
 
-    for ev in _split_shell_events(command_line):
+    for ev in split_shell_events(command_line):
         if ev == "(":
             subshell_stack.append((cur_cwd, list(dir_stack)))
             continue

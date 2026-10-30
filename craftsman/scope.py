@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 from craftsman.export import user_home
-from craftsman.guard import HEREDOC_OPEN_RE, _split_shell_events, iter_simple_commands
+from craftsman.guard import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 from craftsman.records import CRAFTSMAN_AGENTS
 
 ScopeMode = Literal["deny", "warn", "off"]
@@ -350,7 +350,7 @@ def _extract_path_candidates(args: Sequence[str], base_cwd: Path) -> list[Path]:
 
 
 def _has_unmatched_quotes(command_line: str) -> bool:
-    for seg in _split_shell_events(command_line):
+    for seg in split_shell_events(command_line):
         if seg in ("(", ")"):
             continue
         first_line = seg.split("\n", 1)[0]
