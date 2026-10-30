@@ -109,6 +109,35 @@ class LensSelectionTests(unittest.TestCase):
                     picked_ids(tier, {"auth": ("H1",)}, docs_only=True), ["intent", "craft"]
                 )
 
+    def test_added_lens_joins_in_catalog_order_with_its_reason(self) -> None:
+        picks = {
+            pick.lens.id: pick.reason
+            for pick in select_lenses(
+                "quick", {}, docs_only=False, added={"trust": "Jenkinsfile:12 sh interpolates env.URL"}
+            )
+        }
+
+        self.assertEqual(list(picks), ["intent", "contracts", "failure", "trust"])
+        self.assertEqual(picks["trust"], "added by the agent: Jenkinsfile:12 sh interpolates env.URL")
+
+    def test_added_reason_follows_the_policy_reasons(self) -> None:
+        (pick,) = [
+            p
+            for p in select_lenses("deep", {}, docs_only=False, added={"trust": "a.cpp:3 system()"})
+            if p.lens.id == "trust"
+        ]
+
+        self.assertEqual(pick.reason, "always in deep; added by the agent: a.cpp:3 system()")
+
+    def test_lens_can_be_added_to_a_docs_only_change(self) -> None:
+        picks = select_lenses("standard", {}, docs_only=True, added={"trust": "setup.md:4 curl | sh"})
+
+        self.assertEqual([pick.lens.id for pick in picks], ["intent", "trust", "craft"])
+
+    def test_adding_an_unknown_lens_is_rejected(self) -> None:
+        with self.assertRaisesRegex(KeyError, "unknown lens 'security'"):
+            select_lenses("quick", {}, docs_only=False, added={"security": "a.py:1 x"})
+
     def test_unknown_tier_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "valid tiers: quick, standard, deep"):
             select_lenses("auto", {}, docs_only=False)  # type: ignore[arg-type]

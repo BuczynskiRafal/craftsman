@@ -214,6 +214,99 @@ class PrepareTests(RepoTestCase):
         self.assertIn("**Task:** Add cart totals", self.packet())
 
 
+DEPLOY_SCRIPT = '#!/bin/sh\ncurl -fsSL "$INSTALL_URL" | sh\n'
+ADD_TRUST = "trust=deploy.sh:2 pipes a script downloaded from $INSTALL_URL into sh"
+
+
+class LensAdditionTests(RepoTestCase):
+    def prepare_deploy(self, *extra: str) -> str:
+        self.repo.write("deploy.sh", DEPLOY_SCRIPT)
+        return self.review("prepare", "--tier", "quick", *extra).stdout
+
+    def test_added_lens_joins_the_round_with_its_reason(self) -> None:
+        out = self.prepare_deploy("--add-lens", ADD_TRUST)
+
+        self.assertIn("Added lens `trust`: deploy.sh:2 pipes a script downloaded", out)
+        self.assertIn("Lenses: intent, contracts, failure, trust\n", out)
+        self.assertIn("added by the agent: deploy.sh:2 pipes a script downloaded", self.packet())
+
+    def test_prepare_names_files_the_signal_patterns_cannot_read(self) -> None:
+        out = self.prepare_deploy()
+
+        self.assertIn("Not scanned for risk signals (no patterns for their language): deploy.sh.", out)
+        self.assertIn(
+            "Not scanned for risk signals (no patterns for their language): `deploy.sh`", self.packet()
+        )
+
+    def test_adding_a_lens_to_an_unchanged_diff_opens_a_round_that_needs_only_it(self) -> None:
+        self.prepare_deploy()
+        for lens in ("intent", "contracts", "failure"):
+            self.cover(lens, "H1")
+
+        out = self.review("prepare", "--tier", "quick", "--add-lens", ADD_TRUST).stdout
+        blocked = self.review("check", check=False)
+
+        self.assertIn("Round 2 prepared (quick)", out)
+        self.assertIn("[uncovered] Lens `trust` has", blocked.stdout)
+        self.assertNotIn("`intent`", blocked.stdout.split("[uncovered]", 1)[1].splitlines()[0])
+
+    def test_added_lens_stays_in_later_rounds(self) -> None:
+        self.prepare_deploy("--add-lens", ADD_TRUST)
+        self.repo.write("deploy.sh", DEPLOY_SCRIPT + "echo done\n")
+
+        out = self.review("prepare", "--tier", "quick").stdout
+
+        self.assertIn("Round 2 prepared (quick)", out)
+        self.assertIn("Lenses: intent, contracts, failure, trust\n", out)
+
+    def test_adding_a_lens_again_or_one_already_selected_records_nothing(self) -> None:
+        self.prepare_deploy("--add-lens", ADD_TRUST)
+
+        out = self.review(
+            "prepare", "--tier", "quick", "--add-lens", ADD_TRUST,
+            "--add-lens", "intent=deploy.sh:2 the script's purpose is unclear",
+        ).stdout  # fmt: skip
+
+        self.assertIn("Lens `trust` was already added in round 1: deploy.sh:2", out)
+        self.assertIn("Lens `intent` is already selected (always in quick); nothing to add.", out)
+        self.assertIn("Round 1 unchanged", out)
+        self.assertEqual(len(self.json_of("show")["lens_additions"]), 1)
+
+    def test_report_lists_the_added_lens(self) -> None:
+        self.prepare_deploy("--add-lens", ADD_TRUST)
+
+        report = self.review("report").stdout
+
+        self.assertIn(
+            "- Lens `trust` added by the agent in round 1: deploy.sh:2 pipes a script downloaded", report
+        )
+        self.assertEqual(self.json_of("report")["lens_additions"][0]["lens"], "trust")
+
+    def test_invalid_additions_are_rejected_before_anything_is_recorded(self) -> None:
+        self.repo.write("deploy.sh", DEPLOY_SCRIPT)
+        cases = [
+            ("trust", "--add-lens must be LENS=REASON"),
+            ("security=deploy.sh:2 pipes curl into sh", "--add-lens security: lens must be one of"),
+            (
+                "sweep=deploy.sh:2 pipes curl into sh",
+                "--add-lens sweep: lens `sweep` is not a risk lens",
+            ),
+            (
+                "trust=pipes a downloaded script into sh",
+                "--add-lens trust: reason must cite the changed code",
+            ),
+        ]
+        for value, message in cases:
+            with self.subTest(value=value):
+                self.assert_error(self.review("prepare", "--add-lens", value, check=False), 1, message)
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+
+    def test_addition_without_a_change_is_reported_as_ignored(self) -> None:
+        out = self.review("prepare", "--add-lens", ADD_TRUST).stdout
+
+        self.assertIn("--add-lens ignored: there is no change to review.", out)
+
+
 class CoverTests(RepoTestCase):
     def test_cover_reports_what_is_left(self) -> None:
         self.prepare_bug()

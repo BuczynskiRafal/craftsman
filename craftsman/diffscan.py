@@ -130,6 +130,10 @@ _CONTENT_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
         r"\bsubprocess\.|\bos\.(?:system|popen|exec\w*|spawn\w*)\s*\(|\bshell\s*=\s*True\b"
         r"|\bchild_process\b|\bexec\.Command(?:Context)?\s*\(|Runtime\.getRuntime\(\)\.exec"
         r"|\bProcess\.Start\s*\(|\bProcessBuilder\b|\b(?:execSync|spawnSync|execFile)\b"
+        # C/C++, Groovy (`"cmd".execute()`) and Jenkins pipeline shell steps
+        r"|(?<![\w.])(?:std::)?(?:system|popen|exec(?:l|lp|le|v|ve|vp|vpe))\s*\(|\bCreateProcess[AW]?\s*\("
+        r"|\bShellExecute(?:Ex)?[AW]?\s*\(|[\"'\]]\s*\.execute\s*\("
+        r"|(?<![\w.$])(?:sh|bat|powershell|pwsh)\s*[(\"']"
     ),
     "filesystem": re.compile(
         r"(?<![\w])open\s*\(|\bPath\s*\(|\bos\.path\.|\bshutil\.|\bos\.(?:remove|unlink|rename|"
@@ -137,33 +141,40 @@ _CONTENT_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|\bfs\.\w|\bFiles?\.\w|\btempfile\.|\.(?:read_text|write_text|read_bytes|write_bytes|"
         r"touch|mkdir|rmdir)\s*\(|\bos\.(?:Open|Create|ReadFile|WriteFile|Remove|RemoveAll|"
         r"MkdirAll)\b|\bioutil\."
+        r"|\bfopen\s*\(|\bstd::(?:filesystem|[io]?fstream)\b|\bnew\s+File\s*\("
+        r"|\b(?:readFile|writeFile|deleteDir)\b"
     ),
     "network": re.compile(
         r"\brequests\.|\bhttpx\.|\burllib\b|\bfetch\s*\(|\baxios\b|\bsocket\.|\baiohttp\b"
         r"|\bhttp\.(?:Client|Get|Post|NewRequest)\b|\bHttpClient\b|\bWebSocket\b|\burlopen\s*\("
+        r"|\bcurl_easy_\w+|\bboost::asio\b|\bhttpRequest\b"
     ),
     "sql": re.compile(
         r"(?i:\bselect\b.+?\bfrom\b|\binsert\s+into\b|\bupdate\s+\w+\s+set\b|\bdelete\s+from\b)"
-        r"|\.execute(?:many)?\s*\(|\bcursor\s*[.(]|\.cursor\s*\(|\.query\s*\("
+        r"|\.execute(?:many)?\s*\((?!\s*\))|\bcursor\s*[.(]|\.cursor\s*\(|\.query\s*\("
     ),
     "deserialization": re.compile(
         r"\bpickle\.|\byaml\.(?:load|unsafe_load|full_load)\s*\(|\bmarshal\.|\bshelve\.|\bjsonpickle\b"
         r"|(?<![\w.])(?:eval|exec)\s*\(|\bJSON\.parse\s*\(|\bObjectInputStream\b"
+        r"|\bevaluate\s*\(\s*(?:new\s+File|readFile)\b|\bGroovyShell\b|\bEval\.(?:me|x|xy|xyz)\s*\("
     ),
     "concurrency": re.compile(
         r"\bthreading\b|\bThread\s*\(|\bR?Lock\s*\(|\bSemaphore\s*\(|\basyncio\b|\bawait\s"
         r"|\basync\s+def\b|\bPromise\b|\bgo\s+func\b|\bsync\.(?:Mutex|RWMutex|WaitGroup|Once)\b"
         r"|\bmultiprocessing\b|\bconcurrent\.futures\b|\batomic\b|\bAtomic[A-Z]\w*|\bsynchronized\b"
+        r"|\bstd::(?:j?thread|(?:shared_|recursive_)?mutex|condition_variable|async|future|promise"
+        r"|lock_guard|unique_lock|scoped_lock)\b|\bpthread_\w+|(?<![\w.])parallel\s*[({]"
     ),
     "time": re.compile(
         r"\bdatetime\b|\btime\.(?:time|sleep|monotonic|perf_counter|strftime|localtime|gmtime)\s*\("
         r"|\btimezone\b|\btzinfo\b|\bzoneinfo\b|\bpytz\b|\bnew\s+Date\s*\(|\bDate\.now\s*\("
         r"|\butcnow\b|\btime\.(?:Now|Since|Sleep|Duration)\b"
+        r"|\bstd::chrono\b|(?<![\w.])(?:localtime|gmtime|mktime|strftime)(?:_[rs])?\s*\("
     ),
     "regex": re.compile(
         r"\bre\.(?:compile|match|search|sub|subn|fullmatch|findall|finditer|split)\s*\("
         r"|\bnew\s+RegExp\s*\(|\bregexp\.(?:MustCompile|Compile|MatchString)\s*\(|\bRegex\s*\("
-        r"|\bPattern\.compile\s*\("
+        r"|\bPattern\.compile\s*\(|\b(?:std|boost)::regex\b|==?~"
     ),
     "auth": re.compile(
         rf"(?<![A-Za-z])(?i:{_AUTH_ALTERNATION})s?(?![a-z])"
@@ -185,18 +196,34 @@ _CONTENT_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
         r"|\bruntime\.GOOS\b|\bprocess\.platform\b"
     ),
 }
-_CONFIG_SUFFIXES = frozenset({".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".env", ".lock"})
+_CONFIG_SUFFIXES = frozenset(
+    {".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".env", ".lock", ".gradle", ".cmake"}
+)  # fmt: skip
 _CONFIG_NAMES = frozenset(
     {"Dockerfile", "Makefile", "package.json", "pyproject.toml", "setup.py", "setup.cfg", ".env",
-     "CMakeLists.txt"}
+     "CMakeLists.txt", "Jenkinsfile", "build.gradle.kts", "settings.gradle.kts", "conanfile.txt",
+     "conanfile.py"}
 )  # fmt: skip
-_CONFIG_NAME_GLOBS = ("Dockerfile.*", ".env.*", "requirements*.txt", "constraints*.txt")
+_CONFIG_NAME_GLOBS = (
+    "Dockerfile.*", ".env.*", "requirements*.txt", "constraints*.txt", "Jenkinsfile.*", "*.Jenkinsfile",
+)  # fmt: skip
 _TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "__tests__", "testing"})
 _TEST_NAME_GLOBS = (
     "test_*.py", "*_test.py", "*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx",
     "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.spec.jsx", "*_test.go",
+    "*_test.c", "*_test.cc", "*_test.cpp", "*_test.cxx", "*_unittest.cc", "*_unittest.cpp",
+    "test_*.c", "test_*.cc", "test_*.cpp", "*Test.java", "*Tests.java", "*Test.kt", "*Test.groovy",
+    "*Spec.groovy",
 )  # fmt: skip
 _DOCS_SUFFIXES = frozenset({".md", ".rst", ".txt", ".adoc"})
+# Languages whose risky calls the content patterns above know; changed code in any other language
+# is listed by `files_without_signal_patterns` so the reviewer reads it for risks instead.
+_PATTERN_LANGUAGE_SUFFIXES = frozenset(
+    {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".kt", ".cs",
+     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".groovy", ".gradle"}
+)  # fmt: skip
+_PATTERN_LANGUAGE_NAME_GLOBS = ("Jenkinsfile", "Jenkinsfile.*", "*.Jenkinsfile")
+_DATA_SUFFIXES = frozenset({".json", ".lock", ".toml", ".ini", ".cfg", ".csv", ".tsv", ".svg"})
 
 
 class DiffScanError(RuntimeError):
@@ -1305,6 +1332,26 @@ def _hunk_signals(hunk: Hunk) -> set[str]:
 
 def _name_matches(name: str, globs: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(name, glob) for glob in globs)
+
+
+def files_without_signal_patterns(snap: DiffSnapshot) -> tuple[str, ...]:
+    """Changed files that add code in a language the risk-signal patterns were not written for.
+
+    No signal firing for these files says nothing about their risks, e.g. a `curl` in a shell
+    script or a Dockerfile `RUN` step.
+    """
+    paths = dict.fromkeys(
+        hunk.path for hunk in snap.hunks if hunk.added_lines and not _is_docs_hunk(hunk)
+    )
+    return tuple(path for path in paths if _outside_signal_patterns(path))
+
+
+def _outside_signal_patterns(path: str) -> bool:
+    posix = PurePosixPath(path)
+    suffix = posix.suffix.lower()
+    if suffix in _DATA_SUFFIXES or _name_matches(posix.name, _PATTERN_LANGUAGE_NAME_GLOBS):
+        return False
+    return suffix not in _PATTERN_LANGUAGE_SUFFIXES
 
 
 def _is_config(path: str) -> bool:

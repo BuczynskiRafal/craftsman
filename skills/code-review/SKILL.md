@@ -86,7 +86,7 @@ projects' packets/ledgers/reports, or assistant session stores (for the full con
 ## Step 0 — Prepare the packet
 
 ```bash
-craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--staged | --tracked | --paths <csv> | --add-paths <csv>] [--task "<what the change is for, one line>"]
+craftsman review prepare [--tier <quick|standard|deep>] [--base <ref>] [--staged | --tracked | --paths <csv> | --add-paths <csv>] [--task "<what the change is for, one line>"] [--add-lens "<lens>=<file:line> <why>" ...]
 ```
 
 This prints:
@@ -97,7 +97,25 @@ This prints:
 - the resolved tier with its reason (e.g. `Tier quick: 120 changed lines <= 250`);
 - in review-only mode, `Scope: N file(s), frozen for this review.` (and `Ignored (outside the
   review scope): ...` when unrelated files exist outside the pinned scope);
-- on `standard` and `deep`, `Suggested reviewer shards: N`.
+- on `standard` and `deep`, `Suggested reviewer shards: N`;
+- `Not scanned for risk signals (...): <files>` when the change touches a language the risk-signal
+  patterns do not know (shell scripts, Dockerfiles, Rust, Ruby, ...).
+
+**Lenses the signals missed.** The signals that select lenses are pattern matches written for a
+few languages, so they are a floor, not a verdict. Before you review, read the diff, in whatever
+language it is written, for risks no selected lens covers: `trust` for running a process, shell or
+CI step, untrusted input reaching a parser, interpreter, query or file path, and credentials;
+`state` for threads, locks, shared state and clocks; `platform` for OS-, locale-, encoding- or
+time-zone-dependent behaviour. Add each missing lens, citing the code that needs it:
+
+```bash
+craftsman review prepare --add-lens "trust=deploy.sh:14 pipes the downloaded installer into sh"
+```
+
+The added lens opens a new round on the same diff that needs only that lens's coverage; it stays
+in every later round, and `craftsman review report` lists it with your reason. You can add lenses,
+never remove them. Re-running `prepare` with a lens that is already selected or already added
+changes nothing.
 
 On `standard` and `deep`, `craftsman review view --lenses <lenses> [--shard K/N] [--hunks <range>]`
 writes and prints a bounded per-reviewer view (`packet-N.<lenses>.shard-K-of-N.md` or

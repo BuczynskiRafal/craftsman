@@ -43,6 +43,7 @@ from craftsman.records import (
     HunkRef,
     Ledger,
     LedgerError,
+    LensAddition,
     QualitySignal,
     Resolution,
     Round,
@@ -278,7 +279,10 @@ def open_round(
     scope: Sequence[str] | None = None,
     allow_scope_expansion: bool = False,
 ) -> tuple[Ledger, Round]:
-    """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op."""
+    """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op.
+
+    A new lens on an unchanged diff opens a new round, as a deeper tier does.
+    """
     normalized_scope = None if scope is None else tuple(sorted(scope))
     if ledger.rounds:
         _validate_round_continuation(
@@ -289,6 +293,7 @@ def open_round(
             latest.fingerprint == snap.fingerprint
             and latest.tier == tier
             and latest.scope == normalized_scope
+            and latest.lenses == tuple(lenses)
         ):
             return ledger, latest
     unknown = sorted(set(symbols_by_hunk) - {hunk.id for hunk in snap.hunks})
@@ -903,6 +908,15 @@ def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, Sig
         if not (item.round == round_.number and item.signal_id == signal_id)
     )
     return replace(ledger, signal_acks=(*kept, ack)), ack
+
+
+def add_lenses(ledger: Ledger, round_number: int, reasons: Mapping[str, str]) -> Ledger:
+    """Record the lenses the agent added to round `round_number`, each with its reason."""
+    recorded_at = _now()
+    additions = tuple(
+        LensAddition(lens, reason.strip(), round_number, recorded_at) for lens, reason in reasons.items()
+    )
+    return replace(ledger, lens_additions=(*ledger.lens_additions, *additions))
 
 
 def file_sha256(root: Path, rel_path: str) -> str | None:

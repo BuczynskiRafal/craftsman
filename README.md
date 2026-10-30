@@ -291,6 +291,13 @@ in `--fix` mode, `review prepare --add-paths <csv>` extends the scope when a fix
 additional files (such as a new regression test), and after a completed review `prepare` hints to
 run `craftsman review reset` before starting a new review.
 
+Lenses beyond the core ones are selected by pattern-based risk signals, which know Python, JS/TS, Go,
+Java, C#, C/C++ and Groovy/Jenkins. `prepare` lists changed files in other languages under
+`Not scanned for risk signals`; when the reviewing agent sees a risk the selected lenses miss, it
+adds the lens with `review prepare --add-lens "trust=deploy.sh:14 pipes the installer into sh"`.
+An added lens stays in every later round, the gate requires its coverage, and the report lists it
+with its reason. Lenses can be added, never removed.
+
 A review without `--fix` finishes with `craftsman review check --review-only` and
 `craftsman review report --review-only`. They check the round within the frozen scope, coverage of
 selected lenses (`sweep` only from `standard` up), quality signals (`S#`), and verdicts, without

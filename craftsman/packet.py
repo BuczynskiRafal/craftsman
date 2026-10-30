@@ -20,6 +20,7 @@ from craftsman.diffscan import (
     WorktreeIndex,
     commit_sha,
     detect_signals,
+    files_without_signal_patterns,
     git_output,
     is_test_path,
 )
@@ -71,6 +72,18 @@ _FENCE_LANGUAGES = {
     ".go": "go",
     ".rs": "rust",
     ".java": "java",
+    ".kt": "kotlin",
+    ".groovy": "groovy",
+    ".gradle": "groovy",
+    ".c": "c",
+    ".h": "c",
+    ".cc": "cpp",
+    ".cpp": "cpp",
+    ".cxx": "cpp",
+    ".hh": "cpp",
+    ".hpp": "cpp",
+    ".hxx": "cpp",
+    ".jenkinsfile": "groovy",
     ".cs": "csharp",
     ".rb": "ruby",
     ".sh": "sh",
@@ -130,6 +143,7 @@ class PacketContext:
     test_files_by_symbol: Mapping[str, tuple[str, ...]]
     last_runs: tuple[str, ...]
     facts_by_hunk: Mapping[str, tuple[Fact, ...]]
+    unscanned_files: tuple[str, ...] = ()  # changed code the risk-signal patterns cannot read
 
 
 def collect_context(
@@ -163,6 +177,7 @@ def collect_context(
         test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
         last_runs=_last_runs(ledger, snap),
         facts_by_hunk=valid_facts_for_hunk(ledger, root),
+        unscanned_files=files_without_signal_patterns(snap),
     )
 
 
@@ -541,7 +556,14 @@ def _lenses_section(ctx: PacketContext, only: frozenset[str] | None) -> str:
         if pick.lens.id == SWEEP_LENS:
             reason += " (run after all other lenses)"
         rows.append(f"| `{pick.lens.id}` — {pick.lens.title} | {reason} | {pick.lens.focus} |")
-    return "## Lenses in this round\n" + "\n".join(rows)
+    section = "## Lenses in this round\n" + "\n".join(rows)
+    if ctx.unscanned_files:
+        files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
+        section += (
+            f"\n\nNot scanned for risk signals (no patterns for their language): {files}. "
+            "No signal there does not mean no risk."
+        )
+    return section
 
 
 def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
@@ -703,7 +725,10 @@ def _reference_savings(
 
 
 def _fence_language(path: str) -> str:
-    return _FENCE_LANGUAGES.get(PurePosixPath(path).suffix.lower(), "")
+    posix = PurePosixPath(path)
+    if posix.name == "Jenkinsfile" or posix.name.startswith("Jenkinsfile."):
+        return "groovy"
+    return _FENCE_LANGUAGES.get(posix.suffix.lower(), "")
 
 
 def _inline_code(text: str) -> str:

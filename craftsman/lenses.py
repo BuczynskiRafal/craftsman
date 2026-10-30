@@ -181,23 +181,41 @@ def _triggers_for(tier: Tier, lens: Lens) -> frozenset[str]:
 
 
 def select_lenses(
-    tier: Tier, signals: Mapping[str, Sequence[str]], *, docs_only: bool
+    tier: Tier,
+    signals: Mapping[str, Sequence[str]],
+    *,
+    docs_only: bool,
+    added: Mapping[str, str] | None = None,
 ) -> tuple[LensPick, ...]:
-    """Pick the lenses for a change, in catalog order, each with the reason it was selected."""
+    """Pick the lenses for a change, in catalog order, each with the reason it was selected.
+
+    `added` maps lenses the agent added on top of the policy to the reason it gave.
+    """
     if tier not in TIERS:
         raise ValueError(f"unknown tier {tier!r}; valid tiers: {', '.join(TIERS)}")
-    if docs_only:
-        return tuple(LensPick(get_lens(lens_id), "docs-only change") for lens_id in _DOCS_ONLY_LENSES)
+    added = added or {}
+    for lens_id in added:
+        get_lens(lens_id)
     picks: list[LensPick] = []
     for lens in LENSES:
-        fired = [signal for signal in sorted(_triggers_for(tier, lens)) if signals.get(signal)]
-        detail = ", ".join(f"{signal} ({_format_hunk_ids(signals[signal])})" for signal in fired)
-        reasons = [f"always in {tier}"] if tier in lens.always_in else []
-        if fired:
-            reasons.append(f"signals: {detail}")
+        if docs_only:
+            reasons = ["docs-only change"] if lens.id in _DOCS_ONLY_LENSES else []
+        else:
+            reasons = _policy_reasons(tier, lens, signals)
+        if lens.id in added:
+            reasons.append(f"added by the agent: {added[lens.id]}")
         if reasons:
             picks.append(LensPick(lens, "; ".join(reasons)))
     return tuple(picks)
+
+
+def _policy_reasons(tier: Tier, lens: Lens, signals: Mapping[str, Sequence[str]]) -> list[str]:
+    fired = [signal for signal in sorted(_triggers_for(tier, lens)) if signals.get(signal)]
+    detail = ", ".join(f"{signal} ({_format_hunk_ids(signals[signal])})" for signal in fired)
+    reasons = [f"always in {tier}"] if tier in lens.always_in else []
+    if fired:
+        reasons.append(f"signals: {detail}")
+    return reasons
 
 
 def _format_hunk_ids(hunk_ids: Sequence[str]) -> str:

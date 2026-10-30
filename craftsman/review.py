@@ -18,6 +18,7 @@ from craftsman.diffscan import (
     Hunk,
     WorktreeIndex,
     detect_signals,
+    files_without_signal_patterns,
     snapshot,
     staged_paths,
     untracked_paths,
@@ -50,6 +51,7 @@ from craftsman.ledger import (
     ack_signal,
     add_fact,
     add_finding,
+    add_lenses,
     add_multi_coverage,
     coverage_units_for_targets,
     file_sha256,
@@ -89,6 +91,7 @@ from craftsman.packet import (
 from craftsman.quality import MAX_PRODUCTION_ADDED_LINES, collect_quality_signals, production_diff_growth
 from craftsman.records import (
     DESIGN_LENS,
+    LENS_ADDITION_EXAMPLE,
     RESOLUTIONS,
     SEVERITIES,
     SWEEP_LENS,
@@ -106,6 +109,7 @@ from craftsman.records import (
     SignalAck,
     SourceRef,
     as_choice,
+    require_lens_addition,
 )
 from craftsman.workspace import Workspace, open_workspace
 
@@ -113,6 +117,7 @@ PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
 CITED_LINE_CHARS = 120
 MAX_REPORTED_BATCH_PROBLEMS = 20
+MAX_UNSCANNED_PATHS_SHOWN = 8
 UTF8_SAVE_HINT = "save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)"
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
@@ -123,6 +128,7 @@ FIELD_FLAGS = {
     "files": "--files",
     "paths": "--paths",
     "add_paths": "--add-paths",
+    "add_lens": "--add-lens",
     "source": "--source",
     "text": "--text",
     "path": "--file",
@@ -235,6 +241,7 @@ def _print_empty_prepare(
 
 
 def _prepare(args: argparse.Namespace) -> int:
+    requested = _parse_lens_additions(args.add_lens)
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
     base_sha = ws.base_sha(ledger, args.base)
@@ -243,32 +250,44 @@ def _prepare(args: argparse.Namespace) -> int:
         ws, ledger, args, base_sha, full_snap
     )
     if snap.is_empty:
+        if requested:
+            print("--add-lens ignored: there is no change to review.")
         return _print_empty_prepare(scope, snap, full_snap)
     tier = resolve_tier(ws, ledger, args.tier, snap)
     if not ledger.rounds or (
         ledger.rounds[-1].fingerprint, ledger.rounds[-1].tier, ledger.rounds[-1].scope
     ) != (snap.fingerprint, tier, scope):
         print(f"Tier {tier}: {_tier_reason(ws, ledger, args.tier, snap, tier)}")
-    lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap)]
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     signals = collect_quality_signals(ws.root, snap)
 
-    def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
+    def open_next(
+        current: Ledger,
+    ) -> tuple[Ledger, tuple[Ledger, Round, bool, dict[str, str], list[str]]]:
+        new, notes = _new_lens_additions(current, tier, snap, requested)
+        lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap, {**current.added_lenses, **new})]
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
         updated, round_ = open_round(
             current, snap, tier, lens_ids, str(packet), symbols,
             signals=signals, scope=scope, allow_scope_expansion=allow_scope_expansion,
         )
-        return updated, (updated, round_, updated is not current)
+        if new:
+            updated = add_lenses(updated, round_.number, new)
+        return updated, (updated, round_, updated is not current, new, notes)
 
-    ledger, round_, created = mutate(ws.ledger_path, open_next)
+    ledger, round_, created, added, notes = mutate(ws.ledger_path, open_next)
     packet = Path(round_.packet_path)
     if created or not packet.is_file():
         ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=args.task or ws.task)
         _write_text(packet, render_packet(ctx))
     _mark_needs_human_if_oversized(ws, ledger)
+    for note in notes:
+        print(note)
+    for lens, reason in added.items():
+        print(f"Added lens `{lens}`: {reason}")
     _print_prepare_summary(round_, packet, created)
+    _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if created:
         prune_round_files(ws.ledger_path.parent, round_.number)
@@ -481,8 +500,64 @@ def _print_scope_summary(
             )
 
 
-def _lens_picks(tier: Tier, snap: DiffSnapshot) -> tuple[LensPick, ...]:
-    return select_lenses(tier, detect_signals(snap.hunks), docs_only=snap.docs_only)
+def _lens_picks(
+    tier: Tier, snap: DiffSnapshot, added: Mapping[str, str] | None = None
+) -> tuple[LensPick, ...]:
+    return select_lenses(tier, detect_signals(snap.hunks), docs_only=snap.docs_only, added=added)
+
+
+def _parse_lens_additions(values: Sequence[str] | None) -> dict[str, str]:
+    """The `--add-lens LENS=REASON` values as {lens: reason}, each one validated."""
+    reasons: dict[str, str] = {}
+    for value in values or ():
+        lens, separator, reason = value.partition("=")
+        lens, reason = lens.strip(), reason.strip()
+        if not separator:
+            raise FieldError(
+                "add_lens", f"must be LENS=REASON, e.g. {LENS_ADDITION_EXAMPLE!r} (got {value!r})"
+            )
+        if lens in reasons:
+            raise FieldError("add_lens", f"names `{lens}` more than once")
+        try:
+            require_lens_addition(lens, reason)
+        except FieldError as exc:
+            raise FieldError("add_lens", f"{lens}: {exc.field} {exc.problem}") from None
+        reasons[lens] = reason
+    return reasons
+
+
+def _new_lens_additions(
+    ledger: Ledger, tier: Tier, snap: DiffSnapshot, requested: Mapping[str, str]
+) -> tuple[dict[str, str], list[str]]:
+    """The requested lenses that are not in the review yet, and a note for each one skipped."""
+    selected = {pick.lens.id: pick.reason for pick in _lens_picks(tier, snap)}
+    recorded = {addition.lens: addition for addition in ledger.lens_additions}
+    new: dict[str, str] = {}
+    notes: list[str] = []
+    for lens, reason in requested.items():
+        if lens in recorded:
+            earlier = recorded[lens]
+            notes.append(f"Lens `{lens}` was already added in round {earlier.round}: {earlier.reason}")
+        elif lens in selected:
+            notes.append(f"Lens `{lens}` is already selected ({selected[lens]}); nothing to add.")
+        else:
+            new[lens] = reason
+    return new, notes
+
+
+def _print_unscanned_files(snap: DiffSnapshot) -> None:
+    unscanned = files_without_signal_patterns(snap)
+    if not unscanned:
+        return
+    shown = ", ".join(unscanned[:MAX_UNSCANNED_PATHS_SHOWN])
+    more = len(unscanned) - MAX_UNSCANNED_PATHS_SHOWN
+    if more > 0:
+        shown += f" and {more} more"
+    print(
+        f"Not scanned for risk signals (no patterns for their language): {shown}. Read them for "
+        "risks the selected lenses miss and add the matching lens with "
+        '`craftsman review prepare --add-lens "LENS=file:line why"`.'
+    )
 
 
 def _packet_context(
@@ -496,7 +571,11 @@ def _packet_context(
     task: str,
 ) -> PacketContext:
     """What the packet of `round_` shows, with the lenses the round selected."""
-    picks = tuple(pick for pick in _lens_picks(round_.tier, snap) if pick.lens.id in round_.lenses)
+    picks = tuple(
+        pick
+        for pick in _lens_picks(round_.tier, snap, ledger.added_lenses)
+        if pick.lens.id in round_.lenses
+    )
     return collect_context(
         ws.root,
         snap,
@@ -1229,6 +1308,7 @@ def _show(args: argparse.Namespace) -> int:
     if args.json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
+            "lens_additions": [addition.to_json() for addition in ledger.lens_additions],
             "coverage": _coverage_json(ledger, latest) if latest else {},
             "hunks": _hunks_json(ws.root, latest, snap) if latest else [],
             "findings": [finding.to_json() for finding in ledger.findings],
@@ -1241,6 +1321,8 @@ def _show(args: argparse.Namespace) -> int:
     else:
         print(_round_line(latest, snap))
         print(f"Packet: {Path(latest.packet_path).resolve()}")
+        for line in _lens_addition_lines(ledger):
+            print(line)
         print("")
         print(f"Coverage (covered/total non-carried hunks, files for `{DESIGN_LENS}`):")
         print("\n".join(_coverage_lines(ledger, latest)))
@@ -1479,6 +1561,7 @@ def _report(args: argparse.Namespace) -> int:
             "runs": [run.to_json() for run in runs],
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
             "signal_acks": {sid: ack.to_json() for sid, ack in acks_in_force(ledger).items()},
+            "lens_additions": [addition.to_json() for addition in ledger.lens_additions],
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
@@ -1519,6 +1602,13 @@ def _report_status_line(report: GateReport) -> str:
         else "craftsman review check"
     )
     return f"{line} — {report.issue_codes}; see `{check}`"
+
+
+def _lens_addition_lines(ledger: Ledger) -> list[str]:
+    return [
+        f"- Lens `{addition.lens}` added by the agent in round {addition.round}: {addition.reason}"
+        for addition in ledger.lens_additions
+    ]
 
 
 def _not_covered_by_lens(ledger: Ledger) -> dict[str, list[str]]:
@@ -1641,6 +1731,7 @@ def _report_lines(
         f"- Base `{snap.base_sha[:7]}` · tier `{tier}` · {len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
+        *_lens_addition_lines(ledger),
         *_diff_size_lines(ledger, snap),
         *_not_covered_lines(ledger, snap, report),
         "",
@@ -1722,6 +1813,15 @@ def _add_prepare_parser(sub: Any, common: argparse.ArgumentParser) -> None:
         "--tracked",
         action="store_true",
         help="Freeze the review scope to tracked files changed since the base (omit untracked files)",
+    )
+    prepare.add_argument(
+        "--add-lens",
+        action="append",
+        metavar="LENS=REASON",
+        help=(
+            "Add a lens the risk signals did not select, citing the code that needs it as file:line "
+            f"(repeatable), e.g. {LENS_ADDITION_EXAMPLE!r}. Added lenses stay in every later round."
+        ),
     )
     prepare.set_defaults(handler=_prepare)
 
