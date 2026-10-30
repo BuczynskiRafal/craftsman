@@ -161,6 +161,8 @@ gear and by the risk signals in the diff.
 | `standard` | default in `/craftsman`, and above 250 changed lines in review-only | always-on + narrower signal-triggered lenses in 1–2 `craftsman-reviewer` subagents or shards (`review view --shard K/N`, `--parallel` limit 2 by default), `sweep` (inline when 0 findings in review-only), `craftsman-verifier` only when findings exist | in `/craftsman`: passing tests on the final code |
 | `deep` | `--deep` / `--tier deep` or the `ultracraft` keyword | all 12 lenses (shards or `R1`–`R4` groups), `sweep`, `craftsman-verifier` when findings exist | passing tests **and** e2e |
 
+To mention `/craftsman` or `ultracraft` in a prompt without triggering the gate, put the keyword in backticks or quotes.
+
 ### Platform enforcement
 
 ![Lifecycle hooks, gate state machine, and runtime guards](docs/diagrams/lifecycle-hooks-and-guards.png)
@@ -272,6 +274,10 @@ Craftsman's part of the merged files, and does nothing where there is no manifes
   installation, in which case Craftsman leaves the custom value untouched and prints a warning).
   On Google Antigravity, reinstalling replaces `"craftsman-git-guard"` in `hooks.json` with
   `"craftsman-scope-guard"`.
+- **Syntactic trigger detection**: Prompt trigger detection for `/craftsman` and `ultracraft` is
+  now purely syntactic rather than based on natural-language word lists. Any bare `/craftsman` or
+  `ultracraft` token outside quotes and backticks activates the gate; wrap the keyword in backticks
+  or quotes to mention it without triggering.
 
 ## Usage
 

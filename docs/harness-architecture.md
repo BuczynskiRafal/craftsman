@@ -198,7 +198,7 @@ Craftsman authors skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/cod
 
 ### Lifecycle Hook Engine & Bounded Stop Gate (`craftsman.hooks` & `craftsman.gate`)
 
-- **`prompt` (`UserPromptSubmit` / `userPromptSubmitted`)**: Resumes `--await-user` gates on user reply and initializes `craftsman_state.json` on `/craftsman` or `ultracraft`.
+- **`prompt` (`UserPromptSubmit` / `userPromptSubmitted`)**: Resumes `--await-user` gates on user reply and initializes `craftsman_state.json` when `/craftsman` or `ultracraft` appears as a standalone token outside quotes and backticks (`craftsman.trigger`).
 - **`subagent-start` / `subagent-stop`**: Records `AgentEvent` entries in `ledger.json`, injects concise round/finding briefings (using `latest.scope` for snapshot checks), and blocks once if a reviewer or verifier exits without recording ledger entries.
 - **`stop` (`Stop` / `agentStop`)**: Enforces monotonic progress across up to `MAX_FORCED_CONTINUATIONS = 6` consecutive non-progressing turns and `MAX_ROUNDS = 5` delta rounds.
 
@@ -276,6 +276,7 @@ Craftsman enforces review integrity and repository search scope through `craftsm
 | [`craftsman/quality.py`](../craftsman/quality.py) | AST/diff mechanical code-quality signal detectors (`S1..Sn`) | `scan_quality_signals()` |
 | [`craftsman/review.py`](../craftsman/review.py) | CLI handlers for `prepare` (`--staged`/`--tracked`/`--paths`/`--add-paths`/`--add-lens`), `view` (`--shard`), `cover` (multi-lens), `show` (`--hunks`), `report` (`--partial`), `add`, `ack`, `fact`, `merge`, `verdict`, `resolve`, `check`, `reset` | `run_cli()`, `resolve_tier()` |
 | [`craftsman/runner.py`](../craftsman/runner.py) | Live-streaming command execution wrapper (`craftsman run`) with scope-consistent before/after fingerprinting | `run_cli()` |
+| [`craftsman/trigger.py`](../craftsman/trigger.py) | Syntactic `/craftsman` and `ultracraft` prompt trigger detector (ignores tokens inside quotes and backticks) | `detect_trigger()`, `task_from_prompt()` |
 | [`craftsman/hooks.py`](../craftsman/hooks.py) | Multi-platform lifecycle hook adapter (`prompt`, `stop`, `subagent-start`, `subagent-stop`, `pre-tool` work-tree and scope guards) | `run_cli()`, `on_pre_tool()`, `_review_in_progress()` |
 | [`craftsman/shell.py`](../craftsman/shell.py) | Shell command parser, wrapper unwrapper, and `git` invocation analyzer | `iter_simple_commands()`, `parse_git_invocation()`, `SimpleCommand` |
 | [`craftsman/worktree_guard.py`](../craftsman/worktree_guard.py) | Work-tree and index mutation detector during active reviews | `find_worktree_mutation()` |

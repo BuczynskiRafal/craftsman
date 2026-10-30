@@ -5,7 +5,7 @@ trigger: always_on
 # Keyword Triggers: `ultrathink` & `ultracraft`
 
 When the user's request contains one of these keywords (case-insensitive), switch to the matching
-rigor mode.
+rigor mode. To mention the keyword without triggering it, put it in backticks or quotes.
 
 ## `ultrathink` — think before building
 

@@ -126,7 +126,7 @@ class RequestTests(AntigravityTestCase):
         self.assertIsNone(self.stored())
 
     def test_question_about_craftsman_opens_no_gate(self) -> None:
-        self.write_transcript(user_input(1, "Co sądzisz o /craftsman? Tylko opinia."))
+        self.write_transcript(user_input(1, "What do you think of `/craftsman`? Just an opinion."))
         self.repo.write_lines("app.py", 5)
         self.assertEqual(self.stop()[0], {"decision": "allow"})
         self.assertIsNone(self.stored())
