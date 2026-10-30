@@ -33,15 +33,12 @@ from craftsman.export import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
     HOOKS_FILENAME,
-    claude_agent_templates,
     export_copilot_agents,
     export_copilot_home,
-    export_to_claude_user,
     export_to_copilot_skills,
     export_vscode_instructions,
     has_user_copilot_install,
     has_workspace_copilot_install,
-    merge_claude_hooks,
     render_agents_md,
     write_copilot_hooks,
 )
@@ -65,7 +62,6 @@ from craftsman.manifest import (
     TargetKind,
 )
 from craftsman.paths import (
-    default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
     default_repo_dir,
@@ -74,6 +70,7 @@ from craftsman.paths import (
     user_home,
     vscode_prompt_dirs,
 )
+from craftsman.platforms.claude import detect_claude, install_claude_target
 from craftsman.staging import (
     EventKind,
     InstallMode,
@@ -82,8 +79,6 @@ from craftsman.staging import (
     created_before,
     install_runtime,
     install_tree,
-    path_key,
-    report_change,
     revert_modified_file,
     run_reported,
     upsert_markdown,
@@ -173,43 +168,6 @@ def _with_users_enabled_flag(ours: Any, theirs: Any) -> Any:
     if isinstance(ours, dict) and isinstance(theirs, dict) and isinstance(theirs.get("enabled"), bool):
         return {**ours, "enabled": theirs["enabled"]}
     return ours
-
-def detect_claude(home: Path) -> bool:
-    return default_claude_dir(home).is_dir() or bool(os.environ.get("CLAUDECODE"))
-
-def install_claude_target(repo_dir: Path, home: Path, *, with_hooks: bool, tracker: Tracker) -> None:
-    claude_dir = default_claude_dir(home)
-    settings = claude_dir / "settings.json"
-    # Settings Craftsman cannot merge into, or take its hooks back out of, stop the install up front.
-    bash_prefix = absolute_hook_prefixes()[0] if with_hooks else None
-    if bash_prefix is not None:
-        merge_claude_hooks(settings, bash_prefix, dry_run=True)
-    elif exists(settings):
-        read_json_object(settings)
-    session = TargetSession.begin(claude_dir, TargetKind.CLAUDE, home, tracker)
-    for sub in ("commands", "rules", "agents"):
-        session.make_dirs(claude_dir / sub)
-    for skill in iter_skills(repo_dir):
-        session.stage(claude_dir / "commands" / f"{skill.name}.md")
-    session.stage(claude_dir / "rules" / "craftsman-rules.md")
-    for template in claude_agent_templates(repo_dir):
-        session.stage(claude_dir / "agents" / f"{template.name}.md")
-    if not tracker.dry_run:
-        export_to_claude_user(repo_dir, claude_dir)
-    if bash_prefix is not None:
-        _merge_claude_settings(session, settings, bash_prefix)
-    elif session.previous is not None and session.previous.modified_files.get(path_key(settings)):
-        revert_modified_file(settings, ModifiedKind.CLAUDE_SETTINGS, session.previous, tracker)
-    session.finish()
-
-def _merge_claude_settings(session: TargetSession, settings: Path, bash_prefix: str) -> None:
-    existed = exists(settings)
-    change = merge_claude_hooks(settings, bash_prefix, dry_run=session.dry_run)
-    session.modified(settings, ModifiedKind.CLAUDE_SETTINGS)
-    if not existed or created_before(session, settings):
-        session.created(settings)
-    else:
-        report_change(session.tracker, change)
 
 def detect_vscode_copilot(home: Path) -> bool:
     return (

@@ -17,14 +17,12 @@ from typing import Any
 from craftsman import __version__
 from craftsman.assets import craftsman_agent_names, craftsman_skill_names, parse_frontmatter
 from craftsman.export import (
-    CLAUDE_HOOK_EVENTS,
     COPILOT_DISCOVERY,
     HOOKS_FILENAME,
     CopilotClient,
     CopilotDiscoveryLocation,
     has_user_copilot_install,
     has_workspace_copilot_install,
-    is_craftsman_hook_command,
     iter_discovered_files,
     resolve_discovery_dirs,
 )
@@ -43,6 +41,7 @@ from craftsman.paths import (
     resolve_craftsman_pkg_dir,
     user_home,
 )
+from craftsman.platforms.claude import CLAUDE_HOOK_EVENTS, is_craftsman_hook_command
 from craftsman.records import AGENT_ROLES
 
 CLAUDE_AGENT_NAMES = tuple(AGENT_ROLES)

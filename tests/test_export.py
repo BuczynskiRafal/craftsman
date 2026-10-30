@@ -30,23 +30,16 @@ from craftsman.export import (
     CopilotDiscoveryLocation,
     DiscoveryRoot,
     EntityPattern,
-    claude_agent_templates,
     export_copilot_home,
     export_to_agents_workspace,
-    export_to_claude_user,
     export_to_copilot_skills,
     export_to_workspace,
     export_vscode_instructions,
-    is_craftsman_hook_command,
     iter_discovered_files,
-    merge_claude_hooks,
     render_agents_md,
-    render_claude_agent,
-    render_claude_command_file,
     render_copilot_agent,
     render_copilot_hooks,
     resolve_discovery_dirs,
-    strip_claude_hooks,
 )
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import (
@@ -63,6 +56,15 @@ from craftsman.paths import (
     default_vscode_user_dir,
     env_var_for_home,
     resolve_craftsman_pkg_dir,
+)
+from craftsman.platforms.claude import (
+    claude_agent_templates,
+    export_to_claude_user,
+    is_craftsman_hook_command,
+    merge_claude_hooks,
+    render_claude_agent,
+    render_claude_command_file,
+    strip_claude_hooks,
 )
 
 from tests.support import REPO_ROOT, SKILL_COUNT, CliResult, run_main

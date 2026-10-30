@@ -34,7 +34,6 @@ from craftsman.assets import (
     Skill,
     TemplateRole,
     _single_quoted,
-    _with_inlined_siblings,
     _yaml_list,
     craftsman_entity_names,
     export_agents,
@@ -52,10 +51,8 @@ from craftsman.generated import (
     CRAFTSMAN_GENERATED_MARKER,
     ExportError,
     FileChange,
-    _rewrite_json,
     _write_marked,
     is_craftsman_generated_file,
-    read_json_object,
     upsert_managed_markdown,
     write_generated,
 )
@@ -69,6 +66,10 @@ from craftsman.paths import (
     default_vscode_prompts_dir,
     user_home,
     vscode_prompt_dirs,
+)
+from craftsman.platforms.claude import (
+    export_to_claude_user,
+    merge_claude_hooks,
 )
 
 REVIEWER_GROUPS_PLACEHOLDER = "{{reviewer_groups}}"
@@ -189,7 +190,6 @@ COPILOT_AGENT_TOOLS: dict[TemplateRole, tuple[str, ...]] = {
     "reviewer": ("read", "search", "execute"),
     "verifier": ("read", "search", "execute"),
 }
-CLAUDE_AGENT_TOOLS = "Read, Grep, Glob, Bash"
 COPILOT_TERMINAL_NOTE = (
     "Terminal commands run in the integrated terminal: keep single-line `craftsman` commands on "
     "one line (`'...'` in bash, zsh, and PowerShell, escaping inner `'` as `''` in PowerShell; "
@@ -204,9 +204,6 @@ COPILOT_SUBAGENT_NOTE = (
     "Subagents: use the `craftsman-reviewer` and `craftsman-verifier` custom agents (agent tool / "
     "runSubagent)."
 )
-CLAUDE_SUBAGENT_NOTE = (
-    "Subagents: the Agent/Task tool with `subagent_type` `craftsman-reviewer` / `craftsman-verifier`."
-)
 # Copilot CLI event name -> `craftsman hook` event, with the timeout in seconds.
 COPILOT_HOOK_EVENTS: dict[str, tuple[str, int]] = {
     "userPromptSubmitted": ("prompt", 30),
@@ -215,27 +212,12 @@ COPILOT_HOOK_EVENTS: dict[str, tuple[str, int]] = {
     "subagentStop": ("subagent-stop", 30),
     "preToolUse": ("pre-tool", 30),
 }
-CLAUDE_HOOK_EVENTS: dict[str, tuple[str, int]] = {
-    "UserPromptSubmit": ("prompt", 30),
-    "Stop": ("stop", 60),
-    "SubagentStart": ("subagent-start", 30),
-    "SubagentStop": ("subagent-stop", 30),
-    "PreToolUse": ("pre-tool", 30),
-}
 # Claude Code runs a PreToolUse hook for matched tools; pre-tool enforces both the git guard
 # (on Bash) and the repository search scope (on Bash, Read, Grep, Glob, and LS).
-CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash|Read|Grep|Glob|LS"}
 HOOKS_FILENAME = "craftsman.json"
 
-_QUOTED = r'"(?:[^"\\]|\\.)*"'
-_QUOTED_SHIM = r'"(?:[^"\\]|\\.)*craftsman-cli\.py"'
 # Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running
 # `-m craftsman.cli` or the checkout's shim, then `hook <event> --platform claude`.
-OUR_HOOK_COMMAND_RE = re.compile(
-    rf"^{_QUOTED} (?:-m craftsman\.cli|{_QUOTED_SHIM}) hook "
-    rf"(?:{'|'.join(re.escape(event) for event, _ in CLAUDE_HOOK_EVENTS.values())}) "
-    r"--platform claude$"
-)
 
 
 _COPILOT_HOOK_RE = re.compile(r" hook [a-z-]+ --platform copilot$")
@@ -295,9 +277,6 @@ def adapt_body_for_copilot(body: str, *, with_subagents: bool = True) -> str:
     return f"{CRAFTSMAN_GENERATED_MARKER}\n\n" + copilot_note(with_subagents) + body + "\n"
 
 
-def adapt_body_for_claude(body: str) -> str:
-    """Prefix the generated marker and the Claude Code platform note."""
-    return f"{CRAFTSMAN_GENERATED_MARKER}\n\n> **Claude Code:** {CLAUDE_SUBAGENT_NOTE}\n\n{body}\n"
 
 
 def render_copilot_skill_file(skill: Skill) -> str:
@@ -305,9 +284,6 @@ def render_copilot_skill_file(skill: Skill) -> str:
     return f"---\nname: {skill.name}\ndescription: {_single_quoted(skill.description)}\n---\n\n{adapted}"
 
 
-def render_claude_command_file(skill: Skill) -> str:
-    adapted = adapt_body_for_claude(_with_inlined_siblings(skill))
-    return f"---\ndescription: {_single_quoted(skill.description)}\n---\n\n{adapted}"
 
 
 
@@ -324,9 +300,6 @@ def render_claude_command_file(skill: Skill) -> str:
 
 
 
-def claude_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
-    """The reviewer and verifier subagents; Claude users run the orchestrator as `/craftsman`."""
-    return [t for t in load_agent_templates(repo_dir) if t.role != "orchestrator"]
 
 
 
@@ -353,12 +326,6 @@ def render_copilot_agent(template: AgentTemplate) -> str:
     return "\n".join(lines) + "\n" + body
 
 
-def render_claude_agent(template: AgentTemplate) -> str:
-    lines = ["---", f"name: {template.name}", f"description: {_single_quoted(template.description)}"]
-    if template.role != "orchestrator":
-        lines.append(f"tools: {CLAUDE_AGENT_TOOLS}")
-    lines += ["---", "", CRAFTSMAN_GENERATED_MARKER, ""]
-    return "\n".join(lines) + "\n" + template.body + "\n"
 
 
 
@@ -430,8 +397,6 @@ def export_copilot_agents(repo_dir: Path, out_dir: Path) -> list[FileChange]:
     return export_agents(load_agent_templates(repo_dir), out_dir, ".agent.md", render_copilot_agent)
 
 
-def export_claude_agents(repo_dir: Path, agents_dir: Path) -> list[FileChange]:
-    return export_agents(claude_agent_templates(repo_dir), agents_dir, ".md", render_claude_agent)
 
 
 def export_vscode_instructions(repo_dir: Path, prompts_dir: Path) -> list[FileChange]:
@@ -497,95 +462,20 @@ def is_craftsman_hooks_file(path: Path) -> bool:
     return bool(commands) and all(_COPILOT_HOOK_RE.search(str(command)) for command in commands)
 
 
-def is_craftsman_hook_command(command: Any) -> bool:
-    return isinstance(command, str) and OUR_HOOK_COMMAND_RE.match(command) is not None
 
 
 
 
 
 
-def merge_claude_hooks(settings_path: Path, bash_prefix: str, *, dry_run: bool = False) -> FileChange:
-    """Merge the Craftsman hooks into Claude Code settings.
-
-    Only Craftsman's own commands are replaced; other hooks and settings keep their order. The
-    original file is copied to `settings.json.bak` once, before its first change.
-    """
-    original = read_json_object(settings_path) if exists(settings_path) else {}
-    hooks = original.get("hooks", {})
-    if not isinstance(hooks, dict):
-        raise ExportError(f"refusing to modify {settings_path}: `hooks` is not a JSON object")
-    merged_hooks = dict(hooks)
-    for event, (hook_event, timeout) in CLAUDE_HOOK_EVENTS.items():
-        groups = merged_hooks.get(event, [])
-        if not isinstance(groups, list):
-            raise ExportError(f"refusing to modify {settings_path}: `hooks.{event}` is not a list")
-        entry = {
-            "type": "command",
-            "command": f"{bash_prefix} hook {hook_event} --platform claude",
-            "timeout": timeout,
-        }
-        ours: dict[str, Any] = {"hooks": [entry]}
-        if event in CLAUDE_HOOK_MATCHERS:
-            ours = {"matcher": CLAUDE_HOOK_MATCHERS[event], **ours}
-        merged_hooks[event] = _replace_our_group(groups, ours)
-    updated = {**original, "hooks": merged_hooks}
-    return _rewrite_json(settings_path, original, updated, backup=exists(settings_path), dry_run=dry_run)
-
-
-def strip_claude_hooks(settings: dict[str, Any]) -> dict[str, Any]:
-    """Claude Code settings without the Craftsman hook entries (and events left empty by that)."""
-    hooks = settings.get("hooks")
-    if not isinstance(hooks, dict):
-        return settings
-    cleaned: dict[str, Any] = {}
-    for event, groups in hooks.items():
-        kept = list(_without_our_hooks(groups)) if isinstance(groups, list) else groups
-        if kept or not groups:
-            cleaned[event] = kept
-    updated = {key: value for key, value in settings.items() if key != "hooks"}
-    if cleaned or not hooks:
-        updated["hooks"] = cleaned
-    return updated
 
 
 
 
-def _replace_our_group(groups: list[Any], ours: dict[str, Any]) -> list[Any]:
-    """`groups` with Craftsman's hooks replaced by `ours`, at the position of the first one."""
-    position = next(
-        (
-            index
-            for index, group in enumerate(groups)
-            if isinstance(group, dict)
-            and isinstance(group.get("hooks"), list)
-            and any(
-                isinstance(entry, dict) and is_craftsman_hook_command(entry.get("command"))
-                for entry in group["hooks"]
-            )
-        ),
-        len(groups),
-    )
-    before = list(_without_our_hooks(groups[:position]))
-    return [*before, ours, *_without_our_hooks(groups[position:])]
 
 
-def _without_our_hooks(groups: list[Any]) -> Iterator[Any]:
-    """Matcher groups without Craftsman hook commands; groups left empty by that are dropped."""
-    for group in groups:
-        entries = group.get("hooks") if isinstance(group, dict) else None
-        if not isinstance(entries, list):
-            yield group
-            continue
-        kept = [
-            entry
-            for entry in entries
-            if not (isinstance(entry, dict) and is_craftsman_hook_command(entry.get("command")))
-        ]
-        if len(kept) == len(entries):
-            yield group
-        elif kept:
-            yield {**group, "hooks": kept}
+
+
 
 
 # --- managed Markdown blocks ----------------------------------------------------------------
@@ -710,27 +600,8 @@ def export_to_workspace(repo_dir: Path, workspace_dir: Path) -> WorkspaceExport:
     )
 
 
-@dataclass(frozen=True)
-class ClaudeExport:
-    commands: list[FileChange]
-    agents: list[FileChange]
-    rules: FileChange
 
 
-def export_to_claude_user(repo_dir: Path, claude_dir: Path) -> ClaudeExport:
-    rules = f"{CRAFTSMAN_GENERATED_MARKER}\n\n" + render_combined_rules(
-        repo_dir / "rules", with_frontmatter=False
-    )
-    return ClaudeExport(
-        commands=[
-            _write_marked(
-                claude_dir / "commands" / f"{skill.name}.md", render_claude_command_file(skill)
-            )
-            for skill in iter_skills(repo_dir)
-        ],
-        agents=export_claude_agents(repo_dir, claude_dir / "agents"),
-        rules=_write_marked(claude_dir / "rules" / "craftsman-rules.md", rules),
-    )
 
 
 CURSOR_RULE_HEADER = (

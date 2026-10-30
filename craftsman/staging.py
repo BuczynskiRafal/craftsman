@@ -312,7 +312,7 @@ def revert_modified_file(
         )
         return
     if kind is ModifiedKind.CLAUDE_SETTINGS:
-        from craftsman.export import strip_claude_hooks
+        from craftsman.platforms.claude import strip_claude_hooks
 
         strip: Callable[[dict[str, Any]], dict[str, Any]] = strip_claude_hooks
     else:
