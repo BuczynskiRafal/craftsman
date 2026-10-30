@@ -11,6 +11,7 @@ Models scope checks as candidate paths against forbidden zones:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -484,3 +485,67 @@ def evaluate_antigravity_scope(
     if scope_decision.decision == "deny" and policy.mode == "deny":
         return "deny", scope_decision.reason
     return "allow", None
+
+
+def _extract_antigravity_run_command(payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    tool_call = payload.get("toolCall")
+    if not isinstance(tool_call, Mapping) or tool_call.get("name") != "run_command":
+        return None, None
+    args = tool_call.get("args")
+    if not isinstance(args, Mapping):
+        return None, None
+    cmd = args.get("CommandLine")
+    cwd = args.get("Cwd")
+    return (cmd if isinstance(cmd, str) else None), (cwd if isinstance(cwd, str) else None)
+
+
+def evaluate_antigravity_payload(payload: Mapping[str, Any]) -> tuple[str, str | None]:
+    """Evaluate an Antigravity `PreToolUse` payload against the repository search scope."""
+    command_line, cwd_str = _extract_antigravity_run_command(payload)
+    if not isinstance(command_line, str) or not command_line.strip():
+        return "allow", None
+    return evaluate_antigravity_scope(payload, command_line, cwd_str)
+
+
+def _emit(decision: str, reason: str | None = None) -> None:
+    payload: dict[str, Any] = {"decision": decision}
+    if reason:
+        payload["reason"] = reason
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def main(argv: list[str] | None = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] in ("-h", "--help"):
+        print(
+            "Usage: craftsman scope-guard\n\n"
+            "Reads an Antigravity PreToolUse JSON payload from stdin and enforces the search scope."
+        )
+        return 0
+    if args_list:
+        sys.stderr.write(f"craftsman scope-guard: unknown arguments {' '.join(args_list)}\n")
+        return 2
+
+    try:
+        payload = json.loads(sys.stdin.read())
+    except (OSError, ValueError) as exc:
+        _emit(
+            "deny",
+            f"[CRAFTSMAN SCOPE-GUARD] Unreadable hook input, so the call was not checked: {exc}",
+        )
+        return 0
+    if not isinstance(payload, dict):
+        _emit(
+            "deny",
+            "[CRAFTSMAN SCOPE-GUARD] The hook input is not a JSON object, so the call was not checked.",
+        )
+        return 0
+
+    decision, reason = evaluate_antigravity_payload(payload)
+    _emit(decision, reason)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -33,6 +33,7 @@ from craftsman.playbooks import (
 from craftsman.records import VERDICTS, Ledger, LedgerError
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
+from craftsman.scope import main as scope_guard_main
 from craftsman.uninstall import uninstall_main
 
 LATEST_RUNS_SHOWN = 3
@@ -429,6 +430,10 @@ COMMANDS: dict[str, tuple[Callable[[list[str]], int], str]] = {
     "hook": (hook_main, "Lifecycle hook for VS Code Copilot, the Copilot CLI and Claude Code."),
     "review": (review_main, "Prepare review rounds and record findings, coverage and verdicts."),
     "run": (run_main, "Run a command and record its exit code in the evidence ledger."),
+    "scope-guard": (
+        scope_guard_main,
+        "Enforce the search scope on Antigravity PreToolUse payloads.",
+    ),
     "skill": (
         skill_main,
         "Read bundled Craftsman skills and companion files without searching the disk.",

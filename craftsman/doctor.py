@@ -50,7 +50,12 @@ from craftsman.records import AGENT_ROLES
 
 CLAUDE_AGENT_NAMES = tuple(AGENT_ROLES)
 AGENT_NAMES = ("craftsman", *CLAUDE_AGENT_NAMES)
-REQUIRED_SCRIPTS = ("git-guard.py", "craftsman-stop-gate.py", "copilot-export.py", "craftsman-cli.py")
+REQUIRED_SCRIPTS = (
+    "craftsman-scope-guard.py",
+    "craftsman-stop-gate.py",
+    "copilot-export.py",
+    "craftsman-cli.py",
+)
 MIN_RULE_FILES = 2
 # A SKILL.md body shorter than this is a stub, not a skill.
 MIN_SKILL_BODY_CHARS = 100

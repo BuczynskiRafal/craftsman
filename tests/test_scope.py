@@ -6,6 +6,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -23,8 +24,9 @@ from craftsman.scope import (
     is_craftsman_agent,
     load_scope_policy,
 )
+from craftsman.scope import main as scope_guard_main
 
-from tests.support import open_gate
+from tests.support import REPO_ROOT, open_gate
 
 # The test repositories have no commit; the scope checks never read the gate's base.
 UNBORN_BASE = "0" * 40
@@ -1026,6 +1028,80 @@ class ScopeEnforcementTests(unittest.TestCase):
             evaluate_scope("Read", {"file_path": str(wt2 / "app.py")}, wt1, wt1, wide_policy).decision,
             "allow",
         )
+
+    def test_scope_guard_cli_and_script_enforce_only_search_scope(self) -> None:
+        open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
+        session_dir = str(self.tmp / "brain" / "conv-123")
+
+        def run_in_proc(raw_stdin: str, argv: list[str] | None = None) -> tuple[int, str, str]:
+            out, err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch("sys.stdin", io.StringIO(raw_stdin)),
+                redirect_stdout(out),
+                redirect_stderr(err),
+            ):
+                code = scope_guard_main(argv or [])
+            return code, out.getvalue(), err.getvalue()
+
+        code, out, _ = run_in_proc("", ["--help"])
+        self.assertEqual(code, 0)
+        self.assertIn("craftsman scope-guard", out)
+
+        code, _, err = run_in_proc("{}", ["--bogus"])
+        self.assertEqual(code, 2)
+        self.assertIn("unknown arguments --bogus", err)
+
+        code, out, _ = run_in_proc("{not-json")
+        self.assertEqual(code, 0)
+        bad_json = json.loads(out)
+        self.assertEqual(bad_json["decision"], "deny")
+        self.assertIn("Unreadable hook input", bad_json["reason"])
+
+        code, out, _ = run_in_proc("[1, 2]")
+        self.assertEqual(code, 0)
+        non_obj = json.loads(out)
+        self.assertEqual(non_obj["decision"], "deny")
+        self.assertIn("not a JSON object", non_obj["reason"])
+
+        code, out, _ = run_in_proc(json.dumps({"toolCall": {"name": "view_file", "args": {}}}))
+        self.assertEqual((code, json.loads(out)), (0, {"decision": "allow"}))
+
+        # Git policy commands (push to main, AI trailers) are allowed by scope-guard.
+        for git_cmd in (
+            "git push origin main",
+            'git commit -m "feat: x\n\nCo-authored-by: Claude <noreply@anthropic.com>"',
+        ):
+            payload = {
+                "artifactDirectoryPath": session_dir,
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": git_cmd, "Cwd": str(self.repo)},
+                },
+            }
+            code, out, _ = run_in_proc(json.dumps(payload))
+            self.assertEqual((code, json.loads(out)), (0, {"decision": "allow"}), git_cmd)
+
+        # Out-of-scope search via the standalone shim script is denied.
+        script = REPO_ROOT / "scripts" / "craftsman-scope-guard.py"
+        deny_payload = {
+            "artifactDirectoryPath": session_dir,
+            "toolCall": {
+                "name": "run_command",
+                "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)},
+            },
+        }
+        proc = subprocess.run(
+            [sys.executable, str(script)],
+            input=json.dumps(deny_payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env={**os.environ, "HOME": str(self.home), "USERPROFILE": str(self.home)},
+        )
+        script_out = json.loads(proc.stdout)
+        self.assertEqual(script_out["decision"], "deny")
+        self.assertIn("[CRAFTSMAN SCOPE-GUARD]", script_out["reason"])
 
 
 if __name__ == "__main__":

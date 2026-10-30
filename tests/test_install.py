@@ -152,7 +152,7 @@ class AntigravityTests(InstallTestCase):
     def test_hooks_json_merge_keeps_what_the_user_set(self) -> None:
         self.config_dir.mkdir(parents=True)
         original = {
-            "craftsman-git-guard": {"enabled": False, "PreToolUse": []},
+            "craftsman-scope-guard": {"enabled": False, "PreToolUse": []},
             "my-hook": {"enabled": True, "Stop": [{"type": "command", "command": "echo hi"}]},
         }
         (self.config_dir / "hooks.json").write_text(json.dumps(original), encoding="utf-8")
@@ -160,12 +160,49 @@ class AntigravityTests(InstallTestCase):
         self.assert_ok(self.install("--antigravity"))
 
         merged = json.loads((self.config_dir / "hooks.json").read_text(encoding="utf-8"))
-        self.assertIs(merged["craftsman-git-guard"]["enabled"], False)
-        self.assertTrue(merged["craftsman-git-guard"]["PreToolUse"])
+        self.assertIs(merged["craftsman-scope-guard"]["enabled"], False)
+        self.assertTrue(merged["craftsman-scope-guard"]["PreToolUse"])
         self.assertEqual(merged["my-hook"], original["my-hook"])
         self.assertEqual(
             json.loads((self.config_dir / "hooks.json.bak").read_text(encoding="utf-8")), original
         )
+
+    def test_upgrade_from_3x_replaces_git_guard_with_scope_guard_in_hooks_json(self) -> None:
+        self.config_dir.mkdir(parents=True)
+        hooks_path = self.config_dir / "hooks.json"
+        legacy_hooks = {
+            "craftsman-git-guard": {
+                "enabled": False,
+                "PreToolUse": [{"matcher": "run_command", "hooks": []}],
+            },
+            "craftsman-stop-gate": {"enabled": False, "Stop": []},
+            "my-hook": {"enabled": True, "Stop": [{"type": "command", "command": "echo hi"}]},
+        }
+        hooks_path.write_text(json.dumps(legacy_hooks), encoding="utf-8")
+        legacy_manifest = {
+            "targets": {
+                "antigravity": {
+                    "created_paths": [],
+                    "created_dirs": [],
+                    "modified_files": {str(hooks_path): "hooks_json"},
+                    "hooks_json_keys": ["craftsman-git-guard", "craftsman-stop-gate"],
+                    "previous_hooks_path": None,
+                    "hooks_dir": None,
+                }
+            }
+        }
+        (self.config_dir / MANIFEST_FILENAME).write_text(
+            json.dumps(legacy_manifest), encoding="utf-8"
+        )
+
+        self.assert_ok(self.install("--antigravity"))
+
+        merged = json.loads(hooks_path.read_text(encoding="utf-8"))
+        self.assertNotIn("craftsman-git-guard", merged)
+        self.assertIn("craftsman-scope-guard", merged)
+        self.assertIs(merged["craftsman-scope-guard"]["enabled"], True)
+        self.assertIs(merged["craftsman-stop-gate"]["enabled"], False)
+        self.assertEqual(merged["my-hook"], legacy_hooks["my-hook"])
 
     def test_corrupt_hooks_json_stops_the_install_before_any_write(self) -> None:
         self.config_dir.mkdir(parents=True)
