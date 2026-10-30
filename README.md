@@ -163,7 +163,7 @@ gear and by the risk signals in the diff.
 
 ### Platform enforcement
 
-![Lifecycle hooks, gate state machine, and Git protection](docs/diagrams/lifecycle-hooks-and-guards.png)
+![Lifecycle hooks, gate state machine, and runtime guards](docs/diagrams/lifecycle-hooks-and-guards.png)
 
 The protocol, lenses, subagents, and ledger are shared across all platforms. What differs is the
 mechanism that blocks completion.
@@ -189,15 +189,15 @@ Python 3.10 or newer, standard library only.
 ```bash
 git clone https://github.com/BuczynskiRafal/craftsman.git ~/.craftsman
 cd ~/.craftsman
-./install.sh                 # auto-detect Copilot / Claude Code / Antigravity + global Git hooks
+./install.sh                 # auto-detect Copilot / Claude Code / Antigravity
 ```
 
 For a chosen platform:
 
 ```bash
-./install.sh --copilot --git-hooks        # VS Code + Copilot CLI: instructions, skills, agents, user hooks
-./install.sh --claude --git-hooks         # Claude Code: commands, agents, and the gate hooks
-./install.sh --antigravity --git-hooks    # Google Antigravity
+./install.sh --copilot                    # VS Code + Copilot CLI: instructions, skills, agents, user hooks
+./install.sh --claude                     # Claude Code: commands, agents, and the gate hooks
+./install.sh --antigravity                # Google Antigravity
 ./install.sh --copilot-workspace ~/src/app   # commit .github/{skills,agents,hooks} to a repo
 ./install.sh --agents-workspace ~/src/app    # AGENTS.md + .cursor/rules for Codex and Cursor
 ```
@@ -207,7 +207,7 @@ The same through the CLI, on any OS, including Windows PowerShell:
 ```bash
 pip install .
 craftsman install                                  # same flags as ./install.sh (--auto, --all, --dry-run, …)
-craftsman uninstall                                # remove manifest-owned files and restore core.hooksPath
+craftsman uninstall                                # remove manifest-owned files
 craftsman export --user-dir --copilot-skills-dir --copilot-home  # VS Code instructions + ~/.copilot/{skills,agents,hooks}
 craftsman export --workspace path/to/repo          # .github/ for a team repository
 craftsman export --claude-dir                      # ~/.claude (settings.json is merged, a .bak is kept)
@@ -218,17 +218,16 @@ craftsman skill show code-review --lenses intent,contracts,failure  # print sele
 
 | `craftsman install` / `install.sh` flag | Effect |
 | :--- | :--- |
-| *(none)* / `--auto` | Detects installed platforms, installs for each, and adds global Git hooks. |
+| *(none)* / `--auto` | Detects installed platforms and installs for each. |
 | `--copilot` | Global instructions (`craftsman-rules.instructions.md` per VS Code profile), Agent Skills (`~/.copilot/skills/<skill>/SKILL.md`), the three custom agents (`~/.copilot/agents/<name>.agent.md`), and gate hooks (`~/.copilot/hooks/craftsman.json`). |
 | `--claude` | Commands, rules, reviewer and verifier agents in `~/.claude`, gate hooks in `settings.json`. `--no-claude-hooks` leaves the hooks out (and takes out hooks an earlier install merged). |
 | `--antigravity` | Skills, rules, scripts, and `hooks.json` in `~/.gemini/config`. |
-| `--copy` / `--symlink` / `--plugin` | How the Antigravity files and the git hooks are installed: copies (the default), symlinks to this checkout, or an Antigravity plugin in `~/.gemini/config/plugins/craftsman`. A mode flag selects no target by itself. |
+| `--copy` / `--symlink` / `--plugin` | How the Antigravity files are installed: copies (the default), symlinks to this checkout, or an Antigravity plugin in `~/.gemini/config/plugins/craftsman`. A mode flag selects no target by itself. |
 | `--copilot-workspace <dir>` | `.github/skills`, `.github/agents`, `.github/hooks/craftsman.json`, and a marked block in `.github/copilot-instructions.md`. Workspace hooks call `craftsman` from `PATH`. |
 | `--allow-duplicate-scopes` | Overrides the default refusal when installing `--copilot-workspace` on a machine that already has a user-level `--copilot` install (or vice versa). |
 | `--agents-workspace <dir>` | Marked block in `AGENTS.md` and `.cursor/rules/craftsman.mdc`. |
-| `--git-hooks` / `--no-git-hooks` | Installs global `commit-msg`, `pre-push`, and passthrough hooks (`core.hooksPath`), next to the Antigravity install when there is one, else in `$CRAFTSMAN_HOME` (default `~/.craftsman`); `--no-git-hooks` leaves them out of an auto-detected install. A hook whose guard script or Python is missing blocks the commit or push. |
 | `--all` | All platforms, without detection. `--no-claude-hooks` skips the Claude Code hooks. |
-| `--dry-run` | Prints the install or uninstall plan without changing files or Git config. |
+| `--dry-run` | Prints the install or uninstall plan without changing files. |
 
 #### GitHub Copilot discovery locations ("one name = one location")
 
@@ -245,22 +244,34 @@ VS Code Copilot and the GitHub Copilot CLI scan multiple directories at once and
 
 ### Uninstall
 
-Each install target writes a `<base>/.craftsman-install.json` manifest with the paths it created,
-the user files it merged its part into, and the previous `core.hooksPath` value. A user's file or
-folder in the way is moved into a `.craftsman-backup` folder next to it (where no agent discovers
-it); a user file Craftsman merges into (`settings.json`, `hooks.json`, `AGENTS.md`,
-`copilot-instructions.md`) keeps a one-time `.bak` copy; a symlinked one is updated where it
-points, which must be inside the workspace, and markers that do not enclose one block are an error.
-Files Craftsman merges into are checked before anything is written; a target that still fails is
-not recorded, and a manifest that is not in the current format is an error. The git hooks stay in
-the folder whose manifest records them.
+Each install target writes a `<base>/.craftsman-install.json` manifest with the paths it created
+and the user files it merged its part into. A user's file or folder in the way is moved into a
+`.craftsman-backup` folder next to it (where no agent discovers it); a user file Craftsman merges
+into (`settings.json`, `hooks.json`, `AGENTS.md`, `copilot-instructions.md`) keeps a one-time `.bak`
+copy; a symlinked one is updated where it points, which must be inside the workspace, and markers
+that do not enclose one block are an error. Files Craftsman merges into are checked before anything
+is written; a target that still fails is not recorded, and a manifest that is not in the current
+format is an error.
 
 `craftsman uninstall` (or `make uninstall`) takes the targets `--all`, `--antigravity`, `--claude`,
-`--copilot`, `--git-hooks`, `--copilot-workspace <dir>` and `--agents-workspace <dir>`, plus
-`--dry-run`; without a target it uninstalls every user-level target (`--no-git-hooks` keeps the git
-hooks). It removes only the paths in the manifests and Craftsman's part of the merged files, and
-does nothing where there is no manifest. It restores the previous `core.hooksPath`; if that value
-was changed after installation, it leaves the current value and prints a warning.
+`--copilot`, `--copilot-workspace <dir>` and `--agents-workspace <dir>`, plus `--dry-run`; without a
+target it uninstalls every user-level target. It removes only the paths in the manifests and
+Craftsman's part of the merged files, and does nothing where there is no manifest.
+
+### Upgrading from 3.x
+
+- **Git policy removed**: Craftsman 4.0 no longer enforces Git commit, push, or AI attribution
+  policies (`craftsman guard`, global `commit-msg` / `pre-push` hooks, `--git-hooks` /
+  `--no-git-hooks`, and `rules/git_workflow.md` have been removed). Configure branch-push,
+  attribution, and commit-format rules directly in your agent's own rules or user instructions
+  (such as `~/.claude/CLAUDE.md`, Copilot user instructions, or Antigravity global rules) before
+  re-exporting or reinstalling if you relied on the generated `craftsman-rules` file.
+- **Automatic cleanup of 3.x global Git hooks**: Running `craftsman install` or
+  `craftsman uninstall` automatically removes the global Git hooks installed by Craftsman 3.x and
+  restores the previous global `core.hooksPath` (unless `core.hooksPath` was modified after
+  installation, in which case Craftsman leaves the custom value untouched and prints a warning).
+  On Google Antigravity, reinstalling replaces `"craftsman-git-guard"` in `hooks.json` with
+  `"craftsman-scope-guard"`.
 
 ## Usage
 
@@ -339,19 +350,18 @@ and packets (required when moving from an older v1 ledger schema to v2).
   --takeover` replaces it; the stop hooks report it and let the agent stop, so a broken state never
   traps the agent in a loop, and `pre-tool` asks the user. On platforms without hooks,
   `craftsman gate --complete` checks the same thing.
-- **Git guard** (`craftsman guard`, `craftsman hook pre-tool`, global `pre-push` and `commit-msg`
-  hooks): blocks unconfirmed pushes to `main`/`master`, including through `bash -c`, aliases, and
-  `gh pr merge`. Rejects commits, tags, and PRs with AI attribution trailers.
-- **Work-tree mutation guard** (`craftsman hook pre-tool`, `find_worktree_mutation`): denies (`deny`)
-  work-tree and index-mutating Git commands for `craftsman-reviewer` and `craftsman-verifier`
-  (`git stash` except `list`/`show`/`create`, `reset`, `checkout`, `switch`, `restore`, `clean`,
-  plus `commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `apply`, `pull`, `rm`, `mv` for
-  subagents), and asks for user confirmation (`ask`) in the main session while a review-only round
-  is open (leaving `/craftsman` gate sessions and work outside review unblocked). Enforced on
-  platforms with `PreToolUse` hooks (Claude Code, VS Code Copilot, Copilot CLI); on Codex and
-  `agy -p` the skill prohibition applies.
-- **Search scope guard** (`craftsman hook pre-tool`, [`craftsman/scope.py`](craftsman/scope.py)):
-  confines Craftsman sessions and `craftsman-*` subagents to the current git work tree.
+- **Work-tree mutation guard** (`craftsman hook pre-tool`,
+  [`craftsman/worktree_guard.py`](craftsman/worktree_guard.py)): denies (`deny`) work-tree and
+  index-mutating Git commands for `craftsman-reviewer` and `craftsman-verifier` (`git stash` except
+  `list`/`show`/`create`, `reset`, `checkout`, `switch`, `restore`, `clean`, plus `commit`, `merge`,
+  `rebase`, `cherry-pick`, `revert`, `am`, `apply`, `pull`, `rm`, `mv` for subagents), and asks for
+  user confirmation (`ask`) in the main session while a review-only round is open (leaving
+  `/craftsman` gate sessions and work outside review unblocked). Enforced on platforms that run
+  `craftsman hook pre-tool` (Claude Code, VS Code Copilot, Copilot CLI); on Codex and `agy -p` the
+  skill prohibition applies.
+- **Search scope guard** (`craftsman hook pre-tool`, `craftsman scope-guard` on Google Antigravity,
+  [`craftsman/scope.py`](craftsman/scope.py)): confines Craftsman sessions and `craftsman-*`
+  subagents to the current git work tree.
 
 ### Search scope
 
