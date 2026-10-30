@@ -385,6 +385,15 @@ class ArchivePruningTests(unittest.TestCase):
         self.assertIn("Pruned: packet-2.intent.md", err_r3.getvalue())
 
 
+class _ReparseStat:
+    def __init__(self, inner: os.stat_result, reparse_tag: int) -> None:
+        self._inner = inner
+        self.st_reparse_tag = reparse_tag
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._inner, name)
+
+
 class InboxLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -630,6 +639,126 @@ class InboxLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(LedgerError, "refusing to use symlinked directory"):
                 create_inbox_file(self.craftsman_dir, "add")
         self.assertTrue(junction_item.is_file())
+
+    def test_prune_inbox_warns_on_locked_file_deleting_others(self) -> None:
+        inbox_dir = inbox_dir_for(self.craftsman_dir)
+        inbox_dir.mkdir(parents=True)
+        locked = inbox_dir / "add-locked.json"
+        unlocked = inbox_dir / "cover-free.json"
+        locked.write_text("[]", encoding="utf-8")
+        unlocked.write_text("[]", encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def selective_unlink(target: Path, missing_ok: bool = False) -> None:
+            if target == locked:
+                raise PermissionError("sharing violation")
+            real_unlink(target, missing_ok=missing_ok)
+
+        err = io.StringIO()
+        patcher = mock.patch.object(Path, "unlink", autospec=True, side_effect=selective_unlink)
+        with patcher, redirect_stderr(err):
+            pruned = prune_inbox_files(self.craftsman_dir)
+
+        self.assertEqual(pruned, (unlocked,))
+        self.assertFalse(unlocked.exists())
+        self.assertTrue(locked.is_file())
+        self.assertTrue(inbox_dir.is_dir())
+        self.assertIn("warning: could not remove inbox file", err.getvalue())
+        self.assertIn("Pruned 1 inbox file(s): cover-free.json", err.getvalue())
+
+        ledger_path = self.craftsman_dir / LEDGER_FILENAME
+        save(ledger_path, reviewed_ledger())
+        arch_err = io.StringIO()
+        with patcher, redirect_stderr(arch_err):
+            archived = archive_ledger(ledger_path)
+        self.assertEqual(len(archived), 1)
+        self.assertFalse(ledger_path.exists())
+        self.assertTrue(locked.is_file())
+        self.assertIn("warning: could not remove inbox file", arch_err.getvalue())
+
+    def test_prune_inbox_warns_without_raising_on_invalid_inbox(self) -> None:
+        self.craftsman_dir.mkdir()
+        outside = self.tmp / "outside-dir"
+        outside.mkdir()
+        alias_dir = self.tmp / "craftsman-alias"
+        alias_dir.symlink_to(self.craftsman_dir, target_is_directory=True)
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(alias_dir), ())
+        self.assertIn("warning: could not prune symlinked directory", err.getvalue())
+
+        inbox_path = inbox_dir_for(self.craftsman_dir)
+        inbox_path.symlink_to(outside, target_is_directory=True)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertIn("warning: could not prune symlinked inbox", err.getvalue())
+        inbox_path.unlink()
+
+        inbox_path.write_text("not a dir", encoding="utf-8")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertIn("not a directory", err.getvalue())
+        inbox_path.unlink()
+
+        inbox_path.mkdir()
+        err = io.StringIO()
+        with (
+            mock.patch.object(Path, "iterdir", side_effect=PermissionError("denied")),
+            redirect_stderr(err),
+        ):
+            self.assertEqual(prune_inbox_files(self.craftsman_dir), ())
+        self.assertIn("warning: could not prune inbox", err.getvalue())
+
+    def test_reparse_tags_block_links_while_allowing_cloud_files(self) -> None:
+        inbox_file = create_inbox_file(self.craftsman_dir, "cover")
+        (self.craftsman_dir / "packet-1.intent.md").write_text("view", encoding="utf-8")
+        (self.craftsman_dir / "packet-1.md").write_text("p1", encoding="utf-8")
+        (self.craftsman_dir / "packet-2.md").write_text("p2", encoding="utf-8")
+        real_lstat = os.lstat
+        active_tag = 0
+
+        def tagged_lstat(target: str | os.PathLike[str]) -> _ReparseStat:
+            return _ReparseStat(real_lstat(target), active_tag)
+
+        with mock.patch("craftsman.evidence.os.lstat", side_effect=tagged_lstat):
+            for link_tag in (0xA000000C, 0xA0000003):
+                active_tag = link_tag
+                self.assertTrue(evidence._is_symlink_or_junction(self.craftsman_dir))
+                with self.assertRaises(LedgerError):
+                    evidence._require_real_folder(self.craftsman_dir)
+                self.assertFalse(consume_inbox_file(self.craftsman_dir, str(inbox_file)))
+                self.assertTrue(inbox_file.is_file())
+
+            active_tag = 0x9000001A
+            self.assertFalse(evidence._is_symlink_or_junction(self.craftsman_dir))
+            evidence._require_real_folder(self.craftsman_dir)
+            with redirect_stderr(io.StringIO()):
+                removed = prune_round_files(self.craftsman_dir, 2)
+            self.assertEqual([item.name for item in removed], ["packet-1.intent.md"])
+            self.assertTrue(consume_inbox_file(self.craftsman_dir, str(inbox_file)))
+            self.assertFalse(inbox_file.exists())
+
+    def test_create_inbox_file_recovers_when_dir_removed_mid_race(self) -> None:
+        real_open = os.open
+        calls = 0
+
+        def racing_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                inbox_dir_for(self.craftsman_dir).rmdir()
+            return real_open(path, flags, mode)
+
+        with mock.patch("craftsman.evidence.os.open", side_effect=racing_open):
+            created = create_inbox_file(self.craftsman_dir, "verdict")
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(inbox_dir_for(self.craftsman_dir).is_dir())
+        self.assertTrue(created.is_file())
+        self.assertEqual(created.parent, inbox_dir_for(self.craftsman_dir))
 
 
 if __name__ == "__main__":

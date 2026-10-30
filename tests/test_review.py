@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -1054,25 +1055,39 @@ class BatchRejectionTests(FastCliTestCase):
         self.prepare_multi_hunk(14, tier="deep")
         lenses = ("intent", "contracts", "failure")
         entries: list[dict[str, object]] = [
-            {"lens": lenses[i % 3], "hunks": [f"H{(i % 14) + 1}"], "note": coverage_note([f"H{(i % 14) + 1}"])}
+            {
+                "lens": lenses[i % 3],
+                "hunks": [f"H{(i % 14) + 1}"],
+                "note": coverage_note([f"H{(i % 14) + 1}"]),
+            }
             for i in range(42)
         ]
         entries[39] = {"lens": "trust", "hunks": ["H13", "H14"], "note": coverage_note(["H13"])}
         entries[40] = {"lens": "contracts", "hunks": ["H13", "H14"], "note": coverage_note(["H13"])}
         entries[41] = {"lens": "failure", "hunks": ["H13"], "note": "H13 looks good"}
 
-        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+        res = self.cli_fast(
+            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
+        )
 
         self.assertEqual(res.code, 1)
         self.assertNotIn("error:", res.err)
-        self.assertIn("craftsman review cover: 3 of 42 entries rejected; nothing was recorded.", res.err)
+        self.assertIn(
+            "craftsman review cover: 3 of 42 entries rejected; nothing was recorded.", res.err
+        )
         self.assertIn("entry 40 (trust): note:", res.err)
         self.assertIn("entry 41 (contracts): note:", res.err)
         self.assertIn("entry 42 (failure): note:", res.err)
         self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
         for index, lens in ((39, "trust"), (40, "contracts"), (41, "failure")):
-            entries[index] = {"lens": lens, "hunks": ["H13", "H14"], "note": coverage_note(["H13", "H14"])}
-        fixed = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+            entries[index] = {
+                "lens": lens,
+                "hunks": ["H13", "H14"],
+                "note": coverage_note(["H13", "H14"]),
+            }
+        fixed = self.cli_fast(
+            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
+        )
         self.assertEqual(fixed.code, 0, fixed.err)
 
     def test_four_hunk_entry_reports_missing_plus_weak_targets(self) -> None:
@@ -1080,7 +1095,9 @@ class BatchRejectionTests(FastCliTestCase):
         note = f"{coverage_note(['H1'])}; H2 looks clean"
         entries = [{"lens": "intent", "hunks": ["H1", "H2", "H3", "H4"], "note": note}]
 
-        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+        res = self.cli_fast(
+            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
+        )
 
         self.assertEqual(res.code, 1)
         self.assertIn("missing: H3, H4", res.err)
@@ -1127,16 +1144,18 @@ class BatchRejectionTests(FastCliTestCase):
     def test_sweep_annotates_only_lenses_rejected_in_same_batch(self) -> None:
         self.prepare_multi_hunk(1, tier="standard")
         design_note = "mod_1.py:1 fn_1(x) adds 2 lines -> single pure helper with no extra layers"
-        self.assertEqual(
-            self.cli_fast("review", "cover", "--lens", "design", "--files", "mod_1.py", "--note", design_note).code,
-            0,
+        design_res = self.cli_fast(
+            "review", "cover", "--lens", "design", "--files", "mod_1.py", "--note", design_note
         )
+        self.assertEqual(design_res.code, 0)
         entries = [
             {"lens": "intent", "hunks": ["H1"], "note": "H1 looks good"},
             {"lens": "sweep", "hunks": ["H1"], "note": coverage_note(["H1"])},
         ]
 
-        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+        res = self.cli_fast(
+            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
+        )
 
         self.assertEqual(res.code, 1)
         self.assertIn("intent H1 (depends on entry 1)", res.err)
@@ -1155,9 +1174,12 @@ class BatchRejectionTests(FastCliTestCase):
         self.assertEqual(note_res.err.count("Note format:"), 1)
 
         self.add()
-        verdict_entries = [{"id": "F1", "as": "proven", "evidence": "Reproduced crash at cart.py:3"}]
+        verdict_entries = [
+            {"id": "F1", "as": "proven", "evidence": "Reproduced crash at cart.py:3"}
+        ]
         verdict_res = self.cli_fast(
-            "review", "verdict", "--from-json", "-", stdin_bytes=json.dumps(verdict_entries).encode()
+            "review", "verdict", "--from-json", "-",
+            stdin_bytes=json.dumps(verdict_entries).encode(),
         )
         self.assertEqual(verdict_res.code, 1)
         self.assertNotIn("Note format:", verdict_res.err)
@@ -1166,7 +1188,9 @@ class BatchRejectionTests(FastCliTestCase):
         self.prepare_bug()
         entries = [{"lens": "intent", "hunks": ["H1"], "note": "H1 ok"} for _ in range(23)]
 
-        res = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode())
+        res = self.cli_fast(
+            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
+        )
 
         self.assertEqual(res.code, 1)
         self.assertIn("23 of 23 entries rejected", res.err)
@@ -1199,7 +1223,8 @@ class JsonEncodingTests(FastCliTestCase):
         for codec in ("utf-8", "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be"):
             with self.subTest(codec=codec):
                 self.prepare_bug()
-                file_bytes = self._payload("intent").encode("utf-16" if codec == "utf-16-le" else codec)
+                target_codec = "utf-16" if codec == "utf-16-le" else codec
+                file_bytes = self._payload("intent").encode(target_codec)
                 if codec == "utf-16-be":
                     file_bytes = b"\xfe\xff" + self._payload("intent").encode("utf-16-be")
                 json_file = self.tmp / f"batch-{codec}.json"
@@ -1207,11 +1232,12 @@ class JsonEncodingTests(FastCliTestCase):
                 res = self.cli_fast("review", "cover", "--from-json", str(json_file))
                 self.assertEqual(res.code, 0, res.err)
 
-                stdin_bytes = self._payload("contracts").encode("utf-16" if codec == "utf-16-le" else codec)
+                stdin_bytes = self._payload("contracts").encode(target_codec)
                 if codec == "utf-16-be":
                     stdin_bytes = b"\xfe\xff" + self._payload("contracts").encode("utf-16-be")
                 piped = self._pipe_subproc(stdin_bytes)
-                self.assertEqual(piped.returncode, 0, piped.stderr.decode("utf-8", errors="replace"))
+                piped_err = piped.stderr.decode("utf-8", errors="replace")
+                self.assertEqual(piped.returncode, 0, piped_err)
                 self.cli_fast("review", "reset")
 
     def test_from_json_rejects_cp1250_with_utf8_save_hint(self) -> None:
@@ -1246,7 +1272,10 @@ class InboxCliTests(FastCliTestCase):
         self.assertTrue(first.is_file())
         self.assertTrue(second.is_file())
 
-        first.write_text(json.dumps([{"lens": "intent", "hunks": ["H1"], "note": "H1 weak"}]), encoding="utf-8")
+        first.write_text(
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": "H1 weak"}]),
+            encoding="utf-8",
+        )
         rejected = self.cli_fast("review", "cover", "--from-json", str(first))
         self.assertEqual(rejected.code, 1)
         self.assertTrue(first.is_file())
@@ -1283,6 +1312,17 @@ class InboxCliTests(FastCliTestCase):
         self.assertTrue(link.is_symlink())
         self.assertTrue(target.is_file())
 
+    @staticmethod
+    def _locked_unlink(locked_inbox: Path) -> Callable[..., None]:
+        real_unlink = Path.unlink
+
+        def fail_unlink(path_obj: Path, missing_ok: bool = False) -> None:
+            if path_obj.resolve() == locked_inbox.resolve():
+                raise PermissionError("locked by antivirus")
+            real_unlink(path_obj, missing_ok=missing_ok)
+
+        return fail_unlink
+
     def test_inbox_unlink_oserror_warns_without_failing(self) -> None:
         self.prepare_bug()
         inbox_file = self._new_inbox_path("cover")
@@ -1290,19 +1330,41 @@ class InboxCliTests(FastCliTestCase):
             json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
-        real_unlink = Path.unlink
 
-        def fail_inbox_unlink(path_obj: Path, missing_ok: bool = False) -> None:
-            if path_obj.resolve() == inbox_file.resolve():
-                raise PermissionError("locked by antivirus")
-            real_unlink(path_obj, missing_ok=missing_ok)
-
-        with mock.patch.object(Path, "unlink", fail_inbox_unlink):
+        with mock.patch.object(Path, "unlink", self._locked_unlink(inbox_file)):
             res = self.cli_fast("review", "cover", "--from-json", str(inbox_file))
 
         self.assertEqual(res.code, 0)
         self.assertIn("warning: could not remove inbox file", res.err)
         self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 1)
+
+    def test_locked_inbox_file_warns_without_failing_lifecycle_commands(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.assertEqual(self.cli_fast("review", "prepare", "--tier", "quick").code, 0)
+        locked_inbox = self._new_inbox_path("cover")
+        self.repo.write("cart.py", BUGGY_TOTAL + "# round 2\n")
+
+        with mock.patch.object(Path, "unlink", self._locked_unlink(locked_inbox)):
+            prep = self.cli_fast("review", "prepare", "--tier", "quick")
+            report = self.cli_fast("review", "report", "--review-only")
+            reset = self.cli_fast("review", "reset")
+            self.assertEqual(self.cli_fast("gate", "--init", "--tier", "quick").code, 0)
+            self.assertEqual(self.cli_fast("review", "prepare", "--tier", "quick").code, 0)
+            note = coverage_note(["H1"])
+            for lens in ("intent", "contracts", "failure"):
+                cover = self.cli_fast(
+                    "review", "cover", "--lens", lens, "--hunks", "H1", "--note", note
+                )
+                self.assertEqual(cover.code, 0, cover.err)
+            self.run_tests()
+            complete = self.cli_fast("gate", "--complete")
+
+        checks = (("prepare", prep), ("report", report), ("reset", reset), ("complete", complete))
+        for label, res in checks:
+            with self.subTest(command=label):
+                self.assertEqual(res.code, 0, res.err)
+                self.assertIn("warning: could not remove inbox file", res.err)
+        self.assertTrue(locked_inbox.is_file())
 
     def test_inbox_pruned_by_new_round_reset_or_review_only(self) -> None:
         self.prepare_bug()
@@ -1355,8 +1417,9 @@ class InboxCliTests(FastCliTestCase):
 
         inbox_file = self._new_inbox_path("cover", cwd=wt)
         policy = ScopePolicy(mode="deny")
-        allowed = evaluate_scope("Read", {"file_path": str(inbox_file)}, wt, wt, policy)
-        denied = evaluate_scope("Read", {"file_path": str(inbox_file)}, self.repo.root, self.repo.root, policy)
+        read_args = {"file_path": str(inbox_file)}
+        allowed = evaluate_scope("Read", read_args, wt, wt, policy)
+        denied = evaluate_scope("Read", read_args, self.repo.root, self.repo.root, policy)
         self.assertEqual(allowed.decision, "allow", allowed.reason)
         self.assertEqual(denied.decision, "deny")
 
@@ -1364,24 +1427,26 @@ class InboxCliTests(FastCliTestCase):
             json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
-        res = run_main(cli_main, "review", "cover", "--from-json", str(inbox_file), "--cwd", str(wt))
+        res = run_main(
+            cli_main, "review", "cover", "--from-json", str(inbox_file), "--cwd", str(wt)
+        )
         self.assertEqual(res.code, 0, res.err)
         self.assertFalse(inbox_file.exists())
 
     def test_check_flag_validates_without_recording_or_consuming(self) -> None:
         self.prepare_bug()
         inbox_file = self._new_inbox_path("cover")
+        note = coverage_note(["H1"])
         inbox_file.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": note}]),
             encoding="utf-8",
         )
-        self.assertEqual(self.cli_fast("review", "cover", "--check", "--from-json", str(inbox_file)).code, 0)
-        self.assertEqual(
-            self.cli_fast(
-                "review", "cover", "--check", "--lens", "intent", "--hunks", "H1", "--note", coverage_note(["H1"])
-            ).code,
-            0,
+        cover_json = self.cli_fast("review", "cover", "--check", "--from-json", str(inbox_file))
+        self.assertEqual(cover_json.code, 0)
+        cover_cli = self.cli_fast(
+            "review", "cover", "--check", "--lens", "intent", "--hunks", "H1", "--note", note
         )
+        self.assertEqual(cover_cli.code, 0)
         self.assertTrue(inbox_file.is_file())
         self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
 
@@ -1394,33 +1459,34 @@ class InboxCliTests(FastCliTestCase):
             }]),
             encoding="utf-8",
         )
-        self.assertEqual(self.cli_fast("review", "add", "--check", "--from-json", str(add_inbox)).code, 0)
+        add_json = self.cli_fast("review", "add", "--check", "--from-json", str(add_inbox))
+        self.assertEqual(add_json.code, 0)
         self.assertTrue(add_inbox.is_file())
-        self.assertEqual(
-            self.cli_fast("review", "add", "--check", "--file", "cart.py", "--line", "0", *FINDING_FLAGS).code,
-            1,
+        bad_add = self.cli_fast(
+            "review", "add", "--check", "--file", "cart.py", "--line", "0", *FINDING_FLAGS
         )
-        self.assertEqual(
-            self.cli_fast("review", "add", "--check", "--file", "cart.py", "--line", "3", *FINDING_FLAGS).code,
-            0,
+        self.assertEqual(bad_add.code, 1)
+        ok_add = self.cli_fast(
+            "review", "add", "--check", "--file", "cart.py", "--line", "3", *FINDING_FLAGS
         )
+        self.assertEqual(ok_add.code, 0)
         self.assertEqual(self.repo.show()["findings"], [])
 
         self.add()
         verdict_inbox = self._new_inbox_path("verdict")
         verdict_inbox.write_text(
-            json.dumps([{"id": "F1", "as": "probable", "evidence": STATIC_EVIDENCE}]), encoding="utf-8"
+            json.dumps([{"id": "F1", "as": "probable", "evidence": STATIC_EVIDENCE}]),
+            encoding="utf-8",
         )
-        self.assertEqual(
-            self.cli_fast("review", "verdict", "--check", "--from-json", str(verdict_inbox)).code, 0
+        verdict_json = self.cli_fast(
+            "review", "verdict", "--check", "--from-json", str(verdict_inbox)
         )
+        self.assertEqual(verdict_json.code, 0)
         self.assertTrue(verdict_inbox.is_file())
-        self.assertEqual(
-            self.cli_fast(
-                "review", "verdict", "--check", "F1", "--as", "probable", "--evidence", STATIC_EVIDENCE
-            ).code,
-            0,
+        verdict_cli = self.cli_fast(
+            "review", "verdict", "--check", "F1", "--as", "probable", "--evidence", STATIC_EVIDENCE
         )
+        self.assertEqual(verdict_cli.code, 0)
         self.assertIsNone(self.repo.show()["findings"][0]["verdict"])
 
 

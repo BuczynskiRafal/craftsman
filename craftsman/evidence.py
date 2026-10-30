@@ -12,6 +12,7 @@ import re
 import secrets
 import stat
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,11 @@ InboxKind = Literal["cover", "add", "verdict"]
 INBOX_KINDS: tuple[InboxKind, ...] = get_args(InboxKind)
 KEEP_ARCHIVES_ENV = "CRAFTSMAN_KEEP_ARCHIVES"
 DEFAULT_KEEP_ARCHIVES = 5
+_MAX_INBOX_ATTEMPTS = 16
+_LINK_REPARSE_TAGS: frozenset[int] = frozenset({
+    getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
+    getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+})
 _ROUND_PACKET_RE = re.compile(r"\Apacket-([0-9]+)(\..+)?\.md\Z")
 _STAMP_PATTERN = r"([0-9]{8}T[0-9]{6}\.[0-9]{3}Z)(?:-([2-9]|[1-9][0-9]+))?"
 _ARCHIVE_DIR_RE = re.compile(rf"\Aarchive-{_STAMP_PATTERN}\Z")
@@ -75,26 +81,26 @@ def inbox_dir_for(craftsman_dir: Path) -> Path:
     return craftsman_dir / INBOX_DIRNAME
 
 
+def _has_link_reparse_tag(st: os.stat_result) -> bool:
+    return getattr(st, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
+
+
 def _is_symlink_or_junction(path: Path) -> bool:
-    if path.is_symlink():
-        return True
     try:
-        reparse_tag = getattr(os.lstat(path), "st_reparse_tag", 0)
+        return path.is_symlink() or _has_link_reparse_tag(os.lstat(path))
     except OSError:
         return False
-    return bool(reparse_tag)
 
 
 def _has_real_inode(st: os.stat_result) -> bool:
     return st.st_ino != 0 or st.st_dev != 0
 
 
-def create_inbox_file(craftsman_dir: Path, kind: InboxKind) -> Path:
-    """Create and return a unique empty JSON batch file inside `craftsman_dir/inbox`."""
-    if kind not in INBOX_KINDS:
-        raise LedgerError(
-            f"unknown inbox kind {kind!r}; expected one of {', '.join(INBOX_KINDS)}"
-        )
+def _warn_inbox(detail: str) -> None:
+    sys.stderr.write(f"craftsman review: warning: {detail}\n")
+
+
+def _prepare_inbox_dir(craftsman_dir: Path) -> Path:
     _require_real_folder(craftsman_dir, action="use")
     inbox_dir = craftsman_dir / INBOX_DIRNAME
     _require_real_folder(inbox_dir, action="use")
@@ -103,22 +109,30 @@ def create_inbox_file(craftsman_dir: Path, kind: InboxKind) -> Path:
         inbox_dir.mkdir(exist_ok=True)
     except OSError as exc:
         raise LedgerError(f"cannot create inbox directory {inbox_dir}: {exc}") from exc
+    return inbox_dir
+
+
+def create_inbox_file(craftsman_dir: Path, kind: InboxKind) -> Path:
+    """Create and return a unique empty JSON batch file inside `craftsman_dir/inbox`."""
+    if kind not in INBOX_KINDS:
+        raise LedgerError(f"unknown inbox kind {kind!r}; expected one of {', '.join(INBOX_KINDS)}")
     pid = os.getpid()
-    while True:
+    for attempt in range(_MAX_INBOX_ATTEMPTS):
+        inbox_dir = _prepare_inbox_dir(craftsman_dir)
         candidate = inbox_dir / f"{kind}-{pid}-{secrets.token_hex(4)}.json"
         try:
             fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            continue
         except OSError as exc:
+            retryable = isinstance(exc, (FileExistsError, FileNotFoundError))
+            if retryable and attempt + 1 < _MAX_INBOX_ATTEMPTS:
+                continue
             raise LedgerError(f"cannot create inbox file in {inbox_dir}: {exc}") from exc
         os.close(fd)
         return candidate
+    raise LedgerError(f"cannot create inbox file in {craftsman_dir / INBOX_DIRNAME}")
 
 
-def _is_consumable_inbox_entry(
-    craftsman_dir: Path, inbox_dir: Path, candidate: Path
-) -> bool:
+def _is_consumable_inbox_entry(craftsman_dir: Path, inbox_dir: Path, candidate: Path) -> bool:
     for item in (craftsman_dir, inbox_dir, candidate, candidate.parent, candidate.parent.parent):
         if _is_symlink_or_junction(item):
             return False
@@ -135,7 +149,7 @@ def _is_consumable_inbox_entry(
         cand_stat = os.lstat(candidate)
     except OSError:
         return False
-    return stat.S_ISREG(cand_stat.st_mode) and getattr(cand_stat, "st_reparse_tag", 0) == 0
+    return stat.S_ISREG(cand_stat.st_mode) and not _has_link_reparse_tag(cand_stat)
 
 
 def consume_inbox_file(craftsman_dir: Path, source: str) -> bool:
@@ -153,40 +167,46 @@ def consume_inbox_file(craftsman_dir: Path, source: str) -> bool:
     except FileNotFoundError:
         return False
     except OSError as exc:
-        sys.stderr.write(
-            f"craftsman review: warning: could not remove inbox file {candidate}: {exc}\n"
-        )
+        _warn_inbox(f"could not remove inbox file {candidate}: {exc}")
         return False
-    try:
+    with suppress(OSError):
         inbox_dir.rmdir()
-    except OSError:
-        pass
     return True
 
 
 def prune_inbox_files(craftsman_dir: Path) -> tuple[Path, ...]:
     """Delete leftover batch JSON files from `craftsman_dir/inbox` and remove the folder if empty."""
-    _require_real_folder(craftsman_dir)
+    if _is_symlink_or_junction(craftsman_dir):
+        _warn_inbox(f"could not prune symlinked directory {craftsman_dir}")
+        return ()
     inbox_dir = craftsman_dir / INBOX_DIRNAME
-    _require_real_folder(inbox_dir)
-    if not inbox_dir.exists():
+    if _is_symlink_or_junction(inbox_dir):
+        _warn_inbox(f"could not prune symlinked inbox {inbox_dir}")
+        return ()
+    try:
+        if not inbox_dir.exists():
+            return ()
+        if not inbox_dir.is_dir():
+            _warn_inbox(f"could not prune inbox {inbox_dir}: not a directory")
+            return ()
+        entries = sorted(inbox_dir.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        _warn_inbox(f"could not prune inbox {inbox_dir}: {exc}")
         return ()
     pruned: list[Path] = []
-    try:
-        for entry in sorted(inbox_dir.iterdir(), key=lambda item: item.name):
+    for entry in entries:
+        try:
             if _is_symlink_or_junction(entry) or not entry.is_file():
                 continue
-            try:
-                entry.unlink()
-            except FileNotFoundError:
-                continue
-            pruned.append(entry)
-    except OSError as exc:
-        raise LedgerError(f"cannot prune inbox in {craftsman_dir}: {exc}") from exc
-    try:
+            entry.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _warn_inbox(f"could not remove inbox file {entry}: {exc}")
+            continue
+        pruned.append(entry)
+    with suppress(OSError):
         inbox_dir.rmdir()
-    except OSError:
-        pass
     if pruned:
         names = ", ".join(item.name for item in pruned)
         sys.stderr.write(f"Pruned {len(pruned)} inbox file(s): {names}\n")
