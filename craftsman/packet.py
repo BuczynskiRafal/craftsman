@@ -83,18 +83,15 @@ _FENCE_LANGUAGES = {
 }
 _BACKTICK_RUN_RE = re.compile(r"`+")
 CHEAT_SHEET = (
-    "- Cover (1–4 hunks per call; the note names every hunk id and what you tried on it; "
-    "for >1 entry, prefer `--from-json - <<'EOF'`):\n"
-    '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "hunks": ["H1", "H2"], '
-    '"note": "H1 f: x=None -> L42 raises; H2 g: callers a.py:19 ok"}]`, or single:\n'
-    '  `craftsman review cover --lens <lens> --hunks H1,H2 --note "H1 f: x=None -> L42 raises; '
-    'H2 g: callers a.py:19 ok"`; the `design` lens takes `--files a.py` (`"files"` in JSON) '
-    "instead of hunk ids",
-    "- Finding (one per root cause; for >1 entry, prefer `--from-json - <<'EOF'`; group unjudged "
-    "duplicates before verification with `craftsman review merge F1 F2` — Merge only when ONE fix "
-    "removes every consequence. Different fixes are separate findings, even on the same line, file, "
-    "or category, e.g. a missing `--json` flag in `craftsman status` and a stale README example are "
-    "two separate findings, not one 'housekeeping' finding):\n"
+    "- Cover (1–4 hunks per call; combine assigned lenses with `\"lenses\"` — >= 2 lenses need >= 80 "
+    "chars/hunk, 20 concrete; 1 lens >= 40):\n"
+    '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lenses": ["intent", "contracts", '
+    '"failure"], "hunks": ["H1"], "note": "H1 parse_cfg: x=None -> L42 TypeError, raw=\'\' -> '
+    'default {} at cfg.py:18, callers cli.py:19 ok"}]`, or single '
+    '`craftsman review cover --lens intent,contracts --hunks H1 --note "..."`; `design` takes '
+    '`--files a.py` (`"files"` in JSON)',
+    "- Finding (one per root cause; >1 entry via `--from-json - <<'EOF'`; `craftsman review merge "
+    "F1 F2` only when ONE fix removes every consequence — different fixes stay separate findings):\n"
     '  `craftsman review add --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "file": "<path>", '
     '"line": 42, "severity": "major", "title": "...", "scenario": "<root cause -> wrong outcomes>", '
     '"suggestion": "..."}]`, or single:\n'
@@ -109,8 +106,7 @@ CHEAT_SHEET = (
     '`--as dismissed --evidence "<guard at file.py:42>"`',
     "- Run (tests, repro, e2e): `craftsman run --kind test|e2e|repro|lint|build -- <command>`",
     "- Progress: `craftsman review show` · gate status: `craftsman review check` "
-    "(review-only mode without `--fix`: `craftsman review check --review-only` then "
-    "`craftsman review report --review-only`)",
+    "(review-only: `craftsman review check --review-only`, `craftsman review report --review-only`)",
 )
 
 

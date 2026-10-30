@@ -77,18 +77,20 @@ The message that started you names:
    naming and structure problems when you can state the wrong reading: what a reader would believe
    from the name, and what the code actually does. 'I don't like it' is not a finding.
 4. **Record multi-lens coverage incrementally** while you probe:
-   - Combine your assigned **hunk lenses** into one entry per batch of **1–4 hunks** using
-     `"lenses": [...]` (or `--lens a,b,c` on the CLI). Whenever 2 or more lenses are combined, each
-     hunk ID in `note` requires its own concrete code-detail segment of **>= 80 characters**
-     (`>= 40` chars for a single lens) naming concrete inputs, callers, or `file:line` guards —
-     `"ok"` or `"checked"` is rejected:
+   - Combine your assigned **hunk lenses** onto the same **1–4 hunks** in one `"lenses": [...]`
+     entry (or `--lens a,b,c` on the CLI; never emit separate single-lens entries for the same
+     hunks — `"lens"` is only for single-lens passes like `design` or `sweep`). Combining `>= 2`
+     lenses requires ~2x longer concrete detail per hunk: each hunk ID in `note` needs its own
+     concrete code-detail segment of **>= 80 characters** (20 concrete; `>= 40` chars for a single
+     lens) naming concrete inputs, callers, or `file:line` guards — `"ok"` or `"checked"` is
+     rejected:
      ```bash
      craftsman review cover --from-json - <<'EOF'
      [
        {
          "lenses": ["intent", "contracts", "failure"],
          "hunks": ["H2", "H5"],
-         "note": "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4), HTTP 400 -> retried 3x (F5), payload=b'' rejected at client.py:19. H5 checkout: passes gateway error up at checkout.py:41 without partial order row"
+         "note": "H2 _post_with_retry: timeout -> POST retried without idempotency key (F4), HTTP 400 -> retried 3x (F5), payload=b'' rejected at client.py:19. H5 checkout: passes gateway error up at checkout.py:41 without partial order row, callers views.py:63 ok"
        }
      ]
      EOF

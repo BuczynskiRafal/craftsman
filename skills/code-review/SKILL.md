@@ -224,12 +224,12 @@ finding a verdict) or acknowledge it with a concrete code reason (`craftsman rev
 - **Single multi-lens `--files` coverage entry per batch of 1–4 files:** in `quick`, every lens
   accepts `--files`, so record all selected lenses for up to 4 changed files in one call:
   ```bash
-  craftsman review cover --lens intent,contracts,failure --files src/a.py,src/b.py --note "src/a.py: paginate(page=0) -> ValueError at L18, size=None -> DEFAULT_SIZE at L22, callers api.py:44. src/b.py: load_items maps OSError -> ConfigError at L31 without partial state"
+  craftsman review cover --lens intent,contracts,failure --files src/a.py,src/b.py --note "src/a.py: paginate(page=0) -> ValueError at L18, size=None -> DEFAULT_SIZE at L22, callers api.py:44 ok. src/b.py: load_items maps OSError -> ConfigError at L31 without partial state, callers cli.py:19 ok"
   ```
   (or `cover --from-json` with `"lenses": ["intent", "contracts", "failure"]` and `"files": [...]`).
   Name each file (full path, or basename when unique in the round) with a concrete code-detail
-  segment of **>= 80 characters per file** whenever 2 or more lenses are combined (`>= 40` chars
-  for a single lens).
+  segment of **>= 80 characters per file** (20 concrete) whenever 2 or more lenses are combined
+  (`>= 40` chars for a single lens).
 - **No `sweep` lens in `quick`:** `sweep` is not selected on `quick` — never call
   `craftsman review cover --lens sweep`.
 - **Close any `Quality signals` (`S1..Sn`)** via `review ack S# --reason "..."` or
@@ -272,16 +272,18 @@ subagents (when no subagent mechanism exists, run the lenses yourself, loading p
   view/shard (never the full packet).
 - **Multi-lens, incremental coverage:** on `standard` and `deep`, hunk lenses cover `--hunks` while
   `design` covers `--files` (hunk targets and file targets cannot be mixed in one entry, and `sweep`
-  cannot be combined with other lenses). Combine all assigned hunk lenses into one entry per **1–4
-  hunks** with a concrete **>= 80-character** segment per hunk (`>= 40` chars for a single lens),
-  and record `design` separately on `--files`:
+  cannot be combined with other lenses). Combine all assigned hunk lenses onto the same **1–4
+  hunks** in one `"lenses": [...]` entry (never emit separate single-lens entries for the same
+  hunks; `"lens"` is only for single-lens passes like `design` or `sweep`). Combining `>= 2` lenses
+  requires ~2x longer concrete detail per hunk (**`>= 80` characters per hunk, 20 concrete**;
+  `>= 40` chars for a single lens), and `design` is recorded separately on `--files`:
   ```bash
   craftsman review cover --from-json - <<'EOF'
   [
     {
       "lenses": ["intent", "contracts", "failure"],
       "hunks": ["H1", "H3"],
-      "note": "H1 paginate: page=0 -> start=-20 (F2), size=None -> default 20 at catalog.py:14, OSError propagated at L29. H3 search_page: q='' rejected by validate_query at api.py:40 before query_db"
+      "note": "H1 paginate: page=0 -> start=-20 (F2), size=None -> default 20 at catalog.py:14, OSError propagated at L29. H3 search_page: q='' rejected by validate_query at api.py:40 before query_db, callers routes.py:18 ok"
     }
   ]
   EOF
