@@ -11,7 +11,7 @@ This repository uses **Craftsman**: every change is reviewed and verified agains
 - **Verify findings:** group unjudged same-root-cause duplicates first with `craftsman review merge <target> <dup>` (only when one fix removes every consequence), then record verdicts with `craftsman review verdict` (or `--from-json - <<'EOF'`), fix and `craftsman review resolve <id> --as fixed --note "..."`; prepare a new round for the changed hunks.
 - **Run checks through the ledger:** `craftsman run --kind test -- <command>` (and `--kind e2e` on deep); only runs at the final code count.
 - **Done means** `craftsman review check` passes; then `craftsman gate --complete` and report with `craftsman review report` (in standalone review-only `/code-review` without `--fix`, finish with `craftsman review check --review-only` and `craftsman review report --review-only`).
-- **Skills & lenses:** invoke `/name` as a skill if your platform offers it; otherwise run `craftsman skill show <name>` (and `craftsman skill show code-review --file lenses.md` for the review lens playbooks). Never search the file system for skill or lens files.
+- **Skills & lenses:** invoke `/name` as a skill if your platform offers it; otherwise run `craftsman skill show <name>` (and `craftsman skill show code-review --lenses <lenses>` for the playbooks of the lenses you apply). Never search the file system for skill or lens files.
 
 ## Search scope
 - Work only inside this git work tree (`git rev-parse --show-toplevel`): prefer `git ls-files`, `git grep`, and editor search scoped to this folder.

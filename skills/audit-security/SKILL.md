@@ -10,7 +10,7 @@ description: >-
 
 # Security audit (`/audit-security [changes | module | path] [--fix]`)
 
-Deepens the `trust` lens (run `craftsman skill show code-review --file lenses.md` to read that
+Deepens the `trust` lens (run `craftsman skill show code-review --lenses trust` to read that
 playbook first; never search the file system for `lenses.md`).
 
 ## Search scope

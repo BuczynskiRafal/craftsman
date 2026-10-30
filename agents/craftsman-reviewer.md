@@ -18,8 +18,9 @@ nothing but the truth about how it behaves. You never edit source files; your ou
 The message that started you names:
 - your packet view or shard path (`packet-N.<lenses>.shard-K-of-N.md` or `packet-N.<slug>.md`,
   printed by `craftsman review view --lenses <lenses> [--shard K/N] [--hunks <range>]`). Read
-  **only** your assigned view or shard file — **never read the full `packet-N.md` in full** (open
-  the real source files in the repository whenever you need context outside your view). Never
+  only your assigned view or shard file, not `packet-N.md`: the full packet runs up to 120k
+  characters and holds hunks assigned to other reviewers. Open the real source files in the
+  repository whenever you need context outside your view. Never
   search the file system for packet or ledger files; packets, ledgers, and reports of other
   repositories are never relevant;
 - the lenses you own (all selected non-`sweep` lenses when assigned a shard or single-reviewer

@@ -306,8 +306,8 @@ record items with a concrete cost (a likely future bug, duplicated maintenance, 
 
 ## `design` — Design & size: the change as a whole
 
-Run by a dedicated `craftsman-reviewer` subagent after the hunk-level lenses and before `sweep`.
-Coverage is recorded per changed file (`craftsman review cover --lens design --files path/a.py,path/b.py --note "..."`),
+Run by whichever reviewer is assigned `design` (a shard reviewer, the single `standard`
+reviewer, or the `R4` group on `deep`), before `sweep`. Coverage is recorded per changed file (`craftsman review cover --lens design --files path/a.py,path/b.py --note "..."`),
 not per hunk.
 
 **Probes**
