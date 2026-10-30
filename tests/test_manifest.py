@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from craftsman.manifest import (
+    LEGACY_V1_HOOKS_JSON_KEYS,
     MANIFEST_FILENAME,
     InstallError,
     InstallManifest,
@@ -153,6 +154,90 @@ class StrictFormatTests(ManifestTestCase):
         self.write(data)
 
         with self.assertRaisesRegex(InstallError, "created_paths"):
+            load_manifest(self.base)
+
+
+class LegacyV1ManifestTests(ManifestTestCase):
+    def test_schema_v1_antigravity_manifest_loads_with_legacy_hook_keys(self) -> None:
+        self.write(
+            {
+                "schema_version": 1,
+                "version": "3.0.0",
+                "mode": "symlink",
+                "created_paths": ["/h/.gemini/config/scripts/git-guard.py"],
+                "created_dirs": [],
+                "previous_hooks_path": None,
+                "hooks_dir": "/h/.gemini/config/git-hooks",
+                "targets": {
+                    "antigravity": {
+                        "target": "antigravity",
+                        "mode": "symlink",
+                        "version": "3.0.0",
+                        "created_paths": ["/h/.gemini/config/scripts/git-guard.py"],
+                        "created_dirs": [],
+                        "modified_files": {"/h/.gemini/config/hooks.json": "hooks_json"},
+                    },
+                    "git_hooks": {
+                        "target": "git_hooks",
+                        "mode": "symlink",
+                        "version": "3.0.0",
+                        "created_paths": ["/h/.gemini/config/git-hooks/commit-msg"],
+                        "created_dirs": [],
+                        "modified_files": {},
+                        "previous_hooks_path": None,
+                        "hooks_dir": "/h/.gemini/config/git-hooks",
+                    },
+                },
+            }
+        )
+
+        manifest = load_manifest(self.base)
+
+        assert manifest is not None
+        self.assertEqual(
+            manifest.targets[TargetKind.ANTIGRAVITY].hooks_json_keys,
+            LEGACY_V1_HOOKS_JSON_KEYS,
+        )
+        self.assertEqual(
+            manifest.targets[TargetKind.GIT_HOOKS].created_dirs,
+            ("/h/.gemini/config/git-hooks",),
+        )
+
+    def test_schema_v1_claude_manifest_loads(self) -> None:
+        self.write(
+            {
+                "schema_version": 1,
+                "version": "3.0.0",
+                "mode": "copy",
+                "created_paths": ["/h/.claude/commands/craftsman.md"],
+                "created_dirs": [],
+                "previous_hooks_path": None,
+                "hooks_dir": None,
+                "targets": {
+                    "claude": {
+                        "target": "claude",
+                        "mode": "copy",
+                        "version": "3.0.0",
+                        "created_paths": ["/h/.claude/commands/craftsman.md"],
+                        "created_dirs": [],
+                        "modified_files": {"/h/.claude/settings.json": "claude_settings"},
+                    }
+                },
+            }
+        )
+
+        manifest = load_manifest(self.base)
+
+        assert manifest is not None
+        self.assertEqual(
+            manifest.targets[TargetKind.CLAUDE].created_paths,
+            ("/h/.claude/commands/craftsman.md",),
+        )
+
+    def test_unsupported_schema_version_is_an_error(self) -> None:
+        self.write({"schema_version": 99, "targets": {}})
+
+        with self.assertRaisesRegex(InstallError, "schema_version must be 1"):
             load_manifest(self.base)
 
 

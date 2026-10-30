@@ -17,6 +17,7 @@ from craftsman.files import write_text_atomic
 from craftsman.records import FieldError, Fields, as_choice
 
 MANIFEST_FILENAME = ".craftsman-install.json"
+LEGACY_V1_HOOKS_JSON_KEYS: tuple[str, ...] = ("craftsman-git-guard", "craftsman-stop-gate")
 
 
 class InstallError(RuntimeError):
@@ -112,7 +113,88 @@ class InstallManifest:
     @classmethod
     def from_fields(cls, raw: Any) -> InstallManifest:
         fields = Fields(raw)
+        if "schema_version" in raw:
+            return _v1_manifest_from_fields(raw, fields)
         return fields.done(cls(fields.record("targets", _targets)))
+
+
+def _v1_manifest_from_fields(raw: Any, fields: Fields) -> InstallManifest:
+    """Read a Craftsman 3.0-3.2 (`schema_version: 1`) install manifest on upgrade or uninstall."""
+    schema_version = fields.integer("schema_version")
+    if schema_version != 1:
+        raise FieldError("schema_version", f"must be 1 (got {schema_version})")
+    fields.text_if_present("version")
+    fields.text_if_present("mode")
+    if "created_paths" in raw:
+        fields.texts("created_paths")
+    if "created_dirs" in raw:
+        fields.texts("created_dirs")
+    if "previous_hooks_path" in raw:
+        fields.optional_text("previous_hooks_path")
+    if "hooks_dir" in raw:
+        fields.optional_text("hooks_dir")
+    return fields.done(InstallManifest(fields.record("targets", _v1_targets)))
+
+
+def _v1_targets(raw: Any) -> dict[TargetKind, TargetManifest]:
+    fields = Fields(raw)
+    if not raw:
+        raise FieldError("", "is empty")
+    targets: dict[TargetKind, TargetManifest] = {}
+    for key in raw:
+        kind = as_choice(key, tuple(TargetKind))
+        if kind is None:
+            raise FieldError(key, "is not a target")
+        target_kind = TargetKind(kind)
+
+        def parse_target(
+            item: Any, current_kind: TargetKind = target_kind, name: str = key
+        ) -> TargetManifest:
+            return _v1_target_from_fields(current_kind, name, item)
+
+        targets[target_kind] = _require_fields_of(kind, fields.record(key, parse_target), key)
+    return fields.done(targets)
+
+
+def _v1_target_from_fields(kind: TargetKind, key: str, raw: Any) -> TargetManifest:
+    fields = Fields(raw)
+    target_name = fields.text_if_present("target")
+    if target_name is not None and target_name != key:
+        raise FieldError("target", f"must be {key!r} (got {target_name!r})")
+    fields.text_if_present("mode")
+    fields.text_if_present("version")
+    created_paths = fields.texts("created_paths")
+    created_dirs = fields.texts("created_dirs") if "created_dirs" in raw else ()
+    modified_files = (
+        fields.record("modified_files", _modified_kinds) if "modified_files" in raw else {}
+    )
+    previous = fields.optional_text("previous_hooks_path") if "previous_hooks_path" in raw else None
+    hooks_dir = fields.optional_text("hooks_dir") if "hooks_dir" in raw else None
+    hooks_json_keys = _v1_hooks_json_keys(kind, raw, fields, modified_files)
+    if kind is TargetKind.GIT_HOOKS and hooks_dir is not None and not created_dirs:
+        created_dirs = (hooks_dir,)
+    target = TargetManifest(
+        created_paths=created_paths,
+        created_dirs=created_dirs,
+        modified_files=modified_files,
+        hooks_json_keys=hooks_json_keys,
+        previous_hooks_path=previous,
+        hooks_dir=hooks_dir,
+    )
+    return fields.done(target)
+
+
+def _v1_hooks_json_keys(
+    kind: TargetKind,
+    raw: Any,
+    fields: Fields,
+    modified_files: Mapping[str, ModifiedKind],
+) -> tuple[str, ...]:
+    if "hooks_json_keys" in raw:
+        return fields.texts("hooks_json_keys")
+    if kind is TargetKind.ANTIGRAVITY and ModifiedKind.HOOKS_JSON in modified_files.values():
+        return LEGACY_V1_HOOKS_JSON_KEYS
+    return ()
 
 
 def _targets(raw: Any) -> dict[TargetKind, TargetManifest]:
