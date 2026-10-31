@@ -177,12 +177,13 @@ def acks_in_force(ledger: Ledger) -> dict[str, SignalAck]:
     if not ledger.rounds:
         return {}
     latest = ledger.rounds[-1]
+    unique_in_latest = _unique_by_key(latest)
     acks: dict[str, SignalAck] = {}
     for ack in ledger.signal_acks:
         if ack.round == latest.number:
             acks[ack.signal_id] = ack
             continue
-        carried = _unique_by_key(latest).get(
+        carried = unique_in_latest.get(
             _signal_key(ledger.rounds[ack.round - 1].signal(ack.signal_id))
         )
         if carried is not None and _signal_key(carried) in _unique_by_key(ledger.rounds[ack.round - 1]):

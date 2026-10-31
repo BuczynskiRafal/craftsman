@@ -95,9 +95,10 @@ def _changes_by_file(hunks: Sequence[Hunk]) -> dict[str, _FileChanges]:
     removed: dict[str, list[str]] = {}
     growth: dict[str, int] = {}
     for hunk in hunks:
-        touched.setdefault(hunk.path, set()).update(number for number, _ in hunk.added_lines)
-        removed.setdefault(hunk.path, []).extend(text for _, text in hunk.removed_lines)
-        growth[hunk.path] = growth.get(hunk.path, 0) + len(hunk.added_lines) - len(hunk.removed_lines)
+        added, removed_lines = hunk.added_lines, hunk.removed_lines
+        touched.setdefault(hunk.path, set()).update(number for number, _ in added)
+        removed.setdefault(hunk.path, []).extend(text for _, text in removed_lines)
+        growth[hunk.path] = growth.get(hunk.path, 0) + len(added) - len(removed_lines)
     return {
         path: _FileChanges(frozenset(touched[path]), "\n".join(removed[path]), growth[path])
         for path in touched

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, TypeVar, get_args
 
-from craftsman.diffscan import Hunk
+from craftsman.diffscan import Hunk, is_relative_posix_path
 from craftsman.lenses import LENS_IDS, TIERS, Tier
 
 Severity = Literal["blocker", "major", "minor", "nit"]
@@ -535,21 +535,13 @@ class RoundFile:
     carried: bool
 
 
-def _is_valid_scope_path(path: str) -> bool:
-    if not path or path.startswith("/") or path.endswith("/") or "\\" in path or "\0" in path:
-        return False
-    parts = path.split("/")
-    has_drive = len(parts[0]) >= 2 and parts[0][1] == ":" and parts[0][0].isalpha()
-    return not has_drive and not any(part in ("", ".", "..") for part in parts)
-
-
 def _require_scope(scope: tuple[str, ...] | None) -> None:
     if scope is None:
         return
     _require(bool(scope), "scope", "must list at least one file path (or be null)")
     for index, path in enumerate(scope):
         _require(
-            _is_valid_scope_path(path),
+            is_relative_posix_path(path),
             f"scope[{index}]",
             f"must be a normalized relative POSIX file path (got {path!r})",
         )

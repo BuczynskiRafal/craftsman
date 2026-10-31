@@ -603,13 +603,10 @@ def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
 def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> CopilotReport:
     copilot_home = default_copilot_home(home)
     skills = [_skills_report(default_copilot_skills_dir(home))]
+    workspace_agents = None
     if workspace is not None:
         skills.append(_skills_report(workspace / ".github" / "skills"))
-    workspace_agents = (
-        _agents_installed(workspace / ".github" / "agents", AGENT_NAMES, ".agent.md")
-        if workspace is not None
-        else None
-    )
+        workspace_agents = _agents_installed(workspace / ".github" / "agents", AGENT_NAMES, ".agent.md")
     return CopilotReport(
         user_hooks=inspect_copilot_hooks(copilot_home / "hooks" / HOOKS_FILENAME),
         agents=AgentsReport(

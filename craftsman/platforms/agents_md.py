@@ -10,9 +10,7 @@ from craftsman.generated import (
     CRAFTSMAN_GENERATED_MARKER,
     ExportError,
     FileChange,
-    is_craftsman_generated_file,
     upsert_managed_markdown,
-    write_generated,
     write_marked,
 )
 from craftsman.lenses import render_reviewer_groups_markdown
@@ -74,6 +72,6 @@ def install_agents_workspace_target(
     session.stage(cursor_rule)
     content = render_agents_md(repo_dir)
     if not tracker.dry_run:
-        write_generated(cursor_rule, CURSOR_RULE_HEADER + content, owned=is_craftsman_generated_file)
+        write_marked(cursor_rule, CURSOR_RULE_HEADER + content)
     upsert_markdown(session, workspace / "AGENTS.md", content)
     session.finish()

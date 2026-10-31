@@ -320,6 +320,7 @@ def _reopened_hunk_ids(
     previous: set[str],
     reviewed: set[str],
     symbols_by_hunk: Mapping[str, Sequence[str]],
+    file_digests: Mapping[str, str],
 ) -> set[str]:
     mentioned_by: dict[str, list[Hunk]] = {}
     for hunk in hunks:
@@ -343,7 +344,6 @@ def _reopened_hunk_ids(
             if hunk.id not in affected:
                 affected.add(hunk.id)
                 pending.extend(symbols_by_hunk.get(hunk.id, ()))
-    file_digests = {path: file_digest(hunks, path) for path in {hunk.path for hunk in hunks}}
     return {
         hunk.id
         for hunk in hunks
@@ -363,8 +363,8 @@ def _carry_over(
     covered = _carryable_coverage(ledger)
     reviewed = {digest for _, digest in covered}
     previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
-    reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk)
     file_digests = {path: file_digest(hunks, path) for path in {hunk.path for hunk in hunks}}
+    reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk, file_digests)
     carried = {
         hunk.id
         for hunk in hunks
@@ -515,12 +515,6 @@ def _validate_coverage_targets(
     if unit == "files":
         return unit, _validate_design_targets(round_, targets)
     return unit, _validate_hunk_targets(round_, targets)
-
-
-def _validate_coverage_target(round_: Round, lens: str, targets: Sequence[str]) -> tuple[str, ...]:
-    cleaned = _validate_coverage_lenses(round_, (lens,))
-    _, digests = _validate_coverage_targets(round_, cleaned, targets)
-    return digests
 
 
 def _validate_hunk_targets(round_: Round, hunk_ids: Sequence[str]) -> tuple[str, ...]:

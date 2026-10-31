@@ -319,20 +319,22 @@ def plan_shards(ctx: PacketContext, total: int) -> tuple[PacketShard, ...]:
     for hunk in ctx.snap.hunks:
         if hunk.id in open_ids:
             by_file.setdefault(hunk.path, []).append(hunk)
-    ranked = sorted(
-        ((sum(len(_hunk_section(ctx, h, _Owners.of(ctx, by_file[p]))) for h in by_file[p]), p) for p in open_files),
-        key=lambda item: (-item[0], item[1]),
-    )
+    sizes: list[tuple[int, str]] = []
+    for path in open_files:
+        owners = _Owners.of(ctx, by_file[path])
+        sizes.append((sum(len(_hunk_section(ctx, hunk, owners)) for hunk in by_file[path]), path))
+    ranked = sorted(sizes, key=lambda item: (-item[0], item[1]))
     totals, buckets = [0] * total, [set[str]() for _ in range(total)]
     for size, path in ranked:
         target = min(range(total), key=lambda idx: (totals[idx], idx))
         buckets[target].add(path)
         totals[target] += size
-    return tuple(
-        PacketShard(idx + 1, total, files, tuple(h.id for p in files for h in by_file[p]))
-        for idx in range(total)
-        for files in (tuple(p for p in open_files if p in buckets[idx]),)
-    )
+    shards: list[PacketShard] = []
+    for idx in range(total):
+        files = tuple(path for path in open_files if path in buckets[idx])
+        hunk_ids = tuple(hunk.id for path in files for hunk in by_file[path])
+        shards.append(PacketShard(idx + 1, total, files, hunk_ids))
+    return tuple(shards)
 
 
 def select_shard(ctx: PacketContext, raw: str) -> PacketShard:

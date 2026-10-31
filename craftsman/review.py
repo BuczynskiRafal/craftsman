@@ -166,28 +166,28 @@ def _auto_tier_reason(snap: DiffSnapshot) -> str:
     return f"{changed} changed lines {op} {REVIEW_ONLY_QUICK_MAX_LINES}"
 
 
+def _size_tier(snap: DiffSnapshot) -> Tier:
+    return review_only_tier(
+        snap.added + snap.deleted, has_skipped=bool(snap.skipped), docs_only=snap.docs_only
+    )
+
+
 def resolve_tier(ws: Workspace, ledger: Ledger, explicit: Tier | None, snap: DiffSnapshot) -> Tier:
     """`--tier`, else the active task's gear, else size-based review-only tier (never lowered)."""
     if explicit is not None:
         return explicit
     if ws.state is not None:
         return current_tier(ws.state, ws.root)
-    auto = review_only_tier(
-        snap.added + snap.deleted, has_skipped=bool(snap.skipped), docs_only=snap.docs_only
-    )
+    auto = _size_tier(snap)
     return strictest_tier(ledger.rounds[-1].tier, auto) if ledger.rounds else auto
 
 
-def _tier_reason(
-    ws: Workspace, ledger: Ledger, explicit: Tier | None, snap: DiffSnapshot, tier: Tier
-) -> str:
+def _tier_reason(ws: Workspace, ledger: Ledger, explicit: Tier | None, snap: DiffSnapshot) -> str:
     if explicit is not None:
         return "explicit --tier"
     if ws.state is not None:
         return "active /craftsman gate"
-    auto = review_only_tier(
-        snap.added + snap.deleted, has_skipped=bool(snap.skipped), docs_only=snap.docs_only
-    )
+    auto = _size_tier(snap)
     reason = _auto_tier_reason(snap)
     if not ledger.rounds:
         return reason
@@ -222,11 +222,17 @@ class _UnmatchedPathError(FieldError):
     """A syntactically valid `--paths` entry matched no changed files in the current diff."""
 
 
+def _comma_list(raw: str) -> list[str]:
+    """The non-blank items of a comma-separated flag value, stripped."""
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _print_empty_prepare(
     scope: tuple[str, ...] | None, snap: DiffSnapshot, full_snap: DiffSnapshot
 ) -> int:
     if scope is not None and not full_snap.is_empty:
-        ignored = [path for path in full_snap.files if path not in set(scope)]
+        in_scope = set(scope)
+        ignored = [path for path in full_snap.files if path not in in_scope]
         print(
             f"Nothing to review within the frozen scope (matches base {snap.base_sha[:12]}); "
             f"changed files outside scope: {_format_path_sample(ignored)}."
@@ -257,7 +263,7 @@ def _prepare(args: argparse.Namespace) -> int:
     if not ledger.rounds or (
         ledger.rounds[-1].fingerprint, ledger.rounds[-1].tier, ledger.rounds[-1].scope
     ) != (snap.fingerprint, tier, scope):
-        print(f"Tier {tier}: {_tier_reason(ws, ledger, args.tier, snap, tier)}")
+        print(f"Tier {tier}: {_tier_reason(ws, ledger, args.tier, snap)}")
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     signals = collect_quality_signals(ws.root, snap)
@@ -405,7 +411,7 @@ def _resolve_flag_scope(
 def _parse_path_queries(
     root: Path, cwd: Path, raw_paths: str, *, field: str = "paths"
 ) -> list[tuple[str, tuple[str, ...], bool]]:
-    tokens = [item.strip() for item in raw_paths.split(",") if item.strip()]
+    tokens = _comma_list(raw_paths)
     if not tokens:
         raise FieldError(field, "must name at least one file or directory")
     resolved_root = root.resolve()
@@ -654,7 +660,7 @@ def view_slug(
 
 def parse_view_lenses(raw: str, round_: Round) -> list[str]:
     """Lens ids and reviewer-group ids from `--lenses`, resolved to lenses selected in `round_`."""
-    tokens = [item.strip() for item in raw.split(",") if item.strip()]
+    tokens = _comma_list(raw)
     if not tokens:
         raise FieldError("lenses", "must name at least one lens or reviewer group")
     lenses: list[str] = []
@@ -830,7 +836,7 @@ def _cover_one(args: argparse.Namespace) -> int:
     _require_flags(args, {"--lens": args.lens})
     if args.hunks is not None and args.files is not None:
         raise LedgerError("pass either --hunks or --files, not both")
-    lenses = [item.strip() for item in args.lens.split(",") if item.strip()]
+    lenses = _comma_list(args.lens)
     if lenses == [DESIGN_LENS] and args.hunks is not None:
         raise LedgerError(
             "the `design` lens covers changed files, not hunks; pass --files instead of --hunks"
@@ -844,7 +850,7 @@ def _cover_one(args: argparse.Namespace) -> int:
     assert raw_targets is not None
     ws = open_workspace(args.cwd)
     snap = ws.snapshot()
-    targets = [item.strip() for item in raw_targets.split(",") if item.strip()]
+    targets = _comma_list(raw_targets)
 
     def record(current: Ledger) -> tuple[Ledger, str]:
         round_ = require_current_round(current, snap)
@@ -1323,12 +1329,12 @@ def _show(args: argparse.Namespace) -> int:
         print(f"Packet: {Path(latest.packet_path).resolve()}")
         for line in _lens_addition_lines(ledger):
             print(line)
-        print("")
+        print()
         print(f"Coverage (covered/total non-carried hunks, files for `{DESIGN_LENS}`):")
         print("\n".join(_coverage_lines(ledger, latest)))
-    print("")
+    print()
     print("\n".join(_findings_table(ledger.findings)))
-    print("")
+    print()
     print("\n".join(_run_lines(ledger.runs[-SHOW_RECENT_RUNS:], snap)))
     return 0
 
@@ -1448,14 +1454,11 @@ def _round_json(round_: Round, snap: DiffSnapshot) -> dict[str, Any]:
 
 
 def _coverage_json(ledger: Ledger, round_: Round) -> dict[str, Any]:
-    return {
-        lens: {
-            "covered": len(open_units(round_, lens)) - len(missing),
-            "total": len(open_units(round_, lens)),
-            "missing": missing,
-        }
-        for lens, missing in uncovered_by_lens(ledger, round_).items()
-    }
+    coverage: dict[str, Any] = {}
+    for lens, missing in uncovered_by_lens(ledger, round_).items():
+        total = len(open_units(round_, lens))
+        coverage[lens] = {"covered": total - len(missing), "total": total, "missing": missing}
+    return coverage
 
 
 def _coverage_lines(ledger: Ledger, round_: Round) -> list[str]:

@@ -77,7 +77,7 @@ class LedgerOverview:
             total = sum(len(open_units(latest, lens)) for lens in latest.lenses)
             missing = sum(len(ids) for ids in uncovered_by_lens(ledger, latest).values())
             coverage = Coverage(total - missing, total)
-        verdicts = {name: 0 for name in (*VERDICTS, "none")}
+        verdicts = dict.fromkeys((*VERDICTS, "none"), 0)
         for finding in ledger.findings:
             verdicts[finding.verdict or "none"] += 1
         return cls(
