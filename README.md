@@ -35,30 +35,30 @@ An agent's review of its own change usually fails for three reasons:
 
 Pilot from October 2026 on [SWR-Bench](https://doi.org/10.1145/3808144) data (see
 [Citation](#citation)). Five pull requests from real projects: three from `pytest`, one each from
-`flask` and `requests`. Each agent reviewed them twice: alone and with the `/code-review` protocol.
-Both runs had the same model, PR description, and output format. The agents did not see the ground
-truth. Three PRs contain 9 reviewer-confirmed defects in total (logic, contracts, tests, docs,
-changelog). Two are labeled clean in the dataset.
+`flask` and `requests`. At each thinking level, the agent reviewed them twice: alone and with the
+`/code-review` protocol. Both runs had the same model, PR description, and output format. The agent
+did not see the ground truth. Three PRs contain 9 reviewer-confirmed defects in total (logic,
+contracts, tests, docs, changelog). Two are labeled clean in the dataset.
 
 | Agent | Model and thinking level | Variant | Defects found | Avg time per PR | Findings reported |
 | :--- | :--- | :--- | :---: | :---: | :---: |
-| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | without Craftsman, 3 repetitions | **22%** (2/9, 2/9, 2/9) | 4.9 min | 22 |
-| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | with Craftsman, 3 repetitions | **74%** (6/9, 7/9, 7/9) | 10.6 min | 53 |
-| Claude Code | Claude Sonnet 5.5, high (`claude-sonnet-5-5`) | without Craftsman, 1 repetition | **56%** (5/9) | 0.4 min | 9 |
-| Claude Code | Claude Sonnet 5.5, high (`claude-sonnet-5-5`) | with Craftsman, 1 repetition | **78%** (7/9) | 9.0 min | 19 |
+| Google Antigravity | Gemini 4 Argon, low (`gemini-4-argon-low`) | without Craftsman, 1 repetition | **22%** (2/9) | 1.5 min | 4 |
+| Google Antigravity | Gemini 4 Argon, low (`gemini-4-argon-low`) | with Craftsman, 1 repetition | **44%** (4/9) | 4.7 min | 11 |
+| Google Antigravity | Gemini 4 Argon, medium (`gemini-4-argon-medium`) | without Craftsman, 1 repetition | **22%** (2/9) | 2.0 min | 8 |
+| Google Antigravity | Gemini 4 Argon, medium (`gemini-4-argon-medium`) | with Craftsman, 1 repetition | **56%** (5/9) | 6.7 min | 10 |
+| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | without Craftsman, 1 repetition | **33%** (3/9) | 15.6 min | 12 |
+| Google Antigravity | Gemini 4 Argon, high (`gemini-4-argon-high`) | with Craftsman, 1 repetition | **78%** (7/9) | 26.3 min | 17 |
 
-On Antigravity, the agent without Craftsman found the same 2 defects in all three repetitions. With
-Craftsman, it found 6, 7, and 7, including both earlier ones. The new catches were mostly mismatches
-between code and docs or changelog, weakened tests, and a timestamp handling bug in `pytest`.
+Without Craftsman, `low` and `medium` found the same 2 logic defects, and `high` took ten times
+longer than `low` (15.6 vs 1.5 min per PR) to add a third. With Craftsman, `low` (4/9 in 4.7 min)
+and `medium` (5/9 in 6.7 min) found more defects than `high` alone in under half the time, and
+`high` reached 7/9. The extra catches were mismatches between code and docs or changelog, weakened
+tests, and the 32-bit `st_mtime_ns` truncation in `pytest`.
 
-On Claude Code, the variant without Craftsman is a single reply after a few dozen seconds. With
-Craftsman, the agent goes through the lenses and verification.
-
-The verifier dismissed 60 findings: 58 duplicates merged by root cause, one candidate dismissed
-against existing file conventions, and one false alarm disproved by a reproduction script. No real
-defect was dismissed. On the clean `pytest-5680`, neither variant reported anything. On
-`requests-764`, also labeled clean, both variants reported comments. The dataset does not grade
-them, so they are not counted in the score.
+Across the three Craftsman runs, the verifier dismissed 8 findings: inputs outside the function
+contract, behavior unchanged by the diff, and nits checked against existing file conventions. On the
+clean `pytest-5680`, no variant reported anything. On `requests-764`, also labeled clean, every
+variant reported comments. The dataset does not grade them, so they are not counted in the score.
 
 ## How it works
 
