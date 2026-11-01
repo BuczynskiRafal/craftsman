@@ -169,7 +169,7 @@ def _program(executable: str, cwd: Path) -> str:
 
 def _stop(process: subprocess.Popen[bytes], *, graceful: bool) -> None:
     """Stop the command and every process it started."""
-    if os.name == "nt":
+    if sys.platform == "win32":  # mypy narrows platforms only on `sys.platform`
         _stop_windows_tree(process)
         return
     try:
