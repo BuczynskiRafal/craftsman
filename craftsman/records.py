@@ -348,6 +348,10 @@ class Fields:
             _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
         return tuple(values)
 
+    def texts_or_empty(self, key: str) -> tuple[str, ...]:
+        """A list of strings; empty when it is left out."""
+        return () if self._absent(key) else self.texts(key)
+
     def records_or_empty(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
         """A list of records; empty when it is left out (a field added without a schema bump)."""
         return () if self._absent(key) else self.records(key, parse)
@@ -561,6 +565,7 @@ class Round:
     packet_path: str
     signals: tuple[QualitySignal, ...]
     scope: tuple[str, ...] | None = None
+    out_of_scope: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
@@ -577,6 +582,8 @@ class Round:
         sig_ids = [sig.id for sig in self.signals]
         _require(len(set(sig_ids)) == len(sig_ids), "signals", "must not repeat a signal id")
         _require_scope(self.scope)
+        for index, path in enumerate(self.out_of_scope):
+            _require_text(path, f"out_of_scope[{index}]")
 
     @property
     def files(self) -> tuple[RoundFile, ...]:
@@ -627,6 +634,7 @@ class Round:
                 packet_path=f.text("packet_path"),
                 signals=f.records("signals", QualitySignal.from_json),
                 scope=f.optional_texts("scope"),
+                out_of_scope=f.texts_or_empty("out_of_scope"),
             )
         )
 
@@ -1194,3 +1202,144 @@ class Ledger:
             )
         except FieldError as exc:
             raise LedgerError(f"{LEDGER_FILENAME}: {exc}") from None
+
+
+RECORD_CLASSES: tuple[type, ...] = (
+    EntryProblem,
+    HunkRef,
+    QualitySignal,
+    SignalAck,
+    RoundFile,
+    Round,
+    Coverage,
+    Finding,
+    RunWaiver,
+    Run,
+    AgentEvent,
+    SourceRef,
+    Fact,
+    LensAddition,
+    Ledger,
+)
+
+PROSE_RECORD_FIELDS: frozenset[str] = frozenset(
+    {
+        "Coverage.note",
+        "Finding.title",
+        "Finding.scenario",
+        "Finding.suggestion",
+        "Finding.verdict_evidence",
+        "Finding.resolution_note",
+        "LensAddition.reason",
+        "RunWaiver.reason",
+        "SignalAck.reason",
+    }
+)
+
+RAW_RECORD_FIELDS: frozenset[str] = frozenset(
+    {
+        # EntryProblem
+        "EntryProblem.index",
+        "EntryProblem.label",
+        "EntryProblem.field",
+        "EntryProblem.problem",
+        "EntryProblem.example",
+        # HunkRef
+        "HunkRef.id",
+        "HunkRef.path",
+        "HunkRef.digest",
+        "HunkRef.new_start",
+        "HunkRef.new_len",
+        "HunkRef.carried",
+        "HunkRef.reopened",
+        # QualitySignal
+        "QualitySignal.id",
+        "QualitySignal.kind",
+        "QualitySignal.file",
+        "QualitySignal.line",
+        "QualitySignal.detail",
+        # SignalAck
+        "SignalAck.signal_id",
+        "SignalAck.round",
+        "SignalAck.fingerprint",
+        "SignalAck.recorded_at",
+        # RoundFile
+        "RoundFile.path",
+        "RoundFile.digest",
+        "RoundFile.carried",
+        # Round
+        "Round.number",
+        "Round.fingerprint",
+        "Round.base_sha",
+        "Round.tier",
+        "Round.prepared_at",
+        "Round.hunks",
+        "Round.lenses",
+        "Round.packet_path",
+        "Round.signals",
+        "Round.scope",
+        "Round.out_of_scope",
+        # Coverage
+        "Coverage.round",
+        "Coverage.lens",
+        "Coverage.digests",
+        "Coverage.recorded_at",
+        # Finding
+        "Finding.id",
+        "Finding.round",
+        "Finding.lens",
+        "Finding.path",
+        "Finding.line",
+        "Finding.severity",
+        "Finding.fingerprint",
+        "Finding.verdict",
+        "Finding.verdict_run",
+        "Finding.resolution",
+        "Finding.recorded_at",
+        "Finding.updated_at",
+        "Finding.signal_id",
+        # RunWaiver
+        "RunWaiver.waived_at",
+        # Run
+        "Run.id",
+        "Run.kind",
+        "Run.argv",
+        "Run.cwd",
+        "Run.exit_code",
+        "Run.duration_s",
+        "Run.fingerprint",
+        "Run.started_at",
+        "Run.output_tail",
+        "Run.fingerprint_after",
+        "Run.waiver",
+        # AgentEvent
+        "AgentEvent.platform",
+        "AgentEvent.event",
+        "AgentEvent.agent",
+        "AgentEvent.agent_id",
+        "AgentEvent.at",
+        # SourceRef
+        "SourceRef.path",
+        "SourceRef.line",
+        # Fact
+        "Fact.id",
+        "Fact.hunks",
+        "Fact.source",
+        "Fact.text",
+        "Fact.file_digest",
+        "Fact.author_lens",
+        # LensAddition
+        "LensAddition.lens",
+        "LensAddition.round",
+        "LensAddition.recorded_at",
+        # Ledger
+        "Ledger.rounds",
+        "Ledger.coverage",
+        "Ledger.findings",
+        "Ledger.runs",
+        "Ledger.agents",
+        "Ledger.signal_acks",
+        "Ledger.facts",
+        "Ledger.lens_additions",
+    }
+)
