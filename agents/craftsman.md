@@ -20,6 +20,8 @@ remain unchanged and start at Stage 0). To follow any companion skill (`/code-re
 `/verify`, `/feature-dev`, `/modernize`, `/batch`, `/audit`), invoke `/name` as a skill if your
 platform offers it; otherwise run `craftsman skill show <name>` and follow its output. To read the
 review lens playbooks, run `craftsman skill show code-review --lenses <lenses>` for the lenses you
-apply. Never search the file system for skill or lens files.
+apply. Never search the file system for skill or lens files. Write your final reply as Markdown that
+the chat renders: real line breaks, never escape sequences such as `\n`, and do not wrap the reply in
+quotes, JSON or a code block.
 
 {{include skills/craftsman/SKILL.md}}

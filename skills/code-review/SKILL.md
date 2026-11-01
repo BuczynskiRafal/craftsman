@@ -427,7 +427,8 @@ and citing `file:line`; `dismissed` needs either `--run` or a `file:line` refere
 needs fixing — fix all of them in one edit and resend once (never rerun unchanged input).
 
 **Leave the change under review untouched.** Reproductions live in a fresh temporary directory
-outside the repository. Never `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`, or
+outside the repository (or run `craftsman review scratch` for a managed scratch directory in
+`.git/craftsman/scratch/<id>/`). Never `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`, or
 edit files to compare with the old behavior: read the old version with `git show <base>:<path>` (or
 copy it into the temporary directory) instead. Delete caches your runs created inside the repository
 (`__pycache__`, …).
@@ -453,6 +454,9 @@ on rate limits, quota, or timeout after one sequential retry, finish with
 is expected to show `BLOCKED` (because findings are left open for the author and the full test
 suite was not run) — always pass `--review-only` here. Findings are ordered by severity; dismissed
 ones are listed briefly so the reader sees what was considered.
+
+Write your final reply as Markdown that the chat renders: real line breaks, never escape sequences
+such as `\n`, and do not wrap the reply in quotes, JSON or a code block.
 
 ## Step 5 — Fix and re-review (`--fix`, and always inside `/craftsman`)
 
@@ -502,7 +506,11 @@ ones are listed briefly so the reader sees what was considered.
   inbox path, write UTF-8 to it (`Set-Content -LiteralPath <path> -Encoding utf8` for read-only
   subagents without `Edit`), and pass `--from-json <path>` (consumed automatically on success; kept
   in place on rejection so you can fix every listed entry in one edit and resend once; never write
-  batch JSON files to `%TEMP%` or into the repository). Use the project's Python (`python`, or the
-  virtualenv's); `python3` does not exist on many Windows machines.
+  batch JSON files to `%TEMP%` or into the repository). For temporary reproduction or verification
+  scripts, run `craftsman review scratch` to get a managed directory in `.git/craftsman/scratch/<id>/`.
+  When passing double-quoted strings in PowerShell CLI flags, note that PowerShell does not expand `\n`
+  (it uses `` `n `` for newlines; Craftsman flattens both to spaces in single-line prose fields).
+  Use the project's Python (`python`, or the virtualenv's); `python3` does not exist on many Windows
+  machines.
 - **No CLI available?** If `craftsman` is not installed, say so explicitly in the report — the
   review then has no gate and must not be presented as gated.

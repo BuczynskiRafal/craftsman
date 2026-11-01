@@ -180,4 +180,6 @@ Run `craftsman review report` and give the user:
 - the verification commands and their results;
 - a proposed commit message from `/high-level-commit-message`.
 
+Write your final reply as Markdown that the chat renders: real line breaks, never escape sequences such as `\n`, and do not wrap the reply in quotes, JSON or a code block.
+
 Never commit, push or open a pull request unless the user asked for it.
