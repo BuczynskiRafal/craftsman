@@ -711,6 +711,11 @@ def failure(reply: Reply, problem: str) -> Output:
             f"The Craftsman guard could not check this tool call ({problem}); confirm it only if "
             "it is safe."
         )
+    if reply.event == "prompt":
+        return reply.warn(
+            f"Craftsman gate was NOT opened: {problem}; the quality gate was not checked. "
+            "Run `craftsman review check` yourself."
+        )
     return reply.allow(
         f"Craftsman {reply.event} hook failed ({problem}); the quality gate was not checked. "
         "Run `craftsman review check` yourself."
