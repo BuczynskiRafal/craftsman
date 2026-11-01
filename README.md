@@ -13,7 +13,7 @@ Craftsman is a stop-hook quality gate that makes AI coding agents prove they rev
 | **GitHub Copilot in VS Code** | `Stop` hook blocks until review check passes; subagent isolation verified |
 | **GitHub Copilot CLI** | `agentStop` hook enforces passing ledger |
 | **Claude Code** | Native `Stop` hook and standalone Claude Code plugin |
-| **Google Antigravity** | `Stop` hook validates ledger and subagent transcript execution |
+| **Google Antigravity** | `Stop` hook validates ledger and subagent transcript execution; standalone agy plugin |
 | **Codex, Cursor, and AGENTS.md** | Protocol validated on exit by `craftsman gate --complete` |
 
 <!-- Demo: see docs/assets/demo.gif -->
@@ -44,11 +44,12 @@ craftsman install                  # auto-detects Claude Code, Copilot, Antigrav
 /craftsman add pagination to the catalog search
 ```
 
-For Claude Code plugin installation:
+Or install the plugin of your agent instead (see [installation](docs/installation.md)):
 
 ```bash
-/plugin marketplace add BuczynskiRafal/craftsman
+/plugin marketplace add BuczynskiRafal/craftsman              # Claude Code
 /plugin install craftsman@craftsman
+agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
 ```
 
 ## How It Works
