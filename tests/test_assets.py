@@ -152,13 +152,15 @@ class LocationTests(AssetsTestCase):
         ):
             self.assertEqual(default_vscode_user_dir(self.tmp), appdata / "Code" / "User")
 
-    def test_windows_without_appdata_is_an_error(self) -> None:
-        with (
-            mock.patch.object(sys, "platform", "win32"),
-            mock.patch.dict(os.environ, {}, clear=True),
-            self.assertRaisesRegex(ExportError, "APPDATA is not set"),
-        ):
-            default_vscode_user_dir(self.tmp)
+    def test_windows_without_appdata_defaults_to_roaming(self) -> None:
+        expected = self.tmp / "AppData" / "Roaming" / "Code" / "User"
+        for environ in ({}, {"APPDATA": str(self.tmp.parent / "elsewhere")}):
+            with (
+                self.subTest(environ=environ),
+                mock.patch.object(sys, "platform", "win32"),
+                mock.patch.dict(os.environ, environ, clear=True),
+            ):
+                self.assertEqual(default_vscode_user_dir(self.tmp), expected)
 
     def test_setting_outside_an_explicit_home_is_ignored(self) -> None:
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}):
