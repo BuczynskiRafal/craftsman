@@ -36,7 +36,7 @@ def cli_shim_for(python: str) -> Path | None:
     if not shim.is_file():
         raise ExportError(
             f"{python} cannot import craftsman from {package_dir} and {shim} is missing; "
-            "install craftsman for that interpreter (pip install .) and export again"
+            "install craftsman for that interpreter (pip install craftsman-gate) and export again"
         )
     return shim
 

@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "craftsman"
+name = "craftsman-gate"
 version = "4.0.0"
 description = "Make AI coding agents prove they reviewed and tested their change"
 readme = "README.md"
