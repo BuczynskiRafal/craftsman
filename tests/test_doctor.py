@@ -198,7 +198,7 @@ class PlatformReportTests(DoctorTestCase):
 class SkillManifestTests(DoctorTestCase):
     def copy_repo(self) -> Path:
         repo = self.tmp / "repo"
-        for folder in ("skills", "rules", "scripts", "agents"):
+        for folder in ("skills", "rules", "scripts", "templates"):
             shutil.copytree(REPO_ROOT / folder, repo / folder)
         shutil.copy(REPO_ROOT / "plugin.json", repo / "plugin.json")
         return repo

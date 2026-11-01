@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+from craftsman.assets import AGENT_TEMPLATES_DIR
 from craftsman.generated import ExportError
 
 
@@ -36,7 +37,7 @@ def env_var_for_home(env_key: str, home: Path | None = None) -> str:
 
 
 def _has_assets(directory: Path) -> bool:
-    return (directory / "skills").is_dir() and (directory / "agents").is_dir()
+    return (directory / "skills").is_dir() and (directory / AGENT_TEMPLATES_DIR).is_dir()
 
 
 def resolve_craftsman_pkg_dir(repo_dir: Path) -> Path:
@@ -55,7 +56,7 @@ def default_repo_dir() -> Path:
     for candidate in (pkg_dir.parent, pkg_dir / "_assets"):
         if _has_assets(candidate):
             return candidate
-    raise ExportError(f"no Craftsman assets (skills/, agents/) next to {pkg_dir}; pass --repo-dir")
+    raise ExportError(f"no Craftsman assets (skills/, templates/agents/) next to {pkg_dir}; pass --repo-dir")
 
 
 def default_vscode_user_dir(home: Path | None = None) -> Path:

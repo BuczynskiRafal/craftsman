@@ -24,12 +24,12 @@ class AssetsTestCase(unittest.TestCase):
 
     def fake_repo(self, agent_body: str) -> Path:
         repo = self.tmp / "fake-repo"
-        (repo / "agents").mkdir(parents=True)
+        (repo / "templates" / "agents").mkdir(parents=True)
         (repo / "docs").mkdir()
         (repo / "docs" / "part.md").write_text(
             "---\nname: part\n---\nIncluded text.\n", encoding="utf-8"
         )
-        (repo / "agents" / "helper.md").write_text(
+        (repo / "templates" / "agents" / "helper.md").write_text(
             "---\nname: helper\ndescription: >-\n  Helps with\n  things that aren't hard.\nrole: reviewer\n---\n"
             + agent_body,
             encoding="utf-8",
@@ -61,7 +61,7 @@ class AgentTemplateTests(AssetsTestCase):
 
     def test_unknown_role_is_an_error(self) -> None:
         repo = self.fake_repo("body\n")
-        (repo / "agents" / "helper.md").write_text(
+        (repo / "templates" / "agents" / "helper.md").write_text(
             "---\nname: helper\ndescription: x\nrole: boss\n---\nbody\n", encoding="utf-8"
         )
 

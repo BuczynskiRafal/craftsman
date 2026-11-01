@@ -101,7 +101,7 @@ HOME=$(mktemp -d) python3 -m craftsman.cli doctor
 
 ### Claude Code Plugin Files
 The repository root is the Claude Code plugin. `.claude-plugin/` holds its generated files: the
-manifest (with the hooks), the marketplace catalog, and the agents rendered from `agents/*.md`.
+manifest (with the hooks), the marketplace catalog, and the agents rendered from `templates/agents/*.md`.
 After changing an agent template, a hook event or the version, run `craftsman export --claude-plugin`;
 `tests/test_platform_claude.py` fails while they are out of date.
 

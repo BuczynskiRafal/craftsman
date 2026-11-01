@@ -19,7 +19,7 @@ class build_py(_build_py):  # type: ignore[misc]
             shutil.rmtree(assets_dir)
         assets_dir.mkdir(parents=True, exist_ok=True)
 
-        for dirname in ("skills", "agents", "rules", "scripts", "templates"):
+        for dirname in ("skills", "rules", "scripts", "templates"):
             src_dir = repo_root / dirname
             if src_dir.is_dir():
                 shutil.copytree(

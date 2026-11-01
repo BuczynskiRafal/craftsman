@@ -93,7 +93,7 @@ def install_antigravity_target(repo_dir: Path, home: Path, mode: InstallMode, tr
 
 
 # What the plugin loader reads besides `scripts/` and the package, which the hooks run.
-# The agent templates in `agents/` stay out; agy would load them unrendered.
+# The agent templates stay out; agy would load them unrendered.
 PLUGIN_ENTRIES = ("plugin.json", "hooks.json", "skills", "rules")
 
 

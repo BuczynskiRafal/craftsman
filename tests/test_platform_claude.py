@@ -44,12 +44,12 @@ class ClaudeTestCase(unittest.TestCase):
 
     def fake_repo(self, agent_body: str) -> Path:
         repo = self.tmp / "fake-repo"
-        (repo / "agents").mkdir(parents=True)
+        (repo / "templates" / "agents").mkdir(parents=True)
         (repo / "docs").mkdir()
         (repo / "docs" / "part.md").write_text(
             "---\nname: part\n---\nIncluded text.\n", encoding="utf-8"
         )
-        (repo / "agents" / "helper.md").write_text(
+        (repo / "templates" / "agents" / "helper.md").write_text(
             "---\nname: helper\ndescription: >-\n  Helps with\n  things that aren't hard.\nrole: reviewer\n---\n"
             + agent_body,
             encoding="utf-8",

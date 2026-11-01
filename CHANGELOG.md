@@ -72,6 +72,10 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Fixed
 
+- **Unrendered agents in the agy plugin**: The agent templates moved from `agents/` to `templates/agents/`.
+  Plugin loaders read a repository's `agents/` folder as finished agents, so `agy plugin install` gave
+  Antigravity three agents whose bodies were bare `{{include ...}}` lines, the orchestrator without any of
+  its instructions. The rendered Claude Code, Copilot and plugin agents are unchanged.
 - **Antigravity `--plugin` install was never loaded**: `craftsman install --antigravity --plugin` linked
   `~/.gemini/config/plugins/craftsman` to the checkout, and agy skips a plugin folder that is a symlink, so
   Antigravity had neither the skills nor the gate hooks it had just taken out of `hooks.json`. The plugin is

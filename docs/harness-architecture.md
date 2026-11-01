@@ -125,7 +125,7 @@ To eliminate multi-hundred-kilobyte prompt blowups while preserving full code co
   - `review prepare` prints `Suggested reviewer shards: N` on `standard`/`deep`, where `N = min(4, max(1, open_file_count), ceil(packet_chars / MAX_VIEW_CHARS))` (`1 (no sharding needed)` when `N = 1`).
   - `review view --shard K/N --lenses <lenses>` partitions open hunks into `N` shards (`1 <= K <= N <= open_file_count`) without ever splitting a file across shards, greedily balancing rendered size (largest file into lightest shard, ties broken by path) into `packet-<n>.<lenses>.shard-K-of-N.md` with `Files in this shard: a.py, b.py` in the header.
 - **On-Demand Per-Lens Playbooks (`craftsman skill show code-review --lenses <csv>`)**:
-  - Neither `agents/craftsman-reviewer.md` nor single-file command exports (`~/.claude/commands/code-review.md`) inline `skills/code-review/lenses.md` (`22.8 KB`). Instead, `playbooks.lens_playbooks()` slices `lenses.md` on `## \`<id>\` — ...` headings and prints the shared preamble once plus only the requested lenses or `R1`–`R4` groups in catalog order.
+  - Neither `templates/agents/craftsman-reviewer.md` nor single-file command exports (`~/.claude/commands/code-review.md`) inline `skills/code-review/lenses.md` (`22.8 KB`). Instead, `playbooks.lens_playbooks()` slices `lenses.md` on `## \`<id>\` — ...` headings and prints the shared preamble once plus only the requested lenses or `R1`–`R4` groups in catalog order.
 - **`.git/craftsman` State Hygiene (`craftsman.evidence`)**:
   - Preparing round `N` runs `prune_round_files()`, deleting old `packet-<k>.*.md` views for `k < N` and old `packet-<k>.md` packets for `k < N - 1` (`Pruned: <name>`).
   - Archiving ledgers (`review reset`, gate init rebase/new-base archival, hooks) retains the newest `CRAFTSMAN_KEEP_ARCHIVES` (default `5`, integer `>= 1`) `archive-*` directories and `ledger-*.json` files.
@@ -187,7 +187,7 @@ When Round `N+1` is prepared after fixes:
 
 ### Single-Source Multi-Platform Exporter & Installer (`craftsman.platforms.*`, `craftsman.export`, `craftsman.install`)
 
-Craftsman authors skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/code-review/lenses.md`), subagent templates (`agents/craftsman*.md`), and global rules (`rules/*.md`) once, expanding `{{include path}}` directives into native artifacts tracked by `.craftsman-install.json`:
+Craftsman authors skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/code-review/lenses.md`), subagent templates (`templates/agents/craftsman*.md`), and global rules (`rules/*.md`) once, expanding `{{include path}}` directives into native artifacts tracked by `.craftsman-install.json`:
 
 1. **GitHub Copilot (VS Code & Copilot CLI)** — Global instructions (`craftsman-rules.instructions.md`), Agent Skills (`~/.copilot/skills/<skill>/`), custom agents (`~/.copilot/agents/*.agent.md`), and lifecycle hooks (`~/.copilot/hooks/craftsman.json` or `.github/hooks/craftsman.json`).
 2. **Claude Code (`~/.claude`)** — Slash commands (`~/.claude/commands/<skill>.md` — `code-review.md` stays lean without inlining `lenses.md`), subagents (`~/.claude/agents/craftsman-{reviewer,verifier}.md`), combined rules, and `CLAUDE_HOOK_EVENTS` merged into `~/.claude/settings.json`.
