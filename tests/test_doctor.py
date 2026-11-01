@@ -220,7 +220,7 @@ class SkillManifestTests(DoctorTestCase):
     def test_plugin_manifest_must_list_the_skill_folders(self) -> None:
         repo = self.copy_repo()
         names = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
-        names["skills"] = ["code_quality" if n == "code-quality" else n for n in names["skills"]]
+        names["skills"] = [n.replace("code-quality", "code_quality") for n in names["skills"]]
         (repo / "plugin.json").write_text(json.dumps(names), encoding="utf-8")
 
         report = build_report(repo, None, self.tmp)
@@ -237,10 +237,20 @@ class SkillManifestTests(DoctorTestCase):
         with self.assertRaisesRegex(ExportError, "cannot read"):
             plugin_skill_names(repo)
 
-    def test_skill_listed_twice_in_plugin_manifest_is_an_error(self) -> None:
+    def test_a_skill_name_without_its_path_is_an_error(self) -> None:
+        # agy reads `verify` as ./verify, which is no skill folder.
         repo = self.copy_repo()
         manifest = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
         manifest["skills"].append("verify")
+        (repo / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with self.assertRaisesRegex(ExportError, "list of `./skills/<name>` paths"):
+            plugin_skill_names(repo)
+
+    def test_skill_listed_twice_in_plugin_manifest_is_an_error(self) -> None:
+        repo = self.copy_repo()
+        manifest = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
+        manifest["skills"].append("./skills/verify")
         (repo / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
 
         with self.assertRaisesRegex(ExportError, "lists verify more than once"):

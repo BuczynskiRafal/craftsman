@@ -4,30 +4,22 @@
   "license": "MIT",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
   "skills": [
-    "audit",
-    "audit-comments",
-    "audit-errors",
-    "audit-security",
-    "audit-tests",
-    "audit-types",
-    "batch",
-    "code-quality",
-    "code-review",
-    "craftsman",
-    "extreme-optimizer",
-    "feature-dev",
-    "high-level-commit-message",
-    "leetcode-style-code-reviewer",
-    "modernize",
-    "simplify",
-    "verify"
-  ],
-  "agents": [
-    "craftsman",
-    "craftsman-reviewer",
-    "craftsman-verifier"
-  ],
-  "rules": [
-    "ultra_mode.md"
+    "./skills/audit",
+    "./skills/audit-comments",
+    "./skills/audit-errors",
+    "./skills/audit-security",
+    "./skills/audit-tests",
+    "./skills/audit-types",
+    "./skills/batch",
+    "./skills/code-quality",
+    "./skills/code-review",
+    "./skills/craftsman",
+    "./skills/extreme-optimizer",
+    "./skills/feature-dev",
+    "./skills/high-level-commit-message",
+    "./skills/leetcode-style-code-reviewer",
+    "./skills/modernize",
+    "./skills/simplify",
+    "./skills/verify"
   ]
 }

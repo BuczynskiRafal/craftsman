@@ -72,6 +72,10 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Fixed
 
+- **Antigravity plugin manifest**: `plugin.json` lists its skills as `./skills/<name>` paths and no longer
+  carries the `agents` and `rules` fields, as the current agy loader reads it (`agy plugin validate`
+  reported every entry as missing and loaded the plugin only from its default folders). `craftsman doctor`
+  checks the paths against `skills/`.
 - **Unrendered agents in the agy plugin**: The agent templates moved from `agents/` to `templates/agents/`.
   Plugin loaders read a repository's `agents/` folder as finished agents, so `agy plugin install` gave
   Antigravity three agents whose bodies were bare `{{include ...}}` lines, the orchestrator without any of

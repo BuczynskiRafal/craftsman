@@ -169,16 +169,29 @@ class DoctorReport:
 # --- repository assets ----------------------------------------------------------------------
 
 
+PLUGIN_SKILL_PREFIX = "./skills/"
+
+
 def plugin_skill_names(repo_dir: Path) -> tuple[str, ...]:
-    """The skills `plugin.json` ships; an unreadable manifest is an error, not zero skills."""
+    """The skills `plugin.json` ships; an unreadable manifest is an error, not zero skills.
+
+    agy reads each entry as a path inside the plugin, `./skills/<name>`.
+    """
     plugin_file = repo_dir / "plugin.json"
     try:
         data = json.loads(plugin_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ExportError(f"cannot read {plugin_file}: {exc}") from exc
-    skills = data.get("skills") if isinstance(data, dict) else None
-    if not isinstance(skills, list) or not all(isinstance(name, str) for name in skills):
-        raise ExportError(f"{plugin_file}: `skills` must be a list of skill names")
+    entries = data.get("skills") if isinstance(data, dict) else None
+    skills = [
+        entry.removeprefix(PLUGIN_SKILL_PREFIX)
+        for entry in (entries if isinstance(entries, list) else ())
+        if isinstance(entry, str) and entry.startswith(PLUGIN_SKILL_PREFIX)
+    ]
+    if not isinstance(entries, list) or len(skills) != len(entries) or not all(
+        name and "/" not in name for name in skills
+    ):
+        raise ExportError(f"{plugin_file}: `skills` must be a list of `{PLUGIN_SKILL_PREFIX}<name>` paths")
     repeated = sorted({name for name in skills if skills.count(name) > 1})
     if repeated:
         raise ExportError(f"{plugin_file}: `skills` lists {', '.join(repeated)} more than once")
