@@ -551,7 +551,9 @@ class ScopeEnforcementTests(unittest.TestCase):
 
     def test_only_craftsman_agent_names_are_craftsman_agents(self) -> None:
         self.assertTrue(is_craftsman_agent("Craftsman-Reviewer"))
+        self.assertTrue(is_craftsman_agent("craftsman:craftsman-verifier"))
         self.assertFalse(is_craftsman_agent("my-craftsman-helper"))
+        self.assertFalse(is_craftsman_agent("other:craftsman-reviewer"))
 
     def test_unknown_scope_mode_is_an_error(self) -> None:
         subprocess.run(["git", "config", "craftsman.scope", "enforce"], cwd=self.repo, check=True)

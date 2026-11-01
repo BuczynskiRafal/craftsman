@@ -326,8 +326,23 @@ class StopTests(HookTestCase):
         self.assertIn("[no-isolation]", blocked["reason"])
 
     def test_reviewer_hook_events_prove_the_isolated_review(self) -> None:
+        self.assert_reviewer_proves_isolation("craftsman-reviewer")
+
+    def test_plugin_reviewer_hook_events_prove_the_isolated_review(self) -> None:
+        # Claude Code namespaces a plugin's agents `<plugin>:<agent>`.
+        self.assert_reviewer_proves_isolation("craftsman:craftsman-reviewer")
+
+    def test_other_plugins_reviewer_does_not_prove_the_isolated_review(self) -> None:
         self.prepare_unisolated_review()
-        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
+        reviewer = {"agent_id": "a1", "agent_type": "other:craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, **reviewer))
+        blocked, _ = call_hook("stop", "claude", claude("Stop", self.root))
+        self.assertIn("[no-isolation]", blocked["reason"])
+
+    def assert_reviewer_proves_isolation(self, agent_type: str) -> None:
+        self.prepare_unisolated_review()
+        reviewer = {"agent_id": "a1", "agent_type": agent_type}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         call_hook(
             "subagent-stop",

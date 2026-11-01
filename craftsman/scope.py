@@ -26,7 +26,7 @@ from craftsman.antigravity import session_id
 from craftsman.diffscan import DiffScanError, worktree_root
 from craftsman.gate import GateOwner, GateStateError, load_state, state_path_for
 from craftsman.paths import user_home
-from craftsman.records import CRAFTSMAN_AGENTS
+from craftsman.records import CRAFTSMAN_AGENTS, craftsman_agent_name
 from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 from craftsman.streams import configure_std_streams
 
@@ -101,8 +101,8 @@ class ScopeConfigError(ValueError):
 
 
 def is_craftsman_agent(agent: str) -> bool:
-    """Whether the agent is one of Craftsman's own agents (its exact name, in any case)."""
-    return agent.strip().lower() in CRAFTSMAN_AGENTS
+    """Whether the agent is one of Craftsman's own agents (see `craftsman_agent_name`)."""
+    return craftsman_agent_name(agent) in CRAFTSMAN_AGENTS
 
 
 def is_scope_checked_tool(tool_name: str) -> bool:

@@ -36,6 +36,9 @@ VERIFIER_AGENT = "craftsman-verifier"
 ORCHESTRATOR_AGENT = "craftsman"
 AGENT_ROLES: dict[str, AgentRole] = {REVIEWER_AGENT: "reviewer", VERIFIER_AGENT: "verifier"}
 CRAFTSMAN_AGENTS = frozenset({ORCHESTRATOR_AGENT, *AGENT_ROLES})
+# Claude Code names a plugin's agents `<plugin>:<agent>`, so the plugin's reviewer reports itself
+# as `craftsman:craftsman-reviewer`.
+PLUGIN_AGENT_PREFIX = "craftsman:"
 
 SCHEMA_VERSION = 2
 LEDGER_FILENAME = "ledger.json"
@@ -908,9 +911,18 @@ class Run:
         )
 
 
+def craftsman_agent_name(agent: str) -> str:
+    """The agent name compared against Craftsman's own: lower-cased, without the plugin namespace.
+
+    Only the Craftsman plugin's own namespace is dropped; another plugin's
+    `other:craftsman-reviewer` keeps its prefix and so never matches.
+    """
+    return agent.strip().lower().removeprefix(PLUGIN_AGENT_PREFIX)
+
+
 def agent_role(agent: str) -> AgentRole | None:
-    """The Craftsman role an agent name plays; only an exact, case-insensitive name counts."""
-    return AGENT_ROLES.get(agent.strip().lower())
+    """The Craftsman role an agent name plays (see `craftsman_agent_name`); other names play none."""
+    return AGENT_ROLES.get(craftsman_agent_name(agent))
 
 
 @dataclass(frozen=True)
