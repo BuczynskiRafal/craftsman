@@ -607,17 +607,25 @@ def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
 
 # Craftsman's distribution before it became `craftsman-gate` on PyPI; both install the same files.
 LEGACY_DISTRIBUTION = "craftsman"
+DISTRIBUTION = "craftsman-gate"
+
+
+def _has_distribution(name: str) -> bool:
+    try:
+        importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
 
 
 def inspect_legacy_distribution() -> list[str]:
-    """A problem when this interpreter still has the pre-rename `craftsman` distribution.
+    """A problem when this interpreter has the pre-rename `craftsman` beside `craftsman-gate`.
 
     pip does not see that two distributions own the same files, so uninstalling the old one would
-    delete the package and the `craftsman` script out from under `craftsman-gate`.
+    delete the package and the `craftsman` script out from under `craftsman-gate`. Without
+    `craftsman-gate` (a plugin or checkout run) there is nothing for the old one to take away.
     """
-    try:
-        importlib.metadata.distribution(LEGACY_DISTRIBUTION)
-    except importlib.metadata.PackageNotFoundError:
+    if not (_has_distribution(LEGACY_DISTRIBUTION) and _has_distribution(DISTRIBUTION)):
         return []
     return [
         f"The old `{LEGACY_DISTRIBUTION}` distribution is installed for {sys.executable} beside "

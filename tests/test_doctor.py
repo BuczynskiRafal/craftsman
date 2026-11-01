@@ -403,17 +403,25 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
 
 
 class LegacyDistributionTests(unittest.TestCase):
-    def test_the_pre_rename_distribution_beside_craftsman_gate_is_a_problem(self) -> None:
-        with mock.patch("importlib.metadata.distribution") as distribution:
-            (problem,) = inspect_legacy_distribution()
+    def inspect(self, *installed: str) -> list[str]:
+        def distribution(name: str) -> object:
+            if name not in installed:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return object()
 
-        distribution.assert_called_once_with("craftsman")
+        with mock.patch("importlib.metadata.distribution", side_effect=distribution):
+            return inspect_legacy_distribution()
+
+    def test_the_pre_rename_distribution_beside_craftsman_gate_is_a_problem(self) -> None:
+        (problem,) = self.inspect("craftsman", "craftsman-gate")
+
         self.assertIn("pip uninstall craftsman craftsman-gate", problem)
 
     def test_without_the_old_distribution_there_is_no_problem(self) -> None:
-        missing = importlib.metadata.PackageNotFoundError("craftsman")
-        with mock.patch("importlib.metadata.distribution", side_effect=missing):
-            self.assertEqual(inspect_legacy_distribution(), [])
+        self.assertEqual(self.inspect("craftsman-gate"), [])
+
+    def test_the_old_distribution_alone_is_no_problem(self) -> None:
+        self.assertEqual(self.inspect("craftsman"), [])
 
 
 class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):
