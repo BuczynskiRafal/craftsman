@@ -260,15 +260,15 @@ class HookHygieneTests(unittest.TestCase):
     def test_hook_failure_visible_reporting_on_prompt(self) -> None:
         reply_copilot = Reply("copilot", "prompt")
         out_copilot = failure(reply_copilot, "resolve_base_sha error: empty repo")
-        expected_msg = "Craftsman gate was NOT opened: resolve_base_sha error: empty repo"
+        expected_msg = "Craftsman prompt hook failed (resolve_base_sha error: empty repo)"
         self.assertIn(expected_msg, out_copilot.get("systemMessage", ""))
         self.assertIn(expected_msg, out_copilot.get("additionalContext", ""))
         self.assertIn(expected_msg, out_copilot.get("hookSpecificOutput", {}).get("additionalContext", ""))
 
         reply_claude = Reply("claude", "prompt")
         out_claude = failure(reply_claude, "storage error")
-        self.assertIn("Craftsman gate was NOT opened: storage error", out_claude.get("systemMessage", ""))
-        self.assertIn("Craftsman gate was NOT opened: storage error", out_claude.get("hookSpecificOutput", {}).get("additionalContext", ""))
+        self.assertIn("the gate was NOT opened", out_claude.get("systemMessage", ""))
+        self.assertIn("(storage error)", out_claude.get("hookSpecificOutput", {}).get("additionalContext", ""))
 
 
 if __name__ == "__main__":

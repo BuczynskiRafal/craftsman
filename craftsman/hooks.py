@@ -712,9 +712,10 @@ def failure(reply: Reply, problem: str) -> Output:
             "it is safe."
         )
     if reply.event == "prompt":
+        # Shown to the user and the agent: a prompt meant to open the gate must not look accepted.
         return reply.warn(
-            f"Craftsman gate was NOT opened: {problem}; the quality gate was not checked. "
-            "Run `craftsman review check` yourself."
+            f"Craftsman prompt hook failed ({problem}). If this prompt asked for /craftsman, the "
+            "gate was NOT opened; fix the problem and send the prompt again."
         )
     return reply.allow(
         f"Craftsman {reply.event} hook failed ({problem}); the quality gate was not checked. "

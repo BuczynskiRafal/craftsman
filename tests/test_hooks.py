@@ -133,7 +133,8 @@ class InactiveTests(HookTestCase):
         for event in ("prompt", "stop", "subagent-start", "subagent-stop"):
             with self.subTest(event=event):
                 out, err = call_hook(event, "copilot", "{not json")
-                self.assertIn("the quality gate was not checked", out["systemMessage"])
+                expected = "the gate was NOT opened" if event == "prompt" else "the quality gate was not checked"
+                self.assertIn(expected, out["systemMessage"])
                 self.assertIn("unreadable hook input", err)
 
     def test_input_that_is_not_an_object_is_reported(self) -> None:
