@@ -18,6 +18,7 @@ from craftsman.generated import CRAFTSMAN_BEGIN_MARKER
 from craftsman.install import check_ephemeral_uv_interpreter, parse_install_args
 from craftsman.manifest import MANIFEST_FILENAME, InstallError, TargetKind, load_manifest
 from craftsman.paths import default_vscode_prompts_dir
+from craftsman.platforms.antigravity import is_agy_plugin_active
 from craftsman.platforms.claude import is_craftsman_hook_command
 from craftsman.staging import InstallMode
 
@@ -120,9 +121,34 @@ class AntigravityTests(InstallTestCase):
 
         self.assert_ok(self.install("--antigravity", "--plugin"))
 
-        self.assertEqual((self.config_dir / "plugins" / "craftsman").resolve(), REPO_ROOT.resolve())
+        self.assertTrue((self.config_dir / "plugins" / "craftsman" / "plugin.json").is_file())
         self.assertFalse((self.config_dir / "skills" / "craftsman").exists())
         self.assertFalse((self.config_dir / "hooks.json").exists())
+
+    def test_plugin_mode_copies_what_agy_loads(self) -> None:
+        # agy skips a plugin folder that is a symlink, and would load agents/ unrendered.
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        plugin = self.config_dir / "plugins" / "craftsman"
+        self.assertFalse(plugin.is_symlink())
+        self.assertEqual(
+            sorted(p.name for p in plugin.iterdir()),
+            ["craftsman", "hooks.json", "plugin.json", "rules", "scripts", "skills"],
+        )
+        self.assertTrue((plugin / "skills" / "code-review" / "lenses.md").is_file())
+        self.assertTrue((plugin / "craftsman" / "antigravity.py").is_file())
+        if os.name == "posix":
+            self.assertTrue(os.access(plugin / "scripts" / "craftsman-stop-gate.py", os.X_OK))
+        self.assertEqual(detect_antigravity_drift(REPO_ROOT, self.config_dir), [])
+
+    def test_a_stale_plugin_copy_is_drift(self) -> None:
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+        skill = self.config_dir / "plugins" / "craftsman" / "skills" / "verify" / "SKILL.md"
+        skill.write_text("stale\n", encoding="utf-8")
+
+        drifted = detect_antigravity_drift(REPO_ROOT, self.config_dir)
+
+        self.assertEqual(drifted, ["plugins/craftsman/skills/verify/SKILL.md"])
 
     def test_users_skill_is_moved_where_it_is_not_discovered(self) -> None:
         skill = self.config_dir / "skills" / "craftsman"
@@ -779,7 +805,8 @@ class AgyPluginTests(InstallTestCase):
 
         self.assert_ok(self.install("--antigravity", "--plugin"))
 
-        self.assertEqual((self.config_dir / "plugins" / "craftsman").resolve(), REPO_ROOT.resolve())
+        self.assertTrue((self.config_dir / "plugins" / "craftsman" / "hooks.json").is_file())
+        self.assertFalse(is_agy_plugin_active(self.home))
 
     def test_craftsmans_own_plugin_mode_is_no_agy_plugin(self) -> None:
         self.assert_ok(self.install("--antigravity", "--plugin"))

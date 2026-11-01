@@ -32,7 +32,7 @@ from craftsman.paths import (
     resolve_craftsman_pkg_dir,
     user_home,
 )
-from craftsman.platforms.antigravity import is_agy_plugin_active
+from craftsman.platforms.antigravity import PLUGIN_NAME, is_agy_plugin_active, is_own_plugin
 from craftsman.platforms.claude import (
     CLAUDE_HOOK_EVENTS,
     is_claude_plugin_active,
@@ -244,7 +244,28 @@ def detect_antigravity_drift(repo_dir: Path, cfg: Path) -> list[str]:
         drifted.extend(_copied_file_drift(src_base, cfg / subdir, subdir, pattern, cfg))
     if has_skills:
         drifted.extend(_hooks_json_drift(repo_dir / "hooks.json", cfg))
+    if has_plugin and is_own_plugin(cfg):
+        drifted.extend(_plugin_drift(repo_dir, cfg))
     return drifted
+
+
+def _plugin_drift(repo_dir: Path, cfg: Path) -> Iterator[str]:
+    """The copy that `craftsman install --antigravity --plugin` made of the plugin."""
+    plugin_dir = cfg / "plugins" / PLUGIN_NAME
+    label = f"plugins/{PLUGIN_NAME}"
+    for name in ("plugin.json", "hooks.json"):
+        installed = plugin_dir / name
+        if not installed.is_file():
+            yield f"{label}/{name} (missing in {cfg})"
+        elif _sha256_file(repo_dir / name) != _sha256_file(installed):
+            yield f"{label}/{name}"
+    for subdir, pattern in (("skills", "**/*.md"), ("rules", "*.md"), ("scripts", "*.py")):
+        yield from _copied_file_drift(
+            repo_dir / subdir, plugin_dir / subdir, f"{label}/{subdir}", pattern, cfg
+        )
+    yield from _copied_file_drift(
+        resolve_craftsman_pkg_dir(repo_dir), plugin_dir / "craftsman", f"{label}/craftsman", "**/*.py", cfg
+    )
 
 
 def _copied_file_drift(
@@ -812,7 +833,9 @@ def print_report(report: DoctorReport) -> None:
     print(f"  Git identity   : {git.user_name or 'unset'} <{git.user_email or 'unset'}>")
     print(f"  Git hooksPath  : {git.hooks_path or 'unset'}")
     if report.config_drift:
-        sync_hint = "run 'craftsman install --antigravity' to sync"
+        plugin = any(path.startswith(f"plugins/{PLUGIN_NAME}/") for path in report.config_drift)
+        command = "craftsman install --antigravity" + (" --plugin" if plugin else "")
+        sync_hint = f"run '{command}' to sync"
         print(
             f"  Config drift   : {len(report.config_drift)} file(s) differ between repo and "
             f"~/.gemini/config ({sync_hint})"

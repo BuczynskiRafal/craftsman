@@ -72,6 +72,12 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Fixed
 
+- **Antigravity `--plugin` install was never loaded**: `craftsman install --antigravity --plugin` linked
+  `~/.gemini/config/plugins/craftsman` to the checkout, and agy skips a plugin folder that is a symlink, so
+  Antigravity had neither the skills nor the gate hooks it had just taken out of `hooks.json`. The plugin is
+  now a copy of what agy loads (`plugin.json`, `hooks.json`, `skills/`, `rules/`, `scripts/` and the
+  package), without the unrendered agent templates, and `craftsman doctor` reports it when it falls behind
+  the checkout.
 - **UTF-8 through pipes on Windows**: The CLI and the Antigravity hook scripts read and write UTF-8 when
   stdin/stdout are pipes, as the agents do. Before, Python used the ANSI code page there: a `ł` in a
   prompt arrived garbled, every `→` of a report left as `?`, and the Antigravity hooks could crash on a

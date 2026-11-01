@@ -89,7 +89,7 @@ Antigravity installs the repository as a plugin straight from GitHub:
 agy plugin install https://github.com/BuczynskiRafal/craftsman
 ```
 
-agy copies it to `~/.gemini/config/plugins/craftsman` with the skills, the rule and the gate hooks, which run the `scripts/` of the plugin. A copy or symlink install (`craftsman install --antigravity`) would add the same skills and hooks to `~/.gemini/config` a second time, so `craftsman install` skips an auto-detected Antigravity and refuses `--antigravity` while the agy plugin is enabled, and `craftsman doctor` reports both installs side by side.
+agy copies it to `~/.gemini/config/plugins/craftsman` with the skills, the rule and the gate hooks, which run the `scripts/` of the plugin. A copy or symlink install (`craftsman install --antigravity`) would add the same skills and hooks to `~/.gemini/config` a second time, so `craftsman install` skips an auto-detected Antigravity and refuses `--antigravity` while the agy plugin is enabled, and `craftsman doctor` reports both installs side by side. `craftsman install --antigravity --plugin` replaces the agy plugin with a copy of Craftsman's own, which `craftsman uninstall --antigravity` removes again.
 
 ---
 
