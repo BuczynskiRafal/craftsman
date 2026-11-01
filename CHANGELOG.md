@@ -6,8 +6,6 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
-## [4.0.0] - 2026-11-01
-
 ### Added
 
 - **Modular documentation (`docs/`)**: Reference material moved from `README.md` into modular guides:
@@ -36,8 +34,18 @@ All notable changes to Craftsman are recorded here. The format follows
   section anchors, and raw GitHub diagram URLs across `README.md` and `docs/*.md`.
 - **Version consistency check (`tests/test_version.py`)**: Enforces exact version synchronization across
   all repo manifests (`pyproject.toml`, `plugin.json`, `craftsman/__init__.py`, and plugin manifests).
-- **Cleanup of legacy 3.x global Git hooks**: `craftsman install` and `craftsman uninstall` automatically
-  remove global Git hooks installed by Craftsman 3.x and restore `core.hooksPath`.
+- **One-line prose in the ledger and reports**: Finding titles, scenarios, suggestions, coverage notes,
+  verdict evidence, resolution notes, facts and reasons are flattened to one line on the way in, including
+  literal `\n` / `\t` / PowerShell `` `n `` sequences (with a warning). Code spans, Windows paths and quoted
+  escapes such as `newline="\n"` are kept. Every Markdown renderer applies the same rules, so ledgers
+  written by older versions render correctly too.
+- **Managed scratch directory (`craftsman review scratch`)**: Prints a fresh `<git-dir>/craftsman/scratch/<id>/`
+  for repro and verification scripts; removed by `gate --complete`, `review reset` and the final
+  review-only report.
+- **Out-of-scope change warning**: `review report` and `review check --review-only` list files created or
+  changed outside a frozen review scope since the review started.
+- **Stop-hook summary line**: The continuation reason now starts with one line naming what blocks the gate,
+  e.g. `review incomplete: 3 hunks not covered by lens contracts; 1 finding without a verdict`.
 
 ### Changed
 
@@ -48,6 +56,19 @@ All notable changes to Craftsman are recorded here. The format follows
   across all files, eliminating ungrounded marketing buzzwords.
 - **Canonical MIT license and NOTICE**: Canonical MIT text preserved in `LICENSE`; detailed attribution and
   project notices separated into `NOTICE`.
+- **Prompt hook failures**: A failing prompt hook tells the user and the agent that a `/craftsman` prompt did
+  not open the gate.
+- **Windows CI**: A `windows-latest` job runs lint, type checks, tests, `doctor` and an installer dry run.
+
+## [4.0.0] - 2026-10-30
+
+### Added
+
+- **Cleanup of legacy 3.x global Git hooks**: `craftsman install` and `craftsman uninstall` automatically
+  remove global Git hooks installed by Craftsman 3.x and restore `core.hooksPath`.
+
+### Changed
+
 - **Google Antigravity hooks**: Scope guard (`craftsman-scope-guard`) replaces the legacy git guard in `hooks.json`.
 - **Syntactic trigger detection**: Trigger detection for `/craftsman` and `ultracraft` outside quotes and backticks
   is purely syntactic.
