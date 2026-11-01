@@ -242,39 +242,54 @@ def _merge_claude_settings(session: TargetSession, settings: Path, bash_prefix: 
         report_change(session.tracker, change)
 
 
+PLUGIN_NAME = "craftsman"
+
+
+def is_craftsman_plugin_id(plugin_id: object) -> bool:
+    """`craftsman@<marketplace>`: Claude Code's id for this plugin, from any marketplace."""
+    return isinstance(plugin_id, str) and plugin_id.strip().lower().partition("@")[0] == PLUGIN_NAME
+
+
+def _installed_plugin_ids(data: object) -> Iterator[object]:
+    """The plugin ids in `installed_plugins.json`.
+
+    Claude Code writes `{"version": N, "plugins": {"<name>@<marketplace>": [...]}}`; a bare map or
+    list of ids, or of `{"name": ...}` entries, is read as well.
+    """
+    if isinstance(data, dict):
+        yield from data
+        data = data.get("plugins")
+    if isinstance(data, dict):
+        yield from data
+    elif isinstance(data, list):
+        yield from (entry.get("name") if isinstance(entry, dict) else entry for entry in data)
+
+
 def is_claude_plugin_active(claude_dir: Path) -> bool:
-    """Check whether the Craftsman Claude Code plugin is installed and active."""
+    """Whether the Craftsman Claude Code plugin is installed and not disabled in user settings."""
     plugin_found = False
     installed_plugins_file = claude_dir / "plugins" / "installed_plugins.json"
     if installed_plugins_file.is_file():
         try:
             data = json.loads(installed_plugins_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                plugin_found = any("craftsman" in str(k).lower() for k in data)
-            elif isinstance(data, list):
-                plugin_found = any(
-                    (isinstance(x, str) and "craftsman" in x.lower())
-                    or (isinstance(x, dict) and "craftsman" in str(x.get("name", "")).lower())
-                    for x in data
-                )
         except (OSError, ValueError):
-            pass
+            data = None
+        plugin_found = any(map(is_craftsman_plugin_id, _installed_plugin_ids(data)))
 
     settings_file = claude_dir / "settings.json"
     if settings_file.is_file():
         try:
             settings = json.loads(settings_file.read_text(encoding="utf-8"))
-            if isinstance(settings, dict):
-                enabled = settings.get("enabledPlugins", {})
-                if isinstance(enabled, dict):
-                    for k, v in enabled.items():
-                        if "craftsman" in str(k).lower():
-                            if v is False:
-                                return False
-                            if v is True:
-                                plugin_found = True
         except (OSError, ValueError):
-            pass
+            settings = None
+        enabled = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+        if isinstance(enabled, dict):
+            for plugin_id, on in enabled.items():
+                if is_craftsman_plugin_id(plugin_id):
+                    if on is False:
+                        return False
+                    if on is True:
+                        plugin_found = True
 
     return plugin_found
 
@@ -305,7 +320,7 @@ def _render_plugin_manifest(agent_names: list[str]) -> str:
     from craftsman import __version__
 
     manifest = {
-        "name": "craftsman",
+        "name": PLUGIN_NAME,
         "version": __version__,
         "description": PLUGIN_DESCRIPTION,
         "author": PLUGIN_AUTHOR,

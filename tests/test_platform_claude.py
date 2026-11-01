@@ -18,6 +18,7 @@ from craftsman.platforms.claude import (
     claude_agent_templates,
     export_claude_plugin,
     export_to_claude_user,
+    is_claude_plugin_active,
     is_craftsman_hook_command,
     merge_claude_hooks,
     render_claude_agent,
@@ -54,6 +55,59 @@ class ClaudeTestCase(unittest.TestCase):
             encoding="utf-8",
         )
         return repo
+
+
+class ClaudePluginDetectionTests(ClaudeTestCase):
+    def write_json(self, rel_path: str, data: object) -> None:
+        path = self.tmp / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def installed(self, plugins: object) -> None:
+        self.write_json("plugins/installed_plugins.json", plugins)
+
+    def test_claude_codes_wrapped_installed_plugins_file_is_read(self) -> None:
+        entry = [{"scope": "project", "installPath": "/x", "version": "4.0.0"}]
+        self.installed({"version": 2, "plugins": {"craftsman@craftsman": entry}})
+
+        self.assertTrue(is_claude_plugin_active(self.tmp))
+
+    def test_the_plugin_from_any_marketplace_counts(self) -> None:
+        self.installed({"version": 2, "plugins": {"craftsman@my-fork": []}})
+
+        self.assertTrue(is_claude_plugin_active(self.tmp))
+
+    def test_other_plugins_naming_craftsman_do_not_count(self) -> None:
+        self.installed({"version": 2, "plugins": {"my-craftsman-helper@market": []}})
+        self.write_json("settings.json", {"enabledPlugins": {"craftsman-extras@market": True}})
+
+        self.assertFalse(is_claude_plugin_active(self.tmp))
+
+    def test_bare_maps_and_lists_of_ids_are_read(self) -> None:
+        cases: tuple[object, ...] = (
+            {"craftsman@craftsman": {}},
+            ["craftsman@craftsman"],
+            [{"name": "craftsman"}],
+        )
+        for plugins in cases:
+            with self.subTest(plugins=plugins):
+                self.installed(plugins)
+                self.assertTrue(is_claude_plugin_active(self.tmp))
+
+    def test_user_settings_enable_or_disable_the_plugin(self) -> None:
+        self.write_json("settings.json", {"enabledPlugins": {"craftsman@craftsman": True}})
+        self.assertTrue(is_claude_plugin_active(self.tmp))
+
+        self.installed({"version": 2, "plugins": {"craftsman@craftsman": []}})
+        self.write_json("settings.json", {"enabledPlugins": {"craftsman@craftsman": False}})
+        self.assertFalse(is_claude_plugin_active(self.tmp))
+
+    def test_unreadable_files_mean_no_plugin(self) -> None:
+        (self.tmp / "plugins").mkdir()
+        (self.tmp / "plugins" / "installed_plugins.json").write_text("{", encoding="utf-8")
+        (self.tmp / "settings.json").write_text("{", encoding="utf-8")
+
+        self.assertFalse(is_claude_plugin_active(self.tmp))
 
 
 class ClaudePluginExportTests(ClaudeTestCase):

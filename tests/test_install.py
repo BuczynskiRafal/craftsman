@@ -693,7 +693,8 @@ class BootstrapTests(InstallTestCase):
         plugins_dir = self.claude_dir / "plugins"
         plugins_dir.mkdir(parents=True)
         (plugins_dir / "installed_plugins.json").write_text(
-            json.dumps({"craftsman@craftsman": {"source": "market"}}), encoding="utf-8"
+            json.dumps({"version": 2, "plugins": {"craftsman@craftsman": [{"scope": "user"}]}}),
+            encoding="utf-8",
         )
 
     def test_auto_detected_claude_is_skipped_while_the_plugin_is_active(self) -> None:
