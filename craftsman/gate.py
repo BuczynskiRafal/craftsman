@@ -59,7 +59,6 @@ from craftsman.records import (
     LedgerError,
     format_timestamp,
 )
-from craftsman.text import inline_md
 
 GateTier = Literal["auto", "quick", "standard", "deep"]
 GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
@@ -441,29 +440,24 @@ def continuation_reason(header: str, report: GateReport | None, evidence_error: 
     if evidence_error is not None:
         lead = f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}."
     elif report is not None and report.issues:
-        summary = format_blocker_summary(report)
-        lead = f"{summary}." if not summary.endswith(".") else summary
+        lead = f"{format_blocker_summary(report)}."
     else:
         lead = "Review incomplete."
-
     lines = [
         f"{header} {lead} Task completion is blocked until the evidence ledger proves the change is "
         "reviewed and verified."
     ]
-    if evidence_error is not None:
-        lines.append(f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}")
     closing = "Close the gate with `craftsman gate --complete` once `craftsman review check` passes."
     if report is not None and report.issues:
         lines.append("Next actions:")
         more = "… run `craftsman review check` for the remaining actions."
         budget = MAX_CONTINUATION_REASON_CHARS - sum(len(line) + 1 for line in (*lines, closing, more))
         for action in render_next_actions(report.issues):
-            action_line = inline_md(action)
-            if len(action_line) + 1 > budget:
+            if len(action) + 1 > budget:
                 lines.append(more)
                 break
-            lines.append(action_line)
-            budget -= len(action_line) + 1
+            lines.append(action)
+            budget -= len(action) + 1
     lines.append(closing)
     return "\n".join(lines)
 

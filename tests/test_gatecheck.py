@@ -632,25 +632,32 @@ class FormatBlockerSummaryTests(unittest.TestCase):
         report = GateReport((GateIssue("no-round", "No round prepared"),), (), "Summary")
         self.assertEqual(format_blocker_summary(report), "review incomplete: no review round prepared")
 
-    def test_uncovered_single_lens(self) -> None:
-        issue = GateIssue("uncovered", "Lens `contracts` has 3 uncovered hunk(s) in round 1: h1,h2,h3; review them")
-        report = GateReport((issue,), (), "Summary")
-        self.assertEqual(format_blocker_summary(report), "review incomplete: 3 hunks not covered by lens contracts")
-
-    def test_uncovered_multiple_issues(self) -> None:
-        i1 = GateIssue("uncovered", "Lens `contracts` has 2 uncovered hunk(s) in round 1: h1,h2; review them")
-        i2 = GateIssue("uncovered", "Lens `failure` has 1 uncovered hunk(s) in round 1: h3; review them")
-        report = GateReport((i1, i2), (), "Summary")
-        self.assertEqual(format_blocker_summary(report), "review incomplete: 3 hunks not covered by lenses")
-
-    def test_multiple_categories_joined_with_semicolon(self) -> None:
-        i1 = GateIssue("uncovered", "Lens `contracts` has 3 uncovered hunk(s) in round 1: h1,h2,h3; review them")
-        i2 = GateIssue("no-verdict", "Finding F1 has no verdict")
-        i3 = GateIssue("no-passing-run", "No passing test run")
-        report = GateReport((i1, i2, i3), (), "Summary")
+    def test_uncovered_counts_come_from_the_real_coverage_issues(self) -> None:
+        ledger, _ = prepared(two_hunks(), lenses=("intent", "craft"))
+        report = evaluate(ledger, two_hunks(), QUICK)
         self.assertEqual(
             format_blocker_summary(report),
-            "review incomplete: 3 hunks not covered by lens contracts; 1 finding without a verdict; no passing test run",
+            "review incomplete: 2 files not covered by lenses intent, craft; no passing test run",
+        )
+
+    def test_uncovered_single_lens_and_files_are_counted_separately(self) -> None:
+        hunks = GateIssue("uncovered", "…", lenses=("contracts",), missing=1)
+        files = GateIssue("uncovered", "…", lenses=("design",), missing=2, unit="file")
+        report = GateReport((hunks, files), (), "Summary")
+        self.assertEqual(
+            format_blocker_summary(report),
+            "review incomplete: 1 hunk not covered by lens contracts; 2 files not covered by lens design",
+        )
+
+    def test_multiple_categories_joined_with_semicolon(self) -> None:
+        i1 = GateIssue("uncovered", "…", lenses=("contracts",), missing=3)
+        i2 = GateIssue("no-verdict", "Finding F1 has no verdict")
+        i3 = GateIssue("no-passing-run", "No passing test run")
+        report = GateReport((i3, i2, i1), (), "Summary")
+        self.assertEqual(
+            format_blocker_summary(report),
+            "review incomplete: 3 hunks not covered by lens contracts; 1 finding without a verdict; "
+            "no passing test run",
         )
 
     def test_unresolved_findings_and_failing_runs(self) -> None:
@@ -661,7 +668,7 @@ class FormatBlockerSummaryTests(unittest.TestCase):
         report = GateReport((i1, i2, i3, i4), (), "Summary")
         self.assertEqual(
             format_blocker_summary(report),
-            "review incomplete: 2 findings unresolved; 1 failing run; no reviewer isolation evidence",
+            "review incomplete: 2 unresolved findings; 1 failing run; no reviewer isolation evidence",
         )
 
 

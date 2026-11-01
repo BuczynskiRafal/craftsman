@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence, Set
 from dataclasses import dataclass
 from typing import Literal
@@ -72,6 +71,10 @@ _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 class GateIssue:
     code: IssueCode
     message: str
+    # Only for `uncovered`: the lenses and how many hunks (or files) they still miss.
+    lenses: tuple[str, ...] = ()
+    missing: int = 0
+    unit: Literal["hunk", "file"] = "hunk"
 
 
 @dataclass(frozen=True)
@@ -347,6 +350,9 @@ def _uncovered_issue(
         f"{head} {len(missing)} uncovered {unit} in round {round_.number}: "
         f"{batch}{more}; review them and run "
         f'`craftsman review cover --lens {lens_arg} {flag} {batch} --note "..."`.',
+        lenses=tuple(lenses),
+        missing=len(missing),
+        unit="file" if use_files else "hunk",
     )
 
 
@@ -694,90 +700,55 @@ def render_report(report: GateReport) -> str:
     return "\n".join(lines)
 
 
+# One summary clause per issue code, in the order the agent should address them.
+_ROUND_CLAUSES: dict[IssueCode, str] = {
+    "no-round": "no review round prepared",
+    "stale-round": "code changed since the review round",
+    "tier-too-low": "review tier too low",
+    "round-cap": "maximum review rounds reached",
+}
+_COUNTED_CLAUSES: dict[IssueCode, tuple[str, str]] = {
+    "unresolved-signal": ("unacknowledged risk signal", "unacknowledged risk signals"),
+    "no-verdict": ("finding without a verdict", "findings without a verdict"),
+    "unresolved": ("unresolved finding", "unresolved findings"),
+}
+_RUN_CLAUSES: dict[IssueCode, str] = {
+    "no-passing-run": "no passing test run",
+    "no-e2e-run": "no passing e2e run",
+}
+
+
+def _counted(count: int, forms: tuple[str, str]) -> str:
+    return f"{count} {forms[0] if count == 1 else forms[1]}"
+
+
+def _coverage_clauses(issues: Sequence[GateIssue]) -> list[str]:
+    clauses: list[str] = []
+    for unit in ("hunk", "file"):
+        matching = [issue for issue in issues if issue.code == "uncovered" and issue.unit == unit]
+        if not matching:
+            continue
+        lenses = list(dict.fromkeys(lens for issue in matching for lens in issue.lenses))
+        total = sum(issue.missing for issue in matching)
+        noun = "lens" if len(lenses) == 1 else "lenses"
+        clauses.append(f"{_counted(total, (unit, unit + 's'))} not covered by {noun} {', '.join(lenses)}")
+    return clauses
+
+
 def format_blocker_summary(report: GateReport) -> str:
-    """Summarize active blocker issues into a single concise sentence."""
+    """One line naming what still blocks the gate, e.g. `review incomplete: 3 hunks not covered by
+    lens contracts; 1 finding without a verdict`."""
     if not report.issues:
         return "review complete"
-
-    clauses: list[str] = []
-
-    # 1. Round lifecycle issues
-    for issue in report.issues:
-        if issue.code == "no-round":
-            clauses.append("no review round prepared")
-        elif issue.code == "stale-round":
-            clauses.append("code changed since review round")
-        elif issue.code == "tier-too-low":
-            clauses.append("review tier too low")
-        elif issue.code == "round-cap":
-            clauses.append("maximum review rounds reached")
-
-    # 2. Coverage issues
-    coverage_issues = [i for i in report.issues if i.code == "uncovered"]
-    if coverage_issues:
-        if len(coverage_issues) == 1:
-            m = re.search(
-                r"(?:Lens `([^`]+)` has|Lenses ([^h]+) have) (\d+) uncovered (hunk|file)",
-                coverage_issues[0].message,
-            )
-            if m:
-                lens = (m.group(1) or m.group(2)).strip()
-                count = int(m.group(3))
-                unit = m.group(4)
-                unit_str = f"{unit}s" if count != 1 and not unit.endswith("s") else unit
-                clauses.append(f"{count} {unit_str} not covered by lens {lens}")
-            else:
-                clauses.append(f"{len(coverage_issues)} uncovered items")
-        else:
-            total_missing = 0
-            unit = "hunks"
-            for ci in coverage_issues:
-                m = re.search(r"(\d+) uncovered (hunk|file)", ci.message)
-                if m:
-                    total_missing += int(m.group(1))
-                    unit = f"{m.group(2)}s"
-            if total_missing > 0:
-                clauses.append(f"{total_missing} {unit} not covered by lenses")
-            else:
-                clauses.append(f"{len(coverage_issues)} uncovered items")
-
-    # 3. Premature sweep
-    if any(i.code == "sweep-too-early" for i in report.issues):
-        clauses.append("final sweep recorded prematurely")
-
-    # 4. Risk signals
-    signal_issues = [i for i in report.issues if i.code == "unresolved-signal"]
-    if signal_issues:
-        n = len(signal_issues)
-        clauses.append(f"{n} unacknowledged risk signal{'s' if n != 1 else ''}")
-
-    # 5. Verdicts
-    verdict_issues = [i for i in report.issues if i.code == "no-verdict"]
-    if verdict_issues:
-        n = len(verdict_issues)
-        clauses.append(f"{n} finding{'s' if n != 1 else ''} without a verdict")
-
-    # 6. Unresolved findings
-    unresolved = [i for i in report.issues if i.code == "unresolved"]
-    if unresolved:
-        n = len(unresolved)
-        clauses.append(f"{n} finding{'s' if n != 1 else ''} unresolved")
-
-    # 7. Verification runs
-    if any(i.code == "no-passing-run" for i in report.issues):
-        clauses.append("no passing test run")
-    if any(i.code == "no-e2e-run" for i in report.issues):
-        clauses.append("no passing e2e run")
-    failing = [i for i in report.issues if i.code == "failing-run"]
-    if failing:
-        n = len(failing)
-        clauses.append(f"{n} failing run{'s' if n != 1 else ''}")
-
-    # 8. Reviewer isolation
-    if any(i.code == "no-isolation" for i in report.issues):
+    codes = [issue.code for issue in report.issues]
+    clauses = [clause for code, clause in _ROUND_CLAUSES.items() if code in codes]
+    clauses += _coverage_clauses(report.issues)
+    if "sweep-too-early" in codes:
+        clauses.append("final sweep recorded too early")
+    clauses += [_counted(codes.count(code), forms) for code, forms in _COUNTED_CLAUSES.items() if code in codes]
+    clauses += [clause for code, clause in _RUN_CLAUSES.items() if code in codes]
+    if "failing-run" in codes:
+        clauses.append(_counted(codes.count("failing-run"), ("failing run", "failing runs")))
+    if "no-isolation" in codes:
         clauses.append("no reviewer isolation evidence")
-
-    if not clauses:
-        clauses.append(f"{len(report.issues)} open items")
-
-    return f"review incomplete: {'; '.join(clauses)}"
+    return f"review incomplete: {'; '.join(clauses) or _counted(len(codes), ('open item', 'open items'))}"
