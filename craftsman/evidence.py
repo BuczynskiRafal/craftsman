@@ -253,45 +253,39 @@ def create_scratch_dir(craftsman_dir: Path) -> Path:
     raise LedgerError(f"cannot create scratch directory in {scratch_dir}")
 
 
-def _make_tree_writable(root_path: Path) -> None:
-    """Recursively grant write permissions so that tree removal succeeds."""
-    try:
-        os.chmod(root_path, stat.S_IRWXU)
-    except OSError:
-        pass
-    for dirpath, dirnames, filenames in os.walk(root_path):
-        for d in dirnames:
-            try:
-                os.chmod(os.path.join(dirpath, d), stat.S_IRWXU)
-            except OSError:
-                pass
-        for f in filenames:
-            try:
-                os.chmod(os.path.join(dirpath, f), stat.S_IWRITE | stat.S_IREAD)
-            except OSError:
-                pass
+def _make_writable(path: Path) -> None:
+    """Let the owner delete `path`: rwx on a directory, read-write on a file; links stay untouched.
 
-
-def _rmtree_onexc(func: Callable[[str], Any], path: str, exc: BaseException) -> None:
+    A symlink or junction is never followed: chmod on one would change its target, which can be
+    anything outside the scratch tree (a venv links its interpreter, for example).
+    """
+    if _is_symlink_or_junction(path):
+        return
     with suppress(OSError):
-        p = Path(path)
-        os.chmod(p.parent, stat.S_IRWXU)
-        if p.is_dir():
-            os.chmod(p, stat.S_IRWXU)
-        else:
-            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-        func(path)
+        os.chmod(path, stat.S_IRWXU if path.is_dir() else stat.S_IREAD | stat.S_IWRITE)
 
 
-def _rmtree_onerror(func: Callable[[str], Any], path: str, exc_info: Any) -> None:
-    with suppress(OSError):
-        p = Path(path)
-        os.chmod(p.parent, stat.S_IRWXU)
-        if p.is_dir():
-            os.chmod(p, stat.S_IRWXU)
-        else:
-            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-        func(path)
+def _make_tree_writable(root: Path) -> None:
+    """Make every real file and directory under `root` deletable before removing the tree.
+
+    A read-only directory blocks deleting its entries on every platform, and a read-only file
+    blocks deleting itself on Windows.
+    """
+    _make_writable(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in (*dirnames, *filenames):
+            _make_writable(Path(dirpath, name))
+
+
+def _retry_writable(func: Callable[[str], Any], path: str, _error: Any) -> None:
+    """`shutil.rmtree` error handler: make the entry and its directory writable, then retry once.
+
+    A second failure propagates out of `rmtree`, so the caller reports the entry as not removed.
+    """
+    target = Path(path)
+    _make_writable(target.parent)
+    _make_writable(target)
+    func(path)
 
 
 def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
@@ -321,15 +315,12 @@ def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
             elif entry.is_dir():
                 _make_tree_writable(entry)
                 if sys.version_info >= (3, 12):
-                    shutil.rmtree(entry, onexc=_rmtree_onexc)
+                    shutil.rmtree(entry, onexc=_retry_writable)
                 else:
-                    shutil.rmtree(entry, onerror=_rmtree_onerror)
+                    shutil.rmtree(entry, onerror=_retry_writable)
             else:
-                try:
-                    entry.unlink()
-                except PermissionError:
-                    os.chmod(entry, stat.S_IWRITE | stat.S_IREAD)
-                    entry.unlink()
+                _make_writable(entry)
+                entry.unlink()
         except FileNotFoundError:
             continue
         except OSError as exc:

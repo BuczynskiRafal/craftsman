@@ -100,7 +100,36 @@ class ScratchDirectoryTests(unittest.TestCase):
         self.assertFalse(scratch_parent.exists())
 
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission bits")
+    def test_pruning_never_changes_the_target_of_a_link_inside_scratch(self) -> None:
+        # A venv in scratch links its interpreter; chmod through that link stripped its exec bit.
+        outside = self.craftsman_dir.parent / "python3"
+        outside.write_text("#!/bin/sh\n", encoding="utf-8")
+        outside.chmod(0o755)
+        scratch = create_scratch_dir(self.craftsman_dir)
+        (scratch / "venv" / "bin").mkdir(parents=True)
+        (scratch / "venv" / "bin" / "python").symlink_to(outside)
+        (scratch / "venv" / "lib").symlink_to(self.craftsman_dir.parent, target_is_directory=True)
+
+        self.assertIn(scratch, prune_scratch_dirs(self.craftsman_dir))
+
+        self.assertFalse(scratch.exists())
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.craftsman_dir.parent.stat().st_mode & 0o777, 0o700)
+
+
 class WorkingTreeHygieneE2ETests(unittest.TestCase):
+    def test_scratch_survives_the_next_review_round(self) -> None:
+        self.repo.write("app.py", "x = 2\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+        scratch = Path(self.repo.cli("review", "scratch").stdout.strip())
+        (scratch / "repro.py").write_text("print('repro')\n", encoding="utf-8")
+
+        self.repo.write("app.py", "x = 3\n")
+        self.repo.cli("review", "prepare", "--tier", "quick")
+
+        self.assertTrue((scratch / "repro.py").is_file())
+
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

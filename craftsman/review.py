@@ -32,6 +32,7 @@ from craftsman.evidence import (
     effective_tier,
     packet_path,
     prune_all_temp_dirs,
+    prune_inbox_files,
     prune_round_files,
 )
 from craftsman.gate import GateState, GateStateError, Stage, current_tier, state_path_for, update_state
@@ -301,7 +302,8 @@ def _prepare(args: argparse.Namespace) -> int:
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if created:
         prune_round_files(ws.ledger_path.parent, round_.number)
-        prune_all_temp_dirs(ws.ledger_path.parent)
+        # Scratch directories outlive rounds: a repro written in round 1 is re-run after the fix.
+        prune_inbox_files(ws.ledger_path.parent)
     return 0
 
 
