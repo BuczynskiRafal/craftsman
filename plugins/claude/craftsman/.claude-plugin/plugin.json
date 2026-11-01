@@ -1,0 +1,20 @@
+{
+  "name": "craftsman",
+  "version": "4.0.0",
+  "description": "Make AI coding agents prove they reviewed and tested their change.",
+  "author": {
+    "name": "Rafa\u0142 Buczy\u0144ski",
+    "email": "buczynski.rafal2@gmail.com"
+  },
+  "homepage": "https://github.com/BuczynskiRafal/craftsman",
+  "repository": "https://github.com/BuczynskiRafal/craftsman",
+  "license": "MIT",
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "code-review",
+    "quality-gate",
+    "testing"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

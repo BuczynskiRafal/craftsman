@@ -31,7 +31,12 @@ from craftsman.paths import (
     default_vscode_prompts_dir,
 )
 from craftsman.platforms.agents_md import export_to_agents_workspace
-from craftsman.platforms.claude import export_to_claude_user, merge_claude_hooks
+from craftsman.platforms.claude import (
+    export_claude_plugin,
+    export_to_claude_user,
+    is_claude_plugin_active,
+    merge_claude_hooks,
+)
 from craftsman.platforms.copilot import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
@@ -97,6 +102,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Export universal AGENTS.md and .cursor/rules/craftsman.mdc into a project workspace.",
     )
+    parser.add_argument(
+        "--claude-plugin",
+        type=Path,
+        metavar="<dir>",
+        help="Export standalone Claude Code plugin tree to <dir>.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="With --claude-plugin: verify plugin tree matches repository source assets.",
+    )
     return parser
 
 
@@ -110,12 +126,15 @@ def _validate_export_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         args.workspace,
         args.claude_dir,
         args.agents_workspace,
+        args.claude_plugin,
     )
     if all(target is None for target in targets):
         parser.error(
             "Specify at least one target: --user-dir, --copilot-skills-dir, --copilot-home, "
-            "--workspace <path>, --claude-dir, or --agents-workspace <path>"
+            "--workspace <path>, --claude-dir, --agents-workspace <path>, or --claude-plugin <dir>"
         )
+    if args.check and args.claude_plugin is None:
+        parser.error("--check requires --claude-plugin")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -176,6 +195,12 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
         changes = [*workspace.skills, *workspace.agents, workspace.hooks, workspace.instructions]
         _report("workspace skills, agents, hooks and instructions", args.workspace / ".github", changes)
     if (claude_dir := _chosen(args.claude_dir, default_claude_dir)) is not None:
+        if not args.allow_duplicate_scopes and is_claude_plugin_active(claude_dir):
+            raise ExportError(
+                "Refusing to export Claude Code user-level hooks while the craftsman Claude Code "
+                "plugin is active (hooks would fire twice). Pass --allow-duplicate-scopes to override, "
+                "or uninstall the plugin first."
+            )
         claude = export_to_claude_user(repo_dir, claude_dir)
         changes = [*claude.commands, *claude.agents, claude.rules]
         if not args.no_claude_hooks:
@@ -189,6 +214,15 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
             args.agents_workspace,
             [agents.agents_md, agents.cursor_rule],
         )
+    if args.claude_plugin is not None:
+        plugin_dir = args.claude_plugin.resolve()
+        files = export_claude_plugin(repo_dir, plugin_dir, check=args.check)
+        if args.check:
+            print(
+                f"[OK] Claude Code plugin in {plugin_dir} is up to date ({len(files)} files checked)"
+            )
+        else:
+            print(f"[OK] Exported Claude Code plugin -> {plugin_dir} ({len(files)} files)")
 
 
 if __name__ == "__main__":
