@@ -277,11 +277,20 @@ def _make_tree_writable(root: Path) -> None:
             _make_writable(Path(dirpath, name))
 
 
-def _retry_writable(func: Callable[[str], Any], path: str, _error: Any) -> None:
+# The `shutil.rmtree` calls a failure can be retried with; it also reports `os.open`, `os.scandir`,
+# `os.lstat` and others, which take other arguments or remove nothing.
+_RETRYABLE_REMOVALS = (os.unlink, os.remove, os.rmdir)
+
+
+def _retry_writable(func: Callable[..., Any], path: str, error: Any) -> None:
     """`shutil.rmtree` error handler: make the entry and its directory writable, then retry once.
 
-    A second failure propagates out of `rmtree`, so the caller reports the entry as not removed.
+    `error` is the exception (`onexc`) or its `sys.exc_info()` (`onerror`). A failure that is not a
+    removal, or a second failure, propagates out of `rmtree`, so the caller reports the entry as
+    not removed.
     """
+    if func not in _RETRYABLE_REMOVALS:
+        raise error if isinstance(error, BaseException) else error[1]
     target = Path(path)
     _make_writable(target.parent)
     _make_writable(target)

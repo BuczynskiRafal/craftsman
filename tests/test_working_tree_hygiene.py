@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from craftsman import evidence
 from craftsman.evidence import (
     create_inbox_file,
     create_scratch_dir,
@@ -116,6 +121,34 @@ class ScratchDirectoryTests(unittest.TestCase):
         self.assertFalse(scratch.exists())
         self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
         self.assertEqual(self.craftsman_dir.parent.stat().st_mode & 0o777, 0o700)
+
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission bits")
+    def test_a_directory_rmtree_cannot_open_is_reported_not_raised(self) -> None:
+        # A 0700 directory of another user (a docker bind mount): no chmod can open it, and
+        # rmtree reports it as an os.open failure, which takes arguments a retry cannot pass.
+        scratch = create_scratch_dir(self.craftsman_dir)
+        locked = scratch / "pgdata"
+        (locked / "base").mkdir(parents=True)
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        stderr = io.StringIO()
+
+        with mock.patch("os.chmod", side_effect=PermissionError("not the owner")):
+            with contextlib.redirect_stderr(stderr):
+                pruned = prune_scratch_dirs(self.craftsman_dir)
+
+        self.assertEqual(pruned, ())
+        self.assertIn(f"could not remove scratch entry {scratch}", stderr.getvalue())
+
+    def test_failures_other_than_removals_are_not_retried(self) -> None:
+        error = PermissionError(13, "Permission denied", "dir")
+        for func in (os.open, os.scandir, os.lstat):
+            with self.subTest(func=func):
+                with self.assertRaises(PermissionError):
+                    evidence._retry_writable(func, "dir", error)
+                with self.assertRaises(PermissionError):
+                    evidence._retry_writable(func, "dir", (PermissionError, error, None))
 
 
 class WorkingTreeHygieneE2ETests(unittest.TestCase):
