@@ -99,5 +99,11 @@ HOME=$(mktemp -d) python3 -m craftsman.cli doctor
 2. Define hook lifecycle manifests in `hooks.json` or platform-specific settings exporters.
 3. Test platform payload round-tripping and error visibility in `tests/test_hooks.py`.
 
+### Claude Code Plugin Files
+The repository root is the Claude Code plugin. `.claude-plugin/` holds its generated files: the
+manifest (with the hooks), the marketplace catalog, and the agents rendered from `agents/*.md`.
+After changing an agent template, a hook event or the version, run `craftsman export --claude-plugin`;
+`tests/test_platform_claude.py` fails while they are out of date.
+
 ### Altering Review Protocol
 Before proposing changes to core review lenses, tiers, or gate invariants, replicate the benchmark suite (`bench/run.py` against `bench/cases/`) to ensure defect recall and precision do not regress.

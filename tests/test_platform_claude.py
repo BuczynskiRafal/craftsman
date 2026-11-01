@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,8 @@ from craftsman.assets import AgentTemplate, Skill, load_agent_templates
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import ExportError, is_craftsman_generated_file
 from craftsman.platforms.claude import (
+    CLAUDE_HOOK_EVENTS,
+    PLUGIN_LAUNCHERS,
     claude_agent_templates,
     export_claude_plugin,
     export_to_claude_user,
@@ -56,50 +59,75 @@ class ClaudeTestCase(unittest.TestCase):
 class ClaudePluginExportTests(ClaudeTestCase):
     def fake_checkout(self) -> Path:
         repo = self.fake_repo("Review the packet.\n")
-        (repo / "skills" / "demo").mkdir(parents=True)
-        (repo / "skills" / "demo" / "SKILL.md").write_text("---\nname: demo\n---\nDo it.\n", encoding="utf-8")
         (repo / "craftsman").mkdir()
         (repo / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
-        (repo / "craftsman" / "cli.py").write_text("print('cli')\n", encoding="utf-8")
+        for launcher in PLUGIN_LAUNCHERS:
+            (repo / launcher).parent.mkdir(exist_ok=True)
+            (repo / launcher).write_text("launcher\n", encoding="utf-8")
         return repo
 
     def test_committed_plugin_matches_the_source(self) -> None:
-        files = export_claude_plugin(REPO_ROOT, REPO_ROOT / "plugins" / "claude" / "craftsman", check=True)
-        self.assertIn("craftsman/cli.py", files)
+        files = export_claude_plugin(REPO_ROOT, check=True)
+        self.assertIn(".claude-plugin/plugin.json", files)
+
+    def test_the_repository_root_is_the_plugin(self) -> None:
+        plugin_dir = REPO_ROOT / ".claude-plugin"
+        catalog = json.loads((plugin_dir / "marketplace.json").read_text(encoding="utf-8"))
+        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
+
+        # Claude Code refuses a marketplace without an owner.
+        self.assertIn("name", catalog["owner"])
+        self.assertEqual([entry["source"] for entry in catalog["plugins"]], ["./"])
+        self.assertTrue(all((REPO_ROOT / path).is_file() for path in manifest["agents"]))
+        self.assertEqual(sorted(manifest["hooks"]), sorted(CLAUDE_HOOK_EVENTS))
+        for groups in manifest["hooks"].values():
+            command = groups[0]["hooks"][0]["command"]
+            self.assertTrue(command.startswith('"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook '), command)
+        self.assertTrue((REPO_ROOT / "skills" / "craftsman" / "SKILL.md").is_file())
+        if os.name != "nt":
+            self.assertTrue(os.access(REPO_ROOT / "bin" / "launcher.sh", os.X_OK))
 
     def test_assets_without_the_package_source_are_refused(self) -> None:
-        # An installed package's assets have skills and agents but neither the source nor the catalog.
+        # An installed package's assets have skills and agents but neither the source nor the launchers.
         assets = self.fake_repo("Review the packet.\n")
-        plugin = self.tmp / "plugin"
         for check in (False, True):
             with self.subTest(check=check), self.assertRaisesRegex(ExportError, "source checkout"):
-                export_claude_plugin(assets, plugin, check=check)
-        self.assertFalse(plugin.exists())
+                export_claude_plugin(assets, check=check)
         self.assertFalse((assets / ".claude-plugin").exists())
 
-    def test_export_bundles_the_package_and_check_accepts_it(self) -> None:
-        repo, plugin = self.fake_checkout(), self.tmp / "plugin"
-        written = export_claude_plugin(repo, plugin)
-        self.assertEqual(export_claude_plugin(repo, plugin, check=True), written)
-        self.assertEqual((plugin / "craftsman" / "cli.py").read_text(encoding="utf-8"), "print('cli')\n")
-        self.assertTrue((repo / ".claude-plugin" / "marketplace.json").is_file())
+    def test_export_renders_the_agents_and_check_accepts_it(self) -> None:
+        repo = self.fake_checkout()
+        written = export_claude_plugin(repo)
+        self.assertEqual(export_claude_plugin(repo, check=True), written)
+        agent = (repo / ".claude-plugin" / "agents" / "helper.md").read_text(encoding="utf-8")
+        self.assertIn("tools: Read, Grep, Glob, Bash", agent)
+        self.assertNotIn("role:", agent)
 
     def test_check_names_every_drifted_file(self) -> None:
-        repo, plugin = self.fake_checkout(), self.tmp / "plugin"
-        export_claude_plugin(repo, plugin)
-        (plugin / "craftsman" / "cli.py").write_text("print('stale')\n", encoding="utf-8")
-        (plugin / "skills" / "demo" / "SKILL.md").unlink()
-        (plugin / "craftsman" / "removed.py").write_text("", encoding="utf-8")
+        repo = self.fake_checkout()
+        export_claude_plugin(repo)
+        (repo / ".claude-plugin" / "agents" / "helper.md").write_text("stale\n", encoding="utf-8")
+        (repo / ".claude-plugin" / "agents" / "removed.md").write_text("", encoding="utf-8")
         (repo / ".claude-plugin" / "marketplace.json").unlink()
+        (repo / "bin" / "launcher.sh").unlink()
         with self.assertRaises(ExportError) as caught:
-            export_claude_plugin(repo, plugin, check=True)
+            export_claude_plugin(repo, check=True)
         for line in (
-            "differs: craftsman/cli.py",
-            "missing: skills/demo/SKILL.md",
-            "extra: craftsman/removed.py",
+            "differs: .claude-plugin/agents/helper.md",
+            "extra: .claude-plugin/agents/removed.md",
             "missing: .claude-plugin/marketplace.json",
+            "missing: bin/launcher.sh",
         ):
             self.assertIn(line, str(caught.exception))
+
+    def test_export_drops_the_agents_of_removed_templates(self) -> None:
+        repo = self.fake_checkout()
+        stale = repo / ".claude-plugin" / "agents" / "removed.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("", encoding="utf-8")
+        export_claude_plugin(repo)
+        self.assertFalse(stale.exists())
+        self.assertEqual(export_claude_plugin(repo, check=True), export_claude_plugin(repo))
 
 
 class ClaudeAgentRenderingTests(ClaudeTestCase):

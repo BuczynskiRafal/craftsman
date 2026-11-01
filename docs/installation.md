@@ -75,7 +75,7 @@ Claude Code supports installing Craftsman as a standalone plugin:
 /plugin install craftsman@craftsman
 ```
 
-The plugin bundles its own Python launcher, commands, and skills. To prevent duplicate hook executions (hooks firing twice), do not run `craftsman install --claude` while the Claude Code plugin is active, or use `craftsman uninstall --claude` to clean up user-level hooks.
+The repository itself is the plugin: Claude Code loads the skills and the Python package straight from it, and the hooks start the CLI through `bin/launcher.sh`, which needs Python 3.10+ on `PATH`. To prevent duplicate hook executions (hooks firing twice), do not run `craftsman install --claude` while the Claude Code plugin is active, or use `craftsman uninstall --claude` to clean up user-level hooks.
 
 ---
 

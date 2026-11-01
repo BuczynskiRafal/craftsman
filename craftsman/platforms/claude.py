@@ -279,160 +279,45 @@ def is_claude_plugin_active(claude_dir: Path) -> bool:
     return plugin_found
 
 
-def _render_plugin_manifest() -> str:
+# The repository root is the Claude Code plugin: its marketplace entry has `"source": "./"`, so
+# skills/ and the craftsman/ package are used in place and bin/ holds the launchers. Only the
+# manifests and the agents, which need rendering, are generated into .claude-plugin/.
+PLUGIN_DIR = ".claude-plugin"
+PLUGIN_AGENTS_DIR = f"{PLUGIN_DIR}/agents"
+PLUGIN_LAUNCHERS = ("bin/launcher.sh", "bin/launcher.cmd", "bin/craftsman", "bin/craftsman.cmd")
+PLUGIN_DESCRIPTION = "Make AI coding agents prove they reviewed and tested their change."
+PLUGIN_AUTHOR = {"name": "Rafał Buczyński", "email": "buczynski.rafal2@gmail.com"}
+PLUGIN_REPOSITORY = "https://github.com/BuczynskiRafal/craftsman"
+
+
+def _plugin_hooks() -> dict[str, list[dict[str, Any]]]:
+    hooks: dict[str, list[dict[str, Any]]] = {}
+    for event, (name, timeout) in CLAUDE_HOOK_EVENTS.items():
+        command = f'"${{CLAUDE_PLUGIN_ROOT}}/bin/launcher.sh" hook {name} --platform claude'
+        group: dict[str, Any] = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+        if event in CLAUDE_HOOK_MATCHERS:
+            group = {"matcher": CLAUDE_HOOK_MATCHERS[event], **group}
+        hooks[event] = [group]
+    return hooks
+
+
+def _render_plugin_manifest(agent_names: list[str]) -> str:
     from craftsman import __version__
 
     manifest = {
         "name": "craftsman",
         "version": __version__,
-        "description": "Make AI coding agents prove they reviewed and tested their change.",
-        "author": {
-            "name": "Rafał Buczyński",
-            "email": "buczynski.rafal2@gmail.com",
-        },
-        "homepage": "https://github.com/BuczynskiRafal/craftsman",
-        "repository": "https://github.com/BuczynskiRafal/craftsman",
+        "description": PLUGIN_DESCRIPTION,
+        "author": PLUGIN_AUTHOR,
+        "homepage": PLUGIN_REPOSITORY,
+        "repository": PLUGIN_REPOSITORY,
         "license": "MIT",
-        "keywords": [
-            "ai-agents",
-            "claude-code",
-            "code-review",
-            "quality-gate",
-            "testing",
-        ],
-        "hooks": "./hooks/hooks.json",
+        "keywords": ["ai-agents", "claude-code", "code-review", "quality-gate", "testing"],
+        # Replaces the default agents/ folder, which holds the unrendered templates.
+        "agents": [f"./{PLUGIN_AGENTS_DIR}/{name}.md" for name in agent_names],
+        "hooks": _plugin_hooks(),
     }
-    return json.dumps(manifest, indent=2) + "\n"
-
-
-def _render_plugin_hooks() -> str:
-    hooks_data = {
-        "hooks": {
-            "UserPromptSubmit": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": '"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook prompt --platform claude',
-                            "timeout": 30,
-                        }
-                    ]
-                }
-            ],
-            "Stop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": '"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook stop --platform claude',
-                            "timeout": 60,
-                        }
-                    ]
-                }
-            ],
-            "SubagentStart": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": '"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook subagent-start --platform claude',
-                            "timeout": 30,
-                        }
-                    ]
-                }
-            ],
-            "SubagentStop": [
-                {
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": '"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook subagent-stop --platform claude',
-                            "timeout": 30,
-                        }
-                    ]
-                }
-            ],
-            "PreToolUse": [
-                {
-                    "matcher": "Bash|Read|Grep|Glob|LS",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": '"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook pre-tool --platform claude',
-                            "timeout": 30,
-                        }
-                    ],
-                }
-            ],
-        }
-    }
-    return json.dumps(hooks_data, indent=2) + "\n"
-
-
-_LAUNCHER_SH = """#!/bin/sh
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-for candidate in python3 python py; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
-      PYTHON_CMD="$candidate"
-      break
-    fi
-  fi
-done
-
-if [ -z "$PYTHON_CMD" ]; then
-  echo "Craftsman gate inactive: Python 3.10+ not found" >&2
-  exit 0
-fi
-
-PYTHONPATH="$PLUGIN_ROOT" exec "$PYTHON_CMD" -m craftsman.cli "$@"
-"""
-
-_LAUNCHER_CMD = """@echo off
-setlocal
-set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..") do set "PLUGIN_ROOT=%%~fI"
-
-set "PYTHON_CMD="
-for %%C in (py python3 python) do (
-  if "%%C"=="py" (
-    py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
-    if not errorlevel 1 (
-      set "PYTHON_CMD=py -3"
-      goto :found
-    )
-  ) else (
-    where %%C >nul 2>&1
-    if not errorlevel 1 (
-      %%C -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
-      if not errorlevel 1 (
-        set "PYTHON_CMD=%%C"
-        goto :found
-      )
-    )
-  )
-)
-
-:found
-if "%PYTHON_CMD%"=="" (
-  echo Craftsman gate inactive: Python 3.10+ not found >&2
-  exit /b 0
-)
-
-set "PYTHONPATH=%PLUGIN_ROOT%"
-%PYTHON_CMD% -m craftsman.cli %*
-"""
-
-_BIN_CRAFTSMAN_SH = """#!/bin/sh
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/launcher.sh" "$@"
-"""
-
-_BIN_CRAFTSMAN_CMD = """@echo off
-"%~dp0launcher.cmd" %*
-"""
+    return json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
 
 
 def _render_marketplace_manifest() -> str:
@@ -440,122 +325,75 @@ def _render_marketplace_manifest() -> str:
 
     catalog = {
         "name": "craftsman",
-        "description": "Make AI coding agents prove they reviewed and tested their change.",
+        "owner": PLUGIN_AUTHOR,
+        "description": PLUGIN_DESCRIPTION,
         "plugins": [
             {
                 "name": "craftsman",
-                "description": "Make AI coding agents prove they reviewed and tested their change.",
+                "description": PLUGIN_DESCRIPTION,
                 "version": __version__,
-                "source": "./plugins/claude/craftsman",
+                "source": "./",
             }
         ],
     }
-    return json.dumps(catalog, indent=2) + "\n"
+    return json.dumps(catalog, indent=2, ensure_ascii=False) + "\n"
 
 
 def build_plugin_files(repo_dir: Path) -> dict[str, str]:
-    """Build a mapping of plugin-relative file paths to text content."""
-    files: dict[str, str] = {
-        ".claude-plugin/plugin.json": _render_plugin_manifest(),
-        "hooks/hooks.json": _render_plugin_hooks(),
-        "bin/launcher.sh": _LAUNCHER_SH,
-        "bin/launcher.cmd": _LAUNCHER_CMD,
-        "bin/craftsman": _BIN_CRAFTSMAN_SH,
-        "bin/craftsman.cmd": _BIN_CRAFTSMAN_CMD,
+    """The generated plugin files, by path relative to `repo_dir`."""
+    templates = load_agent_templates(repo_dir)
+    files = {
+        f"{PLUGIN_DIR}/plugin.json": _render_plugin_manifest([t.name for t in templates]),
+        f"{PLUGIN_DIR}/marketplace.json": _render_marketplace_manifest(),
     }
-
-    # Skills: copy all files from skills/*/
-    skills_root = repo_dir / "skills"
-    if skills_root.is_dir():
-        for skill_dir in sorted(skills_root.iterdir()):
-            if skill_dir.is_dir():
-                for p in sorted(skill_dir.rglob("*")):
-                    if (
-                        p.is_file()
-                        and not any(part in ("__pycache__", ".DS_Store", "Thumbs.db") for part in p.parts)
-                        and p.suffix != ".pyc"
-                    ):
-                        rel = p.relative_to(skills_root).as_posix()
-                        files[f"skills/{rel}"] = p.read_text(encoding="utf-8")
-
-    # Agents: render all templates
-    for template in load_agent_templates(repo_dir):
-        files[f"agents/{template.name}.md"] = render_claude_agent(template)
-
-    # Craftsman source package: copy all .py files
-    craftsman_root = repo_dir / "craftsman"
-    for p in sorted(craftsman_root.rglob("*.py")):
-        if p.is_file() and "__pycache__" not in p.parts:
-            rel = p.relative_to(craftsman_root).as_posix()
-            files[f"craftsman/{rel}"] = p.read_text(encoding="utf-8")
-
+    for template in templates:
+        files[f"{PLUGIN_AGENTS_DIR}/{template.name}.md"] = render_claude_agent(template)
     return files
 
 
-def export_claude_plugin(
-    repo_dir: Path, plugin_dir: Path, *, check: bool = False
-) -> list[str]:
-    """Export or verify standalone Claude Code plugin tree."""
-    # The plugin bundles the package source and the repository's marketplace catalog; the assets
-    # inside an installed package have neither, and the result would be a plugin without its CLI.
+def _plugin_drift(repo_dir: Path, files: dict[str, str]) -> list[str]:
+    diffs: list[str] = []
+    for rel_path, expected in files.items():
+        dest = repo_dir / rel_path
+        if not dest.is_file():
+            diffs.append(f"missing: {rel_path}")
+        elif dest.read_text(encoding="utf-8").replace("\r\n", "\n") != expected:
+            diffs.append(f"differs: {rel_path}")
+    agents_dir = repo_dir / PLUGIN_AGENTS_DIR
+    if agents_dir.is_dir():
+        for path in sorted(agents_dir.iterdir()):
+            rel = path.relative_to(repo_dir).as_posix()
+            if rel not in files:
+                diffs.append(f"extra: {rel}")
+    diffs.extend(f"missing: {rel}" for rel in PLUGIN_LAUNCHERS if not (repo_dir / rel).is_file())
+    return diffs
+
+
+def export_claude_plugin(repo_dir: Path, *, check: bool = False) -> list[str]:
+    """Write, or with `check` verify, the generated files of the plugin rooted at `repo_dir`."""
+    # The plugin is the checkout itself; an installed package's assets have neither the package
+    # source nor the launchers.
     if not (repo_dir / "craftsman" / "__init__.py").is_file():
         raise ExportError(
             f"--claude-plugin builds from a Craftsman source checkout and {repo_dir} is not one; "
             "pass --repo-dir <checkout>"
         )
     files = build_plugin_files(repo_dir)
-    marketplace_file = repo_dir / ".claude-plugin" / "marketplace.json"
-    marketplace_expected = _render_marketplace_manifest()
-
     if check:
-        diffs: list[str] = []
-        for rel_path, expected_text in files.items():
-            dest = plugin_dir / rel_path
-            if not dest.is_file():
-                diffs.append(f"missing: {rel_path}")
-            else:
-                actual = dest.read_text(encoding="utf-8").replace("\r\n", "\n")
-                if actual != expected_text.replace("\r\n", "\n"):
-                    diffs.append(f"differs: {rel_path}")
-
-        # Check for unexpected files in plugin_dir
-        if plugin_dir.is_dir():
-            for p in sorted(plugin_dir.rglob("*")):
-                if (
-                    p.is_file()
-                    and not any(part in ("__pycache__", ".DS_Store", "Thumbs.db") for part in p.parts)
-                    and p.suffix != ".pyc"
-                ):
-                    rel = p.relative_to(plugin_dir).as_posix()
-                    if rel not in files:
-                        diffs.append(f"extra: {rel}")
-
-        # Check marketplace.json
-        if not marketplace_file.is_file():
-            diffs.append("missing: .claude-plugin/marketplace.json")
-        else:
-            actual_market = marketplace_file.read_text(encoding="utf-8").replace("\r\n", "\n")
-            if actual_market != marketplace_expected.replace("\r\n", "\n"):
-                diffs.append("differs: .claude-plugin/marketplace.json")
-
+        diffs = _plugin_drift(repo_dir, files)
         if diffs:
             raise ExportError(
-                "Claude Code plugin drift detected (run 'craftsman export --claude-plugin plugins/claude/craftsman'):\n  "
+                "Claude Code plugin drift detected (run 'craftsman export --claude-plugin'):\n  "
                 + "\n  ".join(diffs)
             )
-        return sorted(files.keys())
-
-    # Write files
+        return sorted(files)
+    agents_dir = repo_dir / PLUGIN_AGENTS_DIR
+    if agents_dir.is_dir():
+        for stale in agents_dir.glob("*.md"):
+            if stale.relative_to(repo_dir).as_posix() not in files:
+                stale.unlink()
     for rel_path, content in files.items():
-        dest = plugin_dir / rel_path
+        dest = repo_dir / rel_path
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8")
-        if rel_path in ("bin/launcher.sh", "bin/craftsman") and hasattr(os, "chmod"):
-            try:
-                dest.chmod(dest.stat().st_mode | 0o755)
-            except OSError:
-                pass
-
-    marketplace_file.parent.mkdir(parents=True, exist_ok=True)
-    marketplace_file.write_text(marketplace_expected, encoding="utf-8")
-    return sorted(files.keys())
+        dest.write_text(content, encoding="utf-8", newline="\n")
+    return sorted(files)

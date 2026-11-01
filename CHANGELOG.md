@@ -12,13 +12,13 @@ All notable changes to Craftsman are recorded here. The format follows
   [`docs/how-it-works.md`](docs/how-it-works.md), [`docs/installation.md`](docs/installation.md),
   [`docs/usage.md`](docs/usage.md), [`docs/guards.md`](docs/guards.md), [`docs/skills.md`](docs/skills.md),
   and [`docs/benchmark.md`](docs/benchmark.md). `README.md` is condensed to a 30-second first impression.
-- **Claude Code plugin exporter (`craftsman export --claude-plugin <dir>`)**: Generates a self-contained
-  plugin tree with manifest (`.claude-plugin/plugin.json`), lifecycle hooks (`hooks/hooks.json`), cross-platform
-  launchers (`launcher.sh` / `launcher.cmd`), bundled `craftsman/` package (stdlib only), and executable
-  CLI wrapper (`bin/craftsman`). Validated in CI via `--check`.
-- **Marketplace manifest (`.claude-plugin/marketplace.json`)**: Repo-level marketplace catalog enabling
-  one-command installation in Claude Code via `/plugin marketplace add BuczynskiRafal/craftsman` and
-  `/plugin install craftsman@craftsman`.
+- **Claude Code plugin**: The repository root is a Claude Code plugin and its own marketplace
+  (`.claude-plugin/marketplace.json` with `"source": "./"`), installed with
+  `/plugin marketplace add BuczynskiRafal/craftsman` and `/plugin install craftsman@craftsman`. Skills and
+  the stdlib-only `craftsman/` package are used in place; `bin/` holds the POSIX and Windows launchers,
+  which look for Python 3.10+ and put `craftsman` on the agent's `PATH`.
+  `craftsman export --claude-plugin [--check]` regenerates (or verifies) the manifest with its hooks, the
+  catalog and the rendered agents in `.claude-plugin/`; CI fails when they are out of date.
 - **Namespaced plugin triggers**: Recognizes `craftsman:craftsman`, `craftsman:ultracraft`, `/craftsman:craftsman`,
   and `/craftsman:ultracraft` in prompt text and Claude Code `<command-name>` hook payloads.
 - **Doctor duplicate Claude hook check**: `craftsman doctor` inspects both `~/.claude/settings.json` and
@@ -69,9 +69,6 @@ All notable changes to Craftsman are recorded here. The format follows
   UTF-8 and raw path bytes, so a home such as `C:\Users\Rafał` works.
 - **VS Code folder without `APPDATA`**: On Windows `install`, `uninstall` and `doctor` fall back to
   `<home>\AppData\Roaming` when `APPDATA` is unset or points outside the given home, instead of failing.
-- **Claude Code plugin export from an installed package**: `export --claude-plugin` refuses to run on the
-  assets of an installed package, which lack the package source and the marketplace catalog, instead of
-  writing a plugin whose hooks cannot start.
 
 ## [4.0.0] - 2026-10-30
 

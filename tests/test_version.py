@@ -45,26 +45,10 @@ class TestVersionConsistency(unittest.TestCase):
         self.assertIn("version", plugin_data, "plugin.json missing 'version' key")
         versions["plugin.json"] = str(plugin_data["version"])
 
-        # 4. plugins/claude/craftsman/.claude-plugin/plugin.json (if present)
-        claude_plugin_path = (
-            self.repo_root
-            / "plugins"
-            / "claude"
-            / "craftsman"
-            / ".claude-plugin"
-            / "plugin.json"
-        )
-        if claude_plugin_path.exists():
-            with claude_plugin_path.open(encoding="utf-8") as f:
-                claude_plugin_data = json.load(f)
-            self.assertIn(
-                "version",
-                claude_plugin_data,
-                "Claude plugin.json missing 'version' key",
-            )
-            versions["plugins/claude/craftsman/.claude-plugin/plugin.json"] = str(
-                claude_plugin_data["version"]
-            )
+        # 4. .claude-plugin/plugin.json (Claude Code plugin manifest)
+        claude_plugin_path = self.repo_root / ".claude-plugin" / "plugin.json"
+        with claude_plugin_path.open(encoding="utf-8") as f:
+            versions[".claude-plugin/plugin.json"] = str(json.load(f)["version"])
 
         # 5. .claude-plugin/marketplace.json (if present)
         marketplace_path = self.repo_root / ".claude-plugin" / "marketplace.json"

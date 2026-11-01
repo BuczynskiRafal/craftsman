@@ -104,14 +104,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--claude-plugin",
-        type=Path,
-        metavar="<dir>",
-        help="Export standalone Claude Code plugin tree to <dir>.",
+        action="store_true",
+        help="Regenerate the Claude Code plugin files (.claude-plugin/) of the checkout in --repo-dir.",
     )
     parser.add_argument(
         "--check",
         action="store_true",
-        help="With --claude-plugin: verify plugin tree matches repository source assets.",
+        help="With --claude-plugin: fail when the committed plugin files differ from the sources.",
     )
     return parser
 
@@ -126,14 +125,13 @@ def _validate_export_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         args.workspace,
         args.claude_dir,
         args.agents_workspace,
-        args.claude_plugin,
     )
-    if all(target is None for target in targets):
+    if all(target is None for target in targets) and not args.claude_plugin:
         parser.error(
             "Specify at least one target: --user-dir, --copilot-skills-dir, --copilot-home, "
-            "--workspace <path>, --claude-dir, --agents-workspace <path>, or --claude-plugin <dir>"
+            "--workspace <path>, --claude-dir, --agents-workspace <path>, or --claude-plugin"
         )
-    if args.check and args.claude_plugin is None:
+    if args.check and not args.claude_plugin:
         parser.error("--check requires --claude-plugin")
 
 
@@ -214,15 +212,12 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
             args.agents_workspace,
             [agents.agents_md, agents.cursor_rule],
         )
-    if args.claude_plugin is not None:
-        plugin_dir = args.claude_plugin.resolve()
-        files = export_claude_plugin(repo_dir, plugin_dir, check=args.check)
+    if args.claude_plugin:
+        files = export_claude_plugin(repo_dir, check=args.check)
         if args.check:
-            print(
-                f"[OK] Claude Code plugin in {plugin_dir} is up to date ({len(files)} files checked)"
-            )
+            print(f"[OK] Claude Code plugin in {repo_dir} is up to date ({len(files)} files checked)")
         else:
-            print(f"[OK] Exported Claude Code plugin -> {plugin_dir} ({len(files)} files)")
+            print(f"[OK] Generated the Claude Code plugin files in {repo_dir} ({len(files)} files)")
 
 
 if __name__ == "__main__":
