@@ -20,7 +20,11 @@ from craftsman.legacy_githooks import legacy_git_hooks_bases
 from craftsman.manifest import InstallError, TargetKind
 from craftsman.paths import default_claude_dir, default_repo_dir, user_home
 from craftsman.platforms.agents_md import install_agents_workspace_target
-from craftsman.platforms.antigravity import detect_antigravity, install_antigravity_target
+from craftsman.platforms.antigravity import (
+    detect_antigravity,
+    install_antigravity_target,
+    is_agy_plugin_active,
+)
 from craftsman.platforms.claude import (
     detect_claude,
     install_claude_target,
@@ -77,10 +81,19 @@ def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) 
             "the gate hooks (pass --claude --allow-duplicate-scopes to install both).",
         )
         claude = False
+    antigravity = config.antigravity or detected["Google Antigravity"]
+    if antigravity and not config.antigravity and _agy_plugin_would_duplicate(config, home):
+        tracker.add(
+            EventKind.NOTE,
+            "Skipping Google Antigravity: the craftsman plugin from `agy plugin install` is "
+            "enabled and already ships the skills and gate hooks (pass --antigravity "
+            "--allow-duplicate-scopes to install both).",
+        )
+        antigravity = False
     return replace(
         config,
         auto_detect=False,
-        antigravity=config.antigravity or detected["Google Antigravity"],
+        antigravity=antigravity,
         claude=claude,
         copilot=config.copilot or detected["GitHub Copilot (VS Code)"] or nothing,
     )
@@ -173,6 +186,28 @@ def _check_claude_scopes(config: InstallConfig, home: Path) -> None:
         )
 
 
+def _agy_plugin_would_duplicate(config: InstallConfig, home: Path) -> bool:
+    """Whether a copy or symlink install would add the skills and hooks of the agy plugin again.
+
+    `--plugin` puts Craftsman's own plugin where agy keeps it, so it replaces the agy one instead.
+    """
+    return (
+        config.mode is not InstallMode.PLUGIN
+        and not config.allow_duplicate_scopes
+        and is_agy_plugin_active(home)
+    )
+
+
+def _check_antigravity_scopes(config: InstallConfig, home: Path) -> None:
+    if config.antigravity and _agy_plugin_would_duplicate(config, home):
+        raise InstallError(
+            "Refusing to install Craftsman into ~/.gemini/config while the craftsman plugin from "
+            "`agy plugin install` is enabled (skills would be listed twice and hooks could fire "
+            "twice). Pass --allow-duplicate-scopes to override, or remove the plugin first with "
+            "`agy plugin uninstall craftsman`."
+        )
+
+
 def _remove_legacy_git_hooks(config: InstallConfig, home: Path, tracker: Tracker) -> None:
     """Remove Craftsman 3.x global git hooks recorded in any manifest on upgrade to 4.0."""
     antigravity_base = (home / ".gemini" / "config").resolve()
@@ -201,6 +236,7 @@ def run_install(config: InstallConfig, tracker: Tracker, home: Path | None = Non
         check_ephemeral_uv_interpreter()
     _check_copilot_scopes(config, home)
     _check_claude_scopes(config, home)
+    _check_antigravity_scopes(config, home)
     _remove_legacy_git_hooks(config, home, tracker)
     if config.antigravity:
         install_antigravity_target(repo_dir, home, config.mode, tracker)
@@ -255,7 +291,8 @@ def _build_install_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Allow installing Copilot files in both user (~/.copilot) and workspace (.github) "
-            "scopes, or Claude Code hooks beside the active craftsman Claude Code plugin."
+            "scopes, or Claude Code hooks and Antigravity files beside an active craftsman "
+            "Claude Code or agy plugin."
         ),
     )
     parser.add_argument(

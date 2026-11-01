@@ -411,6 +411,24 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
         self.assertEqual(result.code, 1)
         self.assertIn("both user and workspace scopes are installed", result.err)
 
+    def test_agy_plugin_beside_a_copy_install_is_a_duplicate(self) -> None:
+        self.assert_ok(self.install("--antigravity"))
+        plugin = self.home / ".gemini" / "config" / "plugins" / "craftsman"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text('{"name": "craftsman"}', encoding="utf-8")
+
+        code, report = self.report()
+
+        self.assertEqual(code, 1)
+        self.assertTrue(any("Duplicate Antigravity install" in p for p in report["problems"]))
+
+    def test_craftsmans_own_antigravity_plugin_is_no_duplicate(self) -> None:
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        _, report = self.report()
+
+        self.assertFalse(any("Duplicate Antigravity install" in p for p in report["problems"]))
+
 
 class LegacyDistributionTests(unittest.TestCase):
     def inspect(self, *installed: str) -> list[str]:

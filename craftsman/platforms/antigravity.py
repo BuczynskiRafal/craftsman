@@ -8,8 +8,8 @@ from typing import Any
 
 from craftsman.assets import iter_skills
 from craftsman.files import copy_once_backup, exists
-from craftsman.generated import read_json_object, write_json_object
-from craftsman.manifest import TargetKind
+from craftsman.generated import ExportError, read_json_object, write_json_object
+from craftsman.manifest import InstallError, TargetKind, load_manifest
 from craftsman.staging import (
     EventKind,
     InstallMode,
@@ -18,6 +18,7 @@ from craftsman.staging import (
     created_before,
     install_runtime,
     install_tree,
+    path_key,
     revert_json_file,
     strip_hooks_json,
 )
@@ -30,6 +31,38 @@ def detect_antigravity(home: Path) -> bool:
         or bool(os.environ.get("AGY_MANAGED_ENV"))
         or bool(os.environ.get("ANTIGRAVITY_AGENT"))
     )
+
+
+PLUGIN_NAME = "craftsman"
+
+
+def is_agy_plugin_active(home: Path) -> bool:
+    """Whether `agy plugin install` put an enabled Craftsman plugin in `~/.gemini/config/plugins`.
+
+    The plugin ships the skills, rules and gate hooks a copy or symlink install adds once more. A
+    plugin folder that `craftsman install --antigravity --plugin` created is Craftsman's own: the
+    install modes replace each other. agy keeps a plugin's on/off switch in `config.json`
+    (`{"plugins": {"<name>": {"enabled": false}}}`); a plugin without one is enabled.
+    """
+    config_dir = home / ".gemini" / "config"
+    plugin_dir = config_dir / "plugins" / PLUGIN_NAME
+    if not (plugin_dir / "plugin.json").is_file():
+        return False
+    try:
+        manifest = load_manifest(config_dir)
+    except InstallError:
+        manifest = None  # who installed the plugin is unknown; the install reports the manifest
+    previous = manifest.targets.get(TargetKind.ANTIGRAVITY) if manifest else None
+    if previous is not None and path_key(plugin_dir) in previous.created_paths:
+        return False
+    settings_file = config_dir / "config.json"
+    try:
+        settings = read_json_object(settings_file) if exists(settings_file) else {}
+    except ExportError:
+        settings = {}  # agy cannot read it either, so nothing switches the plugin off
+    plugins = settings.get("plugins")
+    entry = plugins.get(PLUGIN_NAME) if isinstance(plugins, dict) else None
+    return not (isinstance(entry, dict) and entry.get("enabled") is False)
 
 
 def install_antigravity_target(repo_dir: Path, home: Path, mode: InstallMode, tracker: Tracker) -> None:

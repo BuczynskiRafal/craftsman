@@ -27,6 +27,10 @@ All notable changes to Craftsman are recorded here. The format follows
   refuses to install user-level hooks when the Claude Code plugin is active unless `--allow-duplicate-scopes`
   is supplied; `--no-claude-hooks` installs the rest beside the plugin. An auto-detected Claude Code is skipped
   with a note instead, so a plain `craftsman install` still sets up the other platforms.
+- **Antigravity plugin duplicate guard**: `agy plugin install https://github.com/BuczynskiRafal/craftsman` is
+  documented. While that plugin is enabled, `craftsman install` skips an auto-detected Antigravity and refuses
+  `--antigravity` (copy or symlink) unless `--allow-duplicate-scopes` is supplied, and `craftsman doctor` reports
+  the plugin beside a copy install. Craftsman's own `--plugin` install is not mistaken for the agy plugin.
 - **Ephemeral `uvx` interpreter refusal**: `craftsman install` detects if running under an ephemeral uv cache
   interpreter (`.cache/uv/archive-...`) and refuses installation with instructions to use `uv tool install craftsman-gate`
   or `pipx install craftsman-gate`, preventing broken hook paths when uv cleans its cache. The interpreter path

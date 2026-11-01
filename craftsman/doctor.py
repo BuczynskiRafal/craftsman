@@ -32,6 +32,7 @@ from craftsman.paths import (
     resolve_craftsman_pkg_dir,
     user_home,
 )
+from craftsman.platforms.antigravity import is_agy_plugin_active
 from craftsman.platforms.claude import (
     CLAUDE_HOOK_EVENTS,
     is_claude_plugin_active,
@@ -634,6 +635,25 @@ def inspect_legacy_distribution() -> list[str]:
     ]
 
 
+def inspect_agy_plugin_duplicate(home: Path) -> list[str]:
+    """A problem when the agy plugin and a copy or symlink install into ~/.gemini/config both exist."""
+    cfg = home / ".gemini" / "config"
+    try:
+        hooks = json.loads((cfg / "hooks.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        hooks = None
+    merged_hooks = isinstance(hooks, dict) and any(str(key).startswith("craftsman-") for key in hooks)
+    copied = (cfg / "skills" / "craftsman" / "SKILL.md").is_file() or merged_hooks
+    if not (copied and is_agy_plugin_active(home)):
+        return []
+    return [
+        f"Duplicate Antigravity install: the craftsman plugin from `agy plugin install` and the "
+        f"skills or hooks that `craftsman install --antigravity` put into {cfg} are both active "
+        "(skills are listed twice and hooks can fire twice). Remove one with "
+        "'craftsman uninstall --antigravity' or 'agy plugin uninstall craftsman'."
+    ]
+
+
 def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> CopilotReport:
     copilot_home = default_copilot_home(home)
     skills = [_skills_report(default_copilot_skills_dir(home))]
@@ -746,6 +766,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         *_platform_problems(copilot, claude, default_claude_dir(home)),
         *inspect_legacy_git_hooks(git.hooks_path, home),
         *inspect_legacy_distribution(),
+        *inspect_agy_plugin_duplicate(home),
     )
     healthy = (
         skill_count == expected_skills

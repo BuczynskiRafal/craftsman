@@ -731,5 +731,62 @@ class BootstrapTests(InstallTestCase):
         self.assertEqual(ok_result.code, 0, ok_result.err)
 
 
+
+class AgyPluginTests(InstallTestCase):
+    """A craftsman plugin that `agy plugin install` put into ~/.gemini/config/plugins."""
+
+    def agy_install_plugin(self, *, enabled: bool | None = None) -> None:
+        plugin = self.config_dir / "plugins" / "craftsman"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text('{"name": "craftsman"}', encoding="utf-8")
+        if enabled is not None:
+            settings = {"plugins": {"craftsman": {"enabled": enabled}}}
+            (self.config_dir / "config.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    def test_explicit_antigravity_install_is_refused_beside_the_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        result = self.install("--antigravity")
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("agy plugin uninstall craftsman", result.err)
+        self.assertFalse((self.config_dir / "skills").exists())
+        self.assertFalse((self.config_dir / "hooks.json").exists())
+
+    def test_auto_detected_antigravity_is_skipped_beside_the_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        result = self.install()
+
+        self.assert_ok(result)
+        self.assertIn("Skipping Google Antigravity", result.out)
+        self.assertFalse((self.config_dir / "skills").exists())
+
+    def test_allow_duplicate_scopes_installs_beside_the_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        self.assert_ok(self.install("--antigravity", "--allow-duplicate-scopes"))
+
+        self.assertTrue((self.config_dir / "skills" / "craftsman" / "SKILL.md").is_file())
+
+    def test_a_disabled_plugin_does_not_block_the_install(self) -> None:
+        self.agy_install_plugin(enabled=False)
+
+        self.assert_ok(self.install("--antigravity"))
+
+    def test_plugin_mode_replaces_the_agy_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        self.assertEqual((self.config_dir / "plugins" / "craftsman").resolve(), REPO_ROOT.resolve())
+
+    def test_craftsmans_own_plugin_mode_is_no_agy_plugin(self) -> None:
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        self.assert_ok(self.install("--antigravity"))
+
+        self.assertFalse((self.config_dir / "plugins" / "craftsman").exists())
+
 if __name__ == "__main__":
     unittest.main()

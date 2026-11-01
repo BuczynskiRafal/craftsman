@@ -48,7 +48,7 @@ craftsman install --agents-workspace ~/src/app    # AGENTS.md + .cursor/rules fo
 | `--antigravity` | Skills, rules, scripts, and `hooks.json` in `~/.gemini/config`. |
 | `--copy` / `--symlink` / `--plugin` | How Antigravity files are installed: copies (default), symlinks, or an Antigravity plugin in `~/.gemini/config/plugins/craftsman`. |
 | `--copilot-workspace <dir>` | `.github/skills`, `.github/agents`, `.github/hooks/craftsman.json`, and a marked block in `.github/copilot-instructions.md`. Workspace hooks call `craftsman` from `PATH`. |
-| `--allow-duplicate-scopes` | Overrides the default refusal when installing `--copilot-workspace` on a machine with a user-level `--copilot` install (or `--claude` with an active Claude plugin). |
+| `--allow-duplicate-scopes` | Overrides the default refusal when installing `--copilot-workspace` on a machine with a user-level `--copilot` install (or `--claude` with an active Claude plugin, or `--antigravity` with an enabled agy plugin). |
 | `--agents-workspace <dir>` | Marked block in `AGENTS.md` and `.cursor/rules/craftsman.mdc`. |
 | `--all` | All platforms, without auto-detection. |
 | `--dry-run` | Prints the install or uninstall plan without modifying files. |
@@ -80,6 +80,16 @@ Claude Code supports installing Craftsman as a standalone plugin:
 ```
 
 The repository itself is the plugin: Claude Code loads the skills and the Python package straight from it, and the hooks start the CLI through `bin/launcher.sh`, which needs Python 3.10+ on `PATH`. To prevent duplicate hook executions (hooks firing twice), `craftsman install` skips an auto-detected Claude Code and refuses `--claude` while the Claude Code plugin is active (`--no-claude-hooks` installs the rest without the hooks); use `craftsman uninstall --claude` to clean up user-level hooks installed earlier.
+
+## Antigravity Plugin
+
+Antigravity installs the repository as a plugin straight from GitHub:
+
+```bash
+agy plugin install https://github.com/BuczynskiRafal/craftsman
+```
+
+agy copies it to `~/.gemini/config/plugins/craftsman` with the skills, the rule and the gate hooks, which run the `scripts/` of the plugin. A copy or symlink install (`craftsman install --antigravity`) would add the same skills and hooks to `~/.gemini/config` a second time, so `craftsman install` skips an auto-detected Antigravity and refuses `--antigravity` while the agy plugin is enabled, and `craftsman doctor` reports both installs side by side.
 
 ---
 
