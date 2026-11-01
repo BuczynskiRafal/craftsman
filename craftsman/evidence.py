@@ -273,6 +273,8 @@ def _make_tree_writable(root: Path) -> None:
     """
     _make_writable(root)
     for dirpath, dirnames, filenames in os.walk(root):
+        # os.walk descends into a Windows junction, which it does not see as a link.
+        dirnames[:] = [name for name in dirnames if not _is_symlink_or_junction(Path(dirpath, name))]
         for name in (*dirnames, *filenames):
             _make_writable(Path(dirpath, name))
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import os
+import stat
 import sys
 import tempfile
 import unittest
@@ -149,6 +150,43 @@ class ScratchDirectoryTests(unittest.TestCase):
                     evidence._retry_writable(func, "dir", error)
                 with self.assertRaises(PermissionError):
                     evidence._retry_writable(func, "dir", (PermissionError, error, None))
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX permission bits")
+    def test_making_a_tree_writable_stops_at_junctions(self) -> None:
+        # os.walk descends into a Windows junction; stand one in with a directory taken for one.
+        scratch = create_scratch_dir(self.craftsman_dir)
+        junction = scratch / "node_modules" / "pkg"
+        junction.mkdir(parents=True)
+        outside_file = junction / "index.js"
+        outside_file.write_text("", encoding="utf-8")
+        outside_file.chmod(0o400)
+        real_check = evidence._is_symlink_or_junction
+
+        with mock.patch.object(
+            evidence, "_is_symlink_or_junction", side_effect=lambda p: p == junction or real_check(p)
+        ):
+            evidence._make_tree_writable(scratch)
+
+        self.assertEqual(outside_file.stat().st_mode & 0o777, 0o400)
+
+    def test_pruning_never_changes_files_behind_a_junction(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("directory junctions are a Windows feature")
+        import _winapi
+
+        outside = self.craftsman_dir.parent / "store"
+        outside.mkdir()
+        outside_file = outside / "index.js"
+        outside_file.write_text("", encoding="utf-8")
+        outside_file.chmod(stat.S_IREAD)
+        self.addCleanup(outside_file.chmod, stat.S_IREAD | stat.S_IWRITE)
+        scratch = create_scratch_dir(self.craftsman_dir)
+        _winapi.CreateJunction(str(outside), str(scratch / "node_modules"))
+
+        self.assertIn(scratch, prune_scratch_dirs(self.craftsman_dir))
+
+        self.assertFalse(scratch.exists())
+        self.assertFalse(outside_file.stat().st_mode & stat.S_IWRITE)
 
 
 class WorkingTreeHygieneE2ETests(unittest.TestCase):
