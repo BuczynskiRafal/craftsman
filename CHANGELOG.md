@@ -60,6 +60,19 @@ All notable changes to Craftsman are recorded here. The format follows
   not open the gate.
 - **Windows CI**: A `windows-latest` job runs lint, type checks, tests, `doctor` and an installer dry run.
 
+### Fixed
+
+- **UTF-8 through pipes on Windows**: The CLI and the Antigravity hook scripts read and write UTF-8 when
+  stdin/stdout are pipes, as the agents do. Before, Python used the ANSI code page there: a `ł` in a
+  prompt arrived garbled, every `→` of a report left as `?`, and the Antigravity hooks could crash on a
+  path they could not encode. `git config` output and the interpreter check of `install` are decoded as
+  UTF-8 and raw path bytes, so a home such as `C:\Users\Rafał` works.
+- **VS Code folder without `APPDATA`**: On Windows `install`, `uninstall` and `doctor` fall back to
+  `<home>\AppData\Roaming` when `APPDATA` is unset or points outside the given home, instead of failing.
+- **Claude Code plugin export from an installed package**: `export --claude-plugin` refuses to run on the
+  assets of an installed package, which lack the package source and the marketplace catalog, instead of
+  writing a plugin whose hooks cannot start.
+
 ## [4.0.0] - 2026-10-30
 
 ### Added
