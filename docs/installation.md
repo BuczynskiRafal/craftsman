@@ -14,6 +14,10 @@ pipx install craftsman-gate
 uv tool install craftsman-gate
 ```
 
+Upgrading from a `pip install .` of a checkout older than 4.0, which installed the distribution under the
+name `craftsman`? Run `pip uninstall craftsman` first: both names install the same files, and uninstalling
+the old one later would delete them from under `craftsman-gate`. `craftsman doctor` reports the leftover.
+
 Then run the installer to automatically configure your active environments:
 
 ```bash

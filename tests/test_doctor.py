@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from craftsman import cli
 from craftsman.doctor import (
@@ -18,6 +20,7 @@ from craftsman.doctor import (
     build_report,
     command_executables,
     detect_antigravity_drift,
+    inspect_legacy_distribution,
     inspect_legacy_git_hooks,
     loads_jsonc_dict,
     plugin_skill_names,
@@ -397,6 +400,20 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
 
         self.assertEqual(result.code, 1)
         self.assertIn("both user and workspace scopes are installed", result.err)
+
+
+class LegacyDistributionTests(unittest.TestCase):
+    def test_the_pre_rename_distribution_beside_craftsman_gate_is_a_problem(self) -> None:
+        with mock.patch("importlib.metadata.distribution") as distribution:
+            (problem,) = inspect_legacy_distribution()
+
+        distribution.assert_called_once_with("craftsman")
+        self.assertIn("pip uninstall craftsman craftsman-gate", problem)
+
+    def test_without_the_old_distribution_there_is_no_problem(self) -> None:
+        missing = importlib.metadata.PackageNotFoundError("craftsman")
+        with mock.patch("importlib.metadata.distribution", side_effect=missing):
+            self.assertEqual(inspect_legacy_distribution(), [])
 
 
 class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):

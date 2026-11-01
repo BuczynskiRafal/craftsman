@@ -55,7 +55,9 @@ All notable changes to Craftsman are recorded here. The format follows
 
 - **PyPI distribution package rename**: Distributed as `craftsman-gate` on PyPI (`pipx install craftsman-gate`,
   `uv tool install craftsman-gate`). Runtime import `import craftsman` and CLI command `craftsman` remain unchanged
-  with zero third-party dependencies (`dependencies = []`).
+  with zero third-party dependencies (`dependencies = []`). Both distributions install the same files, so
+  remove a `pip install .` of an older checkout (`pip uninstall craftsman`) before installing `craftsman-gate`;
+  `craftsman doctor` reports the old distribution when both are installed.
 - **Tagline and messaging cleanup**: Unified project tagline to "Make AI coding agents prove they reviewed and tested their change"
   across all files, eliminating ungrounded marketing buzzwords.
 - **Canonical MIT license and NOTICE**: Canonical MIT text preserved in `LICENSE`; detailed attribution and

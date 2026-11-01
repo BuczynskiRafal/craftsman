@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import shlex
@@ -604,6 +605,27 @@ def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
 # --- report ---------------------------------------------------------------------------------
 
 
+# Craftsman's distribution before it became `craftsman-gate` on PyPI; both install the same files.
+LEGACY_DISTRIBUTION = "craftsman"
+
+
+def inspect_legacy_distribution() -> list[str]:
+    """A problem when this interpreter still has the pre-rename `craftsman` distribution.
+
+    pip does not see that two distributions own the same files, so uninstalling the old one would
+    delete the package and the `craftsman` script out from under `craftsman-gate`.
+    """
+    try:
+        importlib.metadata.distribution(LEGACY_DISTRIBUTION)
+    except importlib.metadata.PackageNotFoundError:
+        return []
+    return [
+        f"The old `{LEGACY_DISTRIBUTION}` distribution is installed for {sys.executable} beside "
+        "craftsman-gate and owns the same files; `pip uninstall craftsman` alone would delete them. "
+        "Run `python -m pip uninstall craftsman craftsman-gate`, then `pip install craftsman-gate`."
+    ]
+
+
 def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> CopilotReport:
     copilot_home = default_copilot_home(home)
     skills = [_skills_report(default_copilot_skills_dir(home))]
@@ -715,6 +737,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         *git_problems,
         *_platform_problems(copilot, claude, default_claude_dir(home)),
         *inspect_legacy_git_hooks(git.hooks_path, home),
+        *inspect_legacy_distribution(),
     )
     healthy = (
         skill_count == expected_skills
