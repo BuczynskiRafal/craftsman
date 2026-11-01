@@ -28,7 +28,7 @@ from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.manifest import MANIFEST_FILENAME
 from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
-from craftsman.platforms.claude import export_to_claude_user
+from craftsman.platforms.claude import export_to_claude_user, merge_claude_hooks
 from craftsman.platforms.copilot import (
     HOOKS_FILENAME,
     export_copilot_home,
@@ -443,6 +443,25 @@ class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):
         (problem,) = inspect_legacy_git_hooks(None, self.home)
 
         self.assertIn("cannot read install manifest", problem)
+
+    def test_duplicate_claude_hooks_flagged(self) -> None:
+        claude_dir = self.home / ".claude"
+        claude_dir.mkdir(parents=True)
+        bash_prefix, _ = absolute_hook_prefixes()
+        merge_claude_hooks(claude_dir / "settings.json", bash_prefix)
+
+        plugins_dir = claude_dir / "plugins"
+        plugins_dir.mkdir()
+        (plugins_dir / "installed_plugins.json").write_text(
+            json.dumps({"craftsman@craftsman": {}}), encoding="utf-8"
+        )
+
+        result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(result.code, 1)
+        problems = json.loads(result.out)["problems"]
+        self.assertTrue(
+            any("Duplicate Claude Code hooks: both user-level hooks" in p for p in problems)
+        )
 
 
 if __name__ == "__main__":

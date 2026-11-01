@@ -31,7 +31,11 @@ from craftsman.paths import (
     resolve_craftsman_pkg_dir,
     user_home,
 )
-from craftsman.platforms.claude import CLAUDE_HOOK_EVENTS, is_craftsman_hook_command
+from craftsman.platforms.claude import (
+    CLAUDE_HOOK_EVENTS,
+    is_claude_plugin_active,
+    is_craftsman_hook_command,
+)
 from craftsman.platforms.copilot import (
     COPILOT_DISCOVERY,
     HOOKS_FILENAME,
@@ -617,7 +621,9 @@ def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> Copil
     )
 
 
-def _platform_problems(copilot: CopilotReport, claude: ClaudeReport) -> list[str]:
+def _platform_problems(
+    copilot: CopilotReport, claude: ClaudeReport, claude_dir: Path | None = None
+) -> list[str]:
     problems = [
         f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
         for entry in copilot.skills
@@ -633,6 +639,16 @@ def _platform_problems(copilot: CopilotReport, claude: ClaudeReport) -> list[str
         )
     if claude.hooks is ClaudeHooks.UNREADABLE:
         problems.append(f"Claude Code settings: {claude.detail}")
+    if (
+        claude.hooks is ClaudeHooks.MERGED
+        and claude_dir is not None
+        and is_claude_plugin_active(claude_dir)
+    ):
+        problems.append(
+            "Duplicate Claude Code hooks: both user-level hooks in settings.json and the craftsman "
+            "Claude Code plugin are installed (hooks would fire twice). Remove user-level hooks with "
+            "'craftsman uninstall --claude' or uninstall the plugin with '/plugin uninstall craftsman@craftsman'."
+        )
     problems.extend(_format_duplicate_problem(dup) for dup in copilot.duplicates)
     return problems
 
@@ -697,7 +713,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
     claude = _claude_report(default_claude_dir(home))
     problems = (
         *git_problems,
-        *_platform_problems(copilot, claude),
+        *_platform_problems(copilot, claude, default_claude_dir(home)),
         *inspect_legacy_git_hooks(git.hooks_path, home),
     )
     healthy = (
