@@ -1,4 +1,4 @@
-# AGENTS.md — Craftsman Adaptive Closed-Loop Engineering Standard
+# AGENTS.md — Craftsman Engineering Standard
 
 This repository uses **Craftsman**: every change is reviewed and verified against an evidence ledger before it counts as done.
 

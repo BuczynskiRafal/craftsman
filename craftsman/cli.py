@@ -448,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
         handler, _ = COMMANDS[args[0]]
         return handler(args[1:])
     parser = argparse.ArgumentParser(
-        prog="craftsman", description="Craftsman: Universal Agentic Engineering & Quality Gate CLI."
+        prog="craftsman", description="Make AI coding agents prove they reviewed and tested their change."
     )
     parser.add_argument("--version", action="version", version=f"craftsman {__version__}")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")

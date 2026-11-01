@@ -1,4 +1,4 @@
-"""Craftsman: Universal Agentic Engineering & Quality Gate Framework."""
+"""Make AI coding agents prove they reviewed and tested their change."""
 
 from __future__ import annotations
 

@@ -25,7 +25,7 @@ class GeneratedFileTestCase(unittest.TestCase):
 class ManagedMarkdownTests(GeneratedFileTestCase):
     def test_file_without_markers_gets_the_block_appended(self) -> None:
         path = self.tmp / "AGENTS.md"
-        heading = "# AGENTS.md — Craftsman Adaptive Closed-Loop Engineering Standard\n"
+        heading = "# AGENTS.md — Craftsman Engineering Standard\n"
         path.write_text(heading, encoding="utf-8")
 
         upsert_managed_markdown(path, "rules", within=self.tmp)

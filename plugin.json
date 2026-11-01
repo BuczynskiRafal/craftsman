@@ -2,7 +2,7 @@
   "name": "craftsman",
   "version": "4.0.0",
   "license": "MIT",
-  "description": "Adaptive Closed-Loop Engineering Harness and Curated Skill Suite with 3-Gear Hybrid Hard-Loop Verification for Claude Code, OpenAI Codex, GitHub Copilot, Cursor, and Google Antigravity.",
+  "description": "Make AI coding agents prove they reviewed and tested their change.",
   "skills": [
     "audit",
     "audit-comments",
