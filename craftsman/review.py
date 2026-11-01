@@ -1591,14 +1591,18 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _warn_new_out_of_scope(ws: Workspace, ledger: Ledger) -> None:
-    if not ledger.rounds:
-        return
-    latest = ledger.rounds[-1]
-    if latest.scope is None:
+    """Warn about changed files outside the scope that were not already changed when it was frozen.
+
+    The baseline is the first scoped round: a later round records whatever the session changed
+    in between as its own baseline, which would hide exactly the files this warning is for.
+    """
+    scoped = [round_ for round_ in ledger.rounds if round_.scope is not None]
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    if not scoped or latest is None or latest.scope is None:
         return
     full_now = snapshot(ws.root, latest.base_sha)
     current_out = set(full_now.files) - set(latest.scope)
-    new_out = sorted(current_out - set(latest.out_of_scope))
+    new_out = sorted(current_out - set(scoped[0].out_of_scope))
     if new_out:
         paths = ", ".join(new_out)
         print(

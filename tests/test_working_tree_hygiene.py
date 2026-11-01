@@ -130,6 +130,17 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
 
         self.assertTrue((scratch / "repro.py").is_file())
 
+    def test_out_of_scope_warning_survives_a_later_round(self) -> None:
+        self.repo.write("app.py", "x = 2\n")
+        self.repo.cli("review", "prepare", "--paths", "app.py", "--tier", "quick")
+        self.repo.write("leak.py", "z = 30\n")
+        self.repo.write("app.py", "x = 3\n")
+        self.repo.cli("review", "prepare", "--paths", "app.py", "--tier", "quick")
+
+        report = self.repo.cli("review", "report", "--review-only").stdout
+
+        self.assertIn("outside its scope: leak.py", report)
+
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
