@@ -154,7 +154,10 @@ class LocationTests(AssetsTestCase):
 
     def test_windows_without_appdata_defaults_to_roaming(self) -> None:
         expected = self.tmp / "AppData" / "Roaming" / "Code" / "User"
-        for environ in ({}, {"APPDATA": str(self.tmp.parent / "elsewhere")}):
+        # The running user's home must stay resolvable: Windows finds it only through USERPROFILE.
+        other_home = str(self.tmp.parent / "other-home")
+        outside = {"APPDATA": str(self.tmp.parent / "elsewhere"), "HOME": other_home, "USERPROFILE": other_home}
+        for environ in ({}, outside):
             with (
                 self.subTest(environ=environ),
                 mock.patch.object(sys, "platform", "win32"),

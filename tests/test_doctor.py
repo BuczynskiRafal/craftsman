@@ -107,7 +107,10 @@ class PlatformReportTests(DoctorTestCase):
     def test_hooks_running_a_missing_interpreter_are_broken(self) -> None:
         self.install_user_copilot()
         hooks_dir = self.tmp / ".copilot" / "hooks"
-        write_copilot_hooks(hooks_dir, '"/no/such/python3" -m craftsman.cli', "& x")
+        # Each platform checks the command it runs: bash on POSIX, PowerShell on Windows.
+        write_copilot_hooks(
+            hooks_dir, '"/no/such/python3" -m craftsman.cli', '& "/no/such/python3" -m craftsman.cli'
+        )
 
         _, report = self.doctor()
 
