@@ -38,8 +38,12 @@ USER_REQUEST_BLOCK_RE = re.compile(
 QUOTED_SPAN_RE = re.compile(
     r"(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)|\"[^\"]*\"|(?<![A-Za-z0-9])'[^'\n]*'(?![A-Za-z0-9])"
 )
+# The ultracraft forms come first: `/craftsman` would otherwise match the start of
+# `/craftsman:ultracraft`. A colon that ends the command (`/craftsman: add x`) goes with it.
 TRIGGER_TOKEN_RE = re.compile(
-    r"(?i)(?<![\w/-])(?:(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard|deep))?|/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft)(?![\w-])"
+    r"(?i)(?<![\w/-])(?:/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft"
+    r"|(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard|deep))?)"
+    rf"(?:{COLON_END}|(?![\w:-]))"
 )
 
 

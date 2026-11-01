@@ -146,6 +146,22 @@ class TaskFromPromptTests(unittest.TestCase):
             "fix the auth bug",
         )
 
+    def test_task_keeps_no_colon_of_the_trigger(self) -> None:
+        for prompt in (
+            "/craftsman:ultracraft fix the bug",
+            "/craftsman: fix the bug",
+            "ultracraft: fix the bug",
+            "/craftsman --quick: fix the bug",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(task_from_prompt(prompt), "fix the bug")
+
+    def test_task_keeps_other_craftsman_commands(self) -> None:
+        self.assertEqual(
+            task_from_prompt("/craftsman fix it, then /craftsman:code-review it"),
+            "fix it, then /craftsman:code-review it",
+        )
+
     def test_task_is_one_line(self) -> None:
         self.assertEqual(task_from_prompt("ultracraft fix\nthe  bug"), "fix the bug")
 
