@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -647,6 +648,46 @@ class BootstrapTests(InstallTestCase):
         for path in persistent_paths:
             with self.subTest(path=path):
                 check_ephemeral_uv_interpreter(path)
+
+    def uvx_interpreter(self, cache: Path) -> str:
+        """A uvx-style cache environment whose `bin/python` links to the real interpreter."""
+        python = cache / "archive-v0" / "abc123" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        try:
+            python.symlink_to(sys.executable)
+        except OSError as exc:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink: {exc}")
+        return str(python)
+
+    def test_ephemeral_uv_interpreter_behind_a_symlink_is_refused(self) -> None:
+        # uvx's bin/python resolves to the base interpreter; the cache path is what hooks embed.
+        python = self.uvx_interpreter(self.home / ".cache" / "uv")
+
+        with self.assertRaisesRegex(InstallError, "ephemeral uvx interpreter"):
+            check_ephemeral_uv_interpreter(python)
+
+    def test_interpreter_in_a_custom_uv_cache_dir_is_refused(self) -> None:
+        cache = self.tmp / "uvc"
+        python = self.uvx_interpreter(cache)
+
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(cache)}):
+            with self.assertRaisesRegex(InstallError, "ephemeral uvx interpreter"):
+                check_ephemeral_uv_interpreter(python)
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(self.tmp / "uv")}):
+            check_ephemeral_uv_interpreter(str(self.tmp / "uvcx" / "bin" / "python"))
+
+    def test_ephemeral_interpreter_is_refused_only_for_hooks_that_embed_it(self) -> None:
+        python = "/home/user/.cache/uv/archive-v0/abc123/bin/python"
+        workspace = self.tmp / "ws"
+        workspace.mkdir()
+        with mock.patch.object(sys, "executable", python):
+            self.assert_ok(self.install("--agents-workspace", str(workspace)))
+            self.assert_ok(self.install("--claude", "--no-claude-hooks"))
+            for target in ("--claude", "--copilot"):
+                with self.subTest(target=target):
+                    result = self.install(target)
+                    self.assertEqual(result.code, 1)
+                    self.assertIn("ephemeral uvx interpreter", result.err)
 
     def test_refuse_claude_install_when_plugin_active(self) -> None:
         plugins_dir = self.claude_dir / "plugins"

@@ -78,44 +78,61 @@ def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) 
     )
 
 
-def check_ephemeral_uv_interpreter(python: str | None = None) -> None:
-    """Refuse installation when running under an ephemeral uvx interpreter path."""
-    exe = Path(python or sys.executable).resolve()
-    exe_str = str(exe).replace("\\", "/").lower()
+EPHEMERAL_UV_MESSAGE = (
+    "Refusing to install lifecycle hooks using an ephemeral uvx interpreter ({exe}): "
+    "the cache environment may be deleted by uv, causing hook failures (exit code 127). "
+    "Use 'uv tool install craftsman-gate' or 'pipx install craftsman-gate' instead."
+)
+_UV_CACHE_MARKERS = ("/.cache/uv/", "/library/caches/uv/", "/appdata/local/uv/cache/", "/uv/cache/")
 
-    # Persistent uv tools are installed in e.g. ~/.local/share/uv/tools/ or %LOCALAPPDATA%/uv/tools/
-    if "/uv/tools/" in exe_str or "\\uv\\tools\\" in str(exe).lower():
-        return
 
-    uv_cache = os.environ.get("UV_CACHE_DIR")
-    if uv_cache and str(Path(uv_cache).resolve()).replace("\\", "/").lower() in exe_str:
-        raise InstallError(
-            f"Refusing to install lifecycle hooks using an ephemeral uvx interpreter ({exe}): "
-            "the cache environment may be deleted by uv, causing hook failures (exit code 127). "
-            "Use 'uv tool install craftsman-gate' or 'pipx install craftsman-gate' instead."
-        )
+def _normalized(path: str) -> str:
+    return path.replace("\\", "/").lower()
 
-    is_ephemeral = (
-        "/.cache/uv/" in exe_str
-        or "/library/caches/uv/" in exe_str
-        or "/appdata/local/uv/cache/" in exe_str
-        or "/uv/cache/" in exe_str
-        or (
-            "/uv/" in exe_str
-            and (
-                "archive-" in exe_str
-                or "environments-" in exe_str
-                or "archive" in exe.parts
-                or "environments" in exe.parts
-            )
+
+def _is_in_uv_cache(path: str, cache_dirs: Sequence[str]) -> bool:
+    text = _normalized(path)
+    # Persistent uv tools live in e.g. ~/.local/share/uv/tools/ or %LOCALAPPDATA%/uv/tools/.
+    if "/uv/tools/" in text:
+        return False
+    if any(cache in text for cache in cache_dirs):
+        return True
+    parts = text.split("/")
+    return any(marker in text for marker in _UV_CACHE_MARKERS) or (
+        "/uv/" in text
+        and (
+            "archive-" in text
+            or "environments-" in text
+            or "archive" in parts
+            or "environments" in parts
         )
     )
-    if is_ephemeral:
-        raise InstallError(
-            f"Refusing to install lifecycle hooks using an ephemeral uvx interpreter ({exe}): "
-            "the cache environment may be deleted by uv, causing hook failures (exit code 127). "
-            "Use 'uv tool install craftsman-gate' or 'pipx install craftsman-gate' instead."
-        )
+
+
+def check_ephemeral_uv_interpreter(python: str | None = None) -> None:
+    """Refuse an interpreter in uv's cache, which the hook commands would embed by path.
+
+    uvx runs a cache environment whose `bin/python` is a symlink to the base interpreter, so the
+    path is checked as written, which is what the hooks embed, and also once resolved.
+    """
+    exe = python or sys.executable
+    candidates = {os.path.abspath(exe), str(Path(exe).resolve())}
+    uv_cache = os.environ.get("UV_CACHE_DIR")
+    cache_dirs = (
+        [
+            _normalized(cache).rstrip("/") + "/"
+            for cache in (os.path.abspath(uv_cache), str(Path(uv_cache).resolve()))
+        ]
+        if uv_cache
+        else []
+    )
+    if any(_is_in_uv_cache(candidate, cache_dirs) for candidate in candidates):
+        raise InstallError(EPHEMERAL_UV_MESSAGE.format(exe=exe))
+
+
+def _embeds_interpreter(config: InstallConfig) -> bool:
+    """Whether a selected target writes hook commands that run this interpreter by its path."""
+    return (config.claude and config.claude_hooks) or config.copilot
 
 
 def _check_copilot_scopes(config: InstallConfig, home: Path) -> None:
@@ -163,10 +180,11 @@ def _remove_legacy_git_hooks(config: InstallConfig, home: Path, tracker: Tracker
 def run_install(config: InstallConfig, tracker: Tracker, home: Path | None = None) -> None:
     home = user_home(home)
     repo_dir = config.repo_dir
-    check_ephemeral_uv_interpreter()
     if not (repo_dir / "skills").is_dir() or not (repo_dir / "rules").is_dir():
         raise InstallError(f"Repository assets (skills/, rules/) not found under {repo_dir}")
     config = resolve_install_config(config, home, tracker)
+    if _embeds_interpreter(config):
+        check_ephemeral_uv_interpreter()
     _check_copilot_scopes(config, home)
     _check_claude_scopes(config, home)
     _remove_legacy_git_hooks(config, home, tracker)

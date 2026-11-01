@@ -27,7 +27,9 @@ All notable changes to Craftsman are recorded here. The format follows
   hooks when the Claude Code plugin is active unless `--allow-duplicate-scopes` is supplied.
 - **Ephemeral `uvx` interpreter refusal**: `craftsman install` detects if running under an ephemeral uv cache
   interpreter (`.cache/uv/archive-...`) and refuses installation with instructions to use `uv tool install craftsman-gate`
-  or `pipx install craftsman-gate`, preventing broken hook paths when uv cleans its cache.
+  or `pipx install craftsman-gate`, preventing broken hook paths when uv cleans its cache. The interpreter path
+  is checked as the hooks embed it (uvx's `bin/python` is a symlink out of the cache), and only for targets
+  whose hooks embed it.
 - **Automated release workflow & CI wheel test**: Added `.github/workflows/release.yml` with tag validation,
   isolated virtualenv smoke tests, and PyPI Trusted Publishing (OIDC). Wheel smoke test is mirrored in CI.
 - **Automated documentation link checker (`tests/test_docs_links.py`)**: Tests all relative file links,
