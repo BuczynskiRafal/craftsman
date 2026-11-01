@@ -52,8 +52,18 @@ class DoctorTestCase(unittest.TestCase):
         self.tmp = Path(tmp.name).resolve()
 
     def run_doctor(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        # -S keeps the machine's site-packages, and the distributions doctor inspects there, out.
         return subprocess.run(
-            [sys.executable, "-m", "craftsman.cli", "doctor", "--repo-dir", str(REPO_ROOT), *extra],
+            [
+                sys.executable,
+                "-S",
+                "-m",
+                "craftsman.cli",
+                "doctor",
+                "--repo-dir",
+                str(REPO_ROOT),
+                *extra,
+            ],
             cwd=REPO_ROOT,
             capture_output=True,
             encoding="utf-8",

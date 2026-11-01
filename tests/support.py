@@ -462,6 +462,10 @@ class IsolatedHomeTestCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, self.env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The distributions installed for this interpreter are the machine's too.
+        legacy = mock.patch("craftsman.doctor.inspect_legacy_distribution", return_value=[])
+        legacy.start()
+        self.addCleanup(legacy.stop)
 
     def install(self, *args: str) -> CliResult:
         return run_main(install_main, "--repo-dir", str(REPO_ROOT), *args)
