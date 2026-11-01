@@ -1,0 +1,98 @@
+name: Bug Report
+description: Create a report to help us improve Craftsman
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please ensure you have run `craftsman doctor` before submitting.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: AI Agent Platform
+      description: Which agent platform were you using?
+      options:
+        - Claude Code
+        - GitHub Copilot CLI
+        - VS Code Copilot Chat
+        - Google Antigravity
+        - Cursor (via AGENTS.md)
+        - Standalone CLI
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System & Architecture
+      description: e.g. macOS Sonoma (arm64), Ubuntu 24.04 (x86_64), Windows 11
+      placeholder: macOS 14.5 (arm64)
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python Version
+      description: Output of `python3 --version`
+      placeholder: Python 3.12.3
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Craftsman Version
+      description: Output of `craftsman --version`
+      placeholder: craftsman 4.0.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor-output
+    attributes:
+      label: Craftsman Doctor Output
+      description: Run `craftsman doctor --json` and paste the output here.
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps or commands to reproduce the issue.
+      placeholder: |
+        1. Run `craftsman gate --init --tier standard --task "example"`
+        2. Execute `...`
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs Actual Behavior
+      description: What did you expect to happen, and what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs or Evidence Ledger Excerpt
+      description: Paste any error traces, hook outputs, or `.git/craftsman/ledger.json` snippets.
+      render: text
+    validations:
+      required: false
