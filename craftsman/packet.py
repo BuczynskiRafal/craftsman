@@ -27,6 +27,7 @@ from craftsman.diffscan import (
 from craftsman.ledger import reopened_mentions, valid_facts_for_hunk
 from craftsman.lenses import LensPick
 from craftsman.records import SWEEP_LENS, Fact, FieldError, Ledger, Round
+from craftsman.text import inline_md
 
 MAX_PACKET_CHARS = 120_000
 MAX_QUICK_PACKET_CHARS = 40_000
@@ -557,7 +558,9 @@ def _lenses_section(ctx: PacketContext, only: frozenset[str] | None) -> str:
         reason = pick.reason
         if pick.lens.id == SWEEP_LENS:
             reason += " (run after all other lenses)"
-        rows.append(f"| `{pick.lens.id}` — {pick.lens.title} | {reason} | {pick.lens.focus} |")
+        rows.append(
+            f"| `{pick.lens.id}` — {pick.lens.title} | {inline_md(reason, table=True)} | {pick.lens.focus} |"
+        )
     section = "## Lenses in this round\n" + "\n".join(rows)
     if ctx.unscanned_files:
         files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)

@@ -38,7 +38,7 @@ from craftsman.evidence import (
     Evaluation,
     archive_ledger_if_rebased,
     evaluate_evidence,
-    prune_inbox_files,
+    prune_all_temp_dirs,
 )
 from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
@@ -58,6 +58,7 @@ from craftsman.records import (
     LedgerError,
     format_timestamp,
 )
+from craftsman.text import inline_md
 
 GateTier = Literal["auto", "quick", "standard", "deep"]
 GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
@@ -448,11 +449,12 @@ def continuation_reason(header: str, report: GateReport | None, evidence_error: 
         more = "… run `craftsman review check` for the remaining actions."
         budget = MAX_CONTINUATION_REASON_CHARS - sum(len(line) + 1 for line in (*lines, closing, more))
         for action in render_next_actions(report.issues):
-            if len(action) + 1 > budget:
+            action_line = inline_md(action)
+            if len(action_line) + 1 > budget:
                 lines.append(more)
                 break
-            lines.append(action)
-            budget -= len(action) + 1
+            lines.append(action_line)
+            budget -= len(action_line) + 1
     lines.append(closing)
     return "\n".join(lines)
 
@@ -649,7 +651,7 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
     )
     (sys.stdout if code == 0 else sys.stderr).write(message)
     if code == 0:
-        prune_inbox_files(path.parent)
+        prune_all_temp_dirs(path.parent)
     return code
 
 

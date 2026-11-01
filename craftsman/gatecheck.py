@@ -29,6 +29,7 @@ from craftsman.records import (
     agent_role,
     parse_timestamp,
 )
+from craftsman.text import inline_md
 from craftsman.triviality import command_without_env, is_trivial_run
 
 IssueCode = Literal[
@@ -364,7 +365,7 @@ def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
     return [
         GateIssue(
             "no-verdict",
-            f"Finding {finding.id} ({finding.severity}: {finding.title}) has no verdict; verify it "
+            f"Finding {finding.id} ({finding.severity}: {inline_md(finding.title)}) has no verdict; verify it "
             f"independently and run `craftsman review verdict {finding.id} "
             '--as proven|probable|question|dismissed --evidence "..."`.',
         )
@@ -376,7 +377,7 @@ def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
 def _unresolved_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
     issues: list[GateIssue] = []
     for finding in ledger.findings:
-        label = f"Finding {finding.id} ({finding.severity}: {finding.title})"
+        label = f"Finding {finding.id} ({finding.severity}: {inline_md(finding.title)})"
         if finding.verdict in ("proven", "probable") and finding.resolution is None:
             alternative = "" if finding.severity == "blocker" else ' (or `--as accepted --note "why"`)'
             issues.append(

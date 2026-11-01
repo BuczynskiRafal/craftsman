@@ -28,9 +28,10 @@ from craftsman.evidence import (
     archive_ledger,
     consume_inbox_file,
     create_inbox_file,
+    create_scratch_dir,
     effective_tier,
     packet_path,
-    prune_inbox_files,
+    prune_all_temp_dirs,
     prune_round_files,
 )
 from craftsman.gate import GateState, GateStateError, Stage, current_tier, state_path_for, update_state
@@ -111,6 +112,7 @@ from craftsman.records import (
     as_choice,
     require_lens_addition,
 )
+from craftsman.text import inline_md, one_line
 from craftsman.workspace import Workspace, open_workspace
 
 PROG = "craftsman review"
@@ -274,9 +276,11 @@ def _prepare(args: argparse.Namespace) -> int:
         new, notes = _new_lens_additions(current, tier, snap, requested)
         lens_ids = [pick.lens.id for pick in _lens_picks(tier, snap, {**current.added_lenses, **new})]
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
+        out_of_scope = tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else ()
         updated, round_ = open_round(
             current, snap, tier, lens_ids, str(packet), symbols,
             signals=signals, scope=scope, allow_scope_expansion=allow_scope_expansion,
+            out_of_scope=out_of_scope,
         )
         if new:
             updated = add_lenses(updated, round_.number, new)
@@ -297,7 +301,7 @@ def _prepare(args: argparse.Namespace) -> int:
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if created:
         prune_round_files(ws.ledger_path.parent, round_.number)
-        prune_inbox_files(ws.ledger_path.parent)
+        prune_all_temp_dirs(ws.ledger_path.parent)
     return 0
 
 
@@ -517,7 +521,7 @@ def _parse_lens_additions(values: Sequence[str] | None) -> dict[str, str]:
     reasons: dict[str, str] = {}
     for value in values or ():
         lens, separator, reason = value.partition("=")
-        lens, reason = lens.strip(), reason.strip()
+        lens, reason = lens.strip(), one_line(reason.strip())
         if not separator:
             raise FieldError(
                 "add_lens", f"must be LENS=REASON, e.g. {LENS_ADDITION_EXAMPLE!r} (got {value!r})"
@@ -823,6 +827,12 @@ def _inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+def _scratch(args: argparse.Namespace) -> int:
+    ws = open_workspace(args.cwd)
+    print(create_scratch_dir(ws.ledger_path.parent).resolve())
+    return 0
+
+
 # --- coverage -------------------------------------------------------------------------------
 
 
@@ -854,7 +864,7 @@ def _cover_one(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, str]:
         round_ = require_current_round(current, snap)
-        return _record_coverage(current, round_, lenses, targets, args.note, target_kind=target_kind)
+        return _record_coverage(current, round_, lenses, targets, one_line(args.note), target_kind=target_kind)
 
     return _run_single(ws, bool(args.check), record, print)
 
@@ -908,7 +918,7 @@ def _cover_one_from_json(
     lenses = _parse_json_lenses(raw, f)
     target_key = _target_key(raw, lenses)
     targets = [item.strip() for item in f.texts(target_key) if item.strip()]
-    note = f.text("note")
+    note = one_line(f.text("note"))
     f.reject_unknown()
     return _record_coverage(
         state, round_, lenses, targets, note, target_kind=target_key, rejected_by=rejected_by
@@ -1008,9 +1018,9 @@ def _add_one(args: argparse.Namespace) -> int:
             path=path,
             line=args.line,
             severity=args.severity,
-            title=args.title,
-            scenario=args.scenario,
-            suggestion=args.suggestion or "",
+            title=one_line(args.title),
+            scenario=one_line(args.scenario),
+            suggestion=one_line(args.suggestion) if args.suggestion else "",
             signal_id=args.signal,
         )
 
@@ -1048,9 +1058,9 @@ def _add_one_from_json(
     raw_file = f.text("file")
     line = f.integer("line")
     severity = f.choice("severity", SEVERITIES)
-    title = f.text("title")
-    scenario = f.text("scenario")
-    suggestion = f.text_or("suggestion", "")
+    title = one_line(f.text("title"))
+    scenario = one_line(f.text("scenario"))
+    suggestion = one_line(f.text_or("suggestion", ""))
     signal_id = f.text_if_present("signal")
     f.reject_unknown()
     path = _finding_path(ws.root, cwd, raw_file, snap)
@@ -1093,7 +1103,7 @@ def _ack(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, SignalAck]:
         require_current_round(current, snap)
-        return ack_signal(current, args.signal_id, args.reason)
+        return ack_signal(current, args.signal_id, one_line(args.reason))
 
     ack = mutate(ws.ledger_path, record)
     print(f"{ack.signal_id} acknowledged in round {ack.round}: {ack.reason}")
@@ -1167,9 +1177,9 @@ def _merge(args: argparse.Namespace) -> int:
             current,
             args.target_id,
             args.duplicate_ids,
-            title=args.title,
-            scenario=args.scenario,
-            suggestion=args.suggestion,
+            title=one_line(args.title) if args.title is not None else None,
+            scenario=one_line(args.scenario) if args.scenario is not None else None,
+            suggestion=one_line(args.suggestion) if args.suggestion is not None else None,
         )
         return updated, (target, duplicates)
 
@@ -1235,7 +1245,7 @@ def _verdict_one(args: argparse.Namespace) -> int:
     return _run_single(
         ws,
         bool(args.check),
-        lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run),
+        lambda current: set_verdict(current, args.finding_id, args.verdict, one_line(args.evidence), args.run),
         _print_verdict,
     )
 
@@ -1244,7 +1254,7 @@ def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
     f = Fields(raw)
     finding_id = f.text("id")
     verdict = f.choice("as", VERDICTS)
-    evidence = f.text("evidence")
+    evidence = one_line(f.text("evidence"))
     run_id = f.text_if_present("run")
     f.reject_unknown()
     return set_verdict(state, finding_id, verdict, evidence, run_id)
@@ -1280,7 +1290,7 @@ def _resolve(args: argparse.Namespace) -> int:
     finding = mutate(
         ws.ledger_path,
         lambda current: resolve(
-            current, args.finding_id, args.resolution, args.note, fingerprint=snap.fingerprint
+            current, args.finding_id, args.resolution, one_line(args.note), fingerprint=snap.fingerprint
         ),
     )
     print(f"{finding.id} resolved as {finding.resolution}")
@@ -1289,7 +1299,7 @@ def _resolve(args: argparse.Namespace) -> int:
 
 def _waive_run(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    run = mutate(ws.ledger_path, lambda current: waive_run(current, args.run_id, args.reason))
+    run = mutate(ws.ledger_path, lambda current: waive_run(current, args.run_id, one_line(args.reason)))
     print(f"{run.id} waived; it no longer blocks the gate")
     return 0
 
@@ -1483,14 +1493,14 @@ def _findings_table(findings: Sequence[Finding]) -> list[str]:
         verdict = f"{finding.verdict or '—'}{run}"
         lines.append(
             f"| {finding.id} | {finding.severity} | {verdict} | {finding.resolution or '—'} | "
-            f"`{_cell(finding.path)}:{finding.line}` | {_cell(finding.title)} |"
+            f"`{inline_md(finding.path, table=True)}:{finding.line}` | {inline_md(finding.title, table=True)} |"
         )
     return lines
 
 
 def _cell(text: str) -> str:
     """Text safe for one Markdown table cell: pipes escaped, line breaks flattened."""
-    return " ".join(text.split("\n")).replace("\r", "").replace("|", "\\|")
+    return inline_md(text, table=True)
 
 
 def _run_lines(runs: Sequence[Run], snap: DiffSnapshot) -> list[str]:
@@ -1522,11 +1532,14 @@ def _evaluate(
 
 
 def _check(args: argparse.Namespace) -> int:
-    _, _, _, report = _evaluate(open_workspace(args.cwd), args.tier, review_only=args.review_only)
+    ws = open_workspace(args.cwd)
+    ledger, _, _, report = _evaluate(ws, args.tier, review_only=args.review_only)
     if args.json:
         print(json.dumps(_report_json(report), indent=2, ensure_ascii=False))
     else:
         print(render_report(report))
+        if args.review_only:
+            _warn_new_out_of_scope(ws, ledger)
     return 0 if report.passed else 1
 
 
@@ -1569,9 +1582,27 @@ def _report(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print("\n".join(_report_lines(ledger, snap, tier, report, groups, runs)))
+        _warn_new_out_of_scope(ws, ledger)
     if args.review_only:
-        prune_inbox_files(ws.ledger_path.parent)
+        prune_all_temp_dirs(ws.ledger_path.parent)
     return 0
+
+
+def _warn_new_out_of_scope(ws: Workspace, ledger: Ledger) -> None:
+    if not ledger.rounds:
+        return
+    latest = ledger.rounds[-1]
+    if latest.scope is None:
+        return
+    full_now = snapshot(ws.root, latest.base_sha)
+    current_out = set(full_now.files) - set(latest.scope)
+    new_out = sorted(current_out - set(latest.out_of_scope))
+    if new_out:
+        paths = ", ".join(new_out)
+        print(
+            f"Warning: Files created or changed during this review outside its scope: {paths}\n"
+            "delete or revert them if this session made them"
+        )
 
 
 def _finding_groups(findings: Sequence[Finding]) -> dict[str, list[Finding]]:
@@ -1609,7 +1640,7 @@ def _report_status_line(report: GateReport) -> str:
 
 def _lens_addition_lines(ledger: Ledger) -> list[str]:
     return [
-        f"- Lens `{addition.lens}` added by the agent in round {addition.round}: {addition.reason}"
+        f"- Lens `{addition.lens}` added by the agent in round {addition.round}: {inline_md(addition.reason)}"
         for addition in ledger.lens_additions
     ]
 
@@ -1639,20 +1670,20 @@ def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> l
     if not ledger.findings:
         return ["No findings recorded."]
     detail: dict[str, Callable[[Finding], str]] = {
-        "fixed": lambda f: f"Fix: {f.resolution_note}",
-        "accepted": lambda f: f"Accepted because: {f.resolution_note}",
+        "fixed": lambda f: f"Fix: {inline_md(f.resolution_note)}",
+        "accepted": lambda f: f"Accepted because: {inline_md(f.resolution_note)}",
         "open": lambda f: (
             f"Verdict: {f.verdict}" if f.verdict is not None else "Verdict: none yet (unverified)"
         ),
-        "question": lambda f: f"Question: {f.verdict_evidence}",
-        "dismissed": lambda f: f"Dismissed: {f.verdict_evidence}",
+        "question": lambda f: f"Question: {inline_md(f.verdict_evidence)}",
+        "dismissed": lambda f: f"Dismissed: {inline_md(f.verdict_evidence)}",
     }
     lines: list[str] = []
     for name, items in groups.items():
         if items:
             lines.append(f"**{name.capitalize()} ({len(items)})**")
             lines.extend(
-                f"- {f.id} · {f.severity} · `{f.path}:{f.line}` — {f.title}. {detail[name](f)}"
+                f"- {f.id} · {f.severity} · `{f.path}:{f.line}` — {inline_md(f.title)}. {detail[name](f)}"
                 for f in items
             )
     return lines
@@ -1666,7 +1697,7 @@ def _signal_ack_lines(ledger: Ledger) -> list[str]:
     lines = ["", "## Acknowledged quality signals"]
     for signal_id, ack in acks.items():
         sig = latest.signal(signal_id)
-        lines.append(f"- {signal_id} (`{sig.kind.value}` at `{sig.file}:{sig.line}`) — {ack.reason}")
+        lines.append(f"- {signal_id} (`{sig.kind.value}` at `{sig.file}:{sig.line}`) — {inline_md(ack.reason)}")
     return lines
 
 
@@ -1708,7 +1739,7 @@ def _waived_run_lines(ledger: Ledger) -> list[str]:
         "",
         "## Waived runs",
         *(
-            f"- {run.id} `{run.command}` ({run.kind}, exit {run.exit_code}) — {waiver.reason}"
+            f"- {run.id} `{run.command}` ({run.kind}, exit {run.exit_code}) — {inline_md(waiver.reason)}"
             for run, waiver in waived
         ),
     ]
@@ -1753,6 +1784,7 @@ def _report_lines(
 def _reset(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     archived = archive_ledger(ws.ledger_path)
+    prune_all_temp_dirs(ws.ledger_path.parent)
     if not archived:
         print("Nothing to archive: no ledger or review packets yet.")
     for path in archived:
@@ -2028,6 +2060,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     inbox.add_argument("kind", choices=INBOX_KINDS, help="Batch command the file is for")
     inbox.set_defaults(handler=_inbox)
+    scratch = sub.add_parser(
+        "scratch",
+        parents=[common],
+        help="Create a unique managed scratch directory in <git-dir>/craftsman/scratch/ for repro scripts",
+    )
+    scratch.set_defaults(handler=_scratch)
     # Prefix matching would let `--lens` stand in for `--lenses` and similar near-misses.
     for command in sub.choices.values():
         command.allow_abbrev = False

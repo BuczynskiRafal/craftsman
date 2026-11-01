@@ -61,6 +61,7 @@ from craftsman.records import (
     parse_timestamp,
     scope_contains,
 )
+from craftsman.text import one_line
 from craftsman.triviality import is_trivial_run
 
 LOCK_POLL_S = 0.05
@@ -278,6 +279,7 @@ def open_round(
     signals: tuple[QualitySignal, ...],
     scope: Sequence[str] | None = None,
     allow_scope_expansion: bool = False,
+    out_of_scope: Sequence[str] = (),
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op.
 
@@ -311,6 +313,7 @@ def open_round(
         packet_path=packet_path,
         signals=signals,
         scope=normalized_scope,
+        out_of_scope=tuple(sorted(out_of_scope)),
     )
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
 
@@ -771,19 +774,19 @@ def add_multi_coverage(
 ) -> tuple[Ledger, tuple[Coverage, ...]]:
     """Record that every lens in `lenses` reviewed `targets` of the latest round."""
     round_ = _latest_round(ledger)
+    note = one_line(note)
     cleaned_lenses = _validate_coverage_lenses(round_, lenses)
     unit, digests = _validate_coverage_targets(round_, cleaned_lenses, targets, target_kind)
     _validate_coverage_note(ledger, round_, cleaned_lenses, targets, note, unit=unit)
     if SWEEP_LENS in cleaned_lenses:
         _require_lenses_before_sweep(ledger, round_, rejected_by=rejected_by)
     now = _now()
-    stripped_note = note.strip()
     records = tuple(
         Coverage(
             round=round_.number,
             lens=lens,
             digests=digests,
-            note=stripped_note,
+            note=note,
             recorded_at=now,
         )
         for lens in cleaned_lenses
@@ -858,9 +861,9 @@ def add_finding(
         path=path.strip(),
         line=line,
         severity=severity,
-        title=title.strip(),
-        scenario=scenario.strip(),
-        suggestion=suggestion.strip(),
+        title=one_line(title),
+        scenario=one_line(scenario),
+        suggestion=one_line(suggestion),
         fingerprint=round_.fingerprint,
         verdict=None,
         verdict_evidence="",
@@ -884,7 +887,7 @@ def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, Sig
             "change or hand the review to the user",
             field="signal_id",
         )
-    stripped = reason.strip()
+    stripped = one_line(reason)
     if len(stripped) < MIN_SIGNAL_ACK_REASON_CHARS:
         raise FieldError(
             "reason",
@@ -908,7 +911,7 @@ def add_lenses(ledger: Ledger, round_number: int, reasons: Mapping[str, str]) ->
     """Record the lenses the agent added to round `round_number`, each with its reason."""
     recorded_at = _now()
     additions = tuple(
-        LensAddition(lens, reason.strip(), round_number, recorded_at) for lens, reason in reasons.items()
+        LensAddition(lens, one_line(reason), round_number, recorded_at) for lens, reason in reasons.items()
     )
     return replace(ledger, lens_additions=(*ledger.lens_additions, *additions))
 
@@ -998,9 +1001,9 @@ def merge_findings(
     updated_target = replace(
         target,
         severity=min((item.severity for item in (target, *duplicates)), key=SEVERITIES.index),
-        title=target.title if title is None else title.strip(),
-        scenario=_merged_scenario(target, duplicates) if scenario is None else scenario.strip(),
-        suggestion=_merged_suggestion(target, duplicates) if suggestion is None else suggestion.strip(),
+        title=target.title if title is None else one_line(title),
+        scenario=_merged_scenario(target, duplicates) if scenario is None else one_line(scenario),
+        suggestion=_merged_suggestion(target, duplicates) if suggestion is None else one_line(suggestion),
         signal_id=_merged_signal(target, duplicates),
         updated_at=now,
     )
@@ -1084,7 +1087,7 @@ def set_verdict(
     updated = replace(
         finding,
         verdict=verdict,
-        verdict_evidence=evidence.strip(),
+        verdict_evidence=one_line(evidence),
         verdict_run=run_id,
         resolution=finding.resolution if keeps_resolution else None,
         resolution_note=finding.resolution_note if keeps_resolution else "",
@@ -1112,7 +1115,7 @@ def resolve(
         raise LedgerError(
             f"the code has not changed since {finding_id} was recorded; fix the code first, then resolve"
         )
-    updated = replace(finding, resolution=resolution, resolution_note=note.strip(), updated_at=_now())
+    updated = replace(finding, resolution=resolution, resolution_note=one_line(note), updated_at=_now())
     return _with_finding(ledger, updated)
 
 
@@ -1131,7 +1134,7 @@ def waive_run(ledger: Ledger, run_id: str, reason: str) -> tuple[Ledger, Run]:
         raise LedgerError(f"{run_id} passed (exit 0); only failing runs can be waived")
     if run.waiver is not None:
         raise LedgerError(f"{run_id} is already waived: {run.waiver.reason}")
-    updated = replace(run, waiver=RunWaiver(reason=reason.strip(), waived_at=_now()))
+    updated = replace(run, waiver=RunWaiver(reason=one_line(reason), waived_at=_now()))
     runs = tuple(updated if item.id == run_id else item for item in ledger.runs)
     return replace(ledger, runs=runs), updated
 
