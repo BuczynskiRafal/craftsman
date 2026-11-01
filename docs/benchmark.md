@@ -44,11 +44,9 @@ using Craftsman's `/code-review` protocol.
 
 ## Claude Code Pilot Runs
 
-Per Decision D3, preliminary pilot runs for Claude Code were conducted on the same 5 PR instances (1 repetition per
-configuration, 2–4 runs per instance). While directional improvements mirrored the Antigravity results (increased
-recall on contract and edge-case defects), Claude Code numbers are reserved for the expanded benchmark suite currently
-under evaluation to ensure statistical confidence intervals and multi-run stability before publication on the main
-project page.
+Pilot runs with Claude Code were made on the same 5 PRs and are not reported on this page yet.
+<!-- TODO(author, plan 4.5): state why the Claude Code pilot numbers are left out. -->
+Claude Code is part of the expanded benchmark, with one repetition per configuration.
 
 ---
 

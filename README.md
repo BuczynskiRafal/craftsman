@@ -47,7 +47,8 @@ craftsman install                  # auto-detects Claude Code, Copilot, Antigrav
 For Claude Code plugin installation:
 
 ```bash
-/plugin marketplace add BuczynskiRafal/craftsman && /plugin install craftsman@craftsman
+/plugin marketplace add BuczynskiRafal/craftsman
+/plugin install craftsman@craftsman
 ```
 
 ## How It Works
