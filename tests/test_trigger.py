@@ -126,6 +126,13 @@ class DetectTriggerTests(unittest.TestCase):
         self.assertIsNone(detect_trigger('what does `craftsman:ultracraft` do?'))
         self.assertIsNone(detect_trigger("do not run '/craftsman:craftsman'"))
 
+    def test_colon_after_the_command_ends_it_unless_another_command_follows(self) -> None:
+        self.assertEqual(detect_trigger("/craftsman: add pagination"), "auto")
+        self.assertEqual(detect_trigger("please run /craftsman: now"), "auto")
+        self.assertEqual(detect_trigger("ultracraft: harden the parser"), "deep")
+        self.assertIsNone(detect_trigger("/craftsman:code-review fix the parser"))
+        self.assertIsNone(detect_trigger("run /craftsman:simplify on it"))
+
 
 class TaskFromPromptTests(unittest.TestCase):
     def test_task_drops_the_trigger(self) -> None:
