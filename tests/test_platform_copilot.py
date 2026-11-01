@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -192,6 +193,7 @@ class HookExportTests(CopilotTestCase):
         python.chmod(0o755)
         return str(python)
 
+    @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
     def test_prefix_quotes_the_interpreter_for_bash(self) -> None:
         folder = self.tmp / "py $HOME" / '"x"'
         python = self.fake_python(folder, Path(hook_command.__file__))
@@ -211,6 +213,7 @@ class HookExportTests(CopilotTestCase):
         )
         self.assertEqual(echoed.stdout.splitlines(), [python, "-m", "craftsman.cli"])
 
+    @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
     def test_interpreter_without_this_package_runs_the_shim(self) -> None:
         python = self.fake_python(self.tmp / "py", self.tmp / "elsewhere" / "craftsman" / "__init__.py")
 
@@ -219,6 +222,7 @@ class HookExportTests(CopilotTestCase):
         shim = str(REPO_ROOT / "scripts" / "craftsman-cli.py")
         self.assertEqual(shlex.split(bash), [python, shim])
 
+    @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
     def test_unreachable_package_without_a_shim_is_an_error(self) -> None:
         python = self.fake_python(self.tmp / "py", self.tmp / "elsewhere" / "craftsman" / "__init__.py")
         with (

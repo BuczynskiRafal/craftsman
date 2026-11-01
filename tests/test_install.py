@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -597,6 +598,7 @@ class DryRunTests(InstallTestCase):
 
 
 class BootstrapTests(InstallTestCase):
+    @unittest.skipIf(os.name == "nt", "install.sh is the POSIX installer")
     def test_install_sh_installs_everything_then_uninstall_empties_home(self) -> None:
         modes = {p: p.stat().st_mode for p in (REPO_ROOT / "scripts").iterdir()}
 
