@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence, Set
 from dataclasses import dataclass
 from typing import Literal
@@ -691,3 +692,92 @@ def render_report(report: GateReport) -> str:
     if report.warnings:
         lines += ["", "**Warnings**", *(f"- {warning}" for warning in report.warnings)]
     return "\n".join(lines)
+
+
+def format_blocker_summary(report: GateReport) -> str:
+    """Summarize active blocker issues into a single concise sentence."""
+    if not report.issues:
+        return "review complete"
+
+    clauses: list[str] = []
+
+    # 1. Round lifecycle issues
+    for issue in report.issues:
+        if issue.code == "no-round":
+            clauses.append("no review round prepared")
+        elif issue.code == "stale-round":
+            clauses.append("code changed since review round")
+        elif issue.code == "tier-too-low":
+            clauses.append("review tier too low")
+        elif issue.code == "round-cap":
+            clauses.append("maximum review rounds reached")
+
+    # 2. Coverage issues
+    coverage_issues = [i for i in report.issues if i.code == "uncovered"]
+    if coverage_issues:
+        if len(coverage_issues) == 1:
+            m = re.search(
+                r"(?:Lens `([^`]+)` has|Lenses ([^h]+) have) (\d+) uncovered (hunk|file)",
+                coverage_issues[0].message,
+            )
+            if m:
+                lens = (m.group(1) or m.group(2)).strip()
+                count = int(m.group(3))
+                unit = m.group(4)
+                unit_str = f"{unit}s" if count != 1 and not unit.endswith("s") else unit
+                clauses.append(f"{count} {unit_str} not covered by lens {lens}")
+            else:
+                clauses.append(f"{len(coverage_issues)} uncovered items")
+        else:
+            total_missing = 0
+            unit = "hunks"
+            for ci in coverage_issues:
+                m = re.search(r"(\d+) uncovered (hunk|file)", ci.message)
+                if m:
+                    total_missing += int(m.group(1))
+                    unit = f"{m.group(2)}s"
+            if total_missing > 0:
+                clauses.append(f"{total_missing} {unit} not covered by lenses")
+            else:
+                clauses.append(f"{len(coverage_issues)} uncovered items")
+
+    # 3. Premature sweep
+    if any(i.code == "sweep-too-early" for i in report.issues):
+        clauses.append("final sweep recorded prematurely")
+
+    # 4. Risk signals
+    signal_issues = [i for i in report.issues if i.code == "unresolved-signal"]
+    if signal_issues:
+        n = len(signal_issues)
+        clauses.append(f"{n} unacknowledged risk signal{'s' if n != 1 else ''}")
+
+    # 5. Verdicts
+    verdict_issues = [i for i in report.issues if i.code == "no-verdict"]
+    if verdict_issues:
+        n = len(verdict_issues)
+        clauses.append(f"{n} finding{'s' if n != 1 else ''} without a verdict")
+
+    # 6. Unresolved findings
+    unresolved = [i for i in report.issues if i.code == "unresolved"]
+    if unresolved:
+        n = len(unresolved)
+        clauses.append(f"{n} finding{'s' if n != 1 else ''} unresolved")
+
+    # 7. Verification runs
+    if any(i.code == "no-passing-run" for i in report.issues):
+        clauses.append("no passing test run")
+    if any(i.code == "no-e2e-run" for i in report.issues):
+        clauses.append("no passing e2e run")
+    failing = [i for i in report.issues if i.code == "failing-run"]
+    if failing:
+        n = len(failing)
+        clauses.append(f"{n} failing run{'s' if n != 1 else ''}")
+
+    # 8. Reviewer isolation
+    if any(i.code == "no-isolation" for i in report.issues):
+        clauses.append("no reviewer isolation evidence")
+
+    if not clauses:
+        clauses.append(f"{len(report.issues)} open items")
+
+    return f"review incomplete: {'; '.join(clauses)}"

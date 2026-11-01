@@ -203,6 +203,7 @@ class DecideStopTests(RepoTestCase):
         decision = decide_stop(self.state, self.repo.root)
         assert decision.block_reason is not None
         self.assertTrue(is_continuation_prompt(decision.block_reason))
+        self.assertIn("review incomplete: no review round prepared", decision.block_reason)
         self.assertIn("[no-round]", decision.block_reason)
 
     def test_every_blocked_stop_counts_as_a_continuation(self) -> None:

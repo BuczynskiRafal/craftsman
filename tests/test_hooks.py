@@ -274,11 +274,13 @@ class StopTests(HookTestCase):
         self.open_unsatisfied_gate()
         out, _ = call_hook("stop", "claude", claude("Stop", self.root))
         self.assertEqual((set(out), out["decision"]), ({"decision", "reason"}, "block"))
+        self.assertIn("review incomplete:", out["reason"])
 
     def test_block_reason_counts_the_continuation(self) -> None:
         self.open_unsatisfied_gate()
         out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
         self.assertTrue(out["reason"].startswith(header(1)))
+        self.assertIn("review incomplete:", out["reason"])
 
     def test_stop_hook_active_does_not_end_the_block(self) -> None:
         self.open_unsatisfied_gate()

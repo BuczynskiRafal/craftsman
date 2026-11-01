@@ -44,6 +44,7 @@ from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
     QUICK_TIER_MAX_CHANGED_LINES,
     GateReport,
+    format_blocker_summary,
     has_unresolved_diff_size,
     render_next_actions,
     render_report,
@@ -437,8 +438,16 @@ def _continue(state: GateState, report: GateReport | None, error: str | None) ->
 
 def continuation_reason(header: str, report: GateReport | None, evidence_error: str | None) -> str:
     """Tell the agent exactly what is missing, within a size the platforms display in full."""
+    if evidence_error is not None:
+        lead = f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}."
+    elif report is not None and report.issues:
+        summary = format_blocker_summary(report)
+        lead = f"{summary}." if not summary.endswith(".") else summary
+    else:
+        lead = "Review incomplete."
+
     lines = [
-        f"{header} Task completion is blocked until the evidence ledger proves the change is "
+        f"{header} {lead} Task completion is blocked until the evidence ledger proves the change is "
         "reviewed and verified."
     ]
     if evidence_error is not None:
