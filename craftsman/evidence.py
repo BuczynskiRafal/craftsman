@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shutil
 import stat
 import sys
 from contextlib import suppress
@@ -27,11 +28,13 @@ from craftsman.records import IsolationEvidence, Ledger, LedgerError
 
 PACKET_GLOB = "packet-*.md"
 INBOX_DIRNAME = "inbox"
+SCRATCH_DIRNAME = "scratch"
 InboxKind = Literal["cover", "add", "verdict"]
 INBOX_KINDS: tuple[InboxKind, ...] = get_args(InboxKind)
 KEEP_ARCHIVES_ENV = "CRAFTSMAN_KEEP_ARCHIVES"
 DEFAULT_KEEP_ARCHIVES = 5
 _MAX_INBOX_ATTEMPTS = 16
+_MAX_SCRATCH_ATTEMPTS = 16
 _LINK_REPARSE_TAGS: frozenset[int] = frozenset({
     getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
     getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
@@ -213,6 +216,82 @@ def prune_inbox_files(craftsman_dir: Path) -> tuple[Path, ...]:
     return tuple(pruned)
 
 
+def scratch_dir_for(craftsman_dir: Path) -> Path:
+    return craftsman_dir / SCRATCH_DIRNAME
+
+
+def _prepare_scratch_dir(craftsman_dir: Path) -> Path:
+    _require_real_folder(craftsman_dir, action="use")
+    scratch_dir = scratch_dir_for(craftsman_dir)
+    _require_real_folder(scratch_dir, action="use")
+    try:
+        craftsman_dir.mkdir(parents=True, exist_ok=True)
+        scratch_dir.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise LedgerError(f"cannot create scratch directory {scratch_dir}: {exc}") from exc
+    return scratch_dir
+
+
+def create_scratch_dir(craftsman_dir: Path) -> Path:
+    """Create a unique managed scratch directory under `craftsman_dir/scratch/<id>/`."""
+    scratch_dir = _prepare_scratch_dir(craftsman_dir)
+    for _ in range(_MAX_SCRATCH_ATTEMPTS):
+        token = secrets.token_hex(6)
+        candidate = scratch_dir / token
+        try:
+            candidate.mkdir(mode=0o700)
+            return candidate
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise LedgerError(f"cannot create scratch directory in {scratch_dir}: {exc}") from exc
+    raise LedgerError(f"cannot create scratch directory in {scratch_dir}")
+
+
+def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
+    """Delete all scratch directories under `craftsman_dir/scratch` and remove the folder if empty."""
+    if _is_symlink_or_junction(craftsman_dir):
+        _warn_inbox(f"could not prune symlinked directory {craftsman_dir}")
+        return ()
+    scratch_dir = craftsman_dir / SCRATCH_DIRNAME
+    if _is_symlink_or_junction(scratch_dir):
+        _warn_inbox(f"could not prune symlinked scratch directory {scratch_dir}")
+        return ()
+    try:
+        if not scratch_dir.exists():
+            return ()
+        if not scratch_dir.is_dir():
+            _warn_inbox(f"could not prune scratch {scratch_dir}: not a directory")
+            return ()
+        entries = sorted(scratch_dir.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        _warn_inbox(f"could not prune scratch {scratch_dir}: {exc}")
+        return ()
+    pruned: list[Path] = []
+    for entry in entries:
+        try:
+            if _is_symlink_or_junction(entry):
+                continue
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _warn_inbox(f"could not remove scratch entry {entry}: {exc}")
+            continue
+        pruned.append(entry)
+    with suppress(OSError):
+        scratch_dir.rmdir()
+    return tuple(pruned)
+
+
+def prune_all_temp_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
+    """Delete leftover inbox files and scratch directories under `craftsman_dir`."""
+    return (*prune_inbox_files(craftsman_dir), *prune_scratch_dirs(craftsman_dir))
+
+
 def prune_round_files(craftsman_dir: Path, round_number: int) -> tuple[Path, ...]:
     """Delete packet views of earlier rounds and full packets older than the previous round."""
     if isinstance(round_number, bool) or round_number < 1:
@@ -293,7 +372,7 @@ def _archive(ledger_path: Path) -> tuple[Path, ...]:
         _prune_archives(ledger_path, keep)
     except OSError as exc:
         raise LedgerError(f"cannot archive {ledger_path}: {exc}") from exc
-    prune_inbox_files(ledger_path.parent)
+    prune_all_temp_dirs(ledger_path.parent)
     return tuple(archived)
 
 
