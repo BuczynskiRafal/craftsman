@@ -193,7 +193,11 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
         changes = [*workspace.skills, *workspace.agents, workspace.hooks, workspace.instructions]
         _report("workspace skills, agents, hooks and instructions", args.workspace / ".github", changes)
     if (claude_dir := _chosen(args.claude_dir, default_claude_dir)) is not None:
-        if not args.allow_duplicate_scopes and is_claude_plugin_active(claude_dir):
+        if (
+            not args.no_claude_hooks
+            and not args.allow_duplicate_scopes
+            and is_claude_plugin_active(claude_dir)
+        ):
             raise ExportError(
                 "Refusing to export Claude Code user-level hooks while the craftsman Claude Code "
                 "plugin is active (hooks would fire twice). Pass --allow-duplicate-scopes to override, "

@@ -69,11 +69,19 @@ def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) 
     nothing = not any(detected.values())
     if nothing:
         tracker.add(EventKind.NOTE, "No AI coding platform detected; installing for GitHub Copilot.")
+    claude = config.claude or detected["Claude Code"]
+    if claude and not config.claude and _plugin_would_duplicate_hooks(config, home):
+        tracker.add(
+            EventKind.NOTE,
+            "Skipping Claude Code: the craftsman Claude Code plugin is active and already runs "
+            "the gate hooks (pass --claude --allow-duplicate-scopes to install both).",
+        )
+        claude = False
     return replace(
         config,
         auto_detect=False,
         antigravity=config.antigravity or detected["Google Antigravity"],
-        claude=config.claude or detected["Claude Code"],
+        claude=claude,
         copilot=config.copilot or detected["GitHub Copilot (VS Code)"] or nothing,
     )
 
@@ -147,11 +155,17 @@ def _check_copilot_scopes(config: InstallConfig, home: Path) -> None:
         raise InstallError(DUPLICATE_SCOPE_WS_TO_USER_MSG)
 
 
+def _plugin_would_duplicate_hooks(config: InstallConfig, home: Path) -> bool:
+    """Whether installing the Claude Code hooks would run them a second time beside the plugin's."""
+    return (
+        config.claude_hooks
+        and not config.allow_duplicate_scopes
+        and is_claude_plugin_active(default_claude_dir(home))
+    )
+
+
 def _check_claude_scopes(config: InstallConfig, home: Path) -> None:
-    if config.allow_duplicate_scopes or not config.claude:
-        return
-    claude_dir = default_claude_dir(home)
-    if is_claude_plugin_active(claude_dir):
+    if config.claude and _plugin_would_duplicate_hooks(config, home):
         raise InstallError(
             "Refusing to install Claude Code user-level hooks while the craftsman Claude Code "
             "plugin is active (hooks would fire twice). Pass --allow-duplicate-scopes to override, "
@@ -239,7 +253,10 @@ def _build_install_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-duplicate-scopes",
         action="store_true",
-        help="Allow installing Copilot files in both user (~/.copilot) and workspace (.github) scopes.",
+        help=(
+            "Allow installing Copilot files in both user (~/.copilot) and workspace (.github) "
+            "scopes, or Claude Code hooks beside the active craftsman Claude Code plugin."
+        ),
     )
     parser.add_argument(
         "--copilot-workspace",

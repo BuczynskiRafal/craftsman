@@ -23,8 +23,10 @@ All notable changes to Craftsman are recorded here. The format follows
   and `/craftsman:ultracraft` in prompt text and Claude Code `<command-name>` hook payloads.
 - **Doctor duplicate Claude hook check**: `craftsman doctor` inspects both `~/.claude/settings.json` and
   plugin state (`installed_plugins.json` / `enabledPlugins`) to flag duplicate active hooks that would fire twice.
-- **Install guard against duplicate Claude hooks**: `craftsman install --claude` refuses to install user-level
-  hooks when the Claude Code plugin is active unless `--allow-duplicate-scopes` is supplied.
+- **Install guard against duplicate Claude hooks**: `craftsman install --claude` (and `export --claude-dir`)
+  refuses to install user-level hooks when the Claude Code plugin is active unless `--allow-duplicate-scopes`
+  is supplied; `--no-claude-hooks` installs the rest beside the plugin. An auto-detected Claude Code is skipped
+  with a note instead, so a plain `craftsman install` still sets up the other platforms.
 - **Ephemeral `uvx` interpreter refusal**: `craftsman install` detects if running under an ephemeral uv cache
   interpreter (`.cache/uv/archive-...`) and refuses installation with instructions to use `uv tool install craftsman-gate`
   or `pipx install craftsman-gate`, preventing broken hook paths when uv cleans its cache. The interpreter path

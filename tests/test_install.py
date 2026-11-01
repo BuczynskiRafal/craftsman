@@ -689,12 +689,35 @@ class BootstrapTests(InstallTestCase):
                     self.assertEqual(result.code, 1)
                     self.assertIn("ephemeral uvx interpreter", result.err)
 
-    def test_refuse_claude_install_when_plugin_active(self) -> None:
+    def activate_plugin(self) -> None:
         plugins_dir = self.claude_dir / "plugins"
         plugins_dir.mkdir(parents=True)
         (plugins_dir / "installed_plugins.json").write_text(
             json.dumps({"craftsman@craftsman": {"source": "market"}}), encoding="utf-8"
         )
+
+    def test_auto_detected_claude_is_skipped_while_the_plugin_is_active(self) -> None:
+        self.activate_plugin()
+        (self.home / ".gemini" / "antigravity").mkdir(parents=True)
+
+        result = self.install()
+
+        self.assert_ok(result)
+        self.assertIn("Skipping Claude Code: the craftsman Claude Code plugin is active", result.out)
+        self.assertTrue((self.config_dir / "skills" / "craftsman" / "SKILL.md").is_file())
+        self.assertFalse((self.claude_dir / "commands").exists())
+        self.assertFalse((self.claude_dir / "settings.json").exists())
+
+    def test_claude_without_hooks_installs_beside_the_plugin(self) -> None:
+        self.activate_plugin()
+
+        self.assert_ok(self.install("--claude", "--no-claude-hooks"))
+
+        self.assertTrue((self.claude_dir / "commands" / "craftsman.md").is_file())
+        self.assertFalse((self.claude_dir / "settings.json").exists())
+
+    def test_refuse_claude_install_when_plugin_active(self) -> None:
+        self.activate_plugin()
 
         # Installing --claude should refuse by default
         result = self.install("--claude")
