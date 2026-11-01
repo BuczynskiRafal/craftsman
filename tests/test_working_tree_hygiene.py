@@ -62,6 +62,43 @@ class ScratchDirectoryTests(unittest.TestCase):
         self.assertFalse(inbox_file.exists())
         self.assertFalse(scratch.exists())
 
+    def test_prune_scratch_dirs_handles_readonly_trees_and_symlinks(self) -> None:
+        # 1. Read-only subdirectory
+        s1 = create_scratch_dir(self.craftsman_dir)
+        sub = s1 / "ro_sub"
+        sub.mkdir()
+        (sub / "inner.txt").write_text("inner", encoding="utf-8")
+        sub.chmod(0o500)
+
+        # 2. Read-only file
+        s2 = create_scratch_dir(self.craftsman_dir)
+        ro_file = s2 / "ro_file.txt"
+        ro_file.write_text("read-only", encoding="utf-8")
+        ro_file.chmod(0o400)
+
+        # 3. Read-only root directory
+        s3 = create_scratch_dir(self.craftsman_dir)
+        (s3 / "data.txt").write_text("data", encoding="utf-8")
+        s3.chmod(0o500)
+
+        # 4. Symlink inside scratch dir
+        scratch_parent = scratch_dir_for(self.craftsman_dir)
+        link = scratch_parent / "external_symlink"
+        link.symlink_to(Path(tempfile.gettempdir()))
+
+        # Prune all scratch dirs
+        pruned = prune_scratch_dirs(self.craftsman_dir)
+        self.assertIn(s1, pruned)
+        self.assertIn(s2, pruned)
+        self.assertIn(s3, pruned)
+        self.assertIn(link, pruned)
+
+        self.assertFalse(s1.exists())
+        self.assertFalse(s2.exists())
+        self.assertFalse(s3.exists())
+        self.assertFalse(link.is_symlink())
+        self.assertFalse(scratch_parent.exists())
+
 
 class WorkingTreeHygieneE2ETests(unittest.TestCase):
     def setUp(self) -> None:

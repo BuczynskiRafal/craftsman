@@ -117,6 +117,60 @@ class TestOneLine(unittest.TestCase):
         result, _ = self._capture_one_line("  multiple   spaces   and\nlines  ", warn=False)
         self.assertEqual(result, "multiple spaces and lines")
 
+    def test_windows_paths_preserved_without_warning(self) -> None:
+        result, err = self._capture_one_line(r"src\new_parser.py:12")
+        self.assertEqual(result, r"src\new_parser.py:12")
+        self.assertEqual(err, "")
+
+        result2, err2 = self._capture_one_line(r"tests\run.py")
+        self.assertEqual(result2, r"tests\run.py")
+        self.assertEqual(err2, "")
+
+        result3, err3 = self._capture_one_line(r"C:\tools\review.py")
+        self.assertEqual(result3, r"C:\tools\review.py")
+        self.assertEqual(err3, "")
+
+        result4, err4 = self._capture_one_line(r"C:\test\new.py")
+        self.assertEqual(result4, r"C:\test\new.py")
+        self.assertEqual(err4, "")
+
+        result5, err5 = self._capture_one_line(r".\new_test.py")
+        self.assertEqual(result5, r".\new_test.py")
+        self.assertEqual(err5, "")
+
+    def test_escaped_backslashes_preserved(self) -> None:
+        result, err = self._capture_one_line(r"foo\\nbar")
+        self.assertEqual(result, r"foo\\nbar")
+        self.assertEqual(err, "")
+
+        result2, err2 = self._capture_one_line(r"src\\new_parser.py:12")
+        self.assertEqual(result2, r"src\\new_parser.py:12")
+        self.assertEqual(err2, "")
+
+    def test_nul_placeholder_safety(self) -> None:
+        result, err = self._capture_one_line("hello \x000\x00 world", warn=False)
+        self.assertEqual(result, "hello \x000\x00 world")
+        self.assertEqual(err, "")
+
+        result2, err2 = self._capture_one_line("test \x00999\x00 buffer `code`", warn=False)
+        self.assertEqual(result2, "test \x00999\x00 buffer `code`")
+        self.assertEqual(err2, "")
+
+    def test_symmetric_backtick_spans(self) -> None:
+        result, err = self._capture_one_line(r"`` `foo\nbar` ``")
+        self.assertEqual(result, r"`` `foo\nbar` ``")
+        self.assertEqual(err, "")
+
+        result2, err2 = self._capture_one_line(r"``` `a\nb` and ``c\nd`` ```")
+        self.assertEqual(result2, r"``` `a\nb` and ``c\nd`` ```")
+        self.assertEqual(err2, "")
+
+    def test_carriage_return_inside_backticks_normalized(self) -> None:
+        result, err = self._capture_one_line("`a\rb`", warn=False)
+        self.assertEqual(result, "`a b`")
+        self.assertNotIn("\r", result)
+        self.assertEqual(err, "")
+
 
 class TestInlineMd(unittest.TestCase):
     def test_inline_md_basic_no_stderr_warning(self) -> None:
@@ -135,6 +189,10 @@ class TestInlineMd(unittest.TestCase):
 
     def test_inline_md_table_does_not_double_escape_existing_pipe(self) -> None:
         self.assertEqual(inline_md(r"a \| b\nc", table=True), r"a \| b c")
+
+    def test_inline_md_table_escapes_pipe_after_escaped_backslashes(self) -> None:
+        self.assertEqual(inline_md(r"C:\\|D:\\", table=True), r"C:\\\|D:\\")
+        self.assertEqual(inline_md(r"foo\\\|bar", table=True), r"foo\\\|bar")
 
     def test_inline_md_table_multiple_pipes(self) -> None:
         self.assertEqual(inline_md("a | b | c", table=True), r"a \| b \| c")

@@ -13,11 +13,12 @@ import secrets
 import shutil
 import stat
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 from craftsman.diffscan import DiffSnapshot
 from craftsman.files import replace_with_retry
@@ -100,6 +101,10 @@ def _has_real_inode(st: os.stat_result) -> bool:
 
 
 def _warn_inbox(detail: str) -> None:
+    sys.stderr.write(f"craftsman: warning: {detail}\n")
+
+
+def _warn_scratch(detail: str) -> None:
     sys.stderr.write(f"craftsman: warning: {detail}\n")
 
 
@@ -248,38 +253,87 @@ def create_scratch_dir(craftsman_dir: Path) -> Path:
     raise LedgerError(f"cannot create scratch directory in {scratch_dir}")
 
 
+def _make_tree_writable(root_path: Path) -> None:
+    """Recursively grant write permissions so that tree removal succeeds."""
+    try:
+        os.chmod(root_path, stat.S_IRWXU)
+    except OSError:
+        pass
+    for dirpath, dirnames, filenames in os.walk(root_path):
+        for d in dirnames:
+            try:
+                os.chmod(os.path.join(dirpath, d), stat.S_IRWXU)
+            except OSError:
+                pass
+        for f in filenames:
+            try:
+                os.chmod(os.path.join(dirpath, f), stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+
+
+def _rmtree_onexc(func: Callable[[str], Any], path: str, exc: BaseException) -> None:
+    with suppress(OSError):
+        p = Path(path)
+        os.chmod(p.parent, stat.S_IRWXU)
+        if p.is_dir():
+            os.chmod(p, stat.S_IRWXU)
+        else:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+
+
+def _rmtree_onerror(func: Callable[[str], Any], path: str, exc_info: Any) -> None:
+    with suppress(OSError):
+        p = Path(path)
+        os.chmod(p.parent, stat.S_IRWXU)
+        if p.is_dir():
+            os.chmod(p, stat.S_IRWXU)
+        else:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+
+
 def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
     """Delete all scratch directories under `craftsman_dir/scratch` and remove the folder if empty."""
     if _is_symlink_or_junction(craftsman_dir):
-        _warn_inbox(f"could not prune symlinked directory {craftsman_dir}")
+        _warn_scratch(f"could not prune symlinked directory {craftsman_dir}")
         return ()
     scratch_dir = craftsman_dir / SCRATCH_DIRNAME
     if _is_symlink_or_junction(scratch_dir):
-        _warn_inbox(f"could not prune symlinked scratch directory {scratch_dir}")
+        _warn_scratch(f"could not prune symlinked scratch directory {scratch_dir}")
         return ()
     try:
         if not scratch_dir.exists():
             return ()
         if not scratch_dir.is_dir():
-            _warn_inbox(f"could not prune scratch {scratch_dir}: not a directory")
+            _warn_scratch(f"could not prune scratch {scratch_dir}: not a directory")
             return ()
         entries = sorted(scratch_dir.iterdir(), key=lambda item: item.name)
     except OSError as exc:
-        _warn_inbox(f"could not prune scratch {scratch_dir}: {exc}")
+        _warn_scratch(f"could not prune scratch {scratch_dir}: {exc}")
         return ()
     pruned: list[Path] = []
     for entry in entries:
         try:
             if _is_symlink_or_junction(entry):
-                continue
-            if entry.is_dir():
-                shutil.rmtree(entry)
+                os.unlink(entry)
+            elif entry.is_dir():
+                _make_tree_writable(entry)
+                if sys.version_info >= (3, 12):
+                    shutil.rmtree(entry, onexc=_rmtree_onexc)
+                else:
+                    shutil.rmtree(entry, onerror=_rmtree_onerror)
             else:
-                entry.unlink()
+                try:
+                    entry.unlink()
+                except PermissionError:
+                    os.chmod(entry, stat.S_IWRITE | stat.S_IREAD)
+                    entry.unlink()
         except FileNotFoundError:
             continue
         except OSError as exc:
-            _warn_inbox(f"could not remove scratch entry {entry}: {exc}")
+            _warn_scratch(f"could not remove scratch entry {entry}: {exc}")
             continue
         pruned.append(entry)
     with suppress(OSError):
