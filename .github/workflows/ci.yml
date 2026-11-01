@@ -90,3 +90,31 @@ jobs:
 
       - name: Run installer dry run
         run: craftsman install --all --dry-run
+
+  packaging-smoke-test:
+    name: Distribution Packaging Smoke Test (ubuntu-latest, Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+
+      - name: Wheel smoke test in clean virtualenv
+        run: |
+          python -m venv test_env
+          test_env/bin/pip install dist/*.whl
+          test_env/bin/craftsman doctor
+          test_env/bin/craftsman doctor --json
+          test_env/bin/craftsman install --all --dry-run
+          test_env/bin/craftsman skill list
+          test_env/bin/craftsman export --claude-plugin plugins/claude/craftsman --check
