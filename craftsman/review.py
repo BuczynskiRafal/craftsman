@@ -864,7 +864,7 @@ def _cover_one(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, str]:
         round_ = require_current_round(current, snap)
-        return _record_coverage(current, round_, lenses, targets, one_line(args.note), target_kind=target_kind)
+        return _record_coverage(current, round_, lenses, targets, args.note, target_kind=target_kind)
 
     return _run_single(ws, bool(args.check), record, print)
 
@@ -918,7 +918,7 @@ def _cover_one_from_json(
     lenses = _parse_json_lenses(raw, f)
     target_key = _target_key(raw, lenses)
     targets = [item.strip() for item in f.texts(target_key) if item.strip()]
-    note = one_line(f.text("note"))
+    note = f.text("note")
     f.reject_unknown()
     return _record_coverage(
         state, round_, lenses, targets, note, target_kind=target_key, rejected_by=rejected_by
@@ -1018,9 +1018,9 @@ def _add_one(args: argparse.Namespace) -> int:
             path=path,
             line=args.line,
             severity=args.severity,
-            title=one_line(args.title),
-            scenario=one_line(args.scenario),
-            suggestion=one_line(args.suggestion) if args.suggestion else "",
+            title=args.title,
+            scenario=args.scenario,
+            suggestion=args.suggestion or "",
             signal_id=args.signal,
         )
 
@@ -1058,9 +1058,9 @@ def _add_one_from_json(
     raw_file = f.text("file")
     line = f.integer("line")
     severity = f.choice("severity", SEVERITIES)
-    title = one_line(f.text("title"))
-    scenario = one_line(f.text("scenario"))
-    suggestion = one_line(f.text_or("suggestion", ""))
+    title = f.text("title")
+    scenario = f.text("scenario")
+    suggestion = f.text_or("suggestion", "")
     signal_id = f.text_if_present("signal")
     f.reject_unknown()
     path = _finding_path(ws.root, cwd, raw_file, snap)
@@ -1103,7 +1103,7 @@ def _ack(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, SignalAck]:
         require_current_round(current, snap)
-        return ack_signal(current, args.signal_id, one_line(args.reason))
+        return ack_signal(current, args.signal_id, args.reason)
 
     ack = mutate(ws.ledger_path, record)
     print(f"{ack.signal_id} acknowledged in round {ack.round}: {ack.reason}")
@@ -1177,9 +1177,9 @@ def _merge(args: argparse.Namespace) -> int:
             current,
             args.target_id,
             args.duplicate_ids,
-            title=one_line(args.title) if args.title is not None else None,
-            scenario=one_line(args.scenario) if args.scenario is not None else None,
-            suggestion=one_line(args.suggestion) if args.suggestion is not None else None,
+            title=args.title,
+            scenario=args.scenario,
+            suggestion=args.suggestion,
         )
         return updated, (target, duplicates)
 
@@ -1245,7 +1245,7 @@ def _verdict_one(args: argparse.Namespace) -> int:
     return _run_single(
         ws,
         bool(args.check),
-        lambda current: set_verdict(current, args.finding_id, args.verdict, one_line(args.evidence), args.run),
+        lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run),
         _print_verdict,
     )
 
@@ -1254,7 +1254,7 @@ def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
     f = Fields(raw)
     finding_id = f.text("id")
     verdict = f.choice("as", VERDICTS)
-    evidence = one_line(f.text("evidence"))
+    evidence = f.text("evidence")
     run_id = f.text_if_present("run")
     f.reject_unknown()
     return set_verdict(state, finding_id, verdict, evidence, run_id)
@@ -1290,7 +1290,7 @@ def _resolve(args: argparse.Namespace) -> int:
     finding = mutate(
         ws.ledger_path,
         lambda current: resolve(
-            current, args.finding_id, args.resolution, one_line(args.note), fingerprint=snap.fingerprint
+            current, args.finding_id, args.resolution, args.note, fingerprint=snap.fingerprint
         ),
     )
     print(f"{finding.id} resolved as {finding.resolution}")
@@ -1299,7 +1299,7 @@ def _resolve(args: argparse.Namespace) -> int:
 
 def _waive_run(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
-    run = mutate(ws.ledger_path, lambda current: waive_run(current, args.run_id, one_line(args.reason)))
+    run = mutate(ws.ledger_path, lambda current: waive_run(current, args.run_id, args.reason))
     print(f"{run.id} waived; it no longer blocks the gate")
     return 0
 
@@ -1493,7 +1493,7 @@ def _findings_table(findings: Sequence[Finding]) -> list[str]:
         verdict = f"{finding.verdict or '—'}{run}"
         lines.append(
             f"| {finding.id} | {finding.severity} | {verdict} | {finding.resolution or '—'} | "
-            f"`{inline_md(finding.path, table=True)}:{finding.line}` | {inline_md(finding.title, table=True)} |"
+            f"`{_cell(finding.path)}:{finding.line}` | {_cell(finding.title)} |"
         )
     return lines
 

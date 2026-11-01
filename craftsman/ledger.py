@@ -946,7 +946,7 @@ def add_fact(
         id=next_id("F-", (item.id for item in ledger.facts)),
         hunks=tuple(dict.fromkeys(hunks)),
         source=source,
-        text=text.strip(),
+        text=one_line(text),
         file_digest=source_digest,
         author_lens=author_lens,
     )

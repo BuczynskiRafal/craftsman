@@ -698,7 +698,7 @@ def _symbol_lines(
     if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
         lines.append("Last runs: " + " · ".join(ctx.last_runs))
     for fact in ctx.facts_by_hunk.get(hunk.id, ()):
-        lines.append(f"Facts: {fact.id} {fact.text} (source {fact.source.path}:{fact.source.line})")
+        lines.append(f"Facts: {fact.id} {inline_md(fact.text)} (source {fact.source.path}:{fact.source.line})")
     return lines
 
 
