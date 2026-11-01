@@ -283,7 +283,7 @@ class EntryPointTests(unittest.TestCase):
             [sys.executable, str(REPO_ROOT / "scripts" / "craftsman-stop-gate.py")],
             input=json.dumps({"terminationReason": "TOOL_CALL"}),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
             timeout=30,
         )

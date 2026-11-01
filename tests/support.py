@@ -302,7 +302,7 @@ class GitRepo:
 
     def git(self, *args: str) -> str:
         proc = subprocess.run(
-            ["git", *args], cwd=self.root, capture_output=True, text=True, check=True, timeout=30
+            ["git", *args], cwd=self.root, capture_output=True, encoding="utf-8", check=True, timeout=30
         )
         return proc.stdout
 
@@ -358,7 +358,7 @@ class EvidenceRepo(GitRepo):
             env=env,
             input=stdin,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=timeout,
         )
@@ -474,7 +474,7 @@ class IsolatedHomeTestCase(unittest.TestCase):
             ["git", "config", "--global", *args],
             env=self.env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=30,
         )

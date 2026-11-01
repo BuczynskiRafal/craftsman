@@ -53,7 +53,7 @@ class DoctorTestCase(unittest.TestCase):
             [sys.executable, "-m", "craftsman.cli", "doctor", "--repo-dir", str(REPO_ROOT), *extra],
             cwd=REPO_ROOT,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=120,
             env={
                 **os.environ,

@@ -28,6 +28,7 @@ from craftsman.gate import GateOwner, GateStateError, load_state, state_path_for
 from craftsman.paths import user_home
 from craftsman.records import CRAFTSMAN_AGENTS
 from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
+from craftsman.streams import configure_std_streams
 
 ScopeMode = Literal["deny", "warn", "off"]
 SHELL_TOOL_NAMES = frozenset(
@@ -123,7 +124,13 @@ def _deny(target_desc: str, detail: str = "is outside the repository work tree")
 def _git_config_lines(cwd: Path, *args: str) -> list[str]:
     try:
         proc = subprocess.run(
-            ["git", "config", *args], cwd=cwd, capture_output=True, text=True, timeout=5, check=False
+            ["git", "config", *args],
+            cwd=cwd,
+            capture_output=True,
+            encoding="utf-8",  # git config files are UTF-8; the locale may not be
+            errors="replace",
+            timeout=5,
+            check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return []
@@ -516,6 +523,7 @@ def _emit(decision: str, reason: str | None = None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_std_streams()
     args_list = list(sys.argv[1:] if argv is None else argv)
     if args_list and args_list[0] in ("-h", "--help"):
         print(

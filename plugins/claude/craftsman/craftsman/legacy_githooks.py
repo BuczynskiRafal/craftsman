@@ -71,7 +71,8 @@ def _git_config(home: Path, *args: str) -> subprocess.CompletedProcess[str]:
             ["git", "config", "--global", *args],
             env=_git_env(home),
             capture_output=True,
-            text=True,
+            encoding="utf-8",  # git config files are UTF-8; the locale may not be
+            errors="replace",
             timeout=GIT_TIMEOUT_S,
             check=False,
         )

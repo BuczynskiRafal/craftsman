@@ -205,7 +205,7 @@ class HookExportTests(CopilotTestCase):
         echoed = subprocess.run(
             ["bash", "-c", f"printf '%s\\n' {bash}"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=30,
             check=True,
         )
@@ -236,7 +236,7 @@ class HookExportTests(CopilotTestCase):
             [sys.executable, str(REPO_ROOT / "scripts" / "craftsman-cli.py"), "--version"],
             cwd=self.tmp,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=60,
             check=True,
         )

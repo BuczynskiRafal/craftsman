@@ -723,7 +723,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             ["git", "rev-parse", "--absolute-git-dir"],
             cwd=wt,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         )
         wt_git_dir = Path(proc.stdout.strip()).resolve()
@@ -1094,7 +1094,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             [sys.executable, str(script)],
             input=json.dumps(deny_payload),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=30,
             check=True,
             env={**os.environ, "HOME": str(self.home), "USERPROFILE": str(self.home)},

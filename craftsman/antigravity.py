@@ -36,6 +36,7 @@ from craftsman.gate import (
 )
 from craftsman.ledger import add_agent_event, ledger_path_for, mutate
 from craftsman.records import REVIEWER_AGENT, AgentEvent, Ledger, LedgerError, format_timestamp
+from craftsman.streams import configure_std_streams
 from craftsman.transcript import (
     Entry,
     TranscriptError,
@@ -228,6 +229,7 @@ def _allow_after_error(problem: str) -> dict[str, str]:
 
 
 def main() -> int:
+    configure_std_streams()
     try:
         out = answer(json.loads(sys.stdin.read()))
     except (OSError, ValueError) as exc:

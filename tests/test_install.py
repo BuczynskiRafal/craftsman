@@ -604,7 +604,7 @@ class BootstrapTests(InstallTestCase):
             ["bash", str(REPO_ROOT / "install.sh"), "--all"],
             env=self.env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=300,
         )
