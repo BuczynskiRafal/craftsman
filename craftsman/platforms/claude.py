@@ -484,11 +484,10 @@ def build_plugin_files(repo_dir: Path) -> dict[str, str]:
 
     # Craftsman source package: copy all .py files
     craftsman_root = repo_dir / "craftsman"
-    if craftsman_root.is_dir():
-        for p in sorted(craftsman_root.rglob("*.py")):
-            if p.is_file() and "__pycache__" not in p.parts:
-                rel = p.relative_to(craftsman_root).as_posix()
-                files[f"craftsman/{rel}"] = p.read_text(encoding="utf-8")
+    for p in sorted(craftsman_root.rglob("*.py")):
+        if p.is_file() and "__pycache__" not in p.parts:
+            rel = p.relative_to(craftsman_root).as_posix()
+            files[f"craftsman/{rel}"] = p.read_text(encoding="utf-8")
 
     return files
 
@@ -497,6 +496,13 @@ def export_claude_plugin(
     repo_dir: Path, plugin_dir: Path, *, check: bool = False
 ) -> list[str]:
     """Export or verify standalone Claude Code plugin tree."""
+    # The plugin bundles the package source and the repository's marketplace catalog; the assets
+    # inside an installed package have neither, and the result would be a plugin without its CLI.
+    if not (repo_dir / "craftsman" / "__init__.py").is_file():
+        raise ExportError(
+            f"--claude-plugin builds from a Craftsman source checkout and {repo_dir} is not one; "
+            "pass --repo-dir <checkout>"
+        )
     files = build_plugin_files(repo_dir)
     marketplace_file = repo_dir / ".claude-plugin" / "marketplace.json"
     marketplace_expected = _render_marketplace_manifest()
