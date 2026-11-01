@@ -8,6 +8,7 @@ base folder; `craftsman uninstall` works from those manifests alone.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -17,10 +18,14 @@ from craftsman.files import UnsafePathError
 from craftsman.generated import ExportError
 from craftsman.legacy_githooks import legacy_git_hooks_bases
 from craftsman.manifest import InstallError, TargetKind
-from craftsman.paths import default_repo_dir, user_home
+from craftsman.paths import default_claude_dir, default_repo_dir, user_home
 from craftsman.platforms.agents_md import install_agents_workspace_target
 from craftsman.platforms.antigravity import detect_antigravity, install_antigravity_target
-from craftsman.platforms.claude import detect_claude, install_claude_target
+from craftsman.platforms.claude import (
+    detect_claude,
+    install_claude_target,
+    is_claude_plugin_active,
+)
 from craftsman.platforms.copilot import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
@@ -73,6 +78,46 @@ def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) 
     )
 
 
+def check_ephemeral_uv_interpreter(python: str | None = None) -> None:
+    """Refuse installation when running under an ephemeral uvx interpreter path."""
+    exe = Path(python or sys.executable).resolve()
+    exe_str = str(exe).replace("\\", "/").lower()
+
+    # Persistent uv tools are installed in e.g. ~/.local/share/uv/tools/ or %LOCALAPPDATA%/uv/tools/
+    if "/uv/tools/" in exe_str or "\\uv\\tools\\" in str(exe).lower():
+        return
+
+    uv_cache = os.environ.get("UV_CACHE_DIR")
+    if uv_cache and str(Path(uv_cache).resolve()).replace("\\", "/").lower() in exe_str:
+        raise InstallError(
+            f"Refusing to install lifecycle hooks using an ephemeral uvx interpreter ({exe}): "
+            "the cache environment may be deleted by uv, causing hook failures (exit code 127). "
+            "Use 'uv tool install craftsman-gate' or 'pipx install craftsman-gate' instead."
+        )
+
+    is_ephemeral = (
+        "/.cache/uv/" in exe_str
+        or "/library/caches/uv/" in exe_str
+        or "/appdata/local/uv/cache/" in exe_str
+        or "/uv/cache/" in exe_str
+        or (
+            "/uv/" in exe_str
+            and (
+                "archive-" in exe_str
+                or "environments-" in exe_str
+                or "archive" in exe.parts
+                or "environments" in exe.parts
+            )
+        )
+    )
+    if is_ephemeral:
+        raise InstallError(
+            f"Refusing to install lifecycle hooks using an ephemeral uvx interpreter ({exe}): "
+            "the cache environment may be deleted by uv, causing hook failures (exit code 127). "
+            "Use 'uv tool install craftsman-gate' or 'pipx install craftsman-gate' instead."
+        )
+
+
 def _check_copilot_scopes(config: InstallConfig, home: Path) -> None:
     if config.allow_duplicate_scopes:
         return
@@ -83,6 +128,18 @@ def _check_copilot_scopes(config: InstallConfig, home: Path) -> None:
     workspace = config.copilot_workspace or Path.cwd()
     if config.copilot and has_workspace_copilot_install(workspace, config.repo_dir):
         raise InstallError(DUPLICATE_SCOPE_WS_TO_USER_MSG)
+
+
+def _check_claude_scopes(config: InstallConfig, home: Path) -> None:
+    if config.allow_duplicate_scopes or not config.claude:
+        return
+    claude_dir = default_claude_dir(home)
+    if is_claude_plugin_active(claude_dir):
+        raise InstallError(
+            "Refusing to install Claude Code user-level hooks while the craftsman Claude Code "
+            "plugin is active (hooks would fire twice). Pass --allow-duplicate-scopes to override, "
+            "or uninstall the plugin first."
+        )
 
 
 def _remove_legacy_git_hooks(config: InstallConfig, home: Path, tracker: Tracker) -> None:
@@ -106,10 +163,12 @@ def _remove_legacy_git_hooks(config: InstallConfig, home: Path, tracker: Tracker
 def run_install(config: InstallConfig, tracker: Tracker, home: Path | None = None) -> None:
     home = user_home(home)
     repo_dir = config.repo_dir
+    check_ephemeral_uv_interpreter()
     if not (repo_dir / "skills").is_dir() or not (repo_dir / "rules").is_dir():
         raise InstallError(f"Repository assets (skills/, rules/) not found under {repo_dir}")
     config = resolve_install_config(config, home, tracker)
     _check_copilot_scopes(config, home)
+    _check_claude_scopes(config, home)
     _remove_legacy_git_hooks(config, home, tracker)
     if config.antigravity:
         install_antigravity_target(repo_dir, home, config.mode, tracker)

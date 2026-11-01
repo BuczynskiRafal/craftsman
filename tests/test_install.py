@@ -13,8 +13,8 @@ from craftsman.assets import iter_skills
 from craftsman.doctor import detect_antigravity_drift, scan_copilot_duplicates
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import CRAFTSMAN_BEGIN_MARKER
-from craftsman.install import parse_install_args
-from craftsman.manifest import MANIFEST_FILENAME, TargetKind, load_manifest
+from craftsman.install import check_ephemeral_uv_interpreter, parse_install_args
+from craftsman.manifest import MANIFEST_FILENAME, InstallError, TargetKind, load_manifest
 from craftsman.paths import default_vscode_prompts_dir
 from craftsman.platforms.claude import is_craftsman_hook_command
 from craftsman.staging import InstallMode
@@ -620,6 +620,48 @@ class BootstrapTests(InstallTestCase):
 
         for base in (self.config_dir, self.claude_dir, self.home / ".copilot"):
             self.assertTrue((base / MANIFEST_FILENAME).is_file(), base)
+
+    def test_ephemeral_uv_interpreter_refusal(self) -> None:
+        # Ephemeral paths should raise InstallError
+        ephemeral_paths = [
+            "/home/user/.cache/uv/archive-12345/bin/python",
+            "/Users/user/Library/Caches/uv/environments-abcd/bin/python3",
+            "C:\\Users\\user\\AppData\\Local\\uv\\cache\\archive-1\\Scripts\\python.exe",
+        ]
+        for path in ephemeral_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(InstallError) as ctx:
+                    check_ephemeral_uv_interpreter(path)
+                self.assertIn("ephemeral uvx interpreter", str(ctx.exception))
+                self.assertIn("uv tool install craftsman-gate", str(ctx.exception))
+
+        # Persistent tool paths or system paths should NOT raise
+        persistent_paths = [
+            "/home/user/.local/share/uv/tools/craftsman-gate/bin/python",
+            "/opt/homebrew/bin/python3",
+            "/usr/bin/python3",
+            "C:\\Users\\user\\AppData\\Local\\uv\\tools\\craftsman-gate\\bin\\python.exe",
+        ]
+        for path in persistent_paths:
+            with self.subTest(path=path):
+                check_ephemeral_uv_interpreter(path)
+
+    def test_refuse_claude_install_when_plugin_active(self) -> None:
+        plugins_dir = self.claude_dir / "plugins"
+        plugins_dir.mkdir(parents=True)
+        (plugins_dir / "installed_plugins.json").write_text(
+            json.dumps({"craftsman@craftsman": {"source": "market"}}), encoding="utf-8"
+        )
+
+        # Installing --claude should refuse by default
+        result = self.install("--claude")
+        self.assertNotEqual(result.code, 0)
+        self.assertIn("Refusing to install Claude Code user-level hooks", result.err)
+        self.assertIn("--allow-duplicate-scopes", result.err)
+
+        # Passing --allow-duplicate-scopes succeeds
+        ok_result = self.install("--claude", "--allow-duplicate-scopes")
+        self.assertEqual(ok_result.code, 0, ok_result.err)
 
 
 if __name__ == "__main__":
