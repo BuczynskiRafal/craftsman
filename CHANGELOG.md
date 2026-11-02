@@ -13,7 +13,8 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Modular documentation (`docs/`)**: Reference material moved from `README.md` into modular guides:
   [`docs/how-it-works.md`](docs/how-it-works.md), [`docs/installation.md`](docs/installation.md),
   [`docs/usage.md`](docs/usage.md), [`docs/guards.md`](docs/guards.md), [`docs/skills.md`](docs/skills.md),
-  and [`docs/benchmark.md`](docs/benchmark.md). `README.md` is condensed to a 30-second first impression.
+  and [`docs/benchmark.md`](docs/benchmark.md). `README.md` is rewritten as a short overview: what the gate
+  enforces, the review loop step by step, supported platforms, and the pilot measurements.
 - **Claude Code plugin**: The repository root is a Claude Code plugin and its own marketplace
   (`.claude-plugin/marketplace.json` with `"source": "./"`), installed with
   `/plugin marketplace add BuczynskiRafal/craftsman` and `/plugin install craftsman@craftsman`. Skills and
@@ -358,8 +359,8 @@ All notable changes to Craftsman are recorded here. The format follows
   follow-up fixes).
 
 [Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...HEAD
-[4.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/v4.0.0...v4.1.0
-[4.0.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.3.0...v4.0.0
+[4.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/a4458c4...v4.1.0
+[4.0.0]: https://github.com/BuczynskiRafal/craftsman/commit/a4458c4
 [3.3.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.1.0...v3.2.0
 [3.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.0.0...v3.1.0
