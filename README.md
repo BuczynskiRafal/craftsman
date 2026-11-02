@@ -1,10 +1,10 @@
 # Craftsman
 
 [![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-4.1.0-emerald.svg)](plugin.json)
-[![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](pyproject.toml)
-[![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-4.1.0-emerald.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/plugin.json)
+[![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
+[![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE)
 
 Craftsman adds a layer to an AI coding agent that checks the quality and simplicity of the code it
 delivers. The agent cannot finish its work until an independent reviewer has examined the change.
@@ -62,7 +62,7 @@ as `SELF-REVIEWED`.
 
 Pilot on [SWR-Bench](https://doi.org/10.1145/3808144): 5 PRs from `pytest`, `flask`, and `requests`,
 9 confirmed defects, 1 repetition per configuration. The sample is too small for statistical
-conclusions. Details and Claude Code runs: [docs/benchmark.md](docs/benchmark.md).
+conclusions. Details and Claude Code runs: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
 
 | Configuration | Defects: without → with Craftsman | Avg. time per PR |
 | :--- | :---: | :---: |
@@ -99,17 +99,17 @@ agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
 
 ## Documentation
 
-- [How it works](docs/how-it-works.md): ledger, lenses, gears, platform enforcement
-- [Installation](docs/installation.md): flags, platform setup, uninstall, `craftsman doctor`
-- [Usage](docs/usage.md): commands, review-only mode
-- [Guards](docs/guards.md): gate state machine, search scope guard
-- [Skills](docs/skills.md): catalog of bundled skills
-- [Benchmark](docs/benchmark.md): methodology, results, replication
-- [Architecture](docs/harness-architecture.md): project internals for contributors
+- [How it works](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md): ledger, lenses, gears, platform enforcement
+- [Installation](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md): flags, platform setup, uninstall, `craftsman doctor`
+- [Usage](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md): commands, review-only mode
+- [Guards](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/guards.md): gate state machine, search scope guard
+- [Skills](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md): catalog of bundled skills
+- [Benchmark](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md): methodology, results, replication
+- [Architecture](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/harness-architecture.md): project internals for contributors
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](https://github.com/BuczynskiRafal/craftsman/blob/main/CONTRIBUTING.md).
 
 ## Citation
 
@@ -128,4 +128,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE) and attribution in [NOTICE](NOTICE).
+MIT, see [LICENSE](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE) and attribution in [NOTICE](https://github.com/BuczynskiRafal/craftsman/blob/main/NOTICE).

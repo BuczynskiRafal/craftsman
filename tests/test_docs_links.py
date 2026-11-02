@@ -10,6 +10,7 @@ from pathlib import Path
 MD_LINK_RE = re.compile(r"!?\[(?:[^\]\\]|\\.)*\]\(([^)]+)\)")
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 RAW_GITHUB_PREFIX = "https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/"
+BLOB_GITHUB_PREFIX = "https://github.com/BuczynskiRafal/craftsman/blob/main/"
 
 
 def github_slug(heading_text: str) -> str:
@@ -72,14 +73,19 @@ class TestDocsLinks(unittest.TestCase):
                 # Strip angle brackets if present: e.g. (<foo.md>)
                 target = target.strip("<>")
 
-                # 1. Raw GitHub repository URLs for repo diagrams/assets
-                if target.startswith(RAW_GITHUB_PREFIX):
-                    rel_repo_path = target[len(RAW_GITHUB_PREFIX) :]
+                # 1. Absolute GitHub URLs into this repository (raw assets, or files linked
+                #    absolutely so they also resolve on PyPI)
+                repo_prefix = next(
+                    (p for p in (RAW_GITHUB_PREFIX, BLOB_GITHUB_PREFIX) if target.startswith(p)),
+                    None,
+                )
+                if repo_prefix is not None:
+                    rel_repo_path = target[len(repo_prefix) :].split("#", 1)[0]
                     local_target = self.repo_root / rel_repo_path
                     if not local_target.exists():
                         broken_links.append(
                             f"{doc_path.relative_to(self.repo_root)}: "
-                            f"Raw GitHub asset not found locally: {rel_repo_path}"
+                            f"GitHub repository file not found locally: {rel_repo_path}"
                         )
                     continue
 
