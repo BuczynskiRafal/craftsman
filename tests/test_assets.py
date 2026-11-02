@@ -24,12 +24,12 @@ class AssetsTestCase(unittest.TestCase):
 
     def fake_repo(self, agent_body: str) -> Path:
         repo = self.tmp / "fake-repo"
-        (repo / "agents").mkdir(parents=True)
+        (repo / "templates" / "agents").mkdir(parents=True)
         (repo / "docs").mkdir()
         (repo / "docs" / "part.md").write_text(
             "---\nname: part\n---\nIncluded text.\n", encoding="utf-8"
         )
-        (repo / "agents" / "helper.md").write_text(
+        (repo / "templates" / "agents" / "helper.md").write_text(
             "---\nname: helper\ndescription: >-\n  Helps with\n  things that aren't hard.\nrole: reviewer\n---\n"
             + agent_body,
             encoding="utf-8",
@@ -61,7 +61,7 @@ class AgentTemplateTests(AssetsTestCase):
 
     def test_unknown_role_is_an_error(self) -> None:
         repo = self.fake_repo("body\n")
-        (repo / "agents" / "helper.md").write_text(
+        (repo / "templates" / "agents" / "helper.md").write_text(
             "---\nname: helper\ndescription: x\nrole: boss\n---\nbody\n", encoding="utf-8"
         )
 
@@ -152,13 +152,18 @@ class LocationTests(AssetsTestCase):
         ):
             self.assertEqual(default_vscode_user_dir(self.tmp), appdata / "Code" / "User")
 
-    def test_windows_without_appdata_is_an_error(self) -> None:
-        with (
-            mock.patch.object(sys, "platform", "win32"),
-            mock.patch.dict(os.environ, {}, clear=True),
-            self.assertRaisesRegex(ExportError, "APPDATA is not set"),
-        ):
-            default_vscode_user_dir(self.tmp)
+    def test_windows_without_appdata_defaults_to_roaming(self) -> None:
+        expected = self.tmp / "AppData" / "Roaming" / "Code" / "User"
+        # The running user's home must stay resolvable: Windows finds it only through USERPROFILE.
+        other_home = str(self.tmp.parent / "other-home")
+        outside = {"APPDATA": str(self.tmp.parent / "elsewhere"), "HOME": other_home, "USERPROFILE": other_home}
+        for environ in ({}, outside):
+            with (
+                self.subTest(environ=environ),
+                mock.patch.object(sys, "platform", "win32"),
+                mock.patch.dict(os.environ, environ, clear=True),
+            ):
+                self.assertEqual(default_vscode_user_dir(self.tmp), expected)
 
     def test_setting_outside_an_explicit_home_is_ignored(self) -> None:
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/opt/cfg"}):

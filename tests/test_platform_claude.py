@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,8 +13,12 @@ from craftsman.assets import AgentTemplate, Skill, load_agent_templates
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import ExportError, is_craftsman_generated_file
 from craftsman.platforms.claude import (
+    CLAUDE_HOOK_EVENTS,
+    PLUGIN_LAUNCHERS,
     claude_agent_templates,
+    export_claude_plugin,
     export_to_claude_user,
+    is_claude_plugin_active,
     is_craftsman_hook_command,
     merge_claude_hooks,
     render_claude_agent,
@@ -39,17 +44,144 @@ class ClaudeTestCase(unittest.TestCase):
 
     def fake_repo(self, agent_body: str) -> Path:
         repo = self.tmp / "fake-repo"
-        (repo / "agents").mkdir(parents=True)
+        (repo / "templates" / "agents").mkdir(parents=True)
         (repo / "docs").mkdir()
         (repo / "docs" / "part.md").write_text(
             "---\nname: part\n---\nIncluded text.\n", encoding="utf-8"
         )
-        (repo / "agents" / "helper.md").write_text(
+        (repo / "templates" / "agents" / "helper.md").write_text(
             "---\nname: helper\ndescription: >-\n  Helps with\n  things that aren't hard.\nrole: reviewer\n---\n"
             + agent_body,
             encoding="utf-8",
         )
         return repo
+
+
+class ClaudePluginDetectionTests(ClaudeTestCase):
+    def write_json(self, rel_path: str, data: object) -> None:
+        path = self.tmp / rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def installed(self, plugins: object) -> None:
+        self.write_json("plugins/installed_plugins.json", plugins)
+
+    def test_claude_codes_wrapped_installed_plugins_file_is_read(self) -> None:
+        entry = [{"scope": "project", "installPath": "/x", "version": "4.0.0"}]
+        self.installed({"version": 2, "plugins": {"craftsman@craftsman": entry}})
+
+        self.assertTrue(is_claude_plugin_active(self.tmp))
+
+    def test_the_plugin_from_any_marketplace_counts(self) -> None:
+        self.installed({"version": 2, "plugins": {"craftsman@my-fork": []}})
+
+        self.assertTrue(is_claude_plugin_active(self.tmp))
+
+    def test_other_plugins_naming_craftsman_do_not_count(self) -> None:
+        self.installed({"version": 2, "plugins": {"my-craftsman-helper@market": []}})
+        self.write_json("settings.json", {"enabledPlugins": {"craftsman-extras@market": True}})
+
+        self.assertFalse(is_claude_plugin_active(self.tmp))
+
+    def test_bare_maps_and_lists_of_ids_are_read(self) -> None:
+        cases: tuple[object, ...] = (
+            {"craftsman@craftsman": {}},
+            ["craftsman@craftsman"],
+            [{"name": "craftsman"}],
+        )
+        for plugins in cases:
+            with self.subTest(plugins=plugins):
+                self.installed(plugins)
+                self.assertTrue(is_claude_plugin_active(self.tmp))
+
+    def test_user_settings_enable_or_disable_the_plugin(self) -> None:
+        self.write_json("settings.json", {"enabledPlugins": {"craftsman@craftsman": True}})
+        self.assertTrue(is_claude_plugin_active(self.tmp))
+
+        self.installed({"version": 2, "plugins": {"craftsman@craftsman": []}})
+        self.write_json("settings.json", {"enabledPlugins": {"craftsman@craftsman": False}})
+        self.assertFalse(is_claude_plugin_active(self.tmp))
+
+    def test_unreadable_files_mean_no_plugin(self) -> None:
+        (self.tmp / "plugins").mkdir()
+        (self.tmp / "plugins" / "installed_plugins.json").write_text("{", encoding="utf-8")
+        (self.tmp / "settings.json").write_text("{", encoding="utf-8")
+
+        self.assertFalse(is_claude_plugin_active(self.tmp))
+
+
+class ClaudePluginExportTests(ClaudeTestCase):
+    def fake_checkout(self) -> Path:
+        repo = self.fake_repo("Review the packet.\n")
+        (repo / "craftsman").mkdir()
+        (repo / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
+        for launcher in PLUGIN_LAUNCHERS:
+            (repo / launcher).parent.mkdir(exist_ok=True)
+            (repo / launcher).write_text("launcher\n", encoding="utf-8")
+        return repo
+
+    def test_committed_plugin_matches_the_source(self) -> None:
+        files = export_claude_plugin(REPO_ROOT, check=True)
+        self.assertIn(".claude-plugin/plugin.json", files)
+
+    def test_the_repository_root_is_the_plugin(self) -> None:
+        plugin_dir = REPO_ROOT / ".claude-plugin"
+        catalog = json.loads((plugin_dir / "marketplace.json").read_text(encoding="utf-8"))
+        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
+
+        # Claude Code refuses a marketplace without an owner.
+        self.assertIn("name", catalog["owner"])
+        self.assertEqual([entry["source"] for entry in catalog["plugins"]], ["./"])
+        self.assertTrue(all((REPO_ROOT / path).is_file() for path in manifest["agents"]))
+        self.assertEqual(sorted(manifest["hooks"]), sorted(CLAUDE_HOOK_EVENTS))
+        for groups in manifest["hooks"].values():
+            command = groups[0]["hooks"][0]["command"]
+            self.assertTrue(command.startswith('"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" hook '), command)
+        self.assertTrue((REPO_ROOT / "skills" / "craftsman" / "SKILL.md").is_file())
+        if os.name != "nt":
+            self.assertTrue(os.access(REPO_ROOT / "bin" / "launcher.sh", os.X_OK))
+
+    def test_assets_without_the_package_source_are_refused(self) -> None:
+        # An installed package's assets have skills and agents but neither the source nor the launchers.
+        assets = self.fake_repo("Review the packet.\n")
+        for check in (False, True):
+            with self.subTest(check=check), self.assertRaisesRegex(ExportError, "source checkout"):
+                export_claude_plugin(assets, check=check)
+        self.assertFalse((assets / ".claude-plugin").exists())
+
+    def test_export_renders_the_agents_and_check_accepts_it(self) -> None:
+        repo = self.fake_checkout()
+        written = export_claude_plugin(repo)
+        self.assertEqual(export_claude_plugin(repo, check=True), written)
+        agent = (repo / ".claude-plugin" / "agents" / "helper.md").read_text(encoding="utf-8")
+        self.assertIn("tools: Read, Grep, Glob, Bash", agent)
+        self.assertNotIn("role:", agent)
+
+    def test_check_names_every_drifted_file(self) -> None:
+        repo = self.fake_checkout()
+        export_claude_plugin(repo)
+        (repo / ".claude-plugin" / "agents" / "helper.md").write_text("stale\n", encoding="utf-8")
+        (repo / ".claude-plugin" / "agents" / "removed.md").write_text("", encoding="utf-8")
+        (repo / ".claude-plugin" / "marketplace.json").unlink()
+        (repo / "bin" / "launcher.sh").unlink()
+        with self.assertRaises(ExportError) as caught:
+            export_claude_plugin(repo, check=True)
+        for line in (
+            "differs: .claude-plugin/agents/helper.md",
+            "extra: .claude-plugin/agents/removed.md",
+            "missing: .claude-plugin/marketplace.json",
+            "missing: bin/launcher.sh",
+        ):
+            self.assertIn(line, str(caught.exception))
+
+    def test_export_drops_the_agents_of_removed_templates(self) -> None:
+        repo = self.fake_checkout()
+        stale = repo / ".claude-plugin" / "agents" / "removed.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("", encoding="utf-8")
+        export_claude_plugin(repo)
+        self.assertFalse(stale.exists())
+        self.assertEqual(export_claude_plugin(repo, check=True), export_claude_plugin(repo))
 
 
 class ClaudeAgentRenderingTests(ClaudeTestCase):

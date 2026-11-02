@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
@@ -13,9 +15,10 @@ from craftsman.assets import iter_skills
 from craftsman.doctor import detect_antigravity_drift, scan_copilot_duplicates
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import CRAFTSMAN_BEGIN_MARKER
-from craftsman.install import parse_install_args
-from craftsman.manifest import MANIFEST_FILENAME, TargetKind, load_manifest
+from craftsman.install import check_ephemeral_uv_interpreter, parse_install_args
+from craftsman.manifest import MANIFEST_FILENAME, InstallError, TargetKind, load_manifest
 from craftsman.paths import default_vscode_prompts_dir
+from craftsman.platforms.antigravity import is_agy_plugin_active
 from craftsman.platforms.claude import is_craftsman_hook_command
 from craftsman.staging import InstallMode
 
@@ -118,9 +121,34 @@ class AntigravityTests(InstallTestCase):
 
         self.assert_ok(self.install("--antigravity", "--plugin"))
 
-        self.assertEqual((self.config_dir / "plugins" / "craftsman").resolve(), REPO_ROOT.resolve())
+        self.assertTrue((self.config_dir / "plugins" / "craftsman" / "plugin.json").is_file())
         self.assertFalse((self.config_dir / "skills" / "craftsman").exists())
         self.assertFalse((self.config_dir / "hooks.json").exists())
+
+    def test_plugin_mode_copies_what_agy_loads(self) -> None:
+        # agy skips a plugin folder that is a symlink, and would load agents/ unrendered.
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        plugin = self.config_dir / "plugins" / "craftsman"
+        self.assertFalse(plugin.is_symlink())
+        self.assertEqual(
+            sorted(p.name for p in plugin.iterdir()),
+            ["craftsman", "hooks.json", "plugin.json", "rules", "scripts", "skills"],
+        )
+        self.assertTrue((plugin / "skills" / "code-review" / "lenses.md").is_file())
+        self.assertTrue((plugin / "craftsman" / "antigravity.py").is_file())
+        if os.name == "posix":
+            self.assertTrue(os.access(plugin / "scripts" / "craftsman-stop-gate.py", os.X_OK))
+        self.assertEqual(detect_antigravity_drift(REPO_ROOT, self.config_dir), [])
+
+    def test_a_stale_plugin_copy_is_drift(self) -> None:
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+        skill = self.config_dir / "plugins" / "craftsman" / "skills" / "verify" / "SKILL.md"
+        skill.write_text("stale\n", encoding="utf-8")
+
+        drifted = detect_antigravity_drift(REPO_ROOT, self.config_dir)
+
+        self.assertEqual(drifted, ["plugins/craftsman/skills/verify/SKILL.md"])
 
     def test_users_skill_is_moved_where_it_is_not_discovered(self) -> None:
         skill = self.config_dir / "skills" / "craftsman"
@@ -597,6 +625,7 @@ class DryRunTests(InstallTestCase):
 
 
 class BootstrapTests(InstallTestCase):
+    @unittest.skipIf(os.name == "nt", "install.sh is the POSIX installer")
     def test_install_sh_installs_everything_then_uninstall_empties_home(self) -> None:
         modes = {p: p.stat().st_mode for p in (REPO_ROOT / "scripts").iterdir()}
 
@@ -604,7 +633,7 @@ class BootstrapTests(InstallTestCase):
             ["bash", str(REPO_ROOT / "install.sh"), "--all"],
             env=self.env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=300,
         )
@@ -621,6 +650,170 @@ class BootstrapTests(InstallTestCase):
         for base in (self.config_dir, self.claude_dir, self.home / ".copilot"):
             self.assertTrue((base / MANIFEST_FILENAME).is_file(), base)
 
+    def test_ephemeral_uv_interpreter_refusal(self) -> None:
+        # Ephemeral paths should raise InstallError
+        ephemeral_paths = [
+            "/home/user/.cache/uv/archive-12345/bin/python",
+            "/Users/user/Library/Caches/uv/environments-abcd/bin/python3",
+            "C:\\Users\\user\\AppData\\Local\\uv\\cache\\archive-1\\Scripts\\python.exe",
+        ]
+        for path in ephemeral_paths:
+            with self.subTest(path=path):
+                with self.assertRaises(InstallError) as ctx:
+                    check_ephemeral_uv_interpreter(path)
+                self.assertIn("ephemeral uvx interpreter", str(ctx.exception))
+                self.assertIn("uv tool install craftsman-gate", str(ctx.exception))
+
+        # Persistent tool paths or system paths should NOT raise
+        persistent_paths = [
+            "/home/user/.local/share/uv/tools/craftsman-gate/bin/python",
+            "/opt/homebrew/bin/python3",
+            "/usr/bin/python3",
+            "C:\\Users\\user\\AppData\\Local\\uv\\tools\\craftsman-gate\\bin\\python.exe",
+        ]
+        for path in persistent_paths:
+            with self.subTest(path=path):
+                check_ephemeral_uv_interpreter(path)
+
+    def uvx_interpreter(self, cache: Path) -> str:
+        """A uvx-style cache environment whose `bin/python` links to the real interpreter."""
+        python = cache / "archive-v0" / "abc123" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        try:
+            python.symlink_to(sys.executable)
+        except OSError as exc:  # Windows without the symlink privilege
+            self.skipTest(f"cannot create a symlink: {exc}")
+        return str(python)
+
+    def test_ephemeral_uv_interpreter_behind_a_symlink_is_refused(self) -> None:
+        # uvx's bin/python resolves to the base interpreter; the cache path is what hooks embed.
+        python = self.uvx_interpreter(self.home / ".cache" / "uv")
+
+        with self.assertRaisesRegex(InstallError, "ephemeral uvx interpreter"):
+            check_ephemeral_uv_interpreter(python)
+
+    def test_interpreter_in_a_custom_uv_cache_dir_is_refused(self) -> None:
+        cache = self.tmp / "uvc"
+        python = self.uvx_interpreter(cache)
+
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(cache)}):
+            with self.assertRaisesRegex(InstallError, "ephemeral uvx interpreter"):
+                check_ephemeral_uv_interpreter(python)
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": str(self.tmp / "uv")}):
+            check_ephemeral_uv_interpreter(str(self.tmp / "uvcx" / "bin" / "python"))
+
+    def test_ephemeral_interpreter_is_refused_only_for_hooks_that_embed_it(self) -> None:
+        python = "/home/user/.cache/uv/archive-v0/abc123/bin/python"
+        workspace = self.tmp / "ws"
+        workspace.mkdir()
+        with mock.patch.object(sys, "executable", python):
+            self.assert_ok(self.install("--agents-workspace", str(workspace)))
+            self.assert_ok(self.install("--claude", "--no-claude-hooks"))
+            for target in ("--claude", "--copilot"):
+                with self.subTest(target=target):
+                    result = self.install(target)
+                    self.assertEqual(result.code, 1)
+                    self.assertIn("ephemeral uvx interpreter", result.err)
+
+    def activate_plugin(self) -> None:
+        plugins_dir = self.claude_dir / "plugins"
+        plugins_dir.mkdir(parents=True)
+        (plugins_dir / "installed_plugins.json").write_text(
+            json.dumps({"version": 2, "plugins": {"craftsman@craftsman": [{"scope": "user"}]}}),
+            encoding="utf-8",
+        )
+
+    def test_auto_detected_claude_is_skipped_while_the_plugin_is_active(self) -> None:
+        self.activate_plugin()
+        (self.home / ".gemini" / "antigravity").mkdir(parents=True)
+
+        result = self.install()
+
+        self.assert_ok(result)
+        self.assertIn("Skipping Claude Code: the craftsman Claude Code plugin is active", result.out)
+        self.assertTrue((self.config_dir / "skills" / "craftsman" / "SKILL.md").is_file())
+        self.assertFalse((self.claude_dir / "commands").exists())
+        self.assertFalse((self.claude_dir / "settings.json").exists())
+
+    def test_claude_without_hooks_installs_beside_the_plugin(self) -> None:
+        self.activate_plugin()
+
+        self.assert_ok(self.install("--claude", "--no-claude-hooks"))
+
+        self.assertTrue((self.claude_dir / "commands" / "craftsman.md").is_file())
+        self.assertFalse((self.claude_dir / "settings.json").exists())
+
+    def test_refuse_claude_install_when_plugin_active(self) -> None:
+        self.activate_plugin()
+
+        # Installing --claude should refuse by default
+        result = self.install("--claude")
+        self.assertNotEqual(result.code, 0)
+        self.assertIn("Refusing to install Claude Code user-level hooks", result.err)
+        self.assertIn("--allow-duplicate-scopes", result.err)
+
+        # Passing --allow-duplicate-scopes succeeds
+        ok_result = self.install("--claude", "--allow-duplicate-scopes")
+        self.assertEqual(ok_result.code, 0, ok_result.err)
+
+
+
+class AgyPluginTests(InstallTestCase):
+    """A craftsman plugin that `agy plugin install` put into ~/.gemini/config/plugins."""
+
+    def agy_install_plugin(self, *, enabled: bool | None = None) -> None:
+        plugin = self.config_dir / "plugins" / "craftsman"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text('{"name": "craftsman"}', encoding="utf-8")
+        if enabled is not None:
+            settings = {"plugins": {"craftsman": {"enabled": enabled}}}
+            (self.config_dir / "config.json").write_text(json.dumps(settings), encoding="utf-8")
+
+    def test_explicit_antigravity_install_is_refused_beside_the_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        result = self.install("--antigravity")
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("agy plugin uninstall craftsman", result.err)
+        self.assertFalse((self.config_dir / "skills").exists())
+        self.assertFalse((self.config_dir / "hooks.json").exists())
+
+    def test_auto_detected_antigravity_is_skipped_beside_the_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        result = self.install()
+
+        self.assert_ok(result)
+        self.assertIn("Skipping Google Antigravity", result.out)
+        self.assertFalse((self.config_dir / "skills").exists())
+
+    def test_allow_duplicate_scopes_installs_beside_the_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        self.assert_ok(self.install("--antigravity", "--allow-duplicate-scopes"))
+
+        self.assertTrue((self.config_dir / "skills" / "craftsman" / "SKILL.md").is_file())
+
+    def test_a_disabled_plugin_does_not_block_the_install(self) -> None:
+        self.agy_install_plugin(enabled=False)
+
+        self.assert_ok(self.install("--antigravity"))
+
+    def test_plugin_mode_replaces_the_agy_plugin(self) -> None:
+        self.agy_install_plugin()
+
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        self.assertTrue((self.config_dir / "plugins" / "craftsman" / "hooks.json").is_file())
+        self.assertFalse(is_agy_plugin_active(self.home))
+
+    def test_craftsmans_own_plugin_mode_is_no_agy_plugin(self) -> None:
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        self.assert_ok(self.install("--antigravity"))
+
+        self.assertFalse((self.config_dir / "plugins" / "craftsman").exists())
 
 if __name__ == "__main__":
     unittest.main()

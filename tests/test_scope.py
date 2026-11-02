@@ -551,7 +551,9 @@ class ScopeEnforcementTests(unittest.TestCase):
 
     def test_only_craftsman_agent_names_are_craftsman_agents(self) -> None:
         self.assertTrue(is_craftsman_agent("Craftsman-Reviewer"))
+        self.assertTrue(is_craftsman_agent("craftsman:craftsman-verifier"))
         self.assertFalse(is_craftsman_agent("my-craftsman-helper"))
+        self.assertFalse(is_craftsman_agent("other:craftsman-reviewer"))
 
     def test_unknown_scope_mode_is_an_error(self) -> None:
         subprocess.run(["git", "config", "craftsman.scope", "enforce"], cwd=self.repo, check=True)
@@ -723,7 +725,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             ["git", "rev-parse", "--absolute-git-dir"],
             cwd=wt,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=True,
         )
         wt_git_dir = Path(proc.stdout.strip()).resolve()
@@ -1094,7 +1096,7 @@ class ScopeEnforcementTests(unittest.TestCase):
             [sys.executable, str(script)],
             input=json.dumps(deny_payload),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=30,
             check=True,
             env={**os.environ, "HOME": str(self.home), "USERPROFILE": str(self.home)},

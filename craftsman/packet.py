@@ -27,6 +27,7 @@ from craftsman.diffscan import (
 from craftsman.ledger import reopened_mentions, valid_facts_for_hunk
 from craftsman.lenses import LensPick
 from craftsman.records import SWEEP_LENS, Fact, FieldError, Ledger, Round
+from craftsman.text import inline_md
 
 MAX_PACKET_CHARS = 120_000
 MAX_QUICK_PACKET_CHARS = 40_000
@@ -319,20 +320,22 @@ def plan_shards(ctx: PacketContext, total: int) -> tuple[PacketShard, ...]:
     for hunk in ctx.snap.hunks:
         if hunk.id in open_ids:
             by_file.setdefault(hunk.path, []).append(hunk)
-    ranked = sorted(
-        ((sum(len(_hunk_section(ctx, h, _Owners.of(ctx, by_file[p]))) for h in by_file[p]), p) for p in open_files),
-        key=lambda item: (-item[0], item[1]),
-    )
+    sizes: list[tuple[int, str]] = []
+    for path in open_files:
+        owners = _Owners.of(ctx, by_file[path])
+        sizes.append((sum(len(_hunk_section(ctx, hunk, owners)) for hunk in by_file[path]), path))
+    ranked = sorted(sizes, key=lambda item: (-item[0], item[1]))
     totals, buckets = [0] * total, [set[str]() for _ in range(total)]
     for size, path in ranked:
         target = min(range(total), key=lambda idx: (totals[idx], idx))
         buckets[target].add(path)
         totals[target] += size
-    return tuple(
-        PacketShard(idx + 1, total, files, tuple(h.id for p in files for h in by_file[p]))
-        for idx in range(total)
-        for files in (tuple(p for p in open_files if p in buckets[idx]),)
-    )
+    shards: list[PacketShard] = []
+    for idx in range(total):
+        files = tuple(path for path in open_files if path in buckets[idx])
+        hunk_ids = tuple(hunk.id for path in files for hunk in by_file[path])
+        shards.append(PacketShard(idx + 1, total, files, hunk_ids))
+    return tuple(shards)
 
 
 def select_shard(ctx: PacketContext, raw: str) -> PacketShard:
@@ -555,7 +558,9 @@ def _lenses_section(ctx: PacketContext, only: frozenset[str] | None) -> str:
         reason = pick.reason
         if pick.lens.id == SWEEP_LENS:
             reason += " (run after all other lenses)"
-        rows.append(f"| `{pick.lens.id}` — {pick.lens.title} | {reason} | {pick.lens.focus} |")
+        rows.append(
+            f"| `{pick.lens.id}` — {pick.lens.title} | {inline_md(reason, table=True)} | {pick.lens.focus} |"
+        )
     section = "## Lenses in this round\n" + "\n".join(rows)
     if ctx.unscanned_files:
         files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
@@ -693,7 +698,7 @@ def _symbol_lines(
     if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
         lines.append("Last runs: " + " · ".join(ctx.last_runs))
     for fact in ctx.facts_by_hunk.get(hunk.id, ()):
-        lines.append(f"Facts: {fact.id} {fact.text} (source {fact.source.path}:{fact.source.line})")
+        lines.append(f"Facts: {fact.id} {inline_md(fact.text)} (source {fact.source.path}:{fact.source.line})")
     return lines
 
 

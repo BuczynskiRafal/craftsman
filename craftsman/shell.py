@@ -214,6 +214,18 @@ def split_shell_events(command_line: str) -> list[str]:
     return events
 
 
+def _is_env_assignment(token: str) -> bool:
+    """A leading `NAME=value` that sets a variable for the command, e.g. `CI=1 pytest`."""
+    return "=" in token and not token.startswith("-") and token.split("=", 1)[0].isidentifier()
+
+
+def _skip_options(tokens: list[str], idx: int, opts_with_value: frozenset[str]) -> int:
+    """The index after the `-` options starting at `idx`, each option in `opts_with_value` with its value."""
+    while idx < len(tokens) and tokens[idx].startswith("-"):
+        idx += 2 if tokens[idx] in opts_with_value else 1
+    return idx
+
+
 def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
     """Strip leading env assignments, shell control keywords, and command wrappers (`env`, `nice`, `sudo`, `timeout`, `xargs`, etc.)."""
     idx = 0
@@ -225,10 +237,10 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
             continue
         if tok == "for" and idx + 2 < n and tokens[idx + 2] == "in":
             idx += 3
-            while idx < n and tokens[idx] not in ("do",):
+            while idx < n and tokens[idx] != "do":
                 idx += 1
             continue
-        if "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+        if _is_env_assignment(tok):
             idx += 1
             continue
         exe = os.path.basename(tok)
@@ -240,11 +252,7 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
                 if cur_tok == "--":
                     idx += 1
                     break
-                if (
-                    "=" in cur_tok
-                    and not cur_tok.startswith("-")
-                    and cur_tok.split("=", 1)[0].isidentifier()
-                ):
+                if _is_env_assignment(cur_tok):
                     idx += 1
                     continue
                 if cur_tok in opts_with_val:
@@ -256,25 +264,13 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
                 break
             continue
         if exe == "timeout":
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                opt = tokens[idx]
-                if opt in TIMEOUT_OPTS_WITH_VALUE:
-                    idx += 2
-                else:
-                    idx += 1
+            idx = _skip_options(tokens, idx + 1, TIMEOUT_OPTS_WITH_VALUE)
             # Skip duration argument (e.g. '30', '10s', '5m')
             if idx < n:
                 idx += 1
             continue
         if exe == "xargs":
-            idx += 1
-            while idx < n and tokens[idx].startswith("-"):
-                opt = tokens[idx]
-                if opt in XARGS_OPTS_WITH_VALUE:
-                    idx += 2
-                else:
-                    idx += 1
+            idx = _skip_options(tokens, idx + 1, XARGS_OPTS_WITH_VALUE)
             continue
         break
 
@@ -451,7 +447,7 @@ def expand_shell_path_token(raw: str) -> str:
         raw,
         flags=re.IGNORECASE,
     )
-    if expanded == "~" or expanded.startswith("~/") or expanded.startswith("~\\"):
+    if expanded == "~" or expanded.startswith(("~/", "~\\")):
         return home + expanded[1:]
     return os.path.expanduser(expanded)
 
@@ -476,7 +472,7 @@ def _consume_wrapper_chdir_options(
         cur_tok = raw_tokens[idx]
         if cur_tok == "--":
             return idx + 1, eff_cwd
-        if "=" in cur_tok and not cur_tok.startswith("-") and cur_tok.split("=", 1)[0].isidentifier():
+        if _is_env_assignment(cur_tok):
             idx += 1
         elif (
             (exe == "env" and cur_tok in ("-C", "--chdir"))
@@ -508,7 +504,7 @@ def _extract_wrapper_chdir(raw_tokens: list[str], current_cwd: str | None) -> st
             idx += 3
             while idx < n and raw_tokens[idx] != "do":
                 idx += 1
-        elif "=" in tok and not tok.startswith("-") and tok.split("=", 1)[0].isidentifier():
+        elif _is_env_assignment(tok):
             idx += 1
         elif (exe := os.path.basename(tok)) in SIMPLE_WRAPPERS:
             idx, eff_cwd = _consume_wrapper_chdir_options(exe, raw_tokens, idx + 1, eff_cwd)
@@ -552,40 +548,38 @@ def _resolve_cd_target(tokens: list[str], current_cwd: str | None) -> str | None
     return _join_and_normpath(target, current_cwd)
 
 
+_FIND_EXEC = (("-exec", "-execdir", "-ok", "-okdir"), (";", "\\;", "+"))
+_FD_EXEC = (("-x", "--exec", "-X", "--exec-batch"), (";", "\\;"))
+# Per executable: the options that start a subcommand, and the tokens that end it.
+_EXEC_OPTIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "find": _FIND_EXEC,
+    "fd": _FD_EXEC,
+    "fdfind": _FD_EXEC,
+}
+
+
 def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[list[str]]:
     """Extract subcommands passed to `find ... -exec/-execdir/-ok/-okdir` or `fd ... -x/--exec/-X/--exec-batch`."""
     if not tokens:
         return []
-    exe = os.path.basename(tokens[0]).lower()
+    exec_options = _EXEC_OPTIONS.get(os.path.basename(tokens[0]).lower())
+    if exec_options is None:
+        return []
+    starters, terminators = exec_options
     subcommands: list[list[str]] = []
-    if exe == "find":
-        idx = 1
-        n = len(tokens)
-        while idx < n:
-            if tokens[idx] in ("-exec", "-execdir", "-ok", "-okdir"):
-                idx += 1
-                sub: list[str] = []
-                while idx < n and tokens[idx] not in (";", "\\;", "+"):
-                    sub.append(tokens[idx])
-                    idx += 1
-                cleaned = _strip_wrappers_from_tokens(sub)
-                if cleaned:
-                    subcommands.append(cleaned)
+    idx = 1
+    n = len(tokens)
+    while idx < n:
+        if tokens[idx] in starters:
             idx += 1
-    elif exe in ("fd", "fdfind"):
-        idx = 1
-        n = len(tokens)
-        while idx < n:
-            if tokens[idx] in ("-x", "--exec", "-X", "--exec-batch"):
+            sub: list[str] = []
+            while idx < n and tokens[idx] not in terminators:
+                sub.append(tokens[idx])
                 idx += 1
-                sub = []
-                while idx < n and tokens[idx] not in (";", "\\;"):
-                    sub.append(tokens[idx])
-                    idx += 1
-                cleaned = _strip_wrappers_from_tokens(sub)
-                if cleaned:
-                    subcommands.append(cleaned)
-            idx += 1
+            cleaned = _strip_wrappers_from_tokens(sub)
+            if cleaned:
+                subcommands.append(cleaned)
+        idx += 1
     return subcommands
 
 

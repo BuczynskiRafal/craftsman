@@ -420,16 +420,20 @@ def _repo_file(root: Path, path: str) -> Path:
 # --- snapshot -------------------------------------------------------------------------------
 
 
+def is_relative_posix_path(path: str) -> bool:
+    """True for a normalized repository-relative POSIX file path: no drive, `.`, `..` or `//`."""
+    if not path or path.startswith("/") or path.endswith("/") or "\\" in path or "\0" in path:
+        return False
+    parts = path.split("/")
+    has_drive = len(parts[0]) >= 2 and parts[0][1] == ":" and parts[0][0].isalpha()
+    return not has_drive and not any(part in ("", ".", "..") for part in parts)
+
+
 def _normalize_filter_path(path: str) -> str:
-    if not path or path.startswith("/") or "\\" in path or "\0" in path:
+    """`path` itself once it is a relative POSIX file path, or a directory with a trailing `/`."""
+    if not is_relative_posix_path(path.removesuffix("/")):
         raise DiffScanError(f"expected a repository-relative POSIX path, got {path!r}")
-    trailing = "/" if path.endswith("/") else ""
-    core = path[:-1] if trailing else path
-    parts = core.split("/")
-    has_drive = bool(parts) and len(parts[0]) >= 2 and parts[0][1] == ":" and parts[0][0].isalpha()
-    if not core or has_drive or any(part in ("", ".", "..") for part in parts):
-        raise DiffScanError(f"expected a repository-relative POSIX path, got {path!r}")
-    return f"{core}{trailing}"
+    return path
 
 
 def _normalize_filter_paths(paths: Sequence[str]) -> tuple[str, ...]:
@@ -965,8 +969,9 @@ class WorktreeIndex:
 
         Hunks without content lines (renames, mode changes, binary files) have no scope.
         """
-        if hunk.added_lines:
-            return self.scope(hunk.path, hunk.added_lines[0][0])
+        added = hunk.added_lines
+        if added:
+            return self.scope(hunk.path, added[0][0])
         lines = _touched_new_lines(hunk)
         return self.scope(hunk.path, lines[0]) if lines else None
 
@@ -1011,12 +1016,8 @@ class WorktreeIndex:
         """
         if limit < 1:
             raise DiffScanError(f"limit must be at least 1, got {limit}")
-        mentions = self.mentions(symbol)
-        ranked = sorted(dict.fromkeys(ref.path for ref in mentions), key=lambda path: path in defined_in)
-        by_path: dict[str, list[Reference]] = {}
-        for ref in mentions:
-            by_path.setdefault(ref.path, []).append(ref)
-        found = [ref for path in ranked for ref in by_path[path]]
+        # `mentions` lists each file's references together, so a stable sort keeps them grouped.
+        found = sorted(self.mentions(symbol), key=lambda ref: ref.path in defined_in)
         return tuple(found[:limit])
 
     def mentions(self, symbol: str) -> tuple[Reference, ...]:

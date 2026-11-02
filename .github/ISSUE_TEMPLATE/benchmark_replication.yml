@@ -1,0 +1,62 @@
+name: Benchmark Replication
+description: Share empirical replication results for Craftsman vs. baseline
+title: "[Benchmark Replication]: "
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for replicating the Craftsman empirical benchmarks! Please share your experimental setup, configuration, and results below.
+
+  - type: input
+    id: agent-setup
+    attributes:
+      label: Model & Platform
+      description: e.g. Claude 3.7 Sonnet (effort high), Gemini 2.5 Flash, Copilot GPT-4o
+      placeholder: Claude 3.7 Sonnet (effort=high), Claude Code CLI v0.2.29
+    validations:
+      required: true
+
+  - type: dropdown
+    id: benchmark-suite
+    attributes:
+      label: Benchmark Suite
+      description: Which benchmark dataset did you evaluate?
+      options:
+        - Synthetic Review Benchmark (bench/cases/)
+        - SWR-Bench (benchmarks/swr-bench/)
+        - Custom Project / Repository
+      default: 0
+    validations:
+      required: true
+
+  - type: input
+    id: repetitions
+    attributes:
+      label: Repetition Count (n)
+      description: Number of repetitions per configuration
+      placeholder: "1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: results-table
+    attributes:
+      label: Evaluation Results Table
+      description: Report defect recall, precision, duration, and cost comparison between baseline and Craftsman.
+      placeholder: |
+        | Configuration | Defect Recall | Precision | Duration (min/PR) | Cost ($/PR) |
+        | :--- | :--- | :--- | :--- | :--- |
+        | Baseline | 2/9 (22%) | 50% | 0.5 min | $0.05 |
+        | Craftsman | 9/9 (100%) | 90% | 6.7 min | $0.55 |
+    validations:
+      required: true
+
+  - type: textarea
+    id: findings-link
+    attributes:
+      label: Findings Dump / Transcript Link
+      description: Provide a link to the raw session ledger, transcript, or PR artifact proving the findings.
+      placeholder: https://gist.github.com/...
+    validations:
+      required: false

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, TypeVar, get_args
 
-from craftsman.diffscan import Hunk
+from craftsman.diffscan import Hunk, is_relative_posix_path
 from craftsman.lenses import LENS_IDS, TIERS, Tier
 
 Severity = Literal["blocker", "major", "minor", "nit"]
@@ -36,6 +36,9 @@ VERIFIER_AGENT = "craftsman-verifier"
 ORCHESTRATOR_AGENT = "craftsman"
 AGENT_ROLES: dict[str, AgentRole] = {REVIEWER_AGENT: "reviewer", VERIFIER_AGENT: "verifier"}
 CRAFTSMAN_AGENTS = frozenset({ORCHESTRATOR_AGENT, *AGENT_ROLES})
+# Claude Code names a plugin's agents `<plugin>:<agent>`, so the plugin's reviewer reports itself
+# as `craftsman:craftsman-reviewer`.
+PLUGIN_AGENT_PREFIX = "craftsman:"
 
 SCHEMA_VERSION = 2
 LEDGER_FILENAME = "ledger.json"
@@ -348,6 +351,10 @@ class Fields:
             _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
         return tuple(values)
 
+    def texts_or_empty(self, key: str) -> tuple[str, ...]:
+        """A list of strings; empty when it is left out."""
+        return () if self._absent(key) else self.texts(key)
+
     def records_or_empty(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
         """A list of records; empty when it is left out (a field added without a schema bump)."""
         return () if self._absent(key) else self.records(key, parse)
@@ -535,21 +542,13 @@ class RoundFile:
     carried: bool
 
 
-def _is_valid_scope_path(path: str) -> bool:
-    if not path or path.startswith("/") or path.endswith("/") or "\\" in path or "\0" in path:
-        return False
-    parts = path.split("/")
-    has_drive = len(parts[0]) >= 2 and parts[0][1] == ":" and parts[0][0].isalpha()
-    return not has_drive and not any(part in ("", ".", "..") for part in parts)
-
-
 def _require_scope(scope: tuple[str, ...] | None) -> None:
     if scope is None:
         return
     _require(bool(scope), "scope", "must list at least one file path (or be null)")
     for index, path in enumerate(scope):
         _require(
-            _is_valid_scope_path(path),
+            is_relative_posix_path(path),
             f"scope[{index}]",
             f"must be a normalized relative POSIX file path (got {path!r})",
         )
@@ -569,6 +568,7 @@ class Round:
     packet_path: str
     signals: tuple[QualitySignal, ...]
     scope: tuple[str, ...] | None = None
+    out_of_scope: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
@@ -585,6 +585,8 @@ class Round:
         sig_ids = [sig.id for sig in self.signals]
         _require(len(set(sig_ids)) == len(sig_ids), "signals", "must not repeat a signal id")
         _require_scope(self.scope)
+        for index, path in enumerate(self.out_of_scope):
+            _require_text(path, f"out_of_scope[{index}]")
 
     @property
     def files(self) -> tuple[RoundFile, ...]:
@@ -635,6 +637,7 @@ class Round:
                 packet_path=f.text("packet_path"),
                 signals=f.records("signals", QualitySignal.from_json),
                 scope=f.optional_texts("scope"),
+                out_of_scope=f.texts_or_empty("out_of_scope"),
             )
         )
 
@@ -908,9 +911,18 @@ class Run:
         )
 
 
+def craftsman_agent_name(agent: str) -> str:
+    """The agent name compared against Craftsman's own: lower-cased, without the plugin namespace.
+
+    Only the Craftsman plugin's own namespace is dropped; another plugin's
+    `other:craftsman-reviewer` keeps its prefix and so never matches.
+    """
+    return agent.strip().lower().removeprefix(PLUGIN_AGENT_PREFIX)
+
+
 def agent_role(agent: str) -> AgentRole | None:
-    """The Craftsman role an agent name plays; only an exact, case-insensitive name counts."""
-    return AGENT_ROLES.get(agent.strip().lower())
+    """The Craftsman role an agent name plays (see `craftsman_agent_name`); other names play none."""
+    return AGENT_ROLES.get(craftsman_agent_name(agent))
 
 
 @dataclass(frozen=True)

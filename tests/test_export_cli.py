@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -53,6 +54,21 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(result.code, 1)
         self.assertIn("[ERROR] refusing to modify", result.err)
         self.assertEqual((self.tmp / "settings.json").read_text(encoding="utf-8"), "{oops")
+
+    def test_plugin_blocks_only_the_hooks_it_would_duplicate(self) -> None:
+        (self.tmp / "plugins").mkdir()
+        (self.tmp / "plugins" / "installed_plugins.json").write_text(
+            json.dumps({"craftsman@craftsman": {}}), encoding="utf-8"
+        )
+
+        refused = self.export("--claude-dir", str(self.tmp))
+        without_hooks = self.export("--claude-dir", str(self.tmp), "--no-claude-hooks")
+
+        self.assertEqual(refused.code, 1)
+        self.assertIn("Refusing to export Claude Code user-level hooks", refused.err)
+        self.assertEqual(without_hooks.code, 0, without_hooks.err)
+        self.assertTrue((self.tmp / "commands" / "craftsman.md").is_file())
+        self.assertFalse((self.tmp / "settings.json").exists())
 
     def test_explicit_folders_leave_the_copilot_home_alone(self) -> None:
         home = self.tmp / "home"

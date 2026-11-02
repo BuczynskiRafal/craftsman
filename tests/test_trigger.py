@@ -82,17 +82,85 @@ class DetectTriggerTests(unittest.TestCase):
         )
         self.assertEqual(detect_trigger(prompt), "auto")
 
-    def test_rule_text_outside_the_user_request_does_not_trigger(self) -> None:
-        prompt = (
-            "<RULE>When `<USER_REQUEST>` contains `ultracraft`, activate Gear 3.</RULE>\n"
-            "<USER_REQUEST>Fix typo in README</USER_REQUEST>"
+    def test_namespaced_triggers(self) -> None:
+        # Claude Code command tags
+        self.assertEqual(
+            detect_trigger("<command-name>craftsman:craftsman</command-name><command-args>fix</command-args>"),
+            "auto",
         )
-        self.assertIsNone(detect_trigger(prompt))
+        self.assertEqual(
+            detect_trigger(
+                "<command-name>/craftsman:craftsman</command-name><command-args>--deep fix</command-args>"
+            ),
+            "deep",
+        )
+        self.assertEqual(
+            detect_trigger(
+                "<command-name>craftsman:ultracraft</command-name><command-args>fix</command-args>"
+            ),
+            "deep",
+        )
+        self.assertEqual(
+            detect_trigger(
+                "<command-name>/craftsman:ultracraft</command-name><command-args>fix</command-args>"
+            ),
+            "deep",
+        )
+        self.assertEqual(
+            detect_trigger(
+                "<command-name>/Craftsman:Craftsman</command-name><command-args>fix</command-args>"
+            ),
+            "auto",
+        )
+
+        # Prompt text triggers
+        self.assertEqual(detect_trigger("/craftsman:craftsman --quick test"), "quick")
+        self.assertEqual(detect_trigger("craftsman:craftsman --standard test"), "standard")
+        self.assertEqual(detect_trigger("/craftsman:craftsman test"), "auto")
+        self.assertEqual(detect_trigger("craftsman:craftsman test"), "auto")
+        self.assertEqual(detect_trigger("/craftsman:ultracraft test"), "deep")
+        self.assertEqual(detect_trigger("craftsman:ultracraft test"), "deep")
+
+        # Quoted spans do not trigger
+        self.assertIsNone(detect_trigger('what does "/craftsman:craftsman" do?'))
+        self.assertIsNone(detect_trigger('what does `craftsman:ultracraft` do?'))
+        self.assertIsNone(detect_trigger("do not run '/craftsman:craftsman'"))
+
+    def test_colon_after_the_command_ends_it_unless_another_command_follows(self) -> None:
+        self.assertEqual(detect_trigger("/craftsman: add pagination"), "auto")
+        self.assertEqual(detect_trigger("please run /craftsman: now"), "auto")
+        self.assertEqual(detect_trigger("ultracraft: harden the parser"), "deep")
+        self.assertIsNone(detect_trigger("/craftsman:code-review fix the parser"))
+        self.assertIsNone(detect_trigger("run /craftsman:simplify on it"))
 
 
 class TaskFromPromptTests(unittest.TestCase):
     def test_task_drops_the_trigger(self) -> None:
         self.assertEqual(task_from_prompt("/craftsman --standard  fix the bug"), "fix the bug")
+        self.assertEqual(
+            task_from_prompt("/craftsman:craftsman --standard fix the auth bug"),
+            "fix the auth bug",
+        )
+        self.assertEqual(
+            task_from_prompt("craftsman:ultracraft fix the auth bug"),
+            "fix the auth bug",
+        )
+
+    def test_task_keeps_no_colon_of_the_trigger(self) -> None:
+        for prompt in (
+            "/craftsman:ultracraft fix the bug",
+            "/craftsman: fix the bug",
+            "ultracraft: fix the bug",
+            "/craftsman --quick: fix the bug",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(task_from_prompt(prompt), "fix the bug")
+
+    def test_task_keeps_other_craftsman_commands(self) -> None:
+        self.assertEqual(
+            task_from_prompt("/craftsman fix it, then /craftsman:code-review it"),
+            "fix it, then /craftsman:code-review it",
+        )
 
     def test_task_is_one_line(self) -> None:
         self.assertEqual(task_from_prompt("ultracraft fix\nthe  bug"), "fix the bug")
@@ -100,6 +168,10 @@ class TaskFromPromptTests(unittest.TestCase):
     def test_task_of_a_claude_command_is_its_arguments(self) -> None:
         prompt = "<command-name>/craftsman</command-name><command-args>--deep tidy</command-args>"
         self.assertEqual(task_from_prompt(prompt), "tidy")
+        namespaced = (
+            "<command-name>craftsman:craftsman</command-name><command-args>--quick tidy</command-args>"
+        )
+        self.assertEqual(task_from_prompt(namespaced), "tidy")
 
     def test_task_is_capped(self) -> None:
         self.assertEqual(len(task_from_prompt("ultracraft " + "x" * 500)), MAX_TASK_CHARS)
@@ -107,3 +179,4 @@ class TaskFromPromptTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -23,7 +23,8 @@ English.
 your platform offers it; otherwise run `craftsman skill show <name>` and follow its output. Never
 search the file system for skill files.
 Subagents are the `craftsman-reviewer` and `craftsman-verifier` agents: custom agents in VS Code
-Copilot, `/agent` or the task tool in the Copilot CLI, the Agent/Task tool in Claude Code,
+Copilot, `/agent` or the task tool in the Copilot CLI, the Agent/Task tool in Claude Code (named
+`craftsman:craftsman-reviewer` / `craftsman:craftsman-verifier` when Craftsman runs as a plugin),
 `invoke_subagent` in Antigravity (`TypeName` `self`, `Role` `craftsman-reviewer` or
 `craftsman-verifier`; only the `craftsman-reviewer` role counts as an isolated review). Without
 any subagent mechanism, play each role yourself, one at a time. Write every `craftsman` command
@@ -179,5 +180,7 @@ Run `craftsman review report` and give the user:
 - findings fixed, findings accepted (with reasons), findings dismissed (count);
 - the verification commands and their results;
 - a proposed commit message from `/high-level-commit-message`.
+
+Write your final reply as Markdown that the chat renders: real line breaks, never escape sequences such as `\n`, and do not wrap the reply in quotes, JSON or a code block.
 
 Never commit, push or open a pull request unless the user asked for it.

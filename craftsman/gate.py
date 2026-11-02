@@ -38,12 +38,13 @@ from craftsman.evidence import (
     Evaluation,
     archive_ledger_if_rebased,
     evaluate_evidence,
-    prune_inbox_files,
+    prune_all_temp_dirs,
 )
 from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
     QUICK_TIER_MAX_CHANGED_LINES,
     GateReport,
+    format_blocker_summary,
     has_unresolved_diff_size,
     render_next_actions,
     render_report,
@@ -436,12 +437,16 @@ def _continue(state: GateState, report: GateReport | None, error: str | None) ->
 
 def continuation_reason(header: str, report: GateReport | None, evidence_error: str | None) -> str:
     """Tell the agent exactly what is missing, within a size the platforms display in full."""
+    if evidence_error is not None:
+        lead = f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}."
+    elif report is not None and report.issues:
+        lead = f"{format_blocker_summary(report)}."
+    else:
+        lead = "Review incomplete."
     lines = [
-        f"{header} Task completion is blocked until the evidence ledger proves the change is "
+        f"{header} {lead} Task completion is blocked until the evidence ledger proves the change is "
         "reviewed and verified."
     ]
-    if evidence_error is not None:
-        lines.append(f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}")
     closing = "Close the gate with `craftsman gate --complete` once `craftsman review check` passes."
     if report is not None and report.issues:
         lines.append("Next actions:")
@@ -649,7 +654,7 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
     )
     (sys.stdout if code == 0 else sys.stderr).write(message)
     if code == 0:
-        prune_inbox_files(path.parent)
+        prune_all_temp_dirs(path.parent)
     return code
 
 

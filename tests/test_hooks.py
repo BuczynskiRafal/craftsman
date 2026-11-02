@@ -133,7 +133,8 @@ class InactiveTests(HookTestCase):
         for event in ("prompt", "stop", "subagent-start", "subagent-stop"):
             with self.subTest(event=event):
                 out, err = call_hook(event, "copilot", "{not json")
-                self.assertIn("the quality gate was not checked", out["systemMessage"])
+                expected = "the gate was NOT opened" if event == "prompt" else "the quality gate was not checked"
+                self.assertIn(expected, out["systemMessage"])
                 self.assertIn("unreadable hook input", err)
 
     def test_input_that_is_not_an_object_is_reported(self) -> None:
@@ -274,11 +275,13 @@ class StopTests(HookTestCase):
         self.open_unsatisfied_gate()
         out, _ = call_hook("stop", "claude", claude("Stop", self.root))
         self.assertEqual((set(out), out["decision"]), ({"decision", "reason"}, "block"))
+        self.assertIn("review incomplete:", out["reason"])
 
     def test_block_reason_counts_the_continuation(self) -> None:
         self.open_unsatisfied_gate()
         out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
         self.assertTrue(out["reason"].startswith(header(1)))
+        self.assertIn("review incomplete:", out["reason"])
 
     def test_stop_hook_active_does_not_end_the_block(self) -> None:
         self.open_unsatisfied_gate()
@@ -323,8 +326,23 @@ class StopTests(HookTestCase):
         self.assertIn("[no-isolation]", blocked["reason"])
 
     def test_reviewer_hook_events_prove_the_isolated_review(self) -> None:
+        self.assert_reviewer_proves_isolation("craftsman-reviewer")
+
+    def test_plugin_reviewer_hook_events_prove_the_isolated_review(self) -> None:
+        # Claude Code namespaces a plugin's agents `<plugin>:<agent>`.
+        self.assert_reviewer_proves_isolation("craftsman:craftsman-reviewer")
+
+    def test_other_plugins_reviewer_does_not_prove_the_isolated_review(self) -> None:
         self.prepare_unisolated_review()
-        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
+        reviewer = {"agent_id": "a1", "agent_type": "other:craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, **reviewer))
+        blocked, _ = call_hook("stop", "claude", claude("Stop", self.root))
+        self.assertIn("[no-isolation]", blocked["reason"])
+
+    def assert_reviewer_proves_isolation(self, agent_type: str) -> None:
+        self.prepare_unisolated_review()
+        reviewer = {"agent_id": "a1", "agent_type": agent_type}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         call_hook(
             "subagent-stop",

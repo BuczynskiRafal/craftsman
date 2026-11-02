@@ -52,16 +52,18 @@ def read_transcript_entries(transcript_path: Path | None) -> list[Entry]:
         for index, line in enumerate(complete, start=1)
         if line.strip()
     ]
-    if partial.strip() and _is_json_object(partial):  # a finished entry without its newline
-        entries.append(_normalize(json.loads(partial), len(lines)))
+    last = _json_object_or_none(partial) if partial.strip() else None
+    if last is not None:  # a finished entry without its newline
+        entries.append(_normalize(last, len(lines)))
     return entries
 
 
-def _is_json_object(line: str) -> bool:
+def _json_object_or_none(line: str) -> Entry | None:
     try:
-        return isinstance(json.loads(line), dict)
+        obj = json.loads(line)
     except json.JSONDecodeError:
-        return False
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 def _json_object(line: str, path: Path, line_number: int) -> Entry:

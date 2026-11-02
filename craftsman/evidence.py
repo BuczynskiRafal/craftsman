@@ -10,13 +10,15 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shutil
 import stat
 import sys
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 from craftsman.diffscan import DiffSnapshot
 from craftsman.files import replace_with_retry
@@ -27,11 +29,13 @@ from craftsman.records import IsolationEvidence, Ledger, LedgerError
 
 PACKET_GLOB = "packet-*.md"
 INBOX_DIRNAME = "inbox"
+SCRATCH_DIRNAME = "scratch"
 InboxKind = Literal["cover", "add", "verdict"]
 INBOX_KINDS: tuple[InboxKind, ...] = get_args(InboxKind)
 KEEP_ARCHIVES_ENV = "CRAFTSMAN_KEEP_ARCHIVES"
 DEFAULT_KEEP_ARCHIVES = 5
 _MAX_INBOX_ATTEMPTS = 16
+_MAX_SCRATCH_ATTEMPTS = 16
 _LINK_REPARSE_TAGS: frozenset[int] = frozenset({
     getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C),
     getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
@@ -97,6 +101,10 @@ def _has_real_inode(st: os.stat_result) -> bool:
 
 
 def _warn_inbox(detail: str) -> None:
+    sys.stderr.write(f"craftsman: warning: {detail}\n")
+
+
+def _warn_scratch(detail: str) -> None:
     sys.stderr.write(f"craftsman: warning: {detail}\n")
 
 
@@ -213,6 +221,133 @@ def prune_inbox_files(craftsman_dir: Path) -> tuple[Path, ...]:
     return tuple(pruned)
 
 
+def scratch_dir_for(craftsman_dir: Path) -> Path:
+    return craftsman_dir / SCRATCH_DIRNAME
+
+
+def _prepare_scratch_dir(craftsman_dir: Path) -> Path:
+    _require_real_folder(craftsman_dir, action="use")
+    scratch_dir = scratch_dir_for(craftsman_dir)
+    _require_real_folder(scratch_dir, action="use")
+    try:
+        craftsman_dir.mkdir(parents=True, exist_ok=True)
+        scratch_dir.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise LedgerError(f"cannot create scratch directory {scratch_dir}: {exc}") from exc
+    return scratch_dir
+
+
+def create_scratch_dir(craftsman_dir: Path) -> Path:
+    """Create a unique managed scratch directory under `craftsman_dir/scratch/<id>/`."""
+    scratch_dir = _prepare_scratch_dir(craftsman_dir)
+    for _ in range(_MAX_SCRATCH_ATTEMPTS):
+        token = secrets.token_hex(6)
+        candidate = scratch_dir / token
+        try:
+            candidate.mkdir(mode=0o700)
+            return candidate
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise LedgerError(f"cannot create scratch directory in {scratch_dir}: {exc}") from exc
+    raise LedgerError(f"cannot create scratch directory in {scratch_dir}")
+
+
+def _make_writable(path: Path) -> None:
+    """Let the owner delete `path`: rwx on a directory, read-write on a file; links stay untouched.
+
+    A symlink or junction is never followed: chmod on one would change its target, which can be
+    anything outside the scratch tree (a venv links its interpreter, for example).
+    """
+    if _is_symlink_or_junction(path):
+        return
+    with suppress(OSError):
+        os.chmod(path, stat.S_IRWXU if path.is_dir() else stat.S_IREAD | stat.S_IWRITE)
+
+
+def _make_tree_writable(root: Path) -> None:
+    """Make every real file and directory under `root` deletable before removing the tree.
+
+    A read-only directory blocks deleting its entries on every platform, and a read-only file
+    blocks deleting itself on Windows.
+    """
+    _make_writable(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        # os.walk descends into a Windows junction, which it does not see as a link.
+        dirnames[:] = [name for name in dirnames if not _is_symlink_or_junction(Path(dirpath, name))]
+        for name in (*dirnames, *filenames):
+            _make_writable(Path(dirpath, name))
+
+
+# The `shutil.rmtree` calls a failure can be retried with; it also reports `os.open`, `os.scandir`,
+# `os.lstat` and others, which take other arguments or remove nothing.
+_RETRYABLE_REMOVALS = (os.unlink, os.remove, os.rmdir)
+
+
+def _retry_writable(func: Callable[..., Any], path: str, error: Any) -> None:
+    """`shutil.rmtree` error handler: make the entry and its directory writable, then retry once.
+
+    `error` is the exception (`onexc`) or its `sys.exc_info()` (`onerror`). A failure that is not a
+    removal, or a second failure, propagates out of `rmtree`, so the caller reports the entry as
+    not removed.
+    """
+    if func not in _RETRYABLE_REMOVALS:
+        raise error if isinstance(error, BaseException) else error[1]
+    target = Path(path)
+    _make_writable(target.parent)
+    _make_writable(target)
+    func(path)
+
+
+def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
+    """Delete all scratch directories under `craftsman_dir/scratch` and remove the folder if empty."""
+    if _is_symlink_or_junction(craftsman_dir):
+        _warn_scratch(f"could not prune symlinked directory {craftsman_dir}")
+        return ()
+    scratch_dir = craftsman_dir / SCRATCH_DIRNAME
+    if _is_symlink_or_junction(scratch_dir):
+        _warn_scratch(f"could not prune symlinked scratch directory {scratch_dir}")
+        return ()
+    try:
+        if not scratch_dir.exists():
+            return ()
+        if not scratch_dir.is_dir():
+            _warn_scratch(f"could not prune scratch {scratch_dir}: not a directory")
+            return ()
+        entries = sorted(scratch_dir.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        _warn_scratch(f"could not prune scratch {scratch_dir}: {exc}")
+        return ()
+    pruned: list[Path] = []
+    for entry in entries:
+        try:
+            if _is_symlink_or_junction(entry):
+                os.unlink(entry)
+            elif entry.is_dir():
+                _make_tree_writable(entry)
+                if sys.version_info >= (3, 12):
+                    shutil.rmtree(entry, onexc=_retry_writable)
+                else:
+                    shutil.rmtree(entry, onerror=_retry_writable)
+            else:
+                _make_writable(entry)
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _warn_scratch(f"could not remove scratch entry {entry}: {exc}")
+            continue
+        pruned.append(entry)
+    with suppress(OSError):
+        scratch_dir.rmdir()
+    return tuple(pruned)
+
+
+def prune_all_temp_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
+    """Delete leftover inbox files and scratch directories under `craftsman_dir`."""
+    return (*prune_inbox_files(craftsman_dir), *prune_scratch_dirs(craftsman_dir))
+
+
 def prune_round_files(craftsman_dir: Path, round_number: int) -> tuple[Path, ...]:
     """Delete packet views of earlier rounds and full packets older than the previous round."""
     if isinstance(round_number, bool) or round_number < 1:
@@ -293,7 +428,7 @@ def _archive(ledger_path: Path) -> tuple[Path, ...]:
         _prune_archives(ledger_path, keep)
     except OSError as exc:
         raise LedgerError(f"cannot archive {ledger_path}: {exc}") from exc
-    prune_inbox_files(ledger_path.parent)
+    prune_all_temp_dirs(ledger_path.parent)
     return tuple(archived)
 
 

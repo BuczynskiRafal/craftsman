@@ -8,6 +8,7 @@ base folder; `craftsman uninstall` works from those manifests alone.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -17,10 +18,18 @@ from craftsman.files import UnsafePathError
 from craftsman.generated import ExportError
 from craftsman.legacy_githooks import legacy_git_hooks_bases
 from craftsman.manifest import InstallError, TargetKind
-from craftsman.paths import default_repo_dir, user_home
+from craftsman.paths import default_claude_dir, default_repo_dir, user_home
 from craftsman.platforms.agents_md import install_agents_workspace_target
-from craftsman.platforms.antigravity import detect_antigravity, install_antigravity_target
-from craftsman.platforms.claude import detect_claude, install_claude_target
+from craftsman.platforms.antigravity import (
+    detect_antigravity,
+    install_antigravity_target,
+    is_agy_plugin_active,
+)
+from craftsman.platforms.claude import (
+    detect_claude,
+    install_claude_target,
+    is_claude_plugin_active,
+)
 from craftsman.platforms.copilot import (
     DUPLICATE_SCOPE_USER_TO_WS_MSG,
     DUPLICATE_SCOPE_WS_TO_USER_MSG,
@@ -64,13 +73,87 @@ def resolve_install_config(config: InstallConfig, home: Path, tracker: Tracker) 
     nothing = not any(detected.values())
     if nothing:
         tracker.add(EventKind.NOTE, "No AI coding platform detected; installing for GitHub Copilot.")
+    claude = config.claude or detected["Claude Code"]
+    if claude and not config.claude and _plugin_would_duplicate_hooks(config, home):
+        tracker.add(
+            EventKind.NOTE,
+            "Skipping Claude Code: the craftsman Claude Code plugin is active and already runs "
+            "the gate hooks (pass --claude --allow-duplicate-scopes to install both).",
+        )
+        claude = False
+    antigravity = config.antigravity or detected["Google Antigravity"]
+    if antigravity and not config.antigravity and _agy_plugin_would_duplicate(config, home):
+        tracker.add(
+            EventKind.NOTE,
+            "Skipping Google Antigravity: the craftsman plugin from `agy plugin install` is "
+            "enabled and already ships the skills and gate hooks (pass --antigravity "
+            "--allow-duplicate-scopes to install both).",
+        )
+        antigravity = False
     return replace(
         config,
         auto_detect=False,
-        antigravity=config.antigravity or detected["Google Antigravity"],
-        claude=config.claude or detected["Claude Code"],
+        antigravity=antigravity,
+        claude=claude,
         copilot=config.copilot or detected["GitHub Copilot (VS Code)"] or nothing,
     )
+
+
+EPHEMERAL_UV_MESSAGE = (
+    "Refusing to install lifecycle hooks using an ephemeral uvx interpreter ({exe}): "
+    "the cache environment may be deleted by uv, causing hook failures (exit code 127). "
+    "Use 'uv tool install craftsman-gate' or 'pipx install craftsman-gate' instead."
+)
+_UV_CACHE_MARKERS = ("/.cache/uv/", "/library/caches/uv/", "/appdata/local/uv/cache/", "/uv/cache/")
+
+
+def _normalized(path: str) -> str:
+    return path.replace("\\", "/").lower()
+
+
+def _is_in_uv_cache(path: str, cache_dirs: Sequence[str]) -> bool:
+    text = _normalized(path)
+    # Persistent uv tools live in e.g. ~/.local/share/uv/tools/ or %LOCALAPPDATA%/uv/tools/.
+    if "/uv/tools/" in text:
+        return False
+    if any(cache in text for cache in cache_dirs):
+        return True
+    parts = text.split("/")
+    return any(marker in text for marker in _UV_CACHE_MARKERS) or (
+        "/uv/" in text
+        and (
+            "archive-" in text
+            or "environments-" in text
+            or "archive" in parts
+            or "environments" in parts
+        )
+    )
+
+
+def check_ephemeral_uv_interpreter(python: str | None = None) -> None:
+    """Refuse an interpreter in uv's cache, which the hook commands would embed by path.
+
+    uvx runs a cache environment whose `bin/python` is a symlink to the base interpreter, so the
+    path is checked as written, which is what the hooks embed, and also once resolved.
+    """
+    exe = python or sys.executable
+    candidates = {os.path.abspath(exe), str(Path(exe).resolve())}
+    uv_cache = os.environ.get("UV_CACHE_DIR")
+    cache_dirs = (
+        [
+            _normalized(cache).rstrip("/") + "/"
+            for cache in (os.path.abspath(uv_cache), str(Path(uv_cache).resolve()))
+        ]
+        if uv_cache
+        else []
+    )
+    if any(_is_in_uv_cache(candidate, cache_dirs) for candidate in candidates):
+        raise InstallError(EPHEMERAL_UV_MESSAGE.format(exe=exe))
+
+
+def _embeds_interpreter(config: InstallConfig) -> bool:
+    """Whether a selected target writes hook commands that run this interpreter by its path."""
+    return (config.claude and config.claude_hooks) or config.copilot
 
 
 def _check_copilot_scopes(config: InstallConfig, home: Path) -> None:
@@ -83,6 +166,46 @@ def _check_copilot_scopes(config: InstallConfig, home: Path) -> None:
     workspace = config.copilot_workspace or Path.cwd()
     if config.copilot and has_workspace_copilot_install(workspace, config.repo_dir):
         raise InstallError(DUPLICATE_SCOPE_WS_TO_USER_MSG)
+
+
+def _plugin_would_duplicate_hooks(config: InstallConfig, home: Path) -> bool:
+    """Whether installing the Claude Code hooks would run them a second time beside the plugin's."""
+    return (
+        config.claude_hooks
+        and not config.allow_duplicate_scopes
+        and is_claude_plugin_active(default_claude_dir(home))
+    )
+
+
+def _check_claude_scopes(config: InstallConfig, home: Path) -> None:
+    if config.claude and _plugin_would_duplicate_hooks(config, home):
+        raise InstallError(
+            "Refusing to install Claude Code user-level hooks while the craftsman Claude Code "
+            "plugin is active (hooks would fire twice). Pass --allow-duplicate-scopes to override, "
+            "or uninstall the plugin first."
+        )
+
+
+def _agy_plugin_would_duplicate(config: InstallConfig, home: Path) -> bool:
+    """Whether a copy or symlink install would add the skills and hooks of the agy plugin again.
+
+    `--plugin` puts Craftsman's own plugin where agy keeps it, so it replaces the agy one instead.
+    """
+    return (
+        config.mode is not InstallMode.PLUGIN
+        and not config.allow_duplicate_scopes
+        and is_agy_plugin_active(home)
+    )
+
+
+def _check_antigravity_scopes(config: InstallConfig, home: Path) -> None:
+    if config.antigravity and _agy_plugin_would_duplicate(config, home):
+        raise InstallError(
+            "Refusing to install Craftsman into ~/.gemini/config while the craftsman plugin from "
+            "`agy plugin install` is enabled (skills would be listed twice and hooks could fire "
+            "twice). Pass --allow-duplicate-scopes to override, or remove the plugin first with "
+            "`agy plugin uninstall craftsman`."
+        )
 
 
 def _remove_legacy_git_hooks(config: InstallConfig, home: Path, tracker: Tracker) -> None:
@@ -109,7 +232,11 @@ def run_install(config: InstallConfig, tracker: Tracker, home: Path | None = Non
     if not (repo_dir / "skills").is_dir() or not (repo_dir / "rules").is_dir():
         raise InstallError(f"Repository assets (skills/, rules/) not found under {repo_dir}")
     config = resolve_install_config(config, home, tracker)
+    if _embeds_interpreter(config):
+        check_ephemeral_uv_interpreter()
     _check_copilot_scopes(config, home)
+    _check_claude_scopes(config, home)
+    _check_antigravity_scopes(config, home)
     _remove_legacy_git_hooks(config, home, tracker)
     if config.antigravity:
         install_antigravity_target(repo_dir, home, config.mode, tracker)
@@ -162,7 +289,11 @@ def _build_install_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--allow-duplicate-scopes",
         action="store_true",
-        help="Allow installing Copilot files in both user (~/.copilot) and workspace (.github) scopes.",
+        help=(
+            "Allow installing Copilot files in both user (~/.copilot) and workspace (.github) "
+            "scopes, or Claude Code hooks and Antigravity files beside an active craftsman "
+            "Claude Code or agy plugin."
+        ),
     )
     parser.add_argument(
         "--copilot-workspace",

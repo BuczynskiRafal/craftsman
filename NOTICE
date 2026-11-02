@@ -1,0 +1,12 @@
+Craftsman
+Copyright (c) 2026 Rafał Buczyński
+
+Make AI coding agents prove they reviewed and tested their change.
+
+This software includes:
+- Quality gate and review verification runtime (`craftsman/`).
+- Lifecycle hook scripts and adapters for Claude Code, GitHub Copilot, and Google Antigravity.
+- Curated software engineering review skills and agent templates.
+- Test suites and benchmarks.
+
+All components are licensed under the MIT License (see LICENSE).

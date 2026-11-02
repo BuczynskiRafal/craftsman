@@ -302,7 +302,7 @@ class GitRepo:
 
     def git(self, *args: str) -> str:
         proc = subprocess.run(
-            ["git", *args], cwd=self.root, capture_output=True, text=True, check=True, timeout=30
+            ["git", *args], cwd=self.root, capture_output=True, encoding="utf-8", check=True, timeout=30
         )
         return proc.stdout
 
@@ -358,7 +358,7 @@ class EvidenceRepo(GitRepo):
             env=env,
             input=stdin,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=timeout,
         )
@@ -462,6 +462,10 @@ class IsolatedHomeTestCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, self.env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The distributions installed for this interpreter are the machine's too.
+        legacy = mock.patch("craftsman.doctor.inspect_legacy_distribution", return_value=[])
+        legacy.start()
+        self.addCleanup(legacy.stop)
 
     def install(self, *args: str) -> CliResult:
         return run_main(install_main, "--repo-dir", str(REPO_ROOT), *args)
@@ -474,7 +478,7 @@ class IsolatedHomeTestCase(unittest.TestCase):
             ["git", "config", "--global", *args],
             env=self.env,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=30,
         )

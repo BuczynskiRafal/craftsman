@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from craftsman import cli
 from craftsman.doctor import (
@@ -18,6 +20,7 @@ from craftsman.doctor import (
     build_report,
     command_executables,
     detect_antigravity_drift,
+    inspect_legacy_distribution,
     inspect_legacy_git_hooks,
     loads_jsonc_dict,
     plugin_skill_names,
@@ -28,7 +31,7 @@ from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.manifest import MANIFEST_FILENAME
 from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
-from craftsman.platforms.claude import export_to_claude_user
+from craftsman.platforms.claude import export_to_claude_user, merge_claude_hooks
 from craftsman.platforms.copilot import (
     HOOKS_FILENAME,
     export_copilot_home,
@@ -49,11 +52,21 @@ class DoctorTestCase(unittest.TestCase):
         self.tmp = Path(tmp.name).resolve()
 
     def run_doctor(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        # -S keeps the machine's site-packages, and the distributions doctor inspects there, out.
         return subprocess.run(
-            [sys.executable, "-m", "craftsman.cli", "doctor", "--repo-dir", str(REPO_ROOT), *extra],
+            [
+                sys.executable,
+                "-S",
+                "-m",
+                "craftsman.cli",
+                "doctor",
+                "--repo-dir",
+                str(REPO_ROOT),
+                *extra,
+            ],
             cwd=REPO_ROOT,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=120,
             env={
                 **os.environ,
@@ -107,7 +120,10 @@ class PlatformReportTests(DoctorTestCase):
     def test_hooks_running_a_missing_interpreter_are_broken(self) -> None:
         self.install_user_copilot()
         hooks_dir = self.tmp / ".copilot" / "hooks"
-        write_copilot_hooks(hooks_dir, '"/no/such/python3" -m craftsman.cli', "& x")
+        # Each platform checks the command it runs: bash on POSIX, PowerShell on Windows.
+        write_copilot_hooks(
+            hooks_dir, '"/no/such/python3" -m craftsman.cli', '& "/no/such/python3" -m craftsman.cli'
+        )
 
         _, report = self.doctor()
 
@@ -182,7 +198,7 @@ class PlatformReportTests(DoctorTestCase):
 class SkillManifestTests(DoctorTestCase):
     def copy_repo(self) -> Path:
         repo = self.tmp / "repo"
-        for folder in ("skills", "rules", "scripts", "agents"):
+        for folder in ("skills", "rules", "scripts", "templates"):
             shutil.copytree(REPO_ROOT / folder, repo / folder)
         shutil.copy(REPO_ROOT / "plugin.json", repo / "plugin.json")
         return repo
@@ -204,7 +220,7 @@ class SkillManifestTests(DoctorTestCase):
     def test_plugin_manifest_must_list_the_skill_folders(self) -> None:
         repo = self.copy_repo()
         names = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
-        names["skills"] = ["code_quality" if n == "code-quality" else n for n in names["skills"]]
+        names["skills"] = [n.replace("code-quality", "code_quality") for n in names["skills"]]
         (repo / "plugin.json").write_text(json.dumps(names), encoding="utf-8")
 
         report = build_report(repo, None, self.tmp)
@@ -221,10 +237,20 @@ class SkillManifestTests(DoctorTestCase):
         with self.assertRaisesRegex(ExportError, "cannot read"):
             plugin_skill_names(repo)
 
-    def test_skill_listed_twice_in_plugin_manifest_is_an_error(self) -> None:
+    def test_a_skill_name_without_its_path_is_an_error(self) -> None:
+        # agy reads `verify` as ./verify, which is no skill folder.
         repo = self.copy_repo()
         manifest = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
         manifest["skills"].append("verify")
+        (repo / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+        with self.assertRaisesRegex(ExportError, "list of `./skills/<name>` paths"):
+            plugin_skill_names(repo)
+
+    def test_skill_listed_twice_in_plugin_manifest_is_an_error(self) -> None:
+        repo = self.copy_repo()
+        manifest = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
+        manifest["skills"].append("./skills/verify")
         (repo / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
 
         with self.assertRaisesRegex(ExportError, "lists verify more than once"):
@@ -395,6 +421,46 @@ class InstalledDuplicateTests(IsolatedHomeTestCase):
         self.assertEqual(result.code, 1)
         self.assertIn("both user and workspace scopes are installed", result.err)
 
+    def test_agy_plugin_beside_a_copy_install_is_a_duplicate(self) -> None:
+        self.assert_ok(self.install("--antigravity"))
+        plugin = self.home / ".gemini" / "config" / "plugins" / "craftsman"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.json").write_text('{"name": "craftsman"}', encoding="utf-8")
+
+        code, report = self.report()
+
+        self.assertEqual(code, 1)
+        self.assertTrue(any("Duplicate Antigravity install" in p for p in report["problems"]))
+
+    def test_craftsmans_own_antigravity_plugin_is_no_duplicate(self) -> None:
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        _, report = self.report()
+
+        self.assertFalse(any("Duplicate Antigravity install" in p for p in report["problems"]))
+
+
+class LegacyDistributionTests(unittest.TestCase):
+    def inspect(self, *installed: str) -> list[str]:
+        def distribution(name: str) -> object:
+            if name not in installed:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return object()
+
+        with mock.patch("importlib.metadata.distribution", side_effect=distribution):
+            return inspect_legacy_distribution()
+
+    def test_the_pre_rename_distribution_beside_craftsman_gate_is_a_problem(self) -> None:
+        (problem,) = self.inspect("craftsman", "craftsman-gate")
+
+        self.assertIn("pip uninstall craftsman craftsman-gate", problem)
+
+    def test_without_the_old_distribution_there_is_no_problem(self) -> None:
+        self.assertEqual(self.inspect("craftsman-gate"), [])
+
+    def test_the_old_distribution_alone_is_no_problem(self) -> None:
+        self.assertEqual(self.inspect("craftsman"), [])
+
 
 class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):
     def setUp(self) -> None:
@@ -443,6 +509,25 @@ class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):
         (problem,) = inspect_legacy_git_hooks(None, self.home)
 
         self.assertIn("cannot read install manifest", problem)
+
+    def test_duplicate_claude_hooks_flagged(self) -> None:
+        claude_dir = self.home / ".claude"
+        claude_dir.mkdir(parents=True)
+        bash_prefix, _ = absolute_hook_prefixes()
+        merge_claude_hooks(claude_dir / "settings.json", bash_prefix)
+
+        plugins_dir = claude_dir / "plugins"
+        plugins_dir.mkdir()
+        (plugins_dir / "installed_plugins.json").write_text(
+            json.dumps({"craftsman@craftsman": {}}), encoding="utf-8"
+        )
+
+        result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
+        self.assertEqual(result.code, 1)
+        problems = json.loads(result.out)["problems"]
+        self.assertTrue(
+            any("Duplicate Claude Code hooks: both user-level hooks" in p for p in problems)
+        )
 
 
 if __name__ == "__main__":

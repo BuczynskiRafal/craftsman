@@ -36,7 +36,7 @@ def cli_shim_for(python: str) -> Path | None:
     if not shim.is_file():
         raise ExportError(
             f"{python} cannot import craftsman from {package_dir} and {shim} is missing; "
-            "install craftsman for that interpreter (pip install .) and export again"
+            "install craftsman for that interpreter (pip install craftsman-gate) and export again"
         )
     return shim
 
@@ -45,18 +45,25 @@ def _imports_package(python: str, package_dir: Path) -> bool:
     """Whether `python`, run outside this checkout, imports the package in `package_dir`."""
     env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     try:
+        # Raw filesystem bytes: a text pipe would use the ANSI code page on Windows and garble,
+        # or fail on, a path such as C:\Users\Rafał.
         proc = subprocess.run(
-            [python, "-c", "import craftsman, sys; sys.stdout.write(craftsman.__file__)"],
+            [
+                python,
+                "-c",
+                "import craftsman, os, sys; sys.stdout.buffer.write(os.fsencode(craftsman.__file__))",
+            ],
             cwd=tempfile.gettempdir(),
             env=env,
             capture_output=True,
-            text=True,
             timeout=IMPORT_CHECK_TIMEOUT_S,
             check=False,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise ExportError(f"cannot run {python} to check which craftsman it imports: {exc}") from exc
-    return proc.returncode == 0 and Path(proc.stdout.strip()).resolve().parent == package_dir
+    if proc.returncode != 0:
+        return False
+    return Path(os.fsdecode(proc.stdout.strip())).resolve().parent == package_dir
 
 
 def absolute_hook_prefixes(python: str | None = None) -> tuple[str, str]:

@@ -15,6 +15,8 @@ INCLUDE_RE = re.compile(r"^\{\{include\s+(\S+)\s*\}\}[ \t]*$", re.MULTILINE)
 MALFORMED_INCLUDE_RE = re.compile(r"^[ \t]*\{\{\s*include\b.*$", re.MULTILINE)
 SIBLING_LINK_RE = re.compile(r"\[[^\]\n]*\]\(([\w.-]+\.md)\)")
 COPY_IGNORED_NAMES = frozenset({"__pycache__", ".DS_Store", "Thumbs.db"})
+# Not `agents/`: plugin loaders (agy, Copilot CLI) read that folder as ready agents.
+AGENT_TEMPLATES_DIR = Path("templates", "agents")
 
 TemplateRole = Literal["orchestrator", "reviewer", "verifier"]
 TEMPLATE_ROLES: tuple[TemplateRole, ...] = get_args(TemplateRole)
@@ -139,9 +141,11 @@ def expand_includes(body: str, repo_dir: Path, source: Path) -> str:
 
 
 def load_agent_templates(repo_dir: Path) -> list[AgentTemplate]:
-    paths = sorted((repo_dir / "agents").glob("*.md"))
+    paths = sorted((repo_dir / AGENT_TEMPLATES_DIR).glob("*.md"))
     if not paths:
-        raise ExportError(f"no agent templates (agents/*.md) found under {repo_dir}")
+        raise ExportError(
+            f"no agent templates ({AGENT_TEMPLATES_DIR.as_posix()}/*.md) found under {repo_dir}"
+        )
     return [_load_agent_template(path, repo_dir) for path in paths]
 
 

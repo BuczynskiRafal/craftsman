@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import sys
@@ -35,6 +34,7 @@ from craftsman.records import VERDICTS, Ledger, LedgerError
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
 from craftsman.scope import main as scope_guard_main
+from craftsman.streams import configure_std_streams
 from craftsman.uninstall import uninstall_main
 
 LATEST_RUNS_SHOWN = 3
@@ -77,7 +77,7 @@ class LedgerOverview:
             total = sum(len(open_units(latest, lens)) for lens in latest.lenses)
             missing = sum(len(ids) for ids in uncovered_by_lens(ledger, latest).values())
             coverage = Coverage(total - missing, total)
-        verdicts = {name: 0 for name in (*VERDICTS, "none")}
+        verdicts = dict.fromkeys((*VERDICTS, "none"), 0)
         for finding in ledger.findings:
             verdicts[finding.verdict or "none"] += 1
         return cls(
@@ -376,13 +376,6 @@ def skill_main(argv: list[str]) -> int:
 # --- entry point ----------------------------------------------------------------------------
 
 
-def _tolerate_unencodable_output() -> None:
-    """Print `?` for characters the console cannot encode (Windows code pages) instead of crashing."""
-    for stream in (sys.stdout, sys.stderr):
-        if isinstance(stream, io.TextIOWrapper):
-            stream.reconfigure(errors="replace")
-
-
 DOCTOR_HELP = "Audit skill manifests, core scripts, Git config, drift, and installed agent targets."
 STATUS_HELP = "Show the work tree's quality gate, cumulative diff and review evidence."
 
@@ -442,13 +435,13 @@ COMMANDS: dict[str, tuple[Callable[[list[str]], int], str]] = {
 
 
 def main(argv: list[str] | None = None) -> int:
-    _tolerate_unencodable_output()
+    configure_std_streams()
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] in COMMANDS:
         handler, _ = COMMANDS[args[0]]
         return handler(args[1:])
     parser = argparse.ArgumentParser(
-        prog="craftsman", description="Craftsman: Universal Agentic Engineering & Quality Gate CLI."
+        prog="craftsman", description="Make AI coding agents prove they reviewed and tested their change."
     )
     parser.add_argument("--version", action="version", version=f"craftsman {__version__}")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")

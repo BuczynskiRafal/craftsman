@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from craftsman.shell import (
@@ -126,9 +127,10 @@ class HeredocAndPathExpansionTests(unittest.TestCase):
             {"HOME": "/Users/alice", "USERPROFILE": "/Users/alice"},
             clear=False,
         ):
-            self.assertEqual(expand_shell_path_token("~/notes"), "/Users/alice/notes")
-            self.assertEqual(expand_shell_path_token("$HOME/notes"), "/Users/alice/notes")
-            self.assertEqual(expand_shell_path_token("%USERPROFILE%/notes"), "/Users/alice/notes")
+            notes = f"{Path('/Users/alice')}/notes"  # the home in this platform's separators
+            self.assertEqual(expand_shell_path_token("~/notes"), notes)
+            self.assertEqual(expand_shell_path_token("$HOME/notes"), notes)
+            self.assertEqual(expand_shell_path_token("%USERPROFILE%/notes"), notes)
             cmds = iter_simple_commands(r"cat ~\notes\todo.txt C:\temp\file.txt")
             self.assertEqual(cmds[0].tokens, [r"cat", r"~\notes\todo.txt", r"C:\temp\file.txt"])
 

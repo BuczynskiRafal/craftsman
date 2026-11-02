@@ -14,6 +14,7 @@ from craftsman.gatecheck import (
     GatePolicy,
     GateReport,
     evaluate,
+    format_blocker_summary,
     passing_runs,
     render_report,
 )
@@ -620,6 +621,55 @@ class EndToEndTests(unittest.TestCase):
             edited = snapshot(repo.root, repo.base_sha)
 
             self.assertEqual(codes(evaluate(ledger, edited, QUICK)), ["stale-round", "no-passing-run"])
+
+
+class FormatBlockerSummaryTests(unittest.TestCase):
+    def test_empty_issues_returns_review_complete(self) -> None:
+        report = GateReport((), (), "Summary")
+        self.assertEqual(format_blocker_summary(report), "review complete")
+
+    def test_single_round_issue(self) -> None:
+        report = GateReport((GateIssue("no-round", "No round prepared"),), (), "Summary")
+        self.assertEqual(format_blocker_summary(report), "review incomplete: no review round prepared")
+
+    def test_uncovered_counts_come_from_the_real_coverage_issues(self) -> None:
+        ledger, _ = prepared(two_hunks(), lenses=("intent", "craft"))
+        report = evaluate(ledger, two_hunks(), QUICK)
+        self.assertEqual(
+            format_blocker_summary(report),
+            "review incomplete: 2 files not covered by lenses intent, craft; no passing test run",
+        )
+
+    def test_uncovered_single_lens_and_files_are_counted_separately(self) -> None:
+        hunks = GateIssue("uncovered", "…", lenses=("contracts",), missing=1)
+        files = GateIssue("uncovered", "…", lenses=("design",), missing=2, unit="file")
+        report = GateReport((hunks, files), (), "Summary")
+        self.assertEqual(
+            format_blocker_summary(report),
+            "review incomplete: 1 hunk not covered by lens contracts; 2 files not covered by lens design",
+        )
+
+    def test_multiple_categories_joined_with_semicolon(self) -> None:
+        i1 = GateIssue("uncovered", "…", lenses=("contracts",), missing=3)
+        i2 = GateIssue("no-verdict", "Finding F1 has no verdict")
+        i3 = GateIssue("no-passing-run", "No passing test run")
+        report = GateReport((i3, i2, i1), (), "Summary")
+        self.assertEqual(
+            format_blocker_summary(report),
+            "review incomplete: 3 hunks not covered by lens contracts; 1 finding without a verdict; "
+            "no passing test run",
+        )
+
+    def test_unresolved_findings_and_failing_runs(self) -> None:
+        i1 = GateIssue("unresolved", "Finding F1 is proven but unresolved")
+        i2 = GateIssue("unresolved", "Finding F2 is proven but unresolved")
+        i3 = GateIssue("failing-run", "Run 1 failed")
+        i4 = GateIssue("no-isolation", "Review lacks proof of an isolated reviewer")
+        report = GateReport((i1, i2, i3, i4), (), "Summary")
+        self.assertEqual(
+            format_blocker_summary(report),
+            "review incomplete: 2 unresolved findings; 1 failing run; no reviewer isolation evidence",
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,82 @@
+{
+  "name": "craftsman",
+  "version": "4.1.0",
+  "description": "Make AI coding agents prove they reviewed and tested their change.",
+  "author": {
+    "name": "Rafał Buczyński",
+    "email": "buczynski.rafal2@gmail.com"
+  },
+  "homepage": "https://github.com/BuczynskiRafal/craftsman",
+  "repository": "https://github.com/BuczynskiRafal/craftsman",
+  "license": "MIT",
+  "keywords": [
+    "ai-agents",
+    "claude-code",
+    "code-review",
+    "quality-gate",
+    "testing"
+  ],
+  "agents": [
+    "./.claude-plugin/agents/craftsman-reviewer.md",
+    "./.claude-plugin/agents/craftsman-verifier.md",
+    "./.claude-plugin/agents/craftsman.md"
+  ],
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh\" hook prompt --platform claude",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh\" hook stop --platform claude",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh\" hook subagent-start --platform claude",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh\" hook subagent-stop --platform claude",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Grep|Glob|LS",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh\" hook pre-tool --platform claude",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

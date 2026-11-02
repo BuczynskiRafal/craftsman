@@ -29,6 +29,7 @@ from craftsman.records import (
     agent_role,
     parse_timestamp,
 )
+from craftsman.text import inline_md
 from craftsman.triviality import command_without_env, is_trivial_run
 
 IssueCode = Literal[
@@ -70,6 +71,10 @@ _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 class GateIssue:
     code: IssueCode
     message: str
+    # Only for `uncovered`: the lenses and how many hunks (or files) they still miss.
+    lenses: tuple[str, ...] = ()
+    missing: int = 0
+    unit: Literal["hunk", "file"] = "hunk"
 
 
 @dataclass(frozen=True)
@@ -177,12 +182,13 @@ def acks_in_force(ledger: Ledger) -> dict[str, SignalAck]:
     if not ledger.rounds:
         return {}
     latest = ledger.rounds[-1]
+    unique_in_latest = _unique_by_key(latest)
     acks: dict[str, SignalAck] = {}
     for ack in ledger.signal_acks:
         if ack.round == latest.number:
             acks[ack.signal_id] = ack
             continue
-        carried = _unique_by_key(latest).get(
+        carried = unique_in_latest.get(
             _signal_key(ledger.rounds[ack.round - 1].signal(ack.signal_id))
         )
         if carried is not None and _signal_key(carried) in _unique_by_key(ledger.rounds[ack.round - 1]):
@@ -344,6 +350,9 @@ def _uncovered_issue(
         f"{head} {len(missing)} uncovered {unit} in round {round_.number}: "
         f"{batch}{more}; review them and run "
         f'`craftsman review cover --lens {lens_arg} {flag} {batch} --note "..."`.',
+        lenses=tuple(lenses),
+        missing=len(missing),
+        unit="file" if use_files else "hunk",
     )
 
 
@@ -363,7 +372,7 @@ def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
     return [
         GateIssue(
             "no-verdict",
-            f"Finding {finding.id} ({finding.severity}: {finding.title}) has no verdict; verify it "
+            f"Finding {finding.id} ({finding.severity}: {inline_md(finding.title)}) has no verdict; verify it "
             f"independently and run `craftsman review verdict {finding.id} "
             '--as proven|probable|question|dismissed --evidence "..."`.',
         )
@@ -375,7 +384,7 @@ def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
 def _unresolved_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
     issues: list[GateIssue] = []
     for finding in ledger.findings:
-        label = f"Finding {finding.id} ({finding.severity}: {finding.title})"
+        label = f"Finding {finding.id} ({finding.severity}: {inline_md(finding.title)})"
         if finding.verdict in ("proven", "probable") and finding.resolution is None:
             alternative = "" if finding.severity == "blocker" else ' (or `--as accepted --note "why"`)'
             issues.append(
@@ -689,3 +698,57 @@ def render_report(report: GateReport) -> str:
     if report.warnings:
         lines += ["", "**Warnings**", *(f"- {warning}" for warning in report.warnings)]
     return "\n".join(lines)
+
+
+# One summary clause per issue code, in the order the agent should address them.
+_ROUND_CLAUSES: dict[IssueCode, str] = {
+    "no-round": "no review round prepared",
+    "stale-round": "code changed since the review round",
+    "tier-too-low": "review tier too low",
+    "round-cap": "maximum review rounds reached",
+}
+_COUNTED_CLAUSES: dict[IssueCode, tuple[str, str]] = {
+    "unresolved-signal": ("unacknowledged risk signal", "unacknowledged risk signals"),
+    "no-verdict": ("finding without a verdict", "findings without a verdict"),
+    "unresolved": ("unresolved finding", "unresolved findings"),
+}
+_RUN_CLAUSES: dict[IssueCode, str] = {
+    "no-passing-run": "no passing test run",
+    "no-e2e-run": "no passing e2e run",
+}
+
+
+def _counted(count: int, forms: tuple[str, str]) -> str:
+    return f"{count} {forms[0] if count == 1 else forms[1]}"
+
+
+def _coverage_clauses(issues: Sequence[GateIssue]) -> list[str]:
+    clauses: list[str] = []
+    for unit in ("hunk", "file"):
+        matching = [issue for issue in issues if issue.code == "uncovered" and issue.unit == unit]
+        if not matching:
+            continue
+        lenses = list(dict.fromkeys(lens for issue in matching for lens in issue.lenses))
+        total = sum(issue.missing for issue in matching)
+        noun = "lens" if len(lenses) == 1 else "lenses"
+        clauses.append(f"{_counted(total, (unit, unit + 's'))} not covered by {noun} {', '.join(lenses)}")
+    return clauses
+
+
+def format_blocker_summary(report: GateReport) -> str:
+    """One line naming what still blocks the gate, e.g. `review incomplete: 3 hunks not covered by
+    lens contracts; 1 finding without a verdict`."""
+    if not report.issues:
+        return "review complete"
+    codes = [issue.code for issue in report.issues]
+    clauses = [clause for code, clause in _ROUND_CLAUSES.items() if code in codes]
+    clauses += _coverage_clauses(report.issues)
+    if "sweep-too-early" in codes:
+        clauses.append("final sweep recorded too early")
+    clauses += [_counted(codes.count(code), forms) for code, forms in _COUNTED_CLAUSES.items() if code in codes]
+    clauses += [clause for code, clause in _RUN_CLAUSES.items() if code in codes]
+    if "failing-run" in codes:
+        clauses.append(_counted(codes.count("failing-run"), ("failing run", "failing runs")))
+    if "no-isolation" in codes:
+        clauses.append("no reviewer isolation evidence")
+    return f"review incomplete: {'; '.join(clauses) or _counted(len(codes), ('open item', 'open items'))}"

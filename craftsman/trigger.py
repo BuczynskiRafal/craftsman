@@ -13,13 +13,21 @@ from craftsman.gate import GateTier
 MAX_TASK_CHARS = 300
 FLAG_TIERS: dict[str, GateTier] = {"quick": "quick", "standard": "standard", "deep": "deep"}
 
-LEADING_COMMAND_TRIGGER_RE = re.compile(
-    r"(?i)^\s*(?:/[a-z0-9_-]+\s+)*(/craftsman|ultracraft)(?=$|[\s.,:;!])"
+COMMANDS_PATTERN = (
+    r"/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft|"
+    r"/(?:craftsman:)?craftsman|craftsman:craftsman"
 )
-INLINE_TRIGGER_RE = re.compile(r"(?i)(?:^|[\s(])(/craftsman|ultracraft)(?=$|[\s.,:;!?)])")
-CRAFTSMAN_FLAG_TIER_RE = re.compile(r"(?i)/craftsman(?:\s+--(quick|standard|deep))\b")
+# `/craftsman: add x` ends the command at the colon; `/craftsman:code-review` is another command.
+COLON_END = r":(?![\w-])"
+LEADING_COMMAND_TRIGGER_RE = re.compile(
+    rf"(?i)^\s*(?:/[a-z0-9_-]+\s+)*({COMMANDS_PATTERN})(?=$|[\s.,;!?]|{COLON_END})"
+)
+INLINE_TRIGGER_RE = re.compile(rf"(?i)(?:^|[\s(])({COMMANDS_PATTERN})(?=$|[\s.,;!?)]|{COLON_END})")
+CRAFTSMAN_FLAG_TIER_RE = re.compile(
+    r"(?i)(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(quick|standard|deep))\b"
+)
 CLAUDE_COMMAND_NAME_RE = re.compile(
-    r"<command-name>\s*/?(craftsman|ultracraft)\s*</command-name>", re.IGNORECASE
+    r"<command-name>\s*/?(?:craftsman:)?(craftsman|ultracraft)\s*</command-name>", re.IGNORECASE
 )
 CLAUDE_COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL | re.IGNORECASE)
 SKILL_METADATA_TRIGGER_RE = re.compile(r"<SKILL>[^<]*skills/craftsman/SKILL\.md</SKILL>", re.IGNORECASE)
@@ -30,8 +38,12 @@ USER_REQUEST_BLOCK_RE = re.compile(
 QUOTED_SPAN_RE = re.compile(
     r"(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)|\"[^\"]*\"|(?<![A-Za-z0-9])'[^'\n]*'(?![A-Za-z0-9])"
 )
+# The ultracraft forms come first: `/craftsman` would otherwise match the start of
+# `/craftsman:ultracraft`. A colon that ends the command (`/craftsman: add x`) goes with it.
 TRIGGER_TOKEN_RE = re.compile(
-    r"(?i)(?<![\w/-])(?:/craftsman(?:\s+--(?:quick|standard|deep))?|ultracraft)(?![\w-])"
+    r"(?i)(?<![\w/-])(?:/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft"
+    r"|(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard|deep))?)"
+    rf"(?:{COLON_END}|(?![\w:-]))"
 )
 
 
@@ -44,7 +56,8 @@ def detect_trigger(content: str) -> GateTier | None:
         if claude_command.group(1).lower() == "ultracraft":
             return "deep"
         args = CLAUDE_COMMAND_ARGS_RE.search(content)
-        return _requested_tier(f"/craftsman {args.group(1).strip() if args else ''}", "/craftsman")
+        arg_str = args.group(1).strip() if args else ""
+        return _requested_tier(f"/craftsman {arg_str}", "/craftsman")
 
     requests = USER_REQUEST_BLOCK_RE.findall(content)
     user_text = QUOTED_SPAN_RE.sub(" ", (requests[-1] if requests else content).strip())
@@ -60,7 +73,7 @@ def detect_trigger(content: str) -> GateTier | None:
 
 
 def _requested_tier(text: str, token: str) -> GateTier:
-    if token.lower() == "ultracraft":
+    if token.lower().endswith("ultracraft"):
         return "deep"
     flag = CRAFTSMAN_FLAG_TIER_RE.search(text)
     if flag is None:

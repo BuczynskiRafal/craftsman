@@ -6,6 +6,7 @@ import os
 import sys
 from pathlib import Path
 
+from craftsman.assets import AGENT_TEMPLATES_DIR
 from craftsman.generated import ExportError
 
 
@@ -36,7 +37,7 @@ def env_var_for_home(env_key: str, home: Path | None = None) -> str:
 
 
 def _has_assets(directory: Path) -> bool:
-    return (directory / "skills").is_dir() and (directory / "agents").is_dir()
+    return (directory / "skills").is_dir() and (directory / AGENT_TEMPLATES_DIR).is_dir()
 
 
 def resolve_craftsman_pkg_dir(repo_dir: Path) -> Path:
@@ -55,16 +56,16 @@ def default_repo_dir() -> Path:
     for candidate in (pkg_dir.parent, pkg_dir / "_assets"):
         if _has_assets(candidate):
             return candidate
-    raise ExportError(f"no Craftsman assets (skills/, agents/) next to {pkg_dir}; pass --repo-dir")
+    raise ExportError(f"no Craftsman assets (skills/, templates/agents/) next to {pkg_dir}; pass --repo-dir")
 
 
 def default_vscode_user_dir(home: Path | None = None) -> Path:
     """VS Code's `Code/User` folder in this operating system's layout."""
     if sys.platform == "win32":
+        # Windows sets APPDATA to this folder by default; like XDG_CONFIG_HOME below, a value
+        # outside an explicitly given home is ignored.
         appdata = env_var_for_home("APPDATA", home)
-        if not appdata:
-            raise ExportError("APPDATA is not set; cannot locate the VS Code user folder")
-        return Path(appdata) / "Code" / "User"
+        return (Path(appdata) if appdata else user_home(home) / "AppData" / "Roaming") / "Code" / "User"
     if sys.platform == "darwin":
         return user_home(home) / "Library" / "Application Support" / "Code" / "User"
     xdg_config = env_var_for_home("XDG_CONFIG_HOME", home)

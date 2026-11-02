@@ -152,16 +152,18 @@ class SnapshotTests(RepoTestCase):
         self.assertEqual(snap.files, ("run.sh",))
 
     def test_paths_with_special_characters_are_unquoted(self) -> None:
-        self.repo.write("dir with space/a b.txt", "one\n")
-        self.repo.write('q"uote.txt', "one\n")
+        # Windows file names cannot contain `"`.
+        tracked = ["dir with space/a b.txt", *(() if os.name == "nt" else ('q"uote.txt',))]
+        for name in tracked:
+            self.repo.write(name, "one\n")
         base = self.repo.commit()
-        self.repo.write("dir with space/a b.txt", "two\n")
-        self.repo.write('q"uote.txt', "two\n")
+        for name in tracked:
+            self.repo.write(name, "two\n")
         self.repo.write("new dir/c d.txt", "three\n")
 
         snap = snapshot(self.repo.root, base)
 
-        self.assertEqual(snap.files, ("dir with space/a b.txt", "new dir/c d.txt", 'q"uote.txt'))
+        self.assertEqual(snap.files, tuple(sorted([*tracked, "new dir/c d.txt"])))
         self.assertEqual([hunk.path for hunk in snap.hunks], list(snap.files))
 
     def test_line_endings_are_kept_exactly(self) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
 import shlex
@@ -31,7 +32,12 @@ from craftsman.paths import (
     resolve_craftsman_pkg_dir,
     user_home,
 )
-from craftsman.platforms.claude import CLAUDE_HOOK_EVENTS, is_craftsman_hook_command
+from craftsman.platforms.antigravity import PLUGIN_NAME, is_agy_plugin_active, is_own_plugin
+from craftsman.platforms.claude import (
+    CLAUDE_HOOK_EVENTS,
+    is_claude_plugin_active,
+    is_craftsman_hook_command,
+)
 from craftsman.platforms.copilot import (
     COPILOT_DISCOVERY,
     HOOKS_FILENAME,
@@ -163,16 +169,29 @@ class DoctorReport:
 # --- repository assets ----------------------------------------------------------------------
 
 
+PLUGIN_SKILL_PREFIX = "./skills/"
+
+
 def plugin_skill_names(repo_dir: Path) -> tuple[str, ...]:
-    """The skills `plugin.json` ships; an unreadable manifest is an error, not zero skills."""
+    """The skills `plugin.json` ships; an unreadable manifest is an error, not zero skills.
+
+    agy reads each entry as a path inside the plugin, `./skills/<name>`.
+    """
     plugin_file = repo_dir / "plugin.json"
     try:
         data = json.loads(plugin_file.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ExportError(f"cannot read {plugin_file}: {exc}") from exc
-    skills = data.get("skills") if isinstance(data, dict) else None
-    if not isinstance(skills, list) or not all(isinstance(name, str) for name in skills):
-        raise ExportError(f"{plugin_file}: `skills` must be a list of skill names")
+    entries = data.get("skills") if isinstance(data, dict) else None
+    skills = [
+        entry.removeprefix(PLUGIN_SKILL_PREFIX)
+        for entry in (entries if isinstance(entries, list) else ())
+        if isinstance(entry, str) and entry.startswith(PLUGIN_SKILL_PREFIX)
+    ]
+    if not isinstance(entries, list) or len(skills) != len(entries) or not all(
+        name and "/" not in name for name in skills
+    ):
+        raise ExportError(f"{plugin_file}: `skills` must be a list of `{PLUGIN_SKILL_PREFIX}<name>` paths")
     repeated = sorted({name for name in skills if skills.count(name) > 1})
     if repeated:
         raise ExportError(f"{plugin_file}: `skills` lists {', '.join(repeated)} more than once")
@@ -238,7 +257,28 @@ def detect_antigravity_drift(repo_dir: Path, cfg: Path) -> list[str]:
         drifted.extend(_copied_file_drift(src_base, cfg / subdir, subdir, pattern, cfg))
     if has_skills:
         drifted.extend(_hooks_json_drift(repo_dir / "hooks.json", cfg))
+    if has_plugin and is_own_plugin(cfg):
+        drifted.extend(_plugin_drift(repo_dir, cfg))
     return drifted
+
+
+def _plugin_drift(repo_dir: Path, cfg: Path) -> Iterator[str]:
+    """The copy that `craftsman install --antigravity --plugin` made of the plugin."""
+    plugin_dir = cfg / "plugins" / PLUGIN_NAME
+    label = f"plugins/{PLUGIN_NAME}"
+    for name in ("plugin.json", "hooks.json"):
+        installed = plugin_dir / name
+        if not installed.is_file():
+            yield f"{label}/{name} (missing in {cfg})"
+        elif _sha256_file(repo_dir / name) != _sha256_file(installed):
+            yield f"{label}/{name}"
+    for subdir, pattern in (("skills", "**/*.md"), ("rules", "*.md"), ("scripts", "*.py")):
+        yield from _copied_file_drift(
+            repo_dir / subdir, plugin_dir / subdir, f"{label}/{subdir}", pattern, cfg
+        )
+    yield from _copied_file_drift(
+        resolve_craftsman_pkg_dir(repo_dir), plugin_dir / "craftsman", f"{label}/craftsman", "**/*.py", cfg
+    )
 
 
 def _copied_file_drift(
@@ -600,16 +640,61 @@ def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
 # --- report ---------------------------------------------------------------------------------
 
 
+# Craftsman's distribution before it became `craftsman-gate` on PyPI; both install the same files.
+LEGACY_DISTRIBUTION = "craftsman"
+DISTRIBUTION = "craftsman-gate"
+
+
+def _has_distribution(name: str) -> bool:
+    try:
+        importlib.metadata.distribution(name)
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def inspect_legacy_distribution() -> list[str]:
+    """A problem when this interpreter has the pre-rename `craftsman` beside `craftsman-gate`.
+
+    pip does not see that two distributions own the same files, so uninstalling the old one would
+    delete the package and the `craftsman` script out from under `craftsman-gate`. Without
+    `craftsman-gate` (a plugin or checkout run) there is nothing for the old one to take away.
+    """
+    if not (_has_distribution(LEGACY_DISTRIBUTION) and _has_distribution(DISTRIBUTION)):
+        return []
+    return [
+        f"The old `{LEGACY_DISTRIBUTION}` distribution is installed for {sys.executable} beside "
+        "craftsman-gate and owns the same files; `pip uninstall craftsman` alone would delete them. "
+        "Run `python -m pip uninstall craftsman craftsman-gate`, then `pip install craftsman-gate`."
+    ]
+
+
+def inspect_agy_plugin_duplicate(home: Path) -> list[str]:
+    """A problem when the agy plugin and a copy or symlink install into ~/.gemini/config both exist."""
+    cfg = home / ".gemini" / "config"
+    try:
+        hooks = json.loads((cfg / "hooks.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        hooks = None
+    merged_hooks = isinstance(hooks, dict) and any(str(key).startswith("craftsman-") for key in hooks)
+    copied = (cfg / "skills" / "craftsman" / "SKILL.md").is_file() or merged_hooks
+    if not (copied and is_agy_plugin_active(home)):
+        return []
+    return [
+        f"Duplicate Antigravity install: the craftsman plugin from `agy plugin install` and the "
+        f"skills or hooks that `craftsman install --antigravity` put into {cfg} are both active "
+        "(skills are listed twice and hooks can fire twice). Remove one with "
+        "'craftsman uninstall --antigravity' or 'agy plugin uninstall craftsman'."
+    ]
+
+
 def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> CopilotReport:
     copilot_home = default_copilot_home(home)
     skills = [_skills_report(default_copilot_skills_dir(home))]
+    workspace_agents = None
     if workspace is not None:
         skills.append(_skills_report(workspace / ".github" / "skills"))
-    workspace_agents = (
-        _agents_installed(workspace / ".github" / "agents", AGENT_NAMES, ".agent.md")
-        if workspace is not None
-        else None
-    )
+        workspace_agents = _agents_installed(workspace / ".github" / "agents", AGENT_NAMES, ".agent.md")
     return CopilotReport(
         user_hooks=inspect_copilot_hooks(copilot_home / "hooks" / HOOKS_FILENAME),
         agents=AgentsReport(
@@ -620,7 +705,9 @@ def _copilot_report(repo_dir: Path, workspace: Path | None, home: Path) -> Copil
     )
 
 
-def _platform_problems(copilot: CopilotReport, claude: ClaudeReport) -> list[str]:
+def _platform_problems(
+    copilot: CopilotReport, claude: ClaudeReport, claude_dir: Path | None = None
+) -> list[str]:
     problems = [
         f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
         for entry in copilot.skills
@@ -636,6 +723,16 @@ def _platform_problems(copilot: CopilotReport, claude: ClaudeReport) -> list[str
         )
     if claude.hooks is ClaudeHooks.UNREADABLE:
         problems.append(f"Claude Code settings: {claude.detail}")
+    if (
+        claude.hooks is ClaudeHooks.MERGED
+        and claude_dir is not None
+        and is_claude_plugin_active(claude_dir)
+    ):
+        problems.append(
+            "Duplicate Claude Code hooks: both user-level hooks in settings.json and the craftsman "
+            "Claude Code plugin are installed (hooks would fire twice). Remove user-level hooks with "
+            "'craftsman uninstall --claude' or uninstall the plugin with '/plugin uninstall craftsman@craftsman'."
+        )
     problems.extend(_format_duplicate_problem(dup) for dup in copilot.duplicates)
     return problems
 
@@ -700,8 +797,10 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
     claude = _claude_report(default_claude_dir(home))
     problems = (
         *git_problems,
-        *_platform_problems(copilot, claude),
+        *_platform_problems(copilot, claude, default_claude_dir(home)),
         *inspect_legacy_git_hooks(git.hooks_path, home),
+        *inspect_legacy_distribution(),
+        *inspect_agy_plugin_duplicate(home),
     )
     healthy = (
         skill_count == expected_skills
@@ -747,7 +846,9 @@ def print_report(report: DoctorReport) -> None:
     print(f"  Git identity   : {git.user_name or 'unset'} <{git.user_email or 'unset'}>")
     print(f"  Git hooksPath  : {git.hooks_path or 'unset'}")
     if report.config_drift:
-        sync_hint = "run 'craftsman install --antigravity' to sync"
+        plugin = any(path.startswith(f"plugins/{PLUGIN_NAME}/") for path in report.config_drift)
+        command = "craftsman install --antigravity" + (" --plugin" if plugin else "")
+        sync_hint = f"run '{command}' to sync"
         print(
             f"  Config drift   : {len(report.config_drift)} file(s) differ between repo and "
             f"~/.gemini/config ({sync_hint})"
