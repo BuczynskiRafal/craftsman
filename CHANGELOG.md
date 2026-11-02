@@ -6,6 +6,8 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+## [4.1.0] - 2026-11-02
+
 ### Added
 
 - **Modular documentation (`docs/`)**: Reference material moved from `README.md` into modular guides:
@@ -355,7 +357,8 @@ All notable changes to Craftsman are recorded here. The format follows
 - Hook parsers, verdict detection and worktree state handling were hardened (see the v2.1.0
   follow-up fixes).
 
-[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...HEAD
+[4.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.3.0...v4.0.0
 [3.3.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.2.0...v3.3.0
 [3.2.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.1.0...v3.2.0

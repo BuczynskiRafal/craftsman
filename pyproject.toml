@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "craftsman-gate"
-version = "4.0.0"
+version = "4.1.0"
 description = "Make AI coding agents prove they reviewed and tested their change"
 readme = "README.md"
 license = { text = "MIT" }
