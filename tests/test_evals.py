@@ -60,6 +60,15 @@ class DistanceTests(unittest.TestCase):
             work = Path(tmp).resolve()
             self.assertEqual(run.normalize_path(f"{work}/pkg/a.py", work), "pkg/a.py")
             self.assertEqual(run.normalize_path("/elsewhere/a.py", work), "/elsewhere/a.py")
+            self.assertEqual(run.normalize_path("C:\\elsewhere\\a.py", work), "C:/elsewhere/a.py")
+
+    def test_windows_paths_are_relative_to_the_work_directory(self) -> None:
+        root = "C:/Users/me/evals/q1"
+        self.assertEqual(run.strip_root("C:/Users/me/evals/q1/quotes/p.py", root), "quotes/p.py")
+        self.assertEqual(run.strip_root("c:/users/ME/Evals/q1/quotes/p.py", root), "quotes/p.py")  # drive paths fold case
+        self.assertEqual(run.strip_root("C:/Users/me/evals/q10/p.py", root), "C:/Users/me/evals/q10/p.py")
+        self.assertEqual(run.strip_root("/home/me/q1/A.py", "/home/me/q1"), "A.py")
+        self.assertEqual(run.strip_root("/Home/me/q1/a.py", "/home/me/q1"), "/Home/me/q1/a.py")  # POSIX is exact
 
 
 class MatchingTests(unittest.TestCase):
@@ -80,14 +89,49 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(result["found"], 1)
         self.assertEqual(result["recall"], 0.5)
 
-    def test_matching_is_maximal_when_a_finding_is_near_two_defects(self) -> None:
-        case = _case(_defect("d1", _loc("a.py", 10)), _defect("d2", _loc("a.py", 16)))
-        # Line 13 is within the window of both; line 8 only of d1. A greedy pass that gives 13 to
-        # d1 would lose d2... 8 -> d1 and 13 -> d2 finds both.
-        matching = run.match_findings(case, [_finding("a.py", 13), _finding("a.py", 8)])
-        self.assertEqual(set(matching.found), {"d1", "d2"})
-        self.assertEqual(matching.found["d1"], 1)
-        self.assertEqual(matching.found["d2"], 0)
+    def test_two_findings_on_one_defect_do_not_credit_its_neighbour(self) -> None:
+        case = _case(_defect("d1", _loc("a.py", 48, 50)), _defect("d2", _loc("a.py", 51, 55)))
+        result = run.score_findings(case, [_finding("a.py", 48), _finding("a.py", 49)])
+        self.assertEqual([d["id"] for d in result["defects"] if d["found"]], ["d1"])
+        self.assertEqual(len(result["duplicates"]), 1)
+
+    def test_the_slack_never_covers_the_gap_between_two_defects(self) -> None:
+        case = _case(_defect("d1", _loc("a.py", 50, 52)), _defect("d2", _loc("a.py", 57, 61)))
+        slacks = {z.id: z.slack for z in run.zones(case)}
+        self.assertEqual(slacks, {"d1": 1, "d2": 1})  # 4 lines between: one each, two stay uncovered
+        credited = [set(run.match_findings(case, [_finding("a.py", line)]).found) for line in (53, 54, 55, 56)]
+        self.assertEqual(credited, [{"d1"}, set(), set(), {"d2"}])
+        far = _case(_defect("d1", _loc("a.py", 10)), _defect("d2", _loc("a.py", 40)))
+        self.assertEqual({z.slack for z in run.zones(far)}, {run.WINDOW})
+        self.assertEqual({z.slack for z in run.zones(_case(_defect("d1", _loc("a.py", 10))))}, {run.WINDOW})
+
+    def test_zones_of_different_items_never_overlap(self) -> None:
+        decoy = run.Decoy("x", "fine", (_loc("a.py", 12, 13),))
+        case = _case(_defect("d1", _loc("a.py", 10, 11)), _defect("d2", _loc("a.py", 15, 16)), decoys=(decoy,))
+        found = run.zones(case)
+        for first in found:
+            for second in found:
+                if first.id < second.id:
+                    reach = (
+                        range(first.location.start - first.slack, first.location.end + first.slack + 1),
+                        range(second.location.start - second.slack, second.location.end + second.slack + 1),
+                    )
+                    self.assertFalse(set(reach[0]) & set(reach[1]), (first.id, second.id))
+
+    def test_a_decoy_next_to_a_defect_is_still_a_decoy_hit(self) -> None:
+        decoy = run.Decoy("x", "fine", (_loc("a.py", 65, 66),))
+        case = _case(_defect("d1", _loc("a.py", 67, 71)), decoys=(decoy,))
+        on_decoy = run.match_findings(case, [_finding("a.py", 66)])
+        self.assertEqual((on_decoy.found, on_decoy.decoy_hits), ({}, ((0, "x"),)))
+        on_defect = run.match_findings(case, [_finding("a.py", 67)])
+        self.assertEqual((on_defect.found, on_defect.decoy_hits), ({"d1": 0}, ()))
+
+    def test_precision_is_the_share_of_findings_on_a_defect(self) -> None:
+        case = _case(_defect("d1", _loc("a.py", 10)))
+        result = run.score_findings(case, [_finding("a.py", 10), _finding("a.py", 10), _finding("a.py", 90)])
+        self.assertAlmostEqual(result["precision"], 2 / 3)
+        self.assertIn("precision", run.render_score(result))
+        self.assertIsNone(run.score_findings(case, [])["precision"])
 
     def test_a_defect_may_have_several_locations(self) -> None:
         case = _case(_defect("d1", _loc("a.py", 10), _loc("b.py", 50)))
@@ -128,7 +172,7 @@ class ReadingTests(unittest.TestCase):
 
     def test_ledger_ignores_dismissed_and_reads_file_or_path(self) -> None:
         ledger = {
-            "schema_version": 3,
+            "schema": 3,
             "findings": [
                 {"id": "F1", "file": "a.py", "line": 3, "title": "one", "verdict": "proven"},
                 {"id": "F2", "path": "./b.py", "line": 4, "title": "two", "verdict": None},
@@ -235,6 +279,9 @@ class SuiteTests(unittest.TestCase):
                         lines = path.read_text(encoding="utf-8").splitlines()
                         self.assertLessEqual(loc.end, len(lines))
                         self.assertTrue(lines[loc.start - 1].strip(), f"{loc.file}:{loc.start} is blank")
+                        self.assertTrue(loc.anchor, f"{item.id}: {loc.file}:{loc.start} has no anchor")
+                        covered = "\n".join(lines[loc.start - 1 : loc.end])
+                        self.assertIn(loc.anchor, covered, f"{item.id}: truth.json is out of date for {loc.file}")
 
     def test_base_and_head_tests_pass(self) -> None:
         env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -294,8 +341,8 @@ class PrepareAndScoreTests(unittest.TestCase):
                 work = self.tmp / case_id
                 code, text = self._run("prepare", case_id, str(work))
                 self.assertEqual(code, 0)
-                self.assertIn("/code-review", text)
-                self.assertIn("Do not modify any file", text)
+                self.assertIn("/craft-review", text)
+                self.assertIn("do not modify any file", text)
                 self.assertEqual(self._git(work, "rev-list", "--count", "HEAD").strip(), "1")
                 self.assertTrue(self._git(work, "status", "--porcelain").strip())
                 committed = set(self._git(work, "ls-tree", "-r", "--name-only", "HEAD").split())
@@ -306,6 +353,15 @@ class PrepareAndScoreTests(unittest.TestCase):
                     (case.path / "task.md").read_text(encoding="utf-8"),
                 )
                 self.assertFalse(list(work.rglob("truth.json")))
+
+    def test_prepare_ignores_stray_editor_files_in_a_case(self) -> None:
+        cases = self.tmp / "cases"
+        shutil.copytree(run.CASES_DIR / "kvstore", cases / "kvstore")
+        (cases / "kvstore" / "base" / ".DS_Store").write_bytes(b"x")
+        work = self.tmp / "stray"
+        code, _ = self._run("--cases-dir", str(cases), "prepare", "kvstore", str(work))
+        self.assertEqual(code, 0)
+        self.assertFalse(list(work.rglob(".DS_Store")))
 
     def test_prepare_refuses_a_non_empty_destination(self) -> None:
         work = self.tmp / "busy"
@@ -347,7 +403,7 @@ class PrepareAndScoreTests(unittest.TestCase):
         entries = [{**f, "verdict": "probable"} for f in findings[:1]]
         entries.append({**findings[1], "verdict": "dismissed"})
         entries.append({**findings[2], "file": str(work / findings[2]["file"])})
-        ledger.write_text(json.dumps({"schema_version": 3, "findings": entries}), encoding="utf-8")
+        ledger.write_text(json.dumps({"schema": 3, "findings": entries}), encoding="utf-8")
         code, text = self._run("score", "quotes", str(work))
         self.assertEqual(code, 0)
         self.assertIn("recall 2/3", text)
@@ -368,25 +424,32 @@ class PrepareAndScoreTests(unittest.TestCase):
                 self.assertEqual(result["found"], len(case.defects))
                 self.assertEqual(result["unmatched"], [])
 
-    def test_decoy_locations_do_not_find_defects(self) -> None:
+    def test_decoys_and_defects_are_told_apart_by_their_own_lines(self) -> None:
         for case_id in run.case_ids():
             with self.subTest(case=case_id):
                 case = run.load_case(case_id)
-                decoy_findings = [
-                    run.Finding(loc.file, loc.start, d.id) for d in case.decoys for loc in d.locations
-                ]
-                matching = run.match_findings(case, decoy_findings)
-                hits = {index for index, _ in matching.decoy_hits}
-                # A decoy that sits next to a defect may be read as a duplicate or a defect hit,
-                # so only decoys clear of every defect window must be reported as decoy hits.
-                for index, finding in enumerate(decoy_findings):
-                    near_defect = any(
-                        run.distance(finding, loc) is not None
-                        for df in case.defects
-                        for loc in df.locations
-                    )
-                    if not near_defect:
-                        self.assertIn(index, hits, finding)
+                for decoy in case.decoys:
+                    for loc in decoy.locations:
+                        found = run.match_findings(case, [run.Finding(loc.file, loc.start, "")])
+                        self.assertEqual((found.found, found.decoy_hits), ({}, ((0, decoy.id),)), decoy.id)
+                for defect in case.defects:
+                    for loc in defect.locations:
+                        found = run.match_findings(case, [run.Finding(loc.file, loc.start, "")])
+                        self.assertEqual((found.found, found.decoy_hits), ({defect.id: 0}, ()), defect.id)
+
+    def test_no_two_items_of_a_case_share_a_line_or_a_window(self) -> None:
+        for case_id in run.case_ids():
+            with self.subTest(case=case_id):
+                found = run.zones(run.load_case(case_id))
+                for index, first in enumerate(found):
+                    for second in found[index + 1 :]:
+                        if first.id == second.id or first.location.file != second.location.file:
+                            continue
+                        reach_a = set(range(first.location.start - first.slack, first.location.end + first.slack + 1))
+                        reach_b = set(
+                            range(second.location.start - second.slack, second.location.end + second.slack + 1)
+                        )
+                        self.assertFalse(reach_a & reach_b, (first.id, second.id))
 
 
 class DocsTests(unittest.TestCase):
@@ -430,10 +493,10 @@ def emit(event):
 skills = ["deep-research"]
 agents = ["Explore"]
 if plugin and mode != "noplugin":
-    skills.append("craftsman:code-review")
+    skills.append("craftsman:craft-review")
     agents += ["craftsman:craftsman-reviewer", "craftsman:craftsman-verifier"]
 if mode == "leaky":
-    skills.append("craftsman:code-review")
+    skills.append("craftsman:craft-review")
 emit({{"type": "system", "subtype": "init", "skills": skills, "agents": agents,
       "plugins": [{{"name": "craftsman"}}] if plugin else [], "permissionMode": "dontAsk"}})
 emit({{"type": "stream_event", "event": {{"type": "message_start"}}}})
@@ -485,7 +548,7 @@ class AgentTestCase(unittest.TestCase):
         self.log = self.tmp / "fake.log"
         self.out = self.tmp / "results" / "r.jsonl"
 
-    def _make_src(self, root: Path, skill: str = "code-review", name: str = "craftsman") -> Path:
+    def _make_src(self, root: Path, skill: str = "craft-review", name: str = "craftsman") -> Path:
         (root / ".claude-plugin").mkdir(parents=True)
         (root / ".claude-plugin" / "plugin.json").write_text(json.dumps({"name": name}), encoding="utf-8")
         (root / "skills" / skill).mkdir(parents=True)
@@ -579,7 +642,7 @@ class AgentRunTests(AgentTestCase):
         )
         self.assertTrue(record["init"]["skill_loaded"])
         self.assertEqual(record["exit_code"], 0)
-        self.assertEqual(record["skill"], "craftsman:code-review")
+        self.assertEqual(record["skill"], "craftsman:craft-review")
         for key in ("stream", "stderr", "ledger"):
             self.assertTrue(Path(record["logs"][key]).is_file(), key)
         self.assertNotIn("workdir", record["logs"])
@@ -595,7 +658,7 @@ class AgentRunTests(AgentTestCase):
         self.assertEqual(argv[argv.index("-p") + 1], records[0]["prompt"])
         self.assertEqual(
             records[0]["prompt"],
-            "/craftsman:code-review review the changes against HEAD (review only, do not fix). "
+            "/craftsman:craft-review review the changes against HEAD (review only, do not fix). "
             "The change description is in .git/evals/task.md.",
         )
         self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
@@ -632,7 +695,7 @@ class AgentRunTests(AgentTestCase):
 
     def test_keep_workdirs_and_custom_prompt(self) -> None:
         _, records = self.agent("--keep-workdirs", "--prompt", "/{skill} look at {case} versus {base}", "--model", "opus")
-        self.assertEqual(records[0]["prompt"], "/craftsman:code-review look at quotes versus HEAD")
+        self.assertEqual(records[0]["prompt"], "/craftsman:craft-review look at quotes versus HEAD")
         self.assertEqual(records[0]["model"], "opus")
         workdir = Path(records[0]["logs"]["workdir"])
         self.assertTrue((workdir / ".git" / "craftsman" / "ledger.json").is_file())
@@ -663,7 +726,7 @@ class AgentRunTests(AgentTestCase):
         self.assertLess(time.monotonic() - started, 30)  # the fake would sleep for 60 s
         self.assertEqual(code, 1)
         self.assertEqual(records[0]["status"], "load-failed")
-        self.assertIn("skill craftsman:code-review", records[0]["init"]["problems"])
+        self.assertIn("skill craftsman:craft-review", records[0]["init"]["problems"])
         self.assertIn("agent craftsman:craftsman-reviewer", records[0]["init"]["problems"])
 
     def test_timeout_keeps_the_findings_written_so_far(self) -> None:
@@ -708,7 +771,7 @@ class AgentRunTests(AgentTestCase):
     def test_baseline_arm_fails_when_craftsman_is_loaded_anyway(self) -> None:
         _, records = self.agent("--baseline", env={"FAKE_CLAUDE_MODE": "leaky"})
         self.assertEqual(records[0]["status"], "load-failed")
-        self.assertIn("unexpected craftsman:code-review", records[0]["init"]["problems"])
+        self.assertIn("unexpected craftsman:craft-review", records[0]["init"]["problems"])
 
     def test_cases_and_repeats_run_in_parallel_and_all_land_in_the_file(self) -> None:
         argv = self.base_argv("--repeat", "2", "--jobs", "3", "--cases", "quotes,kvstore")
@@ -727,7 +790,12 @@ class AgentHelperTests(AgentTestCase):
         info = run_agent.detect_plugin(both)
         self.assertEqual((info.name, info.skill, info.qualified_skill), ("forge", "craft-review", "forge:craft-review"))
         self.assertEqual(info.agents, ("forge:craftsman-reviewer", "forge:craftsman-verifier"))
-        self.assertEqual(run_agent.detect_plugin(self.src).qualified_skill, "craftsman:code-review")
+        self.assertEqual(run_agent.detect_plugin(self.src).qualified_skill, "craftsman:craft-review")
+
+    def test_detect_plugin_still_finds_the_skill_of_an_older_checkout(self) -> None:
+        old = self._make_src(self.tmp / "old", "code-review")
+        self.assertEqual(run_agent.detect_plugin(old).qualified_skill, "craftsman:code-review")
+        self.assertEqual(run_agent.default_prompt(run_agent.detect_plugin(old)).split()[0], "/craftsman:code-review")
 
     def test_detect_plugin_errors(self) -> None:
         empty = self.tmp / "empty"
@@ -784,16 +852,16 @@ class AgentHelperTests(AgentTestCase):
         self.assertIsNone(run_agent.parse_output("").result)
 
     def test_check_init(self) -> None:
-        info = run_agent.PluginInfo("craftsman", "code-review")
+        info = run_agent.PluginInfo("craftsman", "craft-review")
         cfg = run_agent.AgentConfig(
             (), self.src, info, "a", "sonnet", 1, 1, 1.0, 1.0, self.out, self.out, None, "claude", "dontAsk", (), False
         )
         agents = ["craftsman:craftsman-reviewer", "craftsman:craftsman-verifier"]
-        self.assertEqual(run_agent.check_init({"skills": ["craftsman:code-review"], "agents": agents}, cfg), [])
-        self.assertEqual(run_agent.check_init({"slash_commands": ["craftsman:code-review"], "agents": agents}, cfg), [])
+        self.assertEqual(run_agent.check_init({"skills": ["craftsman:craft-review"], "agents": agents}, cfg), [])
+        self.assertEqual(run_agent.check_init({"slash_commands": ["craftsman:craft-review"], "agents": agents}, cfg), [])
         self.assertEqual(
             run_agent.check_init({"skills": [], "agents": agents[:1]}, cfg),
-            ["skill craftsman:code-review", "agent craftsman:craftsman-verifier"],
+            ["skill craftsman:craft-review", "agent craftsman:craftsman-verifier"],
         )
 
     def test_render_prompt_keeps_unknown_braces(self) -> None:

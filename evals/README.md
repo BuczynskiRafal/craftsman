@@ -1,7 +1,7 @@
 # Seeded-defect review benchmark
 
 A cheap, repeatable way to measure how many real defects a review protocol finds on any agent
-platform: Craftsman `/code-review` against a plain "review this change" prompt, on Claude Code,
+platform: Craftsman `/craft-review` against a plain "review this change" prompt, on Claude Code,
 Google Antigravity, Copilot, Codex or anything else that can read a git repository.
 
 Each **case** is a small Python library or CLI (stdlib only, with its own `unittest` tests) plus a
@@ -79,10 +79,10 @@ ones that record the isolation evidence in the ledger. The harness reads the `sy
 stream and **stops the run at once** (status `load-failed`, almost no cost) when the review skill or one of
 the two agents is not in it, and, for `--baseline`, when any `craftsman:` skill or agent is. The record keeps
 how often each hook ran and how often it failed. The review skill is `skills/craft-review` if the source has
-it, else `skills/code-review`; the default prompt is
+it, else (checkouts older than Craftsman 5) `skills/code-review`; the default prompt is
 
 ```text
-/craftsman:code-review review the changes against HEAD (review only, do not fix). The change description is in .git/evals/task.md.
+/craftsman:craft-review review the changes against HEAD (review only, do not fix). The change description is in .git/evals/task.md.
 ```
 
 **Permissions.** Unattended, with an explicit allow list and no `bypassPermissions`:
@@ -183,8 +183,8 @@ of a few hard defects: `--defects` shows which.
 ## Run a case by hand
 
 ```bash
-python3 evals/run.py list                               # case, size, defects, decoys, kinds
-python3 evals/run.py prepare quotes ~/evals/quotes-1     # a fresh, empty directory
+python3 -m evals.run list                               # case, size, defects, decoys, kinds
+python3 -m evals.run prepare quotes ~/evals/quotes-1     # a fresh, empty directory
 ```
 
 This is for other agents and platforms, or to look at a case. `agent` below does the same, unattended,
@@ -203,7 +203,7 @@ Install Craftsman for the platform once (`craftsman install`, see
 [installation](../docs/installation.md)), start the agent inside the prepared directory and run:
 
 ```text
-/code-review
+/craft-review review the changes against HEAD (review only, do not fix)
 ```
 
 Tell it that the change description is the file `.git/evals/task.md` (it can be passed as the
@@ -221,11 +221,9 @@ You are reviewing an uncommitted change in this git repository. The change descr
 `.git/evals/task.md`. See the change with `git status` and `git diff HEAD`; new files are
 untracked, so read them too.
 
-Find the real defects the change introduces or leaves behind: wrong behavior, boundary and edge
-cases, errors that are lost, partial writes, security problems, places that should have been
-updated with the change but were not, tests that cannot fail or that check less than they claim,
-and help text or docs that contradict the code. Read the code around the change, not only the
-diff, and run the tests if that helps. Do not modify any file in the repository.
+Find the real defects the change introduces or leaves behind. Read the code around the change,
+not only the diff, and run the tests if that helps. Review only: do not modify any file in the
+repository.
 
 When you are done, write your findings to `.git/evals/findings.json` as a JSON list, one object
 per defect, with exactly these keys:
@@ -240,7 +238,7 @@ If the agent cannot write the file, save the JSON list it prints to any file and
 ### Claude Code, Antigravity, other agents
 
 - **Claude Code**: `cd` into the prepared directory, run `claude`. For the Craftsman arm use
-  `/code-review`; for the baseline arm start from a profile without the Craftsman plugin (for
+  `/craft-review`; for the baseline arm start from a profile without the Craftsman plugin (for
   example a fresh `CLAUDE_CONFIG_DIR`) and paste the baseline prompt.
 - **Google Antigravity**: open the prepared directory as the workspace. The Craftsman arm needs
   the plugin or `craftsman install --antigravity`; the baseline arm needs a profile without it.
@@ -254,9 +252,9 @@ setup and not the protocol.
 ## Score a run
 
 ```bash
-python3 evals/run.py score quotes ~/evals/quotes-1                    # ledger, or .git/evals/findings.json
-python3 evals/run.py score quotes ~/evals/quotes-1 --findings f.json  # baseline list from anywhere
-python3 evals/run.py score quotes ~/evals/quotes-1 --json             # machine-readable
+python3 -m evals.run score quotes ~/evals/quotes-1                    # ledger, or .git/evals/findings.json
+python3 -m evals.run score quotes ~/evals/quotes-1 --findings f.json  # baseline list from anywhere
+python3 -m evals.run score quotes ~/evals/quotes-1 --json             # machine-readable
 ```
 
 The output has the recall for the case (defects found / defects seeded), every defect with the
@@ -267,11 +265,17 @@ them, a real problem outside the seeded list lands there too), the **decoy hits*
 Matching rules:
 
 - A finding matches a defect when its file is the same as one of the defect's locations and its
-  line lies within `[start - 3, end + 3]` of that location. Paths are compared relative to the
-  repository root (`./`, backslashes and absolute paths inside the work directory are
-  normalized).
-- Each finding matches at most one defect and each defect counts once. The assignment gives the
-  most defects found; ties go to the nearest line.
+  line lies within `[start - s, end + s]` of that location, where `s` is 3 lines but never so many
+  that the windows of two defects or decoys of one file touch: `s` is at most `(g - 1) / 2` for a
+  gap of `g` lines to the next item, so a defect directly after another one has `s = 0`. Two
+  findings on one defect therefore cannot credit its neighbour. Paths are compared relative to the
+  repository root (`./`, backslashes, absolute paths inside the work directory and Windows drive
+  letters are normalized).
+- A finding on a decoy's own lines is a decoy hit, even when a defect is next to it.
+- Each finding counts for at most one defect or decoy and each defect counts once: when several
+  findings point at a defect, the closest one finds it and the rest are duplicates.
+- **Precision** is the share of the scored findings that point at a seeded defect (found or
+  duplicate). It is a floor: an unmatched finding may be a real problem outside the seeded list.
 - Findings with the verdict `dismissed` are ignored. Only `findings[].file` (or `.path`), `.line`,
   `.title` and `.verdict` of the ledger are read, so ledger schema changes do not matter.
 - Findings that have no usable file or line are counted as unreadable and ignored.
@@ -303,17 +307,20 @@ a ledger or findings file counts as zero defects found, and is marked in the rec
        "size": "large",
        "defects": [
          {"id": "x-1", "kind": "swallowed-error", "summary": "one line",
-          "locations": [{"file": "pkg/mod.py", "start": 40, "end": 44}]}
+          "locations": [{"file": "pkg/mod.py", "start": 40, "end": 44, "anchor": "except OSError:"}]}
        ],
        "decoys": [
          {"id": "x-d1", "summary": "why this is correct",
-          "locations": [{"file": "pkg/mod.py", "start": 10, "end": 12}]}
+          "locations": [{"file": "pkg/mod.py", "start": 10, "end": 12, "anchor": "if not items:"}]}
        ]
      }
      ```
 
      `"size"` is optional (`"small"` is the default; a `"large"` case is checked against the large limits).
-     `file` is relative to `head/`, lines are 1-based and inclusive. A propagation defect can be
+     `file` is relative to `head/`, lines are 1-based and inclusive. `anchor` is text that occurs on
+     one of the lines start..end of the head file; the tests fail when an edit of the file moves the
+     code away from the stated lines. Keep decoys out of the lines of defects and mind the gap to
+     neighbouring defects (see the matching rules). A propagation defect can be
      reported at the caller or the callee: list both as locations. `kind` is one of the kinds above (`KINDS` in `run.py`).
 2. Run `python3 -m unittest tests.test_evals`. It checks that the base and head tests pass, that
    every location points at an existing, non-blank line, that the sizes are within the limits for its

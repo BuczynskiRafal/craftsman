@@ -34,9 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def parse_price(text: str) -> Decimal | None:
     try:
-        return Decimal(text)
+        price = Decimal(text)
     except InvalidOperation:
         return None
+    return price if price.is_finite() else None
 
 
 def main(argv: list[str] | None = None, out: TextIO = sys.stdout) -> int:

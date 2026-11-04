@@ -5,57 +5,57 @@
       "id": "od-1",
       "kind": "cache-key-missing-param",
       "summary": "RateTable.quote caches by (carrier, weight_g) only; the zone is not part of the key, so after one zone is quoted for a weight every other zone gets that zone's price.",
-      "locations": [{"file": "orderdesk/rates.py", "start": 58, "end": 61}]
+      "locations": [{"file": "orderdesk/rates.py", "start": 58, "end": 61, "anchor": "key = (carrier, weight_g)"}]
     },
     {
       "id": "od-2",
       "kind": "off-by-one-boundary",
       "summary": "Free shipping is tested with '>' although the task gives it from 75.00 up, so an order with a net amount of exactly 75.00 still pays shipping; the boundary test only asserts that the cost is at most the one below the threshold.",
-      "locations": [{"file": "orderdesk/shipping.py", "start": 35, "end": 36}]
+      "locations": [{"file": "orderdesk/shipping.py", "start": 35, "end": 36, "anchor": "if pricing.net_cents(order) > FREE_SHIPPING_CENTS:"}]
     },
     {
       "id": "od-3",
       "kind": "empty-as-missing",
       "summary": "'if override:' treats a staff override of 0 as no override, so 'ship --override 0', which should waive the shipping, charges the normal rate.",
-      "locations": [{"file": "orderdesk/shipping.py", "start": 33, "end": 34}]
+      "locations": [{"file": "orderdesk/shipping.py", "start": 33, "end": 34, "anchor": "if override:"}]
     },
     {
       "id": "od-4",
       "kind": "incomplete-propagation",
       "summary": "total_cents now includes shipping, but report.daily_summary builds its revenue from net amount and tax by itself and was not updated, so the daily revenue leaves shipping out although the task says it uses the order total.",
       "locations": [
-        {"file": "orderdesk/report.py", "start": 22, "end": 22},
-        {"file": "orderdesk/pricing.py", "start": 21, "end": 21}
+        {"file": "orderdesk/report.py", "start": 22, "end": 22, "anchor": "entry[\"revenue_cents\"] += pricing.net_cents(order) + pricing.tax_cents"},
+        {"file": "orderdesk/pricing.py", "start": 21, "end": 21, "anchor": "return net_cents(order) + tax_cents(order) + order.shipping_cents"}
       ]
     },
     {
       "id": "od-5",
       "kind": "swallowed-error",
       "summary": "apply_events skips a malformed carrier event with 'continue' without adding it to the rejected list, so 'track' neither applies nor reports it; the task lists malformed events as rejected.",
-      "locations": [{"file": "orderdesk/tracking.py", "start": 52, "end": 53}]
+      "locations": [{"file": "orderdesk/tracking.py", "start": 52, "end": 53, "anchor": "except (KeyError, ValueError):"}]
     },
     {
       "id": "od-6",
       "kind": "weak-test",
       "summary": "test_free_shipping_threshold ends with assertLessEqual(at, below), which also holds when the order at exactly the threshold still pays the full rate; it cannot fail for the boundary it is named after.",
-      "locations": [{"file": "tests/test_shipping.py", "start": 36, "end": 38}]
+      "locations": [{"file": "tests/test_shipping.py", "start": 36, "end": 38, "anchor": "self.assertGreater(below, 0)"}]
     }
   ],
   "decoys": [
     {
       "id": "od-d1",
       "summary": "The parcel count uses negative floor division as a ceiling and is at least 1; it gives the fewest parcels of at most 20 kg, as specified.",
-      "locations": [{"file": "orderdesk/shipping.py", "start": 25, "end": 25}]
+      "locations": [{"file": "orderdesk/shipping.py", "start": 25, "end": 25, "anchor": "return max(-(-weight_g // MAX_PARCEL_G), 1)"}]
     },
     {
       "id": "od-d2",
       "summary": "zone_for returns the international zone when the country is not in the table; that is the specified behavior, not a swallowed lookup error.",
-      "locations": [{"file": "orderdesk/zones.py", "start": 25, "end": 26}]
+      "locations": [{"file": "orderdesk/zones.py", "start": 25, "end": 26, "anchor": "except KeyError:"}]
     },
     {
       "id": "od-d3",
       "summary": "from_dict defaults a missing shipping_cents to 0; orders saved before this change have no such field and must still load.",
-      "locations": [{"file": "orderdesk/models.py", "start": 97, "end": 97}]
+      "locations": [{"file": "orderdesk/models.py", "start": 97, "end": 97, "anchor": "shipping_cents=data.get(\"shipping_cents\", 0),"}]
     }
   ]
 }

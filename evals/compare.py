@@ -74,6 +74,7 @@ class Group:
     found: list[int] = field(default_factory=list)
     decoys: list[int] = field(default_factory=list)
     unmatched: list[int] = field(default_factory=list)
+    precision: list[float] = field(default_factory=list)  # runs that scored at least one finding
     cost: list[float] = field(default_factory=list)
     minutes: list[float] = field(default_factory=list)
     turns: list[int] = field(default_factory=list)
@@ -109,6 +110,8 @@ def group_records(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Grou
         group.by_run[int(record.get("run", len(group.found)))] = found
         group.decoys.append(_count(recall.get("decoy_hits")))
         group.unmatched.append(_count(recall.get("unmatched")))
+        if isinstance(recall.get("precision"), (int, float)):
+            group.precision.append(float(recall["precision"]))
         group.cost.append(float(record.get("cost_usd") or 0.0))
         group.minutes.append(float(record.get("wall_s") or 0.0) / 60)
         group.turns.append(int(record.get("turns") or 0))
@@ -160,6 +163,7 @@ def arm_rows(cases: dict[str, Group]) -> list[dict[str, str]]:
                 "range": _range(g.found),
                 "decoys": f"{mean(g.decoys):.2f}" if g.runs else "-",
                 "unmatched": f"{mean(g.unmatched):.2f}" if g.runs else "-",
+                "precision": f"{mean(g.precision):.0%}" if g.precision else "-",
                 "cost $": _pm(g.cost),
                 "minutes": _pm(g.minutes, 1),
                 "turns": f"{mean(g.turns):.0f}" if g.runs else "-",
@@ -181,6 +185,9 @@ def arm_rows(cases: dict[str, Group]) -> list[dict[str, str]]:
             "range": _range(suite, percent=True),
             "decoys": f"{sum(mean(g.decoys) for g in live):.2f}" if live else "-",
             "unmatched": f"{sum(mean(g.unmatched) for g in live):.2f}" if live else "-",
+            "precision": f"{mean([mean(g.precision) for g in live if g.precision]):.0%}"
+            if any(g.precision for g in live)
+            else "-",
             "cost $": f"{sum(mean(g.cost) for g in live):.2f}" if live else "-",
             "minutes": f"{sum(mean(g.minutes) for g in live):.1f}" if live else "-",
             "turns": f"{sum(mean(g.turns) for g in live):.0f}" if live else "-",
@@ -320,7 +327,7 @@ def cmd_compare(args: argparse.Namespace, out: TextIO) -> int:
     print(
         "Per case: mean over the valid runs (± sample standard deviation); recall is defects found / seeded,\n"
         "range the fewest-most found in one run. TOTAL: sums of the case means, i.e. one pass over all cases;\n"
-        "its range is the suite recall per repeat. Unmatched findings are possible false positives. "
+        "its range is the suite recall per repeat. Unmatched findings are possible false positives; precision is the share of scored findings that point at a seeded defect. "
         "'invalid' runs\n(plugin did not load, harness error, no result) are left out of every number.",
         file=out,
     )

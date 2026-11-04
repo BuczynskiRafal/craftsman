@@ -1,9 +1,9 @@
 """Seeded-defect review benchmark: prepare a case, let an agent review it, score the findings.
 
 Usage:
-    python3 evals/run.py list
-    python3 evals/run.py prepare <case> <dest>
-    python3 evals/run.py score <case> <workdir> [--findings findings.json] [--json]
+    python3 -m evals.run list
+    python3 -m evals.run prepare <case> <dest>
+    python3 -m evals.run score <case> <workdir> [--findings findings.json] [--json]
     python3 -m evals.run agent --cases all --arm <label> [--craftsman-src <dir>] [--repeat N] ...
     python3 -m evals.run compare results.jsonl [more.jsonl ...]
 
@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -54,11 +56,9 @@ You are reviewing an uncommitted change in this git repository. The change descr
 `.git/evals/task.md`. See the change with `git status` and `git diff HEAD`; new files are
 untracked, so read them too.
 
-Find the real defects the change introduces or leaves behind: wrong behavior, boundary and edge
-cases, errors that are lost, partial writes, security problems, places that should have been
-updated with the change but were not, tests that cannot fail or that check less than they claim,
-and help text or docs that contradict the code. Read the code around the change, not only the
-diff, and run the tests if that helps. Do not modify any file in the repository.
+Find the real defects the change introduces or leaves behind. Read the code around the change,
+not only the diff, and run the tests if that helps. Review only: do not modify any file in the
+repository.
 
 When you are done, write your findings to `.git/evals/findings.json` as a JSON list, one object
 per defect, with exactly these keys:
@@ -78,6 +78,7 @@ class Location:
     file: str
     start: int
     end: int
+    anchor: str = ""  # text that must be on one of the lines start..end of the head file
 
 
 @dataclass(frozen=True)
@@ -147,7 +148,10 @@ def _locations(data: dict[str, Any], what: str) -> tuple[Location, ...]:
         start, end = entry.get("start"), entry.get("end")
         if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
             raise EvalError(f"{what}: location needs integer 'start' >= 1 and 'end' >= start")
-        found.append(Location(normalize_path(_text(entry, "file", what)), start, end))
+        anchor = entry.get("anchor", "")
+        if not isinstance(anchor, str):
+            raise EvalError(f"{what}: 'anchor' must be a string")
+        found.append(Location(normalize_path(_text(entry, "file", what)), start, end, anchor))
     return tuple(found)
 
 
@@ -200,15 +204,30 @@ def load_case(case_id: str, cases_dir: Path = CASES_DIR) -> Case:
 # --- reading findings --------------------------------------------------------------------------
 
 
+_DRIVE = re.compile(r"^[A-Za-z]:/")
+
+
+def strip_root(text: str, root: str) -> str:
+    """``text`` (POSIX form) relative to ``root`` when it lies inside it, else unchanged.
+
+    Windows paths (a drive letter) are compared case-insensitively, as the file system does.
+    """
+    prefix = root.rstrip("/") + "/"
+    fold = bool(_DRIVE.match(prefix))
+    if (text.lower() if fold else text).startswith(prefix.lower() if fold else prefix):
+        return text[len(prefix) :]
+    return text
+
+
 def normalize_path(raw: str, workdir: Path | None = None) -> str:
     """Repository-relative POSIX form of a path a reviewer reported."""
     text = raw.strip().replace("\\", "/")
-    if workdir is not None and text.startswith("/"):
-        root = workdir.resolve().as_posix().rstrip("/") + "/"
-        for candidate in (text, Path(text).resolve().as_posix()):
-            if candidate.startswith(root):
-                text = candidate[len(root) :]
-                break
+    if workdir is not None and (text.startswith("/") or _DRIVE.match(text)):
+        root = workdir.resolve().as_posix()
+        stripped = strip_root(text, root)
+        if stripped == text and text.startswith("/"):  # a symlinked spelling of the same directory
+            stripped = strip_root(Path(text).resolve().as_posix(), root)
+        text = stripped
     while text.startswith("./"):
         text = text[2:]
     return text
@@ -242,20 +261,14 @@ def _read_json(path: Path) -> Any:
         raise EvalError(f"{path} is not valid JSON: {exc}") from exc
 
 
-def read_ledger(path: Path, workdir: Path | None = None) -> tuple[list[Finding], int, int]:
-    """Findings of a Craftsman ledger as (findings, dismissed count, unreadable count).
-
-    Reads only ``findings[].file`` (or ``.path``), ``.line``, ``.title`` and ``.verdict``, so it
-    works across ledger schema versions. Findings with the verdict ``dismissed`` are ignored.
-    """
-    data = _read_json(path)
-    raw = data.get("findings") if isinstance(data, dict) else None
-    if not isinstance(raw, list):
-        raise EvalError(f"{path} has no 'findings' list; is it a Craftsman ledger?")
+def _collect(
+    entries: Sequence[Any], workdir: Path | None, ignore_dismissed: bool
+) -> tuple[list[Finding], int, int]:
+    """(findings, dismissed count, unreadable count) of a list of finding objects."""
     findings: list[Finding] = []
     dismissed = unreadable = 0
-    for entry in raw:
-        if isinstance(entry, dict) and entry.get("verdict") == "dismissed":
+    for entry in entries:
+        if ignore_dismissed and isinstance(entry, dict) and entry.get("verdict") == "dismissed":
             dismissed += 1
             continue
         finding = _finding(entry, workdir)
@@ -266,22 +279,27 @@ def read_ledger(path: Path, workdir: Path | None = None) -> tuple[list[Finding],
     return findings, dismissed, unreadable
 
 
+def read_ledger(path: Path, workdir: Path | None = None) -> tuple[list[Finding], int, int]:
+    """Findings of a Craftsman ledger as (findings, dismissed count, unreadable count).
+
+    Reads only ``findings[].file`` (or ``.path``), ``.line``, ``.title`` and ``.verdict``, so it
+    works across ledger schema versions. Findings with the verdict ``dismissed`` are ignored.
+    """
+    data = _read_json(path)
+    raw = data.get("findings") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        raise EvalError(f"{path} has no 'findings' list; is it a Craftsman ledger?")
+    return _collect(raw, workdir, ignore_dismissed=True)
+
+
 def read_findings_file(path: Path, workdir: Path | None = None) -> tuple[list[Finding], int, int]:
-    """Findings from a baseline JSON list of {"file", "line", "title"} objects."""
+    """Findings from a baseline JSON list of {"file", "line", "title"} objects (nothing is dismissed)."""
     data = _read_json(path)
     if isinstance(data, dict) and isinstance(data.get("findings"), list):
         data = data["findings"]
     if not isinstance(data, list):
         raise EvalError(f'{path} must be a JSON list of {{"file", "line", "title"}} objects')
-    findings: list[Finding] = []
-    unreadable = 0
-    for entry in data:
-        finding = _finding(entry, workdir)
-        if finding is None:
-            unreadable += 1
-        else:
-            findings.append(finding)
-    return findings, 0, unreadable
+    return _collect(data, workdir, ignore_dismissed=False)
 
 
 def ledger_path(workdir: Path) -> Path:
@@ -313,63 +331,87 @@ def collect_findings(workdir: Path, findings_file: Path | None = None) -> tuple[
 # --- matching ----------------------------------------------------------------------------------
 
 
-def distance(finding: Finding, location: Location) -> int | None:
-    """0 inside [start, end]; the distance to the nearest edge up to WINDOW lines; else None."""
+def distance(finding: Finding, location: Location, slack: int = WINDOW) -> int | None:
+    """0 inside [start, end]; the distance to the nearest edge up to ``slack`` lines; else None."""
     if finding.file != location.file:
         return None
     if location.start <= finding.line <= location.end:
         return 0
     gap = location.start - finding.line if finding.line < location.start else finding.line - location.end
-    return gap if gap <= WINDOW else None
+    return gap if gap <= slack else None
 
 
-def _nearest(finding: Finding, locations: Sequence[Location]) -> int | None:
-    gaps = [g for g in (distance(finding, loc) for loc in locations) if g is not None]
-    return min(gaps) if gaps else None
+@dataclass(frozen=True)
+class Zone:
+    """The lines a finding may point at to count for one location of a defect or a decoy."""
+
+    kind: str  # "defect" or "decoy"
+    id: str
+    location: Location
+    slack: int
+
+
+def _lines_between(a: Location, b: Location) -> int:
+    """Lines strictly between two ranges of one file; 0 when they touch or overlap."""
+    if b.start > a.end:
+        return b.start - a.end - 1
+    if a.start > b.end:
+        return a.start - b.end - 1
+    return 0
+
+
+def zones(case: Case) -> list[Zone]:
+    """Every location of every defect and decoy with its slack.
+
+    The slack is WINDOW lines, but never more than it takes to leave a line of the gap to the next
+    defect or decoy of the same file uncovered: the zones of two items never overlap, so a finding is
+    near at most one of them and two findings on one defect cannot credit its neighbour.
+    """
+    items = [("defect", d.id, loc) for d in case.defects for loc in d.locations]
+    items += [("decoy", d.id, loc) for d in case.decoys for loc in d.locations]
+    result = []
+    for kind, item_id, loc in items:
+        slack = WINDOW
+        for _, other_id, other in items:
+            if other_id != item_id and other.file == loc.file:
+                slack = min(slack, max(_lines_between(loc, other) - 1, 0) // 2)
+        result.append(Zone(kind, item_id, loc, slack))
+    return result
 
 
 def match_findings(case: Case, findings: Sequence[Finding]) -> Matching:
-    """Assign findings to defects: one finding per defect, one defect per finding, most defects.
+    """Assign each finding to the defect or decoy it points at, or to none.
 
-    A finding that lands near a defect that another finding already found is a duplicate; one
-    near a decoy is a decoy hit; the rest are unmatched (possible false positives).
+    A finding inside a zone belongs to that defect or decoy (the closest one when ranges overlap).
+    Each defect is found once, by the finding closest to it; further findings on it are duplicates.
+    A finding on a decoy is a decoy hit; the rest are unmatched (possible false positives).
     """
-    edges: list[list[tuple[int, int]]] = []
-    for finding in findings:
-        near = [(_nearest(finding, d.locations), i) for i, d in enumerate(case.defects)]
-        edges.append(sorted((gap, i) for gap, i in near if gap is not None))
-    owner: dict[int, int] = {}
-
-    def assign(finding_index: int, seen: set[int]) -> bool:
-        for _, defect_index in edges[finding_index]:
-            if defect_index in seen:
-                continue
-            seen.add(defect_index)
-            if defect_index not in owner or assign(owner[defect_index], seen):
-                owner[defect_index] = finding_index
-                return True
-        return False
-
-    order = sorted(range(len(findings)), key=lambda i: (edges[i][0][0] if edges[i] else WINDOW + 1, i))
-    for index in order:
-        assign(index, set())
-    assigned = set(owner.values())
+    all_zones = zones(case)
+    credited: dict[str, tuple[int, int]] = {}  # defect id -> (gap, finding index)
     duplicates: list[int] = []
     decoy_hits: list[tuple[int, str]] = []
     unmatched: list[int] = []
     for index, finding in enumerate(findings):
-        if index in assigned:
-            continue
-        if edges[index]:
-            duplicates.append(index)
-            continue
-        decoy = next((d for d in case.decoys if _nearest(finding, d.locations) is not None), None)
-        if decoy is not None:
-            decoy_hits.append((index, decoy.id))
-        else:
+        best: tuple[int, int, Zone] | None = None
+        for order, zone in enumerate(all_zones):
+            gap = distance(finding, zone.location, zone.slack)
+            if gap is not None and (best is None or (gap, order) < best[:2]):
+                best = (gap, order, zone)
+        if best is None:
             unmatched.append(index)
-    found = {case.defects[d].id: f for d, f in owner.items()}
-    return Matching(found, tuple(duplicates), tuple(decoy_hits), tuple(unmatched))
+        elif best[2].kind == "decoy":
+            decoy_hits.append((index, best[2].id))
+        else:
+            gap, defect_id = best[0], best[2].id
+            if defect_id not in credited:
+                credited[defect_id] = (gap, index)
+            elif gap < credited[defect_id][0]:
+                duplicates.append(credited[defect_id][1])
+                credited[defect_id] = (gap, index)
+            else:
+                duplicates.append(index)
+    found = {defect_id: index for defect_id, (_, index) in credited.items()}
+    return Matching(found, tuple(sorted(duplicates)), tuple(decoy_hits), tuple(unmatched))
 
 
 def score_findings(
@@ -404,6 +446,7 @@ def score_findings(
         "duplicates": [show(i) for i in matching.duplicates],
         "decoy_hits": [{**show(i), "decoy": d} for i, d in matching.decoy_hits],
         "findings_used": len(findings),
+        "precision": (len(matching.found) + len(matching.duplicates)) / len(findings) if findings else None,
         "dismissed_ignored": dismissed,
         "unreadable_ignored": unreadable,
     }
@@ -414,6 +457,9 @@ def render_score(result: dict[str, Any]) -> str:
         f"Case {result['case']}: recall {result['found']}/{result['total']} ({result['recall']:.0%})",
         f"  findings scored: {result['findings_used']}"
         f" (ignored: {result['dismissed_ignored']} dismissed, {result['unreadable_ignored']} unreadable)",
+        "  precision (findings on a seeded defect / findings scored): "
+        + (f"{result['precision']:.0%}" if result["precision"] is not None else "n/a")
+        + "; an unmatched finding may still be a real problem",
         "",
         "Defects",
     ]
@@ -469,8 +515,19 @@ def _git(dest: Path, *args: str) -> None:
         raise EvalError(f"git {' '.join(args)} failed: {exc.stderr.strip()}") from exc
 
 
+_IGNORED_NAMES = {".DS_Store"}
+
+
 def _tree_files(root: Path) -> set[Path]:
-    return {p.relative_to(root) for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+    """Files of a case tree that ``prepare`` copies (the ones _IGNORE does not skip)."""
+    return {
+        p.relative_to(root)
+        for p in root.rglob("*")
+        if p.is_file()
+        and "__pycache__" not in p.parts
+        and p.name not in _IGNORED_NAMES
+        and p.suffix != ".pyc"
+    }
 
 
 def prepare_case(case: Case, dest: Path) -> list[str]:
@@ -490,17 +547,16 @@ def prepare_case(case: Case, dest: Path) -> list[str]:
     _git(dest, "add", "-A")
     _git(dest, "commit", "-q", "-m", f"Base of {case.id}")
     for rel in _tree_files(base) - _tree_files(head):
-        (dest / rel).unlink()
+        (dest / rel).unlink(missing_ok=True)
     shutil.copytree(head, dest, ignore=_IGNORE, dirs_exist_ok=True)
     meta = dest / ".git" / EVALS_DIR
     meta.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(case.path / "task.md", meta / "task.md")
-    changed = [
+    return [
         rel.as_posix()
         for rel in sorted(_tree_files(head) | _tree_files(base))
         if _read_bytes(base / rel) != _read_bytes(head / rel)
     ]
-    return changed
 
 
 def _read_bytes(path: Path) -> bytes | None:
@@ -508,7 +564,8 @@ def _read_bytes(path: Path) -> bytes | None:
 
 
 def next_steps(case: Case, dest: Path, changed: Sequence[str]) -> str:
-    here = "evals/run.py"
+    here = shlex.quote(str(Path(__file__).resolve()))  # absolute: the next step starts in the case dir
+    quoted = shlex.quote(str(dest))
     findings = findings_path(dest)
     return "\n".join(
         [
@@ -517,15 +574,16 @@ def next_steps(case: Case, dest: Path, changed: Sequence[str]) -> str:
             f"  change description: {dest / '.git' / EVALS_DIR / 'task.md'}",
             "",
             "Next, pick one:",
-            f"  With Craftsman:  cd {dest}, start the agent (Craftsman installed), run /code-review,",
+            f"  With Craftsman:  cd {quoted}, start the agent (Craftsman installed), run /craft-review",
+            "                   (/code-review in a checkout older than Craftsman 5), review only,",
             "                   and give it .git/evals/task.md as the change description.",
-            f"  Without it:      cd {dest}, start the agent with no Craftsman skills or hooks,",
+            f"  Without it:      cd {quoted}, start the agent with no Craftsman skills or hooks,",
             "                   and paste this prompt:",
             "",
             *("      " + line for line in BASELINE_PROMPT.splitlines()),
             "",
             "Then score the run:",
-            f"  python3 {here} score {case.id} {dest}",
+            f"  python3 {here} score {case.id} {quoted}",
             f"  (baseline findings are read from {findings} when no ledger exists;",
             "   or pass --findings <file.json>)",
         ]

@@ -5,33 +5,33 @@
       "kind": "incomplete-propagation",
       "summary": "The new priority field is added to the model, JSON, CLI and list output but export_csv still writes only id, title and done; the task asks for a priority column after title.",
       "locations": [
-        {"file": "taskboard/board.py", "start": 47, "end": 51},
-        {"file": "taskboard/model.py", "start": 17, "end": 17}
+        {"file": "taskboard/board.py", "start": 47, "end": 51, "anchor": "def export_csv(self, out: TextIO) -> None:"},
+        {"file": "taskboard/model.py", "start": 17, "end": 17, "anchor": "priority: int = DEFAULT_PRIORITY"}
       ]
     },
     {
       "id": "tb-2",
       "kind": "empty-as-missing",
       "summary": "from_dict uses 'data.get(\"priority\") or DEFAULT_PRIORITY', so the valid, most urgent priority 0 is replaced by the default 2 whenever a saved file is loaded.",
-      "locations": [{"file": "taskboard/model.py", "start": 24, "end": 29}]
+      "locations": [{"file": "taskboard/model.py", "start": 24, "end": 29, "anchor": "return cls("}]
     },
     {
       "id": "tb-3",
       "kind": "weak-test",
       "summary": "test_export_csv used to compare the whole CSV text; it now only checks two substrings, which still pass when the priority column is missing (and would fail once it is added).",
-      "locations": [{"file": "tests/test_board.py", "start": 52, "end": 60}]
+      "locations": [{"file": "tests/test_board.py", "start": 52, "end": 60, "anchor": "def test_export_csv(self) -> None:"}]
     }
   ],
   "decoys": [
     {
       "id": "tb-d1",
       "summary": "by_priority sorts ascending on (priority, id): 0 is the most urgent priority, so ascending order lists the most urgent first and ties by id, as specified.",
-      "locations": [{"file": "taskboard/board.py", "start": 34, "end": 35}]
+      "locations": [{"file": "taskboard/board.py", "start": 34, "end": 35, "anchor": "def by_priority(self) -> list[Task]:"}]
     },
     {
       "id": "tb-d2",
       "summary": "The next id is max(existing ids) + 1 computed on every add; the board never deletes tasks, so ids cannot be reused.",
-      "locations": [{"file": "taskboard/board.py", "start": 22, "end": 23}]
+      "locations": [{"file": "taskboard/board.py", "start": 22, "end": 23, "anchor": "next_id = max((t.id for t in self.tasks), default=0) + 1"}]
     }
   ]
 }

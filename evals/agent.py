@@ -30,7 +30,8 @@ from evals import run
 
 SCHEMA = 1
 PLUGIN_DIRS = (".claude-plugin", "")  # where plugin.json can live, first match wins
-SKILL_CANDIDATES = ("craft-review", "code-review")  # first one that exists in the source wins
+# The review skill is craft-review since Craftsman 5; older checkouts have code-review. First found wins.
+SKILL_CANDIDATES = ("craft-review", "code-review")
 REVIEW_AGENTS = ("craftsman-reviewer", "craftsman-verifier")
 BASE_REF = "HEAD"  # prepare_case commits the base, so the change is the uncommitted diff against HEAD
 TASK_FILE = ".git/evals/task.md"
@@ -454,6 +455,7 @@ def recall_details(case: run.Case, workdir: Path) -> dict[str, Any] | None:
         "unmatched": score["unmatched"],
         "duplicates": score["duplicates"],
         "findings_used": score["findings_used"],
+        "precision": score["precision"],
         "dismissed_ignored": score["dismissed_ignored"],
         "unreadable_ignored": score["unreadable_ignored"],
     }

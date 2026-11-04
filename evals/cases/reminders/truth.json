@@ -4,31 +4,31 @@
       "id": "rem-1",
       "kind": "platform-dependence",
       "summary": "digest() defaults now to datetime.now(), a naive local time, and compares it with the timezone-aware due datetimes: calling digest(days) without now raises TypeError (and would be off by the UTC offset if it did not).",
-      "locations": [{"file": "reminders/agenda.py", "start": 48, "end": 50}]
+      "locations": [{"file": "reminders/agenda.py", "start": 48, "end": 50, "anchor": "def digest(self, days: int, now: datetime | None = None) -> dict[str, "}]
     },
     {
       "id": "rem-2",
       "kind": "off-by-one-boundary",
       "summary": "The digest window is closed at the end ('<= end') although the task says a reminder due exactly at now + days is excluded; due_between right above already has the correct half-open test.",
-      "locations": [{"file": "reminders/agenda.py", "start": 51, "end": 55}]
+      "locations": [{"file": "reminders/agenda.py", "start": 51, "end": 55, "anchor": "groups: dict[str, list[Reminder]] = {}"}]
     },
     {
       "id": "rem-3",
       "kind": "weak-test",
       "summary": "test_digest_end_is_exclusive looks up the key '2026-03-03' (the edge reminder is on 2026-03-02) with .get(..., []) and all() over the result, so it passes whether or not the end instant is excluded; the boundary bug goes unnoticed.",
-      "locations": [{"file": "tests/test_agenda.py", "start": 44, "end": 46}]
+      "locations": [{"file": "tests/test_agenda.py", "start": 44, "end": 46, "anchor": "def test_digest_end_is_exclusive(self) -> None:"}]
     }
   ],
   "decoys": [
     {
       "id": "rem-d1",
       "summary": "Naive text is given the agenda timezone with replace(tzinfo=...) rather than astimezone(): the text is a wall-clock time in that zone, so replace is the correct operation.",
-      "locations": [{"file": "reminders/agenda.py", "start": 31, "end": 33}]
+      "locations": [{"file": "reminders/agenda.py", "start": 31, "end": 33, "anchor": "due = datetime.fromisoformat(text)"}]
     },
     {
       "id": "rem-d2",
       "summary": "EARLIEST is datetime.min made aware so overdue() can reuse due_between; it is only ever compared, never converted, so it cannot overflow.",
-      "locations": [{"file": "reminders/agenda.py", "start": 8, "end": 8}]
+      "locations": [{"file": "reminders/agenda.py", "start": 8, "end": 8, "anchor": "EARLIEST = datetime.min.replace(tzinfo=timezone.utc)"}]
     }
   ]
 }
