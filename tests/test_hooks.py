@@ -494,7 +494,22 @@ class SubagentTests(HookTestCase):
 
     def test_reviewer_brief_lists_the_uncovered_hunks(self) -> None:
         context = self.start_reviewer()["additionalContext"]
-        self.assertIn("Hunks not covered yet (take only your assigned slice): H1\n", context)
+        self.assertIn("Hunks not covered yet (take only your assigned slice): H1", context)
+
+    def test_briefs_hold_only_the_round_the_packet_and_the_open_work(self) -> None:
+        reviewer = self.start_reviewer()["additionalContext"]
+        packet = self.repo.ledger_dir / "packet-1.md"
+
+        self.assertEqual(
+            reviewer.splitlines(),
+            [
+                f"Craftsman review round 1. Packet: {packet}",
+                "Hunks not covered yet (take only your assigned slice): H1",
+            ],
+        )
+        self.assertLess(len(reviewer), 300)
+        for text in ("craftsman review cover", "craftsman review add", "Recording commands", "Scope:"):
+            self.assertNotIn(text, reviewer)
 
     def test_reviewer_start_is_recorded(self) -> None:
         self.start_reviewer()
@@ -514,10 +529,9 @@ class SubagentTests(HookTestCase):
                 self.root, agentName="craftsman-verifier", agentDisplayName="Craftsman Verifier"
             ),
         )
-        self.assertIn(
-            "Findings without a verdict:\n- F1 (major, cart.py:2): Strings are summed",
-            out["additionalContext"],
-        )
+        context = out["additionalContext"]
+        self.assertIn("Findings without a verdict:\n- F1 (major, cart.py:2): Strings are summed", context)
+        self.assertNotIn("craftsman review verdict", context)
 
     def test_other_agents_are_recorded_without_a_briefing(self) -> None:
         self.repo.cli("review", "prepare")

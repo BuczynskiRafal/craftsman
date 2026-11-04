@@ -55,7 +55,6 @@ from craftsman.ledger import (
     mutate,
     uncovered_hunks,
 )
-from craftsman.packet import CHEAT_SHEET
 from craftsman.records import (
     AgentEvent,
     AgentEventKind,
@@ -456,12 +455,11 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
 
 
 def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: bool) -> str:
-    """What a Craftsman reviewer or verifier needs to know about the current round."""
+    """The round, the packet path and the open work: the agent templates hold the rest."""
     latest = ledger.rounds[-1]
     lines = [
         f"Craftsman review round {latest.number}. "
         f"Packet: {latest.packet_path or packet_path(session.ledger_path, latest.number)}",
-        f"Scope: work only inside {session.root}; see Search scope.",
     ]
     if role == "reviewer":
         missing = uncovered_hunks(ledger, latest)
@@ -479,8 +477,6 @@ def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: 
             )
         else:
             lines.append("No finding is waiting for a verdict.")
-    lines.append("Recording commands:")
-    lines.extend(CHEAT_SHEET)
     return "\n".join(lines)
 
 
