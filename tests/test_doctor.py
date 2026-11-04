@@ -110,7 +110,7 @@ class PlatformReportTests(DoctorTestCase):
 
     def test_missing_lenses_file_is_a_problem(self) -> None:
         self.install_user_copilot()
-        (self.tmp / ".copilot" / "skills" / "code-review" / "lenses.md").unlink()
+        (self.tmp / ".copilot" / "skills" / "craft-review" / "lenses.md").unlink()
 
         code, report = self.doctor()
 
@@ -169,7 +169,7 @@ class PlatformReportTests(DoctorTestCase):
 
     def test_text_report_lists_the_problems(self) -> None:
         self.install_user_copilot()
-        (self.tmp / ".copilot" / "skills" / "code-review" / "lenses.md").unlink()
+        (self.tmp / ".copilot" / "skills" / "craft-review" / "lenses.md").unlink()
 
         proc = self.run_doctor()
 

@@ -44,7 +44,7 @@ Start deep (`--deep`, a one-line shortcut) when the user's words ask for care ("
 "production", "be thorough") or say `ultracraft`; otherwise start normal and escalate later (Stage 2
 step 1). It records the base commit: the review covers everything since then, commits included.
 A request that only asks for a review (no fixing, no `/craftsman`, no `ultracraft`) starts no
-gate: follow `/code-review` in review-only mode instead.
+gate: follow `/craft-review` in review-only mode instead.
 
 When deep from the start, write a short design note first: invariants and hazards, two candidate approaches
 with trade-offs and your choice, the three likeliest production failures.
@@ -60,7 +60,7 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
 ## Stage 2 - Final review
 
 1. `craftsman review prepare` freezes the diff into round N and prints the packet path and the
-   risk map. Decide the depth now, as `/code-review` describes: when the risk map or your own
+   risk map. Decide the depth now, as `/craft-review` describes: when the risk map or your own
    reading shows risk (security-relevant code, concurrency or clocks, persistent data, public API
    or file-format changes, removed guarantees, a large or cross-cutting diff), run
    `craftsman review prepare --deep`. In a gate session that raises the gate to deep for good, and
@@ -69,7 +69,7 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
    decisions a reader could mistake for bugs. The summary states intent; it must not argue that
    the code is correct. Your context holds the reasoning that produced the code, which is what
    hides its defects, so the hunters are fresh-context subagents and you only orchestrate.
-3. Follow `/code-review` from its intent brief on, in gate-session mode: hunt plan, wave 1,
+3. Follow `/craft-review` from its intent brief on, in gate-session mode: hunt plan, wave 1,
    verification, saturation waves, fixes with a regression test where the project has tests,
    `craftsman review resolve`, a fresh round for the fix delta. It is the single source for the
    mechanics; do not improvise a lighter review.

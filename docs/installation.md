@@ -62,7 +62,7 @@ VS Code Copilot and GitHub Copilot CLI scan multiple directories simultaneously 
 | Entity | User scope (`--copilot`, canonical) | Workspace scope (`--copilot-workspace`, canonical) | Other locations VS Code scans (`doctor` reports duplicates there) |
 | :--- | :--- | :--- | :--- |
 | **Custom agents** (`craftsman`, `craftsman-reviewer`, `craftsman-verifier`) | `~/.copilot/agents/*.agent.md` | `<workspace>/.github/agents/*.agent.md` | `Code/User/prompts/*.agent.md`, `Code/User/profiles/*/prompts/*.agent.md`, `~/.claude/agents/*.md`, `.claude/agents/*.md` |
-| **Slash commands / Agent Skills** (`/craftsman`, `/code-review`, …) | `~/.copilot/skills/<name>/SKILL.md` | `<workspace>/.github/skills/<name>/SKILL.md` | `Code/User/prompts/*.prompt.md`, `Code/User/profiles/*/prompts/*.prompt.md`, `.github/prompts/*.prompt.md`, `~/.claude/skills/*/SKILL.md` |
+| **Slash commands / Agent Skills** (`/craftsman`, `/craft-review`, …) | `~/.copilot/skills/<name>/SKILL.md` | `<workspace>/.github/skills/<name>/SKILL.md` | `Code/User/prompts/*.prompt.md`, `Code/User/profiles/*/prompts/*.prompt.md`, `.github/prompts/*.prompt.md`, `~/.claude/skills/*/SKILL.md` |
 | **Global instructions** | `Code/User/prompts/craftsman-rules.instructions.md` (+ each profile) | `<workspace>/.github/copilot-instructions.md` | — |
 
 - Installing both `--copilot` (user) and `--copilot-workspace` (workspace) in the same project displays duplicate agents and commands in VS Code; `craftsman install` refuses by default unless `--allow-duplicate-scopes` is specified.

@@ -79,7 +79,7 @@ A subagent that fails (rate limit, timeout) is retried once with a smaller slice
 failing, the agent runs `gate --await-user` and tells you what is not covered; in review-only mode
 the report is `--partial`.
 
-### `/code-review`
+### `/craft-review`
 
 The same hunt (steps 3-7) against a base, with a frozen scope, and no fixes unless asked. It ends
 with `review check --review-only` and `review report --review-only`. Fixing adds steps 8-9.

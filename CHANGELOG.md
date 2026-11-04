@@ -8,12 +8,16 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Changed
 
+- **BREAKING: the review skill is now `/craft-review`** (was `/code-review`), because Claude Code ships a
+  built-in `/code-review` and the two names collided. The skill lives in `skills/craft-review/`, and the
+  playbooks are read with `craftsman skill show craft-review --lenses <ids>`. There is no alias:
+  `craftsman skill show code-review` fails with the unknown-skill error that lists the valid names.
 - **BREAKING: "Build freely, review hard" redesign.** Recall dropped after 3.3.0 because the review
   was optimized for cost and for satisfying the ledger. The agent now builds without review loops or
   ledger bookkeeping; the gate judges outcomes on the final diff only: the diff was frozen, fresh-context
   hunters covered every hunk, every finding has a verdict with checkable evidence, and the tests ran on
   the final code.
-- **New review protocol** (`/code-review` is the single source; `/craftsman` follows it):
+- **New review protocol** (`/craft-review` is the single source; `/craftsman` follows it):
   `review prepare` freezes the diff and prints a risk map, the orchestrator writes an intent brief and
   an adaptive hunt plan, and `craftsman-reviewer` hunters (recall) run in parallel, followed by
   `craftsman-verifier` subagents (precision). While a wave produces `proven` or `probable` findings,
@@ -21,7 +25,7 @@ All notable changes to Craftsman are recorded here. The format follows
   3 waves per round. There is no inline-only review: every review uses a fresh-context hunter where the
   platform has subagents. The prompts are rewritten to teach how to hunt and how to judge, and are much
   shorter.
-- **No flags for users.** `/craftsman <task>` and `/code-review <plain words>` ("review PR 42 and fix
+- **No flags for users.** `/craftsman <task>` and `/craft-review <plain words>` ("review PR 42 and fix
   what you find", "review my staged changes", "be thorough") are enough: the agent infers target, scope,
   fixing, and depth. Flags remain optional shortcuts for agents and power users.
 - **One adaptive depth.** The agent goes deep on its own for security-relevant code, concurrency or
@@ -62,7 +66,7 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Commands and flags.** `review ack`, `review fact`, `review prepare --add-lens`,
   `review add --signal`, `review cover --lens` (and the `"lens"` / `"lenses"` JSON keys),
   `review view --lenses` and `--shard`, and the `R1`-`R4` reviewer groups in
-  `craftsman skill show code-review --lenses`.
+  `craftsman skill show craft-review --lenses`.
 - **Concepts.** Signal acknowledgements, shared facts, lens additions, per-lens coverage, per-lens views,
   reviewer shards and groups, and the gate issues `tier-too-low`, `sweep-too-early`, the quality-signal
   issues, and design-file coverage. Quality signals (`S#`) stay as display hints.

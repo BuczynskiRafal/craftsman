@@ -7,13 +7,13 @@ description: 'Engineering agent that implements a task freely and then drives th
 
 You are running as the **Craftsman** agent. Start every task with Stage 0 below (`craftsman gate
 --init`), even when the user did not type `/craftsman`. **Exception:** when the user asks only for
-a review (`/code-review` or a review request) and not to fix anything, and did not use `/craftsman`
-or `ultracraft`, start no gate: invoke `/code-review` in review-only mode (a review that also fixes
+a review (`/craft-review` or a review request) and not to fix anything, and did not use `/craftsman`
+or `ultracraft`, start no gate: invoke `/craft-review` in review-only mode (a review that also fixes
 and every implementation task start at Stage 0). Users write plain words, not flags: infer target,
-fixing, scope and depth yourself and never ask about them. Companion skills (`/code-review`, `/simplify`, `/verify`, `/feature-dev`,
+fixing, scope and depth yourself and never ask about them. Companion skills (`/craft-review`, `/simplify`, `/verify`, `/feature-dev`,
 `/modernize`, `/batch`, `/audit`): invoke `/name` as a skill if your platform offers it, otherwise
 run `craftsman skill show <name>` and follow its output; lens playbooks come from
-`craftsman skill show code-review --lenses <csv>`. Never search the file system for skill or lens
+`craftsman skill show craft-review --lenses <csv>`. Never search the file system for skill or lens
 files.
 
 # Craftsman (`/craftsman <task>`)
@@ -51,7 +51,7 @@ Start deep (`--deep`, a one-line shortcut) when the user's words ask for care ("
 "production", "be thorough") or say `ultracraft`; otherwise start normal and escalate later (Stage 2
 step 1). It records the base commit: the review covers everything since then, commits included.
 A request that only asks for a review (no fixing, no `/craftsman`, no `ultracraft`) starts no
-gate: follow `/code-review` in review-only mode instead.
+gate: follow `/craft-review` in review-only mode instead.
 
 When deep from the start, write a short design note first: invariants and hazards, two candidate approaches
 with trade-offs and your choice, the three likeliest production failures.
@@ -67,7 +67,7 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
 ## Stage 2 - Final review
 
 1. `craftsman review prepare` freezes the diff into round N and prints the packet path and the
-   risk map. Decide the depth now, as `/code-review` describes: when the risk map or your own
+   risk map. Decide the depth now, as `/craft-review` describes: when the risk map or your own
    reading shows risk (security-relevant code, concurrency or clocks, persistent data, public API
    or file-format changes, removed guarantees, a large or cross-cutting diff), run
    `craftsman review prepare --deep`. In a gate session that raises the gate to deep for good, and
@@ -76,7 +76,7 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
    decisions a reader could mistake for bugs. The summary states intent; it must not argue that
    the code is correct. Your context holds the reasoning that produced the code, which is what
    hides its defects, so the hunters are fresh-context subagents and you only orchestrate.
-3. Follow `/code-review` from its intent brief on, in gate-session mode: hunt plan, wave 1,
+3. Follow `/craft-review` from its intent brief on, in gate-session mode: hunt plan, wave 1,
    verification, saturation waves, fixes with a regression test where the project has tests,
    `craftsman review resolve`, a fresh round for the fix delta. It is the single source for the
    mechanics; do not improvise a lighter review.

@@ -1,4 +1,4 @@
-"""Tests for `craftsman.playbooks` and `craftsman skill show code-review --lenses`."""
+"""Tests for `craftsman.playbooks` and `craftsman skill show craft-review --lenses`."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from craftsman.playbooks import (
 
 from tests.support import REPO_ROOT, CliResult, run_main
 
-LENSES_PATH = REPO_ROOT / "skills" / "code-review" / "lenses.md"
+LENSES_PATH = REPO_ROOT / "skills" / "craft-review" / "lenses.md"
 
 
 class PlaybookTests(unittest.TestCase):
@@ -53,7 +53,7 @@ class PlaybookTests(unittest.TestCase):
     def test_show_emits_only_the_requested_playbooks(self) -> None:
         preamble, sections = parse_playbook_sections(self.full_md)
 
-        result = self.skill_show("code-review", "--lenses", "platform,craft")
+        result = self.skill_show("craft-review", "--lenses", "platform,craft")
 
         self.assertEqual(result.code, 0, result.err)
         self.assertEqual(result.err, "")
@@ -67,14 +67,14 @@ class PlaybookTests(unittest.TestCase):
     def test_show_orders_by_catalog_with_duplicates_removed(self) -> None:
         preamble, sections = parse_playbook_sections(self.full_md)
 
-        reversed_pair = self.skill_show("code-review", "--lenses", "contracts,intent")
+        reversed_pair = self.skill_show("craft-review", "--lenses", "contracts,intent")
         self.assertEqual(reversed_pair.code, 0, reversed_pair.err)
         self.assertEqual(
             reversed_pair.out,
             f"{preamble}\n\n{sections['intent']}\n\n{sections['contracts']}\n",
         )
 
-        with_dups = self.skill_show("code-review", "--lenses", "intent,contracts,intent")
+        with_dups = self.skill_show("craft-review", "--lenses", "intent,contracts,intent")
         self.assertEqual(with_dups.code, 0, with_dups.err)
         self.assertEqual(with_dups.out, reversed_pair.out)
         self.assertEqual(
@@ -83,7 +83,7 @@ class PlaybookTests(unittest.TestCase):
         )
 
     def test_reviewer_groups_are_gone(self) -> None:
-        result = self.skill_show("code-review", "--lenses", "R1")
+        result = self.skill_show("craft-review", "--lenses", "R1")
 
         self.assertNotEqual(result.code, 0)
         self.assertIn("unknown lens 'R1'", result.err)
@@ -91,7 +91,7 @@ class PlaybookTests(unittest.TestCase):
     def test_single_lens_output_is_small_fraction_of_full_file(self) -> None:
         for lens in LENSES:
             with self.subTest(lens=lens.id):
-                result = self.skill_show("code-review", "--lenses", lens.id)
+                result = self.skill_show("craft-review", "--lenses", lens.id)
                 self.assertEqual(result.code, 0, result.err)
                 self.assertLess(len(result.out), len(self.full_md) // 4)
 
@@ -155,10 +155,10 @@ class PlaybookTests(unittest.TestCase):
         self.assertEqual(result.code, 2)
         self.assertEqual(result.out, "")
         self.assertIn("craftsman skill: error:", result.err)
-        self.assertIn("code-review", result.err)
+        self.assertIn("craft-review", result.err)
 
     def test_lenses_flag_combined_with_file_flag_is_refused(self) -> None:
-        result = self.skill_show("code-review", "--lenses", "intent", "--file", "lenses.md")
+        result = self.skill_show("craft-review", "--lenses", "intent", "--file", "lenses.md")
 
         self.assertEqual(result.code, 2)
         self.assertEqual(result.out, "")
@@ -168,7 +168,7 @@ class PlaybookTests(unittest.TestCase):
     def test_unknown_or_empty_lenses_flag_exits_with_usage_error(self) -> None:
         for bad_raw in ("bogus", "R9", "", ",", " , , "):
             with self.subTest(lenses=bad_raw):
-                result = self.skill_show("code-review", "--lenses", bad_raw)
+                result = self.skill_show("craft-review", "--lenses", bad_raw)
                 self.assertEqual(result.code, 2)
                 self.assertEqual(result.out, "")
                 self.assertIn("craftsman skill: error:", result.err)

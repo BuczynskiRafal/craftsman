@@ -55,5 +55,5 @@ Then, in Claude Code, GitHub Copilot, or Antigravity, ask for the feature in you
 To see only the review, implement the feature yourself and ask:
 
 ```text
-/code-review review my changes and fix what you find
+/craft-review review my changes and fix what you find
 ```

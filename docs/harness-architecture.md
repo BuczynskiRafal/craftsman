@@ -79,7 +79,7 @@ Every ledger check compares the recorded state with a live `DiffSnapshot` from `
   3. replace the largest hunk bodies with `diff omitted (N lines): git diff <base7> -- <path>`, listed under `## Omitted hunk bodies`, keeping every header.
 - **Views.** `craftsman review view (--files <csv> | --hunks <ids/ranges>)` writes `packet-N.<slug>.md` (`MAX_VIEW_CHARS = 60_000`, same ladder) and prints its path. The orchestrator gives each hunter one view.
 - **Lens suggestion.** The `LENSES` catalog (`craftsman/lenses.py`) maps risk signals to lenses. `prepare` suggests the core set `intent`, `contracts`, `failure`, `ripple`, `tests` for every non-docs change, `craft` and `design` always (for the simplicity hunter), the triggered lenses on their signals (`filesystem` suggests `state`, `trust`, `platform`; `process` suggests `platform`), and every lens on a deep round. Docs-only changes get `intent` and `craft`. These are hints with reasons, not gate inputs.
-- **Playbooks.** `craftsman skill show code-review --lenses <csv>` prints the shared preamble once and only the requested lenses, sliced from `skills/code-review/lenses.md` on its `## \`<id>\` — ...` headings (`playbooks.lens_playbooks()`). Agent templates do not inline `lenses.md`.
+- **Playbooks.** `craftsman skill show craft-review --lenses <csv>` prints the shared preamble once and only the requested lenses, sliced from `skills/craft-review/lenses.md` on its `## \`<id>\` — ...` headings (`playbooks.lens_playbooks()`). Agent templates do not inline `lenses.md`.
 - **State hygiene (`craftsman.evidence`).** Preparing round `N` deletes `packet-<k>.*.md` views for `k < N` and `packet-<k>.md` packets for `k < N - 1`. Archiving keeps the newest `CRAFTSMAN_KEEP_ARCHIVES` entries.
 
 ---
@@ -150,7 +150,7 @@ The orchestrator (the main agent) never reviews inline where subagents exist: it
 
 - **Hunters** (`craftsman-reviewer`, fresh context) maximize recall. Each reads its slice (a `review view` path), the enclosing function, callers, and tests of every hunk, old code via `git show <base>:<path>`, applies its lenses' probes with concrete values, and records every candidate with a nameable trigger, even if a guard seems to prevent it. A hunter that finds a defect looks for its siblings. It may run experiments in a `craftsman review scratch` directory to find bugs, never to dismiss a candidate. It finishes with `cover` for its slice. It never modifies the work tree.
 - **Verifiers** (`craftsman-verifier`, fresh context) maximize precision. Each re-reads the code, tries to disprove its findings (a guard, unreachability, a misreading, PR intent), reproduces `blocker` and `major` findings whenever the code is runnable, and never dismisses flakiness or platform dependence on one green run.
-- **Saturation.** If wave k yields a `proven` or `probable` finding, wave k+1 adds one variant hunter per confirmed root cause and one fresh hunter with a different partition or unused lenses. Stop at the first wave that adds nothing confirmed; at most 3 waves per round. These limits live in the prompts (`skills/code-review/SKILL.md`), not in the CLI.
+- **Saturation.** If wave k yields a `proven` or `probable` finding, wave k+1 adds one variant hunter per confirmed root cause and one fresh hunter with a different partition or unused lenses. Stop at the first wave that adds nothing confirmed; at most 3 waves per round. These limits live in the prompts (`skills/craft-review/SKILL.md`), not in the CLI.
 - **Failures.** A subagent that fails is retried once with a smaller slice; then `gate --await-user` (or `--partial` in review-only mode).
 
 ---
@@ -161,7 +161,7 @@ The orchestrator (the main agent) never reviews inline where subagents exist: it
 
 ### Single-source exporter and installer (`craftsman.platforms.*`, `craftsman.export`, `craftsman.install`)
 
-Skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/code-review/lenses.md`), agent templates (`templates/agents/craftsman*.md`), and rules (`rules/*.md`) are authored once; `{{include path}}` directives expand into native artifacts tracked by `.craftsman-install.json`:
+Skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/craft-review/lenses.md`), agent templates (`templates/agents/craftsman*.md`), and rules (`rules/*.md`) are authored once; `{{include path}}` directives expand into native artifacts tracked by `.craftsman-install.json`:
 
 1. **GitHub Copilot (VS Code and CLI)**: instructions, Agent Skills (`~/.copilot/skills/`), custom agents (`~/.copilot/agents/*.agent.md`), hooks (`~/.copilot/hooks/craftsman.json` or `.github/hooks/craftsman.json`).
 2. **Claude Code (`~/.claude`)**: commands, subagents (`agents/craftsman-{reviewer,verifier}.md`), combined rules, and hook events merged into `settings.json`. The repository root is also a plugin whose generated files in `.claude-plugin/` come from `craftsman export --claude-plugin`.
@@ -198,7 +198,7 @@ Both run through `craftsman hook pre-tool` (Claude Code, VS Code Copilot, Copilo
 | [`craftsman/diffscan_signals.py`](../craftsman/diffscan_signals.py) | Content risk-signal regex catalog (`CONTENT_SIGNAL_PATTERNS`) |
 | [`craftsman/packet.py`](../craftsman/packet.py) | Packet and view renderer, budgets, trimming ladder |
 | [`craftsman/lenses.py`](../craftsman/lenses.py) | `LENSES` catalog with signal triggers, lens suggestion |
-| [`craftsman/playbooks.py`](../craftsman/playbooks.py) | On-demand slicer for `skills/code-review/lenses.md` |
+| [`craftsman/playbooks.py`](../craftsman/playbooks.py) | On-demand slicer for `skills/craft-review/lenses.md` |
 | [`craftsman/quality.py`](../craftsman/quality.py) | Mechanical quality hint detectors (`S#`) |
 | [`craftsman/review.py`](../craftsman/review.py) | `review` subcommands: `prepare`, `view`, `cover`, `add`, `move`, `merge`, `verdict`, `resolve`, `waive-run`, `show`, `check`, `report`, `reset`, `inbox`, `scratch` |
 | [`craftsman/runner.py`](../craftsman/runner.py) | `craftsman run` with scope-consistent before/after fingerprinting |

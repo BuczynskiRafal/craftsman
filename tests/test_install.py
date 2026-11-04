@@ -135,7 +135,7 @@ class AntigravityTests(InstallTestCase):
             sorted(p.name for p in plugin.iterdir()),
             ["craftsman", "hooks.json", "plugin.json", "rules", "scripts", "skills"],
         )
-        self.assertTrue((plugin / "skills" / "code-review" / "lenses.md").is_file())
+        self.assertTrue((plugin / "skills" / "craft-review" / "lenses.md").is_file())
         self.assertTrue((plugin / "craftsman" / "antigravity.py").is_file())
         if os.name == "posix":
             self.assertTrue(os.access(plugin / "scripts" / "craftsman-stop-gate.py", os.X_OK))

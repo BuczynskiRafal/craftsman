@@ -107,9 +107,9 @@ class SkillCommandTests(unittest.TestCase):
         )
 
     def test_show_prints_a_companion_file(self) -> None:
-        result = self.skill("show", "code-review", "--file", "lenses.md")
+        result = self.skill("show", "craft-review", "--file", "lenses.md")
 
-        lenses = (REPO_ROOT / "skills" / "code-review" / "lenses.md").read_text(encoding="utf-8")
+        lenses = (REPO_ROOT / "skills" / "craft-review" / "lenses.md").read_text(encoding="utf-8")
         self.assertEqual(result.out, lenses)
 
     def test_unknown_skill_is_a_usage_error(self) -> None:
@@ -121,23 +121,23 @@ class SkillCommandTests(unittest.TestCase):
     def test_file_outside_the_skill_is_refused(self) -> None:
         for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
             with self.subTest(file=bad_file):
-                result = self.skill("show", "code-review", "--file", bad_file)
+                result = self.skill("show", "craft-review", "--file", bad_file)
                 self.assertEqual(result.code, 2)
                 self.assertIn("craftsman skill: error:", result.err)
 
     def test_file_symlinked_out_of_the_skill_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp).resolve() / "repo"
-            skill_dir = repo / "skills" / "code-review"
+            skill_dir = repo / "skills" / "craft-review"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
-                "---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8"
+                "---\nname: craft-review\ndescription: x\n---\nbody\n", encoding="utf-8"
             )
             (repo.parent / "secret.md").write_text("top secret\n", encoding="utf-8")
             (skill_dir / "escape.md").symlink_to(repo.parent / "secret.md")
 
             result = run_main(
-                skill_main, "show", "code-review", "--file", "escape.md", "--repo-dir", str(repo)
+                skill_main, "show", "craft-review", "--file", "escape.md", "--repo-dir", str(repo)
             )
 
         self.assertEqual(result.code, 2)

@@ -87,7 +87,7 @@ class HooksReport:
 class SkillsReport:
     path: str
     installed: bool
-    code_review_lenses: bool | None  # None when code-review itself is not installed
+    craft_review_lenses: bool | None  # None when craft-review itself is not installed
 
 
 @dataclass(frozen=True)
@@ -381,7 +381,7 @@ def _agents_installed(directory: Path, names: tuple[str, ...], suffix: str) -> b
 
 
 def _skills_report(skills_dir: Path) -> SkillsReport:
-    review = skills_dir / "code-review"
+    review = skills_dir / "craft-review"
     lenses = (review / "lenses.md").is_file() if (review / "SKILL.md").is_file() else None
     return SkillsReport(str(skills_dir), (skills_dir / "craftsman" / "SKILL.md").is_file(), lenses)
 
@@ -709,9 +709,9 @@ def _platform_problems(
     copilot: CopilotReport, claude: ClaudeReport, claude_dir: Path | None = None
 ) -> list[str]:
     problems = [
-        f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
+        f"{entry.path}/craft-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
         for entry in copilot.skills
-        if entry.code_review_lenses is False
+        if entry.craft_review_lenses is False
     ]
     hooks = copilot.user_hooks
     if hooks.error is not None:

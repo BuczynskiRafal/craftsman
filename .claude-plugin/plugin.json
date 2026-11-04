@@ -13,6 +13,7 @@
     "ai-agents",
     "claude-code",
     "code-review",
+    "craft-review",
     "quality-gate",
     "testing"
   ],

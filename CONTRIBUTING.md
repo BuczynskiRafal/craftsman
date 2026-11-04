@@ -86,7 +86,7 @@ HOME=$(mktemp -d) python3 -m craftsman.cli doctor
 
 ### Adding a Review Lens
 1. Define the lens identifier, title, focus, and the risk signals that suggest it (`triggers`) in `craftsman/lenses.py`.
-2. Write its goal and probes in `skills/code-review/lenses.md` under a `` ## `<id>` — <title> `` heading (`craftsman/playbooks.py` slices the file on these headings).
+2. Write its goal and probes in `skills/craft-review/lenses.md` under a `` ## `<id>` — <title> `` heading (`craftsman/playbooks.py` slices the file on these headings).
 3. Add unit test coverage in `tests/test_lenses.py` and `tests/test_playbooks.py`.
 
 ### Adding a Risk Signal

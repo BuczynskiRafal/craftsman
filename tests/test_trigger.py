@@ -130,7 +130,7 @@ class DetectTriggerTests(unittest.TestCase):
         self.assertIs(detect_trigger("/craftsman: add pagination"), False)
         self.assertIs(detect_trigger("please run /craftsman: now"), False)
         self.assertIs(detect_trigger("ultracraft: harden the parser"), True)
-        self.assertIsNone(detect_trigger("/craftsman:code-review fix the parser"))
+        self.assertIsNone(detect_trigger("/craftsman:craft-review fix the parser"))
         self.assertIsNone(detect_trigger("run /craftsman:simplify on it"))
 
 
@@ -163,8 +163,8 @@ class TaskFromPromptTests(unittest.TestCase):
 
     def test_task_keeps_other_craftsman_commands(self) -> None:
         self.assertEqual(
-            task_from_prompt("/craftsman fix it, then /craftsman:code-review it"),
-            "fix it, then /craftsman:code-review it",
+            task_from_prompt("/craftsman fix it, then /craftsman:craft-review it"),
+            "fix it, then /craftsman:craft-review it",
         )
 
     def test_task_is_one_line(self) -> None:

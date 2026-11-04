@@ -1,4 +1,4 @@
-"""Slice `skills/code-review/lenses.md` down to the playbooks of the assigned review lenses."""
+"""Slice `skills/craft-review/lenses.md` down to the playbooks of the assigned review lenses."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 
 from craftsman.lenses import LENSES, get_lens
 
-CODE_REVIEW_SKILL = "code-review"
+CRAFT_REVIEW_SKILL = "craft-review"
 LENSES_FILENAME = "lenses.md"
 
 _BACKTICK_FENCE_RE = re.compile(r"^ {0,3}(`{3,})[^`]*$")

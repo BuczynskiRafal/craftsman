@@ -66,6 +66,6 @@ starts with `static:` (with a `file:line`) or `no-repro:` (why, then the chain).
 never for a `blocker`, starts with `intent:` (>= 20 characters naming the source) and cites a
 `file:line`. `dismissed` quotes the guard with `file:line`, or cites a `--run` that exercises the
 trigger and behaves correctly. For several verdicts, PowerShell, cmd and batch rejections, read
-"Recording mechanics" in `craftsman skill show code-review`.
+"Recording mechanics" in `craftsman skill show craft-review`.
 
 Finish with a table: finding id, verdict, one-line reason.

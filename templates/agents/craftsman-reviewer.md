@@ -27,7 +27,7 @@ hunks and `craftsman review view (--files <csv> | --hunks <ids>)` writes a view.
 
 ## Hunt
 
-1. Load your playbooks: `craftsman skill show code-review --lenses <your-lenses>`. Read your slice
+1. Load your playbooks: `craftsman skill show craft-review --lenses <your-lenses>`. Read your slice
    and the convention files it lists (`AGENTS.md`, `CLAUDE.md`, ...).
 2. For every hunk read the full enclosing function, its callers (the packet's References) and its
    tests; read old code with `git show <base>:<path>`. Apply every probe of every lens with
@@ -67,7 +67,7 @@ craftsman review cover --files src/a.py,src/b.py --note "..."
 ```
 
 Record as you go, not in one batch at the end. For `--from-json` batches, PowerShell, cmd and
-non-ASCII text, read "Recording mechanics" in `craftsman skill show code-review`.
+non-ASCII text, read "Recording mechanics" in `craftsman skill show craft-review`.
 
 Never change the work tree or index: no `git stash`, `checkout`, `switch`, `reset`, `restore`,
 `clean`, `commit`, `rm`, `mv`, and no files written inside the repository. Do not verify, dismiss

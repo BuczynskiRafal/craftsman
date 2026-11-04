@@ -25,7 +25,7 @@ from craftsman.ledger import ledger_path_for, load, uncovered_hunks
 from craftsman.manifest import InstallError
 from craftsman.paths import default_repo_dir
 from craftsman.playbooks import (
-    CODE_REVIEW_SKILL,
+    CRAFT_REVIEW_SKILL,
     LENSES_FILENAME,
     expand_playbook_lenses,
     lens_playbooks,
@@ -263,14 +263,14 @@ def _build_skill_parser() -> argparse.ArgumentParser:
         parents=[common],
         help="Print a bundled SKILL.md or companion file (such as lenses.md) to stdout.",
     )
-    show_p.add_argument("name", help="Skill name (e.g. craftsman, code-review, simplify)")
+    show_p.add_argument("name", help="Skill name (e.g. craftsman, craft-review, simplify)")
     show_p.add_argument(
         "--file", dest="rel_file", help="Relative file inside the skill directory (e.g. lenses.md)"
     )
     show_p.add_argument(
         "--lenses",
         help=(
-            "Comma-separated lens ids (code-review only), e.g. intent,contracts"
+            "Comma-separated lens ids (craft-review only), e.g. intent,contracts"
         ),
     )
     list_p = sub.add_parser(
@@ -282,7 +282,7 @@ def _build_skill_parser() -> argparse.ArgumentParser:
     path_p = sub.add_parser(
         "path", parents=[common], help="Print the resolved directory path of a bundled skill."
     )
-    path_p.add_argument("name", help="Skill name (e.g. craftsman, code-review)")
+    path_p.add_argument("name", help="Skill name (e.g. craftsman, craft-review)")
     return parser
 
 
@@ -323,9 +323,9 @@ def _read_skill_show_content(
             else (skill_dir / "SKILL.md").resolve()
         )
         return target.read_text(encoding="utf-8")
-    if skill_name != CODE_REVIEW_SKILL:
+    if skill_name != CRAFT_REVIEW_SKILL:
         raise ValueError(
-            f"--lenses is only supported for skill {CODE_REVIEW_SKILL!r} (got {skill_name!r})"
+            f"--lenses is only supported for skill {CRAFT_REVIEW_SKILL!r} (got {skill_name!r})"
         )
     if rel_file is not None:
         raise ValueError("--lenses cannot be combined with --file")

@@ -1,15 +1,15 @@
 ---
-name: code-review
+name: craft-review
 description: >-
   Bug-hunting review of a local diff, branch or pull request. Freezes the diff,
   writes an intent brief, sends fresh-context hunters over it in parallel waves,
   has independent verifiers try to disprove every finding, keeps hunting while
   waves still find real defects, and records the outcome in the Craftsman
-  ledger. Use when /code-review or /review is invoked, or as the final review
-  of /craftsman.
+  ledger. Use when /craft-review is invoked, when the user asks Craftsman to
+  review a diff, branch or pull request, and as the final review of /craftsman.
 ---
 
-# Code Review (`/code-review`)
+# Craft Review (`/craft-review`)
 
 Your job is to find the bugs that would hurt after merge. Hunters (fresh-context subagents)
 maximize recall: they record every candidate with a nameable trigger. Verifiers maximize precision:
@@ -17,7 +17,7 @@ they try to disprove each candidate and reproduce the survivors. You orchestrate
 how many hunters, when the hunt is dry. The gate checks outcomes (the frozen diff reviewed by
 fresh hunters, every finding judged with evidence), not effort.
 
-`/code-review` plus plain words; the user needs no flags. Infer the rest from
+`/craft-review` plus plain words; the user needs no flags. Infer the rest from
 the request and the repository; never ask about depth.
 
 - **Target**: nothing named means the working tree against the base of the active `/craftsman`
@@ -72,7 +72,7 @@ hunter and verifier; so does the base ref.
 Decide the hunters, then launch **all hunters of the wave together** (in parallel where the
 platform allows), each as a fresh-context `craftsman-reviewer` subagent. Brief each with: its slice
 (a packet path or `craftsman review view (--files <csv> | --hunks <ranges>)`, which writes and
-prints a bounded view), the intent brief, the base ref, and its lenses (it loads their playbooks itself with `craftsman skill show code-review --lenses <csv>`). Never paste file contents.
+prints a bounded view), the intent brief, the base ref, and its lenses (it loads their playbooks itself with `craftsman skill show craft-review --lenses <csv>`). Never paste file contents.
 Never review inline while subagents exist: the context that wrote or read the change hides its
 defects. Only `craftsman-reviewer` subagents count as isolated review.
 

@@ -44,9 +44,9 @@ Type a request in plain words. There are no flags to remember.
 ```
 /craftsman add pagination to the catalog search
 /craftsman migrate the session store to Redis, this is critical
-/code-review review my staged changes and fix what you find
-/code-review review PR 42
-/code-review be thorough, this touches authentication
+/craft-review review my staged changes and fix what you find
+/craft-review review PR 42
+/craft-review be thorough, this touches authentication
 ```
 
 The agent works out the target (working tree, staged changes, a branch, a PR), whether to fix what it
@@ -79,7 +79,7 @@ agent decided and why. See [docs/usage.md](https://github.com/BuczynskiRafal/cra
 9. **Done.** The stop hook lets the agent finish when the ledger is complete for the final diff. The
    report lists what was reviewed, found, fixed, and dismissed, and what the gate did not assess.
 
-`/code-review` runs the same hunt on an existing change, and fixes only when you ask.
+`/craft-review` runs the same hunt on an existing change, and fixes only when you ask.
 
 ## Platforms
 

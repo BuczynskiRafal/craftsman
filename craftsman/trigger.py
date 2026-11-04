@@ -14,7 +14,7 @@ COMMANDS_PATTERN = (
     r"/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft|"
     r"/(?:craftsman:)?craftsman|craftsman:craftsman"
 )
-# `/craftsman: add x` ends the command at the colon; `/craftsman:code-review` is another command.
+# `/craftsman: add x` ends the command at the colon; `/craftsman:craft-review` is another command.
 COLON_END = r":(?![\w-])"
 LEADING_COMMAND_TRIGGER_RE = re.compile(
     rf"(?i)^\s*(?:/[a-z0-9_-]+\s+)*({COMMANDS_PATTERN})(?=$|[\s.,;!?]|{COLON_END})"

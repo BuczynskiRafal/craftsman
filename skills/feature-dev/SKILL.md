@@ -56,7 +56,7 @@ the code — at least the main path, the edge cases settled in step 3, and one e
 through `craftsman run --kind test` as you go.
 
 ## 6. Hand over to the final review
-Inside `/craftsman`, run `/simplify`, then continue with its Stage 2. Standalone, run `/simplify`, `/code-review`, and
+Inside `/craftsman`, run `/simplify`, then continue with its Stage 2. Standalone, run `/simplify`, `/craft-review`, and
 `/verify` on the result.
 
 ## 7. Summarize
