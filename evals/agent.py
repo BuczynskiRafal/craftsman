@@ -15,6 +15,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -370,6 +371,9 @@ class Execution:
 
 
 def _kill(proc: subprocess.Popen[str]) -> None:
+    if sys.platform == "win32":
+        proc.kill()
+        return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):

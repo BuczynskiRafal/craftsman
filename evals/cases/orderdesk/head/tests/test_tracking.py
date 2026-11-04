@@ -36,7 +36,7 @@ class NumberTests(unittest.TestCase):
 
 class EventTests(unittest.TestCase):
     def test_parse_event(self) -> None:
-        parsed = tracking.parse_event({"tracking": "T1", "status": "delivered", "at": "2026-03-04T10:00:00Z"})
+        parsed = tracking.parse_event({"tracking": "T1", "status": "delivered", "at": "2026-03-04T10:00:00+00:00"})
         self.assertEqual((parsed.tracking, parsed.status), ("T1", "delivered"))
         for bad in ({"status": "delivered", "at": "2026-03-04"}, {"tracking": "T", "status": "lost", "at": "x"}):
             with self.assertRaises((KeyError, ValueError)):
