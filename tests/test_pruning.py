@@ -68,7 +68,7 @@ class RoundFilePruningTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(
             self.remaining(),
-            ["packet-1.H1.md", "packet-1.H1-H2.md", "packet-1.md"],
+            ["packet-1.H1-H2.md", "packet-1.H1.md", "packet-1.md"],
         )
 
     def test_round_two_prunes_prior_views_keeping_prior_packet(self) -> None:
@@ -82,10 +82,10 @@ class RoundFilePruningTests(unittest.TestCase):
 
         removed, err = self.run_prune(2)
 
-        self.assertEqual(removed, ("packet-1.H1.md", "packet-1.H1-H4.md"))
+        self.assertEqual(removed, ("packet-1.H1-H4.md", "packet-1.H1.md"))
         self.assertEqual(
             err.splitlines(),
-            ["Pruned: packet-1.H1.md", "Pruned: packet-1.H1-H4.md"],
+            ["Pruned: packet-1.H1-H4.md", "Pruned: packet-1.H1.md"],
         )
         self.assertEqual(self.remaining(), ["packet-1.md", "packet-2.H1.md", "packet-2.md"])
 
@@ -110,7 +110,7 @@ class RoundFilePruningTests(unittest.TestCase):
                 "Pruned: packet-2.src-a-py.md",
             ],
         )
-        self.assertEqual(self.remaining(), ["packet-2.md", "packet-3.src-b-py.md", "packet-3.md"])
+        self.assertEqual(self.remaining(), ["packet-2.md", "packet-3.md", "packet-3.src-b-py.md"])
 
     def test_unrelated_entries_stay_untouched(self) -> None:
         kept_files = (
