@@ -72,7 +72,6 @@ from craftsman.ledger import (
 from craftsman.lenses import (
     LENS_IDS,
     REVIEW_ONLY_QUICK_MAX_LINES,
-    REVIEWER_GROUPS,
     TIERS,
     LensPick,
     Tier,
@@ -84,11 +83,8 @@ from craftsman.packet import (
     PacketContext,
     collect_context,
     expand_hunk_spec,
-    parse_shard_spec,
     render_packet,
     render_packet_view,
-    select_shard,
-    suggested_shard_count,
 )
 from craftsman.quality import MAX_PRODUCTION_ADDED_LINES, collect_quality_signals, production_diff_growth
 from craftsman.records import (
@@ -121,13 +117,13 @@ SHOW_RECENT_RUNS = 5
 CITED_LINE_CHARS = 120
 MAX_REPORTED_BATCH_PROBLEMS = 20
 MAX_UNSCANNED_PATHS_SHOWN = 8
+MAX_VIEW_SLUG_CHARS = 60
 UTF8_SAVE_HINT = "save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)"
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
     "lens": "--lens",
     "lenses": "--lenses",
     "hunks": "--hunks",
-    "shard": "--shard",
     "files": "--files",
     "paths": "--paths",
     "add_paths": "--add-paths",
@@ -614,8 +610,6 @@ def _needing_human(state: GateState | None) -> GateState | None:
 def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
     if not created:
         print(f"Round {round_.number} unchanged (same diff and tier). Packet: {packet}")
-        if round_.tier in ("standard", "deep"):
-            print(_suggested_shards_line(round_, packet))
         return
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
     print(
@@ -624,23 +618,11 @@ def _print_prepare_summary(round_: Round, packet: Path, created: bool) -> None:
     )
     print(f"Lenses: {', '.join(round_.lenses)}")
     print(f"Packet: {packet}")
-    if round_.tier in ("standard", "deep"):
-        print(_suggested_shards_line(round_, packet))
     sweep_last = "; run the `sweep` lens last" if SWEEP_LENS in round_.lenses else ""
     print(
         "Next: read the packet, apply every lens to each non-carried hunk, and record "
         f"`craftsman review add` / `craftsman review cover`{sweep_last}."
     )
-
-
-def _suggested_shards_line(round_: Round, packet: Path) -> str:
-    try:
-        packet_chars = len(packet.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise LedgerError(f"cannot read {packet}: {exc}") from exc
-    shards = suggested_shard_count(len(round_.open_files), packet_chars)
-    detail = "1 (no sharding needed)" if shards == 1 else str(shards)
-    return f"Suggested reviewer shards: {detail}"
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -651,65 +633,40 @@ def _write_text(path: Path, text: str) -> None:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
 
 
-def view_slug(
-    lenses: Sequence[str], hunks_raw: str | None = None, *, shard: tuple[int, int] | None = None
-) -> str:
-    """The file-name part of a reviewer view: its lenses, then its shard or hunk selection."""
-    lens_slug = "-".join(lenses)
-    if shard is not None:
-        return f"{lens_slug}.shard-{shard[0]}-of-{shard[1]}"
-    if hunks_raw is None:
-        return lens_slug
-    hunk_slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in hunks_raw.strip()).strip("-")
-    return f"{lens_slug}.{hunk_slug}" if hunk_slug else lens_slug
+def view_slug(files_raw: str | None, hunks_raw: str | None) -> str:
+    """The file-name part of a reviewer view: its file or hunk selection."""
+    raw = (files_raw if hunks_raw is None else hunks_raw) or ""
+    slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.strip()).strip("-")
+    return "-".join(part for part in slug.split("-") if part)[:MAX_VIEW_SLUG_CHARS] or "view"
 
 
-def parse_view_lenses(raw: str, round_: Round) -> list[str]:
-    """Lens ids and reviewer-group ids from `--lenses`, resolved to lenses selected in `round_`."""
-    tokens = _comma_list(raw)
-    if not tokens:
-        raise FieldError("lenses", "must name at least one lens or reviewer group")
-    lenses: list[str] = []
-    for token in tokens:
-        candidates = REVIEWER_GROUPS.get(token, (token,))
-        if token not in REVIEWER_GROUPS and token not in LENS_IDS:
-            known = ", ".join([*REVIEWER_GROUPS, *sorted(LENS_IDS)])
-            raise FieldError("lenses", f"names unknown lens or group {token!r} (choose from {known})")
-        selected = [lens for lens in candidates if lens in round_.lenses]
-        if not selected:
-            raise FieldError(
-                "lenses",
-                f"{token!r} has no lens selected in round {round_.number} "
-                f"(selected: {', '.join(round_.lenses)})",
-            )
-        lenses.extend(selected)
-    return list(dict.fromkeys(lenses))
+def _view_hunk_ids(round_: Round, args: argparse.Namespace) -> tuple[str, ...]:
+    if args.hunks is not None:
+        return expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks])
+    paths = _comma_list(args.files)
+    known = {hunk.path for hunk in round_.hunks}
+    unknown = [path for path in paths if path not in known]
+    if not paths or unknown:
+        shown = ", ".join(unknown) or "(empty)"
+        raise FieldError(
+            "files", f"names files not in round {round_.number}: {shown}; changed files: {', '.join(sorted(known))}"
+        )
+    return tuple(hunk.id for hunk in round_.hunks if hunk.path in set(paths))
 
 
 def _view(args: argparse.Namespace) -> int:
+    if (args.files is None) == (args.hunks is None):
+        raise LedgerError("pass exactly one of --files or --hunks")
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
     snap = ws.snapshot(ledger)
     round_ = require_current_round(ledger, snap)
-    lenses = parse_view_lenses(args.lenses, round_)
-    if args.shard is not None and args.hunks is not None:
-        raise LedgerError("pass either --shard or --hunks, not both")
-    if args.shard is not None:
-        parse_shard_spec(args.shard, len(round_.open_files))
-    assigned = (
-        round_.open_hunk_ids
-        if args.hunks is None
-        else expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks])
-    )
+    assigned = _view_hunk_ids(round_, args)
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=ws.task)
-    shard = select_shard(ctx, args.shard) if args.shard is not None else None
-    if shard is not None:
-        assigned = shard.hunk_ids
-    slug = view_slug(lenses, args.hunks, shard=(shard.index, shard.total) if shard else None)
-    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
-    _write_text(view_path, render_packet_view(ctx, lenses=lenses, assigned_hunks=assigned, shard=shard))
+    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{view_slug(args.files, args.hunks)}.md")
+    _write_text(view_path, render_packet_view(ctx, assigned_hunks=assigned))
     print(view_path)
     return 0
 
@@ -1868,10 +1825,9 @@ def _add_prepare_parser(sub: Any, common: argparse.ArgumentParser) -> None:
 
 
 def _add_view_and_cover_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
-    view = sub.add_parser("view", parents=[common], help="Build a per-reviewer packet view")
-    view.add_argument("--lenses", required=True, help="Comma-separated lens ids or groups, e.g. R1")
+    view = sub.add_parser("view", parents=[common], help="Build a packet view of some files or hunks")
+    view.add_argument("--files", help="Comma-separated changed file paths, e.g. pkg/a.py,pkg/b.py")
     view.add_argument("--hunks", help="Comma-separated hunk ids or ranges, e.g. H3-H17")
-    view.add_argument("--shard", help="File-aligned open-hunk shard K/N (1 <= K <= N), e.g. 1/2")
     view.set_defaults(handler=_view)
 
     cover = sub.add_parser("cover", parents=[common], help="Record that lens(es) reviewed hunks or files")

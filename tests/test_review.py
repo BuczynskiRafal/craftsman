@@ -15,9 +15,7 @@ from typing import Any
 from unittest import mock
 
 from craftsman.cli import main as cli_main
-from craftsman.ledger import open_round
-from craftsman.records import FieldError, Ledger
-from craftsman.review import parse_view_lenses, view_slug
+from craftsman.review import view_slug
 from craftsman.scope import ScopePolicy, evaluate_scope
 
 from tests.support import (
@@ -27,8 +25,6 @@ from tests.support import (
     EvidenceRepo,
     assert_cli_error,
     coverage_note,
-    make_hunk,
-    make_snap,
     run_main,
 )
 
@@ -1013,8 +1009,8 @@ class FactTests(RepoTestCase):
             "fact", "add", "--hunks", "H2", "--source", source, "--text", text, check=check
         )
 
-    def view(self, lenses: str = "contracts") -> str:
-        return Path(self.review("view", "--lenses", lenses).stdout.strip()).read_text(encoding="utf-8")
+    def view(self) -> str:
+        return Path(self.review("view", "--hunks", "H1-H2").stdout.strip()).read_text(encoding="utf-8")
 
     def test_fact_with_a_line_past_the_end_is_rejected(self) -> None:
         proc = self.add_fact(
@@ -1049,64 +1045,51 @@ class FactTests(RepoTestCase):
 
 
 class ViewTests(RepoTestCase):
-    def test_view_is_written_next_to_the_packet(self) -> None:
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("other.py", "def other():\n    return 1\n")
         self.prepare_bug()
 
-        path = Path(self.review("view", "--lenses", "intent,failure", "--hunks", "H1").stdout.strip())
+    def test_hunk_view_is_written_next_to_the_packet(self) -> None:
+        path = Path(self.review("view", "--hunks", "H1").stdout.strip())
 
-        self.assertEqual(path.name, "packet-1.intent-failure.H1.md")
+        self.assertEqual(path.name, "packet-1.H1.md")
+        self.assertTrue(path.is_file())
 
-    def test_lenses_flag_has_no_abbreviation(self) -> None:
-        self.prepare_bug()
+    def test_file_view_holds_the_hunks_of_those_files(self) -> None:
+        path = Path(self.review("view", "--files", "other.py").stdout.strip())
+        text = path.read_text(encoding="utf-8")
 
-        proc = self.review("view", "--lens", "intent", check=False)
+        self.assertEqual(path.name, "packet-1.other-py.md")
+        self.assertIn("`other.py`", text.split("## Hunks")[1].split("### Other hunks")[0])
 
-        self.assert_error(proc, 2, "the following arguments are required: --lenses")
+    def test_view_needs_exactly_one_selector(self) -> None:
+        self.assert_error(self.review("view", check=False), 1, "pass exactly one of --files or --hunks")
+        both = self.review("view", "--files", "cart.py", "--hunks", "H1", check=False)
+        self.assert_error(both, 1, "pass exactly one of --files or --hunks")
+
+    def test_view_rejects_unknown_files_and_hunks(self) -> None:
+        self.assert_error(self.review("view", "--files", "nope.py", check=False), 1, "not in round 1")
+        self.assert_error(self.review("view", "--hunks", "H99", check=False), 1, "unknown hunk")
+
+    def test_lens_and_shard_options_are_gone(self) -> None:
+        self.assert_error(self.review("view", "--lenses", "intent", check=False), 2, "unrecognized arguments")
+        self.assert_error(self.review("view", "--shard", "1/2", check=False), 2, "unrecognized arguments")
 
     def test_view_refuses_a_stale_round(self) -> None:
-        self.prepare_bug()
         self.repo.write("cart.py", BUGGY_TOTAL + "# edited\n")
 
-        proc = self.review("view", "--lenses", "intent", check=False)
+        proc = self.review("view", "--hunks", "H1", check=False)
 
         self.assert_error(proc, 1, "Code changed since round 1 was prepared")
 
 
-class ViewArgumentTests(unittest.TestCase):
-    def setUp(self) -> None:
-        _, self.round = open_round(
-            Ledger(),
-            make_snap(make_hunk("H1")),
-            "standard",
-            ("intent", "contracts", "sweep"),
-            "p.md",
-            {},
-            signals=(),
-        )
+class ViewSlugTests(unittest.TestCase):
+    def test_slug_names_the_hunk_selection(self) -> None:
+        self.assertEqual(view_slug(None, "H1-H3,H7"), "H1-H3-H7")
 
-    def test_group_resolves_to_its_lenses_in_the_round(self) -> None:
-        self.assertEqual(parse_view_lenses("R1", self.round), ["intent", "contracts"])
-
-    def test_resolved_lenses_are_deduplicated(self) -> None:
-        self.assertEqual(parse_view_lenses("intent, R1", self.round), ["intent", "contracts"])
-
-    def test_lens_not_selected_in_the_round_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "'craft' has no lens selected in round 1"):
-            parse_view_lenses("craft", self.round)
-
-    def test_unknown_lens_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "unknown lens or group 'vibes'"):
-            parse_view_lenses("vibes", self.round)
-
-    def test_empty_lens_list_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "must name at least one lens"):
-            parse_view_lenses(" , ", self.round)
-
-    def test_slug_names_lenses_then_hunks(self) -> None:
-        self.assertEqual(view_slug(["intent", "craft"], "H1-H3,H7"), "intent-craft.H1-H3-H7")
-
-    def test_slug_without_hunks_names_only_lenses(self) -> None:
-        self.assertEqual(view_slug(["intent"], None), "intent")
+    def test_slug_names_the_files(self) -> None:
+        self.assertEqual(view_slug("pkg/a.py,pkg/b.py", None), "pkg-a-py-pkg-b-py")
 
 
 class PacketPathTests(RepoTestCase):

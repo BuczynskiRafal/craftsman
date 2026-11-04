@@ -273,8 +273,7 @@ def _build_skill_parser() -> argparse.ArgumentParser:
     show_p.add_argument(
         "--lenses",
         help=(
-            "Comma-separated lens ids or reviewer groups (code-review only), "
-            "e.g. intent,contracts or R3"
+            "Comma-separated lens ids (code-review only), e.g. intent,contracts"
         ),
     )
     list_p = sub.add_parser(

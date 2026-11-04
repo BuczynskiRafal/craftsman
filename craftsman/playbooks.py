@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 
-from craftsman.lenses import LENSES, REVIEWER_GROUPS, get_lens
+from craftsman.lenses import LENSES, get_lens
 
 CODE_REVIEW_SKILL = "code-review"
 LENSES_FILENAME = "lenses.md"
@@ -14,10 +14,6 @@ _BACKTICK_FENCE_RE = re.compile(r"^ {0,3}(`{3,})[^`]*$")
 _TILDE_FENCE_RE = re.compile(r"^ {0,3}(~{3,}).*$")
 _LEVEL2_HEADING_RE = re.compile(r"^##(?!#)")
 _SECTION_HEADING_RE = re.compile(r"^## `([a-z][a-z0-9_-]*)` — \S.*$")
-_PLAYBOOK_TARGETS: dict[str, tuple[str, ...]] = {
-    **REVIEWER_GROUPS,
-    **{lens.id: (lens.id,) for lens in LENSES},
-}
 
 
 def _next_fence_state(
@@ -73,26 +69,17 @@ def parse_playbook_sections(lenses_md: str) -> tuple[str, Mapping[str, str]]:
     return "\n".join(preamble_lines).strip(), sections
 
 
-def _valid_targets_hint() -> str:
-    lenses = ", ".join(lens.id for lens in LENSES)
-    groups = ", ".join(REVIEWER_GROUPS)
-    return f"valid lenses: {lenses}; groups: {groups}"
-
-
 def expand_playbook_lenses(raw: str) -> tuple[str, ...]:
-    """Expand a CSV of lens ids and `R1`..`R4` groups into unique lens ids in `LENSES` order."""
+    """Expand a CSV of lens ids into unique lens ids in `LENSES` order."""
     tokens = [item.strip() for item in raw.split(",") if item.strip()]
+    valid = ", ".join(lens.id for lens in LENSES)
     if not tokens:
-        raise ValueError(
-            f"--lenses must name at least one lens or reviewer group ({_valid_targets_hint()})"
-        )
-    unknown = next((token for token in tokens if token not in _PLAYBOOK_TARGETS), None)
+        raise ValueError(f"--lenses must name at least one lens (valid lenses: {valid})")
+    known = {lens.id for lens in LENSES}
+    unknown = next((token for token in tokens if token not in known), None)
     if unknown is not None:
-        raise ValueError(
-            f"unknown lens or reviewer group {unknown!r} ({_valid_targets_hint()})"
-        )
-    chosen = {lens_id for token in tokens for lens_id in _PLAYBOOK_TARGETS[token]}
-    return tuple(lens.id for lens in LENSES if lens.id in chosen)
+        raise ValueError(f"unknown lens {unknown!r} (valid lenses: {valid})")
+    return tuple(lens.id for lens in LENSES if lens.id in set(tokens))
 
 
 def lens_playbooks(lenses_md: str, lens_ids: Sequence[str]) -> str:

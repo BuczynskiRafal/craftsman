@@ -9,7 +9,6 @@ from craftsman.diffscan import SIGNALS
 from craftsman.lenses import (
     LENS_IDS,
     LENSES,
-    REVIEWER_GROUPS,
     TIERS,
     Tier,
     get_lens,
@@ -141,11 +140,6 @@ class LensSelectionTests(unittest.TestCase):
     def test_unknown_tier_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "valid tiers: quick, standard, deep"):
             select_lenses("auto", {}, docs_only=False)  # type: ignore[arg-type]
-
-    def test_every_review_lens_belongs_to_exactly_one_reviewer_group(self) -> None:
-        all_grouped = [lens for group in REVIEWER_GROUPS.values() for lens in group]
-
-        self.assertEqual(sorted(all_grouped), sorted(LENS_IDS - {"sweep"}))
 
 
 if __name__ == "__main__":

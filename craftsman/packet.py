@@ -6,7 +6,6 @@ collected context so its layout can be tested without a repository.
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -39,7 +38,6 @@ MAX_REFERENCES_PER_SYMBOL = 8
 TRIMMED_REFERENCES_PER_SYMBOL = 3
 MAX_TEST_FILES_PER_SYMBOL = 5
 REFERENCE_SEARCH_LIMIT = 40
-MAX_SUGGESTED_SHARDS = 4
 
 _CONVENTION_FILES = (
     "AGENTS.md",
@@ -279,69 +277,6 @@ def _carried_from(ledger: Ledger, round_: Round) -> dict[str, int]:
 
 
 _HUNK_RANGE_RE = re.compile(r"^H(\d+)-H(\d+)$")
-_SHARD_SPEC_RE = re.compile(r"^(-?\d+)/(-?\d+)$")
-
-
-@dataclass(frozen=True)
-class PacketShard:
-    index: int
-    total: int
-    files: tuple[str, ...]
-    hunk_ids: tuple[str, ...]
-
-
-def parse_shard_spec(raw: str, open_file_count: int) -> tuple[int, int]:
-    """Parse and validate a `K/N` shard selector against the round's open file count."""
-    match = _SHARD_SPEC_RE.match(raw.strip())
-    if match is None:
-        raise FieldError("shard", f"must look like K/N (e.g. 1/2), got {raw!r}")
-    index, total = int(match.group(1)), int(match.group(2))
-    if not (1 <= index <= total):
-        raise FieldError("shard", f"must satisfy 1 <= K <= N (got {raw!r})")
-    if open_file_count < 1:
-        raise FieldError("shard", "round has no open files to shard")
-    if total > open_file_count:
-        msg = f"cannot split {open_file_count} open file(s) into {total} shards (N <= {open_file_count})"
-        raise FieldError("shard", msg)
-    return index, total
-
-
-def suggested_shard_count(open_file_count: int, packet_chars: int) -> int:
-    """Suggested reviewer shard count (1..4), bounded by open files and packet size."""
-    return min(MAX_SUGGESTED_SHARDS, max(1, open_file_count), max(1, math.ceil(packet_chars / MAX_VIEW_CHARS)))
-
-
-def plan_shards(ctx: PacketContext, total: int) -> tuple[PacketShard, ...]:
-    """Partition open hunks into `total` file-disjoint shards balanced by rendered size."""
-    open_files = ctx.round.open_files
-    parse_shard_spec(f"1/{total}", len(open_files))
-    open_ids = set(ctx.round.open_hunk_ids)
-    by_file: dict[str, list[Hunk]] = {path: [] for path in open_files}
-    for hunk in ctx.snap.hunks:
-        if hunk.id in open_ids:
-            by_file.setdefault(hunk.path, []).append(hunk)
-    sizes: list[tuple[int, str]] = []
-    for path in open_files:
-        owners = _Owners.of(ctx, by_file[path])
-        sizes.append((sum(len(_hunk_section(ctx, hunk, owners)) for hunk in by_file[path]), path))
-    ranked = sorted(sizes, key=lambda item: (-item[0], item[1]))
-    totals, buckets = [0] * total, [set[str]() for _ in range(total)]
-    for size, path in ranked:
-        target = min(range(total), key=lambda idx: (totals[idx], idx))
-        buckets[target].add(path)
-        totals[target] += size
-    shards: list[PacketShard] = []
-    for idx in range(total):
-        files = tuple(path for path in open_files if path in buckets[idx])
-        hunk_ids = tuple(hunk.id for path in files for hunk in by_file[path])
-        shards.append(PacketShard(idx + 1, total, files, hunk_ids))
-    return tuple(shards)
-
-
-def select_shard(ctx: PacketContext, raw: str) -> PacketShard:
-    """Return shard `K` from a validated `K/N` shard specification."""
-    index, total = parse_shard_spec(raw, len(ctx.round.open_files))
-    return plan_shards(ctx, total)[index - 1]
 
 
 def expand_hunk_spec(raw: str, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
@@ -369,34 +304,29 @@ def expand_hunk_spec(raw: str, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
 
 
 def render_packet(ctx: PacketContext) -> str:
-    """Render the packet: every lens and every hunk of the round in full."""
-    return _render(ctx, lenses=None, assigned=None, shard=None)
+    """Render the packet: every hunk of the round in full."""
+    return _render(ctx, assigned=None)
 
 
-def render_packet_view(
-    ctx: PacketContext, *, lenses: Collection[str], assigned_hunks: Collection[str], shard: PacketShard | None = None
-) -> str:
-    """Render a per-reviewer view: its lenses, its hunks in full and the other hunks as an index."""
-    return _render(ctx, lenses=frozenset(lenses), assigned=frozenset(assigned_hunks), shard=shard)
+def render_packet_view(ctx: PacketContext, *, assigned_hunks: Collection[str]) -> str:
+    """Render a per-reviewer view: its hunks in full and the other hunks as an index."""
+    return _render(ctx, assigned=frozenset(assigned_hunks))
 
 
-def _render(
-    ctx: PacketContext, *, lenses: frozenset[str] | None, assigned: frozenset[str] | None, shard: PacketShard | None
-) -> str:
+def _render(ctx: PacketContext, *, assigned: frozenset[str] | None) -> str:
     """Trim scopes, then symbol references, then largest hunk diffs to stay within budget."""
-    preamble = _preamble(ctx, lenses, shard)
+    preamble = _preamble(ctx)
     shown = [hunk for hunk in ctx.snap.hunks if assigned is None or hunk.id in assigned]
     owners = _Owners.of(ctx, shown)
     sections = {hunk.id: _hunk_section(ctx, hunk, owners) for hunk in shown}
     index = [_hunk_summary_line(ctx, hunk) for hunk in ctx.snap.hunks if hunk.id not in sections]
-    budget = _char_budget(ctx, len(shown), assigned, shard)
+    budget = MAX_PACKET_CHARS if assigned is None else MAX_VIEW_CHARS
     no_scope: set[str] = set()
-    if ctx.round.tier != "quick":
-        for _, hunk in _scope_savings(ctx, shown, owners):
-            if len(_assemble(preamble, sections, index)) <= budget:
-                break
-            no_scope.add(hunk.id)
-            sections[hunk.id] = _hunk_section(ctx, hunk, owners, omit_scope=True)
+    for _, hunk in _scope_savings(ctx, shown, owners):
+        if len(_assemble(preamble, sections, index)) <= budget:
+            break
+        no_scope.add(hunk.id)
+        sections[hunk.id] = _hunk_section(ctx, hunk, owners, omit_scope=True)
     trimmed: set[str] = set()
     for _, symbol, hunk in _reference_savings(ctx, shown, owners):
         if len(_assemble(preamble, sections, index)) <= budget:
@@ -436,22 +366,12 @@ def _omit_diffs(
     return ordered
 
 
-def _char_budget(
-    ctx: PacketContext, shown: int, assigned: frozenset[str] | None, shard: PacketShard | None
-) -> int:
-    """Full packet gets the tier budget; a shard gets MAX_VIEW_CHARS; a hunk view gets its share."""
-    if shard is not None:
-        return MAX_VIEW_CHARS
-    packet_budget = MAX_QUICK_PACKET_CHARS if ctx.round.tier == "quick" else MAX_PACKET_CHARS
-    return packet_budget if assigned is None else packet_budget * max(1, shown) // max(1, len(ctx.snap.hunks))
-
-
-def _preamble(ctx: PacketContext, lenses: frozenset[str] | None, shard: PacketShard | None = None) -> str:
+def _preamble(ctx: PacketContext) -> str:
     parts = [
-        _header(ctx, shard),
+        _header(ctx),
         _intent(ctx),
         _conventions_section(ctx),
-        _lenses_section(ctx, lenses),
+        _lenses_section(ctx),
         "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
     ]
     if ctx.round.signals:
@@ -524,16 +444,14 @@ def _scope_savings(ctx: PacketContext, shown: Sequence[Hunk], owners: _Owners) -
     return sorted(savings, key=lambda item: item[0], reverse=True)
 
 
-def _header(ctx: PacketContext, shard: PacketShard | None = None) -> str:
+def _header(ctx: PacketContext) -> str:
     snap = ctx.snap
     carried = sum(hunk.carried for hunk in ctx.round.hunks)
-    shard_tag = f" (shard {shard.index}/{shard.total})" if shard is not None else ""
-    shard_files = f"\nFiles in this shard: {', '.join(shard.files)}" if shard is not None else ""
     return (
-        f"# Craftsman review packet — round {ctx.round.number}{shard_tag}\n"
+        f"# Craftsman review packet — round {ctx.round.number}\n"
         f"Base `{snap.base_sha[:7]}` · fingerprint `{snap.fingerprint[:12]}` · tier `{ctx.round.tier}` · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines, "
-        f"{len(snap.hunks)} hunks ({carried} carried){shard_files}"
+        f"{len(snap.hunks)} hunks ({carried} carried)"
     )
 
 
@@ -550,11 +468,9 @@ def _conventions_section(ctx: PacketContext) -> str:
     return f"## Conventions to read first\n{listed}"
 
 
-def _lenses_section(ctx: PacketContext, only: frozenset[str] | None) -> str:
+def _lenses_section(ctx: PacketContext) -> str:
     rows = ["| Lens | Why selected | Focus |", "| :--- | :--- | :--- |"]
     for pick in ctx.picks:
-        if only is not None and pick.lens.id not in only:
-            continue
         reason = pick.reason
         if pick.lens.id == SWEEP_LENS:
             reason += " (run after all other lenses)"

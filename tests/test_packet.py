@@ -314,30 +314,25 @@ class RenderTests(unittest.TestCase):
             "H2": Scope("pkg/b.py", "beta", "function", 7, 10, "def beta():\n    b = 2"),
         }
 
-        view = render_packet_view(
-            build_context(H1, H2, scopes=scopes), lenses=("intent",), assigned_hunks=("H1",)
-        )
+        view = render_packet_view(build_context(H1, H2, scopes=scopes), assigned_hunks=("H1",))
 
         self.assertIn("def alpha():", view)
         self.assertNotIn("def beta():", view)
         self.assertIn("- H2 · pkg/b.py · beta", view)
 
-    def test_view_gets_its_hunks_share_of_the_size_budget(self) -> None:
+    def test_view_has_its_own_size_budget(self) -> None:
         scope = Scope("pkg/a.py", "f", "function", 1, 50, "\n".join(f"line {i}" for i in range(50)))
         ctx = build_context(H1, H2, scopes={"H1": scope})
         full = len(render_packet(ctx))
 
-        with mock.patch.object(packet, "MAX_PACKET_CHARS", full):
-            view = render_packet_view(ctx, lenses=("intent",), assigned_hunks=("H1",))
+        with mock.patch.object(packet, "MAX_PACKET_CHARS", full), mock.patch.object(
+            packet, "MAX_VIEW_CHARS", full // 2
+        ):
+            view = render_packet_view(ctx, assigned_hunks=("H1",))
             whole = render_packet(ctx)
 
         self.assertIn("Enclosing scope omitted for size", view)
         self.assertNotIn("Enclosing scope omitted for size", whole)
-
-    def test_view_lists_only_its_lenses(self) -> None:
-        view = render_packet_view(build_context(), lenses=("intent",), assigned_hunks=("H1",))
-
-        self.assertNotIn("`sweep`", view.split("## Recording cheat sheet")[0])
 
 
 class LayoutTests(unittest.TestCase):

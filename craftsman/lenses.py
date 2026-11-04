@@ -126,30 +126,7 @@ LENSES: tuple[Lens, ...] = (
 )
 LENS_IDS: frozenset[str] = frozenset(lens.id for lens in LENSES)
 
-REVIEWER_GROUPS: dict[str, tuple[str, ...]] = {
-    "R1": ("intent", "contracts", "ripple", "tests"),
-    "R2": ("failure", "state", "trust", "model"),
-    "R3": ("platform", "craft"),
-    "R4": ("design",),
-}
-REVIEWER_GROUP_TITLES: dict[str, str] = {
-    "R1": "callers & contracts",
-    "R2": "failure paths & state",
-    "R3": "environment & clarity",
-    "R4": "whole-change design",
-}
-
 _LENSES_BY_ID = {lens.id: lens for lens in LENSES}
-
-
-def render_reviewer_groups_markdown() -> str:
-    """Render the fixed reviewer groups from `REVIEWER_GROUPS` as a Markdown bullet list."""
-    lines = [
-        f"- **{gid}** ({REVIEWER_GROUP_TITLES[gid]}): " + ", ".join(f"`{lens}`" for lens in lenses)
-        for gid, lenses in REVIEWER_GROUPS.items()
-    ]
-    lines.append("- **Verifier / sweep**: `sweep` (after all reviewer groups finish)")
-    return "\n".join(lines)
 
 
 def review_only_tier(changed_lines: int, *, has_skipped: bool, docs_only: bool) -> Tier:
