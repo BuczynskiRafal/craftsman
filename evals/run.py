@@ -6,9 +6,12 @@ Usage:
     python3 -m evals.run score <case> <workdir> [--findings findings.json] [--json]
     python3 -m evals.run agent --cases all --arm <label> [--craftsman-src <dir>] [--repeat N] ...
     python3 -m evals.run compare results.jsonl [more.jsonl ...]
+    python3 -m evals.run rescore results.jsonl [more.jsonl ...]
 
 ``agent`` runs a real headless Claude Code review per case and appends one JSON line per run to a
-results file (see ``evals/agent.py``); ``compare`` summarizes such files (see ``evals/compare.py``).
+results file (see ``evals/agent.py``); ``compare`` summarizes such files (see ``evals/compare.py``);
+``rescore`` scores their kept ledgers again after the scoring rule or the truth changed (see
+``evals/rescore.py``).
 
 Each case under ``evals/cases/<id>/`` holds ``base/`` and ``head/`` trees, ``task.md`` (the change
 description a reviewer receives) and ``truth.json`` (the seeded defects, never copied to the work
@@ -31,7 +34,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 CASES_DIR = Path(__file__).resolve().parent / "cases"
-WINDOW = 3
+MAX_DISTANCE = 5  # a finding further than this from every seeded item is unmatched
 EVALS_DIR = "evals"  # inside <dest>/.git: holds task.md and, for baseline runs, findings.json
 LEDGER_PARTS = ("craftsman", "ledger.json")
 SIZES = ("small", "large")
@@ -331,78 +334,79 @@ def collect_findings(workdir: Path, findings_file: Path | None = None) -> tuple[
 # --- matching ----------------------------------------------------------------------------------
 
 
-def distance(finding: Finding, location: Location, slack: int = WINDOW) -> int | None:
-    """0 inside [start, end]; the distance to the nearest edge up to ``slack`` lines; else None."""
+def distance(finding: Finding, location: Location) -> int | None:
+    """0 inside [start, end], else the lines to the nearer end; None in another file."""
     if finding.file != location.file:
         return None
-    if location.start <= finding.line <= location.end:
-        return 0
-    gap = location.start - finding.line if finding.line < location.start else finding.line - location.end
-    return gap if gap <= slack else None
+    if finding.line < location.start:
+        return location.start - finding.line
+    return max(finding.line - location.end, 0)
 
 
 @dataclass(frozen=True)
-class Zone:
-    """The lines a finding may point at to count for one location of a defect or a decoy."""
+class Item:
+    """A seeded defect or decoy with all its locations."""
 
     kind: str  # "defect" or "decoy"
     id: str
-    location: Location
-    slack: int
+    locations: tuple[Location, ...]
 
 
-def _lines_between(a: Location, b: Location) -> int:
-    """Lines strictly between two ranges of one file; 0 when they touch or overlap."""
-    if b.start > a.end:
-        return b.start - a.end - 1
-    if a.start > b.end:
-        return a.start - b.end - 1
-    return 0
+def items(case: Case) -> list[Item]:
+    """Every defect, then every decoy of the case."""
+    return [Item("defect", d.id, d.locations) for d in case.defects] + [
+        Item("decoy", d.id, d.locations) for d in case.decoys
+    ]
 
 
-def zones(case: Case) -> list[Zone]:
-    """Every location of every defect and decoy with its slack.
+def _nearest_location(finding: Finding, item: Item) -> tuple[int, int] | None:
+    """(distance, span length) of the location of ``item`` nearest to the finding."""
+    best: tuple[int, int] | None = None
+    for loc in item.locations:
+        gap = distance(finding, loc)
+        if gap is not None and (best is None or (gap, loc.end - loc.start) < best):
+            best = (gap, loc.end - loc.start)
+    return best
 
-    The slack is WINDOW lines, but never more than it takes to leave a line of the gap to the next
-    defect or decoy of the same file uncovered: the zones of two items never overlap, so a finding is
-    near at most one of them and two findings on one defect cannot credit its neighbour.
+
+def nearest_item(case: Case, finding: Finding) -> tuple[int, Item] | None:
+    """The defect or decoy a finding is assigned to, with its distance; None when none is near.
+
+    The nearest item within MAX_DISTANCE lines wins. A tie goes to the defect, except for a finding
+    inside both ranges (distance 0): the narrower range wins, so a decoy nested in a defect's span is
+    still hit by a finding on its own lines. Further ties go to the first item listed.
     """
-    items = [("defect", d.id, loc) for d in case.defects for loc in d.locations]
-    items += [("decoy", d.id, loc) for d in case.decoys for loc in d.locations]
-    result = []
-    for kind, item_id, loc in items:
-        slack = WINDOW
-        for _, other_id, other in items:
-            if other_id != item_id and other.file == loc.file:
-                slack = min(slack, max(_lines_between(loc, other) - 1, 0) // 2)
-        result.append(Zone(kind, item_id, loc, slack))
-    return result
+    best: tuple[tuple[int, int, int, int], Item] | None = None
+    for order, item in enumerate(items(case)):
+        near = _nearest_location(finding, item)
+        if near is None or near[0] > MAX_DISTANCE:
+            continue
+        gap, span = near
+        key = (gap, span if gap == 0 else 0, int(item.kind != "defect"), order)
+        if best is None or key < best[0]:
+            best = (key, item)
+    return (best[0][0], best[1]) if best is not None else None
 
 
 def match_findings(case: Case, findings: Sequence[Finding]) -> Matching:
-    """Assign each finding to the defect or decoy it points at, or to none.
+    """Assign each finding to the nearest defect or decoy, or to none.
 
-    A finding inside a zone belongs to that defect or decoy (the closest one when ranges overlap).
-    Each defect is found once, by the finding closest to it; further findings on it are duplicates.
-    A finding on a decoy is a decoy hit; the rest are unmatched (possible false positives).
+    A defect is found by the finding closest to it (the first one on a tie); further findings
+    assigned to it are duplicates. A finding assigned to a decoy is a decoy hit; a finding with no
+    item within MAX_DISTANCE lines is unmatched (a possible false positive).
     """
-    all_zones = zones(case)
     credited: dict[str, tuple[int, int]] = {}  # defect id -> (gap, finding index)
     duplicates: list[int] = []
     decoy_hits: list[tuple[int, str]] = []
     unmatched: list[int] = []
     for index, finding in enumerate(findings):
-        best: tuple[int, int, Zone] | None = None
-        for order, zone in enumerate(all_zones):
-            gap = distance(finding, zone.location, zone.slack)
-            if gap is not None and (best is None or (gap, order) < best[:2]):
-                best = (gap, order, zone)
-        if best is None:
+        near = nearest_item(case, finding)
+        if near is None:
             unmatched.append(index)
-        elif best[2].kind == "decoy":
-            decoy_hits.append((index, best[2].id))
+        elif near[1].kind == "decoy":
+            decoy_hits.append((index, near[1].id))
         else:
-            gap, defect_id = best[0], best[2].id
+            gap, defect_id = near[0], near[1].id
             if defect_id not in credited:
                 credited[defect_id] = (gap, index)
             elif gap < credited[defect_id][0]:
@@ -655,12 +659,15 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("workdir", type=Path)
     score.add_argument("--findings", type=Path, help='JSON list of {"file", "line", "title"}')
     score.add_argument("--json", action="store_true", help="machine-readable output")
-    from evals import agent, compare
+    from evals import agent, compare, rescore
 
     agent.add_arguments(
         sub.add_parser("agent", help="run real headless Claude Code reviews and record recall, cost, time")
     )
     compare.add_arguments(sub.add_parser("compare", help="summarize results files written by 'agent'"))
+    rescore.add_arguments(
+        sub.add_parser("rescore", help="score the kept ledgers of saved results again with the current truth")
+    )
     return parser
 
 
@@ -676,6 +683,12 @@ def _cmd_compare(args: argparse.Namespace, out: TextIO) -> int:
     return compare.cmd_compare(args, out)
 
 
+def _cmd_rescore(args: argparse.Namespace, out: TextIO) -> int:
+    from evals import rescore
+
+    return rescore.cmd_rescore(args, out)
+
+
 def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
     args = build_parser().parse_args(argv)
     stream = out if out is not None else sys.stdout
@@ -685,6 +698,7 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
         "score": _cmd_score,
         "agent": _cmd_agent,
         "compare": _cmd_compare,
+        "rescore": _cmd_rescore,
     }
     try:
         return handlers[args.command](args, stream)

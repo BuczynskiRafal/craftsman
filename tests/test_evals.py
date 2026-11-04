@@ -42,16 +42,18 @@ def _finding(file: str, line: int, title: str = "t") -> run.Finding:
 
 
 class DistanceTests(unittest.TestCase):
-    def test_window_is_three_lines_around_the_location(self) -> None:
+    def test_distance_is_zero_inside_and_counts_lines_to_the_nearer_end(self) -> None:
         location = _loc("a.py", 10, 12)
-        self.assertEqual(run.distance(_finding("a.py", 11), location), 0)
+        self.assertEqual(run.distance(_finding("a.py", 10), location), 0)
+        self.assertEqual(run.distance(_finding("a.py", 12), location), 0)
         self.assertEqual(run.distance(_finding("a.py", 7), location), 3)
         self.assertEqual(run.distance(_finding("a.py", 15), location), 3)
-        self.assertIsNone(run.distance(_finding("a.py", 6), location))
-        self.assertIsNone(run.distance(_finding("a.py", 16), location))
+        self.assertEqual(run.distance(_finding("a.py", 1), location), 9)
 
     def test_other_file_never_matches(self) -> None:
         self.assertIsNone(run.distance(_finding("b.py", 10), _loc("a.py", 10)))
+        case = _case(_defect("d1", _loc("a.py", 10)))
+        self.assertEqual(run.match_findings(case, [_finding("b.py", 10)]).unmatched, (0,))
 
     def test_paths_are_normalized(self) -> None:
         self.assertEqual(run.normalize_path("./pkg/a.py"), "pkg/a.py")
@@ -72,11 +74,14 @@ class DistanceTests(unittest.TestCase):
 
 
 class MatchingTests(unittest.TestCase):
-    def test_finding_inside_the_window_finds_the_defect(self) -> None:
+    def test_finding_within_five_lines_finds_the_defect(self) -> None:
         case = _case(_defect("d1", _loc("a.py", 10, 12)))
-        matching = run.match_findings(case, [_finding("a.py", 15)])
-        self.assertEqual(matching.found, {"d1": 0})
-        self.assertEqual(matching.unmatched, ())
+        for line in (5, 8, 11, 17):
+            matching = run.match_findings(case, [_finding("a.py", line)])
+            self.assertEqual((matching.found, matching.unmatched), ({"d1": 0}, ()), line)
+        for line in (4, 18):
+            matching = run.match_findings(case, [_finding("a.py", line)])
+            self.assertEqual((matching.found, matching.unmatched), ({}, (0,)), line)
 
     def test_each_defect_counts_once_and_each_finding_matches_one_defect(self) -> None:
         case = _case(_defect("d1", _loc("a.py", 10)), _defect("d2", _loc("a.py", 30)))
@@ -95,28 +100,60 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual([d["id"] for d in result["defects"] if d["found"]], ["d1"])
         self.assertEqual(len(result["duplicates"]), 1)
 
-    def test_the_slack_never_covers_the_gap_between_two_defects(self) -> None:
+    def test_a_finding_goes_to_the_nearest_item_between_two_defects(self) -> None:
         case = _case(_defect("d1", _loc("a.py", 50, 52)), _defect("d2", _loc("a.py", 57, 61)))
-        slacks = {z.id: z.slack for z in run.zones(case)}
-        self.assertEqual(slacks, {"d1": 1, "d2": 1})  # 4 lines between: one each, two stay uncovered
-        credited = [set(run.match_findings(case, [_finding("a.py", line)]).found) for line in (53, 54, 55, 56)]
-        self.assertEqual(credited, [{"d1"}, set(), set(), {"d2"}])
-        far = _case(_defect("d1", _loc("a.py", 10)), _defect("d2", _loc("a.py", 40)))
-        self.assertEqual({z.slack for z in run.zones(far)}, {run.WINDOW})
-        self.assertEqual({z.slack for z in run.zones(_case(_defect("d1", _loc("a.py", 10))))}, {run.WINDOW})
+        credited = [run.match_findings(case, [_finding("a.py", line)]).found for line in range(53, 57)]
+        self.assertEqual(credited, [{"d1": 0}, {"d1": 0}, {"d2": 0}, {"d2": 0}])
+        # Equally far from both (d1 ends at 52, d3 starts at 58): the first listed wins, never both.
+        tie = _case(_defect("d1", _loc("a.py", 50, 52)), _defect("d3", _loc("a.py", 58, 60)))
+        matching = run.match_findings(tie, [_finding("a.py", 55)])
+        self.assertEqual((matching.found, matching.duplicates), ({"d1": 0}, ()))
 
-    def test_zones_of_different_items_never_overlap(self) -> None:
+    def test_a_tie_between_a_defect_and_a_decoy_goes_to_the_defect(self) -> None:
+        decoy = run.Decoy("x", "fine", (_loc("a.py", 10, 11),))
+        case = _case(_defect("d1", _loc("a.py", 17, 20)), decoys=(decoy,))
+        matching = run.match_findings(case, [_finding("a.py", 14)])  # 3 from the decoy, 3 from the defect
+        self.assertEqual((matching.found, matching.decoy_hits), ({"d1": 0}, ()))
+        self.assertEqual(run.match_findings(case, [_finding("a.py", 13)]).decoy_hits, ((0, "x"),))
+        self.assertEqual(run.match_findings(case, [_finding("a.py", 15)]).found, {"d1": 0})
+        self.assertEqual(run.match_findings(case, [_finding("a.py", 26)]).unmatched, (0,))
+
+    def test_the_attach_review_is_credited(self) -> None:
+        # A real review: path traversal reported on the blank line above `def _file` (truth 23-27,
+        # decoy 18-21) and the backslash names at the start of `list()` (truth 42).
+        case = run.load_case("attach")
+        findings = [_finding("attach/store.py", 22), _finding("attach/store.py", 38)]
+        matching = run.match_findings(case, findings)
+        self.assertEqual(matching.found, {"att-1": 0, "att-2": 1})
+        self.assertEqual((matching.decoy_hits, matching.unmatched, matching.duplicates), ((), (), ()))
+        self.assertEqual(run.score_findings(case, findings)["recall"], 1.0)
+
+    def test_adjacent_defects_are_each_credited_by_a_finding_on_their_own_lines(self) -> None:
+        for case_id, first, second in (
+            ("reminders", "rem-1", "rem-2"),
+            ("kvstore", "kv-2", "kv-1"),
+            ("quotes", "q-2", "q-3"),
+        ):
+            case = run.load_case(case_id)
+            by_id = {d.id: d for d in case.defects}
+            loc_a, loc_b = by_id[first].locations[0], by_id[second].locations[0]
+            findings = [run.Finding(loc_a.file, loc_a.end, ""), run.Finding(loc_b.file, loc_b.start, "")]
+            with self.subTest(case=case_id):
+                matching = run.match_findings(case, findings)
+                self.assertEqual(matching.found, {first: 0, second: 1})
+                # Two findings on one defect of the pair never credit the other.
+                twice = run.match_findings(case, [findings[0], findings[0]])
+                self.assertEqual((set(twice.found), len(twice.duplicates)), ({first}, 1))
+
+    def test_a_decoy_inside_a_defect_span_is_hit_by_a_finding_on_its_own_lines(self) -> None:
         decoy = run.Decoy("x", "fine", (_loc("a.py", 12, 13),))
-        case = _case(_defect("d1", _loc("a.py", 10, 11)), _defect("d2", _loc("a.py", 15, 16)), decoys=(decoy,))
-        found = run.zones(case)
-        for first in found:
-            for second in found:
-                if first.id < second.id:
-                    reach = (
-                        range(first.location.start - first.slack, first.location.end + first.slack + 1),
-                        range(second.location.start - second.slack, second.location.end + second.slack + 1),
-                    )
-                    self.assertFalse(set(reach[0]) & set(reach[1]), (first.id, second.id))
+        case = _case(_defect("d1", _loc("a.py", 10, 20)), decoys=(decoy,))
+        on_decoy = run.match_findings(case, [_finding("a.py", 12)])
+        self.assertEqual((on_decoy.found, on_decoy.decoy_hits), ({}, ((0, "x"),)))
+        on_defect = run.match_findings(case, [_finding("a.py", 11), _finding("a.py", 15)])
+        self.assertEqual((on_defect.found, on_defect.decoy_hits), ({"d1": 0}, ()))
+        self.assertEqual(on_defect.duplicates, (1,))
+        self.assertEqual(run.match_findings(case, [_finding("a.py", 14)]).found, {"d1": 0})
 
     def test_a_decoy_next_to_a_defect_is_still_a_decoy_hit(self) -> None:
         decoy = run.Decoy("x", "fine", (_loc("a.py", 65, 66),))
@@ -437,19 +474,15 @@ class PrepareAndScoreTests(unittest.TestCase):
                         found = run.match_findings(case, [run.Finding(loc.file, loc.start, "")])
                         self.assertEqual((found.found, found.decoy_hits), ({defect.id: 0}, ()), defect.id)
 
-    def test_no_two_items_of_a_case_share_a_line_or_a_window(self) -> None:
+    def test_no_two_items_of_a_case_share_a_line(self) -> None:
         for case_id in run.case_ids():
             with self.subTest(case=case_id):
-                found = run.zones(run.load_case(case_id))
-                for index, first in enumerate(found):
-                    for second in found[index + 1 :]:
-                        if first.id == second.id or first.location.file != second.location.file:
-                            continue
-                        reach_a = set(range(first.location.start - first.slack, first.location.end + first.slack + 1))
-                        reach_b = set(
-                            range(second.location.start - second.slack, second.location.end + second.slack + 1)
-                        )
-                        self.assertFalse(reach_a & reach_b, (first.id, second.id))
+                lines: dict[tuple[str, int], str] = {}
+                for item in run.items(run.load_case(case_id)):
+                    for loc in item.locations:
+                        for line in range(loc.start, loc.end + 1):
+                            other = lines.setdefault((loc.file, line), item.id)
+                            self.assertEqual(other, item.id, (loc.file, line))
 
 
 class DocsTests(unittest.TestCase):
@@ -571,7 +604,7 @@ class AgentTestCase(unittest.TestCase):
             loc
             for d in case.decoys
             for loc in d.locations
-            if not any(run.distance(run.Finding(loc.file, loc.start, ""), df) is not None for x in case.defects for df in x.locations)
+            if (near := run.nearest_item(case, run.Finding(loc.file, loc.start, ""))) and near[1].id == d.id
         )
         findings.append({"file": decoy.file, "line": decoy.start, "title": "decoy", "verdict": "probable"})
         findings.append({"file": "nowhere.py", "line": 1, "title": "noise", "verdict": "probable"})
@@ -989,6 +1022,100 @@ class CompareTests(unittest.TestCase):
         two = self._write("2.jsonl", [_record("a", "alpha", 2, 4)])
         _, text = self._compare(one, two)
         self.assertIn("arm a: 2 valid runs", text)
+
+
+class RescoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        findings = [
+            {"file": "attach/store.py", "line": 22, "title": "traversal", "verdict": "proven"},
+            {"file": "/gone/tmp/evals-attach-x/repo/attach/store.py", "line": 38, "title": "names"},
+            {"file": "attach/store.py", "line": 40, "title": "dismissed", "verdict": "dismissed"},
+        ]
+        self.ledger = self.tmp / "ledger.json"
+        self.ledger.write_text(json.dumps({"findings": findings}), encoding="utf-8")
+        stale = {"found": 0, "total": 2, "recall": 0.0, "found_ids": [], "missed_ids": ["att-1", "att-2"]}
+        self.kept = _record("t", "attach", 1, 0, defects_total=2, recall=stale, logs={"ledger": str(self.ledger)})
+        self.no_ledger = _record("t", "attach", 2, 1, logs={"dir": "x"})
+        self.lost = _record("t", "attach", 3, 1, logs={"ledger": str(self.tmp / "missing.json")})
+        self.baseline = _record("b", "attach", 1, 1, recall=None)
+        self.path = self.tmp / "r.jsonl"
+        records = [self.kept, self.no_ledger, self.lost, self.baseline]
+        self.lines = [json.dumps(r, sort_keys=True) for r in records]
+        self.original = "\n".join(self.lines[:2]) + "\n\n" + "\n".join(self.lines[2:]) + "\n"
+        self.path.write_text(self.original, encoding="utf-8")
+
+    def rescore(self, *paths: Path) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = run.main(["rescore", *map(str, paths)], out)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_record_with_a_kept_ledger_is_scored_with_the_current_truth(self) -> None:
+        code, out, err = self.rescore(self.path)
+        self.assertEqual(code, 0)
+        lines = self.path.read_text(encoding="utf-8").split("\n")
+        record = json.loads(lines[0])
+        self.assertEqual((record["recall"]["found"], record["recall"]["total"]), (2, 2))
+        self.assertEqual(record["recall"]["found_ids"], ["att-1", "att-2"])
+        self.assertEqual(record["recall"]["recall"], 1.0)
+        self.assertEqual((record["recall"]["unmatched"], record["recall"]["dismissed_ignored"]), ([], 1))
+        self.assertEqual({k: v for k, v in record.items() if k != "recall"}, {k: v for k, v in self.kept.items() if k != "recall"})
+        self.assertIn("0/2 -> 2/2", out)
+        self.assertIn("1 rescored, 3 left as they are", out)
+
+    def test_other_records_and_blank_lines_stay_as_they_are_with_a_warning(self) -> None:
+        _, _, err = self.rescore(self.path)
+        lines = self.path.read_text(encoding="utf-8").split("\n")
+        self.assertEqual(lines[1:], self.original.split("\n")[1:])
+        self.assertEqual(err.count("warning:"), 3)
+        self.assertIn("no kept ledger", err)
+        self.assertIn("attach#3", err)
+
+    def test_the_original_is_kept_and_a_second_run_does_not_overwrite_it(self) -> None:
+        self.rescore(self.path)
+        backup = self.tmp / "r.jsonl.bak"
+        self.assertEqual(backup.read_text(encoding="utf-8"), self.original)
+        once = self.path.read_text(encoding="utf-8")
+        self.rescore(self.path)
+        self.assertEqual(backup.read_text(encoding="utf-8"), self.original)
+        self.assertEqual((self.tmp / "r.jsonl.bak.1").read_text(encoding="utf-8"), once)
+        self.assertEqual(self.path.read_text(encoding="utf-8"), once)  # rescoring is idempotent
+
+    def test_compare_reads_the_rescored_file(self) -> None:
+        self.rescore(self.path)
+        out = io.StringIO()
+        self.assertEqual(run.main(["compare", str(self.path)], out), 0)
+        self.assertIn("arm t", out.getvalue())
+
+    def test_a_file_without_a_kept_ledger_is_not_touched_and_several_files_are_handled(self) -> None:
+        only = self.tmp / "none.jsonl"
+        only.write_text(self.lines[1] + "\n", encoding="utf-8")
+        _, out, _ = self.rescore(only, self.path)
+        self.assertEqual(only.read_text(encoding="utf-8"), self.lines[1] + "\n")
+        self.assertFalse((self.tmp / "none.jsonl.bak").exists())
+        self.assertTrue((self.tmp / "r.jsonl.bak").exists())
+        self.assertIn("nothing to rescore", out)
+
+    def test_a_bad_line_is_an_error_and_nothing_is_written(self) -> None:
+        bad = self.tmp / "bad.jsonl"
+        bad.write_text(self.lines[0] + "\nnot json\n", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = run.main(["rescore", str(bad)], io.StringIO())
+        self.assertEqual(code, run.EXIT_USAGE)
+        self.assertIn("bad.jsonl:2", err.getvalue())
+        self.assertEqual(bad.read_text(encoding="utf-8"), self.lines[0] + "\nnot json\n")
+        self.assertFalse((self.tmp / "bad.jsonl.bak").exists())
+
+    def test_an_unknown_case_is_left_as_it_is(self) -> None:
+        other = _record("t", "nosuchcase", 1, 1, logs={"ledger": str(self.ledger)})
+        path = self.tmp / "o.jsonl"
+        path.write_text(json.dumps(other) + "\n", encoding="utf-8")
+        _, _, err = self.rescore(path)
+        self.assertIn("warning:", err)
+        self.assertEqual(path.read_text(encoding="utf-8"), json.dumps(other) + "\n")
 
 
 class AgentToCompareTests(AgentTestCase):

@@ -87,8 +87,12 @@ python3 -m evals.run score quotes ~/evals/quotes-1     # recall, unmatched findi
 ```
 
 `score` reads the findings from the Craftsman ledger or, for a baseline run, from a JSON list of
-`{"file", "line", "title"}`. A finding matches a defect when it is in the same file and within 3 lines of the seeded
-location (fewer when another seeded item is close, so that neighbouring defects cannot be credited by one finding); findings the review dismissed are ignored. Compare the recall of `/craft-review` and of a plain review on
+`{"file", "line", "title"}`. Each finding is assigned to the nearest seeded item (defect or decoy) of the same file, measured as 0 inside its
+lines and otherwise the distance to the nearer end; it counts only if that distance is at most 5 lines, and a tie goes
+to the defect. A defect is found by at least one finding assigned to it, so one finding never credits two items, and
+a finding on a decoy's own lines is a decoy hit. Findings the review dismissed are ignored. After the truth or this
+rule changes, `python3 -m evals.run rescore results.jsonl` scores the kept ledgers of saved runs again (the original
+is kept as `results.jsonl.bak`). Compare the recall of `/craft-review` and of a plain review on
 the same model, with at least three repetitions per arm: the suite is small, so single runs are anecdotes. How to run
 each arm, the exact baseline prompt, the scoring rules and how to add a case are in the
 [evals README](../evals/README.md).

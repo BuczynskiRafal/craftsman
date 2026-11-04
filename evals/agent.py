@@ -444,6 +444,13 @@ def recall_details(case: run.Case, workdir: Path) -> dict[str, Any] | None:
         findings, dismissed, unreadable = run.collect_findings(workdir)
     except run.EvalError:
         return None
+    return recall_of(case, findings, dismissed, unreadable)
+
+
+def recall_of(
+    case: run.Case, findings: Sequence[run.Finding], dismissed: int = 0, unreadable: int = 0
+) -> dict[str, Any]:
+    """The ``recall`` field of a result record for these findings."""
     score = run.score_findings(case, findings, dismissed, unreadable)
     return {
         "found": score["found"],

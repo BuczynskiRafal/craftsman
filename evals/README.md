@@ -141,6 +141,12 @@ wall times are only comparable at the same `--jobs`; use `--jobs 1` when time is
 budget. Both arms may share one results file (the `arm` label tells them apart) and `agent` can be run
 again later to add repeats. A baseline arm for the same comparison: `--baseline --arm baseline`.
 
+Scoring changes (a new matching rule, a corrected truth location) do not need new runs: `agent` keeps each
+run's ledger, and `python3 -m evals.run rescore bench/evals/ab.jsonl` scores those ledgers again with the
+current truth and rewrites the `recall` of every record in place. The original file is kept as `ab.jsonl.bak`
+(`.bak.1`, ... when that exists). Records without a kept ledger (baseline runs, runs without findings) stay
+as they are, with a warning.
+
 `compare` prints, per arm and case: runs, recall (mean defects found / seeded), the fewest and most found
 in one run, decoys flagged, unmatched findings (possible false positives), mean cost in USD with the
 spread over the repeats, minutes, turns and subagents spawned; then a TOTAL row (one pass over all cases;
@@ -264,16 +270,17 @@ them, a real problem outside the seeded list lands there too), the **decoy hits*
 
 Matching rules:
 
-- A finding matches a defect when its file is the same as one of the defect's locations and its
-  line lies within `[start - s, end + s]` of that location, where `s` is 3 lines but never so many
-  that the windows of two defects or decoys of one file touch: `s` is at most `(g - 1) / 2` for a
-  gap of `g` lines to the next item, so a defect directly after another one has `s = 0`. Two
-  findings on one defect therefore cannot credit its neighbour. Paths are compared relative to the
-  repository root (`./`, backslashes, absolute paths inside the work directory and Windows drive
-  letters are normalized).
+- A finding is assigned to the nearest defect or decoy of its file. The distance is 0 inside
+  `[start, end]` of a location and otherwise the number of lines to the nearer end; an item with
+  several locations uses the nearest one. The finding counts for that item only when the distance is
+  at most 5 lines, so a finding a few lines off still counts, and a finding with no item within 5
+  lines is unmatched. A tie goes to the defect; a finding inside two overlapping ranges goes to the
+  narrower one, so a decoy nested in a defect's span is still hit by a finding on its own lines.
+  Paths are compared relative to the repository root (`./`, backslashes, absolute paths inside the
+  work directory and Windows drive letters are normalized).
 - A finding on a decoy's own lines is a decoy hit, even when a defect is next to it.
-- Each finding counts for at most one defect or decoy and each defect counts once: when several
-  findings point at a defect, the closest one finds it and the rest are duplicates.
+- Each finding is assigned to at most one defect or decoy and each defect counts once: when
+  several findings are assigned to a defect, the closest one finds it and the rest are duplicates.
 - **Precision** is the share of the scored findings that point at a seeded defect (found or
   duplicate). It is a floor: an unmatched finding may be a real problem outside the seeded list.
 - Findings with the verdict `dismissed` are ignored. Only `findings[].file` (or `.path`), `.line`,
