@@ -5,35 +5,27 @@ loops or ledger bookkeeping. When it finishes, the final diff is frozen and atta
 hunters; every finding is judged with evidence; the tests run on the final code. The gate checks
 outcomes on that final diff, not the effort that led there.
 
-```
-/craftsman <task>          prompt hook (or `craftsman gate --init`) records the base commit
-        │
-        ▼
-   build freely            no gate activity; tests and tools as needed; end with /simplify
-        │
-        ▼
-craftsman review prepare   freezes the diff into round N: packet-N.md and a risk map
-        │
-        ▼
-   intent brief            3-8 claims about what the change must do, each with the line that makes it true
-        │
-        ▼
-   hunt plan + wave 1      craftsman-reviewer hunters in parallel, fresh context, record candidates
-        │
-        ▼
-   verify                  craftsman-verifier subagents try to disprove and reproduce:
-        │                  proven / probable / question / dismissed
-        ▼
-   saturate                confirmed defects in wave k? run wave k+1 (max 3 per round)
-        │
-        ▼
-   fix + resolve  ──►  next round covers only the changed hunks
-        │
-        ▼
-craftsman run --kind test|e2e -- …   runs recorded with exit codes
-        │
-        ▼
-craftsman review check  →  stop hook lets the agent finish  →  craftsman review report
+This page is the one place that explains the protocol in full. The prompts it describes are the
+source of truth: [`skills/craft-review/SKILL.md`](../skills/craft-review/SKILL.md) (the review) and
+[`skills/craftsman/SKILL.md`](../skills/craftsman/SKILL.md) (the build around it). The README and the
+[usage guide](usage.md) only summarize it.
+
+```mermaid
+flowchart TD
+    task["/craftsman task<br/>records the base commit"] --> build["Build freely<br/>no gate activity, end with /simplify"]
+    build --> prepare["review prepare<br/>freezes the diff into round N<br/>packet and risk map"]
+    prepare --> brief["Intent brief<br/>3-8 claims, each tied to a line"]
+    brief --> hunt["Hunt: craftsman-reviewer hunters<br/>fresh context, in parallel"]
+    hunt --> verify["Verify: craftsman-verifier<br/>proven, probable, question, dismissed"]
+    verify --> more{"New proven or<br/>probable finding?"}
+    more -- "yes: wave k+1, 3 generations at most" --> hunt
+    more -- no --> fix["Fix at the root cause<br/>confirm each fix"]
+    fix --> recheck["review prepare: fix-delta round<br/>one fresh hunter checks for regressions"]
+    recheck --> loop{"Anything new<br/>confirmed?"}
+    loop -- yes --> fix
+    loop -- no --> run["craftsman run --kind test<br/>and e2e when deep"]
+    run --> check["review check passes:<br/>the stop hook lets the agent finish"]
+    check --> report["review report"]
 ```
 
 ---
@@ -48,14 +40,17 @@ craftsman review check  →  stop hook lets the agent finish  →  craftsman rev
    path and the **risk map**: files, hunks, changed lines, risk signals with the lenses they suggest,
    quality hints, and warnings such as a very large diff.
 4. **Intent brief.** The orchestrator lists what the change must do, each claim tied to a line. A
-   claim without a line is already a finding.
+   claim without a line is already a finding. It writes the brief from `git diff <base>` and the risk
+   map, not from the full packet.
 5. **Hunt plan and wave 1.** The orchestrator decides the hunters and launches them together, each
-   as a fresh-context `craftsman-reviewer` subagent. Guidance, which the CLI does not enforce:
+   as a fresh-context `craftsman-reviewer` subagent. Every review launches at least one, even for a
+   one-line change, wherever the platform has subagents. Guidance, which the CLI does not enforce:
    - every code change gets `intent`, `contracts`, `failure`, `ripple`, `tests`, plus every lens
      the risk map suggests or the orchestrator's own reading calls for. Risk signals are pattern
      matches for a few languages: a floor, not a verdict. Deep assigns every lens;
    - `craft` and `design` go to a separate simplicity hunter so they never take attention from bug
-     hunting;
+     hunting. On Claude Code it runs on a cheaper model (`haiku`); bug hunters, verifiers and the
+     orchestrator never do;
    - 1-3 lenses per hunter, and large changes split by files (roughly 400 changed lines per hunter);
    - with two or more hunters, one also runs `sweep` over the whole diff;
    - a tiny change may get one hunter with all core lenses.
@@ -63,14 +58,22 @@ craftsman review check  →  stop hook lets the agent finish  →  craftsman rev
    of related findings. They merge duplicates, try to disprove each finding, reproduce it where the
    code is runnable, and record a verdict.
 7. **Saturate.** If wave k produced a finding judged `proven` or `probable`, wave k+1 runs: one
-   variant hunter per confirmed root cause (the same mistake elsewhere in the diff and the code it
-   touches) plus one fresh hunter with a different partition or unused lenses, told nothing about
-   earlier findings. The hunt stops at the first wave that adds nothing confirmed, or after 3 waves
-   per round. Deep always runs at least 2.
-8. **Fix.** Every `proven` or `probable` finding is fixed at the root cause with a regression test
-   where the project has tests, then `review resolve`. `review prepare` opens a new round holding
-   only the changed hunks plus hunks that reference a changed symbol; one fresh hunter re-checks
-   them, with a verifier if it records findings. The round cap bounds this loop.
+   variant hunter per confirmed root cause plus one fresh hunter with a different partition or unused
+   lenses, told nothing about earlier findings. The hunt stops at the first wave that adds nothing
+   confirmed. Waves count as generations: a variant of a variant of a variant spawns nothing. That is
+   at most 3 per round, and deep runs at least 2.
+8. **Fix, confirm, re-check.** Three separate jobs.
+   - *Fix.* Every `proven` or `probable` finding is fixed at the root cause, with a regression test
+     where the project has tests.
+   - *Is it fixed?* A `proven` finding is confirmed by its regression test: it fails before the fix
+     and passes after, through `craftsman run`. A `probable` one (no repro) goes back to the verifier
+     that judged it, resumed with only the fix diff, where the platform can resume an agent;
+     otherwise a fresh verifier gets the finding and the diff. Then `review resolve --as fixed`, with
+     a note that cites the run or the confirmation.
+   - *Did the fix break anything?* `review prepare` opens a fix-delta round: the changed hunks plus
+     the hunks that reference a changed symbol. One fresh, unanchored hunter checks it (never the
+     finder or its verifier, who are anchored), with a verifier if it records findings. The round cap
+     bounds this loop.
 9. **Test.** `craftsman run --kind test -- <cmd>` on the final code; deep also `--kind e2e`.
 10. **Close.** `craftsman review check`, then `craftsman gate --complete`, then `craftsman review
     report`.
@@ -79,30 +82,77 @@ A subagent that fails (rate limit, timeout) is retried once with a smaller slice
 failing, the agent runs `gate --await-user` and tells you what is not covered; in review-only mode
 the report is `--partial`.
 
+Accepting a finding instead of fixing it is a protocol rule, not something the CLI checks beyond
+refusing blockers: a `major` is accepted only after the user agreed.
+
 ### `/craft-review`
 
 The same hunt (steps 3-7) against a base, with a frozen scope, and no fixes unless asked. It ends
 with `review check --review-only` and `review report --review-only`. Fixing adds steps 8-9.
-Every review uses at least one fresh-context hunter where the platform has subagents.
+`ultracraft` inside `/craft-review` makes it a deep review. It never opens a gate: only `/craftsman`
+does.
 
 ### Adaptive depth
 
-There is one depth, `deep`, and the orchestrator decides when to use it: security-relevant code,
-concurrency or clocks, persistent data or migrations, public API or file formats, removed
-guarantees, a large or cross-cutting diff, or a user who asks for care. It escalates with `review
-prepare --deep`; `prepare` may print a hint such as `Depth: deep suggested (signals: auth H3,
-concurrency H7)`. Deep suggests every lens, requires at least two waves by convention, and makes the
-gate require an e2e run. Inside a gate session, `--deep` raises the gate for good. Depth never goes
-down.
+There is one depth, `deep`, and the orchestrator decides when to use it. The canonical list of what
+calls for it (security-relevant code, concurrency, persistent data, public APIs, removed guarantees,
+large diffs, a user who asks for care) is under **Depth** in the
+[`craft-review` skill](../skills/craft-review/SKILL.md). Deep suggests every lens, expects at least
+two waves, and makes the gate require both a test run and an e2e run. `review prepare --deep`
+escalates; `prepare` may print a hint such as `Depth: deep suggested (signals: auth H3, concurrency
+H7)`. Inside a gate session, `--deep` raises the gate for good. Depth never goes down.
+
+---
+
+## What Hunters Read
+
+A review costs agents times turns times context, so the inputs are kept small.
+
+- **Packet.** Each hunk appears once, inside its enclosing scope at HEAD, with `+` and `-` marks on
+  the changed lines and `[H3]` markers around each hunk. A `review view` (what a hunter reads) is
+  slimmer than the packet the orchestrator uses: it drops the lens table and the recording cheat
+  sheet and keeps each hunk's risk signals.
+- **Scout.** `craftsman review scout <H#|path:line|symbol>` answers with code, deterministically and
+  without a model: the base version of the enclosing scope, callers, and tests, capped at 12,000
+  characters. Hunters ask the scout before opening whole files.
+- **Briefs.** Every hunter and verifier prompt starts with the same shared block (intent brief, base
+  ref, rules), then its slice, then its lenses. Identical prefixes are served from the prompt cache.
+  A variant hunter gets a mini-slice: the root cause, its location, and `review view --hunks` of the
+  affected hunks.
+- **Pipelining.** Where agents run in the background (Claude Code, Antigravity async subagents), a
+  hunter's verifier starts when that hunter finishes, a variant hunter starts when a finding is judged
+  `proven` or `probable`, and the fresh hunter starts with wave 1. Where parallel subagents are a
+  barrier (Copilot), the waves stay as they are. On Claude Code, the optional `craftsman:hunt`
+  workflow (`workflows/hunt.js`) runs steps 5-7 from the orchestrator's hunt plan.
+- **Remaining work.** `craftsman review show --hunks` lists the hunks still to cover.
+  `review show` also prints each finding's scenario and verdict evidence, so a verifier needs no
+  `--json` call.
+- **Inbox fallback.** If a heredoc needs approval, the agent writes the JSON to the path that
+  `craftsman review inbox <add|cover>` prints and passes `--from-json <path>`.
+- **Usage.** Where the platform hands over the subagent transcript, `review report` and
+  `craftsman status` total tokens and agent time per role (hunters, verifiers).
 
 ---
 
 ## Evidence Ledger
 
-![Ledger: diff fingerprint, hunk context, and delta carry-over](diagrams/evidence-ledger-flow.png)
-
 Everything goes into `.git/craftsman/ledger.json`, stored separately for each worktree and outside
 commits (schema 3).
+
+```mermaid
+flowchart LR
+    prepare["review prepare<br/>diff, hunks, digests"] --> round["Round N<br/>fingerprint and scope"]
+    round --> carry{"Hunk digest covered<br/>in an earlier round?"}
+    carry -- "no, or it references a changed symbol" --> open["Open hunk<br/>needs a hunter"]
+    carry -- yes --> carried["Carried hunk<br/>no new hunter"]
+    open --> cover["review cover<br/>digests and note"]
+    cover --> gate
+    carried --> gate
+    findings["Findings, verdicts,<br/>resolutions"] --> gate
+    runs["craftsman run<br/>exit code and fingerprint"] --> gate
+    agents["Agent events<br/>from platform hooks"] --> gate
+    gate{"Gate issue list<br/>empty?"}
+```
 
 | Record | Written by | Gate requirement |
 | :--- | :--- | :--- |
@@ -111,13 +161,21 @@ commits (schema 3).
 | **Finding**: location, lens, severity, scenario | `review add` (or `--from-json`); `review move` fixes a line; `review merge` merges duplicates with a shared root cause | Every finding has a verdict |
 | **Verdict**: `proven` (reproduction `--run R#`), `probable` (`static: <file:line chain>` or `no-repro: <why>; <chain>`), `question` (`intent: <source>; <file:line>`, non-blocking findings only), `dismissed` (run or `file:line`) | `review verdict` (or `--from-json`) | `proven` and `probable` findings are resolved. In review-only mode they go into the report as warnings |
 | **Resolution**: `fixed` (only after a code change) or `accepted` (never for blockers) | `review resolve` | All blocking findings are resolved |
-| **Run**: argv, working directory, exit code, output tail, diff fingerprint | `craftsman run` | A passing test run (and e2e when deep) on the final code that did not modify files. The last run of every command succeeds unless retired with `review waive-run` and a visible reason |
-| **Agent event**: reviewer subagent start and stop | platform hooks | An independent reviewer finished after the round was prepared |
+| **Run**: argv, working directory, exit code, output tail, diff fingerprint | `craftsman run` | A passing test run (and an e2e run when deep) on the final code that did not modify files. The last run of every command succeeds unless retired with `review waive-run` and a visible reason |
+| **Agent event**: reviewer subagent start and stop, with token usage when known | platform hooks | An independent reviewer finished after the round was prepared |
 
-Every record is tied to a diff fingerprint, so a code change invalidates old evidence. A hunk stays
-covered across rounds by its digest, which ignores line numbers and CRLF, so the next round re-reviews
-only changed hunks and hunks that reference a changed symbol. Generated files (`__pycache__`, build
-caches, `node_modules`, ...) are skipped; custom patterns go in `.craftsmanignore`.
+Every record is tied to a diff fingerprint, so a code change invalidates old evidence. Details that
+matter when reading the ledger:
+
+- **Hunk ids are stable and never reused.** A carried hunk keeps its id, so ids can be sparse (`H1`,
+  `H4`, `H9`). Do not assume `H1..Hn`; `review show --hunks` lists what is left.
+- **A hunk stays covered across rounds by its digest**, which ignores line numbers and CRLF, so the
+  next round re-reviews only changed hunks and hunks that reference a changed symbol. `cover` skips
+  carried hunks.
+- **`cover --files` is forgiving.** It accepts `./x`, backslashes, absolute paths inside the
+  repository, and the old path of a renamed file.
+- Generated files (`__pycache__`, build caches, `node_modules`, ...) are skipped; custom patterns go
+  in `.craftsmanignore`.
 
 ---
 
@@ -132,49 +190,58 @@ The gate reports an issue list. It passes when the list is empty:
 | `no-verdict` | A finding has no verdict |
 | `unresolved` | A `proven` or `probable` finding is neither fixed nor accepted |
 | `no-passing-run` | No passing test run on the final code |
-| `no-e2e-run` | Deep only: no passing e2e run |
+| `no-e2e-run` | Deep only: no passing e2e run. A deep gate needs both a test run and an e2e run |
 | `failing-run` | The latest run of a command failed and was not waived |
-| `no-isolation` | The platform gives isolation evidence, but no `craftsman-reviewer` finished after the latest round was prepared |
+| `no-isolation` | The platform gives isolation evidence, but no `craftsman-reviewer` finished after this round was prepared |
 | `round-cap` | More than 5 distinct diffs were reviewed: the agent stops and the user decides |
 
-The gate **does not** assess business-requirement fit, naming quality, or architecture outside the
-files touched by the diff. Every report lists these under `Not assessed by the gate`. It also does not
-judge how hard the hunters looked: it checks that fresh hunters covered every hunk of the frozen diff
-and that every finding has checkable evidence. A very large diff produces a warning in `prepare` and
-in the report; it no longer hands off to the user. Without platform or transcript isolation evidence,
-the report carries a `SELF-REVIEWED` banner.
+- **Isolation is checked per round.** Every round with non-carried hunks needs its own finished
+  `craftsman-reviewer`, in gate sessions and in review-only mode. A reviewer must record coverage or
+  a finding before it stops; the hook sends one that did not back to work, once.
+- **No isolation evidence, no claim.** When the platform gives none, the gate still closes, and the
+  report carries the `SELF-REVIEWED` banner, whether the review was deep or not.
+- **What it does not assess.** Business-requirement fit, naming quality, and architecture outside the
+  files touched by the diff. Every report lists these under `Not assessed by the gate`. The gate also
+  does not judge how hard the hunters looked: it checks that fresh hunters covered every hunk of the
+  frozen diff and that every finding has checkable evidence. A very large diff produces a warning in
+  `prepare` and in the report; it does not hand off to the user.
+
+### Upgrading from Craftsman 4.x
+
+Nothing to run. The first command that reads a pre-5.0 gate state or a schema 2 ledger archives it
+(`craftsman_state.json.v4.bak`, `ledger.v2.bak.json`) and starts fresh, so neither `gate --init
+--takeover` nor `review reset` is needed. Re-run `craftsman install` to refresh the skills and agents.
 
 ---
 
 ## Review Lenses
 
-![Two-phase review: lenses, verification, and verdict lifecycle](diagrams/review-protocol-and-verdicts.png)
-
 A lens is a focused review angle with specific probes. `review prepare` suggests lenses from the
-risk signals in the diff; the orchestrator assigns them to hunters.
+risk signals in the diff; the orchestrator assigns them to hunters. The catalog is
+[`craftsman/lenses.py`](../craftsman/lenses.py), the probes are in
+[`skills/craft-review/lenses.md`](../skills/craft-review/lenses.md), and a hunter prints only its own
+with `craftsman skill show craft-review --lenses <ids>`.
 
 | Lens | What it looks for | Suggested |
 | :--- | :--- | :--- |
-| `intent` | Missing pieces, incomplete change propagation, unrequested changes, fixes in the wrong layer | Every change |
-| `contracts` | Input domains, boundary conditions, truthiness, wrong variable, inconsistent return values | Every code change |
-| `failure` | Swallowed errors, partial side effects, retries, fail-open guards | Every code change |
-| `ripple` | Broken callers, removed guarantees, overridden methods, persisted data compatibility | Every code change |
-| `tests` | Tests that would pass even if the change were wrong | Every code change |
-| `craft` | Code reuse, needless complexity, misleading names and comments, wasted work | Always (simplicity hunter) |
-| `design` | Overall design and size of the change, what can be deleted | Always (simplicity hunter) |
-| `state` | Aliasing, caches, check-then-act races, `async` bugs, clocks | Concurrency, time, and filesystem signals |
-| `trust` | Untrusted data in shells, SQL, paths, deserializers; authorization | Process, SQL, deserialization, auth, network, regex, and filesystem signals |
-| `platform` | Paths, encodings, shells, versions across operating systems | Platform, time, filesystem, and process signals |
-| `model` | Invalid states allowed by the data model | New types |
-| `sweep` | Interactions between hunks | One hunter, when two or more hunt |
+| `intent` | Whether the change does all it claims, everywhere it should, and nothing else | Every code change (core) |
+| `contracts` | Whether each changed function handles the full range of inputs it can receive | Every code change (core) |
+| `failure` | Whether failures are loud, precise, and clean | Every code change (core); also on `errors`, `process`, `filesystem`, `network`, `sql` signals |
+| `ripple` | Callers, configs, and users of what changed or disappeared | Every code change (core); also on `deletion`, `config` signals |
+| `tests` | Whether the tests would fail if the changed behavior broke | Every code change (core) |
+| `state` | Shared state, resource release, repeated runs, concurrency | `concurrency`, `filesystem`, `time` signals |
+| `trust` | Untrusted input reaching a dangerous sink, bypassed permission checks | `process`, `sql`, `deserialization`, `auth`, `network`, `regex`, `filesystem` signals |
+| `platform` | Operating systems, shells, encodings, locales, time zones | `platform`, `time`, `process`, `filesystem` signals |
+| `model` | Illegal states the data model allows, invariants | `datamodel` signal |
+| `craft` | Reuse, needless complexity, misleading names and comments | Every code change (simplicity hunter) |
+| `design` | Overall design and size of the change, what can be deleted | Every code change (simplicity hunter) |
+| `sweep` | Hunks that are each correct but disagree with each other, the docs, or the config | Every code change (whole-diff lens; one hunter runs it when two or more hunt) |
 
 Docs-only changes get `intent` and `craft`. A deep round suggests every lens.
 
 ---
 
 ## Platform Enforcement
-
-![Lifecycle hooks, gate state machine, and runtime guards](diagrams/lifecycle-hooks-and-guards.png)
 
 The protocol, lenses, subagents, and ledger are shared across platforms. What differs is the
 mechanism that blocks completion.
@@ -184,11 +251,12 @@ mechanism that blocks completion.
 | GitHub Copilot in VS Code | `Stop` hook blocks until `review check` passes | `SubagentStart`/`SubagentStop` hooks | `craftsman-reviewer`, `craftsman-verifier` agents |
 | GitHub Copilot CLI | `agentStop` hook | `subagentStart`/`subagentStop` hooks | The same agents |
 | Claude Code | `Stop` hook | `SubagentStart`/`SubagentStop` hooks | The same agents in `~/.claude/agents` |
-| Google Antigravity | `Stop` hook | Finished `craftsman-reviewer` subagents in the transcript | `invoke_subagent` (`TypeName: self`, `Role: craftsman-reviewer`) |
+| Google Antigravity | `Stop` hook | Finished `craftsman-reviewer` subagents are recorded from the transcript when the turn ends | `invoke_subagent` (`TypeName: self`, `Role: craftsman-reviewer`) |
 | Codex, Cursor, and others | `craftsman gate --complete` refuses completion until the ledger passes validation | None | None |
 
 The gate runs only in a `/craftsman` session; outside it, the hooks do nothing. After six forced
 continuations in a row without fewer open issues (`MAX_CONTINUATIONS`), the stop hook lets the agent
 through and tells the user the gate was not satisfied. When a hook fails, the agent continues with a
 warning that the gate was not checked; a failing `pre-tool` check asks the user to confirm the tool
-call instead (Copilot denies it).
+call instead (Copilot denies it). Install, hook, and guard internals:
+[harness-architecture.md](harness-architecture.md) and [guards.md](guards.md).

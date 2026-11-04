@@ -54,10 +54,47 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Larger review packet.** One 120k budget and one format for every round. Enclosing scope bodies are
   always included (subject to the trimming ladder), callers are capped at 6 per symbol instead of 3,
   and risk signals show per hunk with the lenses they suggest.
-- **Docs** rewritten around plain-language usage; `docs/harness-architecture.md` roughly halved.
+- **Cheaper reviews.** The packet shows each hunk once, inside its enclosing scope at HEAD, with `+` and
+  `-` marks and `[H3]` markers, and hunter views drop the lens table and the recording cheat sheet.
+  Hunters and verifiers get briefs that start with an identical shared block (served from the prompt
+  cache), then the slice, then the lenses. Where agents run in the background (Claude Code, Antigravity
+  async subagents) a verifier starts when its hunter finishes, a variant hunter when a finding is judged
+  `proven` or `probable`, and the fresh hunter with wave 1; variant hunters get a mini-slice. The
+  simplicity hunter (`craft`, `design`) runs on a cheaper model on Claude Code. The orchestrator writes
+  the intent brief from `git diff <base>` and the risk map, not from the full packet. The SubagentStart
+  briefing carries the round, the packet path and the open work, without the packet.
+- **Fix confirmation is separate from the regression check.** A `proven` finding is confirmed by a
+  regression test that fails before the fix and passes after; a `probable` one by the resumed verifier
+  that judged it (or a fresh verifier given the fix diff). The regression check is a fresh, unanchored
+  hunter on the fix-delta round plus the test run.
+- **Gate behavior.** Hunk ids are stable and never reused, so a round's ids can be sparse. `review cover`
+  skips carried hunks, and `--files` accepts `./x`, backslashes, absolute paths, and the old path of a
+  renamed file. A reviewer must record coverage or a finding before it stops. Deep needs both a test run
+  and an e2e run. With no isolation evidence the gate closes with the `SELF-REVIEWED` banner, deep or
+  not. Isolation is checked per round, and on Antigravity reviewers are recorded when the turn ends.
+  `ultracraft` inside `/craft-review` means a deep review and never opens a gate. Every review
+  launches at least one hunter wherever the platform has subagents.
+- **Docs** rewritten around plain-language usage; `docs/harness-architecture.md` roughly halved. The
+  Excalidraw diagrams (which still showed tiers and per-lens coverage) are replaced by Mermaid diagrams
+  in `docs/how-it-works.md`, `docs/guards.md`, and `docs/harness-architecture.md`, and the README
+  shows a short text flow. `docs/how-it-works.md` is the one full explanation of the protocol, its
+  lens table follows `craftsman/lenses.py`, and the depth triggers live only in the `craft-review`
+  skill.
 
 ### Added
 
+- **Scout:** `craftsman review scout <H#|path:line|symbol>` prints the base version of the enclosing
+  scope, callers, and tests, deterministically and capped at 12,000 characters, so hunters need not open
+  whole files.
+- **`craftsman review show --hunks`** lists the hunks still to cover, and `review show` prints each
+  finding's scenario and verdict evidence.
+- **Agent usage.** Where the platform hands over a subagent transcript, tokens and agent time are
+  recorded per subagent, and `craftsman review report` and `craftsman status` total them per role
+  (hunters, verifiers).
+- **Optional `craftsman:hunt` workflow** (`workflows/hunt.js`) for Claude Code: runs the orchestrator's
+  hunt plan with pipelined verification and variant hunters.
+- **Inbox fallback.** When a heredoc needs approval, subagents write their JSON to the path that
+  `craftsman review inbox` prints and pass `--from-json <path>`.
 - **Public seeded-defect suite** in [`evals/`](evals/README.md): six small Python projects with 15 seeded
   defects and decoys, run with `python3 -m evals.run` and described in
   [`docs/benchmark.md`](docs/benchmark.md).
@@ -78,10 +115,10 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Migration
 
-- **Old ledgers and gate state fail.** A schema 2 ledger raises the existing error: run
-  `craftsman review reset` to archive it. A gate state file from before this release is invalid: run
-  `craftsman gate --init --takeover`. Nothing is converted. Re-run `craftsman install` to refresh the
-  skills, agents, and `AGENTS.md` block.
+- **Old ledgers and gate state migrate on their own.** The first command that reads a pre-5.0 gate state
+  or a schema 2 ledger archives it (`craftsman_state.json.v4.bak`, `ledger.v2.bak.json`) and starts
+  fresh, so neither `gate --init --takeover` nor `review reset` is needed. Nothing is converted. Re-run
+  `craftsman install` to refresh the skills, agents, and `AGENTS.md` block.
 - `gate --init --tier deep` and `review prepare --tier deep` become `--deep`. `--tier quick` and
   `--tier standard` become nothing: omit the flag and the agent chooses.
 - `review cover --lens a,b --hunks H1,H2 --note "..."` becomes

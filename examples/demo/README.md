@@ -20,9 +20,10 @@ Pagination invites subtle boundary defects:
 
 1. **Build freely.** `/craftsman` records the base commit; the agent implements the feature and runs
    its own tests without review loops.
-2. **Hunt.** The agent freezes the final diff and sends fresh-context hunters over it, one per lens
-   group (`contracts`, `intent`, `failure`, `tests`, ...). They did not write the code and record every
-   candidate defect with a concrete trigger, such as `page=0` or 25 items at page size 20.
+2. **Hunt.** The agent freezes the final diff and sends fresh-context hunters over it, each with a
+   few lenses (`contracts`, `intent`, `failure`, `tests`, ...). They did not write the code and
+   record every candidate defect with a concrete trigger, such as `page=0` or 25 items at page size
+   20.
 3. **Verify.** Separate verifier subagents try to disprove each candidate and reproduce the survivors
    with `craftsman run --kind repro`, proving the boundary defects against the real code.
 4. **Saturate.** Because the hunt found confirmed defects, the agent runs another wave: variant
@@ -33,8 +34,9 @@ Pagination invites subtle boundary defects:
    ```
    [CRAFTSMAN GATE 1/6] review incomplete: 2 hunks not covered; 1 finding without a verdict. Task completion is blocked until the evidence ledger proves the change is reviewed and verified.
    ```
-6. **Fix and test.** The agent fixes the boundary bugs at the root cause, adds regression tests, runs
-   `craftsman run --kind test`, and the gate passes. The report says what was found, fixed, and
+6. **Fix and test.** The agent fixes the boundary bugs at the root cause and adds regression tests
+   that fail before the fix and pass after. A fresh hunter checks the fix delta for regressions, the
+   agent runs `craftsman run --kind test`, and the gate passes. The report says what was found, fixed, and
    dismissed, and why the agent chose its depth.
 
 ## Quickstart

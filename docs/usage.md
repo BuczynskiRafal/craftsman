@@ -23,7 +23,8 @@ ultracraft rewrite the token refresh logic
   runs the tests, and closes the gate.
 - `/craft-review <words>` reviews an existing change. It fixes only when you say so ("and fix what
   you find").
-- `ultracraft` in a request starts `/craftsman` at full depth.
+- `ultracraft` in a request starts `/craftsman` at full depth. Inside `/craft-review` it means a deep
+  review; it never opens a gate.
 
 To mention a trigger word without starting a session, put it in backticks or quotes.
 
@@ -37,7 +38,7 @@ You never have to choose these. The agent reads the request and the repository.
 | :--- | :--- |
 | **Target** | Nothing named: the working tree against the gate's base commit, else `HEAD`. A branch or commit: that ref. A PR number or URL: it checks the PR out and reviews against its merge base. "Staged changes", "tracked files", or a path freezes that scope for the review. |
 | **Fixing** | `/craftsman` always fixes. `/craft-review` fixes when the words ask for it; otherwise it only reports. |
-| **Depth** | One adaptive depth. The agent goes deep (every lens, at least two waves, an end-to-end run when fixing) for security-relevant code, concurrency or clocks, persistent data or migrations, public APIs or file formats, removed guarantees, or a large or cross-cutting diff. It also goes deep when you ask for care: "critical", "production", "be thorough", `ultracraft`. Depth never goes down within a session. |
+| **Depth** | One adaptive depth, `deep`: every lens, at least two waves, an end-to-end run in addition to the tests. The agent goes deep for risky changes or when you ask for care ("critical", "be thorough", `ultracraft`); the list of triggers is under **Depth** in the [`craft-review` skill](../skills/craft-review/SKILL.md). Depth never goes down within a session. |
 | **Hunt plan** | How many hunters, which lenses each gets, how the diff is split between them, and whether another wave is worth running. |
 | **When to ask you** | Only for an ambiguity that changes what gets built, to accept a `major` finding instead of fixing it, and when the round cap is reached. |
 
@@ -52,6 +53,7 @@ The final report is plain Markdown for a human reader:
   and why another one ran or stopped, how findings were verified (reproduced, or read statically);
 - findings fixed, accepted (with reasons), and dismissed (count), by severity;
 - the verification commands and their results;
+- the agent usage per role (hunters, verifiers), where the platform provides it;
 - what the gate did not assess, and a `SELF-REVIEWED` banner when the platform could not confirm that
   separate subagents did the review.
 
@@ -69,7 +71,9 @@ slices stayed uncovered after retries and lists them under `Not covered`.
   the agent extends the scope with `--add-paths`.
 - **Archives.** Packets, views, and ledger snapshots live in `.git/craftsman/`. Superseded packets
   are pruned on every `review prepare`; archives keep the newest `CRAFTSMAN_KEEP_ARCHIVES` entries
-  (default `5`). `craftsman review reset` archives the current ledger before an independent review.
+  (default `5`). `craftsman review reset` archives the current ledger before an independent review. A
+  pre-5.0 gate state or schema 2 ledger is archived automatically, so there is nothing to reset when
+  upgrading.
 - **Initial commit.** In a repository with no commits, the empty tree is the base, so the first
   bootstrap can be reviewed too.
 
@@ -78,9 +82,10 @@ slices stayed uncovered after retries and lists them under `Not covered`.
 ## Inspecting a Session
 
 ```bash
-craftsman status                       # deep flag, round, coverage, findings and verdicts, latest runs
-craftsman review show --hunks          # H# -> file:lines map
-craftsman review report                # the final report
+craftsman status                       # deep flag, round, coverage, findings and verdicts, latest runs, agent usage
+craftsman review show --hunks          # the hunks still to cover (H# -> file:lines)
+craftsman review scout H3              # base version, callers and tests of a hunk (or path:line, or a symbol)
+craftsman review report                # the final report, with agent usage per role
 craftsman skill show craft-review --lenses trust,state   # lens playbooks
 ```
 

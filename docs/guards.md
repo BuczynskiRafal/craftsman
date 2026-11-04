@@ -7,7 +7,18 @@ the **Stop Gate**, the **Work-tree Mutation Guard**, and the **Repository Search
 
 ## Stop Gate
 
-![Lifecycle hooks, gate state machine, and runtime guards](diagrams/lifecycle-hooks-and-guards.png)
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Active: craftsman or ultracraft in the prompt, gate init
+    Active --> Waiting: gate await-user
+    Waiting --> Active: gate resume, or the user replies
+    Active --> Active: stop hook finds issues, sends the agent back (up to 6 times)
+    Active --> Completed: review check passes, gate complete
+    Active --> Released: 6 forced continuations without fewer issues, warns the user
+    Completed --> [*]
+    Released --> [*]
+```
 
 The Stop Gate prevents AI coding assistants from prematurely concluding tasks when code changes remain unreviewed,
 unverified, or failing tests:
