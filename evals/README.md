@@ -39,6 +39,9 @@ reported as a decoy hit. There is no cap on the number of defects in the suite.
 scores its findings with the scorer below and appends one JSON line per run to a results file. It
 measures what a protocol change has to be judged on: **recall, cost and wall time**.
 
+The benchmark runs on Linux and macOS only: the harness launches the session through a POSIX shell
+wrapper, and several cases seed defects that only show on POSIX paths.
+
 ```bash
 # one run of every case with the checkout you are in (about 8 runs, see "What it costs")
 python3 -m evals.run agent --cases all --arm current --out bench/evals/current.jsonl

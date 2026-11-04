@@ -21,6 +21,9 @@ from evals import agent as run_agent
 from evals import compare as run_compare
 from evals import run
 
+if sys.platform == "win32":
+    raise unittest.SkipTest("the seeded benchmark runs on Linux and macOS only (POSIX shell wrapper, POSIX-path cases)")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 README = REPO_ROOT / "evals" / "README.md"
 
