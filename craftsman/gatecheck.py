@@ -8,12 +8,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
 from craftsman.diffscan import DiffSnapshot
 from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
     REVIEWER_AGENT,
+    AgentEvent,
     IsolationEvidence,
     Ledger,
     LedgerError,
@@ -140,14 +142,10 @@ def evaluate(
         *(_coverage_issues(ledger, latest) if latest else ()),
         *_verdict_issues(ledger),
         *fix_and_test,
-        *(_isolation_issues(ledger, latest, policy) if latest else ()),
+        *_isolation_issues(ledger, policy),
         *_round_cap_issues(ledger),
     )
-    self_reviewed = bool(
-        latest is not None
-        and not policy.require_isolation
-        and not _has_isolated_reviewer_stop(ledger, latest)
-    )
+    self_reviewed = bool(not policy.require_isolation and unreviewed_rounds(ledger))
     return GateReport(
         issues,
         _warnings(ledger, review_only=review_only),
@@ -269,6 +267,14 @@ def _passing_run_issues(ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy) 
                 "run `craftsman run --kind test -- <your test command>`.",
             )
         )
+    elif policy.deep and not any(run.kind == "test" for run in passing):
+        issues.append(
+            GateIssue(
+                "no-passing-run",
+                "A deep gate needs a passing test run as well as the e2e run at the current "
+                "code; run `craftsman run --kind test -- <your test command>`.",
+            )
+        )
     if policy.deep and not any(run.kind == "e2e" for run in passing):
         issues.append(
             GateIssue(
@@ -307,30 +313,91 @@ def _failing_run_issues(ledger: Ledger) -> list[GateIssue]:
     ]
 
 
-def _has_isolated_reviewer_stop(ledger: Ledger, latest: Round) -> bool:
-    if all(hunk.carried for hunk in latest.hunks):
-        return True
-    prepared_at = parse_timestamp(latest.prepared_at)
-    return any(
-        event.event == "stop"
-        and agent_role(event.agent) == "reviewer"
-        and parse_timestamp(event.at) >= prepared_at
+def _round_window_end(ledger: Ledger, round_: Round) -> datetime | None:
+    """When `round_` stopped being the latest round; None while it still is."""
+    following = ledger.rounds[round_.number : round_.number + 1]
+    return parse_timestamp(following[0].prepared_at) if following else None
+
+
+def _reviewer_run_started(ledger: Ledger, stop: AgentEvent) -> datetime | None:
+    """When the reviewer run that ended with `stop` started, if a start event says so."""
+    stop_at = parse_timestamp(stop.at)
+    starts = [
+        parse_timestamp(event.at)
         for event in ledger.agents
+        if event.event == "start"
+        and parse_timestamp(event.at) <= stop_at
+        and (event.agent_id == stop.agent_id if stop.agent_id else event.agent == stop.agent)
+    ]
+    return max(starts, default=None)
+
+
+def _reviewer_recorded(ledger: Ledger, since: datetime, until: datetime) -> bool:
+    """Whether coverage or a finding was recorded in `since`..`until`: a reviewer that only
+    started and stopped examined nothing."""
+    recorded = [record.recorded_at for record in ledger.coverage]
+    recorded += [finding.recorded_at for finding in ledger.findings]
+    return any(since <= parse_timestamp(at) <= until for at in recorded)
+
+
+def _round_has_reviewer(ledger: Ledger, round_: Round) -> bool:
+    """Whether a `craftsman-reviewer` finished, having recorded something, while `round_` was current."""
+    start, end = parse_timestamp(round_.prepared_at), _round_window_end(ledger, round_)
+    for event in ledger.agents:
+        if event.event != "stop" or agent_role(event.agent) != "reviewer":
+            continue
+        stopped = parse_timestamp(event.at)
+        if stopped < start or (end is not None and stopped >= end):
+            continue
+        since = max(start, _reviewer_run_started(ledger, event) or start)
+        if _reviewer_recorded(ledger, since, stopped):
+            return True
+    return False
+
+
+def unreviewed_rounds(ledger: Ledger) -> tuple[Round, ...]:
+    """The rounds with hunks to review that no isolated reviewer examined while they were current.
+
+    A round whose hunks are all carried over needs no new reviewer, but the rounds that first
+    reviewed those hunks stay checked.
+    """
+    return tuple(
+        round_
+        for round_ in ledger.rounds
+        if not all(hunk.carried for hunk in round_.hunks) and not _round_has_reviewer(ledger, round_)
     )
 
 
-def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list[GateIssue]:
+def _isolation_issues(ledger: Ledger, policy: GatePolicy) -> list[GateIssue]:
     if not policy.require_isolation:
         return []
-    if _has_isolated_reviewer_stop(ledger, latest):
-        return []
-    return [
-        GateIssue(
-            "no-isolation",
-            f"No independent review finished since round {latest.number} was prepared; spawn the "
-            f"{REVIEWER_AGENT} subagent for round {latest.number}.",
+    latest_number = len(ledger.rounds)
+    missing = unreviewed_rounds(ledger)
+    issues: list[GateIssue] = []
+    if any(round_.number == latest_number for round_ in missing):
+        hint = (
+            " Antigravity records finished reviewers from the transcript when your turn ends."
+            if policy.isolation_evidence == "transcript"
+            else ""
         )
-    ]
+        issues.append(
+            GateIssue(
+                "no-isolation",
+                f"No independent review finished since round {latest_number} was prepared; spawn "
+                f"the {REVIEWER_AGENT} subagent for round {latest_number}.{hint}",
+            )
+        )
+    earlier = [str(round_.number) for round_ in missing if round_.number != latest_number]
+    if earlier:
+        issues.append(
+            GateIssue(
+                "no-isolation",
+                f"Round {', '.join(earlier)} had hunks to review but no {REVIEWER_AGENT} finished "
+                "while it was current, and a later round cannot make up for it. Run `craftsman "
+                f"review reset`, prepare again and have the {REVIEWER_AGENT} examine the whole diff.",
+            )
+        )
+    return issues
 
 
 def _round_cap_issues(ledger: Ledger) -> list[GateIssue]:

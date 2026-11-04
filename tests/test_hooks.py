@@ -94,6 +94,17 @@ class HookTestCase(unittest.TestCase):
     def init(self, deep: bool = False) -> None:
         self.repo.cli("gate", "--init", *(["--deep"] if deep else []), "--cwd", ".")
 
+    def run_reviewer(self, agent_type: str = "craftsman-reviewer", agent_id: str = "a1") -> None:
+        """A reviewer that starts, records coverage of the first hunk and stops, as hunters do."""
+        reviewer = {"agent_id": agent_id, "agent_type": agent_type}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        self.repo.cli("review", "cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+        call_hook(
+            "subagent-stop",
+            "claude",
+            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
+        )
+
     def ledger(self) -> dict[str, Any]:
         loaded = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))
         assert isinstance(loaded, dict)
@@ -334,13 +345,7 @@ class StopTests(HookTestCase):
 
     def assert_reviewer_proves_isolation(self, agent_type: str) -> None:
         self.prepare_unisolated_review()
-        reviewer = {"agent_id": "a1", "agent_type": agent_type}
-        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
-        call_hook(
-            "subagent-stop",
-            "claude",
-            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
-        )
+        self.run_reviewer(agent_type)
         self.assertEqual(call_hook("stop", "claude", claude("Stop", self.root))[0], {})
         self.assertEqual(self.state()["stage"], "completed")
 
@@ -388,6 +393,42 @@ class StopTests(HookTestCase):
     def test_trigger_after_the_round_cap_restarts_the_gate(self) -> None:
         self.retry_after_the_round_cap()
         self.assertEqual((self.state()["stage"], self.state()["task"]), ("implement", "retry"))
+
+    def test_restart_after_a_needs_human_stop_keeps_a_deep_gate_deep(self) -> None:
+        self.init(deep=True)
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+        self.update_state(stage="needs_human")
+
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman retry"))
+
+        self.assertEqual((self.state()["stage"], self.state()["deep"]), ("implement", True))
+
+    def test_review_prompt_never_opens_a_gate_even_with_ultracraft(self) -> None:
+        self.repo.write("cart.py", CHANGE)
+        for prompt in ("/craft-review ultracraft", "/code-review ultracraft the cart"):
+            with self.subTest(prompt=prompt):
+                out, _ = call_hook(
+                    "prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt)
+                )
+                self.assertEqual(out, {})
+                self.assertFalse(self.state_file.exists())
+
+    def test_review_only_needs_a_reviewer_once_the_prompt_hook_saw_the_session(self) -> None:
+        call_hook(
+            "prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craft-review the cart")
+        )
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+        session = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "claude-session"}
+
+        inline = self.repo.cli("review", "check", "--review-only", check=False, env_extra=session)
+        elsewhere = self.repo.cli("review", "check", "--review-only", check=False)
+
+        self.assertEqual(inline.returncode, 1, inline.stdout)
+        self.assertIn("[no-isolation]", inline.stdout)
+        self.assertEqual(elsewhere.returncode, 0, elsewhere.stdout)  # another session: advisory only
 
     def test_restarted_gate_archives_the_previous_review(self) -> None:
         self.retry_after_the_round_cap()
@@ -580,13 +621,7 @@ class SubagentTests(HookTestCase):
         self.assertEqual(blocked.returncode, 1, blocked.stdout)
         self.assertIn("[no-isolation]", blocked.stdout)
 
-        reviewer = {"agent_id": "r1", "agent_type": "craftsman-reviewer"}
-        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
-        call_hook(
-            "subagent-stop",
-            "claude",
-            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
-        )
+        self.run_reviewer(agent_id="r1")
         passed = self.repo.cli("review", "check", "--review-only", check=False)
         self.assertEqual(passed.returncode, 0, passed.stdout)
 
@@ -893,13 +928,7 @@ class SessionOwnershipTests(HookTestCase):
         self.init(deep=True)
         self.repo.write("cart.py", CHANGE)
         self.repo.record_full_evidence(deep=True)
-        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
-        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
-        call_hook(
-            "subagent-stop",
-            "claude",
-            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
-        )
+        self.run_reviewer()
 
         completed = self.repo.cli("gate", "--complete", "--cwd", ".", "--session-id", "claude-session")
         self.assertEqual(completed.returncode, 0, completed.stderr)

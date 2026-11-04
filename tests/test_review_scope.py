@@ -414,7 +414,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.assertIn("Round 2 prepared", same_scope)
         self.assertEqual(self.ledger().rounds[1].scope, ("a.py",))
 
-    def test_cli_rejects_older_schema_ledger_with_reset_hint(self) -> None:
+    def test_cli_archives_an_older_schema_ledger_and_goes_on(self) -> None:
         self.repo.ledger_dir.mkdir(parents=True, exist_ok=True)
         (self.repo.ledger_dir / "ledger.json").write_text(
             json.dumps({**Ledger().to_json(), "schema": 2}),
@@ -423,11 +423,29 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
 
         proc = self.review("show", check=False)
 
-        self.assert_error(
-            proc,
-            1,
-            "schema 2 is from an older craftsman; run `craftsman review reset` to archive it",
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr.count("Archived the review ledger of an older craftsman"), 1)
+        self.assertTrue((self.repo.ledger_dir / "ledger.v2.bak.json").is_file())
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+
+    def test_reset_and_prepare_work_over_the_state_and_ledger_of_craftsman_4(self) -> None:
+        self.repo.write("app.py", "x = 2\n")
+        self.repo.ledger_dir.mkdir(parents=True, exist_ok=True)
+        (self.repo.ledger_dir / "ledger.json").write_text(
+            json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8"
         )
+        (self.repo.ledger_dir / "craftsman_state.json").write_text(
+            json.dumps({"owner": {"platform": "claude", "session_id": "s1"}, "tier": "standard",
+                        "base_sha": "abc", "task": "t", "started_at": "2026-01-01T00:00:00.000Z",
+                        "active": False, "stage": "completed"}),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.review("reset", check=False).returncode, 0)
+        prepared = self.review("prepare", check=False)
+
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertTrue((self.repo.ledger_dir / "craftsman_state.json.v4.bak").is_file())
 
     def test_scope_flags_are_rejected_during_active_gate(self) -> None:
         self.repo.cli("gate", "--init", "--cwd", ".")

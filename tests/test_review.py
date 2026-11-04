@@ -10,12 +10,14 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from craftsman.cli import main as cli_main
-from craftsman.review import view_slug
+from craftsman.gate import GateOwner
+from craftsman.review import normalize_round_files, view_slug
 from craftsman.scope import ScopePolicy, evaluate_scope
 
 from tests.support import (
@@ -25,6 +27,10 @@ from tests.support import (
     EvidenceRepo,
     assert_cli_error,
     coverage_note,
+    make_hunk,
+    make_snap,
+    open_gate,
+    prepared,
     run_main,
 )
 
@@ -217,7 +223,7 @@ class PrepareTests(RepoTestCase):
         out = self.review("prepare", "--deep").stdout
 
         shown = self.repo.show()
-        self.assertIn("Round 1 prepared (deep)", out)
+        self.assertIn("Round 1 raised to deep (same diff)", out)
         self.assertEqual((shown["round"]["number"], shown["round"]["deep"]), (1, True))
         self.assertEqual(shown["coverage"]["missing"], [])
         self.assertIn("deep round", self.packet())
@@ -262,7 +268,7 @@ class PrepareTests(RepoTestCase):
         out = self.review("prepare").stdout
 
         self.assertIn("0 hunks carried, 2 to review.", out)
-        self.assertIn("reopened: mentions item_count (changed in H1)\n", self.packet(2))
+        self.assertIn("reopened: mentions item_count (changed in H3)\n", self.packet(2))
 
     def test_prepare_help_mentions_the_ignore_file(self) -> None:
         help_text = self.review("prepare", "--help").stdout
@@ -384,6 +390,110 @@ class CoverTests(RepoTestCase):
         self.assert_error(self.cover("H7", check=False), 1, "unknown hunk 'H7'")
         unknown = self.review("cover", "--files", "nope.py", "--note", "x" * 25, check=False)
         self.assert_error(unknown, 1, "unknown files in round 1: nope.py")
+
+
+class SecondRoundTests(RepoTestCase):
+    """Round 2 of a review: `notes.py` keeps its covered hunk, `cart.py` is a new one."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.repo.write("notes.py", "LABEL = 'cart'\n")
+        self.repo.record_full_evidence()
+        self.repo.write("cart.py", BUGGY_TOTAL.replace("/ len(items)", ""))
+        self.review("prepare")
+
+    def missing(self) -> list[str]:
+        missing = self.repo.show()["coverage"]["missing"]
+        assert isinstance(missing, list)
+        return missing
+
+    def test_hunk_ids_are_never_reused_for_another_hunk(self) -> None:
+        self.assertEqual(self.missing(), ["H3"])
+        stale_id = self.cover("H1", check=False)  # H1 was the cart.py hunk of round 1
+
+        self.assert_error(stale_id, 1, "unknown hunk 'H1'")
+        self.assertEqual(self.missing(), ["H3"])
+
+    def test_an_unchanged_hunk_keeps_its_id(self) -> None:
+        shown = self.review("show", "--hunks").stdout
+
+        self.assertEqual(self.missing(), ["H3"])
+        self.assertNotIn("notes.py", shown)  # carried: H2 is not listed as open
+        self.assertIn("carried (covered in round 1, unchanged)", self.packet(2).split("### H2")[1])
+
+    def test_a_range_over_carried_hunks_covers_the_open_ones(self) -> None:
+        covered = self.review("cover", "--hunks", "H1-H3", "--note", "walked the whole range once")
+
+        self.assertIn("Coverage recorded: H3 in round 2 (1 carried hunk(s) skipped)", covered.stdout)
+        self.assertEqual(self.missing(), [])
+
+    def test_a_file_of_carried_hunks_is_a_no_op(self) -> None:
+        covered = self.review("cover", "--files", "notes.py", "--note", "nothing new in this file")
+
+        self.assertIn("Nothing to record: H2 already covered in an earlier round", covered.stdout)
+        self.assertEqual(self.missing(), ["H3"])
+
+    def test_a_batch_may_name_carried_hunks_and_files(self) -> None:
+        batch = json.dumps(
+            [
+                {"files": ["notes.py"], "note": "nothing new in the carried file"},
+                {"hunks": ["H2", "H3"], "note": "read the open hunk and its neighbour"},
+            ]
+        )
+
+        self.review("cover", "--from-json", "-", stdin=batch)
+
+        self.assertEqual(self.missing(), [])
+
+    def test_files_are_found_by_any_spelling(self) -> None:
+        for spelling in ("./cart.py", str(self.repo.root / "cart.py"), "cart.py"):
+            with self.subTest(spelling=spelling):
+                path = Path(self.review("view", "--files", spelling).stdout.strip())
+                self.assertEqual(path.name, f"packet-2.{view_slug(spelling, None)}.md")
+        covered = self.review("cover", "--files", "./cart.py", "--note", "read the open hunk twice")
+        self.assertIn("Coverage recorded: cart.py in round 2", covered.stdout)
+        self.assertEqual(self.missing(), [])
+
+
+class NormalizeFilesTests(unittest.TestCase):
+    def test_backslashes_and_the_old_path_of_a_rename_name_the_new_file(self) -> None:
+        old = make_hunk("H1", "pkg/new.py")
+        renamed = replace(old, old_path="pkg/old.py", status="renamed")
+        snap = make_snap(renamed, make_hunk("H2", "pkg/other.py"))
+        _, round_ = prepared(snap)
+        root = Path(tempfile.gettempdir()).resolve()
+
+        names = normalize_round_files(
+            root, root, "pkg\\other.py,pkg/old.py, ./pkg/new.py ,missing.py", round_, snap
+        )
+
+        self.assertEqual(names, ["pkg/other.py", "pkg/new.py", "pkg/new.py", "missing.py"])
+
+
+class GateDepthTests(RepoTestCase):
+    def test_a_foreign_session_cannot_raise_the_gate_with_prepare(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        open_gate(
+            self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "owner-session")
+        )
+        other = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "someone-else"}
+
+        out = self.repo.cli("review", "prepare", "--deep", env_extra=other).stdout
+
+        self.assertIn("--deep ignored", out)
+        self.assertFalse(self.repo.state()["deep"])
+        self.assertFalse(self.repo.show()["round"]["deep"])
+
+    def test_the_owner_raises_the_gate_with_prepare(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "owner-session"))
+        owner = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "owner-session"}
+
+        out = self.repo.cli("review", "prepare", "--deep", env_extra=owner).stdout
+
+        self.assertIn("Gate raised to deep", out)
+        self.assertTrue(self.repo.state()["deep"])
 
 
 class AddTests(RepoTestCase):

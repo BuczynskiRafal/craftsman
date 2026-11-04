@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from craftsman.diffscan import DiffSnapshot, snapshot
@@ -286,6 +287,35 @@ class RunTests(unittest.TestCase):
         self.assertEqual(codes(evaluate(ledger, two_hunks(), POLICY)), ["failing-run"])
 
 
+T0 = "2026-01-01T00:00:00.000Z"
+
+
+def retimed(ledger: Ledger, *, rounds: tuple[int, ...], coverage: tuple[int, ...]) -> Ledger:
+    """`ledger` with its rounds prepared and its coverage recorded `seconds` after T0."""
+    return replace(
+        ledger,
+        rounds=tuple(
+            replace(round_, prepared_at=shifted(T0, seconds))
+            for round_, seconds in zip(ledger.rounds, rounds, strict=True)
+        ),
+        coverage=tuple(
+            replace(record, recorded_at=shifted(T0, seconds))
+            for record, seconds in zip(ledger.coverage, coverage, strict=True)
+        ),
+    )
+
+
+def reviewer_stop(seconds: int) -> AgentEvent:
+    return stop_event("craftsman-reviewer", shifted(T0, seconds))
+
+
+def changed_snap(fingerprint: str) -> DiffSnapshot:
+    """`two_hunks` with the second hunk rewritten: the first one is carried over."""
+    return make_snap(
+        make_hunk("H1", "a.py"), make_hunk("H2", "b.py", ("+y = 2",)), fingerprint=fingerprint
+    )
+
+
 class IsolationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.ledger = fully_reviewed(two_hunks())
@@ -323,8 +353,10 @@ class IsolationTests(unittest.TestCase):
         self.assertTrue(report.passed)
         self.assertTrue(report.self_reviewed)
 
-    def test_a_round_of_carried_hunks_needs_no_reviewer(self) -> None:
+    def test_a_round_of_carried_hunks_needs_no_new_reviewer(self) -> None:
         ledger, _ = prepared(two_hunks("fp2"), ledger=self.ledger)
+        ledger = retimed(ledger, rounds=(0, 100), coverage=(10,))
+        ledger = add_agent_event(ledger, reviewer_stop(60))
 
         report = evaluate(record_run(ledger, fingerprint="fp2"), two_hunks("fp2"), ISOLATED)
 
@@ -342,6 +374,108 @@ class IsolationTests(unittest.TestCase):
         report = evaluate(self.ledger, two_hunks(), POLICY)
 
         self.assertIn("SELF-REVIEWED", render_report(report))
+
+
+class RoundIsolationTests(unittest.TestCase):
+    """Every round with hunks to review needs a reviewer that finished while it was current."""
+
+    def two_rounds(self, *, round1_covered_at: int = 10, round2_covered_at: int = 110) -> Ledger:
+        ledger, _ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
+        ledger, _ = prepared(changed_snap("fp2"), ledger=ledger)
+        ledger = cover_open_hunks(ledger)
+        ledger = retimed(
+            ledger, rounds=(0, 100), coverage=(round1_covered_at, round2_covered_at)
+        )
+        return record_run(ledger, fingerprint="fp2")
+
+    def check(self, ledger: Ledger, policy: GatePolicy = ISOLATED) -> GateReport:
+        return evaluate(ledger, changed_snap("fp2"), policy)
+
+    def test_a_later_reviewer_does_not_make_up_for_a_round_nobody_reviewed(self) -> None:
+        ledger = add_agent_event(self.two_rounds(), reviewer_stop(120))
+
+        report = self.check(ledger)
+
+        self.assertEqual(codes(report), ["no-isolation"])
+        self.assertIn("Round 1 had hunks to review", report.issues[0].message)
+
+    def test_the_new_hunks_of_a_later_round_need_their_own_reviewer(self) -> None:
+        ledger = add_agent_event(self.two_rounds(), reviewer_stop(20))
+
+        report = self.check(ledger)
+
+        self.assertEqual(codes(report), ["no-isolation"])
+        self.assertIn("since round 2 was prepared", report.issues[0].message)
+
+    def test_a_reviewer_in_every_round_passes(self) -> None:
+        ledger = add_agent_event(add_agent_event(self.two_rounds(), reviewer_stop(20)), reviewer_stop(120))
+
+        report = self.check(ledger)
+
+        self.assertTrue(report.passed, render_report(report))
+        self.assertFalse(report.self_reviewed)
+
+    def test_a_round_that_only_carries_hunks_keeps_the_earlier_rounds_checked(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
+        ledger, _ = prepared(two_hunks("fp2"), ledger=ledger)
+        ledger = record_run(retimed(ledger, rounds=(0, 100), coverage=(10,)), fingerprint="fp2")
+
+        self.assertEqual(codes(evaluate(ledger, two_hunks("fp2"), ISOLATED)), ["no-isolation"])
+        self.assertTrue(evaluate(ledger, two_hunks("fp2"), POLICY).self_reviewed)
+        reviewed = add_agent_event(ledger, reviewer_stop(20))
+        self.assertTrue(evaluate(reviewed, two_hunks("fp2"), ISOLATED).passed)
+
+    def test_a_reviewer_that_recorded_nothing_is_no_isolation(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = retimed(cover_open_hunks(ledger), rounds=(0,), coverage=(50,))
+        ledger = record_run(add_agent_event(ledger, reviewer_stop(40)))
+
+        self.assertEqual(codes(evaluate(ledger, two_hunks(), ISOLATED)), ["no-isolation"])
+        later = add_agent_event(ledger, reviewer_stop(60))
+        self.assertTrue(evaluate(later, two_hunks(), ISOLATED).passed)
+
+    def test_coverage_before_the_reviewer_started_is_not_its_work(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = retimed(cover_open_hunks(ledger), rounds=(0,), coverage=(10,))
+        started = AgentEvent("copilot", "start", "craftsman-reviewer", "x", shifted(T0, 30))
+        ledger = record_run(add_agent_event(add_agent_event(ledger, started), reviewer_stop(40)))
+
+        self.assertEqual(codes(evaluate(ledger, two_hunks(), ISOLATED)), ["no-isolation"])
+
+    def test_self_reviewed_stays_marked_through_a_round_of_carried_hunks(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
+        ledger, _ = prepared(two_hunks("fp2"), ledger=ledger)
+        ledger = record_run(ledger, fingerprint="fp2")
+
+        self.assertTrue(evaluate(ledger, two_hunks("fp2"), POLICY).self_reviewed)
+
+    def test_a_deep_review_without_evidence_passes_as_self_reviewed_once_it_has_e2e(self) -> None:
+        ledger = fully_reviewed(two_hunks(), deep=True)
+        ledger = record_run(ledger, ("python3", "smoke.py"), kind="e2e")
+
+        report = evaluate(ledger, two_hunks(), DEEP)
+
+        self.assertTrue(report.passed, render_report(report))
+        self.assertTrue(report.self_reviewed)
+
+    def test_a_deep_gate_needs_a_test_run_as_well_as_an_e2e_run(self) -> None:
+        ledger, _ = prepared(two_hunks(), deep=True)
+        ledger = record_run(cover_open_hunks(ledger), ("python3", "smoke.py"), kind="e2e")
+
+        self.assertEqual(codes(evaluate(ledger, two_hunks(), DEEP)), ["no-passing-run"])
+        self.assertTrue(evaluate(ledger, two_hunks(), POLICY).passed)
+        ledger = record_run(ledger, kind="test")
+        self.assertTrue(evaluate(ledger, two_hunks(), DEEP).passed)
+
+    def test_the_antigravity_hint_names_when_reviewers_are_recorded(self) -> None:
+        ledger = fully_reviewed(two_hunks())
+
+        report = evaluate(ledger, two_hunks(), GatePolicy(isolation_evidence="transcript"))
+
+        self.assertIn("transcript when your turn ends", report.issues[0].message)
 
 
 class ReviewOnlyTests(unittest.TestCase):

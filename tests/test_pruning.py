@@ -361,12 +361,12 @@ class ArchivePruningTests(unittest.TestCase):
                 review.main(["prepare", "--cwd", str(repo.root)]), 0
             )
             self.assertEqual(
-                review.main(["view", "--cwd", str(repo.root), "--hunks", "H1"]), 0
+                review.main(["view", "--cwd", str(repo.root), "--hunks", "H2"]), 0
             )
         self.assertFalse((craftsman_dir / "packet-1.H1.md").exists())
         self.assertTrue((craftsman_dir / "packet-1.md").is_file())
         self.assertTrue((craftsman_dir / "packet-2.md").is_file())
-        self.assertTrue((craftsman_dir / "packet-2.H1.md").is_file())
+        self.assertTrue((craftsman_dir / "packet-2.H2.md").is_file())
         self.assertIn("Pruned: packet-1.H1.md", err_r2.getvalue())
 
         # Round 3 prunes packet-1.md and round 2 views while keeping packet-2.md and packet-3.md.
@@ -377,11 +377,11 @@ class ArchivePruningTests(unittest.TestCase):
                 review.main(["prepare", "--cwd", str(repo.root)]), 0
             )
         self.assertFalse((craftsman_dir / "packet-1.md").exists())
-        self.assertFalse((craftsman_dir / "packet-2.H1.md").exists())
+        self.assertFalse((craftsman_dir / "packet-2.H2.md").exists())
         self.assertTrue((craftsman_dir / "packet-2.md").is_file())
         self.assertTrue((craftsman_dir / "packet-3.md").is_file())
         self.assertIn("Pruned: packet-1.md", err_r3.getvalue())
-        self.assertIn("Pruned: packet-2.H1.md", err_r3.getvalue())
+        self.assertIn("Pruned: packet-2.H2.md", err_r3.getvalue())
 
 
 class _ReparseStat:

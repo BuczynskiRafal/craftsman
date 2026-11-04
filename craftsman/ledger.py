@@ -26,6 +26,7 @@ from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
 from craftsman.files import write_text_atomic
 from craftsman.records import (
     LEDGER_FILENAME,
+    SCHEMA_VERSION,
     SEVERITIES,
     AgentEvent,
     Coverage,
@@ -50,6 +51,8 @@ from craftsman.text import one_line
 from craftsman.triviality import is_trivial_run
 
 LOCK_POLL_S = 0.05
+# The ledger schema of Craftsman 4.x, which 5.x sets aside instead of reading.
+OLDER_LEDGER_VERSION = 2
 GROUPED_EVIDENCE_PREFIX = "Grouped into "
 _WORD_RE = re.compile(r"\w+")
 
@@ -151,7 +154,30 @@ def load(path: Path) -> Ledger:
         raise LedgerError(
             f"{path} is not valid JSON ({exc}); restore it or archive it with `craftsman review reset`"
         ) from exc
+    if _is_older_schema(raw):
+        _set_aside_older_ledger(path)
+        return Ledger()
     return Ledger.from_json(raw)
+
+
+def _is_older_schema(raw: object) -> bool:
+    schema = raw.get("schema") if isinstance(raw, dict) else None
+    return isinstance(schema, int) and not isinstance(schema, bool) and schema < SCHEMA_VERSION
+
+
+def _set_aside_older_ledger(path: Path) -> None:
+    """Rename a ledger of an older craftsman, which this one cannot read, and go on without it."""
+    backup = path.with_name(f"{path.stem}.v{OLDER_LEDGER_VERSION}.bak{path.suffix}")
+    try:
+        os.replace(path, backup)
+    except FileNotFoundError:
+        return  # another process set it aside first
+    except OSError as exc:
+        raise LedgerError(f"cannot archive the ledger of an older craftsman {path}: {exc}") from exc
+    sys.stderr.write(
+        f"[craftsman] Archived the review ledger of an older craftsman to {backup.name}; "
+        "starting a new review.\n"
+    )
 
 
 def save(path: Path, ledger: Ledger) -> None:
@@ -195,6 +221,31 @@ def _find(ledger: Ledger, finding_id: str) -> Finding:
 def _with_finding(ledger: Ledger, updated: Finding) -> tuple[Ledger, Finding]:
     findings = tuple(updated if item.id == updated.id else item for item in ledger.findings)
     return replace(ledger, findings=findings), updated
+
+
+def stable_hunk_ids(ledger: Ledger, snap: DiffSnapshot) -> DiffSnapshot:
+    """`snap` with hunk ids that keep their meaning from round to round.
+
+    A hunk whose digest an earlier round already numbered keeps that id; a new digest gets the
+    next number after every id the ledger ever used. An id named from an old packet therefore
+    either still means the same hunk or is unknown, never another hunk.
+    """
+    known: dict[str, str] = {}
+    top = 0
+    for round_ in ledger.rounds:
+        for ref in round_.hunks:
+            known[ref.digest] = ref.id
+            top = max(top, int(ref.id[1:]))
+    used: set[str] = set()
+    hunks: list[Hunk] = []
+    for hunk in snap.hunks:
+        hunk_id = known.get(hunk.digest)
+        if hunk_id is None or hunk_id in used:
+            top += 1
+            hunk_id = f"H{top}"
+        used.add(hunk_id)
+        hunks.append(replace(hunk, id=hunk_id))
+    return replace(snap, hunks=tuple(hunks))
 
 
 def _build_hunk_refs(
@@ -411,6 +462,42 @@ def _hunk_targets(round_: Round, hunk_ids: Sequence[str]) -> tuple[str, ...]:
             field="hunks",
         )
     return tuple(hunk_ids)
+
+
+def plan_coverage(
+    round_: Round, targets: Sequence[str], *, target_kind: TargetKind = "hunks"
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The open hunk ids to cover for `targets` (hunk ids, or files), and the carried ones skipped.
+
+    Hunks carried over from an earlier round are already covered, so naming them, alone or inside
+    a range or a file, is not an error; an unknown hunk id or file is.
+    """
+    if not targets:
+        raise LedgerError(f"name at least one of the {target_kind} to cover", field=target_kind)
+    if target_kind == "files":
+        known = {hunk.path for hunk in round_.hunks}
+        unknown = [path for path in targets if path not in known]
+        if unknown:
+            raise LedgerError(
+                f"unknown files in round {round_.number}: {', '.join(unknown)}; "
+                f"changed files: {', '.join(sorted(known))}",
+                field="files",
+            )
+        selected = [hunk for hunk in round_.hunks if hunk.path in set(targets)]
+    else:
+        by_id = {hunk.id: hunk for hunk in round_.hunks}
+        unknown = [hunk_id for hunk_id in targets if hunk_id not in by_id]
+        if unknown:
+            raise LedgerError(
+                f"unknown hunk ids in round {round_.number}: {', '.join(unknown)}; "
+                f"hunks to cover: {', '.join(round_.open_hunk_ids) or 'none'}",
+                field="hunks",
+            )
+        selected = [by_id[hunk_id] for hunk_id in dict.fromkeys(targets)]
+    return (
+        tuple(hunk.id for hunk in selected if not hunk.carried),
+        tuple(hunk.id for hunk in selected if hunk.carried),
+    )
 
 
 def add_coverage(

@@ -20,10 +20,12 @@ from craftsman.ledger import (
     locked,
     merge_findings,
     mutate,
+    plan_coverage,
     reopened_mentions,
     resolve,
     save,
     set_verdict,
+    stable_hunk_ids,
     uncovered_hunks,
     waive_run,
 )
@@ -238,6 +240,36 @@ class CoverageTests(unittest.TestCase):
             add_coverage(ledger, ["H1"], coverage_note(["H1"]))
         with self.assertRaisesRegex(LedgerError, "f1.py already covered in an earlier round"):
             add_coverage(ledger, ["f1.py"], coverage_note(["H1"]), target_kind="files")
+
+
+class StableHunkIdTests(unittest.TestCase):
+    def test_an_unchanged_hunk_keeps_its_id_and_a_new_one_never_reuses_an_old_id(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))
+        rewritten = make_snap(
+            make_hunk("H1", "b.py"), make_hunk("H2", "c.py", ("+z = 3",)), fingerprint="fp2"
+        )
+
+        stable = stable_hunk_ids(ledger, rewritten)
+
+        self.assertEqual([(h.path, h.id) for h in stable.hunks], [("b.py", "H2"), ("c.py", "H3")])
+
+    def test_a_first_round_is_numbered_in_order(self) -> None:
+        snap = make_snap(make_hunk("H7", "a.py"), make_hunk("H8", "b.py"))
+
+        self.assertEqual([h.id for h in stable_hunk_ids(Ledger(), snap).hunks], ["H1", "H2"])
+
+    def test_plan_coverage_splits_open_and_carried_hunks(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))
+        ledger = cover_open_hunks(ledger)
+        ledger, round_ = prepared(
+            make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py", ("+y",)), fingerprint="fp2"),
+            ledger=ledger,
+        )
+
+        self.assertEqual(plan_coverage(round_, ["H1", "H2"]), (("H2",), ("H1",)))
+        self.assertEqual(plan_coverage(round_, ["a.py"], target_kind="files"), ((), ("H1",)))
+        with self.assertRaisesRegex(LedgerError, "unknown hunk ids"):
+            plan_coverage(round_, ["H9"])
 
 
 class CoverageAccountingTests(unittest.TestCase):

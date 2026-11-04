@@ -150,9 +150,24 @@ class StateFileTests(unittest.TestCase):
         self.assertIsNone(load_state(self.path))
 
     def test_invalid_state_file_names_the_takeover_remedy(self) -> None:
-        self.path.write_text(json.dumps({"active": True, "tier": "standard"}), encoding="utf-8")
+        self.path.write_text(json.dumps({"active": True}), encoding="utf-8")
         with self.assertRaisesRegex(GateStateError, "--init --takeover"):
             load_state(self.path)
+
+    def test_state_of_craftsman_4_is_archived_and_read_as_absent(self) -> None:
+        self.path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+        err = io.StringIO()
+
+        with redirect_stderr(err):
+            loaded = load_state(self.path)
+
+        self.assertIsNone(loaded)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(
+            json.loads(self.path.with_name("craftsman_state.json.v4.bak").read_text("utf-8")), OLD_STATE
+        )
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("Archived the gate state of an older craftsman", err.getvalue())
 
     def test_state_file_that_is_not_json_is_invalid(self) -> None:
         self.path.write_text("{", encoding="utf-8")
@@ -218,6 +233,23 @@ class DecideStopTests(RepoTestCase):
         )
 
 
+OLD_STATE = {
+    "owner": {"platform": "claude", "session_id": "s1"},
+    "base_sha": "abc",
+    "tier": "standard",
+    "task": "t",
+    "started_at": "2026-01-01T00:00:00.000Z",
+    "active": True,
+    "stage": "implement",
+    "awaiting_user": False,
+    "isolation_evidence": "hooks",
+    "forced_continuations": 0,
+    "best_issue_count": None,
+    "takeover_from": None,
+    "request_step": None,
+}
+
+
 class ClosedStateTests(RepoTestCase):
     def complete_without_isolation(self, *flags: str) -> GateState:
         self.repo.write_lines("app.py", 5)
@@ -231,9 +263,40 @@ class ClosedStateTests(RepoTestCase):
         state = self.complete_without_isolation()
         self.assertEqual((state.active, state.stage), (False, Stage.COMPLETE_UNISOLATED))
 
-    def test_self_reviewed_deep_gate_stays_open_for_the_user(self) -> None:
-        state = self.complete_without_isolation("--deep")
-        self.assertEqual((state.active, state.stage), (True, Stage.NEEDS_HUMAN))
+    def test_self_reviewed_deep_gate_closes_with_the_banner(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.assertEqual(self.run_gate("--init", "--deep")[0], 0)
+        self.repo.record_full_evidence(deep=True)
+
+        code, out, err = self.run_gate("--complete")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("SELF-REVIEWED", out)
+        state = self.stored()
+        self.assertEqual((state.active, state.stage), (False, Stage.COMPLETE_UNISOLATED))
+
+    def test_self_reviewed_deep_gate_still_needs_its_e2e_run(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.assertEqual(self.run_gate("--init", "--deep")[0], 0)
+        self.repo.record_full_evidence()
+
+        code, _, err = self.run_gate("--complete")
+
+        self.assertEqual(code, 1)
+        self.assertIn("no-e2e-run", err)
+        self.assertTrue(self.stored().active)
+
+    def test_an_antigravity_gate_needs_the_transcript_evidence_to_close(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("antigravity", "conv-1"))
+        self.repo.record_full_evidence()
+
+        code, _, err = self.run_gate("--complete", "--session-id", "conv-1")
+
+        self.assertEqual(code, 1)
+        self.assertIn("[no-isolation]", err)
+        self.assertIn("transcript when your turn ends", err)
+        self.assertTrue(self.stored().active)
 
 
 class InitTests(RepoTestCase):
@@ -336,6 +399,32 @@ class InitTests(RepoTestCase):
         code, _, err = self.run_gate("--init", "--session-id", "s1", env=CLAUDE_ENV)
         self.assertEqual(code, 0, err)
         self.assertTrue(self.stored().deep)
+
+    def test_takeover_of_a_deep_gate_stays_deep(self) -> None:
+        open_gate(
+            self.repo.root, self.repo.base_sha, deep=True, owner=GateOwner("claude", "s1")
+        )
+
+        code, _, err = self.run_gate(
+            "--init", "--takeover", "--task", "x", env={**CLAUDE_ENV, "CLAUDE_CODE_SESSION_ID": "s2"}
+        )
+
+        self.assertEqual(code, 0, err)
+        state = self.stored()
+        self.assertEqual((state.owner.session_id, state.deep), ("s2", True))
+
+    def test_init_over_the_state_and_ledger_of_craftsman_4_needs_no_takeover(self) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+        (self.repo.ledger_dir / "ledger.json").write_text(
+            json.dumps({"schema": 2, "rounds": []}), encoding="utf-8"
+        )
+
+        code, _, err = self.run_gate("--init", "--task", "after the upgrade")
+
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.stored().active)
+        self.assertTrue((self.repo.ledger_dir / "craftsman_state.json.v4.bak").is_file())
 
     def test_reopening_with_deep_raises_the_gate(self) -> None:
         open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))

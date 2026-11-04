@@ -36,7 +36,7 @@ from craftsman.evidence import (
     prune_inbox_files,
     prune_round_files,
 )
-from craftsman.gate import GateState, GateStateError, state_path_for, update_state
+from craftsman.gate import GateState, GateStateError, cli_caller, state_path_for, update_state
 from craftsman.gatecheck import (
     SELF_REVIEWED_BANNER,
     GatePolicy,
@@ -57,9 +57,11 @@ from craftsman.ledger import (
     mutate,
     next_finding_id,
     open_round,
+    plan_coverage,
     relocate_finding,
     resolve,
     set_verdict,
+    stable_hunk_ids,
     uncovered_hunks,
     waive_run,
 )
@@ -185,14 +187,23 @@ def _prepare(args: argparse.Namespace) -> int:
     )
     if snap.is_empty:
         return _print_empty_prepare(scope, snap, full_snap)
-    deep = resolve_deep(ws, ledger, args.deep)
-    if ws.state is not None and deep and not ws.state.deep:
+    snap = stable_hunk_ids(ledger, snap)
+    owned = _owns_gate(ws)
+    if not owned and args.deep:
+        print(
+            "Note: --deep ignored: the active gate belongs to another session, "
+            "which alone can raise it."
+        )
+    deep = resolve_deep(ws, ledger, bool(args.deep) and owned)
+    if ws.state is not None and owned and deep and not ws.state.deep:
         update_state(state_path_for(ws.root), lambda current: (_raised_to_deep(current), None))
         print("Gate raised to deep: a passing end-to-end run is now required.")
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
 
     def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
+        if stable_hunk_ids(current, snap) != snap:
+            raise LedgerError("the ledger changed while the round was prepared; run prepare again")
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
         out_of_scope = tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else ()
         updated, round_ = open_round(
@@ -206,7 +217,9 @@ def _prepare(args: argparse.Namespace) -> int:
             updated = replace(updated, rounds=(*updated.rounds[:-1], round_))
         return updated, (updated, round_, updated is not current)
 
+    before = len(ledger.rounds)
     ledger, round_, created = mutate(ws.ledger_path, open_next)
+    raised = created and round_.number <= before
     packet = Path(round_.packet_path)
     open_snap = snap.only(round_.open_hunk_ids)
     open_signals = detect_signals(open_snap.hunks)
@@ -217,10 +230,10 @@ def _prepare(args: argparse.Namespace) -> int:
         )
         _write_text(packet, render_packet(ctx))
     hint = None if round_.deep else deep_hint(detect_deep_hint_signals(open_snap.hunks))
-    _print_prepare_summary(round_, packet, snap, picks, hint, created=created)
+    _print_prepare_summary(round_, packet, snap, picks, hint, created=created, raised=raised)
     _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
-    if created:
+    if created and not raised:
         prune_round_files(ws.ledger_path.parent, round_.number)
         # Scratch directories outlive rounds: a repro written in round 1 is re-run after the fix.
         prune_inbox_files(ws.ledger_path.parent)
@@ -247,6 +260,11 @@ def _scope_from_hunks(hunks: Sequence[Hunk]) -> tuple[str, ...]:
         if hunk.old_path is not None:
             paths.add(hunk.old_path)
     return tuple(sorted(paths))
+
+
+def _owns_gate(ws: Workspace) -> bool:
+    """Whether this command acts for the session that owns the active gate (true without one)."""
+    return ws.state is None or ws.state.owner.admits(cli_caller(None, os.environ))
 
 
 def _raised_to_deep(state: GateState | None) -> GateState | None:
@@ -490,11 +508,12 @@ def _print_prepare_summary(
     hint: str | None,
     *,
     created: bool,
+    raised: bool = False,
 ) -> None:
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
     changed = snap.added + snap.deleted
-    deep = " (deep)" if round_.deep else ""
-    state = "prepared" if created else "unchanged (same diff)"
+    deep = " (deep)" if round_.deep and not raised else ""
+    state = "raised to deep (same diff)" if raised else "prepared" if created else "unchanged (same diff)"
     print(
         f"Round {round_.number} {state}{deep}: {len(snap.files)} files, {len(snap.hunks)} hunks, "
         f"{changed} changed lines; {carried} hunks carried, {len(round_.open_hunk_ids)} to review."
@@ -533,10 +552,12 @@ def view_slug(files_raw: str | None, hunks_raw: str | None) -> str:
     return "-".join(part for part in slug.split("-") if part)[:MAX_VIEW_SLUG_CHARS] or "view"
 
 
-def _view_hunk_ids(round_: Round, args: argparse.Namespace) -> tuple[str, ...]:
+def _view_hunk_ids(
+    round_: Round, args: argparse.Namespace, files: Sequence[str] | None = None
+) -> tuple[str, ...]:
     if args.hunks is not None:
         return expand_hunk_spec(args.hunks, [hunk.id for hunk in round_.hunks])
-    paths = _comma_list(args.files)
+    paths = list(files) if files is not None else _comma_list(args.files)
     known = {hunk.path for hunk in round_.hunks}
     unknown = [path for path in paths if path not in known]
     if not paths or unknown:
@@ -554,7 +575,8 @@ def _view(args: argparse.Namespace) -> int:
     ledger = load(ws.ledger_path)
     snap = ws.snapshot(ledger)
     round_ = require_current_round(ledger, snap)
-    assigned = _view_hunk_ids(round_, args)
+    files = None if args.files is None else normalize_round_files(ws.root, _cwd(args), args.files, round_, snap)
+    assigned = _view_hunk_ids(round_, args, files)
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=ws.task)
@@ -749,19 +771,57 @@ def _cover_one(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
     snap = ws.snapshot()
 
+    def files_of(round_: Round) -> Callable[[str], list[str]]:
+        return lambda raw: normalize_round_files(ws.root, _cwd(args), raw, round_, snap)
+
     def record(current: Ledger) -> tuple[Ledger, str]:
         round_ = require_current_round(current, snap)
-        targets = _cover_targets(round_, target_kind, args.files if args.files is not None else args.hunks)
+        raw = args.files if args.files is not None else args.hunks
+        targets = _cover_targets(round_, target_kind, raw, files_of(round_))
         return _record_coverage(current, round_, targets, args.note, target_kind=target_kind)
 
     return _run_single(ws, bool(args.check), record, print)
 
 
-def _cover_targets(round_: Round, kind: TargetKind, raw: str) -> list[str]:
+def _cover_targets(
+    round_: Round, kind: TargetKind, raw: str, files: Callable[[str], list[str]]
+) -> list[str]:
     """The files, or the hunk ids with ranges like `H3-H7` expanded, named by one cover target list."""
     if kind == "files":
-        return _comma_list(raw)
+        return files(raw)
     return list(expand_hunk_spec(raw, [hunk.id for hunk in round_.hunks]))
+
+
+def normalize_round_files(
+    root: Path, cwd: Path, raw: str, round_: Round, snap: DiffSnapshot
+) -> list[str]:
+    """The files of `round_` that a comma-separated `--files` value names, as the round spells them.
+
+    Accepts `./x`, backslashes, absolute paths and relative paths from `--cwd` or the repository
+    root, and the old path of a renamed file. A name that matches no changed file is kept as typed
+    (normalized), so the caller's unknown-file error shows it.
+    """
+    root = root.resolve()
+    changed = {hunk.path for hunk in round_.hunks}
+    renamed = {hunk.old_path: hunk.path for hunk in snap.hunks if hunk.old_path is not None}
+    return [_round_file(root, cwd, item, changed, renamed) for item in _comma_list(raw)]
+
+
+def _round_file(root: Path, cwd: Path, raw: str, changed: set[str], renamed: Mapping[str, str]) -> str:
+    text = raw.replace("\\", "/")
+    candidates = [Path(text)] if Path(text).is_absolute() else [cwd.resolve() / text, root / text]
+    spellings: list[str] = []
+    for candidate in candidates:
+        try:
+            spellings.append(Path(os.path.normpath(candidate)).relative_to(root).as_posix())
+        except ValueError:
+            continue
+    for spelling in spellings:
+        if spelling in changed:
+            return spelling
+        if spelling in renamed:
+            return renamed[spelling]
+    return spellings[0] if spellings else text
 
 
 def _cover_entry_label(raw: Any) -> str | None:
@@ -776,7 +836,9 @@ def _cover_entry_label(raw: Any) -> str | None:
     return None
 
 
-def _cover_one_from_json(state: Ledger, round_: Round, raw: Any) -> tuple[Ledger, str]:
+def _cover_one_from_json(
+    state: Ledger, round_: Round, raw: Any, files: Callable[[str], list[str]]
+) -> tuple[Ledger, str]:
     reader = _EntryReader(raw)
     present = [key for key in ("hunks", "files") if key in raw]
     if len(present) == 2:
@@ -795,7 +857,9 @@ def _cover_one_from_json(state: Ledger, round_: Round, raw: Any) -> tuple[Ledger
     def record(sink: list[LedgerError]) -> tuple[Ledger, str] | None:
         if reader.failed(kind) or not present:
             return None
-        targets = _attempt(sink, lambda: _cover_targets(round_, kind, ",".join(listed)), None)
+        targets = _attempt(
+            sink, lambda: _cover_targets(round_, kind, ",".join(listed), files), None
+        )
         if targets is None:  # the note is still checked, so one resend fixes both
             if not reader.failed("note"):
                 check_coverage_note(one_line(note, warn=False))
@@ -820,7 +884,9 @@ def _cover_from_json(args: argparse.Namespace) -> int:
             raw_entries,
             current,
             lambda _index, raw: _cover_entry_label(raw),
-            lambda _index, state, raw: _cover_one_from_json(state, round_, raw),
+            lambda _index, state, raw: _cover_one_from_json(
+                state, round_, raw, lambda value: normalize_round_files(ws.root, _cwd(args), value, round_, snap)
+            ),
         )
 
     return _run_batch(ws, args, record_batch, print)
@@ -829,10 +895,19 @@ def _cover_from_json(args: argparse.Namespace) -> int:
 def _record_coverage(
     current: Ledger, round_: Round, targets: Sequence[str], note: str, *, target_kind: TargetKind
 ) -> tuple[Ledger, str]:
-    updated, _ = add_coverage(current, targets, note, target_kind=target_kind)
+    open_ids, carried = plan_coverage(round_, targets, target_kind=target_kind)
+    if not open_ids:
+        left = len(uncovered_hunks(current, round_))
+        return current, (
+            f"Nothing to record: {', '.join(carried)} already covered in an earlier round "
+            f"(carried over); {left} hunk(s) left to cover in this round."
+        )
+    skipped = f" ({len(carried)} carried hunk(s) skipped)" if carried else ""
+    updated, _ = add_coverage(current, open_ids, note)
     left = len(uncovered_hunks(updated, round_))
+    label = ", ".join(targets if target_kind == "files" else open_ids)
     return updated, (
-        f"Coverage recorded: {', '.join(targets)} in round {round_.number}; "
+        f"Coverage recorded: {label} in round {round_.number}{skipped}; "
         f"{left} hunk(s) left to cover in this round."
     )
 

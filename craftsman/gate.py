@@ -41,6 +41,7 @@ from craftsman.evidence import (
 )
 from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
+    SELF_REVIEWED_BANNER,
     GateReport,
     format_blocker_summary,
     render_next_actions,
@@ -60,6 +61,7 @@ GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
 GATE_PLATFORMS: tuple[GatePlatform, ...] = get_args(GatePlatform)
 
 STATE_FILENAME = "craftsman_state.json"
+OLDER_STATE_SUFFIX = ".v4.bak"
 MAX_CONTINUATIONS = 6
 MAX_CONTINUATION_REASON_CHARS = 1800
 MAX_ERROR_CHARS = 400
@@ -214,16 +216,24 @@ class GateState:
         data["stage"] = self.stage.value
         return data
 
-    def closed(self, report: GateReport, deep: bool) -> GateState:
-        """The state after the ledger passed the gate, `deep` or not.
+    def closed(self, report: GateReport) -> GateState:
+        """The state after the ledger passed the gate.
 
-        A self-reviewed deep task stays active and waits for the user: deep promises an
-        independent review that did not happen.
+        Without isolation evidence a self-reviewed task closes with the SELF-REVIEWED banner,
+        deep or not: the platform cannot prove a reviewer ran, so that is no reason to hold the
+        user up. A deep gate still needed its end-to-end run to get here.
         """
-        if report.self_reviewed and deep:
-            return replace(self, awaiting_user=False, stage=Stage.NEEDS_HUMAN)
         stage = Stage.COMPLETE_UNISOLATED if report.self_reviewed else Stage.COMPLETED
         return replace(self, active=False, awaiting_user=False, stage=stage)
+
+    @property
+    def required_isolation(self) -> IsolationEvidence:
+        """Where proof of an isolated reviewer must come from for this gate.
+
+        An Antigravity gate always has the transcript as evidence, even before the Stop hook,
+        the only reader of the transcript, has served it.
+        """
+        return "transcript" if self.owner.platform == "antigravity" else self.isolation_evidence
 
 
 def _parsed(raw: object, parse: Callable[[object], P], where: str) -> P:
@@ -242,7 +252,11 @@ def state_path_for(cwd: str | Path) -> Path:
 
 
 def load_state(path: Path) -> GateState | None:
-    """The gate state stored at `path`, or None when no gate was ever opened there."""
+    """The gate state stored at `path`, or None when no gate was ever opened there.
+
+    A state file from Craftsman 4.x (it has `tier` where 5.x has `deep`) is set aside with a
+    notice and read as absent, so an upgrade never leaves a work tree without a way forward.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -250,9 +264,35 @@ def load_state(path: Path) -> GateState | None:
     except (OSError, UnicodeDecodeError) as exc:
         raise GateStateError(f"cannot read {path}: {exc}") from exc
     try:
-        return GateState.from_json(json.loads(text))
-    except (json.JSONDecodeError, GateStateError) as exc:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
         raise GateStateError(f"{path} is not a valid gate state ({exc}); {TAKEOVER_HINT}") from exc
+    if _is_older_state(raw):
+        _set_aside_older_state(path)
+        return None
+    try:
+        return GateState.from_json(raw)
+    except GateStateError as exc:
+        raise GateStateError(f"{path} is not a valid gate state ({exc}); {TAKEOVER_HINT}") from exc
+
+
+def _is_older_state(raw: object) -> bool:
+    """Whether `raw` is the gate state of Craftsman 4.x: it knows a `tier` and no `deep`."""
+    return isinstance(raw, dict) and "tier" in raw and "deep" not in raw
+
+
+def _set_aside_older_state(path: Path) -> None:
+    backup = path.with_name(f"{path.name}{OLDER_STATE_SUFFIX}")
+    try:
+        os.replace(path, backup)
+    except FileNotFoundError:
+        return  # another process set it aside first
+    except OSError as exc:
+        raise GateStateError(f"cannot archive the Craftsman 4.x gate state {path}: {exc}") from exc
+    sys.stderr.write(
+        f"[craftsman] Archived the gate state of an older craftsman to {backup.name}; "
+        "continuing without a gate.\n"
+    )
 
 
 def save_state(path: Path, state: GateState) -> None:
@@ -316,7 +356,7 @@ def evaluate_task(state: GateState, root: Path) -> Evaluation:
     Raises `DiffScanError` or `LedgerError` when the work tree or the ledger cannot be read.
     """
     snap = snapshot(root, state.base_sha)
-    return evaluate_evidence(root, snap, state.deep, state.isolation_evidence)
+    return evaluate_evidence(root, snap, state.deep, state.required_isolation)
 
 
 class Outcome(Enum):
@@ -359,7 +399,7 @@ def decide_stop(state: GateState, root: Path) -> StopDecision:
     if outcome in HUMAN_NOTICES:
         return StopDecision(replace(state, stage=Stage.NEEDS_HUMAN), notice=HUMAN_NOTICES[outcome])
     if outcome is Outcome.PASSED:
-        return StopDecision(state.closed(evaluation.report, evaluation.deep))
+        return StopDecision(state.closed(evaluation.report))
     return _continue(state, evaluation.report, None)
 
 
@@ -551,7 +591,8 @@ def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -
         elif previous is not None and previous.active:
             if not args.takeover:
                 raise ForeignGateError(foreign_gate_refusal(root, previous, "initialize"))
-            takeover_from = previous.owner
+            # Taking a gate over never makes it shallower.
+            takeover_from, deep = previous.owner, previous.deep or deep
         state = GateState.open(
             owner,
             base_sha,
@@ -596,7 +637,7 @@ def _close_gate(
         return replace(state, stage=Stage.NEEDS_HUMAN), (1, failure)
     if outcome is Outcome.UNSATISFIED:
         return state, (1, f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
-    closed = state.closed(evaluation.report, evaluation.deep)
+    closed = state.closed(evaluation.report)
     return closed, (0, closed_gate_line(evaluation, closed))
 
 
@@ -611,18 +652,16 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
 
 
 def closed_gate_line(evaluation: Evaluation, state: GateState) -> str:
-    if state.active:
-        return (
-            "Craftsman gate passed without an isolated review on a deep task; it "
-            "stays open for the user's decision. Run `craftsman review report` for them.\n"
-        )
     findings = evaluation.ledger.findings
     fixed = sum(finding.resolution == "fixed" for finding in findings)
     accepted = sum(finding.resolution == "accepted" for finding in findings)
+    unisolated = (
+        f" {SELF_REVIEWED_BANNER}." if state.stage is Stage.COMPLETE_UNISOLATED else ""
+    )
     return (
         f"Craftsman gate closed: round {len(evaluation.ledger.rounds)}"
         f"{', deep' if evaluation.deep else ''}, "
-        f"{fixed} findings fixed, {accepted} accepted.\n"
+        f"{fixed} findings fixed, {accepted} accepted.{unisolated}\n"
     )
 
 

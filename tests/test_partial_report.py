@@ -212,7 +212,7 @@ class ShowHunksTests(_RepoTestCase):
         self.review("prepare")
 
         current_lines = self.review("show", "--hunks").stdout.strip().splitlines()
-        self.assertEqual(current_lines, ["H1  cart.py:1-3  total"])
+        self.assertEqual(current_lines, ["H3  cart.py:1-3  total"])
 
         # Edit cart.py without re-running `prepare`: round 2 becomes stale.
         self.repo.write("cart.py", "def total(items):\n    return 0\n")
@@ -223,7 +223,7 @@ class ShowHunksTests(_RepoTestCase):
         self.assertEqual(
             stale_lines,
             [
-                "H1  cart.py:1-3  [open]",
+                "H3  cart.py:1-3  [open]",
                 "H2  notes.py:1-1  [carried]",
                 "stale: run `craftsman review prepare`",
             ],
@@ -235,7 +235,7 @@ class ShowHunksTests(_RepoTestCase):
             stale_json["hunks"],
             [
                 {
-                    "id": "H1",
+                    "id": "H3",
                     "path": "cart.py",
                     "new_start": 1,
                     "new_len": 3,

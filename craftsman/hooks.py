@@ -72,7 +72,8 @@ from craftsman.scope import (
     is_scope_checked_tool,
     load_scope_policy,
 )
-from craftsman.trigger import detect_trigger, task_from_prompt
+from craftsman.trigger import detect_trigger, is_review_prompt, task_from_prompt
+from craftsman.workspace import mark_hooks_active
 from craftsman.worktree_guard import find_worktree_mutation
 
 Platform = Literal["copilot", "claude"]
@@ -282,6 +283,8 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     reply = Reply(platform, event)
     session = open_session(hook.cwd)
     caller = GateOwner(platform, hook.session_id)
+    if event == "prompt" and session is not None and is_review_prompt(hook.prompt):
+        mark_hooks_active(session.ledger_path, caller)
     if event == "pre-tool":
         return on_pre_tool(hook, reply, session, caller)
     if session is None:
@@ -349,17 +352,22 @@ def on_prompt(
 ) -> tuple[GateState | None, Output]:
     deep = detect_trigger(hook.prompt)
     owner = caller
+    restarted_deep = False  # a restart after a needs-human stop starts as deep as that gate was
     if state is not None and state.active:
         state = after_user_prompt(state, hook.prompt, deep)
         if deep is None or state.stage is not Stage.NEEDS_HUMAN:
             return state, reply.allow()
         archive_ledger(session.ledger_path)  # the review needed a human; a new request starts over
-        owner = state.owner
+        owner, restarted_deep = state.owner, state.deep
     elif deep is None:
         return state, reply.allow()
     base_sha = resolve_base_sha(session.root, None)
     started = GateState.open(
-        owner, base_sha, bool(deep), task_from_prompt(hook.prompt), isolation_evidence="hooks"
+        owner,
+        base_sha,
+        bool(deep) or restarted_deep,
+        task_from_prompt(hook.prompt),
+        isolation_evidence="hooks",
     )
     archive_ledger_for_new_base(session.root, base_sha)
     return started, reply.inject(
