@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -586,6 +590,50 @@ class PersistenceTests(unittest.TestCase):
 
         self.assertEqual(load(self.path), ledger)
         self.assertEqual([p.name for p in self.path.parent.iterdir()], [LEDGER_FILENAME])
+
+    def test_an_older_ledger_is_set_aside_under_the_lock(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8")
+        taken: list[bool] = []
+        real = ledger_module.locked
+
+        @contextmanager
+        def watching(path: Path) -> Iterator[None]:
+            with real(path):
+                taken.append(True)
+                yield
+
+        with mock.patch.object(ledger_module, "locked", watching), redirect_stderr(io.StringIO()):
+            self.assertEqual(load(self.path), Ledger())
+
+        self.assertEqual(taken, [True])
+        self.assertTrue(self.path.with_name("ledger.v2.bak.json").is_file())
+
+    def test_a_ledger_written_while_the_old_one_was_set_aside_is_left_alone(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8")
+        newer = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))))
+
+        @contextmanager
+        def replaced_first(path: Path) -> Iterator[None]:
+            save(path, newer)  # a concurrent craftsman wrote its ledger before this one got the lock
+            yield
+
+        with mock.patch.object(ledger_module, "locked_unless_held", replaced_first):
+            loaded = load(self.path)
+
+        self.assertEqual(loaded, newer)
+        self.assertEqual(load(self.path), newer)
+        self.assertFalse(self.path.with_name("ledger.v2.bak.json").exists())
+
+    def test_setting_an_older_ledger_aside_inside_mutate_does_not_deadlock(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()):
+            number = mutate(self.path, lambda ledger: (record_run(ledger), len(ledger.runs) + 1))
+
+        self.assertEqual(number, 1)
 
     def test_corrupt_json_raises(self) -> None:
         self.path.parent.mkdir(parents=True)

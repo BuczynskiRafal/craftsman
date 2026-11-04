@@ -763,6 +763,24 @@ class SubagentTests(HookTestCase):
             {"input_tokens": 4, "output_tokens": 42, "cache_read_tokens": 500, "cache_write_tokens": 60, "duration_s": 120.0},
         )
 
+    def test_the_stop_is_recorded_before_the_transcript_is_read(self) -> None:
+        self.repo.cli("review", "prepare")
+        reviewer = {"agent_id": "r-t", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        path = self.agent_transcript("{}")
+
+        with mock.patch("craftsman.hooks.read_usage", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):  # the hook is killed while it reads
+                call_hook(
+                    "subagent-stop",
+                    "claude",
+                    claude("SubagentStop", self.root, agent_transcript_path=str(path), **reviewer),
+                )
+
+        events = self.ledger()["agents"]
+        self.assertEqual([(e["event"], e["agent_id"]) for e in events], [("start", "r-t"), ("stop", "r-t")])
+        self.assertNotIn("usage", events[-1])
+
     def test_the_sessions_own_transcript_path_is_not_read_as_the_agents(self) -> None:
         path = self.agent_transcript(
             json.dumps({"type": "assistant", "message": {"id": "m1", "usage": {"output_tokens": 9}}})

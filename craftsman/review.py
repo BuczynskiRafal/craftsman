@@ -208,19 +208,30 @@ def _prepare(args: argparse.Namespace) -> int:
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
 
+    def open_it(current: Ledger) -> tuple[Ledger, Round]:
+        packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
+        out_of_scope = tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else ()
+        return open_round(
+            current, snap, deep, str(packet), symbols,
+            scope=scope, allow_scope_expansion=allow_scope_expansion, out_of_scope=out_of_scope,
+        )  # fmt: skip
+
+    # The hints parse every changed Python file: compute them before the ledger lock is taken, for
+    # the hunks this round will have to review (carried hunks were reviewed already).
+    planned, planned_round = open_it(ledger)
+    hint_hunks = planned_round.open_hunk_ids if len(planned.rounds) > len(ledger.rounds) else None
+    hints = collect_quality_signals(ws.root, snap.only(hint_hunks)) if hint_hunks is not None else ()
+
     def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
         if stable_hunk_ids(current, snap) != snap:
             raise LedgerError("the ledger changed while the round was prepared; run prepare again")
-        packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
-        out_of_scope = tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else ()
-        updated, round_ = open_round(
-            current, snap, deep, str(packet), symbols,
-            scope=scope, allow_scope_expansion=allow_scope_expansion, out_of_scope=out_of_scope,
-        )
+        updated, round_ = open_it(current)
         if len(updated.rounds) > len(current.rounds):
-            # Carried hunks were reviewed already; the hints are about the code still to review.
-            hints = collect_quality_signals(ws.root, snap.only(round_.open_hunk_ids))
-            round_ = replace(round_, signals=hints)
+            fits = round_.open_hunk_ids == hint_hunks  # else coverage landed meanwhile: rare, slow path
+            round_ = replace(
+                round_,
+                signals=hints if fits else collect_quality_signals(ws.root, snap.only(round_.open_hunk_ids)),
+            )
             updated = replace(updated, rounds=(*updated.rounds[:-1], round_))
         return updated, (updated, round_, updated is not current)
 

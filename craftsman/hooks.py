@@ -533,22 +533,30 @@ def notice(reply: Reply, message: str) -> Output:
 
 
 def record_agent_event(
-    session: Session,
-    hook: HookInput,
-    kind: AgentEventKind,
-    platform: str,
-    usage: AgentUsage | None = None,
-) -> Ledger:
-    """Append the event under the ledger lock and return the ledger as it was before."""
+    session: Session, hook: HookInput, kind: AgentEventKind, platform: str
+) -> tuple[Ledger, AgentEvent]:
+    """Append the event under the ledger lock; return the ledger as it was before, and the event."""
     event = AgentEvent(
         platform=platform,
         event=kind,
         agent=hook.agent or "unknown",
         agent_id=hook.agent_id,
         at=format_timestamp(datetime.now(timezone.utc)),
-        usage=usage,
     )
-    return mutate(session.ledger_path, lambda ledger: (add_agent_event(ledger, event), ledger))
+    before = mutate(session.ledger_path, lambda ledger: (add_agent_event(ledger, event), ledger))
+    return before, event
+
+
+def attach_agent_usage(session: Session, event: AgentEvent, usage: AgentUsage) -> None:
+    """Add `usage` to `event`, recorded earlier: reading a transcript can take long, and the
+    event, which proves isolation, must not wait for it."""
+    attached = replace(event, usage=usage)
+
+    def swap(ledger: Ledger) -> tuple[Ledger, None]:
+        agents = tuple(attached if recorded == event else recorded for recorded in ledger.agents)
+        return replace(ledger, agents=agents), None
+
+    mutate(session.ledger_path, swap)
 
 
 def _has_current_round(session: Session) -> bool:
@@ -576,7 +584,7 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
     role = agent_role(hook.agent)
     if not active and (role is None or not _has_current_round(session)):
         return reply.allow()
-    ledger = record_agent_event(session, hook, "start", reply.platform)
+    ledger, _ = record_agent_event(session, hook, "start", reply.platform)
     if role is None or not ledger.rounds:
         return reply.allow()
     return reply.inject(briefing(role, ledger, session, review_only=not active))
@@ -623,7 +631,19 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
     hook = _with_started_agent_name(session, hook)
     if not active and (agent_role(hook.agent) is None or not _has_current_round(session)):
         return reply.allow()
-    before = record_agent_event(session, hook, "stop", reply.platform, _agent_usage(hook))
+    before, event = record_agent_event(session, hook, "stop", reply.platform)
+    answer = _stop_answer(before, hook, reply)
+    usage = _agent_usage(hook)  # after the event: a slow or killed read must not lose the evidence
+    if usage is not None:
+        try:
+            attach_agent_usage(session, event, usage)
+        except (LedgerError, OSError):
+            pass  # telemetry only
+    return answer
+
+
+def _stop_answer(before: Ledger, hook: HookInput, reply: Reply) -> Output:
+    """Whether the stopping agent may finish: `before` is the ledger without its stop event."""
     role = agent_role(hook.agent)
     if role is None or hook.stop_hook_active or not before.rounds:
         return reply.allow()

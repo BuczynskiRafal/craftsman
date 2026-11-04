@@ -14,13 +14,14 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Literal, TypeVar, cast
 
 from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
 from craftsman.files import write_text_atomic
@@ -75,6 +76,30 @@ def ledger_path_for(cwd: str | Path) -> Path:
         raise LedgerError(f"cannot locate the evidence ledger: {exc}") from exc
 
 
+_HELD = threading.local()
+
+
+def _held_locks() -> list[Path]:
+    if not hasattr(_HELD, "paths"):
+        _HELD.paths = []
+    return cast("list[Path]", _HELD.paths)
+
+
+def holds_lock(path: Path) -> bool:
+    """Whether this thread holds the lock of `path` (taken by `locked`)."""
+    return path.with_suffix(".lock") in _held_locks()
+
+
+@contextmanager
+def locked_unless_held(path: Path) -> Iterator[None]:
+    """Hold the lock of `path`; a caller that holds it already (it cannot be taken twice) keeps it."""
+    if holds_lock(path):
+        yield
+    else:
+        with locked(path):
+            yield
+
+
 @contextmanager
 def locked(path: Path, *, timeout_s: float = 10.0) -> Iterator[None]:
     """Hold an exclusive OS lock on a lock file next to `path` for the duration of the block.
@@ -97,7 +122,11 @@ def locked(path: Path, *, timeout_s: float = 10.0) -> Iterator[None]:
                     "holds it."
                 )
             time.sleep(LOCK_POLL_S)
-        yield
+        _held_locks().append(lock)
+        try:
+            yield
+        finally:
+            _held_locks().remove(lock)
     finally:
         # Also runs when an interrupt arrives mid-acquisition; closing the file releases any lock.
         _unlock(fd)
@@ -156,7 +185,7 @@ def load(path: Path) -> Ledger:
         ) from exc
     if _is_older_schema(raw):
         _set_aside_older_ledger(path)
-        return Ledger()
+        return load(path)  # the old ledger is gone: empty, or a new one written meanwhile
     return Ledger.from_json(raw)
 
 
@@ -166,14 +195,25 @@ def _is_older_schema(raw: object) -> bool:
 
 
 def _set_aside_older_ledger(path: Path) -> None:
-    """Rename a ledger of an older craftsman, which this one cannot read, and go on without it."""
+    """Rename a ledger of an older craftsman, which this one cannot read, and go on without it.
+
+    Under the lock and after reading the file again: it may have been replaced by a ledger of this
+    craftsman since it was read, and that one must stay where it is.
+    """
     backup = path.with_name(f"{path.stem}.v{OLDER_LEDGER_VERSION}.bak{path.suffix}")
-    try:
-        os.replace(path, backup)
-    except FileNotFoundError:
-        return  # another process set it aside first
-    except OSError as exc:
-        raise LedgerError(f"cannot archive the ledger of an older craftsman {path}: {exc}") from exc
+    with locked_unless_held(path):
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return  # gone, or unreadable: not ours to set aside
+        if not _is_older_schema(current):
+            return
+        try:
+            os.replace(path, backup)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise LedgerError(f"cannot archive the ledger of an older craftsman {path}: {exc}") from exc
     sys.stderr.write(
         f"[craftsman] Archived the review ledger of an older craftsman to {backup.name}; "
         "starting a new review.\n"

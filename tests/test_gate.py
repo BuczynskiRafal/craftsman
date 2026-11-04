@@ -6,9 +6,11 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from craftsman import gate
 from craftsman.gate import (
@@ -21,7 +23,9 @@ from craftsman.gate import (
     decide_stop,
     is_continuation_prompt,
     load_state,
+    save_state,
     state_path_for,
+    update_state,
 )
 
 from tests.support import EvidenceRepo, open_gate
@@ -168,6 +172,31 @@ class StateFileTests(unittest.TestCase):
         )
         self.assertEqual(err.getvalue().count("\n"), 1)
         self.assertIn("Archived the gate state of an older craftsman", err.getvalue())
+
+    def test_a_gate_written_while_the_old_state_was_set_aside_is_left_alone(self) -> None:
+        self.path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+        newer = GateState.open(GateOwner("claude", "s2"), "abc", True, "new task")
+
+        @contextmanager
+        def replaced_first(path: Path) -> Iterator[None]:
+            save_state(path, newer)  # a concurrent 5.x gate was opened before this one got the lock
+            yield
+
+        with mock.patch.object(gate, "locked_unless_held", replaced_first):
+            loaded = load_state(self.path)
+
+        self.assertEqual(loaded, newer)
+        self.assertEqual(load_state(self.path), newer)
+        self.assertFalse(self.path.with_name("craftsman_state.json.v4.bak").exists())
+
+    def test_an_old_state_met_inside_update_state_does_not_deadlock(self) -> None:
+        self.path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()):
+            seen = update_state(self.path, lambda state: (None, state))
+
+        self.assertIsNone(seen)
+        self.assertTrue(self.path.with_name("craftsman_state.json.v4.bak").is_file())
 
     def test_state_file_that_is_not_json_is_invalid(self) -> None:
         self.path.write_text("{", encoding="utf-8")

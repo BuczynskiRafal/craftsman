@@ -17,6 +17,8 @@ from unittest import mock
 
 from craftsman.cli import main as cli_main
 from craftsman.gate import GateOwner
+from craftsman.ledger import holds_lock
+from craftsman.quality import collect_quality_signals
 from craftsman.review import normalize_round_files, view_slug
 from craftsman.scope import ScopePolicy, evaluate_scope
 
@@ -1414,6 +1416,23 @@ class FastCliTestCase(RepoTestCase):
             self.repo.write(f"mod_{index}.py", f"def fn_{index}(x):\n    return x + {index}\n")
         res = self.cli_fast("review", "prepare", "--task", "Multi-hunk change")
         self.assertEqual(res.code, 0, res.err)
+
+
+class PrepareLockTests(FastCliTestCase):
+    def test_the_quality_hints_are_computed_outside_the_ledger_lock(self) -> None:
+        self.repo.write("mod.py", "def fn(x):\n    return x + 1\n")
+        held: list[bool] = []
+        real = collect_quality_signals
+
+        def watching(root: Path, snap: Any) -> Any:
+            held.append(holds_lock(self.repo.ledger_dir / "ledger.json"))
+            return real(root, snap)
+
+        with mock.patch("craftsman.review.collect_quality_signals", watching):
+            res = self.cli_fast("review", "prepare", "--task", "One change")
+
+        self.assertEqual(res.code, 0, res.err)
+        self.assertEqual(held, [False])
 
 
 class BatchRejectionTests(FastCliTestCase):

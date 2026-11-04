@@ -22,6 +22,12 @@ All notable changes to Craftsman are recorded here. The format follows
   the coverage and findings recorded while it was current, and a reviewer that finished after the next round was
   prepared still counts for what it recorded. A round replaced before any review, with nothing recorded in it, needs
   nothing; its hunks are open in the next round.
+- **Safer upgrades from Craftsman 4.x.** The old gate state and ledger are set aside only under their lock, after
+  reading the file again, so a 5.x gate or ledger written in between is never renamed to the backup.
+- **`review prepare` no longer holds the ledger lock while it parses the changed Python files** for quality hints,
+  so a `SubagentStop` event that proves isolation cannot time out behind it.
+- **A reviewer's stop event is written before its transcript is read** for token usage; a hook killed while reading
+  a huge transcript no longer loses the isolation evidence.
 
 ### Changed
 

@@ -47,7 +47,7 @@ from craftsman.gatecheck import (
     render_next_actions,
     render_report,
 )
-from craftsman.ledger import locked
+from craftsman.ledger import locked, locked_unless_held
 from craftsman.records import (
     ISOLATION_EVIDENCES,
     FieldError,
@@ -270,7 +270,7 @@ def load_state(path: Path) -> GateState | None:
         raise GateStateError(f"{path} is not a valid gate state ({exc}); {TAKEOVER_HINT}") from exc
     if _is_older_state(raw):
         _set_aside_older_state(path)
-        return None
+        return load_state(path)  # the old state is gone: absent, or a new gate written meanwhile
     try:
         return GateState.from_json(raw)
     except GateStateError as exc:
@@ -283,9 +283,20 @@ def _is_older_state(raw: object) -> bool:
 
 
 def _set_aside_older_state(path: Path) -> None:
+    """Rename a 4.x gate state, under the lock and after reading it again: a 5.x gate written
+    meanwhile must stay where it is."""
     backup = path.with_name(f"{path.name}{OLDER_STATE_SUFFIX}")
     try:
-        os.replace(path, backup)
+        with locked_unless_held(path):
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return  # gone, or unreadable: not ours to set aside
+            if not _is_older_state(current):
+                return
+            os.replace(path, backup)
+    except LedgerError as exc:
+        raise GateStateError(f"cannot archive the Craftsman 4.x gate state {path}: {exc}") from exc
     except FileNotFoundError:
         return  # another process set it aside first
     except OSError as exc:
