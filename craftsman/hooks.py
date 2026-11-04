@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, get_args
 
 from craftsman.diffscan import DiffScanError, resolve_base_sha, snapshot, worktree_root
-from craftsman.evidence import archive_ledger, packet_path
+from craftsman.evidence import archive_ledger
 from craftsman.gate import (
     GateOwner,
     GateState,
@@ -59,6 +59,7 @@ from craftsman.records import (
     AgentEvent,
     AgentEventKind,
     AgentRole,
+    AgentUsage,
     Ledger,
     LedgerError,
     agent_role,
@@ -72,6 +73,7 @@ from craftsman.scope import (
     load_scope_policy,
 )
 from craftsman.trigger import detect_trigger, is_review_prompt, task_from_prompt
+from craftsman.usage import read_usage
 from craftsman.workspace import mark_hooks_active
 from craftsman.worktree_guard import find_worktree_mutation
 
@@ -125,6 +127,7 @@ class HookInput:
     tool_input: dict[str, Any]
     transcript_path: str
     session_id: str | None = None
+    agent_transcript_path: str = ""  # a subagent's own transcript (Claude Code SubagentStop)
 
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> HookInput:
@@ -140,6 +143,7 @@ class HookInput:
             tool_input=_tool_input(payload),
             transcript_path=_text(payload, "transcript_path", "transcriptPath"),
             session_id=_text(payload, "session_id", "sessionId").strip() or None,
+            agent_transcript_path=_text(payload, "agent_transcript_path", "agentTranscriptPath"),
         )
 
 
@@ -411,7 +415,13 @@ def notice(reply: Reply, message: str) -> Output:
 # --- subagents ------------------------------------------------------------------------------
 
 
-def record_agent_event(session: Session, hook: HookInput, kind: AgentEventKind, platform: str) -> Ledger:
+def record_agent_event(
+    session: Session,
+    hook: HookInput,
+    kind: AgentEventKind,
+    platform: str,
+    usage: AgentUsage | None = None,
+) -> Ledger:
     """Append the event under the ledger lock and return the ledger as it was before."""
     event = AgentEvent(
         platform=platform,
@@ -419,6 +429,7 @@ def record_agent_event(session: Session, hook: HookInput, kind: AgentEventKind, 
         agent=hook.agent or "unknown",
         agent_id=hook.agent_id,
         at=format_timestamp(datetime.now(timezone.utc)),
+        usage=usage,
     )
     return mutate(session.ledger_path, lambda ledger: (add_agent_event(ledger, event), ledger))
 
@@ -455,18 +466,22 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
 
 
 def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: bool) -> str:
-    """The round, the packet path and the open work: the agent templates hold the rest."""
+    """The round and the open work, with the commands to read it; the templates hold the rest.
+
+    No packet path: it holds every hunter's hunks, and only the orchestrator reads it.
+    """
     latest = ledger.rounds[-1]
-    lines = [
-        f"Craftsman review round {latest.number}. "
-        f"Packet: {latest.packet_path or packet_path(session.ledger_path, latest.number)}",
-    ]
+    lines = [f"Craftsman review round {latest.number}."]
     if role == "reviewer":
         missing = uncovered_hunks(ledger, latest)
         if missing:
             lines.append(f"Hunks not covered yet (take only your assigned slice): {', '.join(missing)}")
         else:
             lines.append("Every hunk of this round is covered.")
+        lines.append(
+            "Read your slice: `craftsman review view --hunks <ids>`; context before opening files: "
+            "`craftsman review scout H#` or `craftsman review scout <symbol>`."
+        )
     else:
         pending = [finding for finding in ledger.findings if finding.verdict is None]
         if pending:
@@ -477,6 +492,10 @@ def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: 
             )
         else:
             lines.append("No finding is waiting for a verdict.")
+        lines.append(
+            "Lens and scenario of each: `craftsman review show`; code context: "
+            "`craftsman review scout <symbol>`."
+        )
     return "\n".join(lines)
 
 
@@ -487,7 +506,7 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
     hook = _with_started_agent_name(session, hook)
     if not active and (agent_role(hook.agent) is None or not _has_current_round(session)):
         return reply.allow()
-    before = record_agent_event(session, hook, "stop", reply.platform)
+    before = record_agent_event(session, hook, "stop", reply.platform, _agent_usage(hook))
     role = agent_role(hook.agent)
     if role is None or hook.stop_hook_active or not before.rounds:
         return reply.allow()
@@ -515,6 +534,19 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
         '`craftsman review verdict <id> --as proven|probable|question|dismissed --evidence "..."` '
         "before finishing."
     )
+
+
+def _agent_usage(hook: HookInput) -> AgentUsage | None:
+    """The agent's token usage from its own transcript, if the payload names one; never raises.
+
+    The payload's plain `transcript_path` is the parent session's, so it is not read here.
+    """
+    if not hook.agent_transcript_path:
+        return None
+    try:
+        return read_usage(Path(hook.agent_transcript_path))
+    except Exception:  # noqa: BLE001 - telemetry must never fail the hook
+        return None
 
 
 def _with_started_agent_name(session: Session, hook: HookInput) -> HookInput:

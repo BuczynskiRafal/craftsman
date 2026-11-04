@@ -483,32 +483,32 @@ class SubagentTests(HookTestCase):
         payload = vscode("SubagentStart", self.root, agent_id="r-1", agent_type="craftsman-reviewer")
         return call_hook("subagent-start", "copilot", payload)[0]
 
-    def test_reviewer_start_is_briefed_with_its_packet(self) -> None:
+    def test_reviewer_start_is_briefed_with_the_round_and_how_to_read_its_slice(self) -> None:
         out = self.start_reviewer()
         context = out["additionalContext"]
         self.assertEqual(
             out["hookSpecificOutput"], {"hookEventName": "SubagentStart", "additionalContext": context}
         )
-        packet = self.repo.ledger_dir / "packet-1.md"
-        self.assertTrue(context.startswith(f"Craftsman review round 1. Packet: {packet}\n"))
+        self.assertTrue(context.startswith("Craftsman review round 1.\n"))
 
     def test_reviewer_brief_lists_the_uncovered_hunks(self) -> None:
         context = self.start_reviewer()["additionalContext"]
         self.assertIn("Hunks not covered yet (take only your assigned slice): H1", context)
 
-    def test_briefs_hold_only_the_round_the_packet_and_the_open_work(self) -> None:
+    def test_briefs_never_name_the_packet_and_hold_only_the_round_the_work_and_the_commands(self) -> None:
         reviewer = self.start_reviewer()["additionalContext"]
-        packet = self.repo.ledger_dir / "packet-1.md"
 
         self.assertEqual(
             reviewer.splitlines(),
             [
-                f"Craftsman review round 1. Packet: {packet}",
+                "Craftsman review round 1.",
                 "Hunks not covered yet (take only your assigned slice): H1",
+                "Read your slice: `craftsman review view --hunks <ids>`; context before opening files: "
+                "`craftsman review scout H#` or `craftsman review scout <symbol>`.",
             ],
         )
-        self.assertLess(len(reviewer), 300)
-        for text in ("craftsman review cover", "craftsman review add", "Recording commands", "Scope:"):
+        self.assertLess(len(reviewer), 400)
+        for text in ("packet", "craftsman review cover", "craftsman review add", "Recording commands", "Scope:"):
             self.assertNotIn(text, reviewer)
 
     def test_reviewer_start_is_recorded(self) -> None:
@@ -531,7 +531,66 @@ class SubagentTests(HookTestCase):
         )
         context = out["additionalContext"]
         self.assertIn("Findings without a verdict:\n- F1 (major, cart.py:2): Strings are summed", context)
+        self.assertIn("Lens and scenario of each: `craftsman review show`", context)
+        self.assertIn("`craftsman review scout <symbol>`", context)
         self.assertNotIn("craftsman review verdict", context)
+        self.assertNotIn("packet", context)
+
+    def stop_recording_coverage(self, **extra: Any) -> dict[str, Any]:
+        """A reviewer that covered its hunk stops; return the stop event the ledger got."""
+        self.repo.cli("review", "prepare")
+        reviewer = {"agent_id": "r-t", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        self.repo.cli("review", "cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+        out, _ = call_hook(
+            "subagent-stop", "claude", claude("SubagentStop", self.root, **reviewer, **extra)
+        )
+        self.assertEqual(out, {})
+        event: dict[str, Any] = self.ledger()["agents"][-1]
+        self.assertEqual(event["event"], "stop")
+        return event
+
+    def agent_transcript(self, *lines: str) -> Path:
+        path = self.root / "agent-r-t.jsonl"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_stop_records_the_agents_token_usage_and_time_from_its_own_transcript(self) -> None:
+        path = self.agent_transcript(
+            json.dumps({"type": "assistant", "timestamp": "2026-10-21T10:00:00.000Z", "message": {
+                "id": "m1", "usage": {"input_tokens": 3, "output_tokens": 40,
+                                      "cache_read_input_tokens": 500, "cache_creation_input_tokens": 60}}}),
+            json.dumps({"type": "assistant", "timestamp": "2026-10-21T10:02:00.000Z", "message": {
+                "id": "m2", "usage": {"input_tokens": 1, "output_tokens": 2}}}),
+        )  # fmt: skip
+
+        event = self.stop_recording_coverage(agent_transcript_path=str(path))
+
+        self.assertEqual(
+            event["usage"],
+            {"input_tokens": 4, "output_tokens": 42, "cache_read_tokens": 500, "cache_write_tokens": 60, "duration_s": 120.0},
+        )
+
+    def test_the_sessions_own_transcript_path_is_not_read_as_the_agents(self) -> None:
+        path = self.agent_transcript(
+            json.dumps({"type": "assistant", "message": {"id": "m1", "usage": {"output_tokens": 9}}})
+        )
+
+        event = self.stop_recording_coverage(transcript_path=str(path))
+
+        self.assertNotIn("usage", event)
+
+    def test_an_unreadable_agent_transcript_never_fails_the_stop(self) -> None:
+        for broken in (str(self.root / "missing.jsonl"), str(self.root)):
+            with self.subTest(path=broken):
+                event = self.stop_recording_coverage(agent_transcript_path=broken)
+                self.assertNotIn("usage", event)
+
+    def test_a_telemetry_crash_never_fails_the_stop(self) -> None:
+        with mock.patch("craftsman.hooks.read_usage", side_effect=RuntimeError("boom")):
+            event = self.stop_recording_coverage(agent_transcript_path=str(self.root / "x.jsonl"))
+
+        self.assertNotIn("usage", event)
 
     def test_other_agents_are_recorded_without_a_briefing(self) -> None:
         self.repo.cli("review", "prepare")
