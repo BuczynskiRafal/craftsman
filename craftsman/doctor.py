@@ -23,6 +23,7 @@ from craftsman.legacy_githooks import (
     is_craftsman_hooks_path,
     legacy_git_hooks_bases,
 )
+from craftsman.legacy_skills import inspect_legacy_skills
 from craftsman.manifest import InstallError, TargetKind, load_manifest
 from craftsman.paths import (
     default_claude_dir,
@@ -637,6 +638,18 @@ def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
     return problems
 
 
+def inspect_leftover_review_skills(workspace: Path | None, home: Path) -> list[str]:
+    """Problems for the `code-review` skill of Craftsman < 5 that Craftsman still owns."""
+    bases = [
+        (home / ".gemini" / "config", TargetKind.ANTIGRAVITY),
+        (default_claude_dir(home), TargetKind.CLAUDE),
+        (default_copilot_home(home), TargetKind.COPILOT),
+    ]
+    if workspace is not None:
+        bases.append((workspace, TargetKind.COPILOT_WORKSPACE))
+    return [problem for base, kind in bases for problem in inspect_legacy_skills((kind,), base)]
+
+
 # --- report ---------------------------------------------------------------------------------
 
 
@@ -801,6 +814,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         *inspect_legacy_git_hooks(git.hooks_path, home),
         *inspect_legacy_distribution(),
         *inspect_agy_plugin_duplicate(home),
+        *inspect_leftover_review_skills(workspace, home),
     )
     healthy = (
         skill_count == expected_skills

@@ -12,6 +12,10 @@ All notable changes to Craftsman are recorded here. The format follows
   built-in `/code-review` and the two names collided. The skill lives in `skills/craft-review/`, and the
   playbooks are read with `craftsman skill show craft-review --lenses <ids>`. There is no alias:
   `craftsman skill show code-review` fails with the unknown-skill error that lists the valid names.
+- **Upgrade cleanup of the old `code-review` skill**: `craftsman install` and `craftsman uninstall` remove
+  the `code-review` skill an earlier version put in the Antigravity, Copilot and Claude Code folders, but
+  only when Craftsman owns it (an install manifest records it, or its files carry the generated marker);
+  a `code-review` skill of your own is kept. `craftsman doctor` reports a leftover one.
 - **BREAKING: "Build freely, review hard" redesign.** Recall dropped after 3.3.0 because the review
   was optimized for cost and for satisfying the ledger. The agent now builds without review loops or
   ledger bookkeeping; the gate judges outcomes on the final diff only: the diff was frozen, fresh-context
