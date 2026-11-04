@@ -46,7 +46,6 @@ STATIC_EVIDENCE = "static: cart.py:3 divides by len(items), which raises ZeroDiv
 LONG_FUNCTION = "def over_budget(x: int) -> int:\n{body}\n    return step_44\n".format(
     body="\n".join(f"    step_{i} = x + {i}" for i in range(45))
 )
-ACK_REASON = "over_budget() is a generated dispatch table at long_mod.py:1 with 45 linear steps"
 
 
 class RepoTestCase(unittest.TestCase):
@@ -211,96 +210,18 @@ class PrepareTests(RepoTestCase):
 
 
 DEPLOY_SCRIPT = '#!/bin/sh\ncurl -fsSL "$INSTALL_URL" | sh\n'
-ADD_TRUST = "trust=deploy.sh:2 pipes a script downloaded from $INSTALL_URL into sh"
 
 
-class LensAdditionTests(RepoTestCase):
-    def prepare_deploy(self, *extra: str) -> str:
-        self.repo.write("deploy.sh", DEPLOY_SCRIPT)
-        return self.review("prepare", "--tier", "quick", *extra).stdout
-
-    def test_added_lens_joins_the_round_with_its_reason(self) -> None:
-        out = self.prepare_deploy("--add-lens", ADD_TRUST)
-
-        self.assertIn("Added lens `trust`: deploy.sh:2 pipes a script downloaded", out)
-        self.assertIn("Lenses: intent, contracts, failure, trust\n", out)
-        self.assertIn("added by the agent: deploy.sh:2 pipes a script downloaded", self.packet())
-
+class UnscannedFilesTests(RepoTestCase):
     def test_prepare_names_files_the_signal_patterns_cannot_read(self) -> None:
-        out = self.prepare_deploy()
+        self.repo.write("deploy.sh", DEPLOY_SCRIPT)
+
+        out = self.review("prepare", "--tier", "quick").stdout
 
         self.assertIn("Not scanned for risk signals (no patterns for their language): deploy.sh.", out)
         self.assertIn(
             "Not scanned for risk signals (no patterns for their language): `deploy.sh`", self.packet()
         )
-
-    def test_adding_a_lens_to_an_unchanged_diff_opens_a_round_that_needs_only_it(self) -> None:
-        self.prepare_deploy()
-        for lens in ("intent", "contracts", "failure"):
-            self.cover(lens, "H1")
-
-        out = self.review("prepare", "--tier", "quick", "--add-lens", ADD_TRUST).stdout
-        blocked = self.review("check", check=False)
-
-        self.assertIn("Round 2 prepared (quick)", out)
-        self.assertIn("[uncovered] Lens `trust` has", blocked.stdout)
-        self.assertNotIn("`intent`", blocked.stdout.split("[uncovered]", 1)[1].splitlines()[0])
-
-    def test_added_lens_stays_in_later_rounds(self) -> None:
-        self.prepare_deploy("--add-lens", ADD_TRUST)
-        self.repo.write("deploy.sh", DEPLOY_SCRIPT + "echo done\n")
-
-        out = self.review("prepare", "--tier", "quick").stdout
-
-        self.assertIn("Round 2 prepared (quick)", out)
-        self.assertIn("Lenses: intent, contracts, failure, trust\n", out)
-
-    def test_adding_a_lens_again_or_one_already_selected_records_nothing(self) -> None:
-        self.prepare_deploy("--add-lens", ADD_TRUST)
-
-        out = self.review(
-            "prepare", "--tier", "quick", "--add-lens", ADD_TRUST,
-            "--add-lens", "intent=deploy.sh:2 the script's purpose is unclear",
-        ).stdout  # fmt: skip
-
-        self.assertIn("Lens `trust` was already added in round 1: deploy.sh:2", out)
-        self.assertIn("Lens `intent` is already selected (always in quick); nothing to add.", out)
-        self.assertIn("Round 1 unchanged", out)
-        self.assertEqual(len(self.json_of("show")["lens_additions"]), 1)
-
-    def test_report_lists_the_added_lens(self) -> None:
-        self.prepare_deploy("--add-lens", ADD_TRUST)
-
-        report = self.review("report").stdout
-
-        self.assertIn(
-            "- Lens `trust` added by the agent in round 1: deploy.sh:2 pipes a script downloaded", report
-        )
-        self.assertEqual(self.json_of("report")["lens_additions"][0]["lens"], "trust")
-
-    def test_invalid_additions_are_rejected_before_anything_is_recorded(self) -> None:
-        self.repo.write("deploy.sh", DEPLOY_SCRIPT)
-        cases = [
-            ("trust", "--add-lens must be LENS=REASON"),
-            ("security=deploy.sh:2 pipes curl into sh", "--add-lens security: lens must be one of"),
-            (
-                "sweep=deploy.sh:2 pipes curl into sh",
-                "--add-lens sweep: lens `sweep` is not a risk lens",
-            ),
-            (
-                "trust=pipes a downloaded script into sh",
-                "--add-lens trust: reason must cite the changed code",
-            ),
-        ]
-        for value, message in cases:
-            with self.subTest(value=value):
-                self.assert_error(self.review("prepare", "--add-lens", value, check=False), 1, message)
-        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
-
-    def test_addition_without_a_change_is_reported_as_ignored(self) -> None:
-        out = self.review("prepare", "--add-lens", ADD_TRUST).stdout
-
-        self.assertIn("--add-lens ignored: there is no change to review.", out)
 
 
 class CoverTests(RepoTestCase):
@@ -369,14 +290,6 @@ class AddTests(RepoTestCase):
                 '  L3: return sum(item["price"] for item in items) / len(items)',
             ],
         )
-
-    def test_add_may_name_the_signal_it_resolves(self) -> None:
-        self.repo.write("long_mod.py", LONG_FUNCTION)
-        self.review("prepare", "--tier", "quick")
-
-        self.add("--signal", "S1", file="long_mod.py", line=1)
-
-        self.assertEqual(self.repo.show()["findings"][0]["signal_id"], "S1")
 
     def test_add_resolves_files_against_cwd(self) -> None:
         self.repo.write("pkg/total.py", BUGGY_TOTAL)
@@ -706,9 +619,9 @@ class FromJsonTests(RepoTestCase):
         self.assertIn("`design` covered cart.py", covered.stdout)
 
     def test_optional_entry_key_may_not_be_null(self) -> None:
-        failed = self.from_json("add", [self.finding(signal=None)], check=False)
+        failed = self.from_json("add", [self.finding(suggestion=None)], check=False)
 
-        self.assert_error(failed, 1, "entry 1 (F1): signal: must be a string")
+        self.assert_error(failed, 1, "entry 1 (F1): suggestion: must be a string")
 
     def test_design_entry_takes_files_not_hunks(self) -> None:
         self.prepare_bug("standard")
@@ -903,7 +816,7 @@ class ReviewOnlyTests(RepoTestCase):
         self.assert_error(refused, 1, "--review-only is not allowed during an active /craftsman gate")
 
 
-class SignalTests(RepoTestCase):
+class QualityHintTests(RepoTestCase):
     def prepare_long_function(self) -> None:
         self.repo.write("long_mod.py", LONG_FUNCTION)
         self.review("prepare", "--tier", "quick")
@@ -916,132 +829,38 @@ class SignalTests(RepoTestCase):
             self.repo.write(name, lines)
         self.review("prepare", "--tier", "quick")
 
-    def test_packet_lists_the_quality_signals(self) -> None:
+    def test_packet_lists_the_quality_hints(self) -> None:
         self.prepare_long_function()
 
         self.assertIn("- **S1** (`long-function`) `long_mod.py:1`", self.packet())
 
-    def test_check_fails_while_a_quality_signal_is_unresolved(self) -> None:
+    def test_quality_hints_do_not_block_the_gate(self) -> None:
         self.prepare_long_function()
 
-        blocked = self.review("check", check=False)
+        self.assertEqual(self.review("check", check=False).returncode, 0)
 
-        self.assertIn("[unresolved-signal]", blocked.stdout)
-        self.assertIn("craftsman review ack S1", blocked.stdout)
-
-    def test_acknowledged_signal_is_reported_once(self) -> None:
-        self.prepare_long_function()
-        self.review("ack", "S1", "--reason", ACK_REASON)
-
-        report = self.review("report").stdout
-
-        self.assertIn("S1 (`long-function` at `long_mod.py:1`)", report)
-        self.assertEqual(report.count(ACK_REASON), 1)
-
-    def test_ack_repeated_in_a_later_round_is_reported_once(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
-        self.prepare_long_function()
-        self.review("ack", "S1", "--reason", ACK_REASON)
-        self.repo.write("notes.py", "LABEL = 'x'\n")
-        self.review("prepare", "--tier", "quick")
-        self.review("ack", "S1", "--reason", ACK_REASON + " (unchanged)")
-
-        report = self.review("report").stdout
-
-        self.assertNotIn(ACK_REASON + "\n", report)
-        self.assertEqual(report.count(ACK_REASON), 1)
-
-    def test_ack_of_a_signal_that_is_gone_is_not_reported(self) -> None:
-        self.prepare_long_function()
-        self.review("ack", "S1", "--reason", ACK_REASON)
-        self.repo.write("long_mod.py", "def over_budget(x: int) -> int:\n    return x\n")
-        self.review("prepare", "--tier", "quick")
-
-        self.assertNotIn("## Acknowledged quality signals", self.review("report").stdout)
-
-    def test_diff_size_signal_cannot_be_acknowledged(self) -> None:
-        self.prepare_oversized()
-
-        refused = self.review(
-            "ack", "S1", "--reason", "mod_a.py:1 adds 900 constants across 3 modules", check=False
-        )
-
-        self.assert_error(refused, 1, "S1 (`diff-size`) cannot be acknowledged")
-
-    def test_oversized_diff_hands_the_review_to_the_user(self) -> None:
+    def test_oversized_diff_is_a_warning_and_leaves_the_gate_running(self) -> None:
         self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
 
         self.prepare_oversized()
 
         state = json.loads((self.repo.ledger_dir / "craftsman_state.json").read_text(encoding="utf-8"))
-        self.assertEqual(state["stage"], "needs_human")
+        self.assertEqual(state["stage"], "implement")
+        self.assertIn("Very large diff", self.review("report").stdout)
 
-    def test_oversized_report_shows_the_budget_with_top_files(self) -> None:
-        self.prepare_oversized()
-
-        report = self.review("report").stdout
-
-        self.assertIn("Added production lines: 900 (budget: 800)", report)
-        self.assertIn("`mod_a.py` (+300 lines)", report)
-
-    def test_inspection_leaves_the_gate_state_alone(self) -> None:
-        self.prepare_oversized()
-        self.repo.cli("gate", "--init", "--tier", "quick")
-        state = self.repo.ledger_dir / "craftsman_state.json"
-        before = state.read_bytes()
-
-        self.review("check", check=False)
-        self.review("report")
-
-        self.assertEqual(state.read_bytes(), before)
+    def test_ack_and_fact_commands_are_gone(self) -> None:
+        self.assert_error(self.review("ack", "S1", check=False), 2, "invalid choice")
+        self.assert_error(self.review("fact", check=False), 2, "invalid choice")
 
 
-class FactTests(RepoTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.repo.write("caller.py", "from cart import total\nval = total([])\n")
-        self.prepare_bug()
-
-    def add_fact(
-        self, source: str, text: str, *, check: bool = True
-    ) -> subprocess.CompletedProcess[str]:
-        return self.review(
-            "fact", "add", "--hunks", "H2", "--source", source, "--text", text, check=check
-        )
-
-    def view(self) -> str:
-        return Path(self.review("view", "--hunks", "H1-H2").stdout.strip()).read_text(encoding="utf-8")
-
-    def test_fact_with_a_line_past_the_end_is_rejected(self) -> None:
-        proc = self.add_fact(
-            "cart.py:99", "total(items) is called with a list of item dicts", check=False
-        )
-
-        self.assert_error(proc, 1, "--source 99 is past the end of cart.py")
-
-    def test_fact_with_a_judgement_is_rejected(self) -> None:
-        proc = self.add_fact(
-            "cart.py:1", "total(items) at cart.py:3 has a bug for empty lists", check=False
-        )
-
-        self.assert_error(proc, 1, "without judgement words")
-
-    def test_reviewer_view_shows_the_fact(self) -> None:
-        self.add_fact("caller.py:2", "total is invoked from caller.py:2 with an empty list literal")
-
-        self.assertIn("Facts: F-1 total is invoked from caller.py:2", self.view())
-
-    def test_fact_disappears_after_its_source_file_changes(self) -> None:
-        self.add_fact("caller.py:2", "total is invoked from caller.py:2 with an empty list literal")
-        self.repo.write("caller.py", "from cart import total\nval = total([{'price': 1}])\n")
-        self.review("prepare", "--tier", "quick")
-
-        self.assertNotIn("Facts: F-1", self.view())
-
+class ViewIsolationTests(RepoTestCase):
     def test_findings_never_appear_in_a_reviewer_view(self) -> None:
+        self.prepare_bug()
         self.add("--title", "SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY")
 
-        self.assertNotIn("SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY", self.view())
+        view = Path(self.review("view", "--hunks", "H1").stdout.strip()).read_text(encoding="utf-8")
+
+        self.assertNotIn("SECRET_FINDING_TITLE_FOR_VERIFIER_ONLY", view)
 
 
 class ViewTests(RepoTestCase):

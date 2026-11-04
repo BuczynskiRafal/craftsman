@@ -10,7 +10,6 @@ through an agent-facing CLI command: subagent isolation evidence has to come fro
 from __future__ import annotations
 
 import errno
-import hashlib
 import json
 import os
 import re
@@ -32,18 +31,15 @@ from craftsman.records import (
     LEDGER_FILENAME,
     MAX_HUNKS_PER_COVERAGE,
     MIN_HUNK_NOTE_SEGMENT_CHARS,
-    MIN_SIGNAL_ACK_REASON_CHARS,
     SEVERITIES,
     SWEEP_LENS,
     AgentEvent,
     Coverage,
-    Fact,
     FieldError,
     Finding,
     HunkRef,
     Ledger,
     LedgerError,
-    LensAddition,
     QualitySignal,
     Resolution,
     Round,
@@ -51,8 +47,6 @@ from craftsman.records import (
     RunKind,
     RunWaiver,
     Severity,
-    SignalAck,
-    SourceRef,
     Verdict,
     file_digest,
     file_reference_in,
@@ -73,7 +67,6 @@ GROUPED_EVIDENCE_PREFIX = "Grouped into "
 COVERAGE_NOTE_EXAMPLE = "H3 parse_cfg: x=None -> L42 TypeError; callers cli.py:19 ok"
 _WORD_RE = re.compile(r"\w+")
 _HUNK_ID_RE = re.compile(r"\bH[1-9]\d*\b")
-_CONCRETE_TOKEN_RE = re.compile(r"(?:->|`[^`]+`|\b\d+\b|[A-Za-z_]\w*\s*\(|[A-Za-z_]\w*\.[A-Za-z_]\w*)")
 _GENERIC_WORDS_RE = re.compile(
     r"\b(?:" + "|".join(re.escape(word) for word in GENERIC_COVERAGE_WORDS) + r")\b",
     re.IGNORECASE,
@@ -276,7 +269,7 @@ def open_round(
     packet_path: str,
     symbols_by_hunk: Mapping[str, Sequence[str]],
     *,
-    signals: tuple[QualitySignal, ...],
+    signals: tuple[QualitySignal, ...] = (),
     scope: Sequence[str] | None = None,
     allow_scope_expansion: bool = False,
     out_of_scope: Sequence[str] = (),
@@ -847,12 +840,9 @@ def add_finding(
     title: str,
     scenario: str,
     suggestion: str,
-    signal_id: str | None,
 ) -> tuple[Ledger, Finding]:
     """Record a finding against the latest round and the code it reviewed."""
     round_ = _latest_round(ledger)
-    if signal_id is not None:
-        round_.signal(signal_id)
     now = _now()
     finding = Finding(
         id=next_finding_id(ledger),
@@ -872,99 +862,8 @@ def add_finding(
         resolution_note="",
         recorded_at=now,
         updated_at=now,
-        signal_id=signal_id,
     )
     return replace(ledger, findings=(*ledger.findings, finding)), finding
-
-
-def ack_signal(ledger: Ledger, signal_id: str, reason: str) -> tuple[Ledger, SignalAck]:
-    """Acknowledge a quality signal in the latest round with a concrete reason (>= 40 chars)."""
-    round_ = _latest_round(ledger)
-    sig = round_.signal(signal_id)
-    if sig.needs_user:
-        raise LedgerError(
-            f"{signal_id} (`{sig.kind.value}`) cannot be acknowledged by the agent; shrink the "
-            "change or hand the review to the user",
-            field="signal_id",
-        )
-    stripped = one_line(reason)
-    if len(stripped) < MIN_SIGNAL_ACK_REASON_CHARS:
-        raise FieldError(
-            "reason",
-            f"must have at least {MIN_SIGNAL_ACK_REASON_CHARS} characters (got {len(stripped)})",
-        )
-    if _CONCRETE_TOKEN_RE.search(stripped) is None and not file_reference_in(stripped):
-        raise FieldError(
-            "reason",
-            "must include a concrete code detail (a file:line, symbol(), `identifier`, number, or ->)",
-        )
-    ack = SignalAck(signal_id, round_.number, round_.fingerprint, stripped, _now())
-    kept = tuple(
-        item
-        for item in ledger.signal_acks
-        if not (item.round == round_.number and item.signal_id == signal_id)
-    )
-    return replace(ledger, signal_acks=(*kept, ack)), ack
-
-
-def add_lenses(ledger: Ledger, round_number: int, reasons: Mapping[str, str]) -> Ledger:
-    """Record the lenses the agent added to round `round_number`, each with its reason."""
-    recorded_at = _now()
-    additions = tuple(
-        LensAddition(lens, one_line(reason), round_number, recorded_at) for lens, reason in reasons.items()
-    )
-    return replace(ledger, lens_additions=(*ledger.lens_additions, *additions))
-
-
-def file_sha256(root: Path, rel_path: str) -> str | None:
-    """The SHA-256 of a work-tree file, or None when the file does not exist."""
-    target = root / rel_path
-    if not target.is_file():
-        return None
-    try:
-        return hashlib.sha256(target.read_bytes()).hexdigest()
-    except OSError as exc:
-        raise LedgerError(f"cannot read {target}: {exc}") from exc
-
-
-def add_fact(
-    ledger: Ledger,
-    *,
-    hunks: Sequence[str],
-    source: SourceRef,
-    text: str,
-    source_digest: str,
-    author_lens: str,
-) -> tuple[Ledger, Fact]:
-    """Record a fact about the source that other reviewers of the named hunks can rely on."""
-    round_ = _latest_round(ledger)
-    known = {hunk.id for hunk in round_.hunks}
-    unknown = [hunk_id for hunk_id in hunks if hunk_id not in known]
-    if unknown:
-        raise FieldError("hunks", f"are not in round {round_.number}: {', '.join(unknown)}")
-    fact = Fact(
-        id=next_id("F-", (item.id for item in ledger.facts)),
-        hunks=tuple(dict.fromkeys(hunks)),
-        source=source,
-        text=one_line(text),
-        file_digest=source_digest,
-        author_lens=author_lens,
-    )
-    return replace(ledger, facts=(*ledger.facts, fact)), fact
-
-
-def valid_facts_for_hunk(ledger: Ledger, root: Path) -> dict[str, tuple[Fact, ...]]:
-    """Facts per hunk id whose source file is unchanged since the fact was recorded."""
-    by_hunk: dict[str, list[Fact]] = {}
-    digest_cache: dict[str, str | None] = {}
-    for fact in ledger.facts:
-        path = fact.source.path
-        if path not in digest_cache:
-            digest_cache[path] = file_sha256(root, path)
-        if digest_cache[path] is not None and digest_cache[path] == fact.file_digest:
-            for hid in fact.hunks:
-                by_hunk.setdefault(hid, []).append(fact)
-    return {hid: tuple(items) for hid, items in by_hunk.items()}
 
 
 def relocate_finding(
@@ -1004,7 +903,6 @@ def merge_findings(
         title=target.title if title is None else one_line(title),
         scenario=_merged_scenario(target, duplicates) if scenario is None else one_line(scenario),
         suggestion=_merged_suggestion(target, duplicates) if suggestion is None else one_line(suggestion),
-        signal_id=_merged_signal(target, duplicates),
         updated_at=now,
     )
     evidence = f"{GROUPED_EVIDENCE_PREFIX}{target.id} ({target.path}:{target.line}): same root cause."
@@ -1048,26 +946,6 @@ def _merged_scenario(target: Finding, duplicates: Sequence[Finding]) -> str:
 
 def _merged_suggestion(target: Finding, duplicates: Sequence[Finding]) -> str:
     return target.suggestion or next((dup.suggestion for dup in duplicates if dup.suggestion), "")
-
-
-def _merged_signal(target: Finding, duplicates: Sequence[Finding]) -> str | None:
-    """The quality signal the merged finding resolves; it must not resolve two different ones.
-
-    Signal ids are per round, so a signal never moves to a finding of another round.
-    """
-    moved = [dup.id for dup in duplicates if dup.signal_id is not None and dup.round != target.round]
-    if moved:
-        raise LedgerError(
-            f"{', '.join(moved)} resolve a quality signal of another round than {target.id}; "
-            "merge only findings of the same round"
-        )
-    signals = {item.signal_id for item in (target, *duplicates) if item.signal_id is not None}
-    if len(signals) > 1:
-        raise LedgerError(
-            f"the findings resolve different quality signals ({', '.join(sorted(signals))}); "
-            "merge only findings about the same signal"
-        )
-    return next(iter(signals), None)
 
 
 def set_verdict(

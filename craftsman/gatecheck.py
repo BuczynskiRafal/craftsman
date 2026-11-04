@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence, Set
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -21,11 +21,10 @@ from craftsman.records import (
     IsolationEvidence,
     Ledger,
     LedgerError,
-    QualitySignal,
     Round,
     Run,
     RunKind,
-    SignalAck,
+    SignalKind,
     agent_role,
     parse_timestamp,
 )
@@ -38,7 +37,6 @@ IssueCode = Literal[
     "tier-too-low",
     "uncovered",
     "sweep-too-early",
-    "unresolved-signal",
     "no-verdict",
     "unresolved",
     "no-passing-run",
@@ -151,7 +149,6 @@ def evaluate(
         *_round_issues(ledger, snap),
         *(_tier_issues(latest, policy) if latest else ()),
         *(_coverage_issues(ledger, latest) if latest else ()),
-        *(_signal_issues(ledger, latest) if latest else ()),
         *_verdict_issues(ledger),
         *fix_and_test,
         *(_isolation_issues(ledger, latest, policy) if latest else ()),
@@ -170,81 +167,6 @@ def evaluate(
         review_only=review_only,
         self_reviewed=self_reviewed,
     )
-
-
-def acks_in_force(ledger: Ledger) -> dict[str, SignalAck]:
-    """The latest acknowledgement of each signal of the latest round, by its id.
-
-    Signal ids are renumbered every round, so an ack from an earlier round carries over only to a
-    signal that flags the same thing (kind, file and detail), and only when that key names exactly
-    one signal in both rounds: two equal-looking signals must each be acknowledged.
-    """
-    if not ledger.rounds:
-        return {}
-    latest = ledger.rounds[-1]
-    unique_in_latest = _unique_by_key(latest)
-    acks: dict[str, SignalAck] = {}
-    for ack in ledger.signal_acks:
-        if ack.round == latest.number:
-            acks[ack.signal_id] = ack
-            continue
-        carried = unique_in_latest.get(
-            _signal_key(ledger.rounds[ack.round - 1].signal(ack.signal_id))
-        )
-        if carried is not None and _signal_key(carried) in _unique_by_key(ledger.rounds[ack.round - 1]):
-            acks[carried.id] = ack
-    return {sig.id: acks[sig.id] for sig in latest.signals if sig.id in acks}
-
-
-def _unique_by_key(round_: Round) -> dict[tuple[str, str, str], QualitySignal]:
-    """The signals of `round_` whose key no other signal of the round shares."""
-    by_key: dict[tuple[str, str, str], list[QualitySignal]] = {}
-    for sig in round_.signals:
-        by_key.setdefault(_signal_key(sig), []).append(sig)
-    return {key: sigs[0] for key, sigs in by_key.items() if len(sigs) == 1}
-
-
-def _signal_key(sig: QualitySignal) -> tuple[str, str, str]:
-    return (sig.kind.value, sig.file, sig.detail)
-
-
-def _is_signal_resolved(ledger: Ledger, latest: Round, sig: QualitySignal, acked: Set[str]) -> bool:
-    if sig.needs_user:
-        return False
-    if sig.id in acked:
-        return True
-    # A dismissed finding argues the signal away instead of resolving it; that needs an ack.
-    return any(
-        finding.round == latest.number and finding.signal_id == sig.id and finding.verdict != "dismissed"
-        for finding in ledger.findings
-    )
-
-
-def has_unresolved_diff_size(ledger: Ledger) -> bool:
-    """True when the latest round has a signal only the user can resolve: the change is too big."""
-    return bool(ledger.rounds) and any(sig.needs_user for sig in ledger.rounds[-1].signals)
-
-
-def _signal_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
-    acked = acks_in_force(ledger).keys()
-    issues: list[GateIssue] = []
-    for sig in latest.signals:
-        if _is_signal_resolved(ledger, latest, sig, acked):
-            continue
-        action = (
-            "shrink the change below the budget or hand the review to the user"
-            if sig.needs_user
-            else f"record a finding with `craftsman review add --signal {sig.id} ...` or acknowledge it "
-            f'with `craftsman review ack {sig.id} --reason "<concrete reason, >= 40 chars>"`'
-        )
-        issues.append(
-            GateIssue(
-                "unresolved-signal",
-                f"Quality signal {sig.id} ({sig.kind.value} at {sig.file}:{sig.line} — {sig.detail}) "
-                f"is unresolved; {action}.",
-            )
-        )
-    return issues
 
 
 def require_current_round(ledger: Ledger, snap: DiffSnapshot) -> Round:
@@ -607,6 +529,7 @@ def _warnings(
             f"The quick tier reviews {changed_lines} changed lines "
             f"(> {quick_max}); consider the standard tier."
         )
+    warnings.extend(_large_diff_warnings(ledger))
     warnings.extend(
         f"{run.id} (`{run.command}`) is trivial and does not count as verification."
         for run in ledger.runs
@@ -614,6 +537,19 @@ def _warnings(
     )
     warnings.extend(_process_anomaly_warnings(ledger))
     return tuple(warnings)
+
+
+def large_diff_warning(round_: Round) -> str | None:
+    """A warning when the round's quality signals flag a diff too big for a thorough review."""
+    for sig in round_.signals:
+        if sig.kind is SignalKind.DIFF_SIZE:
+            return f"Very large diff: {sig.detail}. Consider splitting the change; a review of this size misses things."
+    return None
+
+
+def _large_diff_warnings(ledger: Ledger) -> list[str]:
+    warning = large_diff_warning(ledger.rounds[-1]) if ledger.rounds else None
+    return [warning] if warning else []
 
 
 def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
@@ -708,7 +644,6 @@ _ROUND_CLAUSES: dict[IssueCode, str] = {
     "round-cap": "maximum review rounds reached",
 }
 _COUNTED_CLAUSES: dict[IssueCode, tuple[str, str]] = {
-    "unresolved-signal": ("unacknowledged risk signal", "unacknowledged risk signals"),
     "no-verdict": ("finding without a verdict", "findings without a verdict"),
     "unresolved": ("unresolved finding", "unresolved findings"),
 }

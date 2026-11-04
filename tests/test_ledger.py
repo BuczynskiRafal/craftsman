@@ -15,12 +15,9 @@ from unittest import mock
 from craftsman import ledger as ledger_module
 from craftsman.ledger import (
     COVERAGE_NOTE_EXAMPLE,
-    ack_signal,
     add_coverage,
-    add_fact,
     add_multi_coverage,
     coverage_units_for_targets,
-    file_sha256,
     ledger_path_for,
     load,
     locked,
@@ -31,7 +28,6 @@ from craftsman.ledger import (
     save,
     set_verdict,
     uncovered_by_lens,
-    valid_facts_for_hunk,
     waive_run,
 )
 from craftsman.records import (
@@ -43,7 +39,6 @@ from craftsman.records import (
     LedgerError,
     QualitySignal,
     SignalKind,
-    SourceRef,
 )
 
 from tests.support import (
@@ -66,9 +61,6 @@ EVIDENCE = "Reproduced via tests/test_app.py::test_empty (fails before fix)."
 PROBABLE = "no-repro: needs a live database; app.py:3 divides by len(items) == 0"
 DISMISSED = "guarded by app.py:2, which returns 0 for an empty list"
 LONG_FUNCTION = QualitySignal("S1", SignalKind.LONG_FUNCTION, "a.py", 1, "`f` spans 50 lines")
-TEST_NAME = QualitySignal("S2", SignalKind.TEST_NAME, "t.py", 3, "`test_x_and_y` contains `_and_`")
-DIFF_SIZE = QualitySignal("S3", SignalKind.DIFF_SIZE, "a.py", 1, "+900 production lines added")
-CONCRETE_REASON = "`f` in a.py:1 is a flat table of 50 literal cases"
 
 
 class OpenRoundTests(unittest.TestCase):
@@ -485,15 +477,6 @@ class FindingTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 record_finding(self.ledger, **change)
 
-    def test_finding_may_resolve_a_signal_of_the_round(self) -> None:
-        ledger = record_finding(self.ledger, signal_id="S1")
-
-        self.assertEqual(ledger.findings[0].signal_id, "S1")
-
-    def test_finding_for_an_unknown_signal_is_rejected(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "unknown quality signal 'S9' in round 1; known: S1"):
-            record_finding(self.ledger, signal_id="S9")
-
     def test_requires_a_round(self) -> None:
         with self.assertRaisesRegex(LedgerError, "craftsman review prepare"):
             record_finding(Ledger())
@@ -647,7 +630,7 @@ class ResolutionTests(unittest.TestCase):
 
 class MergeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.ledger, _ = prepared(make_snap(make_hunk("H1")), signals=(LONG_FUNCTION, TEST_NAME))
+        self.ledger, _ = prepared(make_snap(make_hunk("H1")), signals=(LONG_FUNCTION,))
 
     def finding(self, ledger: Ledger, scenario: str, **overrides: Any) -> Ledger:
         return record_finding(ledger, scenario=scenario, **overrides)
@@ -683,31 +666,6 @@ class MergeTests(unittest.TestCase):
 
         self.assertEqual(target.scenario.count(shared), 1)
 
-    def test_target_resolves_the_signal_of_a_duplicate(self) -> None:
-        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
-        ledger = self.finding(ledger, "total() mixes parsing and summing.", signal_id="S1")
-
-        _, target, _ = merge_findings(ledger, "F1", ["F2"])
-
-        self.assertEqual(target.signal_id, "S1")
-
-    def test_signal_of_another_round_is_not_merged(self) -> None:
-        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
-        ledger, _ = prepared(
-            make_snap(make_hunk("H1"), fingerprint="fp2"), ledger=ledger, signals=(TEST_NAME,)
-        )
-        ledger = self.finding(ledger, "The test name packs two behaviors.", signal_id="S2")
-
-        with self.assertRaisesRegex(LedgerError, "F2 resolve a quality signal of another round"):
-            merge_findings(ledger, "F1", ["F2"])
-
-    def test_findings_about_different_signals_are_not_merged(self) -> None:
-        ledger = self.finding(self.ledger, "total() mixes parsing and summing.", signal_id="S1")
-        ledger = self.finding(ledger, "The test name packs two behaviors.", signal_id="S2")
-
-        with self.assertRaisesRegex(LedgerError, "different quality signals \\(S1, S2\\)"):
-            merge_findings(ledger, "F1", ["F2"])
-
     def test_judged_findings_are_not_merged(self) -> None:
         ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
         ledger = self.finding(ledger, "An empty cart shows an error page.")
@@ -729,89 +687,6 @@ class MergeTests(unittest.TestCase):
         for target, duplicates, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 merge_findings(ledger, target, duplicates)
-
-
-class SignalAckTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.ledger, _ = prepared(make_snap(make_hunk("H1")), signals=(LONG_FUNCTION, DIFF_SIZE))
-
-    def test_ack_records_the_reason_for_the_round(self) -> None:
-        _, ack = ack_signal(self.ledger, "S1", f"  {CONCRETE_REASON}  ")
-
-        self.assertEqual((ack.signal_id, ack.round, ack.reason), ("S1", 1, CONCRETE_REASON))
-
-    def test_acking_again_replaces_the_earlier_ack(self) -> None:
-        ledger, _ = ack_signal(self.ledger, "S1", CONCRETE_REASON)
-        ledger, _ = ack_signal(ledger, "S1", CONCRETE_REASON + " (see a.py:9)")
-
-        self.assertEqual(len(ledger.signal_acks), 1)
-
-    def test_unknown_signal_is_rejected(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "unknown quality signal 'S9'"):
-            ack_signal(self.ledger, "S9", CONCRETE_REASON)
-
-    def test_diff_size_cannot_be_acknowledged(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "S3 \\(`diff-size`\\) cannot be acknowledged"):
-            ack_signal(self.ledger, "S3", CONCRETE_REASON)
-
-    def test_short_reason_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "reason must have at least 40 characters"):
-            ack_signal(self.ledger, "S1", "a.py:1 is fine")
-
-    def test_reason_without_a_code_detail_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "must include a concrete code detail"):
-            ack_signal(self.ledger, "S1", "this function is long but it is easy to read as it is")
-
-
-class FactTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.ledger, _ = prepared(make_snap(make_hunk("H1"), make_hunk("H2", "b.py")))
-        self.source = SourceRef("app.py", 1)
-        self.text = "total() returns 0 for an empty list at app.py:1"
-
-    def record(self, ledger: Ledger, hunks: list[str], digest: str = "d1") -> Ledger:
-        ledger, _ = add_fact(
-            ledger,
-            hunks=hunks,
-            source=self.source,
-            text=self.text,
-            source_digest=digest,
-            author_lens="contracts",
-        )
-        return ledger
-
-    def test_facts_get_sequential_ids(self) -> None:
-        ledger = self.record(self.record(self.ledger, ["H1"]), ["H2"])
-
-        self.assertEqual([fact.id for fact in ledger.facts], ["F-1", "F-2"])
-
-    def test_fact_about_an_unknown_hunk_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "hunks are not in round 1: H9"):
-            self.record(self.ledger, ["H9"])
-
-    def test_fact_with_a_judgement_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "without judgement words \\('bug' found"):
-            add_fact(
-                self.ledger,
-                hunks=["H1"],
-                source=self.source,
-                text="total() has a bug when the list at app.py:1 is empty",
-                source_digest="d1",
-                author_lens="contracts",
-            )
-
-    def test_fact_is_valid_while_its_source_file_is_unchanged(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
-            digest = file_sha256(root, "app.py")
-            assert digest is not None
-            ledger = self.record(self.ledger, ["H1"], digest)
-            self.assertEqual(list(valid_facts_for_hunk(ledger, root)), ["H1"])
-
-            (root / "app.py").write_text("x = 2\n", encoding="utf-8")
-
-            self.assertEqual(valid_facts_for_hunk(ledger, root), {})
 
 
 class RunTests(unittest.TestCase):

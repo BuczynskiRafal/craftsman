@@ -19,7 +19,6 @@ from craftsman.gatecheck import (
     render_report,
 )
 from craftsman.ledger import (
-    ack_signal,
     add_agent_event,
     add_coverage,
     resolve,
@@ -254,48 +253,17 @@ class SignalTests(unittest.TestCase):
         ledger, _ = prepared(two_hunks(), signals=(LONG_FUNCTION,))
         self.ledger = record_run(cover_open_hunks(cover_open_hunks(ledger, "intent"), "craft"))
 
-    def test_unresolved_signal_blocks(self) -> None:
-        (issue,) = evaluate(self.ledger, two_hunks(), QUICK).issues
+    def test_quality_signals_never_block(self) -> None:
+        self.assertEqual(evaluate(self.ledger, two_hunks(), QUICK).issues, ())
 
-        self.assertEqual(issue.code, "unresolved-signal")
-        self.assertIn("craftsman review ack S1", issue.message)
-
-    def test_finding_about_the_signal_resolves_it(self) -> None:
-        ledger = record_finding(self.ledger, signal_id="S1")
-        ledger, _ = set_verdict(ledger, "F1", "probable", PROBABLE, None)
-
-        self.assertNotIn("unresolved-signal", codes(evaluate(ledger, two_hunks(), QUICK)))
-
-    def test_dismissed_finding_does_not_resolve_the_signal(self) -> None:
-        ledger = record_finding(self.ledger, signal_id="S1")
-        ledger, _ = set_verdict(ledger, "F1", "dismissed", DISMISSED, None)
-
-        self.assertEqual(codes(evaluate(ledger, two_hunks(), QUICK)), ["unresolved-signal"])
-
-    def test_ack_carries_over_to_the_same_signal_in_a_later_round(self) -> None:
-        ledger, _ = ack_signal(self.ledger, "S1", "`f` in a.py:1 is a flat table of 50 literal cases")
-        ledger, _ = prepared(two_hunks("fp2"), ledger=ledger, signals=(LONG_FUNCTION,))
-
-        self.assertNotIn("unresolved-signal", codes(evaluate(ledger, two_hunks("fp2"), QUICK)))
-
-    def test_equal_looking_signals_need_one_ack_each(self) -> None:
-        twin = QualitySignal("S2", SignalKind.LONG_FUNCTION, "a.py", 90, "`render` spans 61 lines")
-        first = replace(twin, id="S1", line=10)
-        ledger, _ = prepared(two_hunks(), signals=(first, twin))
-        ledger = record_run(cover_open_hunks(cover_open_hunks(ledger, "intent"), "craft"))
-        ledger, _ = ack_signal(ledger, "S1", "`render` in a.py:10 is a flat table of 61 literal rows")
-
-        (issue,) = evaluate(ledger, two_hunks(), QUICK).issues
-
-        self.assertIn("Quality signal S2", issue.message)
-
-    def test_diff_size_signal_always_blocks(self) -> None:
+    def test_diff_size_signal_is_a_warning_not_a_hand_off(self) -> None:
         ledger, _ = prepared(two_hunks(), signals=(DIFF_SIZE,))
         ledger = record_run(cover_open_hunks(cover_open_hunks(ledger, "intent"), "craft"))
 
-        (issue,) = evaluate(ledger, two_hunks(), QUICK).issues
+        report = evaluate(ledger, two_hunks(), QUICK)
 
-        self.assertIn("hand the review to the user", issue.message)
+        self.assertTrue(report.passed)
+        self.assertTrue(any("Very large diff" in warning for warning in report.warnings))
 
 
 class RunTests(unittest.TestCase):

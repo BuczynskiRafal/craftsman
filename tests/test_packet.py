@@ -83,7 +83,6 @@ def build_context(*hunks: Hunk, **overrides: Any) -> PacketContext:
         "reopened": {},
         "test_files_by_symbol": {},
         "last_runs": (),
-        "facts_by_hunk": {},
     }
     return PacketContext(**{**fields, **overrides})
 

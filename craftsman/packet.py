@@ -23,9 +23,9 @@ from craftsman.diffscan import (
     git_output,
     is_test_path,
 )
-from craftsman.ledger import reopened_mentions, valid_facts_for_hunk
+from craftsman.ledger import reopened_mentions
 from craftsman.lenses import LensPick
-from craftsman.records import SWEEP_LENS, Fact, FieldError, Ledger, Round
+from craftsman.records import SWEEP_LENS, FieldError, Ledger, Round
 from craftsman.text import inline_md
 
 MAX_PACKET_CHARS = 120_000
@@ -141,7 +141,6 @@ class PacketContext:
     reopened: Mapping[str, tuple[tuple[str, str], ...]]
     test_files_by_symbol: Mapping[str, tuple[str, ...]]
     last_runs: tuple[str, ...]
-    facts_by_hunk: Mapping[str, tuple[Fact, ...]]
     unscanned_files: tuple[str, ...] = ()  # changed code the risk-signal patterns cannot read
 
 
@@ -175,7 +174,6 @@ def collect_context(
         reopened=reopened_mentions(round_, snap.hunks, symbols),
         test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
         last_runs=_last_runs(ledger, snap),
-        facts_by_hunk=valid_facts_for_hunk(ledger, root),
         unscanned_files=files_without_signal_patterns(snap),
     )
 
@@ -394,10 +392,8 @@ def _assemble(
 
 def _quality_signals_section(ctx: PacketContext) -> str:
     lines = [
-        "## Quality signals",
-        "Every signal below must be resolved before `craftsman review check` passes: either "
-        "record a finding with `craftsman review add ... --signal <ID>` or acknowledge it with "
-        '`craftsman review ack <ID> --reason "<concrete reason, >= 40 chars>"`.',
+        "## Quality hints",
+        "Deterministic hints for the simplicity review; they are not obligations.",
         "",
     ]
     for sig in ctx.round.signals:
@@ -613,8 +609,6 @@ def _symbol_lines(
     open_ids = [h.id for h in ctx.snap.hunks if h.id not in ctx.carried_from]
     if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
         lines.append("Last runs: " + " · ".join(ctx.last_runs))
-    for fact in ctx.facts_by_hunk.get(hunk.id, ()):
-        lines.append(f"Facts: {fact.id} {inline_md(fact.text)} (source {fact.source.path}:{fact.source.line})")
     return lines
 
 

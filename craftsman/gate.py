@@ -45,7 +45,6 @@ from craftsman.gatecheck import (
     QUICK_TIER_MAX_CHANGED_LINES,
     GateReport,
     format_blocker_summary,
-    has_unresolved_diff_size,
     render_next_actions,
     render_report,
 )
@@ -75,10 +74,6 @@ MAX_ERROR_CHARS = 400
 CONTINUATION_HEADER = "[CRAFTSMAN GATE"
 TAKEOVER_HINT = "start a new gate with `craftsman gate --init --takeover`"
 NO_ACTIVE_GATE = "no active gate in this work tree; open one with `craftsman gate --init`"
-OVERSIZED_NOTICE = (
-    "Craftsman gate: the change exceeds the diff-size budget. The decision belongs to the user; "
-    "`craftsman review report` lists the top files by growth and a split suggestion."
-)
 ROUND_CAP_NOTICE = (
     "Craftsman gate: the review reached its round cap. The remaining issues need your decision; "
     "`craftsman review report` lists them. Start `/craftsman` again to restart."
@@ -364,22 +359,18 @@ def evaluate_task(state: GateState, root: Path) -> Evaluation:
 
 class Outcome(Enum):
     PASSED = "passed"
-    OVERSIZED = "oversized"
     ROUND_CAP = "round-cap"
     UNSATISFIED = "unsatisfied"
 
 
 def judge(evaluation: Evaluation) -> Outcome:
     """Whether an evaluated task passed, needs the user's decision, or needs more work."""
-    if has_unresolved_diff_size(evaluation.ledger):
-        return Outcome.OVERSIZED
     if any(issue.code == "round-cap" for issue in evaluation.report.issues):
         return Outcome.ROUND_CAP
     return Outcome.PASSED if evaluation.report.passed else Outcome.UNSATISFIED
 
 
 HUMAN_NOTICES: dict[Outcome, str] = {
-    Outcome.OVERSIZED: OVERSIZED_NOTICE,
     Outcome.ROUND_CAP: ROUND_CAP_NOTICE,
 }
 

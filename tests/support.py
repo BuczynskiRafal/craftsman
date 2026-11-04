@@ -82,7 +82,6 @@ FINDING = {
     "title": "Empty list crashes total()",
     "scenario": "Calling total([]) divides by len(items) == 0 and raises.",
     "suggestion": "Return 0 for an empty list.",
-    "signal_id": None,
 }
 
 

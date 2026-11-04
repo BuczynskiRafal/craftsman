@@ -40,7 +40,7 @@ CRAFTSMAN_AGENTS = frozenset({ORCHESTRATOR_AGENT, *AGENT_ROLES})
 # as `craftsman:craftsman-reviewer`.
 PLUGIN_AGENT_PREFIX = "craftsman:"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEDGER_FILENAME = "ledger.json"
 OUTPUT_TAIL_CHARS = 4000
 MAX_HUNKS_PER_COVERAGE = 4
@@ -51,10 +51,6 @@ MIN_EVIDENCE_CHARS = 20
 SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
-MIN_SIGNAL_ACK_REASON_CHARS = 40
-MIN_LENS_ADDITION_REASON_CHARS = 20
-LENS_ADDITION_EXAMPLE = "trust=ci/Jenkinsfile:12 the sh step interpolates env.DEPLOY_URL"
-MIN_FACT_TEXT_CHARS = 30
 # Every hunk named in a coverage note needs its own segment of at least this many characters.
 MIN_HUNK_NOTE_SEGMENT_CHARS = 40
 GENERIC_COVERAGE_WORDS: tuple[str, ...] = (
@@ -78,14 +74,6 @@ GENERIC_COVERAGE_WORDS: tuple[str, ...] = (
     "accurate",
     "checked",
     "reviewed",
-)
-FACT_JUDGEMENT_WORDS: tuple[str, ...] = (
-    *GENERIC_COVERAGE_WORDS,
-    "bug",
-    "wrong",
-    "issue",
-    "problem",
-    "should",
 )
 DESIGN_LENS = "design"
 SWEEP_LENS = "sweep"
@@ -115,11 +103,7 @@ QUESTION_EVIDENCE_EXAMPLE = (
     "which keeps the worker busy when the server is down for good"
 )
 DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
-_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S", "F-")}
-_FACT_JUDGEMENT_RE = re.compile(
-    r"\b(?:" + "|".join(re.escape(word) for word in FACT_JUDGEMENT_WORDS) + r")\b",
-    re.IGNORECASE,
-)
+_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S")}
 
 T = TypeVar("T")
 S = TypeVar("S", bound=str)
@@ -355,10 +339,6 @@ class Fields:
         """A list of strings; empty when it is left out."""
         return () if self._absent(key) else self.texts(key)
 
-    def records_or_empty(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
-        """A list of records; empty when it is left out (a field added without a schema bump)."""
-        return () if self._absent(key) else self.records(key, parse)
-
     def records(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
         values: list[Any] = self._value(key, list, "a list")
         parsed: list[T] = []
@@ -476,11 +456,6 @@ class QualitySignal:
         _require(self.line >= 1, "line", "must be >= 1")
         _require_text(self.detail, "detail")
 
-    @property
-    def needs_user(self) -> bool:
-        """Only the user can resolve it: the agent may neither acknowledge it nor argue it away."""
-        return self.kind is SignalKind.DIFF_SIZE
-
     def to_json(self) -> dict[str, Any]:
         return _record_json(self)
 
@@ -494,38 +469,6 @@ class QualitySignal:
                 file=f.text("file"),
                 line=f.integer("line"),
                 detail=f.text("detail"),
-            )
-        )
-
-
-@dataclass(frozen=True)
-class SignalAck:
-    signal_id: str
-    round: int
-    fingerprint: str
-    reason: str
-    recorded_at: str
-
-    def __post_init__(self) -> None:
-        _require_id(self.signal_id, "S", "signal_id")
-        _require(self.round >= 1, "round", "must be >= 1")
-        _require_text(self.fingerprint, "fingerprint")
-        _require_text(self.reason, "reason", min_chars=MIN_SIGNAL_ACK_REASON_CHARS)
-        _require_timestamp(self.recorded_at, "recorded_at")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> SignalAck:
-        f = Fields(raw)
-        return f.done(
-            cls(
-                signal_id=f.text("signal_id"),
-                round=f.integer("round"),
-                fingerprint=f.text("fingerprint"),
-                reason=f.text("reason"),
-                recorded_at=f.text("recorded_at"),
             )
         )
 
@@ -608,16 +551,6 @@ class Round:
     @property
     def open_files(self) -> tuple[str, ...]:
         return tuple(file.path for file in self.files if not file.carried)
-
-    def signal(self, signal_id: str) -> QualitySignal:
-        for sig in self.signals:
-            if sig.id == signal_id:
-                return sig
-        known = ", ".join(sig.id for sig in self.signals) or "none in this round"
-        raise FieldError(
-            "signal_id",
-            f"names an unknown quality signal {signal_id!r} in round {self.number}; known: {known}",
-        )
 
     def to_json(self) -> dict[str, Any]:
         return _record_json(self)
@@ -746,12 +679,9 @@ class Finding:
     resolution_note: str
     recorded_at: str
     updated_at: str
-    signal_id: str | None
 
     def __post_init__(self) -> None:
         _require_id(self.id, "F", "id")
-        if self.signal_id is not None:
-            _require_id(self.signal_id, "S", "signal_id")
         _require(self.round >= 1, "round", "must be >= 1")
         _require_choice(self.lens, sorted(LENS_IDS), "lens")
         _require_text(self.path, "path")
@@ -812,7 +742,6 @@ class Finding:
                 resolution_note=f.text("resolution_note"),
                 recorded_at=f.text("recorded_at"),
                 updated_at=f.text("updated_at"),
-                signal_id=f.optional_text("signal_id"),
             )
         )
 
@@ -955,113 +884,6 @@ class AgentEvent:
         )
 
 
-@dataclass(frozen=True)
-class SourceRef:
-    path: str
-    line: int
-
-    def __post_init__(self) -> None:
-        _require_text(self.path, "path")
-        _require(self.line >= 1, "line", "must be >= 1")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> SourceRef:
-        f = Fields(raw)
-        return f.done(cls(path=f.text("path"), line=f.integer("line")))
-
-
-@dataclass(frozen=True)
-class Fact:
-    id: str
-    hunks: tuple[str, ...]
-    source: SourceRef
-    text: str
-    file_digest: str
-    author_lens: str
-
-    def __post_init__(self) -> None:
-        _require_id(self.id, "F-", "id")
-        _require(bool(self.hunks), "hunks", "must list at least one hunk id")
-        for hunk_id in self.hunks:
-            _require_id(hunk_id, "H", "hunks")
-        _require_text(self.text, "text", min_chars=MIN_FACT_TEXT_CHARS)
-        match = _FACT_JUDGEMENT_RE.search(self.text)
-        if match is not None:
-            raise FieldError(
-                "text",
-                f"must state a verifiable source fact without judgement words ({match.group(0)!r} found; "
-                "record defects with `craftsman review add`)",
-            )
-        _require_text(self.file_digest, "file_digest")
-        _require_choice(self.author_lens, sorted(LENS_IDS), "author_lens")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> Fact:
-        f = Fields(raw)
-        return f.done(
-            cls(
-                id=f.text("id"),
-                hunks=f.texts("hunks"),
-                source=f.record("source", SourceRef.from_json),
-                text=f.text("text"),
-                file_digest=f.text("file_digest"),
-                author_lens=f.text("author_lens"),
-            )
-        )
-
-
-def require_lens_addition(lens: str, reason: str) -> None:
-    """Fail unless `lens` can be added to a review for `reason` (see `LensAddition`)."""
-    _require_choice(lens, sorted(LENS_IDS), "lens")
-    _require(lens != SWEEP_LENS, "lens", f"`{SWEEP_LENS}` is not a risk lens and cannot be added")
-    _require_text(reason, "reason", min_chars=MIN_LENS_ADDITION_REASON_CHARS)
-    _require(
-        file_reference_in(reason),
-        "reason",
-        "must cite the changed code that needs the lens as file:line, "
-        f"e.g. {LENS_ADDITION_EXAMPLE.split('=', 1)[1]!r}",
-    )
-
-
-@dataclass(frozen=True)
-class LensAddition:
-    """A lens the agent added because it saw a risk the deterministic signals missed.
-
-    Every round from `round` on keeps the lens, so the gate requires its coverage like any other.
-    """
-
-    lens: str
-    reason: str
-    round: int
-    recorded_at: str
-
-    def __post_init__(self) -> None:
-        require_lens_addition(self.lens, self.reason)
-        _require(self.round >= 1, "round", "must be >= 1")
-        _require_timestamp(self.recorded_at, "recorded_at")
-
-    def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
-
-    @classmethod
-    def from_json(cls, raw: Any) -> LensAddition:
-        f = Fields(raw)
-        return f.done(
-            cls(
-                lens=f.text("lens"),
-                reason=f.text("reason"),
-                round=f.integer("round"),
-                recorded_at=f.text("recorded_at"),
-            )
-        )
-
-
 def scope_contains(superset: tuple[str, ...] | None, subset: tuple[str, ...] | None) -> bool:
     """True when `superset` covers every path in `subset` (`None` means the full work tree)."""
     if superset is None:
@@ -1078,14 +900,6 @@ class Ledger:
     findings: tuple[Finding, ...] = ()
     runs: tuple[Run, ...] = ()
     agents: tuple[AgentEvent, ...] = ()
-    signal_acks: tuple[SignalAck, ...] = ()
-    facts: tuple[Fact, ...] = ()
-    lens_additions: tuple[LensAddition, ...] = ()
-
-    @property
-    def added_lenses(self) -> dict[str, str]:
-        """The lenses the agent added to this review, each with its reason."""
-        return {addition.lens: addition.reason for addition in self.lens_additions}
 
     @property
     def current_scope(self) -> tuple[str, ...] | None:
@@ -1116,30 +930,14 @@ class Ledger:
                     )
         _require_unique([run.id for run in self.runs], "runs")
         _require_unique([finding.id for finding in self.findings], "findings")
-        _require_unique([fact.id for fact in self.facts], "facts")
-        added = [addition.lens for addition in self.lens_additions]
-        _require(len(set(added)) == len(added), "lens_additions", "must not repeat a lens")
-        for index, addition in enumerate(self.lens_additions):
-            self._check_lens_addition(addition, f"lens_additions[{index}]")
         for index, coverage in enumerate(self.coverage):
             self._check_coverage(coverage, f"coverage[{index}]")
         for index, finding in enumerate(self.findings):
             self._check_finding(finding, f"findings[{index}]")
-        for index, ack in enumerate(self.signal_acks):
-            self._check_signal_ack(ack, f"signal_acks[{index}]")
 
     def _round(self, number: int, where: str) -> Round:
         _require(number <= len(self.rounds), f"{where}.round", "references an unknown round")
         return self.rounds[number - 1]
-
-    def _check_lens_addition(self, addition: LensAddition, where: str) -> None:
-        self._round(addition.round, where)
-        for round_ in self.rounds[addition.round - 1 :]:
-            _require(
-                addition.lens in round_.lenses,
-                f"{where}.lens",
-                f"was added in round {addition.round} but is missing from round {round_.number}",
-            )
 
     def _check_coverage(self, coverage: Coverage, where: str) -> None:
         round_ = self._round(coverage.round, where)
@@ -1158,28 +956,11 @@ class Ledger:
         _require(not unknown, f"{where}.digests", f"are not in round {coverage.round}: {unknown}")
 
     def _check_finding(self, finding: Finding, where: str) -> None:
-        round_ = self._round(finding.round, where)
+        self._round(finding.round, where)
         _require(
             finding.verdict_run is None or any(run.id == finding.verdict_run for run in self.runs),
             f"{where}.verdict_run",
             f"references an unknown run {finding.verdict_run!r}",
-        )
-        if finding.signal_id is not None:
-            try:
-                round_.signal(finding.signal_id)
-            except FieldError as exc:
-                raise exc.within(where) from None
-
-    def _check_signal_ack(self, ack: SignalAck, where: str) -> None:
-        round_ = self._round(ack.round, where)
-        try:
-            round_.signal(ack.signal_id)
-        except FieldError as exc:
-            raise exc.within(where) from None
-        _require(
-            ack.fingerprint == round_.fingerprint,
-            f"{where}.fingerprint",
-            f"must match round {ack.round}",
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -1207,9 +988,6 @@ class Ledger:
                     findings=f.records("findings", Finding.from_json),
                     runs=f.records("runs", Run.from_json),
                     agents=f.records("agents", AgentEvent.from_json),
-                    signal_acks=f.records("signal_acks", SignalAck.from_json),
-                    facts=f.records("facts", Fact.from_json),
-                    lens_additions=f.records_or_empty("lens_additions", LensAddition.from_json),
                 )
             )
         except FieldError as exc:
