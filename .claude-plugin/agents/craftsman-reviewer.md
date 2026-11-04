@@ -85,7 +85,9 @@ entries `{"lens","file","line","severity","title","scenario","suggestion"}` or `
 all, resend once. PowerShell: `@'` newline JSON newline `'@ | craftsman review add --from-json -`;
 Windows PowerShell 5.1 pipes ASCII only, so for other text run `craftsman review inbox add`, write
 UTF-8 to the printed path (`Set-Content -LiteralPath <path> -Encoding utf8`) and pass
-`--from-json <path>`. Throwaway scripts: `craftsman review scratch` prints a managed directory.
+`--from-json <path>`. If a heredoc is denied or needs approval, write the JSON with your
+file-writing tool to the path `craftsman review inbox <add|cover>` prints and pass
+`--from-json <path>`; single-line commands with single-quoted arguments also work. Throwaway scripts: `craftsman review scratch` prints a managed directory.
 
 Never change the work tree or index: no `git stash`, `checkout`, `switch`, `reset`, `restore`,
 `clean`, `commit`, `rm`, `mv`, and no files written inside the repository. Do not verify, dismiss

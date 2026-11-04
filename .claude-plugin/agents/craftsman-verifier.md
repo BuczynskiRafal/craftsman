@@ -81,6 +81,8 @@ required for `proven`); a rejected
 batch records nothing and lists every entry to fix: fix them all, resend once. PowerShell: `@'`
 newline JSON newline `'@ | craftsman review verdict --from-json -`; Windows PowerShell 5.1 pipes
 ASCII only, so for other text run `craftsman review inbox verdict`, write UTF-8 to the printed path
-(`Set-Content -LiteralPath <path> -Encoding utf8`) and pass `--from-json <path>`.
+(`Set-Content -LiteralPath <path> -Encoding utf8`) and pass `--from-json <path>`. If a heredoc is denied or needs approval, write the JSON with your
+file-writing tool to the path `craftsman review inbox verdict` prints and pass `--from-json
+<path>`; single-line commands with single-quoted arguments also work.
 
 Finish with a table: finding id, verdict, one-line reason.

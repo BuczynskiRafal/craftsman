@@ -13,26 +13,30 @@ description: >-
 
 Your job is to find the bugs that would hurt after merge. Hunters (fresh-context subagents)
 maximize recall: they record every candidate with a nameable trigger. Verifiers maximize precision:
-they try to disprove each candidate and reproduce the survivors. You orchestrate: where to look,
-how many hunters, when the hunt is dry. The gate checks outcomes (the frozen diff reviewed by
-fresh hunters, every finding judged with evidence).
+they try to disprove each candidate and reproduce the survivors. You orchestrate.
+
+Every review launches at least one `craftsman-reviewer` subagent, even for a one-line change,
+whenever the platform can launch subagents: the context that read the change cannot see its own
+blind spots. SELF-REVIEWED is only for platforms without subagents, and even then each finding is
+recorded with `craftsman review add` and each hunk with `cover`. A review that is not in the
+ledger did not happen.
 
 The user needs no flags: infer everything from the request and the repository.
 
 - **Target**: nothing named means the working tree against the base of the active `/craftsman`
   gate, else `HEAD`. A branch or commit: `--base <ref>`. A PR number or URL: `gh pr checkout <n>`
-  and pass its merge base as `--base`. "My staged changes" / "tracked files" / a path or directory
-  freezes the review-only scope in round 1 (`--staged`, `--tracked`, `--paths <csv>`).
-- **Fix**: "and fix what you find" or similar means step 6 (shortcut: `--fix`). Without it,
-  review only. "Comment on the PR" means post the report with `gh pr comment` (`--comment`).
-- **Depth** (defined once; others point here): decide it yourself, from the risk map
-  and your own reading. Go deep (every lens, at least two waves, an end-to-end run when fixing)
+  and pass its merge base as `--base`. "My staged changes", "tracked files", a path or directory
+  freeze the review-only scope in round 1 (`--staged`, `--tracked`, `--paths <csv>`).
+- **Fix**: "and fix what you find" means step 6 (`--fix`); without it, review only.
+  "Comment on the PR" means post the report with `gh pr comment` (`--comment`).
+- **Depth** (defined once; others point here): decide it yourself from the risk map and your
+  reading. Go deep (every lens, at least two waves, an end-to-end run when fixing)
   for security-relevant code (processes, SQL, deserialization, auth, paths from untrusted input),
   concurrency or clocks, persistent data or migrations, public API or file-format changes, removed
   guarantees, a large or cross-cutting diff, or when the user asks for care ("critical",
   "production", "be thorough", `ultracraft`). Escalate with `craftsman review prepare --deep`;
-  `prepare` may print a `Depth: deep suggested` hint. In a gate session this raises the gate to
-  deep, which also requires the e2e run. Depth never goes down.
+  `prepare` may print a deep hint. In a gate session this raises the gate to deep, which also
+  requires the e2e run. Depth never goes down.
 
 Search scope: `craftsman skill show craftsman --file scope.md`. Never modify the work tree or
 index under review: no `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`; read old code
@@ -44,13 +48,11 @@ with `git show <base>:<path>`.
 craftsman review prepare [--deep] [--base <ref>] [--task "<what the change is for>"] [--staged | --tracked | --paths <csv>]
 ```
 
-It freezes the diff into round N and prints the packet path (hunks with enclosing scopes, callers,
-risk signals), the size, the **risk map** (each suggested lens with reasons and hunk ids), quality
+It freezes the diff into round N and prints the packet path, the size, the **risk map** (each suggested lens with reasons and hunk ids), quality
 hints (`S#`), files not scanned for risk signals, the frozen scope, and warnings (a very large
 diff: say so in the report).
 
-Risk signals are pattern matches: a floor, not a verdict. Read the diff yourself and add the lenses
-it calls for (`trust` for shell, CI, credentials, parsers; `state` for threads, locks, clocks;
+Risk signals are a floor, not a verdict. Read the diff yourself and add the lenses it calls for (`trust` for shell, CI, credentials, parsers; `state` for threads, locks, clocks;
 `platform` for OS, encoding, time zone, file systems).
 
 If `cover`, `add` or `view` reports a stale round, run `craftsman review prepare` once (unchanged
@@ -63,13 +65,13 @@ reset`: ask the user.
 Write 3-8 claims about what the change must do, each with the line that makes it true. A claim
 without a line is already a finding (`craftsman review add --lens intent ...`). Qualifiers
 ("atomic", "with TTL") are claims too. Take the intent from the task, commits, PR description and docs, not
-from your belief about the code. Work from `git diff <base>` and the risk
+from assumptions about the code. Work from `git diff <base>` and the risk
 map, not the full packet (hunters read their slices).
 
 ## 3. Hunt plan and wave 1
 
 Decide the hunters, then launch **all hunters of the wave together** (in parallel where the
-platform allows), each as a fresh-context `craftsman-reviewer` subagent. On Claude Code, if the
+platform allows) as fresh-context `craftsman-reviewer` subagents. On Claude Code, if the
 plugin provides the `craftsman:hunt` workflow, write the hunt plan and run that workflow for steps
 3-5 (hunt, verify, saturate); otherwise run them yourself.
 
@@ -79,25 +81,23 @@ Every hunter and verifier prompt has the same layout, so the prompt cache serves
    bounded view; never paste file contents);
 3. its lenses, last (it runs `craftsman skill show craft-review --lenses <csv>` itself).
 
-Never review inline while subagents exist: the context that wrote the change hides its defects.
-
 Guidance (deviate when the change calls for it):
 - Every code change gets at least `intent`, `contracts`, `failure`, `ripple`, `tests`, plus every
   lens the risk map suggests or your reading calls for. Docs-only: `intent`, `craft`. Deep:
   every lens.
-- `craft` and `design` go to a separate **simplicity hunter**, so they never take attention from
-  bug hunting. On Claude Code launch it with the Agent tool's `model: "haiku"`; bug hunters,
+- `craft` and `design` go to a separate **simplicity hunter**, so they never distract bug
+  hunting. On Claude Code launch it with the Agent tool's `model: "haiku"`; bug hunters,
   verifiers and you never get a cheaper model.
 - 1-3 lenses per hunter. Split large changes by files so each slice stays readable (<= ~400
   changed lines per hunter).
-- With two or more hunters, one also runs `sweep` over the whole diff.
-- A tiny change (a few lines, one file) may get one hunter with the core lenses.
+- With two or more hunters, one also runs `sweep` over the whole diff. A tiny change gets one
+  hunter with the core lenses.
 
 Platform mechanics: Claude Code, the Agent tool (`craftsman:craftsman-reviewer` /
 `craftsman:craftsman-verifier` as a plugin); Copilot, the custom agents of the same names;
 Antigravity, `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
 `craftsman-verifier`. With no subagent mechanism, play the roles one after another (hunt first,
-judge afterwards) and say **SELF-REVIEWED** in the report.
+judge afterwards), record as usual and say **SELF-REVIEWED** in the report.
 
 A subagent that fails (rate limit, timeout) is retried once with a smaller slice. If that fails
 too: review-only: `craftsman review report --review-only --partial`; when fixing: ask the user
@@ -127,8 +127,8 @@ least 2 when deep). Wave k+1 launches together:
 When pipelining, start a variant hunter the moment a finding is judged `proven`/`probable`, and
 the fresh hunter together with wave 1.
 
-Verify the new findings (step 4). Stop at the first wave that adds nothing confirmed. Every open
-hunk needs a `cover`: `craftsman review show --hunks` lists what is left.
+Verify the new findings (step 4). Stop at the first wave that adds nothing confirmed. Every hunk
+needs a `cover`: `craftsman review show --hunks` lists what is left.
 
 ## 6. Fix, confirm, re-check, test (when asked to fix, and always in a gate session)
 

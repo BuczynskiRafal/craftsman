@@ -71,7 +71,9 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
    orchestrate.
 3. Follow `/craft-review` from its hunt plan (step 3) through step 6 (hunt, verify, saturate, fix,
    confirm, re-check, tests and `craftsman review check`), in gate-session mode. It is the single
-   source for the mechanics; do not improvise a lighter review.
+   source for the mechanics. Even for a one-line change, launch at least one `craftsman-reviewer`
+   subagent when the platform can; never settle for a lighter review or a SELF-REVIEWED one, and
+   remember that a review that is not in the ledger did not happen.
 4. Do what `check` lists, then `craftsman gate --complete`. At `round-cap` stop iterating, report
    what remains and let the user decide; the gate lets you finish.
 
