@@ -369,7 +369,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.assertEqual(self.ledger().rounds[0].scope, ("a.py",))
         self.assertIn("Scope: 1 file(s), frozen for this review.", out)
         self.assertIn("Ignored (outside the review scope): b.py, c.py", out)
-        self.assertIn("+a_worktree = 3", self.packet(1))
+        self.assertIn("+ 2 a_worktree = 3", self.packet(1))
         self.assertNotIn("b.py", self.packet(1))
         self.assertNotIn("c.py", self.packet(1))
 

@@ -317,6 +317,13 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "AgentEvent.agent",
         "AgentEvent.agent_id",
         "AgentEvent.at",
+        "AgentEvent.usage",
+        # AgentUsage
+        "AgentUsage.input_tokens",
+        "AgentUsage.output_tokens",
+        "AgentUsage.cache_read_tokens",
+        "AgentUsage.cache_write_tokens",
+        "AgentUsage.duration_s",
         # Ledger
         "Ledger.rounds",
         "Ledger.coverage",
