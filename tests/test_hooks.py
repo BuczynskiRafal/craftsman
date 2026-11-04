@@ -293,10 +293,55 @@ class ReviewStopGuardTests(HookTestCase):
         self.assertIn("craftsman-reviewer", out["reason"])
         self.assertFalse((self.repo.ledger_dir / "craftsman_state.json").exists())
 
-    def test_the_legacy_command_is_guarded_too(self) -> None:
-        self.begin_review("/code-review ultracraft")
+    def test_the_hosts_own_review_command_is_never_guarded(self) -> None:
+        for prompt in ("/code-review max", "/code-review ultracraft", "/clear /code-review"):
+            with self.subTest(prompt=prompt):
+                self.begin_review(prompt)
 
-        self.assertEqual(self.stop()["decision"], "block")
+                self.assertEqual(self.stop(), {})
+                self.assertFalse((self.repo.ledger_dir / "review_hooks.json").exists())
+                self.assertFalse(self.state_file.exists())
+
+    def test_a_reviewer_still_running_lets_the_agent_wait_for_it(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+        reviewer = {"agent_id": "bg-1", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+
+        self.assertEqual(self.stop(), {})  # its completion wakes the session; no reminder is spent
+        self.assertTrue(self.guarding())
+
+        call_hook(
+            "subagent-stop",
+            "claude",
+            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
+        )
+        self.assertIn("[CRAFTSMAN REVIEW 1/", self.stop()["reason"])
+
+    def test_preparing_an_unchanged_diff_again_counts_as_starting_the_review(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+        self.run_reviewer()
+        self.assertEqual(self.stop(), {})
+        self.prompt("/craft-review again")
+        self.assertIn("No review round yet", self.stop()["reason"])
+
+        self.repo.cli("review", "prepare")
+
+        self.assertEqual(self.stop(), {})
+
+    def test_the_guard_judges_a_copilot_review_like_the_cli_check_does(self) -> None:
+        call_hook("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="/craft-review"))
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+
+        checked = self.repo.cli("review", "check", "--review-only", check=False)
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
+
+        self.assertEqual(checked.returncode, 0, checked.stdout)  # no session id reaches the CLI
+        self.assertEqual(out, {})
 
     def test_a_round_without_coverage_or_a_reviewer_is_named(self) -> None:
         self.begin_review()
@@ -563,6 +608,19 @@ class StopTests(HookTestCase):
         self.assertEqual(inline.returncode, 1, inline.stdout)
         self.assertIn("[no-isolation]", inline.stdout)
         self.assertEqual(elsewhere.returncode, 0, elsewhere.stdout)  # another session: advisory only
+
+    def test_agent_events_of_an_earlier_round_do_not_make_a_terminal_check_need_a_reviewer(self) -> None:
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+        self.run_reviewer()  # a hooked session reviewed this round
+        self.repo.write("cart.py", CHANGE + "# edited from a terminal\n")
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+
+        elsewhere = self.repo.cli("review", "check", "--review-only", check=False)
+
+        self.assertEqual(elsewhere.returncode, 0, elsewhere.stdout)
 
     def test_restarted_gate_archives_the_previous_review(self) -> None:
         self.retry_after_the_round_cap()

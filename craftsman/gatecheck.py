@@ -313,10 +313,29 @@ def _failing_run_issues(ledger: Ledger) -> list[GateIssue]:
     ]
 
 
-def _round_window_end(ledger: Ledger, round_: Round) -> datetime | None:
-    """When `round_` stopped being the latest round; None while it still is."""
+def _round_window(ledger: Ledger, round_: Round) -> tuple[datetime, datetime | None]:
+    """When `round_` was current: from its preparation until the next round's (None while latest)."""
     following = ledger.rounds[round_.number : round_.number + 1]
-    return parse_timestamp(following[0].prepared_at) if following else None
+    end = parse_timestamp(following[0].prepared_at) if following else None
+    return parse_timestamp(round_.prepared_at), end
+
+
+def _reviewer_runs(ledger: Ledger) -> list[tuple[datetime, datetime]]:
+    """The (start, stop) of every finished `craftsman-reviewer` run.
+
+    A stop without a start event counts from the round that was current when it happened.
+    """
+    runs: list[tuple[datetime, datetime]] = []
+    for stop in ledger.agents:
+        if stop.event != "stop" or agent_role(stop.agent) != "reviewer":
+            continue
+        stopped = parse_timestamp(stop.at)
+        started = _reviewer_run_started(ledger, stop)
+        if started is None:
+            current = [r for r in ledger.rounds if parse_timestamp(r.prepared_at) <= stopped]
+            started = parse_timestamp(current[-1].prepared_at) if current else stopped
+        runs.append((started, stopped))
+    return runs
 
 
 def _reviewer_run_started(ledger: Ledger, stop: AgentEvent) -> datetime | None:
@@ -332,39 +351,54 @@ def _reviewer_run_started(ledger: Ledger, stop: AgentEvent) -> datetime | None:
     return max(starts, default=None)
 
 
-def _reviewer_recorded(ledger: Ledger, since: datetime, until: datetime) -> bool:
-    """Whether coverage or a finding was recorded in `since`..`until`: a reviewer that only
-    started and stopped examined nothing."""
-    recorded = [record.recorded_at for record in ledger.coverage]
-    recorded += [finding.recorded_at for finding in ledger.findings]
-    return any(since <= parse_timestamp(at) <= until for at in recorded)
+def _record_times(ledger: Ledger) -> list[datetime]:
+    return [parse_timestamp(item.recorded_at) for item in ledger.coverage] + [
+        parse_timestamp(item.recorded_at) for item in ledger.findings
+    ]
 
 
 def _round_has_reviewer(ledger: Ledger, round_: Round) -> bool:
     """Whether a `craftsman-reviewer` finished, having recorded something, while `round_` was current."""
-    start, end = parse_timestamp(round_.prepared_at), _round_window_end(ledger, round_)
-    for event in ledger.agents:
-        if event.event != "stop" or agent_role(event.agent) != "reviewer":
-            continue
-        stopped = parse_timestamp(event.at)
+    start, end = _round_window(ledger, round_)
+    for started, stopped in _reviewer_runs(ledger):
         if stopped < start or (end is not None and stopped >= end):
             continue
-        since = max(start, _reviewer_run_started(ledger, event) or start)
-        if _reviewer_recorded(ledger, since, stopped):
+        since = max(start, started)
+        if any(since <= at <= stopped for at in _record_times(ledger)):
             return True
     return False
 
 
-def unreviewed_rounds(ledger: Ledger) -> tuple[Round, ...]:
-    """The rounds with hunks to review that no isolated reviewer examined while they were current.
+def _round_has_unexamined_record(ledger: Ledger, round_: Round) -> bool:
+    """Whether coverage or a finding was recorded while `round_` was current outside every
+    reviewer run: a reviewer that outlived the round still examined what it recorded."""
+    start, end = _round_window(ledger, round_)
+    runs = _reviewer_runs(ledger)
+    return any(
+        start <= at and (end is None or at <= end) and not any(a <= at <= b for a, b in runs)
+        for at in _record_times(ledger)
+    )
 
-    A round whose hunks are all carried over needs no new reviewer, but the rounds that first
-    reviewed those hunks stay checked.
+
+def unreviewed_rounds(ledger: Ledger) -> tuple[Round, ...]:
+    """The rounds with hunks to review that no isolated reviewer examined.
+
+    The latest round needs a reviewer that finished, having recorded something, while it was
+    current. An earlier round needs one only for what was recorded in it: a round replaced before
+    anyone reviewed it holds nothing to examine (its hunks are open in the next round), and a
+    reviewer that finished after the next round was prepared still examined its own records. A
+    round whose hunks are all carried over needs no new reviewer.
     """
+    latest = len(ledger.rounds)
     return tuple(
         round_
         for round_ in ledger.rounds
-        if not all(hunk.carried for hunk in round_.hunks) and not _round_has_reviewer(ledger, round_)
+        if not all(hunk.carried for hunk in round_.hunks)
+        and (
+            not _round_has_reviewer(ledger, round_)
+            if round_.number == latest
+            else _round_has_unexamined_record(ledger, round_)
+        )
     )
 
 
@@ -392,8 +426,8 @@ def _isolation_issues(ledger: Ledger, policy: GatePolicy) -> list[GateIssue]:
         issues.append(
             GateIssue(
                 "no-isolation",
-                f"Round {', '.join(earlier)} had hunks to review but no {REVIEWER_AGENT} finished "
-                "while it was current, and a later round cannot make up for it. Run `craftsman "
+                f"Round {', '.join(earlier)} recorded coverage or findings that no {REVIEWER_AGENT} "
+                "run examined, and a later round cannot make up for it. Run `craftsman "
                 f"review reset`, prepare again and have the {REVIEWER_AGENT} examine the whole diff.",
             )
         )

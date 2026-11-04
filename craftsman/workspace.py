@@ -12,7 +12,7 @@ from craftsman.diffscan import DiffSnapshot, resolve_base_sha, snapshot, worktre
 from craftsman.files import write_text_atomic
 from craftsman.gate import GateOwner, GateState, cli_caller, load_state, state_path_for
 from craftsman.ledger import ledger_path_for, load, stable_hunk_ids
-from craftsman.records import IsolationEvidence, Ledger, format_timestamp
+from craftsman.records import IsolationEvidence, Ledger, format_timestamp, parse_timestamp
 
 HOOKS_MARKER = "review_hooks.json"
 
@@ -32,6 +32,7 @@ class ReviewMarker:
     guarding: bool = True
     forced: int = 0
     best: int | None = None
+    touched_at: str | None = None  # when `review prepare` last ran for this review, changed or not
 
     def is_of(self, caller: GateOwner) -> bool:
         return self.platform == caller.platform and self.session_id == caller.session_id
@@ -48,6 +49,7 @@ def read_marker(ledger_path: Path) -> ReviewMarker | None:
             guarding=raw.get("guarding") is True,
             forced=int(raw.get("forced", 0)),
             best=best if isinstance(best, int) else None,
+            touched_at=str(raw["touched_at"]) if raw.get("touched_at") else None,
         )
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
@@ -69,6 +71,24 @@ def mark_hooks_active(ledger_path: Path, caller: GateOwner) -> None:
     write_marker(ledger_path, ReviewMarker(caller.platform, caller.session_id, now))
 
 
+def cli_visible(caller: GateOwner) -> GateOwner:
+    """`caller` as a `craftsman` command run by that session sees it.
+
+    Only Claude Code exports its session id to the commands it runs; on other platforms a command
+    cannot tell which session it serves.
+    """
+    return caller if caller.platform == "claude" else GateOwner(caller.platform, None)
+
+
+def touch_review(ledger_path: Path) -> None:
+    """Note that `review prepare` ran for the guarded review: re-preparing an unchanged diff, or
+    raising its depth, leaves the round as it was but is still the agent doing its part."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding:
+        now = format_timestamp(datetime.now(timezone.utc))
+        write_marker(ledger_path, replace(marker, touched_at=now))
+
+
 def end_review_guard(ledger_path: Path, caller: GateOwner | None = None) -> None:
     """Stop holding the session (of `caller`, if given) to a finished or abandoned review."""
     marker = read_marker(ledger_path)
@@ -88,25 +108,30 @@ class Workspace:
     def task(self) -> str:
         return self.state.task if self.state is not None else ""
 
-    def isolation_evidence(self, ledger: Ledger) -> IsolationEvidence:
+    def isolation_evidence(self, ledger: Ledger, caller: GateOwner | None = None) -> IsolationEvidence:
         """Where proof of an isolated reviewer can come from for this review.
 
-        A gate knows what its platform proved. Without a gate (review-only), hooks serve the
-        session when a subagent event is in the ledger or when the prompt hook saw this session
-        invoke the review command.
+        A gate knows what its platform proved. Without a gate (review-only), hooks serve this review
+        when the prompt hook saw `caller` (default: the session this command runs in) invoke the
+        review command, or when a subagent event arrived after the current round was prepared. An
+        event of an earlier session or platform proves nothing about this one.
         """
         if self.state is not None:
             return self.state.required_isolation
-        return "hooks" if ledger.agents or self._hooks_saw_this_session() else "none"
+        if self._hooks_saw(caller or cli_caller(None, os.environ)) or self._agent_event_since_round(ledger):
+            return "hooks"
+        return "none"
 
-    def _hooks_saw_this_session(self) -> bool:
-        caller = cli_caller(None, os.environ)
+    def _hooks_saw(self, caller: GateOwner) -> bool:
         marker = read_marker(self.ledger_path)
         return marker is not None and caller.session_id is not None and marker.is_of(caller)
 
-    @property
-    def hooks_marker(self) -> Path:
-        return self.ledger_path.parent / HOOKS_MARKER
+    @staticmethod
+    def _agent_event_since_round(ledger: Ledger) -> bool:
+        if not ledger.rounds:
+            return False
+        prepared = parse_timestamp(ledger.rounds[-1].prepared_at)
+        return any(parse_timestamp(event.at) >= prepared for event in ledger.agents)
 
     def base_sha(self, ledger: Ledger, explicit: str | None = None) -> str:
         """`explicit`, else the latest round's base, else the active task's base, else HEAD."""

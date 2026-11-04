@@ -28,12 +28,16 @@ CRAFTSMAN_DEEP_FLAG_RE = re.compile(
 ULTRACRAFT_WORD_RE = re.compile(
     r"(?i)(?<![\w/-])(?:/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft)(?![\w:-])"
 )
-# The review-only command: `ultracraft` there asks for a deep review, never for a gate.
-REVIEW_COMMAND_RE = re.compile(
-    r"(?i)^\s*(?:/[a-z0-9_:-]+\s+)*/(?:craftsman:)?(?:craft|code)-review(?![\w-])"
-)
+# The review-only command: `ultracraft` there asks for a deep review, never for a gate. Only
+# `/craft-review` is Craftsman's; the host agent's own `/code-review` is none of its business.
+REVIEW_COMMAND_RE = re.compile(r"(?i)^\s*(?:/[a-z0-9_:-]+\s+)*/(?:craftsman:)?craft-review(?![\w-])")
 CLAUDE_REVIEW_COMMAND_RE = re.compile(
-    r"<command-name>\s*/?(?:craftsman:)?(?:craft|code)-review\s*</command-name>", re.IGNORECASE
+    r"<command-name>\s*/?(?:craftsman:)?craft-review\s*</command-name>", re.IGNORECASE
+)
+# The host's built-in review command never starts a gate either, whatever words follow it.
+HOST_REVIEW_COMMAND_RE = re.compile(r"(?i)^\s*(?:/[a-z0-9_:-]+\s+)*/code-review(?![\w-])")
+CLAUDE_HOST_REVIEW_COMMAND_RE = re.compile(
+    r"<command-name>\s*/?code-review\s*</command-name>", re.IGNORECASE
 )
 CLAUDE_COMMAND_NAME_RE = re.compile(
     r"<command-name>\s*/?(?:craftsman:)?(craftsman|ultracraft)\s*</command-name>", re.IGNORECASE
@@ -61,7 +65,7 @@ def detect_trigger(content: str) -> bool | None:
 
     None when it starts no session; otherwise True for `ultracraft` and `/craftsman --deep`.
     """
-    if not content.strip() or is_review_prompt(content):
+    if not content.strip() or is_review_prompt(content) or _is_host_review_prompt(content):
         return None
     claude_command = CLAUDE_COMMAND_NAME_RE.search(content)
     if claude_command:
@@ -85,12 +89,20 @@ def detect_trigger(content: str) -> bool | None:
 
 
 def is_review_prompt(content: str) -> bool:
-    """Whether `content` invokes the review-only command (`/craft-review`, or the older
-    `/code-review`), which never starts a gate."""
-    if CLAUDE_REVIEW_COMMAND_RE.search(content):
+    """Whether `content` invokes Craftsman's review-only command (`/craft-review`), which never
+    starts a gate and is the only prompt the review stop guard watches."""
+    return _invokes(content, CLAUDE_REVIEW_COMMAND_RE, REVIEW_COMMAND_RE)
+
+
+def _is_host_review_prompt(content: str) -> bool:
+    return _invokes(content, CLAUDE_HOST_REVIEW_COMMAND_RE, HOST_REVIEW_COMMAND_RE)
+
+
+def _invokes(content: str, tag: re.Pattern[str], leading: re.Pattern[str]) -> bool:
+    if tag.search(content):
         return True
     requests = USER_REQUEST_BLOCK_RE.findall(content)
-    return REVIEW_COMMAND_RE.search((requests[-1] if requests else content).strip()) is not None
+    return leading.search((requests[-1] if requests else content).strip()) is not None
 
 
 def _requests_deep(text: str, token: str) -> bool:

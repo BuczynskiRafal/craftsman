@@ -103,7 +103,7 @@ A hunk is covered when a coverage record in this round or an earlier one holds i
 | `no-isolation` | Isolation evidence exists for the platform, but no `craftsman-reviewer` finished after the latest round was prepared | delegate the hunt to `craftsman-reviewer` |
 | `round-cap` | More than 5 distinct diffs were reviewed (`MAX_ROUNDS = 5`) | stop the loop and ask the user |
 
-- **Isolation.** Wherever the platform provides evidence (hooks, or the Antigravity transcript), the gate requires a finished `craftsman-reviewer` for every round with non-carried hunks, checked per round, in gate sessions and in review-only mode alike. A reviewer that stops without recording coverage or a finding is sent back once. Without evidence the gate still closes, and the report shows the `SELF-REVIEWED` banner, deep or not.
+- **Isolation.** Wherever the platform provides evidence (hooks, or the Antigravity transcript), the gate requires a finished `craftsman-reviewer` for the latest round with non-carried hunks, and for what an earlier round recorded, checked per round, in gate sessions and in review-only mode alike. A reviewer that stops without recording coverage or a finding is sent back once. Without evidence the gate still closes, and the report shows the `SELF-REVIEWED` banner, deep or not.
 - **Warnings, not issues.** A very large diff, anomalies, out-of-scope edits, and quality hints appear in `prepare` and the report but never block.
 - **Partial reports.** When a subagent keeps failing after one retry, `craftsman review report --review-only --partial` exits `0` with `PARTIAL (review-only, N open items)`, adds a `## Not covered` section, and marks unjudged findings `(unverified)`.
 

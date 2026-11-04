@@ -194,9 +194,12 @@ The gate reports an issue list. It passes when the list is empty:
 | `no-isolation` | The platform gives isolation evidence, but no `craftsman-reviewer` finished after this round was prepared |
 | `round-cap` | More than 5 distinct diffs were reviewed: the agent stops and the user decides |
 
-- **Isolation is checked per round.** Every round with non-carried hunks needs its own finished
-  `craftsman-reviewer`, in gate sessions and in review-only mode. A reviewer must record coverage or
-  a finding before it stops; the hook sends one that did not back to work, once.
+- **Isolation is checked per round.** The latest round with non-carried hunks needs a finished
+  `craftsman-reviewer`, in gate sessions and in review-only mode. An earlier round needs one only for the
+  coverage and findings recorded while it was current (a round replaced before anything was recorded in it
+  needs none, and a reviewer that finished after the next round was prepared still counts for its own
+  records). A reviewer must record coverage or a finding before it stops; the hook sends one that did not
+  back to work, once.
 - **No isolation evidence, no claim.** When the platform gives none, the gate still closes, and the
   report carries the `SELF-REVIEWED` banner, whether the review was deep or not.
 - **What it does not assess.** Business-requirement fit, naming quality, and architecture outside the

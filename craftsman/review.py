@@ -100,7 +100,7 @@ from craftsman.records import (
 from craftsman.scout import Scout, parse_target
 from craftsman.text import inline_md, one_line
 from craftsman.usage import usage_json, usage_lines
-from craftsman.workspace import Workspace, end_review_guard, open_workspace
+from craftsman.workspace import Workspace, end_review_guard, open_workspace, touch_review
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
@@ -226,6 +226,7 @@ def _prepare(args: argparse.Namespace) -> int:
 
     before = len(ledger.rounds)
     ledger, round_, created = mutate(ws.ledger_path, open_next)
+    touch_review(ws.ledger_path)
     raised = created and round_.number <= before
     packet = Path(round_.packet_path)
     open_snap = snap.only(round_.open_hunk_ids)

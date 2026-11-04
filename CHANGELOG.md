@@ -6,6 +6,23 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **The host's `/code-review` no longer arms the review stop guard** (nor opens a gate). Only Craftsman's
+  `/craft-review` and `/craftsman:craft-review` do; there is no alias for the old name.
+- **The review stop guard agrees with `craftsman review check --review-only`.** It uses the same isolation
+  evidence (on Copilot, where no session id reaches the CLI, the two used to disagree), and re-running
+  `review prepare` on an unchanged diff or raising its depth counts as starting the review instead of repeating
+  "no review round yet". A session that waits for a background reviewer or verifier is no longer sent back and no
+  longer spends reminders; benchmark reviews used to be stopped 2 to 6 times for that.
+- **Review-only isolation evidence is per review, not per ledger.** A subagent event from an earlier session or
+  platform no longer makes a terminal or hookless review need a reviewer run it can never record; hooks count only
+  for the session that invoked `/craft-review`, or once a subagent event follows the current round.
+- **A replaced round no longer demands a reviewer for good.** An earlier round needs a `craftsman-reviewer` only for
+  the coverage and findings recorded while it was current, and a reviewer that finished after the next round was
+  prepared still counts for what it recorded. A round replaced before any review, with nothing recorded in it, needs
+  nothing; its hunks are open in the next round.
+
 ### Changed
 
 - **BREAKING: the review skill is now `/craft-review`** (was `/code-review`), because Claude Code ships a

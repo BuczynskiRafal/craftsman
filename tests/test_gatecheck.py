@@ -398,7 +398,7 @@ class RoundIsolationTests(unittest.TestCase):
         report = self.check(ledger)
 
         self.assertEqual(codes(report), ["no-isolation"])
-        self.assertIn("Round 1 had hunks to review", report.issues[0].message)
+        self.assertIn("Round 1 recorded coverage or findings", report.issues[0].message)
 
     def test_the_new_hunks_of_a_later_round_need_their_own_reviewer(self) -> None:
         ledger = add_agent_event(self.two_rounds(), reviewer_stop(20))
@@ -407,6 +407,41 @@ class RoundIsolationTests(unittest.TestCase):
 
         self.assertEqual(codes(report), ["no-isolation"])
         self.assertIn("since round 2 was prepared", report.issues[0].message)
+
+    def test_a_round_replaced_before_any_review_needs_no_reviewer(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger, _ = prepared(changed_snap("fp2"), ledger=ledger)
+        ledger = retimed(cover_open_hunks(ledger), rounds=(0, 100), coverage=(110,))
+        ledger = add_agent_event(record_run(ledger, fingerprint="fp2"), reviewer_stop(120))
+
+        report = self.check(ledger)
+
+        self.assertTrue(report.passed, render_report(report))
+
+    def test_a_reviewer_that_outlives_its_round_still_examined_what_it_recorded(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
+        ledger, _ = prepared(changed_snap("fp2"), ledger=ledger)
+        ledger = retimed(cover_open_hunks(ledger), rounds=(0, 100), coverage=(10, 110))
+        started = AgentEvent("copilot", "start", "craftsman-reviewer", "x", shifted(T0, 5))
+        ledger = add_agent_event(add_agent_event(record_run(ledger, fingerprint="fp2"), started), reviewer_stop(120))
+
+        report = self.check(ledger)
+
+        self.assertTrue(report.passed, render_report(report))
+
+    def test_coverage_recorded_outside_any_reviewer_run_still_needs_one(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
+        ledger, _ = prepared(changed_snap("fp2"), ledger=ledger)
+        ledger = retimed(cover_open_hunks(ledger), rounds=(0, 100), coverage=(10, 110))
+        started = AgentEvent("copilot", "start", "craftsman-reviewer", "x", shifted(T0, 105))
+        ledger = add_agent_event(add_agent_event(record_run(ledger, fingerprint="fp2"), started), reviewer_stop(120))
+
+        report = self.check(ledger)
+
+        self.assertEqual(codes(report), ["no-isolation"])
+        self.assertIn("Round 1", report.issues[0].message)
 
     def test_a_reviewer_in_every_round_passes(self) -> None:
         ledger = add_agent_event(add_agent_event(self.two_rounds(), reviewer_stop(20)), reviewer_stop(120))

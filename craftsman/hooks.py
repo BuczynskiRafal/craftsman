@@ -87,6 +87,7 @@ from craftsman.usage import read_usage
 from craftsman.workspace import (
     ReviewMarker,
     Workspace,
+    cli_visible,
     end_review_guard,
     mark_hooks_active,
     read_marker,
@@ -113,6 +114,8 @@ SHELL_TOOLS = frozenset(
 # Characters that a shell or PowerShell would interpret inside a double-quoted argument.
 SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
 REVIEW_GUARD_ACTIONS = 3
+# A subagent that started longer ago and never stopped is taken for dead, not for running.
+AGENT_RUNNING_MAX_AGE = timedelta(minutes=30)
 REVIEW_NOT_STARTED = (
     "No review round yet: run `craftsman review prepare`, launch at least one "
     "craftsman-reviewer subagent on its packet, then record findings and verdicts."
@@ -434,22 +437,48 @@ def on_stop(
     return decision.state, reply.allow()
 
 
-def _review_outcome_issues(session: Session, marker: ReviewMarker) -> list[GateIssue]:
-    """What `craftsman review check --review-only` still lacks for a review begun at `marker`."""
+def _review_outcome_issues(session: Session, marker: ReviewMarker, caller: GateOwner) -> list[GateIssue]:
+    """What `craftsman review check --review-only` still lacks for a review begun at `marker`.
+
+    Judged by the same rules and evidence as that command, as it runs for `caller`'s session.
+    """
     ledger = load(session.ledger_path)
     started = parse_timestamp(marker.at)
     latest = ledger.rounds[-1] if ledger.rounds else None
     touched = latest is not None and (
-        parse_timestamp(latest.prepared_at) >= started
+        (marker.touched_at is not None and parse_timestamp(marker.touched_at) >= started)
+        or parse_timestamp(latest.prepared_at) >= started
         or any(parse_timestamp(item.recorded_at) >= started for item in ledger.coverage)
         or any(parse_timestamp(item.recorded_at) >= started for item in ledger.findings)
     )
     if not touched:
         return [GateIssue("no-round", REVIEW_NOT_STARTED)]
     workspace = Workspace(session.root, None, session.ledger_path)
-    policy = GatePolicy(deep=effective_deep(ledger), isolation_evidence="hooks")
+    policy = GatePolicy(
+        deep=effective_deep(ledger),
+        isolation_evidence=workspace.isolation_evidence(ledger, cli_visible(caller)),
+    )
     snap = workspace.snapshot(ledger)
     return list(evaluate(ledger, snap, policy, review_only=True).issues)
+
+
+def _agent_running(ledger: Ledger, since: datetime) -> bool:
+    """Whether a Craftsman reviewer or verifier started after `since` and has not stopped yet."""
+    now = datetime.now(timezone.utc)
+    for event in ledger.agents:
+        if event.event != "start" or agent_role(event.agent) is None:
+            continue
+        started = parse_timestamp(event.at)
+        if started < since or now - started > AGENT_RUNNING_MAX_AGE:
+            continue
+        if not any(
+            other.event == "stop"
+            and (other.agent_id == event.agent_id if event.agent_id else other.agent == event.agent)
+            and parse_timestamp(other.at) >= started
+            for other in ledger.agents
+        ):
+            return True
+    return False
 
 
 def review_stop_guard(session: Session, reply: Reply, caller: GateOwner) -> Output:
@@ -463,12 +492,16 @@ def review_stop_guard(session: Session, reply: Reply, caller: GateOwner) -> Outp
     if marker is None or not marker.guarding or not marker.is_of(caller):
         return reply.allow()
     try:
-        issues = _review_outcome_issues(session, marker)
+        issues = _review_outcome_issues(session, marker, caller)
     except (DiffScanError, LedgerError, GateStateError) as exc:
         end_review_guard(session.ledger_path, caller)
         return notice(reply, f"Craftsman review guard could not check the review ({exc}); not enforced.")
     if not issues:
         end_review_guard(session.ledger_path, caller)
+        return reply.allow()
+    if _agent_running(load(session.ledger_path), parse_timestamp(marker.at)):
+        # Background subagents report back when they finish and wake the session; a block now
+        # would only burn reminders while the agent waits for them.
         return reply.allow()
     count = len(issues)
     forced = 0 if marker.best is not None and count < marker.best else marker.forced

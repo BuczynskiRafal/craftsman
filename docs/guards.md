@@ -34,6 +34,23 @@ unverified, or failing tests:
 - **Fail-closed posture**: Malformed or unreadable gate states cause immediate warnings, while tool permission checks
   fail closed to protect the repository.
 
+### Review stop guard
+
+`/craft-review` has no gate, so the prompt hook leaves a marker (`review_hooks.json`, next to the ledger) for the
+session that invoked it, and the Stop hook holds that session to the review-only outcome. Only Craftsman's own
+`/craft-review` arms it; the host agent's built-in `/code-review` neither arms it nor opens a gate.
+
+- The guard judges the review with the same rules and the same isolation evidence as
+  `craftsman review check --review-only`. Hooks count as evidence when the marker names the session the command runs in
+  (Claude Code only; other platforms export no session id to commands) or when a reviewer or verifier event arrived
+  after the current round was prepared. Events of an earlier session prove nothing about this one.
+- Running `craftsman review prepare` counts as starting the review even when the diff is unchanged or the depth was
+  only raised.
+- While a Craftsman reviewer or verifier that started in this review has not stopped (a background subagent), the guard
+  lets the agent wait for it: its completion wakes the session, and no reminder is spent.
+- Otherwise a review with hunks uncovered, findings without a verdict or no reviewer run is sent back, up to six
+  times without progress.
+
 ---
 
 ## Work-tree Mutation Guard

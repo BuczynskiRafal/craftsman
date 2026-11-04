@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from craftsman.trigger import MAX_TASK_CHARS, detect_trigger, task_from_prompt
+from craftsman.trigger import MAX_TASK_CHARS, detect_trigger, is_review_prompt, task_from_prompt
 
 
 class DetectTriggerTests(unittest.TestCase):
@@ -48,6 +48,15 @@ class DetectTriggerTests(unittest.TestCase):
         ):
             with self.subTest(prompt=prompt):
                 self.assertIsNone(detect_trigger(prompt))
+
+    def test_only_craft_review_is_the_guarded_review_command(self) -> None:
+        for prompt in ("/craft-review the cart", "/craftsman:craft-review", "<command-name>/craft-review</command-name>"):
+            with self.subTest(prompt=prompt):
+                self.assertTrue(is_review_prompt(prompt))
+        for prompt in ("/code-review max", "/clear /code-review", "<command-name>/code-review</command-name>"):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(is_review_prompt(prompt))
+                self.assertIsNone(detect_trigger(prompt))  # the host's command is not ours either
 
     def test_unknown_flag_is_not_deep(self) -> None:
         self.assertIs(detect_trigger("/craftsman --soft fix"), False)
