@@ -120,6 +120,28 @@ class RequestTests(AntigravityTestCase):
         assert state is not None
         self.assertEqual((state.owner, state.deep, state.task), (self.caller, True, "add totals"))
 
+    def test_later_deep_request_raises_an_active_gate(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=self.caller, request_step=1)
+        self.write_transcript(user_input(1, "/craftsman fix a"), user_input(4, "now /craftsman --deep"))
+        self.repo.write_lines("app.py", 5)
+
+        self.stop()
+
+        state = self.stored()
+        assert state is not None
+        self.assertTrue(state.deep)
+
+    def test_later_plain_request_leaves_an_active_gate_alone(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=self.caller, request_step=1)
+        self.write_transcript(user_input(1, "/craftsman fix a"), user_input(4, "/craftsman fix b"))
+        self.repo.write_lines("app.py", 5)
+
+        self.stop()
+
+        state = self.stored()
+        assert state is not None
+        self.assertFalse(state.deep)
+
     def test_request_without_changes_opens_no_gate(self) -> None:
         self.write_transcript(user_input(1, "/craftsman add totals"))
         self.assertEqual(self.stop()[0], {"decision": "allow"})

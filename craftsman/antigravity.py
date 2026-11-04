@@ -117,7 +117,7 @@ def _opened_by_request(
 ) -> GateState | None:
     """The gate, opened for a `/craftsman` request the agent did not open a gate for."""
     if state is not None and state.active:
-        return state
+        return _raised_by_request(state, entries)
     if state is not None and state.owner.admits(caller):
         if state.request_step is None:
             # Closed with `craftsman gate --complete` before any stop: the request was handled.
@@ -135,6 +135,18 @@ def _opened_by_request(
         return state  # nothing changed yet, so there is nothing to gate
     archive_ledger_for_new_base(root, base_sha)
     return GateState.open(caller, base_sha, deep, task_from_prompt(prompt), request_step=step)
+
+
+def _raised_by_request(state: GateState, entries: Sequence[Entry]) -> GateState:
+    """An active gate, made deep when a later user input asked for `/craftsman --deep` or `ultracraft`."""
+    if state.deep or state.request_step is None:
+        return state
+    for position, entry in enumerate(entries, 1):
+        if step_of(entry, position) <= state.request_step or entry.get("type") != "USER_INPUT":
+            continue
+        if detect_trigger(str(entry.get("content") or "")) is True:
+            return replace(state, deep=True)
+    return state
 
 
 def _latest_trigger(entries: Sequence[Entry], after_step: int) -> tuple[int, bool, str] | None:
