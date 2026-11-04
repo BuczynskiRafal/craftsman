@@ -1,0 +1,28 @@
+{
+  "defects": [
+    {
+      "id": "att-1",
+      "kind": "path-traversal",
+      "summary": "_file joins the user-supplied name onto the ticket directory after stripping only leading slashes; '../OPS-7/x' or '../../x' escapes the ticket directory for save, read and delete (the base version used Path(name).name).",
+      "locations": [{"file": "attach/store.py", "start": 23, "end": 27}]
+    },
+    {
+      "id": "att-2",
+      "kind": "platform-dependence",
+      "summary": "list() builds names with str(relative_to(...)), which uses backslashes on Windows, contradicting the '/'-everywhere requirement; export_zip reuses those names as archive member names.",
+      "locations": [{"file": "attach/store.py", "start": 42, "end": 42}]
+    }
+  ],
+  "decoys": [
+    {
+      "id": "att-d1",
+      "summary": "The zip members get a fixed 1980 timestamp instead of the file mtime on purpose: the task requires byte-identical archives for identical contents.",
+      "locations": [{"file": "attach/store.py", "start": 51, "end": 51}]
+    },
+    {
+      "id": "att-d2",
+      "summary": "The ticket id is validated with a strict fullmatch regex before it is joined to the root; this is what keeps the ticket part of the path safe.",
+      "locations": [{"file": "attach/store.py", "start": 18, "end": 21}]
+    }
+  ]
+}

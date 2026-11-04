@@ -1,0 +1,39 @@
+{
+  "defects": [
+    {
+      "id": "q-1",
+      "kind": "cache-key-missing-param",
+      "summary": "The quote cache is still keyed by (sku, qty), so after quoting in EUR the same sku/qty in USD (or PLN) returns the cached EUR amount, and the first currency asked wins.",
+      "locations": [
+        {"file": "quotes/pricing.py", "start": 44, "end": 49}
+      ]
+    },
+    {
+      "id": "q-2",
+      "kind": "swallowed-error",
+      "summary": "_convert catches KeyError/OSError from the rate lookup and returns the unconverted USD amount; the task requires RateUnavailable, so an outage silently yields a quote in the wrong currency (RateUnavailable is never raised).",
+      "locations": [
+        {"file": "quotes/pricing.py", "start": 67, "end": 71},
+        {"file": "quotes/pricing.py", "start": 21, "end": 24}
+      ]
+    },
+    {
+      "id": "q-3",
+      "kind": "aliasing",
+      "summary": "summarize() has unknown: list[str] = [] as its default and appends to it, so unknown SKUs of earlier calls leak into the Summary of later calls that did not pass a list.",
+      "locations": [{"file": "quotes/pricing.py", "start": 76, "end": 85}]
+    }
+  ],
+  "decoys": [
+    {
+      "id": "q-d1",
+      "summary": "USD is returned before any rate lookup: USD is the base currency, so no rate is needed (the task says so).",
+      "locations": [{"file": "quotes/pricing.py", "start": 65, "end": 66}]
+    },
+    {
+      "id": "q-d2",
+      "summary": "The bulk discount applies from exactly 10 units (>=, as in the base tests) and the quantity is rounded with Decimal half-even; unchanged, correct code the diff only moves the conversion after.",
+      "locations": [{"file": "quotes/pricing.py", "start": 59, "end": 62}]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "defects": [
+    {
+      "id": "kv-1",
+      "kind": "non-atomic-write",
+      "summary": "save() writes a temp file and then copies it over the target with copyfile, which truncates and rewrites the destination in place; a crash mid-copy leaves a half-written file (os.replace is the atomic step).",
+      "locations": [{"file": "kvstore/store.py", "start": 57, "end": 61}]
+    },
+    {
+      "id": "kv-2",
+      "kind": "aliasing",
+      "summary": "snapshot() builds a new dict but reuses the stored entry dicts, so mutating a stored list/dict value (or the entry) after the snapshot changes the snapshot; it needs a deep copy.",
+      "locations": [{"file": "kvstore/store.py", "start": 50, "end": 52}]
+    }
+  ],
+  "decoys": [
+    {
+      "id": "kv-d1",
+      "summary": "_load returns silently on FileNotFoundError: a store whose file does not exist yet is simply empty; other errors (corrupt JSON) still propagate.",
+      "locations": [{"file": "kvstore/store.py", "start": 23, "end": 27}]
+    },
+    {
+      "id": "kv-d2",
+      "summary": "Namespace.keys slices off len(prefix) characters; the prefix includes the colon and startswith(prefix) guards the slice, so 'users2:x' is not listed under 'users'.",
+      "locations": [{"file": "kvstore/store.py", "start": 80, "end": 82}]
+    }
+  ]
+}
