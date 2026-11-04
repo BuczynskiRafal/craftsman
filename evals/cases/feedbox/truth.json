@@ -1,0 +1,65 @@
+{
+  "size": "large",
+  "defects": [
+    {
+      "id": "fb-1",
+      "kind": "path-traversal",
+      "summary": "article_path puts the articles in a folder named after the raw feed name, which comes from the feed's <title>; a feed called '../../x' (or an absolute path) makes export write outside DEST, and a name is not slugified as the task requires.",
+      "locations": [{"file": "feedbox/exporter.py", "start": 37, "end": 37}]
+    },
+    {
+      "id": "fb-2",
+      "kind": "platform-dependence",
+      "summary": "write_index builds the link with str(path.relative_to(dest)), which uses backslashes on Windows although the task wants forward slashes (as_posix).",
+      "locations": [{"file": "feedbox/exporter.py", "start": 54, "end": 54}]
+    },
+    {
+      "id": "fb-3",
+      "kind": "aliasing",
+      "summary": "Library.add_feed has a mutable default 'tags=[]' that is stored as the new feed's tags, so every feed added without tags (as 'import' does) shares one list and 'feedbox tag' on one of them tags all of them.",
+      "locations": [{"file": "feedbox/store.py", "start": 52, "end": 55}]
+    },
+    {
+      "id": "fb-4",
+      "kind": "help-contradicts-code",
+      "summary": "The --format help says md is the default and the task requires it, but the argument's default is html.",
+      "locations": [{"file": "feedbox/cli.py", "start": 53, "end": 53}]
+    },
+    {
+      "id": "fb-5",
+      "kind": "qualifier-not-implemented",
+      "summary": "--tag is documented and specified as 'every given tag', but select keeps an article when its feed has any of the tags ('wanted & set(owner.tags)').",
+      "locations": [
+        {"file": "feedbox/query.py", "start": 36, "end": 39},
+        {"file": "feedbox/cli.py", "start": 27, "end": 27}
+      ]
+    },
+    {
+      "id": "fb-6",
+      "kind": "incomplete-propagation",
+      "summary": "The new Article.author is read by the parser and written by the exporter, but the library's article (de)serialization lists the fields by hand and does not include it, so every author is lost when the library is saved and loaded again.",
+      "locations": [
+        {"file": "feedbox/store.py", "start": 12, "end": 21},
+        {"file": "feedbox/store.py", "start": 24, "end": 27},
+        {"file": "feedbox/model.py", "start": 24, "end": 24}
+      ]
+    }
+  ],
+  "decoys": [
+    {
+      "id": "fb-d1",
+      "summary": "slugify falls back to 'untitled' when nothing is left after cleaning; that is a deliberate file name fallback, not a value mistaken for missing.",
+      "locations": [{"file": "feedbox/slug.py", "start": 11, "end": 11}]
+    },
+    {
+      "id": "fb-d2",
+      "summary": "unique_path checks exists() before the caller writes; the library is a single-user command line tool and the task only asks that existing files are not overwritten.",
+      "locations": [{"file": "feedbox/exporter.py", "start": 44, "end": 46}]
+    },
+    {
+      "id": "fb-d3",
+      "summary": "parse_tags checks 'tag not in tags' on a list; the lists are a handful of items and the check keeps the order of first appearance, as a set would not.",
+      "locations": [{"file": "feedbox/tags.py", "start": 17, "end": 18}]
+    }
+  ]
+}
