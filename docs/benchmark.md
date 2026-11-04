@@ -23,8 +23,9 @@ controls.
 
 ## Antigravity Pilot Results
 
-Each configuration evaluated the pull requests under identical conditions: once in an unassisted baseline run and once
-using Craftsman's `/code-review` protocol.
+These numbers were measured on the earlier, 4.x `/code-review` protocol (the skill is `/craft-review` since
+Craftsman 5), not on the current one. Each configuration evaluated the pull requests under identical conditions: once in
+an unassisted baseline run and once using that protocol. The seeded suite below is what to use for the current protocol.
 
 | Agent & Configuration | Without Craftsman | With Craftsman | Defects Found | Avg Time / PR | Findings |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -79,15 +80,15 @@ defaults, cache keys missing a new parameter, platform dependence, path traversa
 code, and a qualifier of the task that is not implemented.
 
 ```bash
-python3 evals/run.py list
-python3 evals/run.py prepare quotes ~/evals/quotes-1   # git repo: base committed, change uncommitted
-# review it with /code-review, or with the baseline prompt from evals/README.md
-python3 evals/run.py score quotes ~/evals/quotes-1     # recall, unmatched findings, decoy hits
+python3 -m evals.run list
+python3 -m evals.run prepare quotes ~/evals/quotes-1   # git repo: base committed, change uncommitted
+# review it with /craft-review, or with the baseline prompt from evals/README.md
+python3 -m evals.run score quotes ~/evals/quotes-1     # recall, unmatched findings, decoy hits
 ```
 
 `score` reads the findings from the Craftsman ledger or, for a baseline run, from a JSON list of
 `{"file", "line", "title"}`. A finding matches a defect when it is in the same file and within 3 lines of the seeded
-location; findings the review dismissed are ignored. Compare the recall of `/code-review` and of a plain review on
+location (fewer when another seeded item is close, so that neighbouring defects cannot be credited by one finding); findings the review dismissed are ignored. Compare the recall of `/craft-review` and of a plain review on
 the same model, with at least three repetitions per arm: the suite is small, so single runs are anecdotes. How to run
 each arm, the exact baseline prompt, the scoring rules and how to add a case are in the
 [evals README](../evals/README.md).
@@ -129,7 +130,7 @@ Researchers and developers are encouraged to replicate these findings or contrib
 
 1. Obtain instance definitions from [SWR-Bench](https://github.com/ZZR0/SWRench) (`data/swr_datasets_d5c5.jsonl`).
 2. Run baseline reviews without Craftsman hooks or skills.
-3. Run reviews under `/code-review` with the evidence ledger enabled.
+3. Run reviews under `/craft-review` with the evidence ledger enabled.
 4. Compare reported findings and verifier logs against the ground-truth annotations.
 5. Share replication results in GitHub Discussions under the **Benchmark replications** category.
 
