@@ -83,7 +83,7 @@ LENSES: tuple[Lens, ...] = (
         title="Test evidence",
         focus="Would the tests fail if the changed behavior broke, and do they hit risky paths?",
         always="core lens",
-        triggers=frozenset({"tests"}),
+        triggers=frozenset(),
     ),
     Lens(
         id="platform",
@@ -140,11 +140,12 @@ def select_lenses(
     """Suggest the lenses for a change, in catalog order, each with the reasons behind it.
 
     Every non-docs change gets the core and simplicity lenses; a lens whose risk signals fired
-    is added with the hunks that fired it; a deep round suggests every lens.
+    is added with the hunks that fired it; a deep round suggests every lens, a docs-only change
+    included.
     """
     picks: list[LensPick] = []
     for lens in LENSES:
-        if docs_only:
+        if docs_only and not deep:
             reasons = ["docs-only change"] if lens.id in _DOCS_ONLY_LENSES else []
         else:
             reasons = _reasons(lens, signals, deep=deep)

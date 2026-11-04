@@ -331,7 +331,7 @@ class IsolationTests(unittest.TestCase):
         self.assertTrue(report.passed, render_report(report))
 
     def test_a_diff_without_hunks_needs_no_reviewer(self) -> None:
-        snap = DiffSnapshot(BASE_SHA, "fp1", (), ("logo.png",), (), 0, 0)
+        snap = DiffSnapshot(BASE_SHA, "fp1", (), ("logo.png",), 0, 0)
         ledger, _ = prepared(snap)
 
         report = evaluate(record_run(ledger), snap, ISOLATED)

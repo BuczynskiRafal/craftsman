@@ -86,7 +86,8 @@ class PlaybookTests(unittest.TestCase):
         result = self.skill_show("craft-review", "--lenses", "R1")
 
         self.assertNotEqual(result.code, 0)
-        self.assertIn("unknown lens 'R1'", result.err)
+        self.assertIn("unknown lens 'R1': reviewer groups were removed, name lens ids", result.err)
+        self.assertIn("(valid lenses: intent, contracts,", result.err)
 
     def test_single_lens_output_is_small_fraction_of_full_file(self) -> None:
         for lens in LENSES:

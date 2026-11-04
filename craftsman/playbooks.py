@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 
-from craftsman.lenses import LENSES, get_lens
+from craftsman.lenses import LENS_IDS, LENSES, get_lens
 
 CRAFT_REVIEW_SKILL = "craft-review"
 LENSES_FILENAME = "lenses.md"
@@ -75,11 +75,18 @@ def expand_playbook_lenses(raw: str) -> tuple[str, ...]:
     valid = ", ".join(lens.id for lens in LENSES)
     if not tokens:
         raise ValueError(f"--lenses must name at least one lens (valid lenses: {valid})")
-    known = {lens.id for lens in LENSES}
-    unknown = next((token for token in tokens if token not in known), None)
+    unknown = next((token for token in tokens if token not in LENS_IDS), None)
     if unknown is not None:
-        raise ValueError(f"unknown lens {unknown!r} (valid lenses: {valid})")
-    return tuple(lens.id for lens in LENSES if lens.id in set(tokens))
+        raise ValueError(f"unknown lens {unknown!r}{_removed_group_note(unknown)} (valid lenses: {valid})")
+    wanted = set(tokens)
+    return tuple(lens.id for lens in LENSES if lens.id in wanted)
+
+
+def _removed_group_note(token: str) -> str:
+    """Tell a stale prompt that the reviewer groups (`R1`..`R4`) are gone and lens ids replace them."""
+    if re.fullmatch(r"R\d+", token, re.IGNORECASE):
+        return ": reviewer groups were removed, name lens ids"
+    return ""
 
 
 def lens_playbooks(lenses_md: str, lens_ids: Sequence[str]) -> str:

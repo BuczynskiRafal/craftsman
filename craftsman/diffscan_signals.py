@@ -226,3 +226,51 @@ CONTENT_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
         re.VERBOSE,
     ),
 }
+
+# What suggests a deep round: the patterns of the security and concurrency signals that name a real
+# call or usage. Bare words (`token`, `session`) and the everyday `subprocess.run`, `await` and
+# `Promise` stay out; they are in `CONTENT_SIGNAL_PATTERNS` only to pick lenses.
+DEEP_HINT_PATTERNS: dict[str, re.Pattern[str]] = {
+    "process": re.compile(
+        r"""
+        \bshell\s*=\s*True\b                                          # Python subprocess shell=True
+        | \bos\.(?:system|popen)\s*\(                                # Python shell-string spawners
+        | \b(?:execSync|spawnSync)\b                                  # Node.js synchronous shell helpers
+        | Runtime\.getRuntime\(\)\.exec                              # Java Runtime.exec
+        | \bProcessBuilder\b                                          # Java ProcessBuilder
+        | ["'](?:sh|bash|cmd(?:\.exe)?)["']\s*,\s*["'](?:-c|/c)["']    # an explicit shell -c command
+        """,
+        re.VERBOSE,
+    ),
+    "sql": CONTENT_SIGNAL_PATTERNS["sql"],
+    "deserialization": CONTENT_SIGNAL_PATTERNS["deserialization"],
+    "auth": re.compile(
+        r"""
+        \b(?:
+            jwt\.(?:encode|decode)
+            | hmac\.compare_digest
+            | set_cookie
+            | (?:check|verify|validate|hash|compare|decode)_(?:password|passwd|token|signature|credentials?|permissions?)
+            | (?:authenticate|authorize)\w*
+        )\s*\(                                                        # an authentication or permission call
+        | @(?:login|permission|auth\w*)_required\b                    # an access-control decorator
+        | \bBearer\s                                                  # bearer-token header
+        """,
+        re.VERBOSE,
+    ),
+    "concurrency": re.compile(
+        r"""
+        \bthreading\.                                                 # Python threads and locks
+        | \bThread\s*\(                                              # Thread(...)
+        | \bR?Lock\s*\(                                              # Lock() / RLock()
+        | \bSemaphore\s*\(                                           # Semaphore(...)
+        | \bmultiprocessing\.                                         # Python multiprocessing
+        | \bconcurrent\.futures\b                                    # executors
+        | \bgo\s+func\b                                              # Go goroutine
+        | \bsync\.(?:Mutex|RWMutex|WaitGroup|Once)\b                 # Go sync primitives
+        | \bsynchronized\b                                            # Java synchronized
+        | \bpthread_\w+                                               # POSIX threads
+        """,
+        re.VERBOSE,
+    ),
+}

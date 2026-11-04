@@ -80,10 +80,6 @@ def packet_path(ledger_path: Path, round_number: int) -> Path:
     return ledger_path.parent / f"packet-{round_number}.md"
 
 
-def inbox_dir_for(craftsman_dir: Path) -> Path:
-    return craftsman_dir / INBOX_DIRNAME
-
-
 def _has_link_reparse_tag(st: os.stat_result) -> bool:
     return getattr(st, "st_reparse_tag", 0) in _LINK_REPARSE_TAGS
 

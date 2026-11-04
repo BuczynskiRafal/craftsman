@@ -13,14 +13,17 @@ from craftsman.diffscan import (
     DiffScanError,
     Hunk,
     WorktreeIndex,
+    detect_deep_hint_signals,
     detect_signals,
     files_without_signal_patterns,
     git_dir,
+    hunks_docs_only,
+    is_agent_prompt_path,
     resolve_base_sha,
     snapshot,
 )
 
-from tests.support import GitRepo, change_hunk, make_snap
+from tests.support import GitRepo, change_hunk, make_hunk, make_snap
 
 
 def numbered_lines(count: int, prefix: str = "line") -> str:
@@ -90,7 +93,6 @@ class SnapshotTests(RepoTestCase):
         self.repo.write("logo.bin", b"\x00\x01three")
         second = snapshot(self.repo.root, base)
 
-        self.assertEqual(first.skipped, ("logo.bin", "new.bin"))
         self.assertEqual([hunk.lines for hunk in first.hunks], [("~ binary file changed",)] * 2)
         self.assertEqual((first.hunks[0].new_start, first.hunks[0].new_len), (0, 0))
         self.assertNotEqual(first.hunks[0].digest, second.hunks[0].digest)
@@ -135,7 +137,6 @@ class SnapshotTests(RepoTestCase):
         snap = snapshot(self.repo.root, base)
 
         self.assertEqual(snap.files, ("empty.txt", "huge.log"))
-        self.assertEqual(snap.skipped, ("huge.log",))
         self.assertEqual(snap.hunks[0].lines, ("~ empty file added",))
         self.assertEqual(snap.hunks[1].lines, ("~ file too large to inline: 1048577 bytes",))
         self.assertFalse(snap.is_empty)
@@ -1218,6 +1219,80 @@ class DocsClassificationTests(RepoTestCase):
 
         self.assertTrue(snap.docs_only)
         self.assertEqual(detect_signals(snap.hunks), {"docs": ("H1",)})
+
+
+class AgentPromptTests(unittest.TestCase):
+    def test_agent_prompt_files_are_recognised(self) -> None:
+        for path in (
+            "skills/x/SKILL.md",
+            "AGENTS.md",
+            "sub/CLAUDE.md",
+            "GEMINI.md",
+            "rules/ultra_mode.md",
+            "pkg/rules/nested/style.md",
+            "agents/reviewer.md",
+            "templates/agents/craftsman.md",
+            ".claude-plugin/agents/craftsman.md",
+            ".github/copilot-instructions.md",
+            "review.prompt.md",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(is_agent_prompt_path(path))
+
+    def test_other_prose_is_not(self) -> None:
+        for path in ("README.md", "docs/usage.md", "CHANGELOG.md", "notes.txt", "rules/engine.py"):
+            with self.subTest(path=path):
+                self.assertFalse(is_agent_prompt_path(path))
+
+    def test_a_prompt_file_change_is_not_docs_only(self) -> None:
+        readme = make_hunk("H1", "README.md")
+        skill = make_hunk("H2", "skills/x/SKILL.md")
+
+        self.assertTrue(hunks_docs_only([readme]))
+        self.assertFalse(hunks_docs_only([readme, skill]))
+        self.assertFalse(make_snap(skill).docs_only)
+        self.assertFalse(hunks_docs_only([]))
+
+
+class SnapshotOnlyTests(unittest.TestCase):
+    def test_only_keeps_the_named_hunks_and_recounts(self) -> None:
+        a = make_hunk("H1", "a.py", ("+one", "+two"))
+        b = make_hunk("H2", "b.py", ("-gone", "+new"))
+        c = make_hunk("H3", "a.py", ("+three",))
+        snap = make_snap(a, b, c)
+
+        part = snap.only({"H2", "H3"})
+
+        self.assertEqual([hunk.id for hunk in part.hunks], ["H2", "H3"])
+        self.assertEqual(part.files, ("a.py", "b.py"))
+        self.assertEqual((part.added, part.deleted), (2, 1))
+        self.assertEqual(part.fingerprint, snap.fingerprint)
+        self.assertEqual(snap.only(()).files, ())
+
+
+class DeepHintSignalTests(unittest.TestCase):
+    def fired(self, path: str, *added: str) -> dict[str, tuple[str, ...]]:
+        return detect_deep_hint_signals([make_hunk("H1", path, [f"+{line}" for line in added])])
+
+    def test_bare_words_do_not_fire(self) -> None:
+        self.assertEqual(self.fired("app.py", "def f(token, session_id, secret):", "    return token"), {})
+
+    def test_everyday_subprocess_calls_do_not_fire_but_a_shell_does(self) -> None:
+        self.assertEqual(self.fired("app.py", "subprocess.run(cmd, check=True)"), {})
+        self.assertEqual(self.fired("app.py", "subprocess.run(cmd, shell=True)"), {"process": ("H1",)})
+
+    def test_real_security_and_concurrency_usage_fires(self) -> None:
+        self.assertEqual(self.fired("app.py", "verify_token(request.token)"), {"auth": ("H1",)})
+        self.assertEqual(self.fired("app.py", "t = threading.Thread(target=run)"), {"concurrency": ("H1",)})
+        self.assertEqual(self.fired("app.py", "pickle.loads(blob)"), {"deserialization": ("H1",)})
+
+    def test_awaiting_alone_is_not_concurrency(self) -> None:
+        self.assertEqual(self.fired("app.py", "async def get():", "    return await fetch()"), {})
+
+    def test_tests_config_and_docs_are_ignored(self) -> None:
+        for path in ("tests/test_auth.py", "test_x.py", "config.yaml", "settings.json", "README.md"):
+            with self.subTest(path=path):
+                self.assertEqual(self.fired(path, "verify_token(t)", "os.system(cmd)"), {})
 
 
 if __name__ == "__main__":

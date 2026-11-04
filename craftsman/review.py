@@ -17,6 +17,7 @@ from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
     WorktreeIndex,
+    detect_deep_hint_signals,
     detect_signals,
     files_without_signal_patterns,
     snapshot,
@@ -82,11 +83,16 @@ from craftsman.records import (
     Finding,
     Ledger,
     LedgerError,
+    MultiFieldError,
     Round,
     Run,
+    Severity,
+    Verdict,
     as_choice,
+    check_coverage_note,
+    collecting_problems,
 )
-from craftsman.text import inline_md
+from craftsman.text import inline_md, one_line
 from craftsman.workspace import Workspace, open_workspace
 
 PROG = "craftsman review"
@@ -118,6 +124,7 @@ FIELD_FLAGS = {
 }
 S = TypeVar("S", bound=str)
 R = TypeVar("R")
+T = TypeVar("T")
 JSON_FIELD_NAMES = {
     "path": "file",
     "verdict": "as",
@@ -184,24 +191,33 @@ def _prepare(args: argparse.Namespace) -> int:
         print("Gate raised to deep: a passing end-to-end run is now required.")
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    signals = collect_quality_signals(ws.root, snap)
 
     def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
         packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
         out_of_scope = tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else ()
         updated, round_ = open_round(
             current, snap, deep, str(packet), symbols,
-            signals=signals, scope=scope, allow_scope_expansion=allow_scope_expansion,
-            out_of_scope=out_of_scope,
+            scope=scope, allow_scope_expansion=allow_scope_expansion, out_of_scope=out_of_scope,
         )
+        if len(updated.rounds) > len(current.rounds):
+            # Carried hunks were reviewed already; the hints are about the code still to review.
+            hints = collect_quality_signals(ws.root, snap.only(round_.open_hunk_ids))
+            round_ = replace(round_, signals=hints)
+            updated = replace(updated, rounds=(*updated.rounds[:-1], round_))
         return updated, (updated, round_, updated is not current)
 
     ledger, round_, created = mutate(ws.ledger_path, open_next)
     packet = Path(round_.packet_path)
+    open_snap = snap.only(round_.open_hunk_ids)
+    open_signals = detect_signals(open_snap.hunks)
+    picks = select_lenses(open_signals, deep=round_.deep, docs_only=open_snap.docs_only)
     if created or not packet.is_file():
-        ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=args.task or ws.task)
+        ctx = _packet_context(
+            ws, snap, ledger, round_, index, symbols, task=args.task or ws.task, picks=picks
+        )
         _write_text(packet, render_packet(ctx))
-    _print_prepare_summary(round_, packet, snap, created=created)
+    hint = None if round_.deep else deep_hint(detect_deep_hint_signals(open_snap.hunks))
+    _print_prepare_summary(round_, packet, snap, picks, hint, created=created)
     _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if created:
@@ -420,8 +436,12 @@ def _print_scope_summary(
             )
 
 
-def _lens_picks(deep: bool, snap: DiffSnapshot) -> tuple[LensPick, ...]:
-    return select_lenses(detect_signals(snap.hunks), deep=deep, docs_only=snap.docs_only)
+def _lens_picks(round_: Round, snap: DiffSnapshot) -> tuple[LensPick, ...]:
+    """The lenses suggested for the hunks still open in `round_`; carried hunks were reviewed."""
+    open_snap = snap.only(round_.open_hunk_ids)
+    return select_lenses(
+        detect_signals(open_snap.hunks), deep=round_.deep, docs_only=open_snap.docs_only
+    )
 
 
 def _print_unscanned_files(snap: DiffSnapshot) -> None:
@@ -447,13 +467,14 @@ def _packet_context(
     symbols: Mapping[str, tuple[str, ...]],
     *,
     task: str,
+    picks: Sequence[LensPick] | None = None,
 ) -> PacketContext:
     """What the packet of `round_` shows, with the lenses suggested for the round."""
     return collect_context(
         ws.root,
         snap,
         round_,
-        _lens_picks(round_.deep, snap),
+        _lens_picks(round_, snap) if picks is None else picks,
         task,
         symbols=symbols,
         ledger=ledger,
@@ -461,7 +482,15 @@ def _packet_context(
     )
 
 
-def _print_prepare_summary(round_: Round, packet: Path, snap: DiffSnapshot, *, created: bool) -> None:
+def _print_prepare_summary(
+    round_: Round,
+    packet: Path,
+    snap: DiffSnapshot,
+    picks: Sequence[LensPick],
+    hint: str | None,
+    *,
+    created: bool,
+) -> None:
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
     changed = snap.added + snap.deleted
     deep = " (deep)" if round_.deep else ""
@@ -472,13 +501,12 @@ def _print_prepare_summary(round_: Round, packet: Path, snap: DiffSnapshot, *, c
     )
     print(f"Packet: {packet}")
     print("Risk map (suggested lenses):")
-    for pick in _lens_picks(round_.deep, snap):
+    for pick in picks:
         print(f"  {pick.lens.id} — {pick.reason}")
     if round_.signals:
         print("Quality hints:")
         for sig in round_.signals:
             print(f"  {sig.id} {sig.kind.value} {sig.file}:{sig.line} — {sig.detail}")
-    hint = None if round_.deep else deep_hint(detect_signals(snap.hunks))
     if hint is not None:
         print(hint)
     warning = large_diff_warning(round_)
@@ -583,6 +611,54 @@ def _entry_label(raw: Any, key: str) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+class _EntryReader:
+    """Reads one `--from-json` entry and keeps every problem, so a rejected batch lists them all."""
+
+    def __init__(self, raw: Any) -> None:
+        self.fields = Fields(raw)
+        self.errors: list[LedgerError] = []
+        self._failed: set[str] = set()
+
+    def read(self, key: str, get: Callable[[Fields], T], fallback: T) -> T:
+        try:
+            return get(self.fields)
+        except FieldError as exc:
+            self.errors.append(exc)
+            self._failed.add(key)
+            return fallback
+
+    def failed(self, *keys: str) -> bool:
+        return any(key in self._failed for key in keys)
+
+    def reject_unknown(self) -> None:
+        self.errors.extend(
+            FieldError(key, "is not a known field") for key in self.fields.unknown_fields()
+        )
+
+    def finish(self, step: Callable[[list[LedgerError]], R | None]) -> R:
+        """Run `step` with the problems of the semantic checks collected next to the field problems."""
+        with collecting_problems() as sink:
+            try:
+                result = step(sink)
+            except LedgerError as exc:
+                sink.append(exc)
+                result = None
+        errors = [*self.errors, *sink]
+        if not errors and result is not None:
+            return result
+        if not errors:
+            raise LedgerError("the entry was not recorded")
+        raise errors[0] if len(errors) == 1 else MultiFieldError(errors)
+
+
+def _attempt(sink: list[LedgerError], get: Callable[[], T], fallback: T) -> T:
+    try:
+        return get()
+    except LedgerError as exc:
+        sink.append(exc)
+        return fallback
+
+
 def _entry_problem(index: int, label: str | None, exc: LedgerError) -> EntryProblem:
     field = JSON_FIELD_NAMES.get(exc.field, exc.field)
     problem = exc.problem if isinstance(exc, FieldError) else str(exc)
@@ -595,7 +671,6 @@ def _record_entries(
     current: Ledger,
     label_for: Callable[[int, Any], str | None],
     record_one: Callable[[int, Ledger, Any], tuple[Ledger, R]],
-    on_rejected: Callable[[int, Any], None] | None = None,
 ) -> tuple[Ledger, list[R]]:
     results: list[R] = []
     problems: list[EntryProblem] = []
@@ -603,9 +678,9 @@ def _record_entries(
         try:
             current, item = record_one(index, current, raw)
         except LedgerError as exc:
-            problems.append(_entry_problem(index, label_for(index, raw), exc))
-            if on_rejected is not None:
-                on_rejected(index, raw)
+            label = label_for(index, raw)
+            found = exc.errors if isinstance(exc, MultiFieldError) else (exc,)
+            problems.extend(_entry_problem(index, label, error) for error in found)
             continue
         results.append(item)
     if problems:
@@ -702,15 +777,34 @@ def _cover_entry_label(raw: Any) -> str | None:
 
 
 def _cover_one_from_json(state: Ledger, round_: Round, raw: Any) -> tuple[Ledger, str]:
-    f = Fields(raw)
-    if isinstance(raw, dict) and "files" in raw and "hunks" in raw:
+    reader = _EntryReader(raw)
+    present = [key for key in ("hunks", "files") if key in raw]
+    if len(present) == 2:
         raise LedgerError("pass either 'hunks' or 'files', not both")
-    kind: TargetKind = "files" if isinstance(raw, dict) and "files" in raw else "hunks"
-    listed = [item.strip() for item in f.texts(kind) if item.strip()]
-    note = f.text("note")
-    f.reject_unknown()
-    targets = _cover_targets(round_, kind, ",".join(listed))
-    return _record_coverage(state, round_, targets, note, target_kind=kind)
+    kind: TargetKind = "files" if present == ["files"] else "hunks"
+    listed: list[str] = []
+    if present:
+        listed = reader.read(
+            kind, lambda f: [item.strip() for item in f.texts(kind) if item.strip()], listed
+        )
+    else:
+        reader.errors.append(FieldError("hunks", "is missing; pass 'hunks' or 'files'"))
+    note = reader.read("note", lambda f: f.text("note"), "")
+    reader.reject_unknown()
+
+    def record(sink: list[LedgerError]) -> tuple[Ledger, str] | None:
+        if reader.failed(kind) or not present:
+            return None
+        targets = _attempt(sink, lambda: _cover_targets(round_, kind, ",".join(listed)), None)
+        if targets is None:  # the note is still checked, so one resend fixes both
+            if not reader.failed("note"):
+                check_coverage_note(one_line(note, warn=False))
+            return None
+        return _attempt(
+            sink, lambda: _record_coverage(state, round_, targets, note, target_kind=kind), None
+        )
+
+    return reader.finish(record)
 
 
 def _cover_from_json(args: argparse.Namespace) -> int:
@@ -812,28 +906,38 @@ def _add_from_json(args: argparse.Namespace) -> int:
 def _add_one_from_json(
     ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any
 ) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
-    f = Fields(raw)
-    lens = f.choice("lens", tuple(sorted(LENS_IDS)))
-    raw_file = f.text("file")
-    line = f.integer("line")
-    severity = f.choice("severity", SEVERITIES)
-    title = f.text("title")
-    scenario = f.text("scenario")
-    suggestion = f.text_or("suggestion", "")
-    f.reject_unknown()
-    path = _finding_path(ws.root, cwd, raw_file, snap)
-    lines = _source_lines(ws.root, path, line)
-    updated, finding = add_finding(
-        current,
-        lens=lens,
-        path=path,
-        line=line,
-        severity=severity,
-        title=title,
-        scenario=scenario,
-        suggestion=suggestion,
-    )
-    return updated, (finding, lines)
+    reader = _EntryReader(raw)
+    lens = reader.read("lens", lambda f: f.choice("lens", tuple(sorted(LENS_IDS))), "intent")
+    raw_file = reader.read("file", lambda f: f.text("file"), "")
+    line = reader.read("line", lambda f: f.integer("line"), 1)
+    severity: Severity = reader.read("severity", lambda f: f.choice("severity", SEVERITIES), "minor")
+    title = reader.read("title", lambda f: f.text("title"), "")
+    scenario = reader.read("scenario", lambda f: f.text("scenario"), "")
+    suggestion = reader.read("suggestion", lambda f: f.text_or("suggestion", ""), "")
+    reader.reject_unknown()
+
+    def record(sink: list[LedgerError]) -> tuple[Ledger, tuple[Finding, list[str] | None]] | None:
+        path = raw_file
+        lines: list[str] | None = None
+        if not reader.failed("file"):
+            found = _attempt(sink, lambda: _finding_path(ws.root, cwd, raw_file, snap), None)
+            if found is not None:
+                path = found
+                if not reader.failed("line"):
+                    lines = _attempt(sink, lambda: _source_lines(ws.root, found, line), None)
+        updated, finding = add_finding(
+            current,
+            lens=lens,
+            path=path,
+            line=line,
+            severity=severity,
+            title=title,
+            scenario=scenario,
+            suggestion=suggestion,
+        )
+        return updated, (finding, lines)
+
+    return reader.finish(record)
 
 
 def _print_recorded(finding: Finding, lines: Sequence[str] | None) -> None:
@@ -953,13 +1057,19 @@ def _verdict_one(args: argparse.Namespace) -> int:
 
 
 def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
-    f = Fields(raw)
-    finding_id = f.text("id")
-    verdict = f.choice("as", VERDICTS)
-    evidence = f.text("evidence")
-    run_id = f.text_if_present("run")
-    f.reject_unknown()
-    return set_verdict(state, finding_id, verdict, evidence, run_id)
+    reader = _EntryReader(raw)
+    finding_id = reader.read("id", lambda f: f.text("id"), "")
+    verdict: Verdict = reader.read("as", lambda f: f.choice("as", VERDICTS), "dismissed")
+    evidence = reader.read("evidence", lambda f: f.text("evidence"), "")
+    run_id = reader.read("run", lambda f: f.text_if_present("run"), None)
+    reader.reject_unknown()
+
+    def record(sink: list[LedgerError]) -> tuple[Ledger, Finding] | None:
+        if reader.failed("id", "as", "evidence", "run"):
+            return None
+        return set_verdict(state, finding_id, verdict, evidence, run_id)
+
+    return reader.finish(record)
 
 
 def _verdict_from_json(args: argparse.Namespace) -> int:

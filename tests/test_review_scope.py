@@ -550,6 +550,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
 
         r2_out = self.review("prepare", "--add-paths", "tests/").stdout
         self.assertIn("Round 2 prepared: 2 files, 2 hunks", r2_out)
+        self.assertIn("0 hunks carried, 2 to review.", r2_out)
         self.assertIn("Scope: 2 file(s), frozen for this review.", r2_out)
         self.assertIn("Ignored (outside the review scope): PLAN.md", r2_out)
         self.assertEqual(self.ledger().current_scope, ("calc.py", "tests/test_calc.py"))
@@ -566,6 +567,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         )
         r3_out = self.review("prepare").stdout
         self.assertIn("Round 3 prepared: 2 files, 2 hunks", r3_out)
+        self.assertIn("1 hunks carried, 1 to review.", r3_out)
         self.assertEqual(self.ledger().rounds[2].scope, ("calc.py", "tests/test_calc.py"))
 
     def test_completed_review_with_out_of_scope_edits_hints_reset(self) -> None:

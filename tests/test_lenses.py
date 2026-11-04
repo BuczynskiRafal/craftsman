@@ -74,11 +74,17 @@ class LensSuggestionTests(unittest.TestCase):
         self.assertNotIn("trust", picked_ids({"sql": ()}))
 
     def test_docs_only_change_selects_the_prose_lenses(self) -> None:
-        for deep in (False, True):
-            with self.subTest(deep=deep):
-                self.assertEqual(
-                    picked_ids({"auth": ("H1",)}, deep=deep, docs_only=True), ["intent", "craft"]
-                )
+        self.assertEqual(picked_ids({"auth": ("H1",)}, docs_only=True), ["intent", "craft"])
+
+    def test_a_deep_round_suggests_every_lens_even_for_a_docs_only_change(self) -> None:
+        self.assertEqual(
+            picked_ids({}, deep=True, docs_only=True), [lens.id for lens in LENSES]
+        )
+
+    def test_tests_signal_does_not_repeat_the_core_reason(self) -> None:
+        picks = {p.lens.id: p.reason for p in select_lenses({"tests": ("H1",)}, deep=False, docs_only=False)}
+
+        self.assertEqual(picks["tests"], "core lens")
 
 
 class DeepHintTests(unittest.TestCase):

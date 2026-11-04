@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from craftsman.diffscan_signals import CONTENT_SIGNAL_PATTERNS
+from craftsman.diffscan_signals import CONTENT_SIGNAL_PATTERNS, DEEP_HINT_PATTERNS
 
 ChangeStatus = Literal["modified", "added", "deleted", "renamed"]
 ScopeKind = Literal["function", "class", "block"]
@@ -236,7 +236,6 @@ class DiffSnapshot:
     fingerprint: str
     hunks: tuple[Hunk, ...]
     files: tuple[str, ...]
-    skipped: tuple[str, ...]
     added: int
     deleted: int
 
@@ -246,8 +245,20 @@ class DiffSnapshot:
 
     @property
     def docs_only(self) -> bool:
-        renamed_from = (hunk.old_path for hunk in self.hunks if hunk.old_path is not None)
-        return bool(self.files) and all(is_docs_path(path) for path in (*self.files, *renamed_from))
+        return hunks_docs_only(self.hunks)
+
+    def only(self, hunk_ids: Collection[str]) -> DiffSnapshot:
+        """The part of this snapshot made of the hunks named in `hunk_ids`."""
+        keep = set(hunk_ids)
+        hunks = tuple(hunk for hunk in self.hunks if hunk.id in keep)
+        lines = [line for hunk in hunks for line in hunk.lines]
+        return replace(
+            self,
+            hunks=hunks,
+            files=tuple(sorted({hunk.path for hunk in hunks})),
+            added=sum(1 for line in lines if line.startswith("+")),
+            deleted=sum(1 for line in lines if line.startswith("-")),
+        )
 
 
 @dataclass(frozen=True)
@@ -528,7 +539,6 @@ def _assemble(base: str, chunks: Sequence[_FileDiff]) -> DiffSnapshot:
         fingerprint=fingerprint.hexdigest(),
         hunks=tuple(hunks),
         files=tuple(sorted({chunk.path for chunk in chunks})),
-        skipped=tuple(sorted({chunk.path for chunk in chunks if chunk.skipped})),
         added=sum(1 for line in content_lines if line.startswith("+")),
         deleted=sum(1 for line in content_lines if line.startswith("-")),
     )
@@ -1351,6 +1361,52 @@ def is_test_path(path: str) -> bool:
 def is_docs_path(path: str) -> bool:
     """Prose by file type alone: a `docs/` folder can hold code (e.g. Sphinx's conf.py)."""
     return PurePosixPath(path).suffix.lower() in _DOCS_SUFFIXES and not _is_config(path)
+
+
+_AGENT_PROMPT_NAMES = frozenset({"skill.md", "agents.md", "claude.md", "gemini.md"})
+_AGENT_PROMPT_DIRS = frozenset({"agents", "rules"})
+_AGENT_PROMPT_NAME_GLOBS = ("*.prompt.md", "*.instructions.md")
+
+
+def is_agent_prompt_path(path: str) -> bool:
+    """A prompt file that steers an agent: its prose is behavior, not documentation.
+
+    `SKILL.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `*.prompt.md`, `copilot-instructions.md`,
+    Markdown under a `rules/` or `agents/` folder.
+    """
+    posix = PurePosixPath(path)
+    name = posix.name.lower()
+    if posix.suffix.lower() not in _DOCS_SUFFIXES:
+        return False
+    return (
+        name in _AGENT_PROMPT_NAMES
+        or name == "copilot-instructions.md"
+        or _name_matches(name, _AGENT_PROMPT_NAME_GLOBS)
+        or bool(_AGENT_PROMPT_DIRS.intersection(part.lower() for part in posix.parts[:-1]))
+    )
+
+
+def hunks_docs_only(hunks: Sequence[Hunk]) -> bool:
+    """Whether every changed path (renames included) is documentation, not code or an agent prompt."""
+    paths = [path for hunk in hunks for path in (hunk.path, hunk.old_path) if path is not None]
+    return bool(paths) and all(is_docs_path(path) and not is_agent_prompt_path(path) for path in paths)
+
+
+def detect_deep_hint_signals(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]]:
+    """The hunks with real security or concurrency usage, in production code only.
+
+    Tests, configuration and documentation never count, and a bare word such as `token` does not:
+    the hint needs a call or usage pattern.
+    """
+    fired: dict[str, list[str]] = {}
+    for hunk in hunks:
+        if is_test_path(hunk.path) or _is_config(hunk.path) or _is_docs_hunk(hunk):
+            continue
+        content = "\n".join(text for _, text in (*hunk.added_lines, *hunk.removed_lines))
+        for name, pattern in DEEP_HINT_PATTERNS.items():
+            if pattern.search(content):
+                fired.setdefault(name, []).append(hunk.id)
+    return {name: tuple(ids) for name, ids in fired.items()}
 
 
 def _is_docs_hunk(hunk: Hunk) -> bool:

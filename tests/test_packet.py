@@ -66,7 +66,7 @@ def picks() -> tuple[Any, ...]:
 def build_context(*hunks: Hunk, **overrides: Any) -> PacketContext:
     """A context for `hunks` (default: H1) with no scopes, symbols or references unless given."""
     shown = hunks or (H1,)
-    snap = DiffSnapshot("b" * 40, "f" * 64, shown, tuple(dict.fromkeys(h.path for h in shown)), (), 1, 1)
+    snap = DiffSnapshot("b" * 40, "f" * 64, shown, tuple(dict.fromkeys(h.path for h in shown)), 1, 1)
     fields: dict[str, Any] = {
         "snap": snap,
         "round": round_for(snap, carried=frozenset(overrides.get("carried_from", {}))),

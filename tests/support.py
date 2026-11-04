@@ -29,7 +29,6 @@ from craftsman.manifest import (
     save_manifest,
 )
 from craftsman.records import (
-    Coverage,
     Ledger,
     QualitySignal,
     Round,
@@ -126,7 +125,6 @@ def make_snap(*hunks: Hunk, fingerprint: str = "fp1", base: str = BASE_SHA) -> D
         fingerprint=fingerprint,
         hunks=hunks,
         files=tuple(dict.fromkeys(hunk.path for hunk in hunks)),
-        skipped=(),
         added=sum(line.startswith("+") for hunk in hunks for line in hunk.lines),
         deleted=sum(line.startswith("-") for hunk in hunks for line in hunk.lines),
     )
@@ -189,10 +187,6 @@ def fully_reviewed(snap: DiffSnapshot, deep: bool = False) -> Ledger:
 def record_finding(ledger: Ledger, severity: Severity = "major", **overrides: Any) -> Ledger:
     ledger, _ = add_finding(ledger, **{**FINDING, "severity": severity, **overrides})
     return ledger
-
-
-def coverage_record(round_number: int, digests: list[str], at: str) -> Coverage:
-    return Coverage(round_number, tuple(digests), coverage_note(["H1"]), at)
 
 
 def shifted(timestamp: str, seconds: float) -> str:
