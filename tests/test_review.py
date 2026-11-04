@@ -450,7 +450,7 @@ class SecondRoundTests(RepoTestCase):
         for spelling in ("./cart.py", str(self.repo.root / "cart.py"), "cart.py"):
             with self.subTest(spelling=spelling):
                 path = Path(self.review("view", "--files", spelling).stdout.strip())
-                self.assertEqual(path.name, f"packet-2.{view_slug(spelling, None)}.md")
+                self.assertEqual(path.name, f"packet-2.{view_slug(files=('cart.py',))}.md")
         covered = self.review("cover", "--files", "./cart.py", "--note", "read the open hunk twice")
         self.assertIn("Coverage recorded: cart.py in round 2", covered.stdout)
         self.assertEqual(self.missing(), [])
