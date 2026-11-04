@@ -60,9 +60,9 @@ class RepoTestCase(unittest.TestCase):
     ) -> None:
         assert_cli_error(self, proc, exit_code, fragment)
 
-    def prepare_bug(self, tier: str = "quick") -> None:
+    def prepare_bug(self, deep: bool = False) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.cli("review", "prepare", "--tier", tier, "--task", "Add cart totals")
+        self.repo.cli("review", "prepare", *(["--deep"] if deep else []), "--task", "Add cart totals")
 
     def review(
         self, *args: str, check: bool = True, stdin: str | None = None
@@ -76,11 +76,9 @@ class RepoTestCase(unittest.TestCase):
             "add", "--file", file, "--line", str(line), *FINDING_FLAGS, *extra, check=check
         )
 
-    def cover(self, lens: str, *hunks: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def cover(self, *hunks: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         note = coverage_note(list(hunks))
-        return self.review(
-            "cover", "--lens", lens, "--hunks", ",".join(hunks), "--note", note, check=check
-        )
+        return self.review("cover", "--hunks", ",".join(hunks), "--note", note, check=check)
 
     def verdict(
         self, finding_id: str, verdict: str, evidence: str, *extra: str, check: bool = True
@@ -105,65 +103,102 @@ class PrepareTests(RepoTestCase):
     def test_prepare_writes_the_packet(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
 
-        out = self.review("prepare", "--tier", "quick", "--task", "Add cart totals").stdout
+        out = self.review("prepare", "--task", "Add cart totals").stdout
 
-        self.assertIn("Round 1 prepared (quick): 1 hunks, 0 carried, 1 to review.", out)
-        self.assertIn("Lenses: intent, contracts, failure\n", out)
+        self.assertIn(
+            "Round 1 prepared: 1 files, 1 hunks, 3 changed lines; 0 hunks carried, 1 to review.", out
+        )
         self.assertIn("**Task:** Add cart totals", self.packet())
         self.assertIn("Scope: `total` (function, L1–L3)", self.packet())
+
+    def test_prepare_prints_the_risk_map(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Risk map (suggested lenses):\n  intent — core lens\n", out)
+        self.assertIn("  craft — simplicity lens\n", out)
+        self.assertNotIn("  trust", out)
+        self.assertIn(f"Packet: {self.repo.ledger_dir / 'packet-1.md'}", out)
+
+    def test_risk_map_names_signals_and_hunks_and_hints_at_depth(self) -> None:
+        self.repo.write("run.py", "import subprocess\n\n\ndef go(cmd):\n    subprocess.run(cmd, shell=True)\n")
+
+        out = self.review("prepare").stdout
+
+        self.assertRegex(out, r"  trust — signals: process \(H1\)")
+        self.assertIn("Depth: deep suggested (signals: process H1)", out)
+        self.assertIn("signals: process (→ failure, trust, platform)", self.packet())
+
+    def test_a_deep_round_suggests_every_lens_and_needs_no_depth_hint(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+
+        out = self.review("prepare", "--deep").stdout
+
+        self.assertIn("Round 1 prepared (deep)", out)
+        self.assertIn("  model — deep round\n", out)
+        self.assertNotIn("Depth:", out)
 
     def test_preparing_the_same_diff_again_keeps_the_round(self) -> None:
         self.prepare_bug()
 
-        again = self.review("prepare", "--tier", "quick").stdout
+        again = self.review("prepare").stdout
 
-        self.assertIn("Round 1 unchanged (same diff and tier)", again)
+        self.assertIn("Round 1 unchanged (same diff)", again)
+        self.assertEqual(self.repo.show()["round"]["number"], 1)
+
+    def test_preparing_an_unchanged_diff_deep_raises_the_round_in_place(self) -> None:
+        self.prepare_bug()
+        self.repo.cover_all()
+
+        out = self.review("prepare", "--deep").stdout
+
+        shown = self.repo.show()
+        self.assertIn("Round 1 prepared (deep)", out)
+        self.assertEqual((shown["round"]["number"], shown["round"]["deep"]), (1, True))
+        self.assertEqual(shown["coverage"]["missing"], [])
+        self.assertIn("deep round", self.packet())
+
+    def test_a_review_stays_deep_once_it_was_deep(self) -> None:
+        self.prepare_bug(deep=True)
+        self.repo.write("cart.py", BUGGY_TOTAL + "# edited\n")
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Round 2 prepared (deep)", out)
 
     def test_prepare_rewrites_a_missing_packet(self) -> None:
         self.prepare_bug()
         (self.repo.ledger_dir / "packet-1.md").unlink()
 
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         self.assertIn("# Craftsman review packet — round 1", self.packet())
 
     def test_round_two_carries_unchanged_hunks(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
         self.repo.write("notes.py", "LABEL = 'cart'\n")
-        self.repo.record_full_evidence("quick")
+        self.repo.record_full_evidence()
         self.repo.write("cart.py", BUGGY_TOTAL.replace("/ len(items)", ""))
 
-        out = self.review("prepare", "--tier", "quick").stdout
+        out = self.review("prepare").stdout
 
-        self.assertIn("Round 2 prepared (quick): 2 hunks, 1 carried, 1 to review.", out)
+        self.assertIn("2 hunks, 4 changed lines; 1 hunks carried, 1 to review.", out)
         self.assertIn(
             "### H2 · `notes.py` L1–L1 · carried (covered in round 1, unchanged)", self.packet(2)
         )
-
-    def test_auto_tier_follows_the_gate(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "auto", "--cwd", ".")
-        self.repo.write("cart.py", BUGGY_TOTAL)
-
-        out = self.review("prepare", "--tier", "auto").stdout
-
-        self.assertIn("Round 1 prepared (quick)", out)
-
-    def test_unknown_tier_is_a_usage_error(self) -> None:
-        bogus = self.review("prepare", "--tier", "max", check=False)
-
-        self.assert_error(bogus, 2, "invalid choice 'max' (choose from auto, quick, standard, deep)")
 
     def test_hunks_mentioning_a_changed_symbol_are_marked_reopened(self) -> None:
         self.repo.write("cart.py", "def item_count(items):\n    return len(items)\n")
         self.repo.write(
             "tests/test_cart.py", "from cart import item_count\n\nassert item_count([1]) == 1\n"
         )
-        self.repo.record_full_evidence("quick")
+        self.repo.record_full_evidence()
         self.repo.write("cart.py", "def item_count(items):\n    return len(list(items))\n")
 
-        out = self.review("prepare", "--tier", "quick").stdout
+        out = self.review("prepare").stdout
 
-        self.assertIn("2 hunks, 0 carried, 2 to review.", out)
+        self.assertIn("0 hunks carried, 2 to review.", out)
         self.assertIn("reopened: mentions item_count (changed in H1)\n", self.packet(2))
 
     def test_prepare_help_mentions_the_ignore_file(self) -> None:
@@ -190,10 +225,10 @@ class PrepareTests(RepoTestCase):
         self.repo.write("cart.py", BUGGY_TOTAL)
         self.repo.git("add", "-A")
         self.repo.git("commit", "-q", "--no-verify", "-m", "cart")
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         self.repo.write("notes.py", "LABEL = 'cart'\n")
 
-        self.review("prepare", "--tier", "quick", "--base", self.repo.base_sha)
+        self.review("prepare", "--base", self.repo.base_sha)
         self.repo.cover_all()
         self.run_tests()
 
@@ -201,7 +236,7 @@ class PrepareTests(RepoTestCase):
         self.assertEqual(checked.returncode, 0, checked.stdout)
 
     def test_packet_shows_the_task_of_the_active_gate(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--task", "Add cart totals")
+        self.repo.cli("gate", "--init", "--task", "Add cart totals")
         self.repo.write("cart.py", BUGGY_TOTAL)
 
         self.review("prepare")
@@ -216,7 +251,7 @@ class UnscannedFilesTests(RepoTestCase):
     def test_prepare_names_files_the_signal_patterns_cannot_read(self) -> None:
         self.repo.write("deploy.sh", DEPLOY_SCRIPT)
 
-        out = self.review("prepare", "--tier", "quick").stdout
+        out = self.review("prepare").stdout
 
         self.assertIn("Not scanned for risk signals (no patterns for their language): deploy.sh.", out)
         self.assertIn(
@@ -226,55 +261,66 @@ class UnscannedFilesTests(RepoTestCase):
 
 class CoverTests(RepoTestCase):
     def test_cover_reports_what_is_left(self) -> None:
+        self.repo.write("notes.py", "LABEL = 'cart'\n")
         self.prepare_bug()
 
-        covered = self.cover("intent", "H1")
+        covered = self.cover("H1")
 
-        self.assertIn(
-            "Coverage recorded: `intent` covered H1 in round 1; 2 lens item(s)", covered.stdout
-        )
+        self.assertIn("Coverage recorded: H1 in round 1; 1 hunk(s) left to cover", covered.stdout)
+
+    def test_cover_accepts_hunk_ranges(self) -> None:
+        self.repo.write("notes.py", "LABEL = 'cart'\n")
+        self.prepare_bug()
+
+        covered = self.review("cover", "--hunks", "H1-H2", "--note", "walked both files end to end")
+
+        self.assertIn("Coverage recorded: H1, H2 in round 1; 0 hunk(s) left", covered.stdout)
+
+    def test_cover_files_covers_every_open_hunk_of_the_file(self) -> None:
+        self.prepare_bug()
+
+        covered = self.review("cover", "--files", "cart.py", "--note", "read cart.py and its callers")
+
+        self.assertIn("Coverage recorded: cart.py in round 1; 0 hunk(s) left", covered.stdout)
 
     def test_cover_refuses_a_stale_round(self) -> None:
         self.prepare_bug()
         self.repo.write("cart.py", BUGGY_TOTAL + "# edited\n")
 
-        self.assert_error(self.cover("intent", "H1", check=False), 1, "Code changed since round 1")
+        self.assert_error(self.cover("H1", check=False), 1, "Code changed since round 1")
 
-    def test_cover_without_a_lens_is_a_usage_error(self) -> None:
-        proc = self.review("cover", "--hunks", "H1", "--note", "x", check=False)
+    def test_cover_needs_exactly_one_target_kind(self) -> None:
+        self.prepare_bug()
 
-        self.assert_error(proc, 2, "the following arguments are required: --lens")
+        neither = self.review("cover", "--note", "x" * 25, check=False)
+        both = self.review("cover", "--hunks", "H1", "--files", "cart.py", "--note", "x" * 25, check=False)
+
+        self.assert_error(neither, 1, "pass exactly one of --hunks or --files")
+        self.assert_error(both, 1, "pass exactly one of --hunks or --files")
+
+    def test_cover_without_a_note_is_a_usage_error(self) -> None:
+        proc = self.review("cover", "--hunks", "H1", check=False)
+
+        self.assert_error(proc, 2, "the following arguments are required: --note")
+
+    def test_the_lens_option_is_gone(self) -> None:
+        proc = self.review("cover", "--lens", "intent", "--hunks", "H1", "--note", "x", check=False)
+
+        self.assert_error(proc, 2, "unrecognized arguments: --lens intent")
 
     def test_note_error_names_the_note_flag(self) -> None:
         self.prepare_bug()
 
-        proc = self.review("cover", "--lens", "intent", "--hunks", "H1", "--note", "H1 ok", check=False)
+        proc = self.review("cover", "--hunks", "H1", "--note", "H1 ok", check=False)
 
-        self.assert_error(proc, 1, "error: --note needs at least 40 characters per hunk or file")
+        self.assert_error(proc, 1, "error: --note must have at least 20 characters")
 
-    def test_design_lens_refuses_hunks(self) -> None:
-        self.prepare_bug("standard")
+    def test_unknown_hunk_or_file_is_refused(self) -> None:
+        self.prepare_bug()
 
-        proc = self.cover("design", "H1", check=False)
-
-        self.assert_error(proc, 1, "pass --files instead of --hunks")
-
-    def test_design_lens_covers_files(self) -> None:
-        self.prepare_bug("standard")
-        note = "cart.py:1 total(items) adds 3 lines -> minimal shape with no extra abstractions"
-
-        covered = self.review("cover", "--lens", "design", "--files", "cart.py", "--note", note)
-
-        self.assertIn("`design` covered cart.py", covered.stdout)
-
-    def test_design_count_error_speaks_of_files(self) -> None:
-        self.prepare_bug("standard")
-
-        proc = self.review(
-            "cover", "--lens", "design", "--files", "a,b,c,d,e", "--note", "x", check=False
-        )
-
-        self.assert_error(proc, 1, "cover 1..4 files per call (got 5)")
+        self.assert_error(self.cover("H7", check=False), 1, "unknown hunk 'H7'")
+        unknown = self.review("cover", "--files", "nope.py", "--note", "x" * 25, check=False)
+        self.assert_error(unknown, 1, "unknown files in round 1: nope.py")
 
 
 class AddTests(RepoTestCase):
@@ -293,7 +339,7 @@ class AddTests(RepoTestCase):
 
     def test_add_resolves_files_against_cwd(self) -> None:
         self.repo.write("pkg/total.py", BUGGY_TOTAL)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         added = self.add("--cwd", str(self.repo.root / "pkg"), file="total.py")
 
@@ -303,9 +349,9 @@ class AddTests(RepoTestCase):
         self.repo.write("cart.py", BUGGY_TOTAL)
         self.repo.git("add", "-A")
         self.repo.git("commit", "-q", "--no-verify", "-m", "cart")
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         (self.repo.root / "cart.py").unlink()
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         gone = self.add()
 
@@ -317,7 +363,7 @@ class AddTests(RepoTestCase):
         outside = self.tmp / "shared.py"
         outside.write_text(BUGGY_TOTAL, encoding="utf-8")
         (self.repo.root / "linked.py").symlink_to(outside)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         added = self.add(file="linked.py")
 
@@ -333,7 +379,7 @@ class AddTests(RepoTestCase):
     def test_line_count_ignores_form_feeds(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
         (self.repo.root / "feed.py").write_bytes(b"a = 1\x0cb = 2\nc = 3\n")
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         feed = self.add(file="feed.py", check=False)
 
@@ -344,11 +390,8 @@ class AddTests(RepoTestCase):
         outside = self.tmp / "outside.py"
         outside.write_text("x = 1\n", encoding="utf-8")
         cases = [
-            (
-                ("cover", "--lens", "intent", "--hunks", "H7", "--note", coverage_note(["H7"])),
-                "unknown hunk ids",
-            ),
-            (("cover", "--lens", "intent", "--hunks", "H1", "--note", "x" * 40), "missing: H1"),
+            (("cover", "--hunks", "H7", "--note", coverage_note(["H7"])), "unknown hunk"),
+            (("cover", "--hunks", "H1", "--note", "x" * 10), "--note must have at least 20"),
             (("add", "--file", str(outside), "--line", "1", *FINDING_FLAGS), "outside the repository"),
             (("add", "--file", "nope.py", "--line", "1", *FINDING_FLAGS), "does not exist"),
             (
@@ -532,14 +575,14 @@ class FromJsonTests(RepoTestCase):
 
     def test_cover_records_every_entry(self) -> None:
         entries = [
-            {"lens": lens, "hunks": ["H1"], "note": coverage_note(["H1"])}
-            for lens in ("intent", "contracts", "failure")
+            {"hunks": ["H1"], "note": coverage_note(["H1"])},
+            {"files": ["cart.py"], "note": "read cart.py and the code that calls it"},
         ]
 
         covered = self.from_json("cover", entries)
 
-        self.assertEqual(len(covered.stdout.splitlines()), 3)
-        self.assertIn("`failure` covered H1 in round 1; 0 lens item(s) left", covered.stdout)
+        self.assertEqual(len(covered.stdout.splitlines()), 2)
+        self.assertIn("0 hunk(s) left to cover", covered.stdout)
 
     def test_add_reads_a_file(self) -> None:
         source = self.tmp / "findings.json"
@@ -568,16 +611,15 @@ class FromJsonTests(RepoTestCase):
         )
 
     def test_a_bad_cover_entry_records_nothing(self) -> None:
-        five = ["H1", "H2", "H3", "H4", "H5"]
         entries = [
-            {"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])},
-            {"lens": "contracts", "hunks": five, "note": coverage_note(five)},
+            {"hunks": ["H1"], "note": coverage_note(["H1"])},
+            {"hunks": ["H1"], "note": "too short"},
         ]
 
         failed = self.from_json("cover", entries, check=False)
 
-        self.assert_error(failed, 1, "entry 2 (contracts): hunks: cover 1..4 hunks per call (got 5)")
-        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
+        self.assert_error(failed, 1, "entry 2 (H1): note: must have at least 20 characters")
+        self.assertEqual(self.repo.show()["coverage"]["covered"], 0)
 
     def test_a_bad_finding_entry_records_nothing(self) -> None:
         failed = self.from_json("add", [self.finding(), self.finding(severity="critical")], check=False)
@@ -599,43 +641,39 @@ class FromJsonTests(RepoTestCase):
         self.assertEqual([f["verdict"] for f in self.repo.show()["findings"]], [None, None])
 
     def test_unknown_entry_key_is_rejected(self) -> None:
-        entries = [{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"]), "extra": 1}]
+        entries = [{"hunks": ["H1"], "note": coverage_note(["H1"]), "extra": 1}]
 
         failed = self.from_json("cover", entries, check=False)
 
-        self.assert_error(failed, 1, "entry 1 (intent): extra: is not a known field")
+        self.assert_error(failed, 1, "entry 1 (H1): extra: is not a known field")
+
+    def test_the_lens_key_is_gone(self) -> None:
+        entries = [{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]
+
+        failed = self.from_json("cover", entries, check=False)
+
+        self.assert_error(failed, 1, "entry 1 (H1): lens: is not a known field")
 
     def test_empty_list_is_rejected(self) -> None:
         self.assert_error(
             self.from_json("cover", [], check=False), 1, "--from-json list must not be empty"
         )
 
-    def test_design_entry_covers_files(self) -> None:
-        self.prepare_bug("standard")
-        note = "cart.py:1 total(items) adds 3 lines -> minimal shape with no extra abstractions"
-
-        covered = self.from_json("cover", [{"lens": "design", "files": ["cart.py"], "note": note}])
-
-        self.assertIn("`design` covered cart.py", covered.stdout)
-
     def test_optional_entry_key_may_not_be_null(self) -> None:
         failed = self.from_json("add", [self.finding(suggestion=None)], check=False)
 
         self.assert_error(failed, 1, "entry 1 (F1): suggestion: must be a string")
 
-    def test_design_entry_takes_files_not_hunks(self) -> None:
-        self.prepare_bug("standard")
-        entries = [
-            {"lens": "design", "hunks": ["H1"], "note": "H1 total(): 2 branches -> L9 returns 0 here"}
-        ]
+    def test_entry_takes_hunks_or_files_not_both(self) -> None:
+        entries = [{"hunks": ["H1"], "files": ["cart.py"], "note": coverage_note(["H1"])}]
 
         failed = self.from_json("cover", entries, check=False)
 
-        self.assert_error(failed, 1, "entry 1 (design): files: is missing")
+        self.assert_error(failed, 1, "pass either 'hunks' or 'files', not both")
 
     def test_from_json_cannot_be_combined_with_entry_flags(self) -> None:
         cases = [
-            ("cover", ("--lens", "intent"), "--from-json cannot be combined with --lens"),
+            ("cover", ("--hunks", "H1"), "--from-json cannot be combined with --hunks"),
             ("add", ("--file", "cart.py"), "--from-json cannot be combined with --file"),
             ("verdict", ("F1",), "--from-json cannot be combined with ID"),
         ]
@@ -652,42 +690,45 @@ class InspectionTests(RepoTestCase):
 
         self.assertEqual(blocked.returncode, 1)
         self.assertIn("**Craftsman gate: BLOCKED", blocked.stdout)
-        self.assertIn("[uncovered] Lenses `intent`, `contracts`, `failure`", blocked.stdout)
+        self.assertIn("[uncovered] 1 hunk(s) uncovered in round 1: H1", blocked.stdout)
 
     def test_check_passes_with_full_evidence(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.record_full_evidence("quick")
+        self.repo.record_full_evidence()
 
         self.assertTrue(self.json_of("check")["passed"])
 
-    def test_check_never_evaluates_below_the_task_tier(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+    def test_a_deeper_round_raises_the_gate_and_is_held_to_it(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.record_full_evidence("quick")
-
-        lowered = self.review("check", "--tier", "quick", check=False)
-
-        self.assertIn("[tier-too-low]", lowered.stdout)
-
-    def test_a_deeper_round_is_held_to_its_own_tier(self) -> None:
-        self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.cli("gate", "--init", "--tier", "standard")
-        self.review("prepare", "--tier", "deep")
+        self.repo.cli("gate", "--init")
+        out = self.review("prepare", "--deep").stdout
         self.repo.cover_all()
         self.run_tests()
 
         completed = self.repo.cli("gate", "--complete", check=False)
 
-        self.assertEqual(self.json_of("report")["tier"], "deep")
+        self.assertIn("Gate raised to deep", out)
+        self.assertTrue(self.repo.state()["deep"])
+        self.assertTrue(self.json_of("report")["deep"])
         self.assert_error(completed, 1, "[no-e2e-run]")
 
-    def test_show_lists_coverage_per_lens(self) -> None:
+    def test_a_round_prepared_deep_makes_check_deep_without_a_gate(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.review("prepare", "--deep")
+        self.repo.cover_all()
+        self.run_tests()
+
+        blocked = self.review("check", check=False)
+
+        self.assertIn("[no-e2e-run]", blocked.stdout)
+
+    def test_show_lists_coverage(self) -> None:
         self.prepare_bug()
 
         shown = self.review("show").stdout
 
-        self.assertIn("Round 1 (quick) prepared", shown)
-        self.assertIn("intent     0/1 (missing H1)", shown)
+        self.assertIn("Round 1 prepared", shown)
+        self.assertIn("0/1 hunks (missing H1)", shown)
         self.assertIn("Findings: none recorded.", shown)
 
     def test_show_prints_the_packet_path(self) -> None:
@@ -705,7 +746,7 @@ class InspectionTests(RepoTestCase):
 
     def test_report_of_a_passing_gate(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.repo.record_full_evidence("quick")
+        self.repo.record_full_evidence()
 
         report = self.review("report").stdout
 
@@ -809,7 +850,7 @@ class ReviewOnlyTests(RepoTestCase):
         self.assertIn("[unresolved]", self.review("check", check=False).stdout)
 
     def test_review_only_is_refused_during_an_active_gate(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
 
         refused = self.review("check", "--review-only", check=False)
 
@@ -819,7 +860,7 @@ class ReviewOnlyTests(RepoTestCase):
 class QualityHintTests(RepoTestCase):
     def prepare_long_function(self) -> None:
         self.repo.write("long_mod.py", LONG_FUNCTION)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
         self.repo.cover_all()
         self.run_tests("import long_mod")
 
@@ -827,7 +868,7 @@ class QualityHintTests(RepoTestCase):
         lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))
         for name in ("mod_a.py", "mod_b.py", "mod_c.py"):
             self.repo.write(name, lines)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
     def test_packet_lists_the_quality_hints(self) -> None:
         self.prepare_long_function()
@@ -840,7 +881,7 @@ class QualityHintTests(RepoTestCase):
         self.assertEqual(self.review("check", check=False).returncode, 0)
 
     def test_oversized_diff_is_a_warning_and_leaves_the_gate_running(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
 
         self.prepare_oversized()
 
@@ -938,28 +979,22 @@ class FastCliTestCase(RepoTestCase):
         with mock.patch("sys.stdin", fake_stdin):
             return run_main(cli_main, *args, "--cwd", str(self.repo.root))
 
-    def prepare_multi_hunk(self, count: int, tier: str = "standard") -> None:
+    def prepare_multi_hunk(self, count: int) -> None:
         for index in range(1, count + 1):
             self.repo.write(f"mod_{index}.py", f"def fn_{index}(x):\n    return x + {index}\n")
-        res = self.cli_fast("review", "prepare", "--tier", tier, "--task", "Multi-hunk change")
+        res = self.cli_fast("review", "prepare", "--task", "Multi-hunk change")
         self.assertEqual(res.code, 0, res.err)
 
 
 class BatchRejectionTests(FastCliTestCase):
     def test_batch_reports_three_bad_entries_in_one_pass(self) -> None:
-        self.prepare_multi_hunk(14, tier="deep")
-        lenses = ("intent", "contracts", "failure")
+        self.prepare_multi_hunk(14)
         entries: list[dict[str, object]] = [
-            {
-                "lens": lenses[i % 3],
-                "hunks": [f"H{(i % 14) + 1}"],
-                "note": coverage_note([f"H{(i % 14) + 1}"]),
-            }
-            for i in range(42)
+            {"hunks": [f"H{index}"], "note": coverage_note([f"H{index}"])} for index in range(1, 15)
         ]
-        entries[39] = {"lens": "trust", "hunks": ["H13", "H14"], "note": coverage_note(["H13"])}
-        entries[40] = {"lens": "contracts", "hunks": ["H13", "H14"], "note": coverage_note(["H13"])}
-        entries[41] = {"lens": "failure", "hunks": ["H13"], "note": "H13 looks good"}
+        entries[3] = {"hunks": ["H4"], "note": "H4 ok"}
+        entries[7] = {"hunks": ["H99"], "note": coverage_note(["H8"])}
+        entries[11] = {"files": ["nope.py"], "note": coverage_note(["H12"])}
 
         res = self.cli_fast(
             "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
@@ -968,40 +1003,24 @@ class BatchRejectionTests(FastCliTestCase):
         self.assertEqual(res.code, 1)
         self.assertNotIn("error:", res.err)
         self.assertIn(
-            "craftsman review cover: 3 of 42 entries rejected; nothing was recorded.", res.err
+            "craftsman review cover: 3 of 14 entries rejected; nothing was recorded.", res.err
         )
-        self.assertIn("entry 40 (trust): note:", res.err)
-        self.assertIn("entry 41 (contracts): note:", res.err)
-        self.assertIn("entry 42 (failure): note:", res.err)
-        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
-        for index, lens in ((39, "trust"), (40, "contracts"), (41, "failure")):
-            entries[index] = {
-                "lens": lens,
-                "hunks": ["H13", "H14"],
-                "note": coverage_note(["H13", "H14"]),
-            }
+        self.assertIn("entry 4 (H4): note: must have at least 20 characters", res.err)
+        self.assertIn("entry 8 (H99): hunks: unknown hunk 'H99'", res.err)
+        self.assertIn("entry 12 (nope.py): files: unknown files in round 1: nope.py", res.err)
+        self.assertEqual(self.repo.show()["coverage"]["covered"], 0)
+        entries[3] = {"hunks": ["H4"], "note": coverage_note(["H4"])}
+        entries[7] = {"hunks": ["H8"], "note": coverage_note(["H8"])}
+        entries[11] = {"hunks": ["H12"], "note": coverage_note(["H12"])}
         fixed = self.cli_fast(
             "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
         )
         self.assertEqual(fixed.code, 0, fixed.err)
 
-    def test_four_hunk_entry_reports_missing_plus_weak_targets(self) -> None:
-        self.prepare_multi_hunk(4, tier="quick")
-        note = f"{coverage_note(['H1'])}; H2 looks clean"
-        entries = [{"lens": "intent", "hunks": ["H1", "H2", "H3", "H4"], "note": note}]
-
-        res = self.cli_fast(
-            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
-        )
-
-        self.assertEqual(res.code, 1)
-        self.assertIn("missing: H3, H4", res.err)
-        self.assertIn("too little concrete detail: H2", res.err)
-
     def test_stale_or_missing_round_reports_one_state_error(self) -> None:
         entries = [
-            {"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])},
-            {"lens": "contracts", "hunks": ["H1"], "note": coverage_note(["H1"])},
+            {"hunks": ["H1"], "note": coverage_note(["H1"])},
+            {"files": ["cart.py"], "note": coverage_note(["H1"])},
         ]
         payload = json.dumps(entries).encode()
         missing = self.cli_fast("review", "cover", "--from-json", "-", stdin_bytes=payload)
@@ -1036,52 +1055,9 @@ class BatchRejectionTests(FastCliTestCase):
         self.assertIn("entry 1 (F1): severity:", res.err)
         self.assertIn("entry 2 (F2): line:", res.err)
 
-    def test_sweep_annotates_only_lenses_rejected_in_same_batch(self) -> None:
-        self.prepare_multi_hunk(1, tier="standard")
-        design_note = "mod_1.py:1 fn_1(x) adds 2 lines -> single pure helper with no extra layers"
-        design_res = self.cli_fast(
-            "review", "cover", "--lens", "design", "--files", "mod_1.py", "--note", design_note
-        )
-        self.assertEqual(design_res.code, 0)
-        entries = [
-            {"lens": "intent", "hunks": ["H1"], "note": "H1 looks good"},
-            {"lens": "sweep", "hunks": ["H1"], "note": coverage_note(["H1"])},
-        ]
-
-        res = self.cli_fast(
-            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
-        )
-
-        self.assertEqual(res.code, 1)
-        self.assertIn("intent H1 (depends on entry 1)", res.err)
-        self.assertIn("contracts H1;", res.err)
-        self.assertNotIn("contracts H1 (depends on", res.err)
-
-    def test_note_format_shown_once_for_notes_omitted_elsewhere(self) -> None:
-        self.prepare_bug()
-        bad_notes = [
-            {"lens": "intent", "hunks": ["H1"], "note": "H1 ok"},
-            {"lens": "contracts", "hunks": ["H1"], "note": "short"},
-        ]
-        note_res = self.cli_fast(
-            "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(bad_notes).encode()
-        )
-        self.assertEqual(note_res.err.count("Note format:"), 1)
-
-        self.add()
-        verdict_entries = [
-            {"id": "F1", "as": "proven", "evidence": "Reproduced crash at cart.py:3"}
-        ]
-        verdict_res = self.cli_fast(
-            "review", "verdict", "--from-json", "-",
-            stdin_bytes=json.dumps(verdict_entries).encode(),
-        )
-        self.assertEqual(verdict_res.code, 1)
-        self.assertNotIn("Note format:", verdict_res.err)
-
     def test_batch_rejection_caps_output_at_twenty_items(self) -> None:
         self.prepare_bug()
-        entries = [{"lens": "intent", "hunks": ["H1"], "note": "H1 ok"} for _ in range(23)]
+        entries = [{"hunks": ["H1"], "note": "H1 ok"} for _ in range(23)]
 
         res = self.cli_fast(
             "review", "cover", "--from-json", "-", stdin_bytes=json.dumps(entries).encode()
@@ -1089,10 +1065,9 @@ class BatchRejectionTests(FastCliTestCase):
 
         self.assertEqual(res.code, 1)
         self.assertIn("23 of 23 entries rejected", res.err)
-        self.assertIn("entry 20 (intent):", res.err)
-        self.assertNotIn("entry 21 (intent):", res.err)
+        self.assertIn("entry 20 (H1):", res.err)
+        self.assertNotIn("entry 21 (H1):", res.err)
         self.assertIn("  ... and 3 more", res.err)
-        self.assertEqual(res.err.count("Note format:"), 1)
 
 
 class JsonEncodingTests(FastCliTestCase):
@@ -1108,9 +1083,9 @@ class JsonEncodingTests(FastCliTestCase):
             timeout=30,
         )
 
-    def _payload(self, lens: str) -> str:
+    def _payload(self) -> str:
         return json.dumps(
-            [{"lens": lens, "hunks": ["H1"], "note": f"{coverage_note(['H1'])} — Größe & naïve"}],
+            [{"hunks": ["H1"], "note": f"{coverage_note(['H1'])} — Größe & naïve"}],
             ensure_ascii=False,
         )
 
@@ -1119,17 +1094,17 @@ class JsonEncodingTests(FastCliTestCase):
             with self.subTest(codec=codec):
                 self.prepare_bug()
                 target_codec = "utf-16" if codec == "utf-16-le" else codec
-                file_bytes = self._payload("intent").encode(target_codec)
+                file_bytes = self._payload().encode(target_codec)
                 if codec == "utf-16-be":
-                    file_bytes = b"\xfe\xff" + self._payload("intent").encode("utf-16-be")
+                    file_bytes = b"\xfe\xff" + self._payload().encode("utf-16-be")
                 json_file = self.tmp / f"batch-{codec}.json"
                 json_file.write_bytes(file_bytes)
                 res = self.cli_fast("review", "cover", "--from-json", str(json_file))
                 self.assertEqual(res.code, 0, res.err)
 
-                stdin_bytes = self._payload("contracts").encode(target_codec)
+                stdin_bytes = self._payload().encode(target_codec)
                 if codec == "utf-16-be":
-                    stdin_bytes = b"\xfe\xff" + self._payload("contracts").encode("utf-16-be")
+                    stdin_bytes = b"\xfe\xff" + self._payload().encode("utf-16-be")
                 piped = self._pipe_subproc(stdin_bytes)
                 piped_err = piped.stderr.decode("utf-8", errors="replace")
                 self.assertEqual(piped.returncode, 0, piped_err)
@@ -1138,7 +1113,7 @@ class JsonEncodingTests(FastCliTestCase):
     def test_from_json_rejects_cp1250_with_utf8_save_hint(self) -> None:
         self.prepare_bug()
         cp1250_bytes = json.dumps(
-            [{"lens": "intent", "hunks": ["H1"], "note": f"{coverage_note(['H1'])} Größe"}],
+            [{"hunks": ["H1"], "note": f"{coverage_note(['H1'])} Größe"}],
             ensure_ascii=False,
         ).encode("cp1250")
         json_file = self.tmp / "cp1250.json"
@@ -1168,7 +1143,7 @@ class InboxCliTests(FastCliTestCase):
         self.assertTrue(second.is_file())
 
         first.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": "H1 weak"}]),
+            json.dumps([{"hunks": ["H1"], "note": "H1 weak"}]),
             encoding="utf-8",
         )
         rejected = self.cli_fast("review", "cover", "--from-json", str(first))
@@ -1176,7 +1151,7 @@ class InboxCliTests(FastCliTestCase):
         self.assertTrue(first.is_file())
 
         first.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            json.dumps([{"hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
         recorded = self.cli_fast("review", "cover", "--from-json", str(first))
@@ -1188,7 +1163,7 @@ class InboxCliTests(FastCliTestCase):
         self.prepare_bug()
         outside = self.tmp / "outside-cover.json"
         outside.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            json.dumps([{"hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
         self.assertEqual(self.cli_fast("review", "cover", "--from-json", str(outside)).code, 0)
@@ -1196,7 +1171,7 @@ class InboxCliTests(FastCliTestCase):
 
         target = self.tmp / "symlink-target.json"
         target.write_text(
-            json.dumps([{"lens": "contracts", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            json.dumps([{"hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
         inbox_dir = self.repo.ledger_dir / "inbox"
@@ -1222,7 +1197,7 @@ class InboxCliTests(FastCliTestCase):
         self.prepare_bug()
         inbox_file = self._new_inbox_path("cover")
         inbox_file.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            json.dumps([{"hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
 
@@ -1231,26 +1206,23 @@ class InboxCliTests(FastCliTestCase):
 
         self.assertEqual(res.code, 0)
         self.assertIn("warning: could not remove inbox file", res.err)
-        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 1)
+        self.assertEqual(self.repo.show()["coverage"]["covered"], 1)
 
     def test_locked_inbox_file_warns_without_failing_lifecycle_commands(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.assertEqual(self.cli_fast("review", "prepare", "--tier", "quick").code, 0)
+        self.assertEqual(self.cli_fast("review", "prepare").code, 0)
         locked_inbox = self._new_inbox_path("cover")
         self.repo.write("cart.py", BUGGY_TOTAL + "# round 2\n")
 
         with mock.patch.object(Path, "unlink", self._locked_unlink(locked_inbox)):
-            prep = self.cli_fast("review", "prepare", "--tier", "quick")
+            prep = self.cli_fast("review", "prepare")
             report = self.cli_fast("review", "report", "--review-only")
             reset = self.cli_fast("review", "reset")
-            self.assertEqual(self.cli_fast("gate", "--init", "--tier", "quick").code, 0)
-            self.assertEqual(self.cli_fast("review", "prepare", "--tier", "quick").code, 0)
+            self.assertEqual(self.cli_fast("gate", "--init").code, 0)
+            self.assertEqual(self.cli_fast("review", "prepare").code, 0)
             note = coverage_note(["H1"])
-            for lens in ("intent", "contracts", "failure"):
-                cover = self.cli_fast(
-                    "review", "cover", "--lens", lens, "--hunks", "H1", "--note", note
-                )
-                self.assertEqual(cover.code, 0, cover.err)
+            cover = self.cli_fast("review", "cover", "--hunks", "H1", "--note", note)
+            self.assertEqual(cover.code, 0, cover.err)
             self.run_tests()
             complete = self.cli_fast("gate", "--complete")
 
@@ -1264,12 +1236,12 @@ class InboxCliTests(FastCliTestCase):
     def test_inbox_pruned_by_new_round_reset_or_review_only(self) -> None:
         self.prepare_bug()
         orphan = self._new_inbox_path("cover")
-        same_round = self.cli_fast("review", "prepare", "--tier", "quick")
+        same_round = self.cli_fast("review", "prepare")
         self.assertEqual(same_round.code, 0)
         self.assertTrue(orphan.is_file())
 
         self.repo.write("cart.py", BUGGY_TOTAL + "# next round\n")
-        next_round = self.cli_fast("review", "prepare", "--tier", "quick")
+        next_round = self.cli_fast("review", "prepare")
         self.assertEqual(next_round.code, 0)
         self.assertFalse(orphan.exists())
         self.assertIn("Pruned 1 inbox file(s):", next_round.err)
@@ -1288,8 +1260,8 @@ class InboxCliTests(FastCliTestCase):
 
     def test_inbox_pruned_when_gate_complete_succeeds(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
-        self.assertEqual(self.cli_fast("gate", "--init", "--tier", "quick").code, 0)
-        self.assertEqual(self.cli_fast("review", "prepare", "--tier", "quick").code, 0)
+        self.assertEqual(self.cli_fast("gate", "--init").code, 0)
+        self.assertEqual(self.cli_fast("review", "prepare").code, 0)
         orphan = self._new_inbox_path("cover")
 
         blocked = self.cli_fast("gate", "--complete")
@@ -1307,7 +1279,7 @@ class InboxCliTests(FastCliTestCase):
         wt = self.tmp / "wt-linked"
         self.repo.git("worktree", "add", "-q", "-b", "wt-branch", str(wt))
         (wt / "cart.py").write_text(BUGGY_TOTAL, encoding="utf-8")
-        prep = run_main(cli_main, "review", "prepare", "--tier", "quick", "--cwd", str(wt))
+        prep = run_main(cli_main, "review", "prepare", "--cwd", str(wt))
         self.assertEqual(prep.code, 0, prep.err)
 
         inbox_file = self._new_inbox_path("cover", cwd=wt)
@@ -1319,7 +1291,7 @@ class InboxCliTests(FastCliTestCase):
         self.assertEqual(denied.decision, "deny")
 
         inbox_file.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": coverage_note(["H1"])}]),
+            json.dumps([{"hunks": ["H1"], "note": coverage_note(["H1"])}]),
             encoding="utf-8",
         )
         res = run_main(
@@ -1333,17 +1305,17 @@ class InboxCliTests(FastCliTestCase):
         inbox_file = self._new_inbox_path("cover")
         note = coverage_note(["H1"])
         inbox_file.write_text(
-            json.dumps([{"lens": "intent", "hunks": ["H1"], "note": note}]),
+            json.dumps([{"hunks": ["H1"], "note": note}]),
             encoding="utf-8",
         )
         cover_json = self.cli_fast("review", "cover", "--check", "--from-json", str(inbox_file))
         self.assertEqual(cover_json.code, 0)
         cover_cli = self.cli_fast(
-            "review", "cover", "--check", "--lens", "intent", "--hunks", "H1", "--note", note
+            "review", "cover", "--check", "--hunks", "H1", "--note", note
         )
         self.assertEqual(cover_cli.code, 0)
         self.assertTrue(inbox_file.is_file())
-        self.assertEqual(self.repo.show()["coverage"]["intent"]["covered"], 0)
+        self.assertEqual(self.repo.show()["coverage"]["covered"], 0)
 
         add_inbox = self._new_inbox_path("add")
         add_inbox.write_text(

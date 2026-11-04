@@ -8,10 +8,7 @@ from __future__ import annotations
 
 import re
 
-from craftsman.gate import GateTier
-
 MAX_TASK_CHARS = 300
-FLAG_TIERS: dict[str, GateTier] = {"quick": "quick", "standard": "standard", "deep": "deep"}
 
 COMMANDS_PATTERN = (
     r"/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft|"
@@ -23,8 +20,9 @@ LEADING_COMMAND_TRIGGER_RE = re.compile(
     rf"(?i)^\s*(?:/[a-z0-9_-]+\s+)*({COMMANDS_PATTERN})(?=$|[\s.,;!?]|{COLON_END})"
 )
 INLINE_TRIGGER_RE = re.compile(rf"(?i)(?:^|[\s(])({COMMANDS_PATTERN})(?=$|[\s.,;!?)]|{COLON_END})")
-CRAFTSMAN_FLAG_TIER_RE = re.compile(
-    r"(?i)(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(quick|standard|deep))\b"
+# `--quick` and `--standard` are accepted and ignored; only `--deep` changes the gate.
+CRAFTSMAN_DEEP_FLAG_RE = re.compile(
+    r"(?i)(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard))*\s+--deep\b"
 )
 CLAUDE_COMMAND_NAME_RE = re.compile(
     r"<command-name>\s*/?(?:craftsman:)?(craftsman|ultracraft)\s*</command-name>", re.IGNORECASE
@@ -42,43 +40,41 @@ QUOTED_SPAN_RE = re.compile(
 # `/craftsman:ultracraft`. A colon that ends the command (`/craftsman: add x`) goes with it.
 TRIGGER_TOKEN_RE = re.compile(
     r"(?i)(?<![\w/-])(?:/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft"
-    r"|(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard|deep))?)"
+    r"|(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard|deep))*)"
     rf"(?:{COLON_END}|(?![\w:-]))"
 )
 
 
-def detect_trigger(content: str) -> GateTier | None:
-    """The tier `content` asks for when it invokes `/craftsman` or `ultracraft`, else None."""
+def detect_trigger(content: str) -> bool | None:
+    """Whether `content` asks for a deep gate when it invokes `/craftsman` or `ultracraft`.
+
+    None when it starts no session; otherwise True for `ultracraft` and `/craftsman --deep`.
+    """
     if not content.strip():
         return None
     claude_command = CLAUDE_COMMAND_NAME_RE.search(content)
     if claude_command:
         if claude_command.group(1).lower() == "ultracraft":
-            return "deep"
+            return True
         args = CLAUDE_COMMAND_ARGS_RE.search(content)
         arg_str = args.group(1).strip() if args else ""
-        return _requested_tier(f"/craftsman {arg_str}", "/craftsman")
+        return _requests_deep(f"/craftsman {arg_str}", "/craftsman")
 
     requests = USER_REQUEST_BLOCK_RE.findall(content)
     user_text = QUOTED_SPAN_RE.sub(" ", (requests[-1] if requests else content).strip())
     leading = LEADING_COMMAND_TRIGGER_RE.search(user_text)
     if leading:
-        return _requested_tier(user_text, leading.group(1))
+        return _requests_deep(user_text, leading.group(1))
     inline = INLINE_TRIGGER_RE.search(user_text)
     if inline:
-        return _requested_tier(user_text, inline.group(1))
+        return _requests_deep(user_text, inline.group(1))
     if SKILL_METADATA_TRIGGER_RE.search(content):
-        return _requested_tier(user_text, "/craftsman")
+        return _requests_deep(user_text, "/craftsman")
     return None
 
 
-def _requested_tier(text: str, token: str) -> GateTier:
-    if token.lower().endswith("ultracraft"):
-        return "deep"
-    flag = CRAFTSMAN_FLAG_TIER_RE.search(text)
-    if flag is None:
-        return "auto"
-    return FLAG_TIERS[flag.group(1).lower()]
+def _requests_deep(text: str, token: str) -> bool:
+    return token.lower().endswith("ultracraft") or CRAFTSMAN_DEEP_FLAG_RE.search(text) is not None
 
 
 def task_from_prompt(prompt: str) -> str:

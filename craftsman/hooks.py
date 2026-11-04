@@ -14,7 +14,7 @@ Events:
 - `pre-tool`: guards shell commands against work-tree violations and enforces search scope.
 
 The first event of the owning session claims an active gate for the hooks: from then on the gate
-requires an isolated reviewer on the `standard` and `deep` tiers. Events of other sessions leave
+requires an isolated reviewer for every round with hunks to review. Events of other sessions leave
 the gate alone.
 
 A hook never crashes the session it serves. When an event cannot be handled, `pre-tool` asks the
@@ -39,13 +39,11 @@ from craftsman.gate import (
     GateOwner,
     GateState,
     GateStateError,
-    GateTier,
     Stage,
     archive_ledger_for_new_base,
     decide_stop,
     is_continuation_prompt,
     load_state,
-    raised_tier,
     state_path_for,
     update_state,
 )
@@ -55,11 +53,10 @@ from craftsman.ledger import (
     ledger_path_for,
     load,
     mutate,
-    uncovered_by_lens,
+    uncovered_hunks,
 )
 from craftsman.packet import CHEAT_SHEET
 from craftsman.records import (
-    SWEEP_LENS,
     AgentEvent,
     AgentEventKind,
     AgentRole,
@@ -97,7 +94,7 @@ SHELL_TOOLS = frozenset(
 # Characters that a shell or PowerShell would interpret inside a double-quoted argument.
 SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
 REVIEWER_STOP_REASON = (
-    "Before finishing, record coverage (`craftsman review cover ...`) for every lens you "
+    "Before finishing, record coverage (`craftsman review cover ...`) for the slice you "
     "examined, and a finding (`craftsman review add ...`) for every defect you found."
 )
 
@@ -338,35 +335,35 @@ def on_non_owner_prompt(session: Session, state: GateState, hook: HookInput, rep
     )
 
 
-def after_user_prompt(state: GateState, prompt: str, tier: GateTier | None) -> GateState:
-    """An active gate after its user wrote `prompt`: a new streak, and the tier can rise."""
+def after_user_prompt(state: GateState, prompt: str, deep: bool | None) -> GateState:
+    """An active gate after its user wrote `prompt`: a new streak, and the gate can become deep."""
     if not is_continuation_prompt(prompt):
         state = replace(state, awaiting_user=False, forced_continuations=0, best_issue_count=None)
-    if tier is not None and state.stage is not Stage.NEEDS_HUMAN:
-        state = replace(state, tier=raised_tier(state.tier, tier))
+    if deep and state.stage is not Stage.NEEDS_HUMAN:
+        state = replace(state, deep=True)
     return state
 
 
 def on_prompt(
     session: Session, state: GateState | None, hook: HookInput, reply: Reply, caller: GateOwner
 ) -> tuple[GateState | None, Output]:
-    tier = detect_trigger(hook.prompt)
+    deep = detect_trigger(hook.prompt)
     owner = caller
     if state is not None and state.active:
-        state = after_user_prompt(state, hook.prompt, tier)
-        if tier is None or state.stage is not Stage.NEEDS_HUMAN:
+        state = after_user_prompt(state, hook.prompt, deep)
+        if deep is None or state.stage is not Stage.NEEDS_HUMAN:
             return state, reply.allow()
         archive_ledger(session.ledger_path)  # the review needed a human; a new request starts over
         owner = state.owner
-    elif tier is None:
+    elif deep is None:
         return state, reply.allow()
     base_sha = resolve_base_sha(session.root, None)
     started = GateState.open(
-        owner, base_sha, tier, task_from_prompt(hook.prompt), isolation_evidence="hooks"
+        owner, base_sha, bool(deep), task_from_prompt(hook.prompt), isolation_evidence="hooks"
     )
     archive_ledger_for_new_base(session.root, base_sha)
     return started, reply.inject(
-        f"Craftsman session started (tier {tier}, base {base_sha[:7]}). Follow the /craftsman "
+        f"Craftsman session started ({'deep, ' if deep else ''}base {base_sha[:7]}). Follow the /craftsman "
         f"skill (Stage 0 command: `{init_command(started)}`); the gate will block finishing "
         "until `craftsman review check` passes.\n"
         f"Scope: work only inside {session.root}; see Search scope."
@@ -376,7 +373,8 @@ def on_prompt(
 def init_command(state: GateState) -> str:
     """The Stage 0 command for `state`, safe to paste into a POSIX shell or PowerShell."""
     session = f" --session-id {_shell_safe(state.owner.session_id)}" if state.owner.session_id else ""
-    return f'craftsman gate --init{session} --tier {state.tier} --task "{_shell_safe(state.task)}"'
+    deep = " --deep" if state.deep else ""
+    return f'craftsman gate --init{session}{deep} --task "{_shell_safe(state.task)}"'
 
 
 def _shell_safe(text: str) -> str:
@@ -458,23 +456,12 @@ def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: 
         f"Scope: work only inside {session.root}; see Search scope.",
     ]
     if role == "reviewer":
-        missing = {lens: ids for lens, ids in uncovered_by_lens(ledger, latest).items() if ids}
+        missing = uncovered_hunks(ledger, latest)
         if missing:
-            lines.append("Lenses with uncovered items (take only the lenses you were assigned):")
-            lines.extend(
-                f"- {lens}: {', '.join(ids)}" + (" (run last)" if lens == SWEEP_LENS else "")
-                for lens, ids in missing.items()
-            )
+            lines.append(f"Hunks not covered yet (take only your assigned slice): {', '.join(missing)}")
         else:
-            lines.append("Every lens of this round is covered.")
+            lines.append("Every hunk of this round is covered.")
     else:
-        sweep_missing = uncovered_by_lens(ledger, latest).get(SWEEP_LENS, [])
-        if review_only and sweep_missing:
-            lines.append(
-                f"Uncovered `{SWEEP_LENS}` hunks (in review-only mode without --fix, cover `{SWEEP_LENS}` "
-                f"in Step 0 before verdicts): {', '.join(sweep_missing)} "
-                f"(with --fix, a separate `craftsman-reviewer` covers `{SWEEP_LENS}`)."
-            )
         pending = [finding for finding in ledger.findings if finding.verdict is None]
         if pending:
             lines.append("Findings without a verdict:")
@@ -579,7 +566,7 @@ def _review_in_progress(session: Session) -> int | None:
     latest = ledger.rounds[-1]
     if datetime.now(timezone.utc) - parse_timestamp(latest.prepared_at) > REVIEW_IN_PROGRESS_MAX_AGE:
         return None
-    has_open = any(uncovered_by_lens(ledger, latest).values()) or any(
+    has_open = bool(uncovered_hunks(ledger, latest)) or any(
         finding.verdict is None for finding in ledger.findings
     )
     return latest.number if has_open else None

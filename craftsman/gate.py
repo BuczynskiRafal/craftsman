@@ -28,7 +28,6 @@ from typing import Any, Literal, TypeVar, get_args
 
 from craftsman.diffscan import (
     DiffScanError,
-    DiffSnapshot,
     git_dir,
     resolve_base_sha,
     snapshot,
@@ -42,14 +41,12 @@ from craftsman.evidence import (
 )
 from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
-    QUICK_TIER_MAX_CHANGED_LINES,
     GateReport,
     format_blocker_summary,
     render_next_actions,
     render_report,
 )
 from craftsman.ledger import locked
-from craftsman.lenses import Tier
 from craftsman.records import (
     ISOLATION_EVIDENCES,
     FieldError,
@@ -59,16 +56,11 @@ from craftsman.records import (
     format_timestamp,
 )
 
-GateTier = Literal["auto", "quick", "standard", "deep"]
 GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
-GATE_TIERS: tuple[GateTier, ...] = get_args(GateTier)
 GATE_PLATFORMS: tuple[GatePlatform, ...] = get_args(GatePlatform)
-# `auto` ranks between `quick` and `standard`: it may still resolve to either.
-TIER_RANK: dict[GateTier, int] = {"quick": 0, "auto": 1, "standard": 2, "deep": 3}
 
 STATE_FILENAME = "craftsman_state.json"
 MAX_CONTINUATIONS = 6
-QUICK_TIER_MAX_FILES = 2
 MAX_CONTINUATION_REASON_CHARS = 1800
 MAX_ERROR_CHARS = 400
 CONTINUATION_HEADER = "[CRAFTSMAN GATE"
@@ -166,7 +158,7 @@ class GateState:
 
     owner: GateOwner
     base_sha: str
-    tier: GateTier
+    deep: bool
     task: str
     started_at: str
     active: bool = True
@@ -181,17 +173,15 @@ class GateState:
     def __post_init__(self) -> None:
         if not self.base_sha:
             raise GateStateError("base_sha must not be empty")
-        if self.tier not in GATE_TIERS:
-            raise GateStateError(f"unknown tier {self.tier!r}")
         if self.isolation_evidence not in ISOLATION_EVIDENCES:
             raise GateStateError(f"unknown isolation evidence {self.isolation_evidence!r}")
         if self.forced_continuations < 0 or (self.best_issue_count or 0) < 0:
             raise GateStateError("counters must not be negative")
 
     @classmethod
-    def open(cls, owner: GateOwner, base_sha: str, tier: GateTier, task: str, **extra: Any) -> GateState:
+    def open(cls, owner: GateOwner, base_sha: str, deep: bool, task: str, **extra: Any) -> GateState:
         """A new active gate starting now."""
-        return cls(owner, base_sha, tier, task, format_timestamp(datetime.now(timezone.utc)), **extra)
+        return cls(owner, base_sha, deep, task, format_timestamp(datetime.now(timezone.utc)), **extra)
 
     @classmethod
     def from_json(cls, raw: object) -> GateState:
@@ -203,7 +193,7 @@ class GateState:
         state = cls(
             owner=fields.record("owner", GateOwner.from_fields),
             base_sha=fields.text("base_sha"),
-            tier=fields.choice("tier", GATE_TIERS),
+            deep=fields.flag("deep"),
             task=fields.text("task"),
             started_at=fields.text("started_at"),
             active=fields.flag("active"),
@@ -224,16 +214,15 @@ class GateState:
         data["stage"] = self.stage.value
         return data
 
-    def closed(self, report: GateReport, tier: Tier) -> GateState:
-        """The state after the ledger passed the gate on `tier`.
+    def closed(self, report: GateReport, deep: bool) -> GateState:
+        """The state after the ledger passed the gate, `deep` or not.
 
-        A self-reviewed `deep` task stays active and waits for the user: the deep tier promises
-        an independent review that did not happen.
+        A self-reviewed deep task stays active and waits for the user: deep promises an
+        independent review that did not happen.
         """
-        if report.self_reviewed and tier == "deep":
+        if report.self_reviewed and deep:
             return replace(self, awaiting_user=False, stage=Stage.NEEDS_HUMAN)
-        unisolated = report.self_reviewed and tier != "quick"
-        stage = Stage.COMPLETE_UNISOLATED if unisolated else Stage.COMPLETED
+        stage = Stage.COMPLETE_UNISOLATED if report.self_reviewed else Stage.COMPLETED
         return replace(self, active=False, awaiting_user=False, stage=stage)
 
 
@@ -242,11 +231,6 @@ def _parsed(raw: object, parse: Callable[[object], P], where: str) -> P:
         return parse(raw)
     except FieldError as exc:
         raise GateStateError(f"{where}: {exc}") from None
-
-
-def raised_tier(current: GateTier, requested: GateTier) -> GateTier:
-    """The stricter of two tiers: an active gate's tier can rise, never drop."""
-    return requested if TIER_RANK[requested] > TIER_RANK[current] else current
 
 
 # --- persistence ----------------------------------------------------------------------------
@@ -326,35 +310,13 @@ def foreign_gate_refusal(root: Path, active: GateState, action: str) -> str:
 # --- evaluation -----------------------------------------------------------------------------
 
 
-def task_tier(configured: GateTier, snap: DiffSnapshot) -> Tier:
-    """The concrete tier of a task; `auto` is `quick` while the diff stays within the quick limits.
-
-    A binary or oversized file exceeds the limits: its size in lines is unknown.
-    """
-    if configured != "auto":
-        return configured
-    small = (
-        len(snap.files) <= QUICK_TIER_MAX_FILES
-        and snap.added + snap.deleted <= QUICK_TIER_MAX_CHANGED_LINES
-        and not snap.skipped
-    )
-    return "quick" if small else "standard"
-
-
-def current_tier(state: GateState, root: Path) -> Tier:
-    """The concrete tier of `state`'s task for the work tree `root` as it is now."""
-    if state.tier != "auto":
-        return state.tier
-    return task_tier(state.tier, snapshot(root, state.base_sha))
-
-
 def evaluate_task(state: GateState, root: Path) -> Evaluation:
     """Evaluate the evidence ledger of the work tree `root` for the task of `state`.
 
     Raises `DiffScanError` or `LedgerError` when the work tree or the ledger cannot be read.
     """
     snap = snapshot(root, state.base_sha)
-    return evaluate_evidence(root, snap, task_tier(state.tier, snap), state.isolation_evidence)
+    return evaluate_evidence(root, snap, state.deep, state.isolation_evidence)
 
 
 class Outcome(Enum):
@@ -397,7 +359,7 @@ def decide_stop(state: GateState, root: Path) -> StopDecision:
     if outcome in HUMAN_NOTICES:
         return StopDecision(replace(state, stage=Stage.NEEDS_HUMAN), notice=HUMAN_NOTICES[outcome])
     if outcome is Outcome.PASSED:
-        return StopDecision(state.closed(evaluation.report, evaluation.tier))
+        return StopDecision(state.closed(evaluation.report, evaluation.deep))
     return _continue(state, evaluation.report, None)
 
 
@@ -497,7 +459,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="craftsman gate",
         description=(
             "Open, update and close the Craftsman quality gate of the current git work tree. "
-            "Without an action, --tier and --task update the active gate."
+            "Without an action, --deep and --task update the active gate."
         ),
     )
     action = parser.add_mutually_exclusive_group()
@@ -513,11 +475,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cwd", help="A directory inside the work tree (default: the current one).")
     parser.add_argument(
-        "--tier",
-        choices=GATE_TIERS,
-        help=f"auto (quick while the diff stays within {QUICK_TIER_MAX_FILES} files and "
-        f"{QUICK_TIER_MAX_CHANGED_LINES} lines, else standard), quick, standard or deep. An active "
-        "gate's tier can only rise.",
+        "--deep",
+        action="store_true",
+        help="A deep gate: every lens is suggested and an end-to-end run is required. "
+        "An active gate can only be raised to deep.",
     )
     parser.add_argument("--task", help="One-line description of the task (shown in review packets).")
     parser.add_argument("--base-sha", help="With --init: the base commit (default HEAD).")
@@ -544,10 +505,10 @@ def _check_combinations(parser: argparse.ArgumentParser, args: argparse.Namespac
     ]
     if init_only and not args.init:
         parser.error(f"{', '.join(init_only)}: only valid with --init")
-    if (args.complete or args.await_user or args.resume) and (args.tier or args.task):
-        parser.error("--tier and --task apply with --init or on their own")
-    if not (args.init or args.complete or args.await_user or args.resume or args.tier or args.task):
-        parser.error("choose --init, --complete, --await-user or --resume, or update --tier/--task")
+    if (args.complete or args.await_user or args.resume) and (args.deep or args.task):
+        parser.error("--deep and --task apply with --init or on their own")
+    if not (args.init or args.complete or args.await_user or args.resume or args.deep or args.task):
+        parser.error("choose --init, --complete, --await-user or --resume, or update --deep/--task")
 
 
 def run_cli(argv: list[str], env: Mapping[str, str]) -> int:
@@ -579,14 +540,14 @@ def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -
     with state_lock(path):
         previous = _replaceable_state(path, takeover=args.takeover)
         owner = caller
-        tier: GateTier = args.tier or "auto"
+        deep = bool(args.deep)
         isolation: IsolationEvidence = "none"
         takeover_from: GateOwner | None = None
         if previous is not None and previous.active and previous.owner.admits(caller):
-            # Re-opening its own gate keeps what the hooks proved about the session, and its tier
-            # can only rise, so a re-init cannot shed the isolated reviewer requirement.
+            # Re-opening its own gate keeps what the hooks proved about the session, and it can
+            # only become deep, so a re-init cannot shed the deep requirements.
             owner, isolation = previous.owner.claimed_by(caller), previous.isolation_evidence
-            tier = raised_tier(previous.tier, args.tier or previous.tier)
+            deep = previous.deep or deep
         elif previous is not None and previous.active:
             if not args.takeover:
                 raise ForeignGateError(foreign_gate_refusal(root, previous, "initialize"))
@@ -594,7 +555,7 @@ def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -
         state = GateState.open(
             owner,
             base_sha,
-            tier,
+            deep,
             args.task or "",
             isolation_evidence=isolation,
             takeover_from=takeover_from,
@@ -619,7 +580,7 @@ def _updated(state: GateState, args: argparse.Namespace) -> GateState:
         return replace(state, awaiting_user=bool(args.await_user))
     return replace(
         state,
-        tier=raised_tier(state.tier, args.tier) if args.tier else state.tier,
+        deep=state.deep or bool(args.deep),
         task=args.task or state.task,
     )
 
@@ -635,7 +596,7 @@ def _close_gate(
         return replace(state, stage=Stage.NEEDS_HUMAN), (1, failure)
     if outcome is Outcome.UNSATISFIED:
         return state, (1, f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
-    closed = state.closed(evaluation.report, evaluation.tier)
+    closed = state.closed(evaluation.report, evaluation.deep)
     return closed, (0, closed_gate_line(evaluation, closed))
 
 
@@ -652,14 +613,15 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
 def closed_gate_line(evaluation: Evaluation, state: GateState) -> str:
     if state.active:
         return (
-            f"Craftsman gate passed without an isolated review on the {evaluation.tier} tier; it "
+            "Craftsman gate passed without an isolated review on a deep task; it "
             "stays open for the user's decision. Run `craftsman review report` for them.\n"
         )
     findings = evaluation.ledger.findings
     fixed = sum(finding.resolution == "fixed" for finding in findings)
     accepted = sum(finding.resolution == "accepted" for finding in findings)
     return (
-        f"Craftsman gate closed: round {len(evaluation.ledger.rounds)}, tier {evaluation.tier}, "
+        f"Craftsman gate closed: round {len(evaluation.ledger.rounds)}"
+        f"{', deep' if evaluation.deep else ''}, "
         f"{fixed} findings fixed, {accepted} accepted.\n"
     )
 

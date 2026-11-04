@@ -24,17 +24,16 @@ from craftsman.diffscan import (
     is_test_path,
 )
 from craftsman.ledger import reopened_mentions
-from craftsman.lenses import LensPick
-from craftsman.records import SWEEP_LENS, FieldError, Ledger, Round
+from craftsman.lenses import LENSES, LensPick
+from craftsman.records import FieldError, Ledger, Round
 from craftsman.text import inline_md
 
 MAX_PACKET_CHARS = 120_000
-MAX_QUICK_PACKET_CHARS = 40_000
 MAX_VIEW_CHARS = 60_000
 MAX_SCOPE_LINES = 60
 SCOPE_CONTEXT_RADIUS = 15
 MAX_COMMITS = 50
-MAX_REFERENCES_PER_SYMBOL = 8
+MAX_REFERENCES_PER_SYMBOL = 6
 TRIMMED_REFERENCES_PER_SYMBOL = 3
 MAX_TEST_FILES_PER_SYMBOL = 5
 REFERENCE_SEARCH_LIMIT = 40
@@ -95,32 +94,21 @@ _FENCE_LANGUAGES = {
 }
 _BACKTICK_RUN_RE = re.compile(r"`+")
 CHEAT_SHEET = (
-    "- Cover (1–4 hunks per call; combine assigned lenses with `\"lenses\"` — >= 2 lenses need >= 80 "
-    "chars/hunk, 20 concrete; 1 lens >= 40):\n"
-    '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lenses": ["intent", "contracts", '
-    '"failure"], "hunks": ["H1"], "note": "H1 parse_cfg: x=None -> L42 TypeError, raw=\'\' -> '
-    'default {} at cfg.py:18, callers cli.py:19 ok"}]`, or single '
-    '`craftsman review cover --lens intent,contracts --hunks H1 --note "..."`; `design` takes '
-    '`--files a.py` (`"files"` in JSON)',
-    "- Finding (one per root cause; >1 entry via `--from-json - <<'EOF'`; `craftsman review merge "
-    "F1 F2` only when ONE fix removes every consequence — different fixes stay separate findings):\n"
-    '  `craftsman review add --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "file": "<path>", '
-    '"line": 42, "severity": "major", "title": "...", "scenario": "<root cause -> wrong outcomes>", '
-    '"suggestion": "..."}]`, or single:\n'
-    "  `craftsman review add --lens <lens> --file <path> --line <n> --severity "
-    'blocker|major|minor|nit --title "..." --scenario "<root cause -> wrong outcomes>" '
-    '--suggestion "..."`',
-    "- Verdict (for >1 entry, prefer `craftsman review verdict --from-json - <<'EOF'` with "
-    '`[{"id": "F1", "as": "probable", "evidence": "static: <file.py:42 chain>"}]`): '
+    "- Cover your slice (free-text note, >= 20 chars: what you examined and tried): "
+    '`craftsman review cover --hunks H1,H3-H5 --note "..."`, or `--files <paths>` for every open '
+    'hunk of those files, or `--from-json - <<\'EOF\'` with `[{"hunks": ["H1"], "note": "..."}]`',
+    "- Finding (one per root cause; several via `--from-json - <<'EOF'`): "
+    "`craftsman review add --lens <lens> --file <path> --line <n> --severity "
+    'blocker|major|minor|nit --title "..." --scenario "<trigger -> wrong outcome>" '
+    '--suggestion "..."`; duplicates of one root cause: `craftsman review merge F1 F2` (only when '
+    "ONE fix removes every consequence)",
+    "- Verdict (several via `craftsman review verdict --from-json - <<'EOF'`): "
     '`craftsman review verdict F1 --as proven --run R1 --evidence "..."` · '
     '`--as probable --evidence "static: <file.py:42 chain>"` (or `"no-repro: <why>; <chain>"`) · '
     '`--as question --evidence "intent: <source>; <file.py:42 trade-off>"` · '
     '`--as dismissed --evidence "<guard at file.py:42>"`',
-    "- PowerShell / rejections: `@'` / `[...]` / `'@ | craftsman review <cmd> --from-json -` (ASCII "
-    "in PS 5.1) or `Set-Content -LiteralPath <path> -Encoding utf8` to `craftsman review inbox "
-    "<cover|add|verdict>`; fix all rejected entries in one edit, resend once",
     "- Run (tests, repro, e2e): `craftsman run --kind test|e2e|repro|lint|build -- <command>`",
-    "- Progress: `craftsman review show` · gate status: `craftsman review check` "
+    "- Progress: `craftsman review show` · gate: `craftsman review check` "
     "(review-only: `craftsman review check --review-only`, `craftsman review report --review-only`)",
 )
 
@@ -259,6 +247,12 @@ def _signals_by_hunk(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]]:
         for hunk_id in hunk_ids:
             by_hunk.setdefault(hunk_id, []).append(signal)
     return {hunk_id: tuple(signals) for hunk_id, signals in by_hunk.items()}
+
+
+def _signal_label(signal: str) -> str:
+    """A risk signal with the lenses it suggests, e.g. `process (→ failure, trust, platform)`."""
+    lenses = [lens.id for lens in LENSES if signal in lens.triggers]
+    return f"{signal} (→ {', '.join(lenses)})" if lenses else signal
 
 
 def _carried_from(ledger: Ledger, round_: Round) -> dict[str, int]:
@@ -445,7 +439,8 @@ def _header(ctx: PacketContext) -> str:
     carried = sum(hunk.carried for hunk in ctx.round.hunks)
     return (
         f"# Craftsman review packet — round {ctx.round.number}\n"
-        f"Base `{snap.base_sha[:7]}` · fingerprint `{snap.fingerprint[:12]}` · tier `{ctx.round.tier}` · "
+        f"Base `{snap.base_sha[:7]}` · fingerprint `{snap.fingerprint[:12]}` · "
+        f"{'deep round · ' if ctx.round.deep else ''}"
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines, "
         f"{len(snap.hunks)} hunks ({carried} carried)"
     )
@@ -465,15 +460,12 @@ def _conventions_section(ctx: PacketContext) -> str:
 
 
 def _lenses_section(ctx: PacketContext) -> str:
-    rows = ["| Lens | Why selected | Focus |", "| :--- | :--- | :--- |"]
+    rows = ["| Lens | Why suggested | Focus |", "| :--- | :--- | :--- |"]
     for pick in ctx.picks:
-        reason = pick.reason
-        if pick.lens.id == SWEEP_LENS:
-            reason += " (run after all other lenses)"
         rows.append(
-            f"| `{pick.lens.id}` — {pick.lens.title} | {inline_md(reason, table=True)} | {pick.lens.focus} |"
+            f"| `{pick.lens.id}` — {pick.lens.title} | {inline_md(pick.reason, table=True)} | {pick.lens.focus} |"
         )
-    section = "## Lenses in this round\n" + "\n".join(rows)
+    section = "## Suggested lenses\n" + "\n".join(rows)
     if ctx.unscanned_files:
         files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
         section += (
@@ -503,7 +495,7 @@ def _hunk_section(
         return f"{title} · carried (covered in round {ctx.carried_from[hunk.id]}, unchanged)"
     status = f"renamed from `{hunk.old_path}`" if hunk.old_path else hunk.status
     signals = ctx.signals_by_hunk.get(hunk.id, ())
-    title += f" · {status}" + (f" · signals: {', '.join(signals)}" if signals else "")
+    title += f" · {status}" + (f" · signals: {', '.join(_signal_label(s) for s in signals)}" if signals else "")
     mentions = ctx.reopened.get(hunk.id, ())
     if mentions:
         title += " · reopened: mentions " + ", ".join(
@@ -511,15 +503,14 @@ def _hunk_section(
         )
     lines = [title]
     scope = ctx.scopes.get(hunk.id)
-    inline_scopes = ctx.round.tier != "quick"
     owner = owners.scope.get(_scope_key(hunk, scope), hunk.id) if scope is not None else hunk.id
     if scope is not None:
-        if inline_scopes and owner != hunk.id:
+        if owner != hunk.id:
             lines.append(f"Scope: `{scope.name}` — shown at {owner}")
         else:
             lines.append(f"Scope: `{scope.name}` ({scope.kind}, L{scope.start}–L{scope.end})")
     lines.append(_omitted_diff_line(ctx, hunk) if omit_diff else _diff_block(hunk))
-    if inline_scopes and scope is not None and owner == hunk.id:
+    if scope is not None and owner == hunk.id:
         lines.append(_omitted_scope_line(scope) if omit_scope else _scope_block(hunk, scope))
     lines.extend(_symbol_lines(ctx, hunk, owners, trimmed_symbols))
     return "\n".join(lines)

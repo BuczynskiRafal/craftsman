@@ -44,13 +44,12 @@ def round_for(snap: DiffSnapshot, *, carried: frozenset[str] = frozenset()) -> R
         number=2,
         fingerprint=snap.fingerprint,
         base_sha=snap.base_sha,
-        tier="standard",
+        deep=False,
         prepared_at=PREPARED_AT,
         hunks=tuple(
             HunkRef(hunk.id, hunk.path, hunk.digest, hunk.new_start, hunk.new_len, hunk.id in carried)
             for hunk in snap.hunks
         ),
-        lenses=("intent", "sweep"),
         packet_path="packet-2.md",
         signals=(),
     )
@@ -59,7 +58,7 @@ def round_for(snap: DiffSnapshot, *, carried: frozenset[str] = frozenset()) -> R
 def picks() -> tuple[Any, ...]:
     return tuple(
         pick
-        for pick in select_lenses("standard", {}, docs_only=False)
+        for pick in select_lenses({}, deep=False, docs_only=False)
         if pick.lens.id in ("intent", "sweep")
     )
 
@@ -255,7 +254,7 @@ class RenderTests(unittest.TestCase):
         scope = Scope("pkg/a.py", "f", "function", 1, 50, "\n".join(f"line {i}" for i in range(50)))
         ctx = build_context(scopes={"H1": scope})
 
-        with mock.patch.object(packet, "MAX_PACKET_CHARS", 3000):
+        with mock.patch.object(packet, "MAX_PACKET_CHARS", 1500):
             text = render_packet(ctx)
 
         self.assertIn("Enclosing scope omitted for size — open pkg/a.py:L1–L50", text)
@@ -358,10 +357,10 @@ class LayoutTests(unittest.TestCase):
                 "# Craftsman review packet — round 2",
                 "## Intent",
                 "## Conventions to read first",
-                "## Lenses in this round",
+                "## Suggested lenses",
                 "## Recording cheat sheet",
                 "## Hunks",
-                "### H1 · `pkg/a.py` L1–L2 · modified · signals: errors",
+                "### H1 · `pkg/a.py` L1–L2 · modified · signals: errors (→ failure)",
             ],
         )
 

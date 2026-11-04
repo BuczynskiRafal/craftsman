@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, TypeVar, get_args
 
-from craftsman.diffscan import Hunk, is_relative_posix_path
-from craftsman.lenses import LENS_IDS, TIERS, Tier
+from craftsman.diffscan import is_relative_posix_path
+from craftsman.lenses import LENS_IDS
 
 Severity = Literal["blocker", "major", "minor", "nit"]
 Verdict = Literal["proven", "probable", "question", "dismissed"]
@@ -43,7 +43,6 @@ PLUGIN_AGENT_PREFIX = "craftsman:"
 SCHEMA_VERSION = 3
 LEDGER_FILENAME = "ledger.json"
 OUTPUT_TAIL_CHARS = 4000
-MAX_HUNKS_PER_COVERAGE = 4
 MIN_TITLE_CHARS = 8
 MAX_TITLE_CHARS = 160
 MIN_SCENARIO_CHARS = 20
@@ -51,32 +50,7 @@ MIN_EVIDENCE_CHARS = 20
 SHORT_COMMAND_CHARS = 60
 MIN_RESOLUTION_NOTE_CHARS = 20
 MIN_WAIVER_REASON_CHARS = 20
-# Every hunk named in a coverage note needs its own segment of at least this many characters.
-MIN_HUNK_NOTE_SEGMENT_CHARS = 40
-GENERIC_COVERAGE_WORDS: tuple[str, ...] = (
-    "looks good",
-    "well-factored",
-    "well factored",
-    "clear structure",
-    "no issues",
-    "nothing to report",
-    "clean",
-    "ok",
-    "okay",
-    "fine",
-    "good",
-    "lgtm",
-    "readable",
-    "clear",
-    "dry",
-    "consistent",
-    "concise",
-    "accurate",
-    "checked",
-    "reviewed",
-)
-DESIGN_LENS = "design"
-SWEEP_LENS = "sweep"
+MIN_COVERAGE_NOTE_CHARS = 20
 _EXTENSIONLESS_FILES = (
     "Makefile|Dockerfile|Jenkinsfile|Gemfile|Rakefile|Procfile|BUILD|WORKSPACE|Vagrantfile|"
     "Containerfile|Justfile|AUTHORS|CONTRIBUTORS|CHANGELOG|CHANGES|NEWS|HISTORY|README|"
@@ -113,29 +87,20 @@ E = TypeVar("E", bound=Enum)
 class LedgerError(RuntimeError):
     """Raised for invalid ledger data, rejected operations and ledger I/O failures."""
 
-    def __init__(self, message: str, *, field: str = "", example: str | None = None) -> None:
+    def __init__(self, message: str, *, field: str = "") -> None:
         super().__init__(message)
         self.field = field
-        self.example = example
 
 
 class FieldError(LedgerError):
     """A validation error that knows which (possibly nested) field it concerns."""
 
-    def __init__(self, field: str, problem: str, *, example: str | None = None) -> None:
-        super().__init__(
-            " ".join(part for part in (field, problem) if part),
-            field=field,
-            example=example,
-        )
+    def __init__(self, field: str, problem: str) -> None:
+        super().__init__(" ".join(part for part in (field, problem) if part), field=field)
         self.problem = problem
 
     def within(self, parent: str) -> FieldError:
-        return FieldError(
-            f"{parent}.{self.field}" if self.field else parent,
-            self.problem,
-            example=self.example,
-        )
+        return FieldError(f"{parent}.{self.field}" if self.field else parent, self.problem)
 
 
 @dataclass(frozen=True)
@@ -146,7 +111,6 @@ class EntryProblem:
     label: str | None
     field: str
     problem: str
-    example: str | None = None
 
 
 class BatchRejected(LedgerError):
@@ -473,18 +437,6 @@ class QualitySignal:
         )
 
 
-def file_digest(hunks: Iterable[Hunk | HunkRef], path: str) -> str:
-    """The digest the `design` lens covers for `path`: it changes whenever any of its hunks does."""
-    return "file:" + path + ":" + ",".join(hunk.digest for hunk in hunks if hunk.path == path)
-
-
-@dataclass(frozen=True)
-class RoundFile:
-    path: str
-    digest: str
-    carried: bool
-
-
 def _require_scope(scope: tuple[str, ...] | None) -> None:
     if scope is None:
         return
@@ -504,10 +456,9 @@ class Round:
     number: int
     fingerprint: str
     base_sha: str
-    tier: Tier
+    deep: bool
     prepared_at: str
     hunks: tuple[HunkRef, ...]
-    lenses: tuple[str, ...]
     packet_path: str
     signals: tuple[QualitySignal, ...]
     scope: tuple[str, ...] | None = None
@@ -517,12 +468,7 @@ class Round:
         _require(self.number >= 1, "number", "must be >= 1")
         _require_text(self.fingerprint, "fingerprint")
         _require_text(self.base_sha, "base_sha")
-        _require_choice(self.tier, TIERS, "tier")
         _require_timestamp(self.prepared_at, "prepared_at")
-        _require(bool(self.lenses), "lenses", "must name at least one lens")
-        for lens in self.lenses:
-            _require_choice(lens, sorted(LENS_IDS), "lenses")
-        _require(len(set(self.lenses)) == len(self.lenses), "lenses", "must not repeat a lens")
         hunk_ids = [hunk.id for hunk in self.hunks]
         _require(len(set(hunk_ids)) == len(hunk_ids), "hunks", "must not repeat a hunk id")
         sig_ids = [sig.id for sig in self.signals]
@@ -532,25 +478,8 @@ class Round:
             _require_text(path, f"out_of_scope[{index}]")
 
     @property
-    def files(self) -> tuple[RoundFile, ...]:
-        """The changed files in diff order; the `design` lens covers these instead of hunks."""
-        paths = dict.fromkeys(hunk.path for hunk in self.hunks)
-        return tuple(
-            RoundFile(
-                path,
-                file_digest(self.hunks, path),
-                all(hunk.carried for hunk in self.hunks if hunk.path == path),
-            )
-            for path in paths
-        )
-
-    @property
     def open_hunk_ids(self) -> tuple[str, ...]:
         return tuple(hunk.id for hunk in self.hunks if not hunk.carried)
-
-    @property
-    def open_files(self) -> tuple[str, ...]:
-        return tuple(file.path for file in self.files if not file.carried)
 
     def to_json(self) -> dict[str, Any]:
         return _record_json(self)
@@ -563,10 +492,9 @@ class Round:
                 number=f.integer("number"),
                 fingerprint=f.text("fingerprint"),
                 base_sha=f.text("base_sha"),
-                tier=f.choice("tier", TIERS),
+                deep=f.flag("deep"),
                 prepared_at=f.text("prepared_at"),
                 hunks=f.records("hunks", HunkRef.from_json),
-                lenses=f.texts("lenses"),
                 packet_path=f.text("packet_path"),
                 signals=f.records("signals", QualitySignal.from_json),
                 scope=f.optional_texts("scope"),
@@ -578,20 +506,14 @@ class Round:
 @dataclass(frozen=True)
 class Coverage:
     round: int
-    lens: str
     digests: tuple[str, ...]
     note: str
     recorded_at: str
 
     def __post_init__(self) -> None:
         _require(self.round >= 1, "round", "must be >= 1")
-        _require_choice(self.lens, sorted(LENS_IDS), "lens")
-        _require(
-            1 <= len(self.digests) <= MAX_HUNKS_PER_COVERAGE,
-            "digests",
-            f"must list 1..{MAX_HUNKS_PER_COVERAGE} hunk digests (got {len(self.digests)})",
-        )
-        _require_text(self.note, "note", min_chars=MIN_HUNK_NOTE_SEGMENT_CHARS)
+        _require(bool(self.digests), "digests", "must list at least one hunk digest")
+        _require_text(self.note, "note", min_chars=MIN_COVERAGE_NOTE_CHARS)
         _require_timestamp(self.recorded_at, "recorded_at")
 
     def to_json(self) -> dict[str, Any]:
@@ -603,7 +525,6 @@ class Coverage:
         return f.done(
             cls(
                 round=f.integer("round"),
-                lens=f.text("lens"),
                 digests=f.texts("digests"),
                 note=f.text("note"),
                 recorded_at=f.text("recorded_at"),
@@ -941,17 +862,7 @@ class Ledger:
 
     def _check_coverage(self, coverage: Coverage, where: str) -> None:
         round_ = self._round(coverage.round, where)
-        _require(
-            coverage.lens in round_.lenses,
-            f"{where}.lens",
-            f"was not selected in round {coverage.round}",
-        )
-        if coverage.lens == DESIGN_LENS:
-            known = {file.digest for file in round_.files}
-        elif round_.tier == "quick":
-            known = {hunk.digest for hunk in round_.hunks} | {file.digest for file in round_.files}
-        else:
-            known = {hunk.digest for hunk in round_.hunks}
+        known = {hunk.digest for hunk in round_.hunks}
         unknown = [digest for digest in coverage.digests if digest not in known]
         _require(not unknown, f"{where}.digests", f"are not in round {coverage.round}: {unknown}")
 

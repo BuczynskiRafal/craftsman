@@ -61,7 +61,7 @@ class RoundFilePruningTests(unittest.TestCase):
         return sorted(path.name for path in self.craftsman_dir.iterdir())
 
     def test_round_one_keeps_current_packet_views(self) -> None:
-        self.touch("packet-1.md", "packet-1.intent.md", "packet-1.R1.H1-H2.md")
+        self.touch("packet-1.md", "packet-1.H1.md", "packet-1.R1.H1-H2.md")
 
         removed, err = self.run_prune(1)
 
@@ -69,31 +69,31 @@ class RoundFilePruningTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(
             self.remaining(),
-            ["packet-1.R1.H1-H2.md", "packet-1.intent.md", "packet-1.md"],
+            ["packet-1.H1.md", "packet-1.R1.H1-H2.md", "packet-1.md"],
         )
 
     def test_round_two_prunes_prior_views_keeping_prior_packet(self) -> None:
         self.touch(
             "packet-1.md",
-            "packet-1.intent.md",
+            "packet-1.H1.md",
             "packet-1.R1.H1-H4.md",
             "packet-2.md",
-            "packet-2.intent.md",
+            "packet-2.H1.md",
         )
 
         removed, err = self.run_prune(2)
 
-        self.assertEqual(removed, ("packet-1.R1.H1-H4.md", "packet-1.intent.md"))
+        self.assertEqual(removed, ("packet-1.H1.md", "packet-1.R1.H1-H4.md"))
         self.assertEqual(
             err.splitlines(),
-            ["Pruned: packet-1.R1.H1-H4.md", "Pruned: packet-1.intent.md"],
+            ["Pruned: packet-1.H1.md", "Pruned: packet-1.R1.H1-H4.md"],
         )
-        self.assertEqual(self.remaining(), ["packet-1.md", "packet-2.intent.md", "packet-2.md"])
+        self.assertEqual(self.remaining(), ["packet-1.md", "packet-2.H1.md", "packet-2.md"])
 
     def test_round_three_prunes_packets_older_than_previous_round(self) -> None:
         self.touch(
             "packet-1.md",
-            "packet-1.intent.md",
+            "packet-1.H1.md",
             "packet-2.md",
             "packet-2.craft.md",
             "packet-3.md",
@@ -102,11 +102,11 @@ class RoundFilePruningTests(unittest.TestCase):
 
         removed, err = self.run_prune(3)
 
-        self.assertEqual(removed, ("packet-1.intent.md", "packet-1.md", "packet-2.craft.md"))
+        self.assertEqual(removed, ("packet-1.H1.md", "packet-1.md", "packet-2.craft.md"))
         self.assertEqual(
             err.splitlines(),
             [
-                "Pruned: packet-1.intent.md",
+                "Pruned: packet-1.H1.md",
                 "Pruned: packet-1.md",
                 "Pruned: packet-2.craft.md",
             ],
@@ -337,21 +337,21 @@ class ArchivePruningTests(unittest.TestCase):
         repo.write("app.py", "def compute(x: int) -> int:\n    return x + 1\n")
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(
-                review.main(["prepare", "--cwd", str(repo.root), "--tier", "standard"]), 0
+                review.main(["prepare", "--cwd", str(repo.root)]), 0
             )
             self.assertEqual(
-                review.main(["view", "--cwd", str(repo.root), "--lenses", "intent"]), 0
+                review.main(["view", "--cwd", str(repo.root), "--hunks", "H1"]), 0
             )
         self.assertTrue((craftsman_dir / "packet-1.md").is_file())
-        self.assertTrue((craftsman_dir / "packet-1.intent.md").is_file())
+        self.assertTrue((craftsman_dir / "packet-1.H1.md").is_file())
 
         # Re-preparing an unchanged diff does not prune round 1's view.
         err_unchanged = io.StringIO()
         with redirect_stdout(io.StringIO()), redirect_stderr(err_unchanged):
             self.assertEqual(
-                review.main(["prepare", "--cwd", str(repo.root), "--tier", "standard"]), 0
+                review.main(["prepare", "--cwd", str(repo.root)]), 0
             )
-        self.assertTrue((craftsman_dir / "packet-1.intent.md").is_file())
+        self.assertTrue((craftsman_dir / "packet-1.H1.md").is_file())
         self.assertEqual(err_unchanged.getvalue(), "")
 
         # Round 2 prunes round 1 views while keeping packet-1.md and packet-2.md.
@@ -359,30 +359,30 @@ class ArchivePruningTests(unittest.TestCase):
         err_r2 = io.StringIO()
         with redirect_stdout(io.StringIO()), redirect_stderr(err_r2):
             self.assertEqual(
-                review.main(["prepare", "--cwd", str(repo.root), "--tier", "standard"]), 0
+                review.main(["prepare", "--cwd", str(repo.root)]), 0
             )
             self.assertEqual(
-                review.main(["view", "--cwd", str(repo.root), "--lenses", "intent"]), 0
+                review.main(["view", "--cwd", str(repo.root), "--hunks", "H1"]), 0
             )
-        self.assertFalse((craftsman_dir / "packet-1.intent.md").exists())
+        self.assertFalse((craftsman_dir / "packet-1.H1.md").exists())
         self.assertTrue((craftsman_dir / "packet-1.md").is_file())
         self.assertTrue((craftsman_dir / "packet-2.md").is_file())
-        self.assertTrue((craftsman_dir / "packet-2.intent.md").is_file())
-        self.assertIn("Pruned: packet-1.intent.md", err_r2.getvalue())
+        self.assertTrue((craftsman_dir / "packet-2.H1.md").is_file())
+        self.assertIn("Pruned: packet-1.H1.md", err_r2.getvalue())
 
         # Round 3 prunes packet-1.md and round 2 views while keeping packet-2.md and packet-3.md.
         repo.write("app.py", "def compute(x: int) -> int:\n    return x + 3\n")
         err_r3 = io.StringIO()
         with redirect_stdout(io.StringIO()), redirect_stderr(err_r3):
             self.assertEqual(
-                review.main(["prepare", "--cwd", str(repo.root), "--tier", "standard"]), 0
+                review.main(["prepare", "--cwd", str(repo.root)]), 0
             )
         self.assertFalse((craftsman_dir / "packet-1.md").exists())
-        self.assertFalse((craftsman_dir / "packet-2.intent.md").exists())
+        self.assertFalse((craftsman_dir / "packet-2.H1.md").exists())
         self.assertTrue((craftsman_dir / "packet-2.md").is_file())
         self.assertTrue((craftsman_dir / "packet-3.md").is_file())
         self.assertIn("Pruned: packet-1.md", err_r3.getvalue())
-        self.assertIn("Pruned: packet-2.intent.md", err_r3.getvalue())
+        self.assertIn("Pruned: packet-2.H1.md", err_r3.getvalue())
 
 
 class _ReparseStat:
@@ -594,7 +594,7 @@ class InboxLifecycleTests(unittest.TestCase):
         repo = EvidenceRepo(self.tmp.resolve() / "gate-repo")
         repo.write_lines("app.py", 5)
         self.assertEqual(
-            gate.run_cli(["--init", "--tier", "quick", "--cwd", str(repo.root)], {}), 0
+            gate.run_cli(["--init", "--cwd", str(repo.root)], {}), 0
         )
         stale = create_inbox_file(repo.ledger_dir, "cover")
 
@@ -604,7 +604,7 @@ class InboxLifecycleTests(unittest.TestCase):
         self.assertEqual(refused_code, 1)
         self.assertTrue(stale.is_file())
 
-        repo.record_full_evidence("quick")
+        repo.record_full_evidence()
         stale_at_close = create_inbox_file(repo.ledger_dir, "cover")
         closed_out, closed_err = io.StringIO(), io.StringIO()
         with redirect_stdout(closed_out), redirect_stderr(closed_err):
@@ -714,7 +714,7 @@ class InboxLifecycleTests(unittest.TestCase):
 
     def test_reparse_tags_block_links_while_allowing_cloud_files(self) -> None:
         inbox_file = create_inbox_file(self.craftsman_dir, "cover")
-        (self.craftsman_dir / "packet-1.intent.md").write_text("view", encoding="utf-8")
+        (self.craftsman_dir / "packet-1.H1.md").write_text("view", encoding="utf-8")
         (self.craftsman_dir / "packet-1.md").write_text("p1", encoding="utf-8")
         (self.craftsman_dir / "packet-2.md").write_text("p2", encoding="utf-8")
         real_lstat = os.lstat
@@ -737,7 +737,7 @@ class InboxLifecycleTests(unittest.TestCase):
             evidence._require_real_folder(self.craftsman_dir)
             with redirect_stderr(io.StringIO()):
                 removed = prune_round_files(self.craftsman_dir, 2)
-            self.assertEqual([item.name for item in removed], ["packet-1.intent.md"])
+            self.assertEqual([item.name for item in removed], ["packet-1.H1.md"])
             self.assertTrue(consume_inbox_file(self.craftsman_dir, str(inbox_file)))
             self.assertFalse(inbox_file.exists())
 

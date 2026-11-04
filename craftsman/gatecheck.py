@@ -11,13 +11,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 from craftsman.diffscan import DiffSnapshot
-from craftsman.ledger import counting_sweeps, open_units, uncovered_by_lens
-from craftsman.lenses import REVIEW_ONLY_QUICK_MAX_LINES, TIERS, Tier
+from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
-    DESIGN_LENS,
-    MAX_HUNKS_PER_COVERAGE,
     REVIEWER_AGENT,
-    SWEEP_LENS,
     IsolationEvidence,
     Ledger,
     LedgerError,
@@ -34,9 +30,7 @@ from craftsman.triviality import command_without_env, is_trivial_run
 IssueCode = Literal[
     "no-round",
     "stale-round",
-    "tier-too-low",
     "uncovered",
-    "sweep-too-early",
     "no-verdict",
     "unresolved",
     "no-passing-run",
@@ -49,15 +43,13 @@ IssueCode = Literal[
 SELF_REVIEWED_BANNER = (
     "SELF-REVIEWED: no evidence that anyone other than the author reviewed this change"
 )
-QUICK_TIER_MAX_CHANGED_LINES = 40
 MAX_NEXT_ACTIONS = 12
+MAX_LISTED_HUNKS = 12
 SUMMARY_RECENT_RUNS = 3
 # Review rounds of different diffs before the agent must stop iterating and ask the user.
 MAX_ROUNDS = 5
 # Process anomalies: patterns typical of a review that was recorded rather than performed.
 ANOMALY_MIN_FINDINGS = 5
-ANOMALY_FAST_COVERAGE_HUNKS = 20
-ANOMALY_FAST_COVERAGE_SECONDS = 120
 PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
 _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 
@@ -69,10 +61,8 @@ _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 class GateIssue:
     code: IssueCode
     message: str
-    # Only for `uncovered`: the lenses and how many hunks (or files) they still miss.
-    lenses: tuple[str, ...] = ()
+    # Only for `uncovered`: how many hunks are still uncovered.
     missing: int = 0
-    unit: Literal["hunk", "file"] = "hunk"
 
 
 @dataclass(frozen=True)
@@ -115,16 +105,16 @@ class GateReport:
 class GatePolicy:
     """How strictly the gate judges a ledger.
 
-    `isolation_evidence` names where proof of an isolated reviewer can come from; with `none`, a
-    `standard` or `deep` review passes as self-reviewed.
+    `isolation_evidence` names where proof of an isolated reviewer can come from; with `none`, the
+    review passes as self-reviewed. `deep` additionally requires a passing end-to-end run.
     """
 
-    tier: Tier
+    deep: bool = False
     isolation_evidence: IsolationEvidence = "none"
 
     @property
     def require_isolation(self) -> bool:
-        return self.isolation_evidence != "none" and self.tier != "quick"
+        return self.isolation_evidence != "none"
 
 
 def evaluate(
@@ -147,7 +137,6 @@ def evaluate(
     )
     issues = (
         *_round_issues(ledger, snap),
-        *(_tier_issues(latest, policy) if latest else ()),
         *(_coverage_issues(ledger, latest) if latest else ()),
         *_verdict_issues(ledger),
         *fix_and_test,
@@ -156,13 +145,12 @@ def evaluate(
     )
     self_reviewed = bool(
         latest is not None
-        and policy.tier != "quick"
         and not policy.require_isolation
         and not _has_isolated_reviewer_stop(ledger, latest)
     )
     return GateReport(
         issues,
-        _warnings(ledger, snap, policy, review_only=review_only),
+        _warnings(ledger, review_only=review_only),
         _summary(ledger, snap),
         review_only=review_only,
         self_reviewed=self_reviewed,
@@ -203,91 +191,21 @@ def _round_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
     return []
 
 
-def _tier_issues(latest: Round, policy: GatePolicy) -> list[GateIssue]:
-    if TIERS.index(latest.tier) >= TIERS.index(policy.tier):
+def _coverage_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
+    missing = uncovered_hunks(ledger, latest)
+    if not missing:
         return []
+    batch = ",".join(missing[:MAX_LISTED_HUNKS])
+    extra = len(missing) - MAX_LISTED_HUNKS
+    more = f" (+{extra} more)" if extra > 0 else ""
     return [
         GateIssue(
-            "tier-too-low",
-            f"Round {latest.number} was prepared for the {latest.tier} tier but this task needs "
-            f"{policy.tier}; run `craftsman review prepare --tier {policy.tier}`.",
+            "uncovered",
+            f"{len(missing)} hunk(s) uncovered in round {latest.number}: {batch}{more}; have them "
+            f'reviewed and run `craftsman review cover --hunks {batch} --note "..."`.',
+            missing=len(missing),
         )
     ]
-
-
-def _coverage_issues(ledger: Ledger, latest: Round) -> list[GateIssue]:
-    missing = uncovered_by_lens(ledger, latest)
-    sweep_missing = missing.pop(SWEEP_LENS, [])
-    design_missing = missing.pop(DESIGN_LENS, [])
-    use_files = latest.tier == "quick"
-    path_by_hunk = {hunk.id: hunk.path for hunk in latest.hunks}
-    grouped: dict[tuple[str, ...], list[str]] = {}
-    for lens, ids in missing.items():
-        if not ids:
-            continue
-        targets = (
-            tuple(dict.fromkeys(path_by_hunk[hid] for hid in ids)) if use_files else tuple(ids)
-        )
-        grouped.setdefault(targets, []).append(lens)
-    issues = [
-        _uncovered_issue(lenses, targets, latest, use_files=use_files)
-        for targets, lenses in grouped.items()
-    ]
-    if design_missing:
-        issues.append(_uncovered_issue((DESIGN_LENS,), design_missing, latest, use_files=True))
-    premature = _premature_sweep_ids(ledger, latest, sweep_missing)
-    if premature:
-        batch = ",".join(premature[:MAX_HUNKS_PER_COVERAGE])
-        issues.append(
-            GateIssue(
-                "sweep-too-early",
-                f"The final sweep of {', '.join(premature)} was recorded before the other lenses "
-                f"of round {latest.number} were complete, so it does not count; once every other "
-                f"lens is covered, repeat it: "
-                f'`craftsman review cover --lens {SWEEP_LENS} --hunks {batch} --note "..."`.',
-            )
-        )
-    remaining = [hunk_id for hunk_id in sweep_missing if hunk_id not in premature]
-    if remaining and not any(missing.values()) and not design_missing:
-        issues.append(_uncovered_issue((SWEEP_LENS,), remaining, latest, use_files=False))
-    return issues
-
-
-def _uncovered_issue(
-    lenses: Sequence[str], missing: Sequence[str], round_: Round, *, use_files: bool
-) -> GateIssue:
-    batch = ",".join(missing[:MAX_HUNKS_PER_COVERAGE])
-    extra = len(missing) - MAX_HUNKS_PER_COVERAGE
-    more = f" (+{extra} more)" if extra > 0 else ""
-    unit = "file(s)" if use_files else "hunk(s)"
-    flag = "--files" if use_files else "--hunks"
-    lens_arg = ",".join(lenses)
-    head = (
-        f"Lens `{lenses[0]}` has"
-        if len(lenses) == 1
-        else f"Lenses {', '.join(f'`{lens}`' for lens in lenses)} have"
-    )
-    return GateIssue(
-        "uncovered",
-        f"{head} {len(missing)} uncovered {unit} in round {round_.number}: "
-        f"{batch}{more}; review them and run "
-        f'`craftsman review cover --lens {lens_arg} {flag} {batch} --note "..."`.',
-        lenses=tuple(lenses),
-        missing=len(missing),
-        unit="file" if use_files else "hunk",
-    )
-
-
-def _premature_sweep_ids(ledger: Ledger, round_: Round, sweep_missing: Sequence[str]) -> list[str]:
-    """Still-uncovered hunk ids whose only sweep coverage in `round_` came too early."""
-    counting = counting_sweeps(ledger)
-    digests = {
-        digest
-        for record in ledger.coverage
-        if record.round == round_.number and record.lens == SWEEP_LENS and record not in counting
-        for digest in record.digests
-    }
-    return [hunk.id for hunk in round_.hunks if hunk.id in sweep_missing and hunk.digest in digests]
 
 
 def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
@@ -351,11 +269,11 @@ def _passing_run_issues(ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy) 
                 "run `craftsman run --kind test -- <your test command>`.",
             )
         )
-    if policy.tier == "deep" and not any(run.kind == "e2e" for run in passing):
+    if policy.deep and not any(run.kind == "e2e" for run in passing):
         issues.append(
             GateIssue(
                 "no-e2e-run",
-                "The deep tier needs a passing end-to-end run at the current code; run "
+                "A deep gate needs a passing end-to-end run at the current code; run "
                 "`craftsman run --kind e2e -- <command that exercises the real flow>`.",
             )
         )
@@ -416,7 +334,6 @@ def _isolation_issues(ledger: Ledger, latest: Round, policy: GatePolicy) -> list
 
 
 def _round_cap_issues(ledger: Ledger) -> list[GateIssue]:
-    # Re-preparing the same diff for a stricter tier is not another iteration.
     diffs = len({round_.fingerprint for round_ in ledger.rounds})
     if diffs <= MAX_ROUNDS:
         return []
@@ -432,7 +349,6 @@ def _round_cap_issues(ledger: Ledger) -> list[GateIssue]:
 def _process_anomaly_warnings(ledger: Ledger) -> list[str]:
     return [
         *_all_confirmed_warnings(ledger),
-        *_fast_coverage_warnings(ledger),
         *_retried_with_other_env_warnings(ledger),
     ]
 
@@ -447,27 +363,6 @@ def _all_confirmed_warnings(ledger: Ledger) -> list[str]:
         f"Process anomaly: {len(findings)} findings and 0 dismissed "
         "(all findings confirmed — typical of self-review)."
     ]
-
-
-def _fast_coverage_warnings(ledger: Ledger) -> list[str]:
-    if not ledger.rounds:
-        return []
-    latest = ledger.rounds[-1]
-    warnings: list[str] = []
-    for lens in latest.lenses:
-        if lens == DESIGN_LENS:  # covers whole files, which takes fewer, larger steps
-            continue
-        records = [r for r in ledger.coverage if r.round == latest.number and r.lens == lens]
-        covered = sum(len(record.digests) for record in records)
-        if covered <= ANOMALY_FAST_COVERAGE_HUNKS:
-            continue
-        times = [parse_timestamp(record.recorded_at) for record in records]
-        if (max(times) - min(times)).total_seconds() < ANOMALY_FAST_COVERAGE_SECONDS:
-            warnings.append(
-                f"Process anomaly: {covered} hunks covered in lens `{lens}` in under "
-                f"{ANOMALY_FAST_COVERAGE_SECONDS // 60} minutes."
-            )
-    return warnings
 
 
 def _retried_with_other_env_warnings(ledger: Ledger) -> list[str]:
@@ -507,9 +402,7 @@ def _review_only_warnings(ledger: Ledger) -> list[str]:
     return warnings
 
 
-def _warnings(
-    ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy, *, review_only: bool = False
-) -> tuple[str, ...]:
+def _warnings(ledger: Ledger, *, review_only: bool = False) -> tuple[str, ...]:
     warnings = _review_only_warnings(ledger) if review_only else []
     accepted = [finding.id for finding in ledger.findings if finding.resolution == "accepted"]
     if accepted:
@@ -522,13 +415,6 @@ def _warnings(
     waived = [run.id for run in ledger.runs if run.waiver is not None]
     if waived:
         warnings.append(f"Waived failing runs: {', '.join(waived)}; tell the user about them.")
-    changed_lines = snap.added + snap.deleted
-    quick_max = REVIEW_ONLY_QUICK_MAX_LINES if review_only else QUICK_TIER_MAX_CHANGED_LINES
-    if policy.tier == "quick" and changed_lines > quick_max and not (review_only and snap.docs_only):
-        warnings.append(
-            f"The quick tier reviews {changed_lines} changed lines "
-            f"(> {quick_max}); consider the standard tier."
-        )
     warnings.extend(_large_diff_warnings(ledger))
     warnings.extend(
         f"{run.id} (`{run.command}`) is trivial and does not count as verification."
@@ -560,7 +446,7 @@ def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
         latest = ledger.rounds[-1]
         freshness = "current" if latest.fingerprint == snap.fingerprint else "stale"
         round_line = (
-            f"Round {latest.number} ({latest.tier}, {len(latest.lenses)} lenses, {freshness}): "
+            f"Round {latest.number} ({'deep, ' if latest.deep else ''}{freshness}): "
             f"{len(latest.hunks)} hunks in {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines."
         )
         coverage_line = _coverage_summary(ledger, latest)
@@ -568,18 +454,10 @@ def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
 
 
 def _coverage_summary(ledger: Ledger, latest: Round) -> str:
-    missing = uncovered_by_lens(ledger, latest)
-    total = sum(len(open_units(latest, lens)) for lens in latest.lenses)
-    done = total - sum(len(ids) for ids in missing.values())
-    carried = len(latest.hunks) - len(latest.open_hunk_ids)
-    line = (
-        f"Coverage: {done}/{total} lens items (hunks, or files for `{DESIGN_LENS}`); "
-        f"{carried} hunk(s) carried from earlier rounds."
-    )
-    lenses_pending = any(ids for lens, ids in missing.items() if lens != SWEEP_LENS)
-    if SWEEP_LENS in latest.lenses and lenses_pending:
-        line += " Sweep pending (runs after every other lens)."
-    return line
+    total = len(latest.open_hunk_ids)
+    done = total - len(uncovered_hunks(ledger, latest))
+    carried = len(latest.hunks) - total
+    return f"Coverage: {done}/{total} hunks; {carried} hunk(s) carried from earlier rounds."
 
 
 def _findings_summary(ledger: Ledger) -> str:
@@ -640,7 +518,6 @@ def render_report(report: GateReport) -> str:
 _ROUND_CLAUSES: dict[IssueCode, str] = {
     "no-round": "no review round prepared",
     "stale-round": "code changed since the review round",
-    "tier-too-low": "review tier too low",
     "round-cap": "maximum review rounds reached",
 }
 _COUNTED_CLAUSES: dict[IssueCode, tuple[str, str]] = {
@@ -658,28 +535,18 @@ def _counted(count: int, forms: tuple[str, str]) -> str:
 
 
 def _coverage_clauses(issues: Sequence[GateIssue]) -> list[str]:
-    clauses: list[str] = []
-    for unit in ("hunk", "file"):
-        matching = [issue for issue in issues if issue.code == "uncovered" and issue.unit == unit]
-        if not matching:
-            continue
-        lenses = list(dict.fromkeys(lens for issue in matching for lens in issue.lenses))
-        total = sum(issue.missing for issue in matching)
-        noun = "lens" if len(lenses) == 1 else "lenses"
-        clauses.append(f"{_counted(total, (unit, unit + 's'))} not covered by {noun} {', '.join(lenses)}")
-    return clauses
+    total = sum(issue.missing for issue in issues if issue.code == "uncovered")
+    return [f"{_counted(total, ('hunk', 'hunks'))} not covered"] if total else []
 
 
 def format_blocker_summary(report: GateReport) -> str:
-    """One line naming what still blocks the gate, e.g. `review incomplete: 3 hunks not covered by
-    lens contracts; 1 finding without a verdict`."""
+    """One line naming what still blocks the gate, e.g. `review incomplete: 3 hunks not covered;
+    1 finding without a verdict`."""
     if not report.issues:
         return "review complete"
     codes = [issue.code for issue in report.issues]
     clauses = [clause for code, clause in _ROUND_CLAUSES.items() if code in codes]
     clauses += _coverage_clauses(report.issues)
-    if "sweep-too-early" in codes:
-        clauses.append("final sweep recorded too early")
     clauses += [_counted(codes.count(code), forms) for code, forms in _COUNTED_CLAUSES.items() if code in codes]
     clauses += [clause for code, clause in _RUN_CLAUSES.items() if code in codes]
     if "failing-run" in codes:

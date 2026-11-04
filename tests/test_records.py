@@ -32,7 +32,7 @@ LONG_FUNCTION = QualitySignal("S1", SignalKind.LONG_FUNCTION, "a.py", 1, "`f` sp
 def full_ledger() -> Ledger:
     snap = make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py"))
     ledger, _ = prepared(snap, signals=(LONG_FUNCTION,))
-    ledger = cover_open_hunks(ledger, "intent")
+    ledger = cover_open_hunks(ledger)
     ledger = record_run(record_finding(ledger), kind="repro", exit_code=1)
     ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
     ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list in total().", fingerprint="fp2")
@@ -123,7 +123,6 @@ class LedgerConsistencyTests(unittest.TestCase):
         raw["coverage"] = [
             {
                 "round": 1,
-                "lens": "intent",
                 "digests": ["not-a-digest"],
                 "note": "H1 f_1.py:1: x=1 -> returns 2 on boundary input",
                 "recorded_at": "2026-01-01T00:00:00.000Z",

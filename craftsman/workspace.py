@@ -24,9 +24,15 @@ class Workspace:
     def task(self) -> str:
         return self.state.task if self.state is not None else ""
 
-    @property
-    def isolation_evidence(self) -> IsolationEvidence:
-        return self.state.isolation_evidence if self.state is not None else "none"
+    def isolation_evidence(self, ledger: Ledger) -> IsolationEvidence:
+        """Where proof of an isolated reviewer can come from for this review.
+
+        A gate knows what its platform proved. Without a gate (review-only), subagent events in
+        the ledger are what the hooks recorded, so they show that hooks serve this session.
+        """
+        if self.state is not None:
+            return self.state.isolation_evidence
+        return "hooks" if ledger.agents else "none"
 
     def base_sha(self, ledger: Ledger, explicit: str | None = None) -> str:
         """`explicit`, else the latest round's base, else the active task's base, else HEAD."""

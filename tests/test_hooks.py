@@ -21,8 +21,8 @@ from tests.support import EvidenceRepo, coverage_note
 
 CHANGE = "def total(items):\n    return sum(items)\n"
 STARTED = (
-    "Craftsman session started (tier {tier}, base {base}). Follow the /craftsman skill "
-    '(Stage 0 command: `craftsman gate --init --session-id {sid} --tier {tier} --task "{task}"`); '
+    "Craftsman session started (deep, base {base}). Follow the /craftsman skill "
+    '(Stage 0 command: `craftsman gate --init --session-id {sid} --deep --task "{task}"`); '
     "the gate will block finishing until `craftsman review check` passes.\n"
     "Scope: work only inside {root}; see Search scope."
 )
@@ -91,8 +91,8 @@ class HookTestCase(unittest.TestCase):
     def update_state(self, **changes: Any) -> None:
         self.state_file.write_text(json.dumps({**self.state(), **changes}), encoding="utf-8")
 
-    def init(self, tier: str) -> None:
-        self.repo.cli("gate", "--init", "--tier", tier, "--cwd", ".")
+    def init(self, deep: bool = False) -> None:
+        self.repo.cli("gate", "--init", *(["--deep"] if deep else []), "--cwd", ".")
 
     def ledger(self) -> dict[str, Any]:
         loaded = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))
@@ -184,7 +184,6 @@ class PromptTests(HookTestCase):
 
     def test_trigger_briefs_the_agent_with_the_init_command(self) -> None:
         context = STARTED.format(
-            tier="deep",
             base=self.repo.base_sha[:7],
             sid="vscode-session",
             task="add cart totals",
@@ -207,11 +206,11 @@ class PromptTests(HookTestCase):
         self.assertEqual(
             {
                 key: state[key]
-                for key in ("active", "tier", "base_sha", "task", "owner", "isolation_evidence")
+                for key in ("active", "deep", "base_sha", "task", "owner", "isolation_evidence")
             },
             {
                 "active": True,
-                "tier": "deep",
+                "deep": True,
                 "base_sha": self.repo.base_sha,
                 "task": "add cart totals",
                 "owner": {"platform": "copilot", "session_id": "vscode-session"},
@@ -221,7 +220,7 @@ class PromptTests(HookTestCase):
 
     def test_copilot_cli_trigger_opens_a_gate(self) -> None:
         call_hook("prompt", "copilot", copilot_cli(self.root, prompt="ultracraft refactor the cart"))
-        self.assertEqual((self.state()["tier"], self.state()["task"]), ("deep", "refactor the cart"))
+        self.assertEqual((self.state()["deep"], self.state()["task"]), (True, "refactor the cart"))
 
     def test_second_trigger_keeps_the_active_task(self) -> None:
         call_hook("prompt", "copilot", copilot_cli(self.root, prompt="ultracraft refactor the cart"))
@@ -249,13 +248,13 @@ class PromptTests(HookTestCase):
         )
         self.assertEqual(
             command,
-            'craftsman gate --init --session-id claude-session --tier auto --task "fix (touch pwned) and id "',
+            'craftsman gate --init --session-id claude-session --task "fix (touch pwned) and id "',
         )
 
 
 class StopTests(HookTestCase):
-    def open_unsatisfied_gate(self, tier: str = "quick") -> None:
-        self.init(tier)
+    def open_unsatisfied_gate(self) -> None:
+        self.init()
         self.repo.write("cart.py", CHANGE)
 
     def test_unsatisfied_gate_blocks_in_the_copilot_dialect(self) -> None:
@@ -299,13 +298,6 @@ class StopTests(HookTestCase):
         out, _ = call_hook("stop", "claude", claude("Stop", self.root, stop_hook_active=True))
         self.assertTrue(out["reason"].startswith(header(2)))
 
-    def test_passing_ledger_closes_the_gate_at_stop(self) -> None:
-        self.open_unsatisfied_gate()
-        self.repo.record_full_evidence("quick")
-        done, _ = call_hook("stop", "copilot", copilot_cli(self.root, stopReason="end_turn"))
-        self.assertEqual(done, {})
-        self.assertEqual((self.state()["active"], self.state()["stage"]), (False, "completed"))
-
     def test_cap_answers_with_a_system_message(self) -> None:
         self.open_unsatisfied_gate()
         self.update_state(forced_continuations=MAX_CONTINUATIONS)
@@ -315,8 +307,8 @@ class StopTests(HookTestCase):
 
     def prepare_unisolated_review(self) -> None:
         """A standard change with a covered round and a test run, but no reviewer agent."""
-        self.open_unsatisfied_gate("standard")
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.open_unsatisfied_gate()
+        self.repo.cli("review", "prepare")
         self.repo.cover_all()
         self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
 
@@ -372,21 +364,22 @@ class StopTests(HookTestCase):
         call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="Use option B"))
         self.assertFalse(self.state()["awaiting_user"])
 
-    def test_trigger_during_a_session_raises_the_tier(self) -> None:
+    def test_trigger_during_a_session_raises_the_gate_to_deep(self) -> None:
         self.open_unsatisfied_gate()
         prompt = "/craftsman --deep go"
         call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
-        self.assertEqual(self.state()["tier"], "deep")
+        self.assertTrue(self.state()["deep"])
 
-    def test_trigger_during_a_session_never_lowers_the_tier(self) -> None:
-        self.open_unsatisfied_gate("deep")
+    def test_trigger_during_a_session_never_lowers_a_deep_gate(self) -> None:
+        self.init(deep=True)
+        self.repo.write("cart.py", CHANGE)
         prompt = "/craftsman --quick"
         call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
-        self.assertEqual(self.state()["tier"], "deep")
+        self.assertTrue(self.state()["deep"])
 
     def retry_after_the_round_cap(self) -> dict[str, Any]:
         self.open_unsatisfied_gate()
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
         self.update_state(stage="needs_human")
         prompt = "/craftsman retry"
         out, _ = call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
@@ -407,10 +400,10 @@ class StopTests(HookTestCase):
         self.assertEqual(call_hook("stop", "claude", claude("Stop", self.root))[0], {})
 
     def exceed_the_round_cap(self) -> None:
-        self.init("quick")
+        self.init()
         for revision in range(MAX_ROUNDS + 1):
             self.repo.write("cart.py", CHANGE + f"# revision {revision}\n")
-            self.repo.cli("review", "prepare", "--tier", "quick")
+            self.repo.cli("review", "prepare")
 
     def test_round_cap_answers_with_a_system_message(self) -> None:
         self.exceed_the_round_cap()
@@ -432,7 +425,7 @@ class StopTests(HookTestCase):
         self.assertIn("RuntimeError: boom", err)
 
     def test_invalid_gate_state_is_reported_at_stop(self) -> None:
-        self.init("quick")
+        self.init()
         self.update_state(owner=None)
         out, _ = call_hook("stop", "claude", claude("Stop", self.root))
         self.assertIn("not a valid gate state", out["systemMessage"])
@@ -441,11 +434,11 @@ class StopTests(HookTestCase):
 class SubagentTests(HookTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.init("standard")
+        self.init()
         self.repo.write("cart.py", CHANGE)
 
     def start_reviewer(self) -> dict[str, Any]:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         payload = vscode("SubagentStart", self.root, agent_id="r-1", agent_type="craftsman-reviewer")
         return call_hook("subagent-start", "copilot", payload)[0]
 
@@ -458,10 +451,9 @@ class SubagentTests(HookTestCase):
         packet = self.repo.ledger_dir / "packet-1.md"
         self.assertTrue(context.startswith(f"Craftsman review round 1. Packet: {packet}\n"))
 
-    def test_reviewer_brief_lists_the_hunks_of_each_lens(self) -> None:
+    def test_reviewer_brief_lists_the_uncovered_hunks(self) -> None:
         context = self.start_reviewer()["additionalContext"]
-        self.assertIn("- intent: H1\n", context)
-        self.assertIn("- sweep: H1 (run last)\n", context)
+        self.assertIn("Hunks not covered yet (take only your assigned slice): H1\n", context)
 
     def test_reviewer_start_is_recorded(self) -> None:
         self.start_reviewer()
@@ -472,7 +464,7 @@ class SubagentTests(HookTestCase):
         )
 
     def test_verifier_brief_lists_findings_without_a_verdict(self) -> None:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         self.add_finding()
         out, _ = call_hook(
             "subagent-start",
@@ -487,7 +479,7 @@ class SubagentTests(HookTestCase):
         )
 
     def test_other_agents_are_recorded_without_a_briefing(self) -> None:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         explore = {"agent_id": "x", "agent_type": "Explore"}
         started, _ = call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **explore))
         stopped, _ = call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, **explore))
@@ -507,7 +499,7 @@ class SubagentTests(HookTestCase):
         self.assertEqual(len(self.ledger()["agents"]), 1)
 
     def test_reviewer_stop_without_records_is_sent_back_once(self) -> None:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         call_hook("subagent-start", "copilot", copilot_cli(self.root, agentName="craftsman-reviewer"))
         stop = copilot_cli(self.root, agentId="r-9", agentType="custom", agentName="craftsman-reviewer")
 
@@ -519,11 +511,11 @@ class SubagentTests(HookTestCase):
         self.assertEqual([e["event"] for e in self.ledger()["agents"]], ["start", "stop", "stop"])
 
     def test_reviewer_that_recorded_coverage_may_stop(self) -> None:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         reviewer = {"agent_id": "r-2", "agent_type": "craftsman-reviewer"}
         call_hook("subagent-start", "copilot", vscode("SubagentStart", self.root, **reviewer))
         self.repo.cli(
-            "review", "cover", "--lens", "intent", "--hunks", "H1", "--note", coverage_note(["H1"])
+            "review", "cover", "--hunks", "H1", "--note", coverage_note(["H1"])
         )
 
         out, _ = call_hook(
@@ -535,7 +527,7 @@ class SubagentTests(HookTestCase):
         self.assertEqual(out, {})
 
     def stop_verifier_with_a_pending_verdict(self, *, stop_hook_active: bool) -> dict[str, Any]:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         self.add_finding()
         verifier = {"agent_id": "v-1", "agent_type": "craftsman-verifier"}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **verifier))
@@ -552,7 +544,7 @@ class SubagentTests(HookTestCase):
         self.assertEqual(out, {})
 
     def test_verifier_that_judged_its_findings_may_stop_while_others_wait(self) -> None:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         self.add_finding()
         self.add_finding()
         verifier = {"agent_id": "v-2", "agent_type": "craftsman-verifier"}
@@ -569,16 +561,34 @@ class SubagentTests(HookTestCase):
     def start_review_only_verifier(self) -> dict[str, Any]:
         """Two findings in review-only mode (no active gate), then the verifier starts."""
         self.update_state(active=False)
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         self.add_finding()
         self.add_finding()
         payload = claude("SubagentStart", self.root, **REVIEW_ONLY_VERIFIER)
         return call_hook("subagent-start", "claude", payload)[0]
 
-    def test_review_only_verifier_brief_names_uncovered_sweep_hunks(self) -> None:
-        context = self.start_review_only_verifier()["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("Uncovered `sweep` hunks", context)
-        self.assertIn(": H1", context.split("Uncovered `sweep` hunks")[1].splitlines()[0])
+    def test_review_only_requires_an_isolated_reviewer_once_hooks_recorded_agents(self) -> None:
+        self.start_review_only_verifier()
+        self.repo.cover_all()
+        for finding in ("F1", "F2"):
+            self.repo.cli(
+                "review", "verdict", finding, "--as", "dismissed",
+                "--evidence", "guarded by cart.py:2, which rejects the input first",
+            )  # fmt: skip
+
+        blocked = self.repo.cli("review", "check", "--review-only", check=False)
+        self.assertEqual(blocked.returncode, 1, blocked.stdout)
+        self.assertIn("[no-isolation]", blocked.stdout)
+
+        reviewer = {"agent_id": "r1", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook(
+            "subagent-stop",
+            "claude",
+            claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
+        )
+        passed = self.repo.cli("review", "check", "--review-only", check=False)
+        self.assertEqual(passed.returncode, 0, passed.stdout)
 
     def test_merge_does_not_count_as_a_verdict(self) -> None:
         self.start_review_only_verifier()
@@ -589,7 +599,7 @@ class SubagentTests(HookTestCase):
 
     def test_other_agents_outside_a_session_are_not_recorded(self) -> None:
         self.update_state(active=False)
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         agents_before = list(self.ledger()["agents"])
         for event, extra in (
             ("subagent-start", {"agent_id": "e-1", "agent_type": "Explore"}),
@@ -605,7 +615,7 @@ class SubagentTests(HookTestCase):
 
     def test_craftsman_agents_of_a_stale_round_are_ignored(self) -> None:
         self.update_state(active=False)
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         agents_before = list(self.ledger()["agents"])
         self.repo.write("cart.py", CHANGE + "# stale round\n")
         for role_name in ("craftsman-reviewer", "craftsman-verifier"):
@@ -621,7 +631,7 @@ class SubagentTests(HookTestCase):
                 self.assertEqual(self.ledger()["agents"], agents_before)
 
     def test_a_stop_with_only_an_agent_id_is_matched_to_its_start(self) -> None:
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
         start = vscode("SubagentStart", self.root, agent_id="r-7", agent_type="craftsman-reviewer")
         call_hook("subagent-start", "copilot", start)
 
@@ -665,7 +675,7 @@ class PreToolTests(HookTestCase):
         self.assertEqual(call_hook("pre-tool", "copilot", edit)[0], {})
 
     def test_shell_commands_mark_the_session_as_hooked(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         self.assertEqual(self.state()["isolation_evidence"], "none")
         payload = vscode(
             "PreToolUse", self.root, tool_name="run_in_terminal",
@@ -689,14 +699,14 @@ class PreToolTests(HookTestCase):
         self.assertEqual(out["permissionDecision"], "deny")
 
     def test_invalid_gate_state_asks_before_a_search(self) -> None:
-        self.init("standard")
+        self.init()
         self.update_state(owner=None)
         payload = claude("PreToolUse", self.root, tool_name="Grep", tool_input={"pattern": "x"})
         out, _ = call_hook("pre-tool", "claude", payload)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
     def test_non_scope_checked_tools_skip_load_scope_policy_subprocesses(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         with mock.patch("craftsman.hooks.load_scope_policy") as mock_policy:
             for tool in ("Edit", "Write", "editFiles", "replace_string_in_file"):
                 out, _ = call_hook(
@@ -806,7 +816,7 @@ class SessionOwnershipTests(HookTestCase):
         self.assertTrue(owner_s["reason"].startswith(header(4)))
 
     def open_claude_gate_from_the_terminal(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".", env_extra={"CLAUDECODE": "1"})
+        self.repo.cli("gate", "--init", "--cwd", ".", env_extra={"CLAUDECODE": "1"})
         self.repo.write("cart.py", CHANGE)
 
     def test_another_platforms_stop_leaves_the_gate_unclaimed(self) -> None:
@@ -826,11 +836,11 @@ class SessionOwnershipTests(HookTestCase):
 
     def open_antigravity_gate_from_the_terminal(self) -> None:
         self.repo.cli(
-            "gate", "--init", "--tier", "standard", "--cwd", ".",
+            "gate", "--init", "--cwd", ".",
             env_extra={"ANTIGRAVITY_AGENT": "1"},
         )  # fmt: skip
         self.repo.write("cart.py", CHANGE)
-        self.repo.cli("review", "prepare", "--tier", "standard")
+        self.repo.cli("review", "prepare")
 
     def test_tool_call_of_another_session_does_not_claim_the_gate(self) -> None:
         self.open_antigravity_gate_from_the_terminal()
@@ -880,9 +890,9 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual(self.state_file.read_bytes(), raw_before)
 
     def test_reviewer_hook_events_let_a_deep_gate_close_as_isolated(self) -> None:
-        self.init("deep")
+        self.init(deep=True)
         self.repo.write("cart.py", CHANGE)
-        self.repo.record_full_evidence("deep")
+        self.repo.record_full_evidence(deep=True)
         reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         call_hook(

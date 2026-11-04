@@ -236,15 +236,12 @@ class TestInlineMd(unittest.TestCase):
 PROSE_FIELDS: frozenset[str] = frozenset(
     {
         "Coverage.note",
-        "Fact.text",
         "Finding.title",
         "Finding.scenario",
         "Finding.suggestion",
         "Finding.verdict_evidence",
         "Finding.resolution_note",
-        "LensAddition.reason",
         "RunWaiver.reason",
-        "SignalAck.reason",
     }
 )
 
@@ -257,7 +254,6 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "EntryProblem.label",
         "EntryProblem.field",
         "EntryProblem.problem",
-        "EntryProblem.example",
         # HunkRef
         "HunkRef.id",
         "HunkRef.path",
@@ -266,36 +262,26 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "HunkRef.new_len",
         "HunkRef.carried",
         "HunkRef.reopened",
+        # Round
+        "Round.deep",
         # QualitySignal
         "QualitySignal.id",
         "QualitySignal.kind",
         "QualitySignal.file",
         "QualitySignal.line",
         "QualitySignal.detail",
-        # SignalAck
-        "SignalAck.signal_id",
-        "SignalAck.round",
-        "SignalAck.fingerprint",
-        "SignalAck.recorded_at",
-        # RoundFile
-        "RoundFile.path",
-        "RoundFile.digest",
-        "RoundFile.carried",
         # Round
         "Round.number",
         "Round.fingerprint",
         "Round.base_sha",
-        "Round.tier",
         "Round.prepared_at",
         "Round.hunks",
-        "Round.lenses",
         "Round.packet_path",
         "Round.signals",
         "Round.scope",
         "Round.out_of_scope",
         # Coverage
         "Coverage.round",
-        "Coverage.lens",
         "Coverage.digests",
         "Coverage.recorded_at",
         # Finding
@@ -311,7 +297,6 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Finding.resolution",
         "Finding.recorded_at",
         "Finding.updated_at",
-        "Finding.signal_id",
         # RunWaiver
         "RunWaiver.waived_at",
         # Run
@@ -332,28 +317,12 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "AgentEvent.agent",
         "AgentEvent.agent_id",
         "AgentEvent.at",
-        # SourceRef
-        "SourceRef.path",
-        "SourceRef.line",
-        # Fact
-        "Fact.id",
-        "Fact.hunks",
-        "Fact.source",
-        "Fact.file_digest",
-        "Fact.author_lens",
-        # LensAddition
-        "LensAddition.lens",
-        "LensAddition.round",
-        "LensAddition.recorded_at",
         # Ledger
         "Ledger.rounds",
         "Ledger.coverage",
         "Ledger.findings",
         "Ledger.runs",
         "Ledger.agents",
-        "Ledger.signal_acks",
-        "Ledger.facts",
-        "Ledger.lens_additions",
     }
 )
 
@@ -387,7 +356,7 @@ class TestProseFieldsReachTheReportAsOneLine(unittest.TestCase):
 
     def test_cli_and_json_input_are_stored_and_reported_on_one_line(self) -> None:
         repo = self.repo
-        repo.cli("review", "prepare", "--tier", "quick")
+        repo.cli("review", "prepare")
         added = repo.cli(
             "review", "add", "--lens", "intent", "--file", "app.py", "--line", "2",
             "--severity", "major", "--title", r"Off by one\nwhen x is 0",

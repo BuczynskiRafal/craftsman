@@ -76,7 +76,7 @@ class NoGateTests(AntigravityTestCase):
         self.assertIsNone(self.stored())
 
     def test_pause_between_tool_calls_allows(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, tier="quick")
+        open_gate(self.repo.root, self.repo.base_sha)
         self.repo.write_lines("app.py", 5)
         self.assertEqual(self.stop(terminationReason="TOOL_CALL")[0], {"decision": "allow"})
 
@@ -118,7 +118,7 @@ class RequestTests(AntigravityTestCase):
         self.assertIn(f"1/{MAX_CONTINUATIONS}]", answer["reason"])
         state = self.stored()
         assert state is not None
-        self.assertEqual((state.owner, state.tier, state.task), (self.caller, "deep", "add totals"))
+        self.assertEqual((state.owner, state.deep, state.task), (self.caller, True, "add totals"))
 
     def test_request_without_changes_opens_no_gate(self) -> None:
         self.write_transcript(user_input(1, "/craftsman add totals"))
@@ -154,14 +154,14 @@ class RequestTests(AntigravityTestCase):
 
 class OwnershipTests(AntigravityTestCase):
     def test_another_sessions_gate_is_left_alone(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, tier="quick", owner=GateOwner("claude", "s1"))
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))
         self.repo.write_lines("app.py", 5)
         before = state_path_for(self.repo.root).read_bytes()
         self.assertEqual(self.stop()[0], {"decision": "allow"})
         self.assertEqual(state_path_for(self.repo.root).read_bytes(), before)
 
     def test_gate_opened_from_the_terminal_is_claimed(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, tier="quick")
+        open_gate(self.repo.root, self.repo.base_sha)
         self.write_transcript(user_input(3, "go"))
         self.repo.write_lines("app.py", 5)
         self.assertEqual(self.stop()[0]["decision"], "continue")
@@ -172,25 +172,16 @@ class OwnershipTests(AntigravityTestCase):
         )
 
     def test_pending_question_lets_the_agent_stop(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, tier="quick")
+        open_gate(self.repo.root, self.repo.base_sha)
         self.write_transcript(user_input(1, "go"), ask_question(2))
         self.repo.write_lines("app.py", 5)
         self.assertEqual(self.stop()[0], {"decision": "allow"})
-
-    def test_passing_ledger_closes_the_gate(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, tier="quick")
-        self.repo.write_lines("app.py", 5)
-        self.repo.record_full_evidence("quick")
-        self.assertEqual(self.stop()[0], {"decision": "allow"})
-        state = self.stored()
-        assert state is not None
-        self.assertEqual(state.stage, Stage.COMPLETED)
 
 
 class ReviewerRecordTests(AntigravityTestCase):
     def setUp(self) -> None:
         super().setUp()
-        open_gate(self.repo.root, self.repo.base_sha, tier="standard", owner=self.caller, request_step=1)
+        open_gate(self.repo.root, self.repo.base_sha, owner=self.caller, request_step=1)
         self.repo.write_lines("app.py", 5)
 
     def finish_reviewer(self, sub_id: str = REVIEWER_ID) -> int:
@@ -235,7 +226,7 @@ class ReviewerRecordTests(AntigravityTestCase):
         self.assertEqual(len(self.reviewer_stops()), 1)
 
     def test_recorded_reviewer_proves_an_isolated_review(self) -> None:
-        self.repo.record_full_evidence("standard")
+        self.repo.record_full_evidence()
         self.write_transcript(
             user_input(1, "go"),
             invoke_subagent(2, REVIEWER),
@@ -249,7 +240,7 @@ class ReviewerRecordTests(AntigravityTestCase):
         self.assertEqual(state.stage, Stage.COMPLETED)
 
     def test_review_without_a_recorded_reviewer_is_not_isolated(self) -> None:
-        self.repo.record_full_evidence("standard")
+        self.repo.record_full_evidence()
         self.write_transcript(user_input(1, "go"))
         answer, _ = self.stop()
         self.assertEqual(answer["decision"], "continue")

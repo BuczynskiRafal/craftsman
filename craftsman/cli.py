@@ -16,12 +16,12 @@ from craftsman.assets import Skill, iter_skills
 from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.doctor import run_doctor
 from craftsman.export import main as export_main
-from craftsman.gate import GateState, GateStateError, load_state, state_path_for, task_tier
+from craftsman.gate import GateState, GateStateError, load_state, state_path_for
 from craftsman.gate import main as gate_main
 from craftsman.generated import ExportError
 from craftsman.hooks import main as hook_main
 from craftsman.install import install_main
-from craftsman.ledger import ledger_path_for, load, open_units, uncovered_by_lens
+from craftsman.ledger import ledger_path_for, load, uncovered_hunks
 from craftsman.manifest import InstallError
 from craftsman.paths import default_repo_dir
 from craftsman.playbooks import (
@@ -62,7 +62,7 @@ class LedgerOverview:
     """A compact summary of the evidence ledger for `craftsman status`."""
 
     rounds: int
-    tier: str | None
+    deep: bool
     coverage: Coverage | None
     findings: int
     verdicts: dict[str, int]
@@ -74,15 +74,14 @@ class LedgerOverview:
         latest = ledger.rounds[-1] if ledger.rounds else None
         coverage = None
         if latest is not None:
-            total = sum(len(open_units(latest, lens)) for lens in latest.lenses)
-            missing = sum(len(ids) for ids in uncovered_by_lens(ledger, latest).values())
-            coverage = Coverage(total - missing, total)
+            total = len(latest.open_hunk_ids)
+            coverage = Coverage(total - len(uncovered_hunks(ledger, latest)), total)
         verdicts = dict.fromkeys((*VERDICTS, "none"), 0)
         for finding in ledger.findings:
             verdicts[finding.verdict or "none"] += 1
         return cls(
             rounds=len(ledger.rounds),
-            tier=latest.tier if latest is not None else None,
+            deep=latest is not None and latest.deep,
             coverage=coverage,
             findings=len(ledger.findings),
             verdicts=verdicts,
@@ -102,8 +101,8 @@ class LedgerOverview:
         )
         runs = ", ".join(f"{run.id} {run.kind} exit {run.exit_code}" for run in self.latest_runs)
         return (
-            f"{self.rounds} round(s), tier {self.tier}, coverage "
-            f"{self.coverage.covered}/{self.coverage.total}; findings {self.findings} ({verdicts}, "
+            f"{self.rounds} round(s){', deep' if self.deep else ''}, coverage "
+            f"{self.coverage.covered}/{self.coverage.total} hunks; findings {self.findings} ({verdicts}, "
             f"resolved {self.resolved}); latest runs: {runs or 'none'}"
         )
 
@@ -123,8 +122,7 @@ class StatusReport:
     owner: dict[str, str | None] | None
     takeover_from: dict[str, str | None] | None
     started_at: str | None
-    configured_tier: str
-    effective_gear: str
+    deep: bool
     stage: str
     isolation_evidence: str
     base_sha: str
@@ -142,15 +140,14 @@ class StatusReport:
             ledger_error = None
         except LedgerError as exc:
             overview, ledger_error = None, str(exc)
-        configured = state.tier if state is not None else "auto"
+        deep = bool(state is not None and state.deep) or bool(overview is not None and overview.deep)
         return cls(
             state_file=str(state_path),
             active=state is not None and state.active,
             owner=state.owner.to_json() if state is not None else None,
             takeover_from=state.takeover_from.to_json() if state and state.takeover_from else None,
             started_at=state.started_at if state is not None else None,
-            configured_tier=configured,
-            effective_gear=task_tier(configured, snap),
+            deep=deep,
             stage=state.stage.value if state is not None else "idle",
             isolation_evidence=state.isolation_evidence if state is not None else "none",
             base_sha=snap.base_sha,
@@ -197,7 +194,7 @@ def run_status(cwd: str | None, *, as_json: bool) -> int:
     print(f"Craftsman Status (v{__version__})")
     print(f"  Active         : {report.active}")
     print(f"  Owner          : {state.owner.describe() if state is not None else 'none'}")
-    print(f"  Effective Gear : {report.effective_gear}")
+    print(f"  Deep           : {report.deep}")
     print(f"  Stage          : {report.stage}")
     print(f"  Base SHA       : {report.base_sha}")
     diff = report.diff
