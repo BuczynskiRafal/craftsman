@@ -4,6 +4,11 @@ Usage:
     python3 evals/run.py list
     python3 evals/run.py prepare <case> <dest>
     python3 evals/run.py score <case> <workdir> [--findings findings.json] [--json]
+    python3 -m evals.run agent --cases all --arm <label> [--craftsman-src <dir>] [--repeat N] ...
+    python3 -m evals.run compare results.jsonl [more.jsonl ...]
+
+``agent`` runs a real headless Claude Code review per case and appends one JSON line per run to a
+results file (see ``evals/agent.py``); ``compare`` summarizes such files (see ``evals/compare.py``).
 
 Each case under ``evals/cases/<id>/`` holds ``base/`` and ``head/`` trees, ``task.md`` (the change
 description a reviewer receives) and ``truth.json`` (the seeded defects, never copied to the work
@@ -27,6 +32,7 @@ CASES_DIR = Path(__file__).resolve().parent / "cases"
 WINDOW = 3
 EVALS_DIR = "evals"  # inside <dest>/.git: holds task.md and, for baseline runs, findings.json
 LEDGER_PARTS = ("craftsman", "ledger.json")
+SIZES = ("small", "large")
 
 KINDS = (
     "aliasing",
@@ -95,6 +101,7 @@ class Case:
     path: Path
     defects: tuple[Defect, ...]
     decoys: tuple[Decoy, ...]
+    size: str = "small"  # "large" cases are 400-700 changed lines in 10-15 files, see README
 
 
 @dataclass(frozen=True)
@@ -184,7 +191,10 @@ def load_case(case_id: str, cases_dir: Path = CASES_DIR) -> Case:
         raise EvalError(f"{truth_path}: ids must be unique")
     if not defects:
         raise EvalError(f"{truth_path}: no defects")
-    return Case(case_id, path, tuple(defects), tuple(decoys))
+    size = truth.get("size", "small")
+    if size not in SIZES:
+        raise EvalError(f"{truth_path}: 'size' must be one of {', '.join(SIZES)}")
+    return Case(case_id, path, tuple(defects), tuple(decoys), size)
 
 
 # --- reading findings --------------------------------------------------------------------------
@@ -280,6 +290,24 @@ def ledger_path(workdir: Path) -> Path:
 
 def findings_path(workdir: Path) -> Path:
     return workdir / ".git" / EVALS_DIR / "findings.json"
+
+
+def collect_findings(workdir: Path, findings_file: Path | None = None) -> tuple[list[Finding], int, int]:
+    """Findings of a review as (findings, dismissed, unreadable).
+
+    From ``findings_file`` when given, else the Craftsman ledger of the work directory, else its
+    ``.git/evals/findings.json`` (baseline runs).
+    """
+    if findings_file is not None:
+        return read_findings_file(findings_file, workdir)
+    if ledger_path(workdir).is_file():
+        return read_ledger(ledger_path(workdir), workdir)
+    if findings_path(workdir).is_file():
+        return read_findings_file(findings_path(workdir), workdir)
+    raise EvalError(
+        f"no findings: {ledger_path(workdir)} does not exist (Craftsman run) and neither does "
+        f"{findings_path(workdir)} (baseline run); pass --findings <file.json>"
+    )
 
 
 # --- matching ----------------------------------------------------------------------------------
@@ -514,6 +542,7 @@ def _cmd_list(args: argparse.Namespace, out: TextIO) -> int:
         rows.append(
             {
                 "case": case.id,
+                "size": case.size,
                 "defects": len(case.defects),
                 "decoys": len(case.decoys),
                 "kinds": sorted({d.kind for d in case.defects}),
@@ -524,11 +553,12 @@ def _cmd_list(args: argparse.Namespace, out: TextIO) -> int:
         return 0
     for row in rows:
         print(
-            f"{row['case']:<12} {row['defects']:>2} defects {row['decoys']:>2} decoys  {', '.join(row['kinds'])}",
+            f"{row['case']:<12} {row['size']:<5} {row['defects']:>2} defects {row['decoys']:>2} decoys"
+            f"  {', '.join(row['kinds'])}",
             file=out,
         )
     print(
-        f"{'total':<12} {sum(r['defects'] for r in rows):>2} defects {sum(r['decoys'] for r in rows):>2} decoys",
+        f"{'total':<12} {'':<5} {sum(r['defects'] for r in rows):>2} defects {sum(r['decoys'] for r in rows):>2} decoys",
         file=out,
     )
     return 0
@@ -547,17 +577,7 @@ def _cmd_score(args: argparse.Namespace, out: TextIO) -> int:
     workdir = args.workdir.resolve()
     if not workdir.is_dir():
         raise EvalError(f"{workdir} is not a directory")
-    if args.findings is not None:
-        findings, dismissed, unreadable = read_findings_file(args.findings, workdir)
-    elif ledger_path(workdir).is_file():
-        findings, dismissed, unreadable = read_ledger(ledger_path(workdir), workdir)
-    elif findings_path(workdir).is_file():
-        findings, dismissed, unreadable = read_findings_file(findings_path(workdir), workdir)
-    else:
-        raise EvalError(
-            f"no findings: {ledger_path(workdir)} does not exist (Craftsman run) and neither does "
-            f"{findings_path(workdir)} (baseline run); pass --findings <file.json>"
-        )
+    findings, dismissed, unreadable = collect_findings(workdir, args.findings)
     result = score_findings(case, findings, dismissed, unreadable)
     print(json.dumps(result, indent=2) if args.json else render_score(result), file=out)
     return 0
@@ -577,13 +597,37 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("workdir", type=Path)
     score.add_argument("--findings", type=Path, help='JSON list of {"file", "line", "title"}')
     score.add_argument("--json", action="store_true", help="machine-readable output")
+    from evals import agent, compare
+
+    agent.add_arguments(
+        sub.add_parser("agent", help="run real headless Claude Code reviews and record recall, cost, time")
+    )
+    compare.add_arguments(sub.add_parser("compare", help="summarize results files written by 'agent'"))
     return parser
+
+
+def _cmd_agent(args: argparse.Namespace, out: TextIO) -> int:
+    from evals import agent
+
+    return agent.cmd_agent(args, out)
+
+
+def _cmd_compare(args: argparse.Namespace, out: TextIO) -> int:
+    from evals import compare
+
+    return compare.cmd_compare(args, out)
 
 
 def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
     args = build_parser().parse_args(argv)
     stream = out if out is not None else sys.stdout
-    handlers = {"list": _cmd_list, "prepare": _cmd_prepare, "score": _cmd_score}
+    handlers = {
+        "list": _cmd_list,
+        "prepare": _cmd_prepare,
+        "score": _cmd_score,
+        "agent": _cmd_agent,
+        "compare": _cmd_compare,
+    }
     try:
         return handlers[args.command](args, stream)
     except EvalError as exc:
@@ -592,4 +636,9 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Run the importable copy of this module: agent.py and compare.py import ``evals.run``, and their
+    # EvalError must be the one main() catches.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from evals.run import main as _main
+
+    sys.exit(_main())
