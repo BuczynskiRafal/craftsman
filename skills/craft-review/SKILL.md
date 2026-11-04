@@ -15,11 +15,9 @@ Your job is to find the bugs that would hurt after merge. Hunters (fresh-context
 maximize recall: they record every candidate with a nameable trigger. Verifiers maximize precision:
 they try to disprove each candidate and reproduce the survivors. You orchestrate.
 
-Every review launches at least one `craftsman-reviewer` subagent, even for a one-line change,
-whenever the platform can launch subagents: the context that read the change cannot see its own
-blind spots. SELF-REVIEWED is only for platforms without subagents, and even then each finding is
-recorded with `craftsman review add` and each hunk with `cover`. A review that is not in the
-ledger did not happen.
+**Start every review with `craftsman review prepare` (step 1), then launch hunters (step 3), even
+for a one-line change.** The context that reads a change cannot see its own blind spots, and a
+review that is not in the ledger did not happen.
 
 The user needs no flags: infer everything from the request and the repository.
 
@@ -96,8 +94,9 @@ Guidance (deviate when the change calls for it):
 Platform mechanics: Claude Code, the Agent tool (`craftsman:craftsman-reviewer` /
 `craftsman:craftsman-verifier` as a plugin); Copilot, the custom agents of the same names;
 Antigravity, `invoke_subagent` with `TypeName` `self` and `Role` `craftsman-reviewer` or
-`craftsman-verifier`. With no subagent mechanism, play the roles one after another (hunt first,
-judge afterwards), record as usual and say **SELF-REVIEWED** in the report.
+`craftsman-verifier`. Only where the platform cannot launch subagents at all, play the roles one after another
+(hunt first, judge afterwards), still record every finding (`review add`) and every hunk
+(`cover`), and say **SELF-REVIEWED** in the report.
 
 A subagent that fails (rate limit, timeout) is retried once with a smaller slice. If that fails
 too: review-only: `craftsman review report --review-only --partial`; when fixing: ask the user
@@ -161,6 +160,5 @@ Review-only: `craftsman review check --review-only`, then `craftsman review repo
 (`--partial` when slices stayed uncovered after retries); plain `check`/`report` show BLOCKED
 there. Present findings by severity, dismissed ones briefly, and your decisions in plain
 language: the depth and why, the hunters and their lenses, why each wave ran or stopped, how
-findings were verified (reproduced, or static reading); SELF-REVIEWED when no subagents ran. If
-`craftsman` is not installed, say the review is ungated. Write rendered Markdown, never `\n`
+findings were verified (reproduced, or static reading). If `craftsman` is not installed, say the review is ungated. Write rendered Markdown, never `\n`
 escapes.

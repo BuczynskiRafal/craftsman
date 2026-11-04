@@ -60,8 +60,8 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
 
 ## Stage 2 - Final review
 
-1. `craftsman review prepare` freezes the diff into round N and prints the packet path and the
-   risk map. Decide the depth now by the rule in `/craft-review` (Depth); to go deep, run
+1. Run `craftsman review prepare` first, even for a one-line change: it freezes the diff into
+   round N and prints the packet path and the risk map. Decide the depth now by the rule in `/craft-review` (Depth); to go deep, run
    `craftsman review prepare --deep`.
 2. Write the intent brief (`/craft-review` step 2) with the task and what you built per file in
    a line. It states intent; it must not argue that the code is correct. Decisions a reader could
@@ -69,11 +69,10 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
    never get them (they would anchor the hunt). Your context holds the reasoning that produced the
    code, which is what hides its defects, so the hunters are fresh-context subagents and you only
    orchestrate.
-3. Follow `/craft-review` from its hunt plan (step 3) through step 6 (hunt, verify, saturate, fix,
-   confirm, re-check, tests and `craftsman review check`), in gate-session mode. It is the single
-   source for the mechanics. Even for a one-line change, launch at least one `craftsman-reviewer`
-   subagent when the platform can; never settle for a lighter review or a SELF-REVIEWED one, and
-   remember that a review that is not in the ledger did not happen.
+3. Launch the hunters next: follow `/craft-review` from its hunt plan (step 3) through step 6
+   (hunt, verify, saturate, fix, confirm, re-check, tests and `craftsman review check`), in
+   gate-session mode, even for a one-line change. It is the single source for the mechanics. A
+   review that is not in the ledger did not happen.
 4. Do what `check` lists, then `craftsman gate --complete`. At `round-cap` stop iterating, report
    what remains and let the user decide; the gate lets you finish.
 
