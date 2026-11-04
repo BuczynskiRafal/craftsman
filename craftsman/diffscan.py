@@ -1358,6 +1358,21 @@ def is_test_path(path: str) -> bool:
     return bool(_TEST_DIRS.intersection(posix.parts[:-1])) or _name_matches(posix.name, _TEST_NAME_GLOBS)
 
 
+_IMPORT_LINE_RE = re.compile(
+    r"^(?:from\s+\S+\s+import\b|import\b|use\s|using\s|#\s*include\b|require\b|extern\s+crate\b"
+    r"|(?:const|let|var)\b.*\brequire\()"
+)
+
+
+def reference_kind(ref: Reference) -> Literal["call", "test", "import", "docs"]:
+    """What a reference most likely is, so real uses can rank before imports and prose."""
+    if is_docs_path(ref.path):
+        return "docs"
+    if _IMPORT_LINE_RE.match(ref.text):
+        return "import"
+    return "test" if is_test_path(ref.path) else "call"
+
+
 def is_docs_path(path: str) -> bool:
     """Prose by file type alone: a `docs/` folder can hold code (e.g. Sphinx's conf.py)."""
     return PurePosixPath(path).suffix.lower() in _DOCS_SUFFIXES and not _is_config(path)
