@@ -97,6 +97,7 @@ from craftsman.records import (
     check_coverage_note,
     collecting_problems,
 )
+from craftsman.scout import Scout, parse_target
 from craftsman.text import inline_md, one_line
 from craftsman.usage import usage_json, usage_lines
 from craftsman.workspace import Workspace, open_workspace
@@ -622,6 +623,22 @@ def _view(args: argparse.Namespace) -> int:
     view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
     _write_text(view_path, render_packet_view(ctx, assigned_hunks=assigned))
     print(view_path)
+    return 0
+
+
+def _scout(args: argparse.Namespace) -> int:
+    target = parse_target(args.target)
+    ws = open_workspace(args.cwd)
+    ledger = load(ws.ledger_path)
+    if target.kind == "hunks":
+        snap = ws.snapshot(ledger)
+        round_ = require_current_round(ledger, snap)
+        wanted = set(expand_hunk_spec(target.raw, [hunk.id for hunk in round_.hunks]))
+        scout = Scout(WorktreeIndex(ws.root), snap.base_sha)
+        print(scout.hunks([hunk for hunk in snap.hunks if hunk.id in wanted]))
+        return 0
+    scout = Scout(WorktreeIndex(ws.root), ws.base_sha(ledger, args.base))
+    print(scout.location(target.raw, target.line) if target.kind == "location" else scout.symbol(target.raw))
     return 0
 
 
@@ -1763,6 +1780,22 @@ def _add_view_and_cover_parsers(sub: Any, common: argparse.ArgumentParser) -> No
     view.add_argument("--files", help="Comma-separated changed file paths, e.g. pkg/a.py,pkg/b.py")
     view.add_argument("--hunks", help="Comma-separated hunk ids or ranges, e.g. H3-H17")
     view.set_defaults(handler=_view)
+
+    scout = sub.add_parser(
+        "scout",
+        parents=[common],
+        help="Base version, callers and tests for a hunk, a location or a symbol",
+        description=(
+            "Grounded context in at most 12,000 characters, no opinions: for hunks (H3, H3-H5, H3,H7) "
+            "and for path:line, the base version of the enclosing scope, up to 3 callers per symbol "
+            "it defines and up to 3 tests; for a symbol name, its definitions, references and tests."
+        ),
+    )
+    scout.add_argument("target", metavar="TARGET", help="H3, H3-H5, H3,H7, path:line or a symbol name")
+    scout.add_argument(
+        "--base", help="Revision the base version comes from (default: the round's base, else HEAD)"
+    )
+    scout.set_defaults(handler=_scout)
 
     cover = sub.add_parser("cover", parents=[common], help="Record that hunks or files were reviewed")
     cover.add_argument("--hunks", help="Comma-separated hunk ids or ranges, e.g. H1,H3-H7")

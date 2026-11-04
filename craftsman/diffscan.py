@@ -1055,6 +1055,11 @@ class WorktreeIndex:
             found.extend(itertools.islice(matches, REFERENCES_PER_FILE))
         return tuple(found)
 
+    def lines(self, path: str) -> tuple[str, ...] | None:
+        """The lines of a work tree text file; None when it is missing, binary or too large."""
+        source = self._source(path)
+        return None if source is None else source.lines
+
     def _source(self, path: str) -> _Source | None:
         if path not in self._sources:
             self._sources[path] = _load_source(self.root, self._real_root, path)
@@ -1073,6 +1078,48 @@ class WorktreeIndex:
         if code != 0:
             raise DiffScanError(f"`git grep` for {symbol!r} failed (exit {code}): {err.strip()}")
         return [path for path in out.split("\0") if path]
+
+
+def file_at_revision(cwd: str | Path, revision: str, path: str) -> str | None:
+    """The text of `path` as committed at `revision`; None when it did not exist there or is binary."""
+    root = worktree_root(cwd)
+    _repo_file(root, path)  # rejects absolute and `..` paths
+    code, data, _ = _git_bytes(root, "show", f"{revision}:{path}")
+    if code != 0 or b"\0" in data[:BINARY_SNIFF_BYTES] or len(data) > MAX_SOURCE_BYTES:
+        return None
+    return _decode(data)
+
+
+def text_scope_at(path: str, text: str, line: int) -> Scope | None:
+    """The innermost function/class (or block window) around `line` of `text`, as `scope` finds it."""
+    return _scope_at(_Source(path, text), line)
+
+
+def text_scope_named(path: str, text: str, name: str, near: int = 1) -> Scope | None:
+    """The definition called `name` in `text`; of several, the one starting closest to `near`.
+
+    `name` is a scope name as `Scope.name` spells it (`Class.method` for Python), or its last part.
+    """
+    source = _Source(path, text)
+    short = name.rsplit(".", 1)[-1]
+    found: list[Scope] = []
+    if source.python_spans is not None:
+        spans = [span for span in source.python_spans if span.name == name] or [
+            span for span in source.python_spans if span.name.rsplit(".", 1)[-1] == short
+        ]
+        found = [scope for span in spans if (scope := _scope_at(source, span.header_line)) is not None]
+    else:
+        for index in range(len(source.lines)):
+            if _looks_like_definition(source.lines, index) and _definition_name(source.lines[index].strip())[0] == short:
+                scope = _scope_at(source, index + 1)
+                if scope is not None and scope.name == short:
+                    found.append(scope)
+    return min(found, key=lambda scope: abs(scope.start - near), default=None)
+
+
+def defines_symbol(path: str, line_text: str, symbol: str) -> bool:
+    """Whether the single line `line_text` defines `symbol` (a `def`, `class`, `function`, ...)."""
+    return _defined_name(line_text, python=_is_python(path)) == symbol
 
 
 def _load_source(root: Path, real_root: Path, path: str) -> _Source | None:

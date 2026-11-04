@@ -626,7 +626,7 @@ def _scope_line(scope: Scope, also: Sequence[str]) -> str:
 
 def _diff_block(hunk: Hunk) -> str:
     header = f"@@ -{hunk.old_start},{hunk.old_len} +{hunk.new_start},{hunk.new_len} @@ {hunk.header}"
-    return _fenced("diff", [header.rstrip(), *hunk.lines])
+    return fenced("diff", [header.rstrip(), *hunk.lines])
 
 
 def _omitted_diff_line(ctx: PacketContext, hunk: Hunk) -> str:
@@ -670,7 +670,7 @@ def _unit_block(
     if not hunks:
         return ""
     rows = _unit_rows(hunks, scope)
-    return _fenced(_fence_language(group[0].path), _display_lines(rows, scope, bare=bare))
+    return fenced(fence_language(group[0].path), _display_lines(rows, scope, bare=bare))
 
 
 def _unit_rows(hunks: Sequence[Hunk], scope: Scope) -> list[_Row]:
@@ -720,7 +720,7 @@ def _display_lines(rows: Sequence[_Row], scope: Scope, *, bare: bool) -> list[st
             open_hunk = None
         if gap:
             if not bare:
-                lines.append(_omission_marker(gap[0], gap[-1]))
+                lines.append(omission_marker(gap[0], gap[-1]))
             gap = []
         if row.hunk != open_hunk:
             open_hunk = row.hunk
@@ -730,7 +730,7 @@ def _display_lines(rows: Sequence[_Row], scope: Scope, *, bare: bool) -> list[st
     if open_hunk is not None:
         lines.append(f"[/{open_hunk}]")
     if gap and not bare:
-        lines.append(_omission_marker(gap[0], gap[-1]))
+        lines.append(omission_marker(gap[0], gap[-1]))
     return lines
 
 
@@ -761,7 +761,7 @@ def _row_text(row: _Row, width: int) -> str:
     return f"{row.tag}{row.number:>{width}} {row.text}"
 
 
-def _omission_marker(first: int, last: int) -> str:
+def omission_marker(first: int, last: int) -> str:
     # Not a comment of any one language: the block may hold Python, Go, SQL or YAML.
     return f"[… L{first}–L{last} omitted …]"
 
@@ -796,7 +796,7 @@ def _symbol_lines(
 def _reference_line(symbol: str, refs: Sequence[Reference], *, trim: bool) -> str:
     shown = refs[: TRIMMED_REFERENCES_PER_SYMBOL if trim else MAX_REFERENCES_PER_SYMBOL]
     listed = " · ".join(
-        f"{_inline_code(f'{ref.path}:{ref.line}')} {_inline_code(ref.text)}" for ref in shown
+        f"{inline_code(f'{ref.path}:{ref.line}')} {inline_code(ref.text)}" for ref in shown
     )
     more = len(refs) - len(shown)
     suffix = f" (+{more} more: git grep -n {symbol})" if more > 0 else ""
@@ -820,14 +820,14 @@ def _reference_savings(
     return sorted(savings, key=lambda item: (-item[0], item[1]))
 
 
-def _fence_language(path: str) -> str:
+def fence_language(path: str) -> str:
     posix = PurePosixPath(path)
     if posix.name == "Jenkinsfile" or posix.name.startswith("Jenkinsfile."):
         return "groovy"
     return _FENCE_LANGUAGES.get(posix.suffix.lower(), "")
 
 
-def _inline_code(text: str) -> str:
+def inline_code(text: str) -> str:
     """Wrap `text` in a code span that backticks inside it cannot close early (CommonMark)."""
     longest = max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0)
     fence = "`" * (longest + 1)
@@ -835,7 +835,7 @@ def _inline_code(text: str) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
-def _fenced(language: str, lines: Sequence[str]) -> str:
+def fenced(language: str, lines: Sequence[str]) -> str:
     """Fence `lines` with more backticks than any run inside them so the block cannot break."""
     longest = max((len(run) for line in lines for run in _BACKTICK_RUN_RE.findall(line)), default=0)
     fence = "`" * max(3, longest + 1)
