@@ -42,7 +42,7 @@ contract).
 3. **Execute.** One aspect: do it yourself. Several aspects on a large target: one subagent per
    aspect when the platform offers subagents, each given the skill to follow and the target.
 4. **Challenge before reporting.** Every finding goes through the verification discipline of
-   `/code-review` Step 3 (try to disprove it, reproduce it if possible). Inside a `/craftsman`
+   `/code-review` (a verifier tries to disprove it and reproduces it if possible). Inside a `/craftsman`
    session, record findings and verdicts in the ledger with `craftsman review add` /
    `craftsman review verdict`; outside one, keep them in the report.
 5. **Report** one merged list ordered by severity (`blocker`, `major`, `minor`), each entry with

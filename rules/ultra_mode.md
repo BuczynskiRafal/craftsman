@@ -20,17 +20,16 @@ Before writing or editing any code, include a section **`### Design analysis`** 
 4. **Pre-mortem:** the three most likely ways the chosen solution fails in production and what in
    your implementation prevents each.
 
-## `ultracraft` — the deep quality loop
+## `ultracraft` — the deep review loop
 
-Treat the request as `/craftsman --deep <request>` and follow the `/craftsman` skill end to end:
-1. `craftsman gate --init --tier deep --task "<request in one line>"` before anything else
+`ultracraft` is `/craftsman --deep <request>`: follow the `/craftsman` skill end to end.
+1. `craftsman gate --init --deep --task "<request in one line>"` before anything else
    (`--await-user` / `--resume` around questions to the user).
 2. Include the `ultrathink` design analysis before implementing.
-3. Implement with explicit types and explicit error handling: no silent failures, no broad
-   catch-alls, invalid states made impossible where the type system allows it.
-4. Run the quality loop on the whole cumulative diff: `/simplify`, then review rounds with every
-   lens in fresh-context `craftsman-reviewer` subagents plus a final sweep, a
-   `craftsman-verifier` for every finding, fixes with delta re-review, and runtime verification
-   through `craftsman run` (tests **and** an end-to-end run).
+3. Build with explicit types and explicit error handling: no silent failures, no broad catch-alls,
+   invalid states made impossible where the type system allows it.
+4. Run the final review of `/code-review` in deep mode: every lens, at least two hunter waves,
+   verifiers for every finding, fixes with a re-check of the fix delta, then tests **and** an
+   end-to-end run through `craftsman run`.
 5. Finish only when `craftsman review check` passes, then `craftsman gate --complete` and report
    with `craftsman review report`.

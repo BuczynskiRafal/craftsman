@@ -5,7 +5,7 @@ description: >-
   existing helpers, needless complexity, dead weight, dishonest names or
   comments, and wasted work, then proves behavior is unchanged by re-running
   the same checks. Not a bug hunt (use /code-review). Use when /simplify is
-  invoked or as the first step of the /craftsman quality loop.
+  invoked or as the last step of the /craftsman build.
 ---
 
 # Simplify (`/simplify [path | ref]`)

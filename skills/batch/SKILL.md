@@ -49,4 +49,4 @@ must run and report.
 Track units in a table (`unit | files | status | check result | cases reported`). Resolve
 reported odd cases yourself. Then verify the whole repository: full test suite, type checker,
 linter, and a search showing no old-pattern occurrences remain. Inside `/craftsman`, continue
-with its quality loop.
+with its Stage 2 (final review).

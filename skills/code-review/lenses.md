@@ -1,20 +1,12 @@
 # Craftsman Review Lenses
 
-A lens is one narrow way of looking at a change. Each lens below is a playbook: a goal, the
-material to read first, and numbered probes — concrete questions you answer for **every hunk**
-assigned to you. If you cannot answer a probe from what you have read, you have not read enough
-yet: open more files before moving on.
+A lens is one narrow way of looking at a change: a goal, what to read first, and numbered probes.
+Answer every probe for every hunk in your slice. If you cannot answer one from what you have read,
+open more files before moving on.
 
 How to use a probe: pick a concrete value or situation and *execute the code in your head*, line
-by line, writing the intermediate values down. Most real defects surface at the moment a
-reviewer substitutes a specific value instead of reading the code as prose.
-
-Record what you find with `craftsman review add` (one finding per root cause, listing all
-consequences in `--scenario`; fold unjudged duplicates from other lenses before verification with
-`craftsman review merge`) and
-what you examined with `craftsman review cover`. Coverage notes name each hunk id and what you
-tried on it, e.g.
-`H3 parse_cfg: x=None -> L42 TypeError, empty string -> empty dict; callers cli.py:19, api.py:88`.
+by line, writing the intermediate values down. Most real defects surface at the moment a reviewer
+substitutes a specific value instead of reading the code as prose.
 
 ---
 
@@ -40,7 +32,11 @@ top to bottom, before any other lens.
    or must be justified by the task.
 4. Leftovers: debug output, commented-out code, TODOs the change was meant to resolve, temporary
    flags left on, placeholder values.
-5. Root cause: follow the bad input or state that the change handles back to where it is created.
+5. Documentation against code: for every doc, README, help text, docstring, comment, changelog
+   entry, config sample or error message the diff touches or describes, check each claim and run
+   each example against the code. A document that promises what the code does not do (or the
+   reverse) is a finding; anchor it at whichever side is wrong and say which.
+6. Root cause: follow the bad input or state that the change handles back to where it is created.
    List the other consumers of that origin. If any of them still receives the same unhandled value,
    the fix sits too far downstream — report it.
 
@@ -60,6 +56,9 @@ listed under "References".
    - **numbers:** `0`, `-1`, `limit - 1`, `limit`, `limit + 1`, very large, and for floats `NaN`
      and `inf` — every ordered comparison with `NaN` is false, so `if x < 0 or x > MAX: raise`
      lets `NaN` through;
+   - **integer width and units:** 32-bit overflow or truncation (`int`, `size_t`, `time_t`, file
+     sizes and offsets above 2 GiB, JSON numbers above 2^53, `struct`/`ctypes` fields, array
+     indexes), signed vs unsigned, bytes vs characters, seconds vs milliseconds;
    - **strings and paths:** `""`, whitespace only, non-ASCII, embedded newline or `\0`, different
      case, leading `/` or `..`, trailing separator;
    - **collections:** empty, one element, duplicates, unsorted, very large;
@@ -183,7 +182,8 @@ removed (`-`) line in your hunks.
    end-of-month arithmetic.
 9. Generated names and ids that must be unique (output files, keys, ids — not display
    timestamps): if they come from a timestamp, counter or hash, can two runs produce the same one
-   (two jobs within the clock's resolution, the same input twice, concurrent processes)? Without
+   (two jobs within the clock's or file system's timestamp resolution, the same input twice,
+   concurrent processes)? Without
    a disambiguator or exclusive creation (`O_EXCL`, mode `"x"`), the second silently overwrites the
    first.
 
@@ -229,7 +229,11 @@ did not intend.
    added in the changed code. Name the assertion that would notice — or record that none would.
 4. Assertions that cannot fail: `assertGreaterEqual(x, 0)` on a value that is never negative,
    `assertTrue(result)` on a non-empty object, asserting only that no exception was raised, or
-   asserting on the mock that replaced the code under test.
+   asserting on the mock that replaced the code under test. Also look for assertions the diff
+   *weakened* to make a test pass: `assertEqual` turned into `assertIn`/`assertTrue`, an exact value
+   turned into a range or a wider tolerance, a removed `assertRaises`, a deleted, skipped or
+   `xfail`ed test. Ask what the old assertion protected and whether the production change now
+   violates it.
 5. Negative and boundary paths: error paths, empty inputs and limits are exercised, not only the
    happy path. A bug fix needs a test that fails before the fix.
 6. Test hygiene: dependence on wall-clock time, randomness without a seed, test order, network,
@@ -247,15 +251,22 @@ wrong thing (probe 4) is a separate finding, anchored at that test.
 **Goal:** the change works on every platform and environment the project claims to support.
 
 **Probes**
-1. Paths: separators, drive letters, case-insensitive filesystems, spaces and non-ASCII in paths,
-   `~` expansion, long paths, home and config directory resolution on each OS.
+1. Paths: separators (paths split, joined or compared as strings with a hard-coded `/` or `\`;
+   `os.path.sep` vs `/` in globs, regexes and stored or printed relative paths; the VCS always
+   prints `/`), drive letters, case-insensitive filesystems, spaces and non-ASCII in paths, `~`
+   expansion, long paths, home and config directory resolution on each OS.
 2. Text: default encodings (Windows is often not UTF-8), line endings, BOMs, locale-dependent
    number and date formatting.
 3. Processes: shell differences (PowerShell, cmd, bash, zsh), quoting, executable lookup (`.exe`,
    `.cmd` shims, shebangs, PATH), signals, exit codes.
 4. Versions: syntax or library features newer than the minimum version the project declares
    (check `pyproject.toml`, `package.json` engines, `go.mod`, CI matrix).
-5. Environment assumptions: variables that may be unset, tools that may be missing, no network,
+5. File system timestamps and sizes: resolution differs (FAT 2 s, ext3/HFS+ 1 s, NTFS 100 ns,
+   ext4 ns; network and container mounts vary), so `mtime` equality, "newer than" checks and change
+   detection built on them miss changes made within one tick; mtimes survive copies, extractions
+   and checkouts differently; 32-bit `time_t` and FAT limit dates; file sizes and offsets can
+   exceed 32 bits.
+6. Environment assumptions: variables that may be unset, tools that may be missing, no network,
    read-only filesystem, running in CI or a container, running as a different user.
 
 ## `model` — Data model & invariants
@@ -306,9 +317,7 @@ record items with a concrete cost (a likely future bug, duplicated maintenance, 
 
 ## `design` — Design & size: the change as a whole
 
-Run by whichever reviewer is assigned `design` (a shard reviewer, the single `standard`
-reviewer, or the `R4` group on `deep`), before `sweep`. Coverage is recorded per changed file (`craftsman review cover --lens design --files path/a.py,path/b.py --note "..."`),
-not per hunk.
+Run by the simplicity hunter together with `craft`, over the whole slice rather than hunk by hunk.
 
 **Probes**
 1. Size vs. task: how many production lines were added, and how many does the task actually
@@ -321,25 +330,18 @@ not per hunk.
 5. Soundness of the model: is the underlying model sound, or are findings patching symptoms of
    the wrong model (for example, per-tool option tables instead of path candidates vs. forbidden
    zones)?
-6. Quality signals: for every quality signal reported for this file, verify that there is either
-   a finding (`--signal <ID>`) or a concrete `ack` justification.
+6. Quality hints: each `S#` hint in the packet is a mechanical smell (size, duplication,
+   structure). Read the code it points at: a hint with a concrete cost is a finding, the rest are
+   noise.
 
 ## `sweep` — Final sweep: interactions between hunks
 
-Run after all other lenses, by a reviewer who did none of them (or in review-only mode without
-`--fix`, by `craftsman-verifier` in Step 0 before issuing verdicts). Read the whole diff top to
+Run over the whole diff by a hunter who is not busy with other lenses. Read the diff top to
 bottom once more and look only for what single-lens passes miss:
 - two hunks that are each correct but disagree (one writes a format the other does not read; one
   adds a step the other skips; one renames, the other still uses the old name);
 - the same decision implemented differently in two places;
 - a fix for one finding that re-opened another;
 - configuration, documentation and code that now contradict each other;
-- **root-cause deduplication:** check `craftsman review show` for unjudged findings recorded by
-  earlier lenses that stem from the same root cause (the same changed line or decision producing
-  multiple symptoms), and fold them into one finding before verification with `craftsman review
-  merge <target_id> <dup_id> ...` (`merge` only works on findings without a verdict) so all
-  consequences are listed on `<target_id>`:
-  > Merge only when ONE fix removes every consequence. Different fixes are separate findings, even on the same line, file, or category.
-
-  For example, a CLI command missing a documented `--format` option and a stale README example are two
-  separate findings, not one "housekeeping" finding.
+- findings already recorded (`craftsman review show`) that miss a consequence in a hunk you now
+  see.
