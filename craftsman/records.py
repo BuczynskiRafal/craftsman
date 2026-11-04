@@ -375,6 +375,10 @@ class Fields:
         """The fields of the JSON object that were never read."""
         return sorted(set(self._raw) - self._seen)
 
+    def optional_record_if_present(self, key: str, parse: Callable[[Any], T]) -> T | None:
+        """The record at `key`; None when the key is left out or null."""
+        return None if self._absent(key) else self.optional_record(key, parse)
+
     def reject_unknown(self) -> None:
         """Fail on any field of the JSON object that was never read."""
         unknown = self.unknown_fields()
@@ -397,7 +401,8 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_json_value(item) for item in value]
     if is_dataclass(value) and not isinstance(value, type):
-        return _record_json(value)
+        to_json = getattr(value, "to_json", None)  # a record may shape its own JSON
+        return to_json() if callable(to_json) else _record_json(value)
     return value
 
 
@@ -835,20 +840,57 @@ def agent_role(agent: str) -> AgentRole | None:
 
 
 @dataclass(frozen=True)
+class AgentUsage:
+    """What one subagent run used, read from its transcript when its stop hook ran."""
+
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    cache_write_tokens: int
+    duration_s: float
+
+    def __post_init__(self) -> None:
+        for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"):
+            _require(getattr(self, name) >= 0, name, "must be >= 0")
+        _require(self.duration_s >= 0, "duration_s", "must be >= 0")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> AgentUsage:
+        f = Fields(raw)
+        return f.done(
+            cls(
+                input_tokens=f.integer("input_tokens"),
+                output_tokens=f.integer("output_tokens"),
+                cache_read_tokens=f.integer("cache_read_tokens"),
+                cache_write_tokens=f.integer("cache_write_tokens"),
+                duration_s=f.number("duration_s"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class AgentEvent:
     platform: str
     event: AgentEventKind
     agent: str
     agent_id: str
     at: str
+    usage: AgentUsage | None = None  # a stop event only, and only when the transcript was readable
 
     def __post_init__(self) -> None:
         _require_text(self.platform, "platform")
         _require_choice(self.event, AGENT_EVENT_KINDS, "event")
         _require_timestamp(self.at, "at")
+        _require(self.usage is None or self.event == "stop", "usage", "is only allowed on a stop event")
 
     def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
+        data = _record_json(self)
+        if self.usage is None:
+            del data["usage"]  # ledgers without telemetry stay byte-identical
+        return data
 
     @classmethod
     def from_json(cls, raw: Any) -> AgentEvent:
@@ -860,6 +902,7 @@ class AgentEvent:
                 agent=f.text("agent"),
                 agent_id=f.text("agent_id"),
                 at=f.text("at"),
+                usage=f.optional_record_if_present("usage", AgentUsage.from_json),
             )
         )
 

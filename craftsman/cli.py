@@ -8,8 +8,9 @@ import json
 import os
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from craftsman import __version__
 from craftsman.assets import Skill, iter_skills
@@ -36,6 +37,7 @@ from craftsman.runner import main as run_main
 from craftsman.scope import main as scope_guard_main
 from craftsman.streams import configure_std_streams
 from craftsman.uninstall import uninstall_main
+from craftsman.usage import usage_json, usage_summary
 
 LATEST_RUNS_SHOWN = 3
 
@@ -68,6 +70,7 @@ class LedgerOverview:
     verdicts: dict[str, int]
     resolved: int
     latest_runs: tuple[RunSummary, ...]
+    agent_usage: dict[str, dict[str, Any]] = field(default_factory=dict)  # per role, when recorded
 
     @classmethod
     def of(cls, ledger: Ledger) -> LedgerOverview:
@@ -90,6 +93,7 @@ class LedgerOverview:
                 RunSummary(run.id, run.kind, run.command, run.exit_code)
                 for run in ledger.runs[-LATEST_RUNS_SHOWN:]
             ),
+            agent_usage=usage_json(ledger),
         )
 
     def describe(self) -> str:
@@ -103,7 +107,7 @@ class LedgerOverview:
         return (
             f"{self.rounds} round(s){', deep' if self.deep else ''}, coverage "
             f"{self.coverage.covered}/{self.coverage.total} hunks; findings {self.findings} ({verdicts}, "
-            f"resolved {self.resolved}); latest runs: {runs or 'none'}"
+            f"resolved {self.resolved}); latest runs: {runs or 'none'}{usage_summary(self.agent_usage)}"
         )
 
 
