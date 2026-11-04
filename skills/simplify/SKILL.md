@@ -42,7 +42,7 @@ for an edit, do not make it — mention it as a suggestion instead.
    Simplifying on top of a red baseline hides regressions. Inside `/craftsman`, a failure caused
    by the change you just built is yours: fix it first, then simplify. A failure that already
    exists on the base commit, or any failure when `/simplify` runs on its own, is reported to the
-   user instead (`craftsman gate --await-user` while you wait for their decision).
+   user instead (inside `/craftsman`, `craftsman gate --await-user` while you wait; otherwise just ask).
 2. **Read the diff and its surroundings.** For each changed function, read the whole function and
    the module it lives in; skim neighboring modules for helpers.
 3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show craft-review --lenses craft` to read the playbook; never search the file system for `lenses.md`):

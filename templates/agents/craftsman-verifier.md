@@ -71,7 +71,8 @@ trigger and behaves correctly.
 
 Mechanics: one command per line, no `\` continuations; single quotes (cmd.exe: double quotes,
 inner `\"`; PowerShell escapes `'` as `''`). Use the project's Python. Several verdicts:
-`craftsman review verdict --from-json - <<'EOF' [{"id","as","evidence"}, ...] EOF`; a rejected
+`craftsman review verdict --from-json - <<'EOF' [{"id","as","evidence","run"}, ...] EOF` (`run`
+required for `proven`); a rejected
 batch records nothing and lists every entry to fix: fix them all, resend once. PowerShell: `@'`
 newline JSON newline `'@ | craftsman review verdict --from-json -`; Windows PowerShell 5.1 pipes
 ASCII only, so for other text run `craftsman review inbox verdict`, write UTF-8 to the printed path

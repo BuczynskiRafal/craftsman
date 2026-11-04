@@ -43,9 +43,11 @@ Write every `craftsman` command on one line.
 craftsman gate --init [--deep] --task "<the user's request in one line>"
 ```
 
-The prompt hook runs this on platforms with hooks; otherwise run it yourself before touching code.
-Start deep (`--deep`) when the user's words ask for care ("critical", "production", "be
-thorough") or say `ultracraft`; otherwise start normal and escalate later (Stage 2 step 1). It records the base commit: the review covers everything since then, commits included.
+The prompt hook runs this on platforms with hooks; if no hook opened the gate, run it yourself
+before touching code. Start deep (`--deep`) when the user's words ask for care ("critical",
+"production", "be thorough"), say `ultracraft` or type `--deep`; otherwise start normal and
+escalate later (Stage 2 step 1). A typed `--quick` or `--standard` is ignored. It records the base
+commit: the review covers everything since then, commits included.
 A request that only asks for a review (no fixing, no `/craftsman`, no `ultracraft`) starts no
 gate: follow `/craft-review` in review-only mode instead.
 
@@ -65,11 +67,13 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
 1. `craftsman review prepare` freezes the diff into round N and prints the packet path and the
    risk map. Decide the depth now by the rule in `/craft-review` (Depth); to go deep, run
    `craftsman review prepare --deep`.
-2. Write a compact summary for the hunt: the task, what you built per file in a line, the
-   decisions a reader could mistake for bugs. The summary states intent; it must not argue that
-   the code is correct. Your context holds the reasoning that produced the code, which is what
-   hides its defects, so the hunters are fresh-context subagents and you only orchestrate.
-3. Follow `/craft-review` from its intent brief through step 6 (hunt, verify, saturate, fix,
+2. Write the intent brief (`/craft-review` step 2) with the task and what you built per file in
+   a line. It states intent; it must not argue that the code is correct. Decisions a reader could
+   mistake for bugs go only to verifiers, after the shared block, as context for judging; hunters
+   never get them (they would anchor the hunt). Your context holds the reasoning that produced the
+   code, which is what hides its defects, so the hunters are fresh-context subagents and you only
+   orchestrate.
+3. Follow `/craft-review` from its hunt plan (step 3) through step 6 (hunt, verify, saturate, fix,
    confirm, re-check, tests and `craftsman review check`), in gate-session mode. It is the single
    source for the mechanics; do not improvise a lighter review.
 4. Do what `check` lists, then `craftsman gate --complete`. At `round-cap` stop iterating, report
