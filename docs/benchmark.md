@@ -62,6 +62,35 @@ An expanded, multi-language benchmark suite addressing these limitations is acti
 
 ---
 
+## Seeded Defect Suite
+
+The pilot depends on a third-party dataset and needs real pull requests. For a cheap, repeatable check that works on
+any agent platform (Claude Code, Antigravity, Copilot, Codex), the repository ships a seeded suite in
+[`evals/`](../evals/README.md): 6 small stdlib-only Python projects, each with a pull request that implements a
+written task and hides 2 or 3 defects that look like honest mistakes (15 in total). The shipped tests of every
+pull request pass, and each case also carries 1 or 2 decoys, correct code that only looks wrong.
+
+The defects cover twelve kinds: boundary and off-by-one errors, a legitimate empty value treated as missing, swallowed
+errors, non-atomic writes, incomplete propagation, tests that cannot fail or were weakened, aliasing and mutable
+defaults, cache keys missing a new parameter, platform dependence, path traversal, help text that contradicts the
+code, and a qualifier of the task that is not implemented.
+
+```bash
+python3 evals/run.py list
+python3 evals/run.py prepare quotes ~/evals/quotes-1   # git repo: base committed, change uncommitted
+# review it with /code-review, or with the baseline prompt from evals/README.md
+python3 evals/run.py score quotes ~/evals/quotes-1     # recall, unmatched findings, decoy hits
+```
+
+`score` reads the findings from the Craftsman ledger or, for a baseline run, from a JSON list of
+`{"file", "line", "title"}`. A finding matches a defect when it is in the same file and within 3 lines of the seeded
+location; findings the review dismissed are ignored. Compare the recall of `/code-review` and of a plain review on
+the same model, with at least three repetitions per arm: the suite is small, so single runs are anecdotes. How to run
+each arm, the exact baseline prompt, the scoring rules and how to add a case are in the
+[evals README](../evals/README.md).
+
+---
+
 ## Replication Guide
 
 Researchers and developers are encouraged to replicate these findings or contribute evaluations from other agent architectures:
