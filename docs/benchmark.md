@@ -51,6 +51,33 @@ Claude Code is part of the expanded benchmark, with one repetition per configura
 
 ---
 
+## Seeded Suite Results (November 2026)
+
+End-to-end runs of `python3 -m evals.run agent` on the 8 cases of the seeded suite: 27 defects and 18 decoys. Each run
+is a headless Claude Code session with Sonnet 5.5, `--permission-mode auto` and a $5 cap. Findings are scored with
+nearest-item matching.
+
+| Version | Passes | Recall | Precision | Protocol skipped | Cost per pass | Time per pass |
+| :-- | --: | --: | --: | --: | --: | --: |
+| 4.1.0 (inline quick review) | 2 | 89% | 86% | n/a | $1.72 | 9.9 min |
+| 5.0, before the cost work | 2 | 89% | 71% | 2 of 16 runs | $3.11 | 19.6 min |
+| 5.0, final | 3 | 96% | 73% | 0 of 24 runs | $2.58 | 17.3 min |
+
+Cost and time for the final version come from its last pass. The two earlier passes cost $2.99 and took 29.7 minutes,
+because the review stop guard prompted again while background agents were still running; that is fixed.
+
+- Recall rose because every review now runs the protocol. Before, the orchestrator sometimes reviewed a small diff
+  itself and recorded nothing. The review stop guard and the "prepare first" step brought that to 0 of 24 runs.
+- On the two large cases, the cost work (scout, slimmer views, pipelining, a cheaper simplicity hunter) cut cost by
+  about a third: feedbox fell from $0.95 to $0.60 and orderdesk from $0.84 to $0.58. Time fell by 20-30%. On small
+  cases cost stayed flat, because every review now runs at least one hunter.
+- Precision is lower than in 4.1.0 because hunters report more findings outside the seeded set. Some of these are real
+  issues that the cases did not seed; the scorer counts them as unmatched.
+- These numbers rest on 2-3 passes per version, small synthetic cases, one model and one platform. At this sample size
+  a recall difference below about 13 points cannot be told apart from noise.
+
+---
+
 ## Limitations
 
 We present these preliminary results transparently with their methodological limitations:
