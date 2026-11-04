@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -126,7 +128,8 @@ class BatchRejected(LedgerError):
             raise ValueError("BatchRejected requires at least one EntryProblem")
         noun = "entry" if total == 1 else "entries"
         super().__init__(
-            f"{command}: {len(problems)} of {total} {noun} rejected; nothing was recorded."
+            f"{command}: {len({item.index for item in problems})} of {total} {noun} rejected; "
+            "nothing was recorded."
         )
         self.command = command
         self.problems = problems
@@ -159,9 +162,51 @@ def next_id(prefix: str, existing: Iterable[str]) -> str:
     return f"{prefix}{max((int(item[len(prefix) :]) for item in existing), default=0) + 1}"
 
 
+class MultiFieldError(LedgerError):
+    """Every problem found in one record, reported together instead of one at a time."""
+
+    def __init__(self, errors: Sequence[LedgerError]) -> None:
+        seen: set[str] = set()
+        kept: list[LedgerError] = []
+        for error in errors:  # one problem per field: later ones are usually echoes of the first
+            if error.field and error.field in seen:
+                continue
+            seen.add(error.field)
+            kept.append(error)
+        super().__init__("; ".join(str(error) for error in kept))
+        self.errors = tuple(kept)
+
+
+_problem_sink: ContextVar[list[LedgerError] | None] = ContextVar("problem_sink", default=None)
+
+
+@contextmanager
+def collecting_problems() -> Iterator[list[LedgerError]]:
+    """Inside the block a failed record check is collected, not raised, so a record reports all its problems.
+
+    The records built inside may be invalid; the caller discards them when the list is not empty.
+    """
+    sink: list[LedgerError] = []
+    token = _problem_sink.set(sink)
+    try:
+        yield sink
+    finally:
+        _problem_sink.reset(token)
+
+
 def _require(condition: bool, field: str, problem: str) -> None:
-    if not condition:
-        raise FieldError(field, problem)
+    if condition:
+        return
+    error = FieldError(field, problem)
+    sink = _problem_sink.get()
+    if sink is None:
+        raise error
+    sink.append(error)
+
+
+def check_coverage_note(note: str) -> None:
+    """Fail (or collect) when `note` is too short to say what was examined."""
+    _require_text(note, "note", min_chars=MIN_COVERAGE_NOTE_CHARS)
 
 
 def _require_text(value: str, field: str, *, min_chars: int = 1, max_chars: int | None = None) -> None:
@@ -326,9 +371,13 @@ class Fields:
             return None
         return self.record(key, parse)
 
+    def unknown_fields(self) -> list[str]:
+        """The fields of the JSON object that were never read."""
+        return sorted(set(self._raw) - self._seen)
+
     def reject_unknown(self) -> None:
         """Fail on any field of the JSON object that was never read."""
-        unknown = sorted(set(self._raw) - self._seen)
+        unknown = self.unknown_fields()
         if unknown:
             raise FieldError(unknown[0], "is not a known field")
 
@@ -406,7 +455,7 @@ class SignalKind(str, Enum):
 
 @dataclass(frozen=True)
 class QualitySignal:
-    """A quality signal computed for a round; the reviewer resolves it or the gate blocks."""
+    """A quality hint computed for a round and shown to the reviewer; it never blocks the gate."""
 
     id: str
     kind: SignalKind
@@ -513,7 +562,7 @@ class Coverage:
     def __post_init__(self) -> None:
         _require(self.round >= 1, "round", "must be >= 1")
         _require(bool(self.digests), "digests", "must list at least one hunk digest")
-        _require_text(self.note, "note", min_chars=MIN_COVERAGE_NOTE_CHARS)
+        check_coverage_note(self.note)
         _require_timestamp(self.recorded_at, "recorded_at")
 
     def to_json(self) -> dict[str, Any]:
@@ -532,8 +581,18 @@ class Coverage:
         )
 
 
+_SEVERITY_MARKER_RE = re.compile(r"\s*\[severity:\s*[a-z]+\]\s*", re.IGNORECASE)
+
+
 def _check_verdict_evidence(verdict: Verdict, evidence: str, run_id: str | None) -> None:
-    """Each verdict needs evidence a reader can check; see the module constants for examples."""
+    """Each verdict needs evidence a reader can check; see the module constants for examples.
+
+    A leading `[severity: <new>]` marker, which a verifier uses to correct the severity, comes
+    before the required prefix and is not part of the check.
+    """
+    marker = _SEVERITY_MARKER_RE.match(evidence)
+    if marker is not None:
+        evidence = evidence[marker.end() :]
     if verdict == "proven":
         _require(
             run_id is not None,

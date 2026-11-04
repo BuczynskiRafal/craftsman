@@ -171,7 +171,7 @@ def _round_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
             GateIssue(
                 "no-round",
                 "No review round yet; run `craftsman review prepare` to snapshot the diff "
-                "and select lenses.",
+                "and see the suggested lenses.",
             )
         ]
     base = ledger.rounds[0].base_sha

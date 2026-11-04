@@ -43,6 +43,7 @@ FINDING_FLAGS = (
     "total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError",
 )
 STATIC_EVIDENCE = "static: cart.py:3 divides by len(items), which raises ZeroDivisionError on []"
+SHELL_OUT = "import subprocess\n\n\ndef go(cmd):\n    subprocess.run(cmd, shell=True)\n"
 LONG_FUNCTION = "def over_budget(x: int) -> int:\n{body}\n    return step_44\n".format(
     body="\n".join(f"    step_{i} = x + {i}" for i in range(45))
 )
@@ -122,7 +123,7 @@ class PrepareTests(RepoTestCase):
         self.assertIn(f"Packet: {self.repo.ledger_dir / 'packet-1.md'}", out)
 
     def test_risk_map_names_signals_and_hunks_and_hints_at_depth(self) -> None:
-        self.repo.write("run.py", "import subprocess\n\n\ndef go(cmd):\n    subprocess.run(cmd, shell=True)\n")
+        self.repo.write("run.py", SHELL_OUT)
 
         out = self.review("prepare").stdout
 
@@ -131,13 +132,75 @@ class PrepareTests(RepoTestCase):
         self.assertIn("signals: process (→ failure, trust, platform)", self.packet())
 
     def test_a_deep_round_suggests_every_lens_and_needs_no_depth_hint(self) -> None:
-        self.repo.write("cart.py", BUGGY_TOTAL)
+        self.repo.write("run.py", SHELL_OUT)
 
         out = self.review("prepare", "--deep").stdout
 
         self.assertIn("Round 1 prepared (deep)", out)
         self.assertIn("  model — deep round\n", out)
         self.assertNotIn("Depth:", out)
+
+    def test_the_depth_hint_is_not_repeated_under_a_deep_gate(self) -> None:
+        self.repo.cli("gate", "--init", "--deep")
+        self.repo.write("run.py", SHELL_OUT)
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Round 1 prepared (deep)", out)
+        self.assertNotIn("Depth:", out)
+
+    def test_the_depth_hint_needs_real_usage_in_production_code(self) -> None:
+        self.repo.write("login.py", "def check(token, session_id):\n    return token == session_id\n")
+        self.repo.write("tests/test_run.py", SHELL_OUT)
+        self.repo.write("deploy.yaml", "token: abc\nrun: os.system(rm)\n")
+
+        out = self.review("prepare").stdout
+
+        self.assertNotIn("Depth:", out)
+
+    def test_a_deep_round_over_docs_still_suggests_every_lens(self) -> None:
+        self.repo.write("README.md", "# Cart\n\nTotals.\n")
+
+        out = self.review("prepare", "--deep").stdout
+
+        self.assertIn("  trust — deep round\n", out)
+
+    def test_an_agent_prompt_file_is_not_a_docs_change(self) -> None:
+        self.repo.write("skills/x/SKILL.md", "# Skill\n\nRun `rm -rf build` first.\n")
+        self.repo.write("README.md", "# Cart\n")
+
+        out = self.review("prepare").stdout
+
+        self.assertNotIn("docs-only change", out)
+        self.assertIn("  contracts — core lens\n", out)
+
+    def test_prose_changes_get_the_docs_lenses(self) -> None:
+        self.repo.write("README.md", "# Cart\n")
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("  intent — docs-only change\n", out)
+        self.assertNotIn("  contracts", out)
+
+    def test_later_rounds_read_signals_from_the_open_hunks_only(self) -> None:
+        self.repo.write("run.py", SHELL_OUT)
+        self.repo.write("big.py", LONG_FUNCTION)
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        first = self.review("prepare").stdout
+        self.assertIn("Depth: deep suggested", first)
+        self.assertIn("Quality hints:", first)
+        self.repo.record_full_evidence()
+        self.repo.write("cart.py", BUGGY_TOTAL.replace("/ len(items)", ""))
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("2 hunks carried, 1 to review.", out)
+        self.assertNotIn("Depth:", out)
+        self.assertNotIn("Quality hints:", out)
+        self.assertNotIn("trust", out)
+        rounds = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))["rounds"]
+        self.assertTrue(rounds[0]["signals"])
+        self.assertEqual(rounds[1]["signals"], [])
 
     def test_preparing_the_same_diff_again_keeps_the_round(self) -> None:
         self.prepare_bug()
@@ -495,6 +558,32 @@ class VerdictTests(RepoTestCase):
         self.assertIn("R1 recorded (repro, exit 1", run.stderr)
         self.assertEqual(judged.stdout.strip(), "F1 verdict recorded: proven (run R1)")
 
+    def test_a_severity_marker_may_precede_the_evidence_prefix(self) -> None:
+        probable = self.verdict("F1", "probable", f"[severity: minor] {STATIC_EVIDENCE}")
+        self.assertEqual(probable.stdout.strip(), "F1 verdict recorded: probable")
+
+        self.add()
+        question = self.verdict(
+            "F2", "question", "[severity: nit] intent: task asks for totals, cart.py:3 averages"
+        )
+        self.assertEqual(question.stdout.strip(), "F2 verdict recorded: question")
+
+    def test_the_marker_does_not_replace_the_required_prefix(self) -> None:
+        proc = self.verdict("F1", "probable", "[severity: minor] it is probably wrong at cart.py:3", check=False)
+
+        self.assert_error(proc, 1, "must start with")
+
+    def test_a_verdict_batch_takes_the_run_key_for_proven(self) -> None:
+        self.repo.cli(
+            "run", "--kind", "repro", "--", sys.executable, "-c", "from cart import total; total([])",
+            check=False,
+        )
+        entry = {"id": "F1", "as": "proven", "evidence": "R1 raised ZeroDivisionError", "run": "R1"}
+
+        out = self.review("verdict", "--from-json", "-", stdin=json.dumps([entry])).stdout
+
+        self.assertEqual(out.strip(), "F1 verdict recorded: proven (run R1)")
+
     def test_proven_verdict_without_a_run_is_refused(self) -> None:
         no_run = self.verdict("F1", "proven", "it obviously crashes on empty input", check=False)
 
@@ -640,6 +729,37 @@ class FromJsonTests(RepoTestCase):
         self.assert_error(failed, 1, "entry 2 (F2): run: is required for a 'proven' verdict")
         self.assertEqual([f["verdict"] for f in self.repo.show()["findings"]], [None, None])
 
+    def test_every_problem_of_an_entry_is_reported_at_once(self) -> None:
+        entry = self.finding(severity="huge", title="x", scenario="short", extra=1)
+
+        failed = self.from_json("add", [entry], check=False)
+
+        self.assert_error(failed, 1, "1 of 1 entry rejected")
+        for fragment in ("severity: must be one of", "title: must have", "scenario: must have", "extra: is not"):
+            self.assertIn(fragment, failed.stderr)
+
+    def test_a_bad_hunk_does_not_hide_a_short_note(self) -> None:
+        failed = self.from_json("cover", [{"hunks": ["H9"], "note": "short"}], check=False)
+
+        self.assert_error(failed, 1, "1 of 1 entry rejected")
+        self.assertIn("H9", failed.stderr)
+        self.assertIn("note: must have at least 20 characters", failed.stderr)
+
+    def test_a_cover_entry_without_targets_names_both_keys(self) -> None:
+        failed = self.from_json("cover", [{"note": coverage_note(["H1"])}], check=False)
+
+        self.assert_error(failed, 1, "pass 'hunks' or 'files'")
+
+    def test_each_entry_reports_its_own_problems(self) -> None:
+        entries = [self.finding(title="x"), self.finding(severity="huge", scenario="s")]
+
+        failed = self.from_json("add", entries, check=False)
+
+        self.assert_error(failed, 1, "2 of 2 entries rejected")
+        self.assertIn("entry 1 (F1): title:", failed.stderr)
+        self.assertIn("entry 2 (F2): severity:", failed.stderr)
+        self.assertIn("entry 2 (F2): scenario:", failed.stderr)
+
     def test_unknown_entry_key_is_rejected(self) -> None:
         entries = [{"hunks": ["H1"], "note": coverage_note(["H1"]), "extra": 1}]
 
@@ -653,6 +773,13 @@ class FromJsonTests(RepoTestCase):
         failed = self.from_json("cover", entries, check=False)
 
         self.assert_error(failed, 1, "entry 1 (H1): lens: is not a known field")
+
+    def test_the_signal_key_is_gone(self) -> None:
+        for key in ("signal", "signal_id"):
+            with self.subTest(key):
+                failed = self.from_json("add", [self.finding(**{key: "S1"})], check=False)
+
+                self.assert_error(failed, 1, f"{key}: is not a known field")
 
     def test_empty_list_is_rejected(self) -> None:
         self.assert_error(
@@ -888,6 +1015,19 @@ class QualityHintTests(RepoTestCase):
         state = json.loads((self.repo.ledger_dir / "craftsman_state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["stage"], "implement")
         self.assertIn("Very large diff", self.review("report").stdout)
+
+    def test_removed_flags_are_rejected(self) -> None:
+        self.prepare_bug()
+        finding = ("--file", "cart.py", "--line", "3", *FINDING_FLAGS)
+        for label, args in (
+            ("gate --init --tier", ("gate", "--init", "--tier", "deep")),
+            ("gate --tier", ("gate", "--tier", "deep")),
+            ("review prepare --tier", ("review", "prepare", "--tier", "deep")),
+            ("review prepare --add-lens", ("review", "prepare", "--add-lens", "trust")),
+            ("review add --signal", ("review", "add", *finding, "--signal", "S1")),
+        ):
+            with self.subTest(label):
+                self.assert_error(self.repo.cli(*args, check=False), 2, "unrecognized arguments")
 
     def test_ack_and_fact_commands_are_gone(self) -> None:
         self.assert_error(self.review("ack", "S1", check=False), 2, "invalid choice")
