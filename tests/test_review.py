@@ -1158,6 +1158,60 @@ class QualityHintTests(RepoTestCase):
         self.assert_error(self.review("fact", check=False), 2, "invalid choice")
 
 
+class AgentUsageReportTests(RepoTestCase):
+    def record_usage(self) -> None:
+        self.prepare_bug()
+        path = self.repo.ledger_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        usage = {
+            "input_tokens": 120, "output_tokens": 45_600, "cache_read_tokens": 1_200_000,
+            "cache_write_tokens": 234_000, "duration_s": 852.0,
+        }  # fmt: skip
+        stamp = "2026-10-21T10:00:00.000Z"
+        data["agents"] = [
+            {"platform": "claude", "event": "start", "agent": "craftsman-reviewer", "agent_id": "r1", "at": stamp},
+            {"platform": "claude", "event": "stop", "agent": "craftsman-reviewer", "agent_id": "r1", "at": stamp, "usage": usage},
+            {"platform": "claude", "event": "stop", "agent": "craftsman-verifier", "agent_id": "v1", "at": stamp, "usage": {**usage, "output_tokens": 900, "duration_s": 60.0}},
+        ]  # fmt: skip
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_report_totals_tokens_and_time_per_role(self) -> None:
+        self.record_usage()
+
+        report = self.review("report", "--review-only").stdout
+
+        self.assertIn("## Agent usage", report)
+        self.assertIn(
+            "- hunters: 1 agent(s) · in 120 · out 45.6k · cache read 1.2M · cache write 234.0k · 14.2 min agent time",
+            report,
+        )
+        self.assertIn("- verifiers: 1 agent(s) · in 120 · out 900 ·", report)
+
+    def test_report_json_carries_the_totals(self) -> None:
+        self.record_usage()
+
+        usage = json.loads(self.review("report", "--review-only", "--json").stdout)["agent_usage"]
+
+        self.assertEqual(usage["hunters"]["output_tokens"], 45_600)
+        self.assertEqual(usage["verifiers"]["duration_s"], 60.0)
+
+    def test_status_shows_the_totals_per_role(self) -> None:
+        self.record_usage()
+
+        status = self.repo.cli("status").stdout
+        payload = json.loads(self.repo.cli("status", "--json").stdout)
+
+        self.assertIn("; hunters 1 (45.6k out, 14.2 min); verifiers 1 (900 out, 1.0 min)", status)
+        self.assertEqual(payload["ledger"]["agent_usage"]["hunters"]["agents"], 1)
+
+    def test_nothing_is_shown_when_no_agent_recorded_usage(self) -> None:
+        self.prepare_bug()
+
+        self.assertNotIn("Agent usage", self.review("report", "--review-only").stdout)
+        self.assertNotIn("hunters", self.repo.cli("status").stdout)
+        self.assertEqual(json.loads(self.review("report", "--review-only", "--json").stdout)["agent_usage"], {})
+
+
 class ShowDetailsTests(RepoTestCase):
     def test_show_prints_each_findings_scenario_without_json(self) -> None:
         self.prepare_bug()
@@ -1166,7 +1220,7 @@ class ShowDetailsTests(RepoTestCase):
         out = self.review("show").stdout
 
         self.assertIn(
-            "F1 scenario: total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError", out
+            "F1 scenario (lens contracts): total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError", out
         )
         self.assertNotIn("F1 evidence", out)
 
@@ -1184,7 +1238,7 @@ class ShowDetailsTests(RepoTestCase):
         self.add("--scenario", "first line of the trigger\n  then the wrong outcome follows here")
 
         self.assertIn(
-            "F1 scenario: first line of the trigger then the wrong outcome follows here",
+            "F1 scenario (lens contracts): first line of the trigger then the wrong outcome follows here",
             self.review("show").stdout,
         )
 

@@ -185,23 +185,46 @@ class ShowHunksTests(_RepoTestCase):
         lines = proc.stdout.strip().splitlines()
 
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(len(lines), 3)
         self.assertEqual(
             lines,
             [
                 f"{by_path['notes.py'].id}  notes.py:1-1  added",
                 f"{by_path['old.py'].id}  old.py:1-2  deleted",
                 f"{a_hunk.id}  {a_range}  compute_total",
+                "3 left to cover",
             ],
         )
 
         payload = json.loads(self.review("show", "--hunks", "--json").stdout)
         self.assertFalse(payload["stale"])
+        self.assertEqual([item["covered"] for item in payload["hunks"]], [False, False, False])
         self.assertEqual([item["path"] for item in payload["hunks"]], ["notes.py", "old.py", "src/a.py"])
         a_json = next(item for item in payload["hunks"] if item["path"] == "src/a.py")
         self.assertEqual(a_json["scope"], "compute_total")
         self.assertEqual(a_json["status"], "modified")
         self.assertEqual(a_json["end_line"], a_hunk.new_start + a_hunk.new_len - 1)
+
+    def test_show_hunks_lists_only_the_hunks_still_to_cover(self) -> None:
+        self.repo.write("a.py", "".join(f"v{i} = {i}\n" for i in range(30)))
+        self.repo.write("b.py", "".join(f"w{i} = {i}\n" for i in range(30)))
+        self.repo.base_sha = self.repo.commit("seed")
+        self.repo.write("a.py", "".join(f"v{i} = {-i}\n" for i in range(30)))
+        self.repo.write("b.py", "".join(f"w{i} = {-i}\n" for i in range(30)))
+        self.review("prepare")
+        self.review("cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+
+        lines = self.review("show", "--hunks").stdout.strip().splitlines()
+        payload = json.loads(self.review("show", "--hunks", "--json").stdout)
+
+        self.assertEqual([line.split()[0] for line in lines[:-1]], ["H2"])
+        self.assertEqual(lines[-1], "1 left to cover")
+        self.assertEqual({item["id"]: item["covered"] for item in payload["hunks"]}, {"H1": True, "H2": False})
+
+        self.review("cover", "--hunks", "H2", "--note", coverage_note(["H2"]))
+
+        self.assertEqual(
+            self.review("show", "--hunks").stdout.strip(), "0 left to cover: every hunk is covered"
+        )
 
     def test_show_hunks_omits_carried_hunks_until_round_becomes_stale(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)
@@ -212,7 +235,7 @@ class ShowHunksTests(_RepoTestCase):
         self.review("prepare")
 
         current_lines = self.review("show", "--hunks").stdout.strip().splitlines()
-        self.assertEqual(current_lines, ["H3  cart.py:1-3  total"])
+        self.assertEqual(current_lines, ["H3  cart.py:1-3  total", "1 left to cover"])
 
         # Edit cart.py without re-running `prepare`: round 2 becomes stale.
         self.repo.write("cart.py", "def total(items):\n    return 0\n")

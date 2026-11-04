@@ -98,6 +98,7 @@ from craftsman.records import (
     collecting_problems,
 )
 from craftsman.text import inline_md, one_line
+from craftsman.usage import usage_json, usage_lines
 from craftsman.workspace import Workspace, open_workspace
 
 PROG = "craftsman review"
@@ -1245,7 +1246,8 @@ def _show(args: argparse.Namespace) -> int:
         print(str(Path(latest.packet_path).resolve()))
         return 0
     if args.hunks:
-        return _show_hunks(ws.root, latest, snap, as_json=args.json)
+        missing = uncovered_hunks(ledger, latest) if latest else []
+        return _show_hunks(ws.root, latest, snap, missing, as_json=args.json)
     if args.json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
@@ -1275,19 +1277,21 @@ def _show(args: argparse.Namespace) -> int:
     return 0
 
 
-def _show_hunks(root: Path, latest: Round | None, snap: DiffSnapshot, *, as_json: bool) -> int:
+def _show_hunks(
+    root: Path, latest: Round | None, snap: DiffSnapshot, missing: Sequence[str], *, as_json: bool
+) -> int:
     if as_json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
             "stale": bool(latest is not None and latest.fingerprint != snap.fingerprint),
-            "hunks": _hunks_json(root, latest, snap) if latest else [],
+            "hunks": _hunks_json(root, latest, snap, missing) if latest else [],
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     if latest is None:
         print("No review round yet; run `craftsman review prepare`.")
         return 0
-    print("\n".join(_hunk_map_lines(root, latest, snap)))
+    print("\n".join(_hunk_map_lines(root, latest, snap, missing)))
     return 0
 
 
@@ -1299,7 +1303,10 @@ def _hunk_span(new_start: int, new_len: int, old_start: int = 0, old_len: int = 
     return 0, 0
 
 
-def _hunks_json(root: Path, round_: Round, snap: DiffSnapshot) -> list[dict[str, Any]]:
+def _hunks_json(
+    root: Path, round_: Round, snap: DiffSnapshot, missing: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
+    """The round's hunks; for a current round each says whether it is `covered` (when `missing` is given)."""
     if round_.fingerprint != snap.fingerprint:
         return [
             {
@@ -1331,6 +1338,7 @@ def _hunks_json(root: Path, round_: Round, snap: DiffSnapshot) -> list[dict[str,
                 "carried": False,
                 "status": hunk.status,
                 "scope": scope.name if scope is not None and scope.kind != "block" else None,
+                **({} if missing is None else {"covered": ref.id not in missing}),
             }
         )
     return items
@@ -1342,8 +1350,11 @@ def _format_span(path: str, start: int, end: int, has_range: bool, *, bare_zero:
     return path if bare_zero else f"{path}:{start}"
 
 
-def _hunk_map_lines(root: Path, round_: Round, snap: DiffSnapshot) -> list[str]:
-    """One compact `H#  path:start-end  scope|status` line per open hunk, or HunkRef fields if stale."""
+def _hunk_map_lines(root: Path, round_: Round, snap: DiffSnapshot, missing: Sequence[str]) -> list[str]:
+    """One compact `H#  path:start-end  scope|status` line per hunk still to cover, then `N left`.
+
+    A stale round lists its HunkRef fields instead: its coverage no longer matches the code.
+    """
     entries = _hunks_json(root, round_, snap)
     if round_.fingerprint != snap.fingerprint:
         lines = [
@@ -1358,8 +1369,11 @@ def _hunk_map_lines(root: Path, round_: Round, snap: DiffSnapshot) -> list[str]:
         f"{_format_span(e['path'], e['start_line'], e['end_line'], e['end_line'] > 0, bare_zero=True)}  "
         f"{e['scope'] or e['status']}"
         for e in entries
+        if e["id"] in missing
     ]
-    return lines or ["(no open hunks)"]
+    if not entries:
+        return ["(no open hunks)"]
+    return [*lines, f"{len(lines)} left to cover" if lines else "0 left to cover: every hunk is covered"]
 
 
 def _round_line(round_: Round, snap: DiffSnapshot) -> str:
@@ -1421,7 +1435,7 @@ def _finding_details(findings: Sequence[Finding]) -> list[str]:
     """Each finding's scenario and verdict evidence, so a verifier needs no `--json` call."""
     lines: list[str] = []
     for finding in findings:
-        lines.append(f"{finding.id} scenario: {_flat(finding.scenario)}")
+        lines.append(f"{finding.id} scenario (lens {finding.lens}): {_flat(finding.scenario)}")
         if finding.verdict is not None:
             run = f", {finding.verdict_run}" if finding.verdict_run else ""
             lines.append(f"{finding.id} evidence ({finding.verdict}{run}): {_flat(finding.verdict_evidence)}")
@@ -1510,6 +1524,7 @@ def _report(args: argparse.Namespace) -> int:
             "findings": {name: [f.to_json() for f in items] for name, items in groups.items()},
             "runs": [run.to_json() for run in runs],
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
+            "agent_usage": usage_json(ledger),
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
@@ -1625,6 +1640,11 @@ def _not_assessed_lines(report: GateReport) -> list[str]:
     ]
 
 
+def _usage_section(ledger: Ledger) -> list[str]:
+    lines = usage_lines(ledger)
+    return ["", "## Agent usage", *lines] if lines else []
+
+
 def _waived_run_lines(ledger: Ledger) -> list[str]:
     waived = [(run, run.waiver) for run in ledger.runs if run.waiver is not None]
     if not waived:
@@ -1667,6 +1687,7 @@ def _report_lines(
         "## Verification at the final code",
         *run_lines,
         *_waived_run_lines(ledger),
+        *_usage_section(ledger),
         *warning_lines,
         *_not_assessed_lines(report),
     ]
@@ -1860,7 +1881,7 @@ def _add_inspection_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
     sub.choices["show"].add_argument(
         "--hunks",
         action="store_true",
-        help="Print a compact map of open hunks (H# -> file:lines and scope or status)",
+        help="Print the hunks still to cover (H# -> file:lines and scope or status) and how many are left",
     )
     for name in ("check", "report"):
         sub.choices[name].add_argument(
