@@ -240,15 +240,13 @@ def _prepare(args: argparse.Namespace) -> int:
     touch_review(ws.ledger_path)
     raised = created and round_.number <= before
     packet = Path(round_.packet_path)
-    open_snap = snap.only(round_.open_hunk_ids)
-    open_signals = detect_signals(open_snap.hunks)
-    picks = select_lenses(open_signals, deep=round_.deep, docs_only=open_snap.docs_only)
+    picks = _lens_picks(round_, snap)
     if created or not packet.is_file():
         ctx = _packet_context(
             ws, snap, ledger, round_, index, symbols, task=args.task or ws.task, picks=picks
         )
         _write_text(packet, render_packet(ctx))
-    hint = None if round_.deep else deep_hint(detect_deep_hint_signals(open_snap.hunks))
+    hint = None if round_.deep else deep_hint(detect_deep_hint_signals(snap.only(round_.open_hunk_ids).hunks))
     _print_prepare_summary(round_, packet, snap, picks, hint, created=created, raised=raised)
     _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)

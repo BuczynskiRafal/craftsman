@@ -18,6 +18,9 @@ from typing import Any
 from craftsman.records import AgentRole, AgentUsage, Ledger, agent_role, parse_timestamp
 
 MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024
+# A longer pause between two transcript entries is the agent being idle (a resumed agent waits for
+# its parent between runs), not working.
+IDLE_GAP_S = 300.0
 ROLE_LABELS: Mapping[AgentRole, str] = {"reviewer": "hunters", "verifier": "verifiers"}
 _TOKEN_KEYS = (
     ("input_tokens", "input_tokens"),
@@ -57,7 +60,10 @@ class RoleUsage:
 
 
 def read_usage(path: Path) -> AgentUsage | None:
-    """The tokens and the time span in the transcript at `path`; None when it has no usage."""
+    """The tokens and the active time in the transcript at `path`; None when it has no usage.
+
+    Active time adds up the gaps between entries shorter than `IDLE_GAP_S`.
+    """
     try:
         return _read_usage(path)
     except Exception:  # noqa: BLE001 - best effort: any unreadable transcript just has no telemetry
@@ -69,8 +75,8 @@ def _read_usage(path: Path) -> AgentUsage | None:
         return None
     by_message: dict[str, dict[str, int]] = {}
     anonymous: list[dict[str, int]] = []
-    first: datetime | None = None
-    last: datetime | None = None
+    previous: datetime | None = None
+    active_s = 0.0
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             entry = _entry(line)
@@ -78,8 +84,10 @@ def _read_usage(path: Path) -> AgentUsage | None:
                 continue
             stamp = _moment(entry.get("timestamp"))
             if stamp is not None:
-                first = stamp if first is None or stamp < first else first
-                last = stamp if last is None or stamp > last else last
+                if previous is not None:
+                    gap = (stamp - previous).total_seconds()
+                    active_s += gap if 0 < gap <= IDLE_GAP_S else 0.0
+                previous = stamp if previous is None or stamp > previous else previous
             message = entry.get("message")
             if entry.get("type") != "assistant" or not isinstance(message, dict):
                 continue
@@ -98,13 +106,12 @@ def _read_usage(path: Path) -> AgentUsage | None:
     if not messages:
         return None
     totals = {name: sum(message[name] for message in messages) for _, name in _TOKEN_KEYS}
-    span = 0.0 if first is None or last is None else (last - first).total_seconds()
     return AgentUsage(
         input_tokens=totals["input_tokens"],
         output_tokens=totals["output_tokens"],
         cache_read_tokens=totals["cache_read_tokens"],
         cache_write_tokens=totals["cache_write_tokens"],
-        duration_s=max(0.0, span),
+        duration_s=active_s,
     )
 
 

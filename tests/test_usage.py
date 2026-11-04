@@ -43,7 +43,7 @@ class ReadUsageTests(unittest.TestCase):
         )
         return path
 
-    def test_tokens_are_summed_over_messages_and_time_spans_the_entries(self) -> None:
+    def test_tokens_are_summed_over_messages_and_time_adds_up_the_gaps(self) -> None:
         path = self.transcript(
             {"type": "user", "timestamp": "2026-10-21T10:00:00.000Z", "message": {"content": "go"}},
             assistant("m1", "2026-10-21T10:00:05.000Z", input_tokens=10, output_tokens=5,
@@ -58,6 +58,20 @@ class ReadUsageTests(unittest.TestCase):
                 input_tokens=11, output_tokens=12, cache_read_tokens=230, cache_write_tokens=20, duration_s=90.0
             ),
         )
+
+    def test_the_idle_time_of_a_resumed_agent_is_not_agent_time(self) -> None:
+        path = self.transcript(
+            assistant("m1", "2026-10-21T10:00:00.000Z", output_tokens=1),
+            assistant("m2", "2026-10-21T10:01:00.000Z", output_tokens=1),
+            # resumed two hours later, after waiting for its parent
+            assistant("m3", "2026-10-21T12:01:00.000Z", output_tokens=1),
+            assistant("m4", "2026-10-21T12:01:30.000Z", output_tokens=1),
+        )
+
+        usage = read_usage(path)
+
+        assert usage is not None
+        self.assertEqual(usage.duration_s, 90.0)
 
     def test_a_message_written_as_several_entries_counts_once(self) -> None:
         block = {"input_tokens": 4, "output_tokens": 9, "cache_read_input_tokens": 50}

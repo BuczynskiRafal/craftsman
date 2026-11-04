@@ -26,7 +26,7 @@ from craftsman.diffscan import (
     text_scope_at,
     text_scope_named,
 )
-from craftsman.packet import fence_language, fenced, omission_marker
+from craftsman.packet import fence_language, fenced, inside_hunk, omission_marker
 from craftsman.records import FieldError
 
 MAX_SCOUT_CHARS = 12_000
@@ -169,7 +169,7 @@ class Scout:
             for ref in self.index.mentions(symbol)
             if reference_kind(ref) == "call"
             and not defines_symbol(ref.path, ref.text, symbol)
-            and not (hunk is not None and _inside(ref, hunk))
+            and not (hunk is not None and inside_hunk(ref, hunk))
             and not (own and ref.path == scope.path and scope.start <= ref.line <= scope.end)
         ]
         home = scope.path
@@ -256,10 +256,6 @@ class Scout:
 
 def _short(name: str) -> str:
     return name.rsplit(".", 1)[-1]
-
-
-def _inside(ref: Reference, hunk: Hunk) -> bool:
-    return ref.path == hunk.path and hunk.new_start <= ref.line < hunk.new_start + hunk.new_len
 
 
 def _old_anchor(hunk: Hunk) -> int:

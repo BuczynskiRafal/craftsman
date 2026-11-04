@@ -194,24 +194,32 @@ class CoverageTests(unittest.TestCase):
         snap = make_snap(
             make_hunk("H1", "a.py"), make_hunk("H2", "a.py", ("+y = 2",), new_start=9), make_hunk("H3", "b.py")
         )
-        ledger, _ = prepared(snap)
+        ledger, round_ = prepared(snap)
+        open_ids, carried = plan_coverage(round_, ["a.py"], target_kind="files")
 
-        ledger, record = add_coverage(ledger, ["a.py"], "read a.py and its callers", target_kind="files")
+        ledger, record = add_coverage(ledger, open_ids, "read a.py and its callers")
 
+        self.assertEqual((open_ids, carried), (("H1", "H2"), ()))
         self.assertEqual(len(record.digests), 2)
         self.assertEqual(uncovered_hunks(ledger, ledger.rounds[-1]), ["H3"])
 
     def test_rejections_explain_what_is_valid(self) -> None:
         note = "examined the slice and tried None"
         cases = [
-            ([], note, "hunks", "name at least one of the hunks to cover"),
-            (["H42"], note, "hunks", "unknown hunk ids in round 1: H42"),
-            (["nope.py"], note, "files", "unknown files in round 1: nope.py; changed files: f1.py"),
-            (["H1"], "too short", "hunks", "note must have at least 20 characters"),
+            ([], note, "name at least one of the hunks to cover"),
+            (["H42"], note, "not an open hunk of round 1: H42"),
+            (["H1"], "too short", "note must have at least 20 characters"),
         ]
-        for ids, text, kind, message in cases:
+        for ids, text, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
-                add_coverage(self.ledger, ids, text, target_kind=kind)  # type: ignore[arg-type]
+                add_coverage(self.ledger, ids, text)
+        for targets, kind, message in (
+            (["H42"], "hunks", "unknown hunk ids in round 1: H42"),
+            (["nope.py"], "files", "unknown files in round 1: nope.py; changed files: f1.py"),
+            ([], "hunks", "name at least one of the hunks to cover"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
+                plan_coverage(self.round, targets, target_kind=kind)  # type: ignore[arg-type]
 
     def test_repeated_targets_are_recorded_once(self) -> None:
         _, record = add_coverage(self.ledger, ["H1", "H1"], coverage_note(["H1"]))
@@ -240,10 +248,9 @@ class CoverageTests(unittest.TestCase):
         )
         ledger, _ = prepared(snap, ledger=ledger)
 
-        with self.assertRaisesRegex(LedgerError, "H1 already covered in an earlier round"):
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
             add_coverage(ledger, ["H1"], coverage_note(["H1"]))
-        with self.assertRaisesRegex(LedgerError, "f1.py already covered in an earlier round"):
-            add_coverage(ledger, ["f1.py"], coverage_note(["H1"]), target_kind="files")
+        self.assertEqual(plan_coverage(ledger.rounds[-1], ["f1.py"], target_kind="files"), ((), ("H1",)))
 
 
 class StableHunkIdTests(unittest.TestCase):

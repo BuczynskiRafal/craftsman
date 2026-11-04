@@ -465,45 +465,6 @@ def reopened_mentions(
     return mentions
 
 
-def _file_targets(round_: Round, paths: Sequence[str]) -> tuple[str, ...]:
-    """Ids of the open hunks of `paths` in `round_`."""
-    known = {hunk.path for hunk in round_.hunks}
-    unknown = [path for path in paths if path not in known]
-    if unknown:
-        raise LedgerError(
-            f"unknown files in round {round_.number}: {', '.join(unknown)}; "
-            f"changed files: {', '.join(sorted(known))}",
-            field="files",
-        )
-    open_ids = [hunk.id for hunk in round_.hunks if hunk.path in set(paths) and not hunk.carried]
-    if not open_ids:
-        raise LedgerError(
-            f"{', '.join(paths)} already covered in an earlier round (carried over); "
-            "cover only the remaining hunks",
-            field="files",
-        )
-    return tuple(open_ids)
-
-
-def _hunk_targets(round_: Round, hunk_ids: Sequence[str]) -> tuple[str, ...]:
-    by_id = {hunk.id: hunk for hunk in round_.hunks}
-    unknown = [hunk_id for hunk_id in hunk_ids if hunk_id not in by_id]
-    if unknown:
-        raise LedgerError(
-            f"unknown hunk ids in round {round_.number}: {', '.join(unknown)}; "
-            f"hunks to cover: {', '.join(round_.open_hunk_ids) or 'none'}",
-            field="hunks",
-        )
-    carried = [hunk_id for hunk_id in hunk_ids if by_id[hunk_id].carried]
-    if carried:
-        raise LedgerError(
-            f"{', '.join(carried)} already covered in an earlier round (carried over); "
-            "cover only the remaining hunks",
-            field="hunks",
-        )
-    return tuple(hunk_ids)
-
-
 def plan_coverage(
     round_: Round, targets: Sequence[str], *, target_kind: TargetKind = "hunks"
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -540,18 +501,20 @@ def plan_coverage(
     )
 
 
-def add_coverage(
-    ledger: Ledger, targets: Sequence[str], note: str, *, target_kind: TargetKind = "hunks"
-) -> tuple[Ledger, Coverage]:
-    """Record that the open hunks named by `targets` (hunk ids, or files) of the latest round
-    were examined, with a free-text note of what was tried."""
+def add_coverage(ledger: Ledger, hunk_ids: Sequence[str], note: str) -> tuple[Ledger, Coverage]:
+    """Record that the open hunks `hunk_ids` of the latest round were examined, with a free-text
+    note of what was tried. `plan_coverage` turns what a user named into those ids."""
     round_ = _latest_round(ledger)
-    if not targets:
-        raise LedgerError(f"name at least one of the {target_kind} to cover", field=target_kind)
-    hunk_ids = tuple(dict.fromkeys(
-        _file_targets(round_, targets) if target_kind == "files" else _hunk_targets(round_, targets)
-    ))
-    by_id = {hunk.id: hunk for hunk in round_.hunks}
+    if not hunk_ids:
+        raise LedgerError("name at least one of the hunks to cover", field="hunks")
+    by_id = {hunk.id: hunk for hunk in round_.hunks if not hunk.carried}
+    closed = [hunk_id for hunk_id in dict.fromkeys(hunk_ids) if hunk_id not in by_id]
+    if closed:
+        raise LedgerError(
+            f"not an open hunk of round {round_.number}: {', '.join(closed)}; "
+            f"hunks to cover: {', '.join(round_.open_hunk_ids) or 'none'}",
+            field="hunks",
+        )
     record = Coverage(
         round=round_.number,
         digests=tuple(dict.fromkeys(by_id[hunk_id].digest for hunk_id in hunk_ids)),

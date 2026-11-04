@@ -579,9 +579,12 @@ class StopTests(HookTestCase):
         self.repo.cli("review", "prepare")
         self.update_state(stage="needs_human")
 
-        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman retry"))
+        out, _ = call_hook(
+            "prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craftsman retry")
+        )
 
         self.assertEqual((self.state()["stage"], self.state()["deep"]), ("implement", True))
+        self.assertIn("Craftsman session started (deep, base", out["hookSpecificOutput"]["additionalContext"])
 
     def test_review_prompt_never_opens_a_gate_even_with_ultracraft(self) -> None:
         self.repo.write("cart.py", CHANGE)

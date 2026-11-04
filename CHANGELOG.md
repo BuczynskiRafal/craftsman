@@ -22,6 +22,10 @@ All notable changes to Craftsman are recorded here. The format follows
   the coverage and findings recorded while it was current, and a reviewer that finished after the next round was
   prepared still counts for what it recorded. A round replaced before any review, with nothing recorded in it, needs
   nothing; its hunks are open in the next round.
+- **Agent time counts active time.** A subagent's `duration_s` adds up the gaps between transcript entries of
+  at most 5 minutes instead of spanning first to last entry, so a resumed agent no longer counts the time it
+  sat idle between runs.
+- **The "session started" text after a needs-human restart** says `deep` when the restarted gate is deep.
 - **`evals` `agent` continues run numbering** per arm and case from the results file and the logs folder. Repeats
   added later no longer restart at 1 and replace earlier runs, logs and kept ledgers (which skewed `rescore` and
   the ranges of `compare`).

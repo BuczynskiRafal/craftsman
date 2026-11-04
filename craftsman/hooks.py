@@ -402,7 +402,7 @@ def on_prompt(
     )
     archive_ledger_for_new_base(session.root, base_sha)
     return started, reply.inject(
-        f"Craftsman session started ({'deep, ' if deep else ''}base {base_sha[:7]}). Follow the /craftsman "
+        f"Craftsman session started ({'deep, ' if started.deep else ''}base {base_sha[:7]}). Follow the /craftsman "
         f"skill (Stage 0 command: `{init_command(started)}`); the gate will block finishing "
         "until `craftsman review check` passes.\n"
         f"Scope: work only inside {session.root}; see Search scope."
@@ -587,10 +587,10 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
     ledger, _ = record_agent_event(session, hook, "start", reply.platform)
     if role is None or not ledger.rounds:
         return reply.allow()
-    return reply.inject(briefing(role, ledger, session, review_only=not active))
+    return reply.inject(briefing(role, ledger))
 
 
-def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: bool) -> str:
+def briefing(role: AgentRole, ledger: Ledger) -> str:
     """The round and the open work, with the commands to read it; the templates hold the rest.
 
     No packet path: it holds every hunter's hunks, and only the orchestrator reads it.

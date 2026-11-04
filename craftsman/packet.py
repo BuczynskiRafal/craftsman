@@ -219,7 +219,7 @@ def _references(
     for symbol, defining in owners.items():
         defined_in = {hunk.path for hunk in defining}
         outside = [
-            ref for ref in index.mentions(symbol) if not any(_inside(ref, hunk) for hunk in defining)
+            ref for ref in index.mentions(symbol) if not any(inside_hunk(ref, hunk) for hunk in defining)
         ]
         # Stable: `mentions` lists each file's lines together, in path order.
         outside.sort(key=lambda ref: (_KIND_RANK[reference_kind(ref)], ref.path in defined_in))
@@ -252,7 +252,8 @@ def _last_runs(ledger: Ledger, snap: DiffSnapshot) -> tuple[str, ...]:
     return tuple(lines)
 
 
-def _inside(ref: Reference, hunk: Hunk) -> bool:
+def inside_hunk(ref: Reference, hunk: Hunk) -> bool:
+    """Whether `ref` points at a line the hunk adds or keeps."""
     return ref.path == hunk.path and hunk.new_start <= ref.line < hunk.new_start + hunk.new_len
 
 
