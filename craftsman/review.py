@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -36,6 +37,7 @@ from craftsman.evidence import (
     prune_inbox_files,
     prune_round_files,
 )
+from craftsman.files import write_text_atomic
 from craftsman.gate import GateState, GateStateError, cli_caller, state_path_for, update_state
 from craftsman.gatecheck import (
     SELF_REVIEWED_BANNER,
@@ -68,6 +70,7 @@ from craftsman.ledger import (
 from craftsman.lenses import LENS_IDS, LensPick, deep_hint, select_lenses
 from craftsman.packet import (
     PacketContext,
+    bound_hints,
     collect_context,
     expand_hunk_spec,
     render_packet,
@@ -103,6 +106,7 @@ CITED_LINE_CHARS = 120
 MAX_REPORTED_BATCH_PROBLEMS = 20
 MAX_UNSCANNED_PATHS_SHOWN = 8
 MAX_VIEW_SLUG_CHARS = 60
+VIEW_HASH_CHARS = 8
 UTF8_SAVE_HINT = "save it as UTF-8 (PowerShell: Set-Content -Encoding utf8)"
 # Ledger record fields that come straight from a command-line flag, for error messages.
 FIELD_FLAGS = {
@@ -523,8 +527,9 @@ def _print_prepare_summary(
     for pick in picks:
         print(f"  {pick.lens.id} — {pick.reason}")
     if round_.signals:
-        print("Quality hints:")
-        for sig in round_.signals:
+        listed, summary = bound_hints(round_.signals)
+        print(f"Quality hints: {summary}")
+        for sig in listed:
             print(f"  {sig.id} {sig.kind.value} {sig.file}:{sig.line} — {sig.detail}")
     if hint is not None:
         print(hint)
@@ -538,18 +543,50 @@ def _print_prepare_summary(
 
 
 def _write_text(path: Path, text: str) -> None:
+    """Replace `path` atomically: a reader never sees a half-written packet or view."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        write_text_atomic(path, text)
     except OSError as exc:
         raise LedgerError(f"cannot write {path}: {exc}") from exc
 
 
-def view_slug(files_raw: str | None, hunks_raw: str | None) -> str:
-    """The file-name part of a reviewer view: its file or hunk selection."""
-    raw = (files_raw if hunks_raw is None else hunks_raw) or ""
-    slug = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.strip()).strip("-")
-    return "-".join(part for part in slug.split("-") if part)[:MAX_VIEW_SLUG_CHARS] or "view"
+def view_slug(*, hunks: Sequence[str] = (), files: Sequence[str] = ()) -> str:
+    """The file-name part of a reviewer view: one name per selection, however it was spelled.
+
+    Hunks are named by their sorted ids in runs (`H1,H3` and `H3,H1` give `H1_H3`, `H1-H3` gives
+    `H1-H3`); files by their sorted paths plus a hash of them, since flattening `/` and `.` makes
+    different paths look alike. A name that has to be cut also gets a hash of the whole selection.
+    """
+    if hunks:
+        numbers = sorted({int(hunk_id[1:]) for hunk_id in hunks})
+        label = "_".join(_hunk_run(run) for run in _runs(numbers))
+        whole = label
+    else:
+        paths = sorted(set(files))
+        flat = "-".join("".join(ch if ch.isalnum() else "-" for ch in path).strip("-") for path in paths)
+        label = "-".join(part for part in flat.split("-") if part)
+        whole = "\n".join(paths)
+        label = f"{label}-" if label else ""
+        label += hashlib.sha1(whole.encode("utf-8")).hexdigest()[:VIEW_HASH_CHARS]
+    if len(label) <= MAX_VIEW_SLUG_CHARS:
+        return label or "view"
+    digest = hashlib.sha1(whole.encode("utf-8")).hexdigest()[:VIEW_HASH_CHARS]
+    return f"{label[: MAX_VIEW_SLUG_CHARS - VIEW_HASH_CHARS - 1].rstrip('-_')}-{digest}"
+
+
+def _runs(numbers: Sequence[int]) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    for number in numbers:
+        if runs and runs[-1][1] + 1 == number:
+            runs[-1] = (runs[-1][0], number)
+        else:
+            runs.append((number, number))
+    return runs
+
+
+def _hunk_run(run: tuple[int, int]) -> str:
+    first, last = run
+    return f"H{first}" if first == last else f"H{first}-H{last}"
 
 
 def _view_hunk_ids(
@@ -580,7 +617,8 @@ def _view(args: argparse.Namespace) -> int:
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=ws.task)
-    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{view_slug(args.files, args.hunks)}.md")
+    slug = view_slug(hunks=assigned) if args.hunks is not None else view_slug(files=files or ())
+    view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
     _write_text(view_path, render_packet_view(ctx, assigned_hunks=assigned))
     print(view_path)
     return 0

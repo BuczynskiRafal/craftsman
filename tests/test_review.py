@@ -1112,6 +1112,20 @@ class QualityHintTests(RepoTestCase):
 
         self.assertIn("- **S1** (`long-function`) `long_mod.py:1`", self.packet())
 
+    def test_near_identical_functions_cannot_flood_prepare_the_packet_or_a_view(self) -> None:
+        body = "".join(f"    step_{n} = value + {n}\n" for n in range(8))
+        handlers = "".join(f"def handler_{index}(value):\n{body}    return step_7\n\n" for index in range(40))
+        self.repo.write("handlers.py", handlers)
+        self.repo.write("small.py", "x = 1\ny = 2\n")
+
+        out = self.review("prepare").stdout
+        view = Path(self.review("view", "--files", "small.py").stdout.strip()).read_text(encoding="utf-8")
+
+        self.assertLess(len(out), 6_000)
+        self.assertRegex(out, r"Quality hints: \d+ hints \(.*duplicate-logic \d+.*\); \+\d+ more not listed")
+        self.assertLess(len(self.packet()), 60_000)
+        self.assertLess(len(view), 12_000)
+
     def test_quality_hints_do_not_block_the_gate(self) -> None:
         self.prepare_long_function()
 
@@ -1170,7 +1184,7 @@ class ViewTests(RepoTestCase):
         path = Path(self.review("view", "--files", "other.py").stdout.strip())
         text = path.read_text(encoding="utf-8")
 
-        self.assertEqual(path.name, "packet-1.other-py.md")
+        self.assertRegex(path.name, r"\Apacket-1\.other-py-[0-9a-f]{8}\.md\Z")
         self.assertIn("`other.py`", text.split("## Hunks")[1].split("### Other hunks")[0])
 
     def test_view_needs_exactly_one_selector(self) -> None:
@@ -1195,11 +1209,92 @@ class ViewTests(RepoTestCase):
 
 
 class ViewSlugTests(unittest.TestCase):
-    def test_slug_names_the_hunk_selection(self) -> None:
-        self.assertEqual(view_slug(None, "H1-H3,H7"), "H1-H3-H7")
+    def test_slug_names_the_hunk_selection_in_runs(self) -> None:
+        self.assertEqual(view_slug(hunks=("H1", "H2", "H3", "H7")), "H1-H3_H7")
 
-    def test_slug_names_the_files(self) -> None:
-        self.assertEqual(view_slug("pkg/a.py,pkg/b.py", None), "pkg-a-py-pkg-b-py")
+    def test_slug_ignores_the_order_and_repeats_of_a_selection(self) -> None:
+        self.assertEqual(view_slug(hunks=("H7", "H1", "H7", "H2")), view_slug(hunks=("H1", "H2", "H7")))
+
+    def test_different_hunk_sets_get_different_slugs(self) -> None:
+        self.assertNotEqual(view_slug(hunks=("H1", "H3")), view_slug(hunks=("H1", "H2", "H3")))
+
+    def test_paths_that_flatten_alike_get_different_slugs(self) -> None:
+        for first, second in (
+            ("pkg/a-b.py", "pkg/a/b.py"),
+            ("other-file.py", "other_file.py"),
+            ("a.py", "a-py"),
+        ):
+            with self.subTest(first=first, second=second):
+                self.assertNotEqual(view_slug(files=(first,)), view_slug(files=(second,)))
+
+    def test_slug_names_the_files_with_a_hash(self) -> None:
+        self.assertRegex(view_slug(files=("pkg/b.py", "pkg/a.py")), r"\Apkg-a-py-pkg-b-py-[0-9a-f]{8}\Z")
+
+    def test_long_selections_are_cut_to_the_limit_and_stay_distinct(self) -> None:
+        shared = tuple(f"pkg/module_{index}/handler.py" for index in range(10))
+        first, second = view_slug(files=(*shared, "a.py")), view_slug(files=(*shared, "b.py"))
+
+        self.assertLessEqual(len(first), 60)
+        self.assertNotEqual(first, second)
+        every_other = tuple(f"H{number}" for number in range(1, 200, 2))
+        self.assertLessEqual(len(view_slug(hunks=every_other)), 60)
+        self.assertNotEqual(view_slug(hunks=every_other), view_slug(hunks=(*every_other, "H300")))
+
+
+class ViewFileCollisionTests(RepoTestCase):
+    NAMES = ("a/b.py", "a_b.py", "a-b.py")
+
+    def test_files_whose_names_flatten_alike_get_their_own_view_each(self) -> None:
+        for name in self.NAMES:
+            self.repo.write(name, f"def only_in_{name.replace('/', '_').replace('-', '_').split('.')[0]}():\n    return 1\n")
+        self.review("prepare")
+
+        views = {name: Path(self.review("view", "--files", name).stdout.strip()) for name in self.NAMES}
+
+        self.assertEqual(len(set(views.values())), 3)
+        for name, path in views.items():
+            hunks = path.read_text(encoding="utf-8").split("## Hunks")[1].split("### Other hunks")[0]
+            self.assertIn(f"`{name}`", hunks)
+            self.assertEqual(hunks.count("`.py` L"), 0)
+            for other in set(self.NAMES) - {name}:
+                self.assertNotIn(f"### H1 · `{other}`", hunks)
+                self.assertNotIn(f"· `{other}` L", hunks)
+
+
+class ViewCollisionTests(RepoTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("mod.py", "".join(f"value_{index} = {index}\n" for index in range(40)))
+        self.repo.commit("add mod")
+        text = (self.repo.root / "mod.py").read_text(encoding="utf-8")
+        for index in (2, 18, 34):
+            text = text.replace(f"value_{index} = {index}", f"value_{index} = -{index}")
+        self.repo.write("mod.py", text)
+        self.review("prepare")
+
+    def view(self, spec: str) -> tuple[Path, str]:
+        path = Path(self.review("view", "--hunks", spec).stdout.strip())
+        return path, path.read_text(encoding="utf-8")
+
+    def test_two_spellings_of_different_hunk_sets_write_two_views(self) -> None:
+        listed, listed_text = self.view("H1,H3")
+        ranged, ranged_text = self.view("H1-H3")
+
+        self.assertNotEqual(listed, ranged)
+        self.assertEqual(listed_text, listed.read_text(encoding="utf-8"), "the second view left it alone")
+        self.assertNotIn("### H2 ·", listed_text)
+        self.assertIn("### H2 ·", ranged_text)
+
+    def test_the_same_set_spelled_two_ways_shares_one_view(self) -> None:
+        self.assertEqual(self.view("H3,H1")[0], self.view("H1,H3")[0])
+
+    def test_a_view_is_written_through_an_atomic_replace(self) -> None:
+        with mock.patch("craftsman.review.write_text_atomic") as write:
+            result = run_main(cli_main, "review", "view", "--hunks", "H1", "--cwd", str(self.repo.root))
+
+        self.assertEqual(result.code, 0, result.err)
+        self.assertEqual(write.call_count, 1)
+        self.assertEqual(write.call_args.args[0].name, "packet-1.H1.md")
 
 
 class PacketPathTests(RepoTestCase):
