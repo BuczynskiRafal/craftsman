@@ -815,6 +815,29 @@ class AgentRunTests(AgentTestCase):
         self.assertEqual(runs, [("kvstore", 1), ("kvstore", 2), ("quotes", 1), ("quotes", 2)])
 
 
+class AgentRepeatNumberingTests(AgentTestCase):
+    def test_a_later_invocation_continues_the_run_numbers_instead_of_replacing_them(self) -> None:
+        self.agent("--repeat", "2")
+        _, records = self.agent("--repeat", "2")
+
+        self.assertEqual(sorted(r["run"] for r in records), [1, 2, 3, 4])
+        logs = self.out.with_suffix(".logs") / "t"
+        self.assertEqual(sorted(p.name for p in logs.iterdir()), [f"quotes-{n}" for n in (1, 2, 3, 4)])
+
+    def test_numbering_is_per_arm_and_case(self) -> None:
+        self.agent()
+        _, records = self.agent("--arm", "other")
+
+        self.assertEqual([(r["arm"], r["run"]) for r in records], [("t", 1), ("other", 1)])
+
+    def test_log_folders_without_a_record_are_not_reused(self) -> None:
+        (self.out.with_suffix(".logs") / "t" / "quotes-3").mkdir(parents=True)
+
+        _, records = self.agent()
+
+        self.assertEqual([r["run"] for r in records], [4])
+
+
 class AgentHelperTests(AgentTestCase):
     def test_detect_plugin_prefers_craft_review_and_uses_the_manifest_name(self) -> None:
         both = self._make_src(self.tmp / "both", "craft-review", "forge")

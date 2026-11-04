@@ -22,6 +22,9 @@ All notable changes to Craftsman are recorded here. The format follows
   the coverage and findings recorded while it was current, and a reviewer that finished after the next round was
   prepared still counts for what it recorded. A round replaced before any review, with nothing recorded in it, needs
   nothing; its hunks are open in the next round.
+- **`evals` `agent` continues run numbering** per arm and case from the results file and the logs folder. Repeats
+  added later no longer restart at 1 and replace earlier runs, logs and kept ledgers (which skewed `rescore` and
+  the ranges of `compare`).
 - **Safer upgrades from Craftsman 4.x.** The old gate state and ledger are set aside only under their lock, after
   reading the file again, so a 5.x gate or ledger written in between is never renamed to the backup.
 - **`review prepare` no longer holds the ledger lock while it parses the changed Python files** for quality hints,

@@ -53,7 +53,7 @@ python3 -m evals.run compare bench/evals/current.jsonl
 | `--craftsman-src <dir>` | the Craftsman checkout to test, default this repository |
 | `--arm <label>` | name of this configuration in the results (`main`, `compact-prompt`, `baseline`) |
 | `--model <name>` | default `sonnet`; keep it equal across arms |
-| `--repeat N` | runs per case, default 1 |
+| `--repeat N` | runs per case, default 1; a later invocation numbers its runs after the earlier ones |
 | `--jobs N` | parallel runs, default 2 |
 | `--budget-usd N` | spending cap of one run (`--max-budget-usd`), default 5 |
 | `--timeout-min N` | wall clock cap of one run, default 30 |
@@ -139,7 +139,8 @@ python3 -m evals.run compare bench/evals/ab.jsonl --defects
 Keep everything but the checkout equal: model, `--jobs` (parallel runs share the API and the machine, so
 wall times are only comparable at the same `--jobs`; use `--jobs 1` when time is the question), prompt,
 budget. Both arms may share one results file (the `arm` label tells them apart) and `agent` can be run
-again later to add repeats. A baseline arm for the same comparison: `--baseline --arm baseline`.
+again later to add repeats: the run numbers of an arm and case continue after the ones already in the file
+(or in its logs folder), so earlier runs, logs and kept ledgers are never replaced. A baseline arm for the same comparison: `--baseline --arm baseline`.
 
 Scoring changes (a new matching rule, a corrected truth location) do not need new runs: `agent` keeps each
 run's ledger, and `python3 -m evals.run rescore bench/evals/ab.jsonl` scores those ledgers again with the

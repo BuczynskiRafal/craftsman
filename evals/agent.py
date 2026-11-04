@@ -684,9 +684,47 @@ def summary_line(record: dict[str, Any]) -> str:
     )
 
 
+def used_run_indexes(out: Path, logs_dir: Path, arm: str, case_id: str) -> int:
+    """The highest run index of `arm` and `case_id` already in the results file `out` or its logs.
+
+    Results, log folders and kept ledgers are keyed by (arm, case, index), so a repeat added later
+    must continue after it instead of replacing an earlier run.
+    """
+    highest = 0
+    try:
+        lines = out.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        run_index = record.get("run") if isinstance(record, dict) else None
+        if (
+            isinstance(record, dict)
+            and record.get("arm") == arm
+            and record.get("case") == case_id
+            and isinstance(run_index, int)
+        ):
+            highest = max(highest, run_index)
+    prefix = f"{case_id}-"
+    try:
+        for folder in (logs_dir / arm).iterdir():
+            suffix = folder.name[len(prefix) :]
+            if folder.name.startswith(prefix) and suffix.isdecimal():
+                highest = max(highest, int(suffix))
+    except OSError:
+        pass
+    return highest
+
+
 def cmd_agent(args: argparse.Namespace, out: TextIO) -> int:
     cfg = build_config(args)
-    jobs = [(case, index) for case in cfg.cases for index in range(1, cfg.repeat + 1)]
+    jobs: list[tuple[run.Case, int]] = []
+    for case in cfg.cases:
+        first = used_run_indexes(cfg.out, cfg.logs_dir, cfg.arm, case.id) + 1
+        jobs.extend((case, index) for index in range(first, first + cfg.repeat))
     if args.dry_run:
         case = cfg.cases[0]
         plugin = cfg.src
