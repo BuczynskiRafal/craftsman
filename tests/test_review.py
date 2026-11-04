@@ -1158,6 +1158,37 @@ class QualityHintTests(RepoTestCase):
         self.assert_error(self.review("fact", check=False), 2, "invalid choice")
 
 
+class ShowDetailsTests(RepoTestCase):
+    def test_show_prints_each_findings_scenario_without_json(self) -> None:
+        self.prepare_bug()
+        self.add()
+
+        out = self.review("show").stdout
+
+        self.assertIn(
+            "F1 scenario: total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError", out
+        )
+        self.assertNotIn("F1 evidence", out)
+
+    def test_show_adds_a_verdicts_evidence_and_run(self) -> None:
+        self.prepare_bug()
+        self.add()
+        self.verdict("F1", "probable", STATIC_EVIDENCE)
+
+        out = self.review("show").stdout
+
+        self.assertIn(f"F1 evidence (probable): {STATIC_EVIDENCE}", out)
+
+    def test_show_flattens_multi_line_text_to_one_line(self) -> None:
+        self.prepare_bug()
+        self.add("--scenario", "first line of the trigger\n  then the wrong outcome follows here")
+
+        self.assertIn(
+            "F1 scenario: first line of the trigger then the wrong outcome follows here",
+            self.review("show").stdout,
+        )
+
+
 class ViewIsolationTests(RepoTestCase):
     def test_findings_never_appear_in_a_reviewer_view(self) -> None:
         self.prepare_bug()

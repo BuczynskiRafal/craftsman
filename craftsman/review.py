@@ -1266,6 +1266,10 @@ def _show(args: argparse.Namespace) -> int:
         print(_coverage_line(ledger, latest))
     print()
     print("\n".join(_findings_table(ledger.findings)))
+    details = _finding_details(ledger.findings)
+    if details:
+        print()
+        print("\n".join(details))
     print()
     print("\n".join(_run_lines(ledger.runs[-SHOW_RECENT_RUNS:], snap)))
     return 0
@@ -1411,6 +1415,21 @@ def _findings_table(findings: Sequence[Finding]) -> list[str]:
             f"`{_cell(finding.path)}:{finding.line}` | {_cell(finding.title)} |"
         )
     return lines
+
+
+def _finding_details(findings: Sequence[Finding]) -> list[str]:
+    """Each finding's scenario and verdict evidence, so a verifier needs no `--json` call."""
+    lines: list[str] = []
+    for finding in findings:
+        lines.append(f"{finding.id} scenario: {_flat(finding.scenario)}")
+        if finding.verdict is not None:
+            run = f", {finding.verdict_run}" if finding.verdict_run else ""
+            lines.append(f"{finding.id} evidence ({finding.verdict}{run}): {_flat(finding.verdict_evidence)}")
+    return lines
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _cell(text: str) -> str:
