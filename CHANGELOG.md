@@ -6,6 +6,85 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: "Build freely, review hard" redesign.** Recall dropped after 3.3.0 because the review
+  was optimized for cost and for satisfying the ledger. The agent now builds without review loops or
+  ledger bookkeeping; the gate judges outcomes on the final diff only: the diff was frozen, fresh-context
+  hunters covered every hunk, every finding has a verdict with checkable evidence, and the tests ran on
+  the final code.
+- **New review protocol** (`/code-review` is the single source; `/craftsman` follows it):
+  `review prepare` freezes the diff and prints a risk map, the orchestrator writes an intent brief and
+  an adaptive hunt plan, and `craftsman-reviewer` hunters (recall) run in parallel, followed by
+  `craftsman-verifier` subagents (precision). While a wave produces `proven` or `probable` findings,
+  another wave runs (a variant hunter per confirmed root cause plus a fresh unanchored hunter), at most
+  3 waves per round. There is no inline-only review: every review uses a fresh-context hunter where the
+  platform has subagents. The prompts are rewritten to teach how to hunt and how to judge, and are much
+  shorter.
+- **No flags for users.** `/craftsman <task>` and `/code-review <plain words>` ("review PR 42 and fix
+  what you find", "review my staged changes", "be thorough") are enough: the agent infers target, scope,
+  fixing, and depth. Flags remain optional shortcuts for agents and power users.
+- **One adaptive depth.** The agent goes deep on its own for security-relevant code, concurrency or
+  clocks, persistent data or migrations, public API or file formats, removed guarantees, and large or
+  cross-cutting diffs, or when the user asks for care. `review prepare` prints a
+  `Depth: deep suggested (signals: ...)` hint, and `review prepare --deep` inside a gate session raises
+  the gate to deep for good. Depth never goes down. `ultracraft` is `/craftsman --deep`.
+- **Cheaper bookkeeping.** `review cover` takes `--hunks` or `--files` (every open hunk of those files)
+  and one free-text note of at least 20 characters. There are no per-hunk note segments, no 80-character
+  rule, and no batch-size limit.
+- **Ledger schema 3** and a simpler gate. Coverage records hold hunk digests and a note, with no lens;
+  a hunk is covered when this round or an earlier one holds its digest. Gate state and rounds carry
+  `deep: bool` instead of a tier. The gate issues are `no-round`, `stale-round`, `uncovered`,
+  `no-verdict`, `unresolved`, `no-passing-run`, `no-e2e-run` (deep only), `failing-run`,
+  `no-isolation`, and `round-cap`. A very large diff is now a warning in `prepare` and the report, not
+  a `needs_human` hand-off. Whenever the platform provides isolation evidence, every round with
+  non-carried hunks needs a finished `craftsman-reviewer`, in gate sessions and in review-only mode.
+  Owner binding, `MAX_CONTINUATIONS`, the round cap, run rules, evidence rules, and the frozen
+  review-only scope are unchanged.
+- **Restored risk triggers.** `filesystem` signals suggest `state`, `trust`, and `platform` again, and
+  `process` suggests `platform`. Both were narrowed in 3.3.0.
+- **Larger review packet.** One 120k budget and one format for every round. Enclosing scope bodies are
+  always included (subject to the trimming ladder), callers are capped at 6 per symbol instead of 3,
+  and risk signals show per hunk with the lenses they suggest.
+- **Docs** rewritten around plain-language usage; `docs/harness-architecture.md` roughly halved.
+
+### Added
+
+- **Public seeded-defect suite** in [`evals/`](evals/README.md): six small Python projects with 15 seeded
+  defects and decoys, run with `python3 -m evals.run` and described in
+  [`docs/benchmark.md`](docs/benchmark.md).
+
+### Removed
+
+- **Tiers.** The `quick` / `standard` / `deep` tiers, `--tier`, and automatic tier selection (including
+  the review-only `quick` default up to 250 changed lines). `--quick` and `--standard` right after
+  `/craftsman` are still accepted and ignored (stripped from the task text).
+- **Commands and flags.** `review ack`, `review fact`, `review prepare --add-lens`,
+  `review add --signal`, `review cover --lens` (and the `"lens"` / `"lenses"` JSON keys),
+  `review view --lenses` and `--shard`, and the `R1`-`R4` reviewer groups in
+  `craftsman skill show code-review --lenses`.
+- **Concepts.** Signal acknowledgements, shared facts, lens additions, per-lens coverage, per-lens views,
+  reviewer shards and groups, and the gate issues `tier-too-low`, `sweep-too-early`, the quality-signal
+  issues, and design-file coverage. Quality signals (`S#`) stay as display hints.
+- The `{{reviewer_groups}}` placeholder in `templates/AGENTS.md`.
+
+### Migration
+
+- **Old ledgers and gate state fail.** A schema 2 ledger raises the existing error: run
+  `craftsman review reset` to archive it. A gate state file from before this release is invalid: run
+  `craftsman gate --init --takeover`. Nothing is converted. Re-run `craftsman install` to refresh the
+  skills, agents, and `AGENTS.md` block.
+- `gate --init --tier deep` and `review prepare --tier deep` become `--deep`. `--tier quick` and
+  `--tier standard` become nothing: omit the flag and the agent chooses.
+- `review cover --lens a,b --hunks H1,H2 --note "..."` becomes
+  `review cover --hunks H1,H2 --note "..."`; drop `"lens"` / `"lenses"` from `--from-json` entries.
+- `review add --signal S#` and `review ack S#`: drop them. Mention the point in a finding if it is a
+  real defect.
+- `review prepare --add-lens`: assign the lens to a hunter in the hunt plan instead.
+- `review view --shard K/N` and `--lenses`: use `--files <csv>` or `--hunks <ids>` to give each hunter
+  a slice; the lenses go in the hunter's brief.
+- Scripts that read `tier` from `craftsman status` or the state file: read the deep flag.
+
 ## [4.1.0] - 2026-11-02
 
 ### Added

@@ -1,29 +1,43 @@
 # Craftsman Demo: Catalog Pagination
 
-A minimal demo project showcasing how Craftsman stops AI coding agents from declaring "done" on incomplete or buggy implementations.
+A minimal demo project showing how Craftsman stops an AI coding agent from declaring "done" on an
+incomplete or buggy implementation.
 
-## The Challenge
+## The Request
 
-Task given to the AI coding agent:
+Say it in plain words:
 > *"Add 1-based pagination to catalog search results (page number and optional page size)."*
 
-### Why LLM Agents Typically Fail This Task
-When implementing pagination, AI agents frequently introduce subtle boundary defects:
-1. **Partial Page Truncation**: Using floor division `total_pages = len(products) // size`, dropping the remainder (e.g., 25 items at page size 20 yields 1 page instead of 2; 5 items yields 0 pages).
-2. **Missing Page Validation**: Computing `start = (page - 1) * size` without validating `page >= 1`. In Python, `page = 0` produces negative slice indices (e.g. `products[-20:0]`), returning items from the end of the list instead of an error or empty result.
+### Why Agents Typically Get This Wrong
+Pagination invites subtle boundary defects:
+1. **Partial page truncation**: `total_pages = len(products) // size` drops the remainder (25 items at
+   page size 20 yields 1 page instead of 2; 5 items yields 0 pages).
+2. **Missing page validation**: `start = (page - 1) * size` without checking `page >= 1`. In Python,
+   `page = 0` produces negative slice indices (`products[-20:0]`), returning the wrong items instead
+   of an error or an empty result.
 
-## How Craftsman Protects the Codebase
+## What Craftsman Does
 
-1. **Gate Engagement**: When the agent is prompted with `/craftsman ...`, Craftsman locks the baseline commit and monitors the evidence ledger.
-2. **Review & Lens Contracts**: Review subagents examine changed hunks through specialized lenses (`contracts`, `intent`, `failure`, `tests`).
-3. **STOP-Hook Enforcement**: When the agent attempts to conclude prematurely, the STOP-hook blocks completion with an immediate summary:
+1. **Build freely.** `/craftsman` records the base commit; the agent implements the feature and runs
+   its own tests without review loops.
+2. **Hunt.** The agent freezes the final diff and sends fresh-context hunters over it, one per lens
+   group (`contracts`, `intent`, `failure`, `tests`, ...). They did not write the code and record every
+   candidate defect with a concrete trigger, such as `page=0` or 25 items at page size 20.
+3. **Verify.** Separate verifier subagents try to disprove each candidate and reproduce the survivors
+   with `craftsman run --kind repro`, proving the boundary defects against the real code.
+4. **Saturate.** Because the hunt found confirmed defects, the agent runs another wave: variant
+   hunters look for the same mistake elsewhere, plus one fresh hunter with no knowledge of the
+   earlier findings.
+5. **Stop hook.** If the agent tries to finish early, the hook sends it back with the list of what is
+   missing:
    ```
-   [CRAFTSMAN GATE 1/5] review incomplete: 2 hunks not covered by lens contracts; 1 finding without a verdict. Task completion is blocked until the evidence ledger proves the change is reviewed and verified.
+   [CRAFTSMAN GATE 1/6] review incomplete: 2 hunks not covered; 1 finding without a verdict. Task completion is blocked until the evidence ledger proves the change is reviewed and verified.
    ```
-4. **Adversarial Verification**: A verifier agent executes reproduction scripts (`craftsman run --kind repro`) against the real code, proving the boundary defects before allowing a fix.
-5. **Verified Resolution**: The agent fixes the boundary bugs, adds regression tests, runs verification (`craftsman run --kind test`), and the gate passes cleanly.
+6. **Fix and test.** The agent fixes the boundary bugs at the root cause, adds regression tests, runs
+   `craftsman run --kind test`, and the gate passes. The report says what was found, fixed, and
+   dismissed, and why the agent chose its depth.
 
-## Quickstart: Running the Demo
+## Quickstart
 
 Set up an isolated demo repository:
 
@@ -32,8 +46,14 @@ Set up an isolated demo repository:
 cd /tmp/craftsman-demo
 ```
 
-Then in your AI coding assistant (Claude Code, GitHub Copilot, or Antigravity):
+Then, in Claude Code, GitHub Copilot, or Antigravity, ask for the feature in your own words:
 
-```bash
+```text
 /craftsman Add 1-based pagination to catalog search results (page number and optional page size)
+```
+
+To see only the review, implement the feature yourself and ask:
+
+```text
+/code-review review my changes and fix what you find
 ```

@@ -85,14 +85,14 @@ HOME=$(mktemp -d) python3 -m craftsman.cli doctor
 ## Extending Craftsman
 
 ### Adding a Review Lens
-1. Define the lens identifier, playbooks, and triggering heuristics in `craftsman/lenses.py`.
-2. Document the lens methodology and checklist in `skills/code-review/SKILL.md`.
-3. Add unit test coverage in `tests/test_lenses.py` and `tests/test_gatecheck.py`.
+1. Define the lens identifier, title, focus, and the risk signals that suggest it (`triggers`) in `craftsman/lenses.py`.
+2. Write its goal and probes in `skills/code-review/lenses.md` under a `` ## `<id>` — <title> `` heading (`craftsman/playbooks.py` slices the file on these headings).
+3. Add unit test coverage in `tests/test_lenses.py` and `tests/test_playbooks.py`.
 
 ### Adding a Risk Signal
-1. Implement the signal detector in `craftsman/signals.py`.
-2. Connect the signal to relevant lenses in `craftsman/records.py` (`QualitySignal`).
-3. Add unit tests in `tests/test_signals.py`.
+1. Add the signal name to `SIGNALS` in `craftsman/diffscan.py` and its content patterns to `craftsman/diffscan_signals.py`.
+2. Map the signal to the lenses it suggests through their `triggers` in `craftsman/lenses.py`.
+3. Add unit tests in `tests/test_diffscan_signals.py` (patterns) and `tests/test_lenses.py` (lens suggestion).
 
 ### Supporting an Agent Platform
 1. Implement platform hook adapters in `craftsman/hooks.py` and `craftsman/install.py`.
@@ -106,4 +106,4 @@ After changing an agent template, a hook event or the version, run `craftsman ex
 `tests/test_platform_claude.py` fails while they are out of date.
 
 ### Altering Review Protocol
-Before proposing changes to core review lenses, tiers, or gate invariants, replicate the benchmark suite (`bench/run.py` against `bench/cases/`) to ensure defect recall and precision do not regress.
+The protocol lives in prompts (`skills/`, `templates/agents/`, `rules/`) and in the gate (`craftsman/gatecheck.py`); keep each prompt line earning its tokens. Before proposing changes to review lenses, the hunt protocol, or gate invariants, replicate the benchmark suite (`bench/run.py` against `bench/cases/`, the maintainer's private harness) and run the public seeded-defect suite (`python3 -m evals.run`, see [docs/benchmark.md](docs/benchmark.md)) to ensure defect recall and precision do not regress.
