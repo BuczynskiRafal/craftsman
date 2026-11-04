@@ -69,9 +69,7 @@ map, not the full packet (hunters read their slices).
 ## 3. Hunt plan and wave 1
 
 Decide the hunters, then launch **all hunters of the wave together** (in parallel where the
-platform allows) as fresh-context `craftsman-reviewer` subagents. On Claude Code, if the
-plugin provides the `craftsman:hunt` workflow, write the hunt plan and run that workflow for steps
-3-5 (hunt, verify, saturate); otherwise run them yourself.
+platform allows) as fresh-context `craftsman-reviewer` subagents.
 
 Every hunter and verifier prompt has the same layout, so the prompt cache serves the shared part:
 1. the **shared block**, word for word identical in all of them: intent brief, base ref, rules;

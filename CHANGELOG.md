@@ -91,8 +91,6 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Agent usage.** Where the platform hands over a subagent transcript, tokens and agent time are
   recorded per subagent, and `craftsman review report` and `craftsman status` total them per role
   (hunters, verifiers).
-- **Optional `craftsman:hunt` workflow** (`workflows/hunt.js`) for Claude Code: runs the orchestrator's
-  hunt plan with pipelined verification and variant hunters.
 - **Inbox fallback.** When a heredoc needs approval, subagents write their JSON to the path that
   `craftsman review inbox` prints and pass `--from-json <path>`.
 - **Public seeded-defect suite** in [`evals/`](evals/README.md): six small Python projects with 15 seeded

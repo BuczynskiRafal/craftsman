@@ -122,8 +122,7 @@ A review costs agents times turns times context, so the inputs are kept small.
 - **Pipelining.** Where agents run in the background (Claude Code, Antigravity async subagents), a
   hunter's verifier starts when that hunter finishes, a variant hunter starts when a finding is judged
   `proven` or `probable`, and the fresh hunter starts with wave 1. Where parallel subagents are a
-  barrier (Copilot), the waves stay as they are. On Claude Code, the optional `craftsman:hunt`
-  workflow (`workflows/hunt.js`) runs steps 5-7 from the orchestrator's hunt plan.
+  barrier (Copilot), the waves stay as they are.
 - **Remaining work.** `craftsman review show --hunks` lists the hunks still to cover.
   `review show` also prints each finding's scenario and verdict evidence, so a verifier needs no
   `--json` call.
