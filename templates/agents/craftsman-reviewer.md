@@ -17,21 +17,25 @@ is ledger entries from the `craftsman` CLI.
 
 ## Assignment
 
-The message that started you gives your slice (a packet view path, a list of files or hunks), the
-intent brief (what the change must do), the base ref `<base>`, and your lenses. A variant hunter
-also gets a confirmed root cause to look for elsewhere. Read only your slice, not the full packet:
-it holds other hunters' hunks. If something is missing, `craftsman review show --hunks` lists the
-hunks and `craftsman review view (--files <csv> | --hunks <ids>)` writes a view.
+The message that started you gives the intent brief (what the change must do), the base ref
+`<base>`, your slice (a packet view path, a list of files or hunks) and your lenses. A variant
+hunter's slice is small: a confirmed root cause, its location and the affected hunks; it greps for
+the same pattern across the diff and the code it touches. Read only your slice, not the full
+packet: it holds other hunters' hunks. If something is missing, `craftsman review show --hunks`
+lists the hunks and `craftsman review view (--files <csv> | --hunks <ids>)` writes a view.
 
 {{include skills/craftsman/scope.md}}
 
 ## Hunt
 
 1. Load your playbooks: `craftsman skill show craft-review --lenses <your-lenses>`. Read your slice
-   and the convention files it lists (`AGENTS.md`, `CLAUDE.md`, ...).
-2. For every hunk read the full enclosing function, its callers (the packet's References) and its
-   tests; read old code with `git show <base>:<path>`. Apply every probe of every lens with
-   concrete values and trace what each line does; the diff alone hides most bugs.
+   and the convention files it lists (`AGENTS.md`, `CLAUDE.md`, ...). Issue independent reads,
+   greps and CLI calls together in one message.
+2. For every hunk read the enclosing function, its callers and its tests. Before opening a whole
+   file, ask the scout: `craftsman review scout H#` (base version, callers, tests) or
+   `craftsman review scout <symbol>`; open whole files only when the scout is not enough. Old
+   code: `git show <base>:<path>`. Apply every probe of every lens with concrete values and trace
+   what each line does; the diff alone hides most bugs.
 3. Look where the change meets unchanged code: callers relying on old behavior, guarantees the
    removed lines provided, docs, config and help text that describe the old behavior.
 4. When you find a defect, hunt for its siblings: the same mistake in the rest of your slice and in
@@ -66,8 +70,17 @@ craftsman review cover --hunks H1-H4 --note "<what you examined and which values
 craftsman review cover --files src/a.py,src/b.py --note "..."
 ```
 
-Record as you go, not in one batch at the end. For `--from-json` batches, PowerShell, cmd and
-non-ASCII text, read "Recording mechanics" in `craftsman skill show craft-review`.
+Record as you go, not in one batch at the end.
+
+Mechanics: one command per line, no `\` continuations; single quotes (cmd.exe: double quotes,
+inner `\"`; PowerShell escapes `'` as `''`). Use the project's Python (`python3` is missing on many
+Windows machines). Batches: `craftsman review add|cover --from-json - <<'EOF' [ ... ] EOF` with
+entries `{"lens","file","line","severity","title","scenario","suggestion"}` or `{"hunks":[...] or
+"files":[...],"note"}`; a rejected batch records nothing and lists every entry to fix: fix them
+all, resend once. PowerShell: `@'` newline JSON newline `'@ | craftsman review add --from-json -`;
+Windows PowerShell 5.1 pipes ASCII only, so for other text run `craftsman review inbox add`, write
+UTF-8 to the printed path (`Set-Content -LiteralPath <path> -Encoding utf8`) and pass
+`--from-json <path>`. Throwaway scripts: `craftsman review scratch` prints a managed directory.
 
 Never change the work tree or index: no `git stash`, `checkout`, `switch`, `reset`, `restore`,
 `clean`, `commit`, `rm`, `mv`, and no files written inside the repository. Do not verify, dismiss

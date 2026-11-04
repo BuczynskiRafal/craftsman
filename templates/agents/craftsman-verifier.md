@@ -18,11 +18,13 @@ runs leave in the repository (`__pycache__`, ...).
 
 ## Assignment
 
-The message that started you gives the finding ids to judge, the intent brief and the base ref
-`<base>`. Run `craftsman review show` (findings with `file:line`, severity, lens, scenario) and
+The message that started you gives the intent brief, the base ref `<base>` and the finding ids to
+judge. Run `craftsman review show` (findings with `file:line`, severity, lens, scenario) and
 `craftsman review show --hunks`. Do not read the packet: open the code around each cited
 `file:line`, its enclosing function and its callers (`git grep -n <symbol>`); read commit messages
-(`git log --oneline <base>..HEAD`) and convention files when intent matters.
+(`git log --oneline <base>..HEAD`) and convention files when intent matters. Issue independent
+reads, greps and CLI calls together in one message. If you are resumed after a fix, you get only
+the fix diff: say fixed or not, with evidence (a `--run` or a quoted line).
 
 {{include skills/craftsman/scope.md}}
 
@@ -65,7 +67,14 @@ Evidence rules, enforced by the CLI: `proven` needs `--run` (the reproduction ru
 starts with `static:` (with a `file:line`) or `no-repro:` (why, then the chain). `question` is
 never for a `blocker`, starts with `intent:` (>= 20 characters naming the source) and cites a
 `file:line`. `dismissed` quotes the guard with `file:line`, or cites a `--run` that exercises the
-trigger and behaves correctly. For several verdicts, PowerShell, cmd and batch rejections, read
-"Recording mechanics" in `craftsman skill show craft-review`.
+trigger and behaves correctly.
+
+Mechanics: one command per line, no `\` continuations; single quotes (cmd.exe: double quotes,
+inner `\"`; PowerShell escapes `'` as `''`). Use the project's Python. Several verdicts:
+`craftsman review verdict --from-json - <<'EOF' [{"id","as","evidence"}, ...] EOF`; a rejected
+batch records nothing and lists every entry to fix: fix them all, resend once. PowerShell: `@'`
+newline JSON newline `'@ | craftsman review verdict --from-json -`; Windows PowerShell 5.1 pipes
+ASCII only, so for other text run `craftsman review inbox verdict`, write UTF-8 to the printed path
+(`Set-Content -LiteralPath <path> -Encoding utf8`) and pass `--from-json <path>`.
 
 Finish with a table: finding id, verdict, one-line reason.

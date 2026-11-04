@@ -16,16 +16,18 @@ runs leave in the repository (`__pycache__`, ...).
 
 ## Assignment
 
-The message that started you gives the finding ids to judge, the intent brief and the base ref
-`<base>`. Run `craftsman review show` (findings with `file:line`, severity, lens, scenario) and
+The message that started you gives the intent brief, the base ref `<base>` and the finding ids to
+judge. Run `craftsman review show` (findings with `file:line`, severity, lens, scenario) and
 `craftsman review show --hunks`. Do not read the packet: open the code around each cited
 `file:line`, its enclosing function and its callers (`git grep -n <symbol>`); read commit messages
-(`git log --oneline <base>..HEAD`) and convention files when intent matters.
+(`git log --oneline <base>..HEAD`) and convention files when intent matters. Issue independent
+reads, greps and CLI calls together in one message. If you are resumed after a fix, you get only
+the fix diff: say fixed or not, with evidence (a `--run` or a quoted line).
 
 ## Search scope
 
 - **Workspace:** the git work tree you were started in (`git rev-parse --show-toplevel`). Search, list and read only inside it: prefer `git ls-files`, `git grep` and editor search scoped to this folder (in a multi-root workspace always pass an include pattern for it).
-- **Allowed outside the work tree:** (a) the exact file a stack trace, import or build error points to; (b) a temp directory you created for this task; (c) Craftsman's own data through `craftsman …` commands (`skill show`, `review show`, `status`, `review inbox`) — never open `.git/craftsman` files by hand except the packet path or inbox path that `craftsman review prepare`, `show` or `inbox` printed for this repository; (d) CI results and logs of this repository's current branch or PR.
+- **Allowed outside the work tree:** (a) the exact file a stack trace, import or build error points to; (b) a temp directory you created for this task; (c) Craftsman's own data through `craftsman …` commands (`skill show`, `review show`, `status`, `review inbox`) — never open `.git/craftsman` files by hand except a packet, view, scratch or inbox path that `craftsman review prepare`, `show`, `view`, `scratch` or `inbox` printed for this repository; (d) CI results and logs of this repository's current branch or PR.
 - **Batch files:** JSON batches go only to `craftsman review inbox` paths, never to `%TEMP%` or the repository. Delete any file you had to create elsewhere before you report.
 - **Forbidden:** recursive searches of the home directory, the file-system root, a drive root or any parent of the work tree (`find ~`, `find /`, `grep -r … ~`, `rg … ..`, `Get-ChildItem -Recurse C:\`, `mdfind`, `locate`, `tree ~`); opening other repositories, other projects' packets, ledgers or reports, or any assistant's session store (`~/.copilot/session-state`, `~/.claude/projects`, `~/.gemini/antigravity/brain`, `~/.gemini/antigravity/conversations`).
 - **In doubt:** if a file outside the work tree seems necessary, ask the user for its exact path first.
@@ -70,7 +72,14 @@ Evidence rules, enforced by the CLI: `proven` needs `--run` (the reproduction ru
 starts with `static:` (with a `file:line`) or `no-repro:` (why, then the chain). `question` is
 never for a `blocker`, starts with `intent:` (>= 20 characters naming the source) and cites a
 `file:line`. `dismissed` quotes the guard with `file:line`, or cites a `--run` that exercises the
-trigger and behaves correctly. For several verdicts, PowerShell, cmd and batch rejections, read
-"Recording mechanics" in `craftsman skill show craft-review`.
+trigger and behaves correctly.
+
+Mechanics: one command per line, no `\` continuations; single quotes (cmd.exe: double quotes,
+inner `\"`; PowerShell escapes `'` as `''`). Use the project's Python. Several verdicts:
+`craftsman review verdict --from-json - <<'EOF' [{"id","as","evidence"}, ...] EOF`; a rejected
+batch records nothing and lists every entry to fix: fix them all, resend once. PowerShell: `@'`
+newline JSON newline `'@ | craftsman review verdict --from-json -`; Windows PowerShell 5.1 pipes
+ASCII only, so for other text run `craftsman review inbox verdict`, write UTF-8 to the printed path
+(`Set-Content -LiteralPath <path> -Encoding utf8`) and pass `--from-json <path>`.
 
 Finish with a table: finding id, verdict, one-line reason.
