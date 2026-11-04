@@ -66,9 +66,12 @@ An expanded, multi-language benchmark suite addressing these limitations is acti
 
 The pilot depends on a third-party dataset and needs real pull requests. For a cheap, repeatable check that works on
 any agent platform (Claude Code, Antigravity, Copilot, Codex), the repository ships a seeded suite in
-[`evals/`](../evals/README.md): 6 small stdlib-only Python projects, each with a pull request that implements a
-written task and hides 2 or 3 defects that look like honest mistakes (15 in total). The shipped tests of every
-pull request pass, and each case also carries 1 or 2 decoys, correct code that only looks wrong.
+[`evals/`](../evals/README.md): 8 stdlib-only Python projects, each with a pull request that implements a
+written task and hides defects that look like honest mistakes (27 in total). Six cases are small (2 or 3 defects,
+up to 150 changed lines); two are large (6 defects, 450 to 670 changed lines in 14 or 15 files, one of the defects
+an incomplete propagation across files) so that the way cost and time grow with the size of a change shows. The
+shipped tests of every pull request pass, and each case also carries decoys (1 or 2 in a small case, 3 in a large
+one), correct code that only looks wrong. The suite has no cap on the number of defects.
 
 The defects cover twelve kinds: boundary and off-by-one errors, a legitimate empty value treated as missing, swallowed
 errors, non-atomic writes, incomplete propagation, tests that cannot fail or were weakened, aliasing and mutable
@@ -88,6 +91,35 @@ location; findings the review dismissed are ignored. Compare the recall of `/cod
 the same model, with at least three repetitions per arm: the suite is small, so single runs are anecdotes. How to run
 each arm, the exact baseline prompt, the scoring rules and how to add a case are in the
 [evals README](../evals/README.md).
+
+### Measuring a review end to end
+
+`python3 -m evals.run agent` runs the reviews unattended in headless Claude Code (`claude -p` with the
+checkout loaded as a plugin, an explicit tool allow list and a per-run budget cap) and records, per run, which
+seeded defects were found, the decoys flagged, the unmatched findings, the cost in USD, the wall time, the turns,
+the subagents spawned and the tokens per model. `python3 -m evals.run compare` turns the result files into a table
+per arm and case with the spread over the repeats.
+
+To judge a change of the review protocol (fewer tokens, less wall time) check out the old and the new protocol in
+two directories and run both on the same cases with the same model and `--jobs`:
+
+```bash
+for i in 1 2 3 4 5; do
+  python3 -m evals.run agent --craftsman-src ../craftsman-a --arm a --out bench/evals/ab.jsonl
+  python3 -m evals.run agent --craftsman-src ../craftsman-b --arm b --out bench/evals/ab.jsonl
+done
+python3 -m evals.run compare bench/evals/ab.jsonl --defects
+```
+
+What it costs: runs x the per-run cap (`--budget-usd`, default 5) is the ceiling; a session that only loads the
+plugin costs 0.06 to 0.15 USD, and the real cost of a review per case has to be measured with a first repeat
+before planning more (the large cases are the dear ones). How many repeats a claim needs: the unit is the suite
+recall of one repeat, and with a repeat-to-repeat standard deviation of 0.10 the 90% interval of the difference
+between two arms excludes a drop of about 17 points with 3 repeats per arm, 12 with 5, 8 with 10 and 5 with 20.
+Three repeats can only show large differences; to claim that an optimization did not lower recall use at least
+5 per arm and report the margin the interval excludes. The 0.10 is an assumption to be replaced by the spread
+`compare` prints. The details, the permission model of the unattended runs and the record format are in the
+[evals README](../evals/README.md#measure-a-review-end-to-end-agent-compare).
 
 ---
 

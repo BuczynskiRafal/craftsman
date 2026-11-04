@@ -9,8 +9,10 @@ pull request that implements a written task. The pull request contains a few **s
 that look like honest mistakes, and the shipped tests are green, as in a real PR with passing CI.
 A review is scored by how many seeded defects its findings point at.
 
-The suite has 6 cases and 15 defects. Run a case several times (3 or more) before drawing
-conclusions: model output varies from run to run.
+The suite has 8 cases and 27 defects: 6 small cases (2 or 3 defects each) and 2 large ones that show how
+cost scales with the size of the change. Run a case several times (3 or more) before drawing
+conclusions: model output varies from run to run. To measure recall, cost and wall time of a real
+Claude Code review automatically, see [Measure a review end to end](#measure-a-review-end-to-end-agent-compare).
 
 | Case | What the PR does | Defect kinds |
 | :--- | :--- | :--- |
@@ -20,21 +22,173 @@ conclusions: model output varies from run to run.
 | `attach` | folders in ticket attachments, zip export | `path-traversal`, `platform-dependence` |
 | `reminders` | daily digest and local times for reminders | `platform-dependence`, `off-by-one-boundary`, `weak-test` |
 | `taskboard` | task priorities in model, JSON, CLI and CSV | `incomplete-propagation`, `empty-as-missing`, `weak-test` |
+| `orderdesk` (large) | shipping for an order desk: zones, carrier rate tables, free-shipping threshold, tracking numbers and carrier events (~670 changed lines, 14 files) | `cache-key-missing-param`, `off-by-one-boundary`, `empty-as-missing`, `incomplete-propagation` (across files), `swallowed-error`, `weak-test` |
+| `feedbox` (large) | feed tags, export to Markdown/HTML files with an index, and a digest for an RSS reader (~450 changed lines, 15 files) | `path-traversal`, `platform-dependence`, `aliasing`, `help-contradicts-code`, `qualifier-not-implemented`, `incomplete-propagation` (across files) |
 
 Every defect kind appears at least once: `off-by-one-boundary`, `empty-as-missing`,
 `swallowed-error`, `non-atomic-write`, `incomplete-propagation`, `weak-test` (a test that cannot
 fail or a weakened assertion), `aliasing` (shallow copy or mutable default),
 `cache-key-missing-param`, `platform-dependence` (path separator, naive vs aware datetime),
-`path-traversal`, `help-contradicts-code` and `qualifier-not-implemented`. Each case also has 1 or
-2 **decoys**: code that looks suspicious but is correct. A finding on a decoy is reported as a
-decoy hit.
+`path-traversal`, `help-contradicts-code` and `qualifier-not-implemented`. Each small case also has 1 or
+2 **decoys** (the large ones 3): code that looks suspicious but is correct. A finding on a decoy is
+reported as a decoy hit. There is no cap on the number of defects in the suite.
 
-## Run a case
+## Measure a review end to end (`agent`, `compare`)
+
+`python3 -m evals.run agent` runs a real, unattended Claude Code session (`claude -p`) per case,
+scores its findings with the scorer below and appends one JSON line per run to a results file. It
+measures what a protocol change has to be judged on: **recall, cost and wall time**.
 
 ```bash
-python3 evals/run.py list
+# one run of every case with the checkout you are in (about 8 runs, see "What it costs")
+python3 -m evals.run agent --cases all --arm current --out bench/evals/current.jsonl
+
+python3 -m evals.run agent --help
+python3 -m evals.run compare bench/evals/current.jsonl
+```
+
+| Flag | Meaning |
+| :--- | :--- |
+| `--cases <ids\|all>` | comma separated case ids, default `all` |
+| `--craftsman-src <dir>` | the Craftsman checkout to test, default this repository |
+| `--arm <label>` | name of this configuration in the results (`main`, `compact-prompt`, `baseline`) |
+| `--model <name>` | default `sonnet`; keep it equal across arms |
+| `--repeat N` | runs per case, default 1 |
+| `--jobs N` | parallel runs, default 2 |
+| `--budget-usd N` | spending cap of one run (`--max-budget-usd`), default 5 |
+| `--timeout-min N` | wall clock cap of one run, default 30 |
+| `--out <file>` | results file, appended to; default `bench/evals/<arm>.jsonl`. Logs go to `<file stem>.logs/` |
+| `--prompt <template or file>` | the prompt; `{skill}` `{base}` `{task_file}` `{case}` are replaced |
+| `--baseline` | no Craftsman at all: no plugin, no `craftsman` command, the baseline prompt below |
+| `--keep-workdirs`, `--dry-run` | keep the temp repositories; print the first command and stop |
+| `--claude`, `--permission-mode`, `--allow-tool` | the executable, the permission mode, one more allowed tool rule |
+
+**What one run does.** It prepares the case in a fresh temp directory (`repo/`, the base committed and
+the change uncommitted, exactly as `prepare`), puts a `craftsman` wrapper script in front of `PATH`
+(`PYTHONPATH=<src> exec python3 -m craftsman.cli "$@"`, so the session runs the CLI of the checkout
+under test and not an installed one), starts `claude` in `repo/`, scores the ledger in
+`repo/.git/craftsman/ledger.json` and appends the record. The checkout under test is copied once per
+invocation, without `.git`, `evals/`, `docs/` and `tests/`: the arm cannot change while a long run is in
+progress, and the session cannot find `truth.json` next to the plugin. The record holds the source commit
+(`+dirty` when tracked plugin files had uncommitted changes).
+
+**How Craftsman is loaded.** With `--plugin-dir <copy of src>`. The plugin manifest
+(`.claude-plugin/plugin.json`) brings the skills (as `craftsman:<skill>`), the `craftsman-reviewer`,
+`craftsman-verifier` and `craftsman` agents (as `craftsman:<agent>`) and the lifecycle hooks, which are the
+ones that record the isolation evidence in the ledger. The harness reads the `system`/`init` event of the
+stream and **stops the run at once** (status `load-failed`, almost no cost) when the review skill or one of
+the two agents is not in it, and, for `--baseline`, when any `craftsman:` skill or agent is. The record keeps
+how often each hook ran and how often it failed. The review skill is `skills/craft-review` if the source has
+it, else `skills/code-review`; the default prompt is
+
+```text
+/craftsman:code-review review the changes against HEAD (review only, do not fix). The change description is in .git/evals/task.md.
+```
+
+**Permissions.** Unattended, with an explicit allow list and no `bypassPermissions`:
+`--permission-mode dontAsk` (anything not allowed is refused instead of asked, so nothing can hang on a
+prompt) plus `--allowedTools`:
+
+- `Skill`, `Task`/`Agent` (subagents), `TodoWrite`;
+- `Bash(craftsman:*)`, the read-only git commands (`status`, `diff`, `log`, `show`, `grep`, `ls-files`,
+  `ls-tree`, `cat-file`, `rev-parse`, `rev-list`, `merge-base`, `blame`, `branch`), `python3`/`python` (to run
+  the tests and to reproduce a finding), `cd`, `pwd`, `ls`, `wc`;
+- `Read`, `Grep` and `Glob` need no rule: Claude Code allows them inside the working directory, the temp
+  case, and `dontAsk` refuses them elsewhere (checked: `Read /etc/hostname` is denied);
+- `--disallowedTools Edit,Write,NotebookEdit,WebFetch,WebSearch`: a review does not edit, and cannot look
+  anything up (in the baseline arm `Write` is allowed for `.git/evals/findings.json` only).
+
+`git stash`, `checkout`, `reset`, `rm` and the like are not on the list, which is also what the review
+protocol demands. Why not `bypassPermissions`: it also lets a misbehaving run edit or delete anything the
+user can, and a measurement should fail loudly (a refused tool shows up as `permission_denials` in the
+record) rather than succeed by doing something the protocol forbids. What this does not do: the Bash rules
+are prefix rules, not a sandbox; `python3` can read any file and the session has the user's network and
+credentials. The cwd of every session is its own temp directory and only that directory is ever written
+by the harness, but run it in a container or a throw-away VM if the machine matters. The session also gets
+only the project and local settings (`--setting-sources project,local`) and no MCP servers
+(`--strict-mcp-config`), so user plugins, skills, memory and connectors cannot differ between machines
+or arms.
+
+**Result record** (one JSON object per line): `arm`, `case`, `run`, `status`
+(`ok`, `budget`, `timeout`, `max-turns`, `error`, `load-failed`, `no-result`, `harness-error`),
+`recall` (found, total, ids found and missed, decoy hits, unmatched findings, duplicates, ignored
+dismissed findings), `cost_usd`, `duration_ms` (Claude's own clock), `wall_s` (the harness's clock),
+`turns`, `subagents` (spawned, completed, failed), `usage` and `model_usage` (tokens and cost per model),
+`tool_calls`, `hooks`, `permission_denials`, the `init` check, the prompt, the source commit and `logs`:
+the stream (`stream.jsonl`, without the token-level `stream_event` lines), `stderr.txt` and the ledger
+of the run. `status` other than `ok` makes the command exit 1. Runs with `load-failed`, `no-result`,
+`error` or `harness-error` are left out of every mean in `compare` and counted in its `invalid` note; a
+`budget` or `timeout` run is kept with the findings it recorded before it stopped, because a protocol that
+runs out of money is a result.
+
+### Compare two protocols (A/B)
+
+```bash
+git worktree add ../craftsman-a main            # the protocol you have
+git worktree add ../craftsman-b my-experiment   # the protocol you changed
+
+# interleave the arms so that API speed drift hits both the same way
+for i in 1 2 3 4 5; do
+  python3 -m evals.run agent --craftsman-src ../craftsman-a --arm a --out bench/evals/ab.jsonl --jobs 2
+  python3 -m evals.run agent --craftsman-src ../craftsman-b --arm b --out bench/evals/ab.jsonl --jobs 2
+done
+
+python3 -m evals.run compare bench/evals/ab.jsonl --defects
+```
+
+Keep everything but the checkout equal: model, `--jobs` (parallel runs share the API and the machine, so
+wall times are only comparable at the same `--jobs`; use `--jobs 1` when time is the question), prompt,
+budget. Both arms may share one results file (the `arm` label tells them apart) and `agent` can be run
+again later to add repeats. A baseline arm for the same comparison: `--baseline --arm baseline`.
+
+`compare` prints, per arm and case: runs, recall (mean defects found / seeded), the fewest and most found
+in one run, decoys flagged, unmatched findings (possible false positives), mean cost in USD with the
+spread over the repeats, minutes, turns and subagents spawned; then a TOTAL row (one pass over all cases;
+its range is the suite recall of each repeat). With several arms it adds, for every later arm, the ratios of
+cost, minutes and turns per case and the **difference of the suite recall with a 90% interval** (Welch's t
+on the per-repeat suite recalls). `--defects` shows how often each seeded defect was found, which is the
+number to look at when the totals look equal: a defect that dropped from 5/5 to 1/5 is a regression the
+mean can hide. `--json` prints the same tables as JSON.
+
+### What it costs, and how many repeats a claim needs
+
+*Cost.* Runs = arms x cases x repeats; the spending of a run is capped by `--budget-usd`, so the ceiling is
+runs x cap (8 cases x 5 repeats x 2 arms = 80 runs, 400 USD at the default cap of 5). A session that only
+loads the plugin and runs one command costs about 0.06-0.15 USD (measured on `sonnet`); a real review is
+far more, and the large cases cost more than the small ones, which is what they are for. Measure before you
+plan: run one repeat of `kvstore` and `orderdesk`, read the cost column, and set `--budget-usd` to about twice
+the dearest run. `compare` prints the cost of a full pass over all cases.
+
+*Repeats.* A single run is an anecdote: the same prompt on the same case finds a different number of
+defects from run to run. The unit to compare is the **suite recall of one repeat** (all cases run once). If
+that varies by a standard deviation of sigma between repeats, the 90% interval of the difference of two arms
+with n repeats each is about +-t x sigma x sqrt(2/n) (t is 2.1 at n=3, 1.9 at n=5, 1.7 at n=10), so:
+
+| Repeats per arm | Smallest recall drop the interval can rule out (sigma = 0.10) |
+| :---: | :---: |
+| 3 | about 17 points |
+| 5 | about 12 points |
+| 10 | about 8 points |
+| 20 | about 5 points |
+
+Equivalently, to detect a real difference d with 80% power at 5% (one sided) you need about
+`12.4 x sigma^2 / d^2` repeats per arm: with sigma = 0.10, d = 0.20 needs 4, d = 0.15 needs 6, d = 0.10 needs
+13. The sigma of 0.10 is an assumption: run 5 repeats of the current protocol first, read the spread of the
+suite recall in the `compare` TOTAL row (and the per-case `±`), and replace it. The practical rule: 3
+repeats find only large changes (20 points); to claim "recall did not drop" for a token or time
+optimization use at least 5 repeats per arm and state the margin the interval actually excludes; 10 if the
+margin has to be under 10 points. Add large cases rather than repeats when the interval is wide because
+of a few hard defects: `--defects` shows which.
+
+## Run a case by hand
+
+```bash
+python3 evals/run.py list                               # case, size, defects, decoys, kinds
 python3 evals/run.py prepare quotes ~/evals/quotes-1     # a fresh, empty directory
 ```
+
+This is for other agents and platforms, or to look at a case. `agent` below does the same, unattended,
+for Claude Code.
 
 `prepare` creates a git repository in the destination, commits the case's `base/` tree, then
 copies `head/` over it **without committing**, so the pull request is the uncommitted diff
@@ -122,24 +276,31 @@ Matching rules:
   `.title` and `.verdict` of the ledger are read, so ledger schema changes do not matter.
 - Findings that have no usable file or line are counted as unreadable and ignored.
 
-To compare arms, score each run, then average the recalls over the repetitions of each arm and
-list the unmatched findings of each arm side by side.
+To compare arms by hand, score each run, then average the recalls over the repetitions of each arm and
+list the unmatched findings of each arm side by side. For Claude Code, `compare` does this (a run without
+a ledger or findings file counts as zero defects found, and is marked in the record).
 
 ## Add a case
 
 1. Create `evals/cases/<id>/` with
    - `base/`: a small stdlib-only Python library or CLI, at most about 200 lines including its
      tests, with `unittest` tests in `tests/` (`tests/__init__.py` too). The tests run with
-     `python3 -m unittest` from `base/`.
+     `python3 -m unittest` from `base/`. A **large** case has a base that looks like a real project:
+     6 to 9 modules, a test file for most of them, shared helpers.
    - `head/`: the same tree after a change of at most about 150 changed lines that implements
      `task.md`. Its tests pass. Defects must look like honest mistakes: no comments, names or
-     TODOs that give them away.
+     TODOs that give them away. A large case changes 400 to 700 lines in 10 to 15 files (new
+     modules, edits to existing ones, new and edited tests) and seeds 4 to 6 defects, at least one
+     of them an `incomplete-propagation` whose locations are in two different files, plus 2 to 4
+     decoys. A decoy must be in code the change touches and be correct for a reason the task or the
+     code states.
    - `task.md`: the pull request description a reviewer receives. State the requirements the
      defects violate (a defect is only fair if the task or the code around it says what is right).
    - `truth.json`:
 
      ```json
      {
+       "size": "large",
        "defects": [
          {"id": "x-1", "kind": "swallowed-error", "summary": "one line",
           "locations": [{"file": "pkg/mod.py", "start": 40, "end": 44}]}
@@ -151,10 +312,17 @@ list the unmatched findings of each arm side by side.
      }
      ```
 
+     `"size"` is optional (`"small"` is the default; a `"large"` case is checked against the large limits).
      `file` is relative to `head/`, lines are 1-based and inclusive. A propagation defect can be
      reported at the caller or the callee: list both as locations. `kind` is one of the kinds above (`KINDS` in `run.py`).
 2. Run `python3 -m unittest tests.test_evals`. It checks that the base and head tests pass, that
-   every location points at an existing, non-blank line, that the sizes are within the limits,
-   that `evals/README.md` still carries the baseline prompt of `run.py`, and that the suite has
-   12 to 16 defects covering every kind.
-3. Keep the total at 16 defects or fewer and add the case to the table above.
+   every location points at an existing, non-blank line, that the sizes are within the limits for its
+   size, that `evals/README.md` still carries the baseline prompt of `run.py`, and that the suite has
+   at least 12 defects covering every kind. The tests of `agent` and `compare` use a fake `claude`
+   and never call the real one.
+3. Add the case to the table above. The suite has no cap on defects; keep the large cases few, they
+   are what makes a run expensive.
+
+Lint: `python3 -m ruff check evals tests/test_evals.py` and
+`python3 -m mypy --strict --exclude 'evals/cases/' evals tests/test_evals.py` are clean (the case trees
+are fixtures with seeded defects and are not linted).
