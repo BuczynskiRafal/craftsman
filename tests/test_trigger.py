@@ -26,6 +26,29 @@ class DetectTriggerTests(unittest.TestCase):
     def test_ultracraft_is_deep(self) -> None:
         self.assertIs(detect_trigger("ultracraft refactor the cart"), True)
 
+    def test_ultracraft_anywhere_after_the_command_is_deep(self) -> None:
+        for prompt in (
+            "/craftsman fix the bug, ultracraft",
+            "fix the bug and /craftsman, then ultracraft it",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIs(detect_trigger(prompt), True)
+
+    def test_deep_dive_is_not_the_deep_flag(self) -> None:
+        self.assertIs(detect_trigger("/craftsman --deep-dive into the cache"), False)
+        self.assertEqual(task_from_prompt("/craftsman --deep-dive into the cache"), "--deep-dive into the cache")
+
+    def test_the_review_command_never_starts_a_session(self) -> None:
+        for prompt in (
+            "/craft-review ultracraft review PR 42",
+            "/code-review ultracraft",
+            "/craftsman:craft-review ultracraft",
+            "/clear /craft-review ultracraft",
+            "<command-name>/craft-review</command-name><command-args>ultracraft PR 42</command-args>",
+        ):
+            with self.subTest(prompt=prompt):
+                self.assertIsNone(detect_trigger(prompt))
+
     def test_unknown_flag_is_not_deep(self) -> None:
         self.assertIs(detect_trigger("/craftsman --soft fix"), False)
 

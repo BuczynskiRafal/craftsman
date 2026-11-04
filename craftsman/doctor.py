@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -650,6 +651,34 @@ def inspect_leftover_review_skills(workspace: Path | None, home: Path) -> list[s
     return [problem for base, kind in bases for problem in inspect_legacy_skills((kind,), base)]
 
 
+# Commands and flags that Craftsman < 5 prompts tell the agent to run and that no longer exist.
+STALE_PROMPT_RE = re.compile(
+    r"review (?:ack|fact)\b|--tier\b|--add-lens\b|--shard\b|--signal\b|skill show code-review"
+)
+STALE_PROMPT_PROBLEM = (
+    "{path} is a prompt of Craftsman before 5.0 (it uses `{marker}`, which was removed); "
+    "run `craftsman install`"
+)
+
+
+def inspect_stale_prompts(workspace: Path | None, home: Path) -> list[str]:
+    """Problems for installed Craftsman commands and agents that still follow the old protocol."""
+    claude, copilot = default_claude_dir(home), default_copilot_home(home)
+    folders = [claude / "commands", claude / "agents", copilot / "agents"]
+    if workspace is not None:
+        folders.append(workspace / ".github" / "agents")
+    problems: list[str] = []
+    for folder in folders:
+        for path in sorted(folder.glob("*craftsman*.md")) if folder.is_dir() else ():
+            try:
+                found = STALE_PROMPT_RE.search(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                continue
+            if found:
+                problems.append(STALE_PROMPT_PROBLEM.format(path=path, marker=found.group(0)))
+    return problems
+
+
 # --- report ---------------------------------------------------------------------------------
 
 
@@ -815,6 +844,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         *inspect_legacy_distribution(),
         *inspect_agy_plugin_duplicate(home),
         *inspect_leftover_review_skills(workspace, home),
+        *inspect_stale_prompts(workspace, home),
     )
     healthy = (
         skill_count == expected_skills

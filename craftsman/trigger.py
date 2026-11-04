@@ -22,7 +22,18 @@ LEADING_COMMAND_TRIGGER_RE = re.compile(
 INLINE_TRIGGER_RE = re.compile(rf"(?i)(?:^|[\s(])({COMMANDS_PATTERN})(?=$|[\s.,;!?)]|{COLON_END})")
 # `--quick` and `--standard` are accepted and ignored; only `--deep` changes the gate.
 CRAFTSMAN_DEEP_FLAG_RE = re.compile(
-    r"(?i)(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard))*\s+--deep\b"
+    r"(?i)(?:/(?:craftsman:)?craftsman|craftsman:craftsman)(?:\s+--(?:quick|standard))*\s+--deep(?![\w-])"
+)
+# `ultracraft` as a word of its own anywhere in a request asks for depth.
+ULTRACRAFT_WORD_RE = re.compile(
+    r"(?i)(?<![\w/-])(?:/(?:craftsman:)?ultracraft|craftsman:ultracraft|ultracraft)(?![\w:-])"
+)
+# The review-only command: `ultracraft` there asks for a deep review, never for a gate.
+REVIEW_COMMAND_RE = re.compile(
+    r"(?i)^\s*(?:/[a-z0-9_:-]+\s+)*/(?:craftsman:)?(?:craft|code)-review(?![\w-])"
+)
+CLAUDE_REVIEW_COMMAND_RE = re.compile(
+    r"<command-name>\s*/?(?:craftsman:)?(?:craft|code)-review\s*</command-name>", re.IGNORECASE
 )
 CLAUDE_COMMAND_NAME_RE = re.compile(
     r"<command-name>\s*/?(?:craftsman:)?(craftsman|ultracraft)\s*</command-name>", re.IGNORECASE
@@ -50,7 +61,7 @@ def detect_trigger(content: str) -> bool | None:
 
     None when it starts no session; otherwise True for `ultracraft` and `/craftsman --deep`.
     """
-    if not content.strip():
+    if not content.strip() or is_review_prompt(content):
         return None
     claude_command = CLAUDE_COMMAND_NAME_RE.search(content)
     if claude_command:
@@ -58,7 +69,7 @@ def detect_trigger(content: str) -> bool | None:
             return True
         args = CLAUDE_COMMAND_ARGS_RE.search(content)
         arg_str = args.group(1).strip() if args else ""
-        return _requests_deep(f"/craftsman {arg_str}", "/craftsman")
+        return _requests_deep(f"/craftsman {QUOTED_SPAN_RE.sub(' ', arg_str)}", "/craftsman")
 
     requests = USER_REQUEST_BLOCK_RE.findall(content)
     user_text = QUOTED_SPAN_RE.sub(" ", (requests[-1] if requests else content).strip())
@@ -73,8 +84,21 @@ def detect_trigger(content: str) -> bool | None:
     return None
 
 
+def is_review_prompt(content: str) -> bool:
+    """Whether `content` invokes the review-only command (`/craft-review`, or the older
+    `/code-review`), which never starts a gate."""
+    if CLAUDE_REVIEW_COMMAND_RE.search(content):
+        return True
+    requests = USER_REQUEST_BLOCK_RE.findall(content)
+    return REVIEW_COMMAND_RE.search((requests[-1] if requests else content).strip()) is not None
+
+
 def _requests_deep(text: str, token: str) -> bool:
-    return token.lower().endswith("ultracraft") or CRAFTSMAN_DEEP_FLAG_RE.search(text) is not None
+    return (
+        token.lower().endswith("ultracraft")
+        or CRAFTSMAN_DEEP_FLAG_RE.search(text) is not None
+        or ULTRACRAFT_WORD_RE.search(text) is not None
+    )
 
 
 def task_from_prompt(prompt: str) -> str:
