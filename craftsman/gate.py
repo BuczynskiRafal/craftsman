@@ -66,6 +66,7 @@ MAX_CONTINUATIONS = 6
 MAX_CONTINUATION_REASON_CHARS = 1800
 MAX_ERROR_CHARS = 400
 CONTINUATION_HEADER = "[CRAFTSMAN GATE"
+REVIEW_CONTINUATION_HEADER = "[CRAFTSMAN REVIEW"
 TAKEOVER_HINT = "start a new gate with `craftsman gate --init --takeover`"
 NO_ACTIVE_GATE = "no active gate in this work tree; open one with `craftsman gate --init`"
 ROUND_CAP_NOTICE = (
@@ -457,7 +458,7 @@ def continuation_reason(header: str, report: GateReport | None, evidence_error: 
 
 def is_continuation_prompt(prompt: str) -> bool:
     """True for a stop hook's block reason, which some platforms send back as a user prompt."""
-    return prompt.lstrip().startswith(CONTINUATION_HEADER)
+    return prompt.lstrip().startswith((CONTINUATION_HEADER, REVIEW_CONTINUATION_HEADER))
 
 
 def archive_ledger_for_new_base(root: Path, base_sha: str) -> None:

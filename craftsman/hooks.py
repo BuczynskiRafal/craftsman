@@ -34,8 +34,10 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, get_args
 
 from craftsman.diffscan import DiffScanError, resolve_base_sha, snapshot, worktree_root
-from craftsman.evidence import archive_ledger
+from craftsman.evidence import archive_ledger, effective_deep
 from craftsman.gate import (
+    MAX_CONTINUATIONS,
+    REVIEW_CONTINUATION_HEADER,
     GateOwner,
     GateState,
     GateStateError,
@@ -46,6 +48,14 @@ from craftsman.gate import (
     load_state,
     state_path_for,
     update_state,
+)
+from craftsman.gatecheck import (
+    GateIssue,
+    GatePolicy,
+    GateReport,
+    evaluate,
+    format_blocker_summary,
+    render_next_actions,
 )
 from craftsman.ledger import (
     GROUPED_EVIDENCE_PREFIX,
@@ -74,7 +84,14 @@ from craftsman.scope import (
 )
 from craftsman.trigger import detect_trigger, is_review_prompt, task_from_prompt
 from craftsman.usage import read_usage
-from craftsman.workspace import mark_hooks_active
+from craftsman.workspace import (
+    ReviewMarker,
+    Workspace,
+    end_review_guard,
+    mark_hooks_active,
+    read_marker,
+    write_marker,
+)
 from craftsman.worktree_guard import find_worktree_mutation
 
 Platform = Literal["copilot", "claude"]
@@ -95,6 +112,11 @@ SHELL_TOOLS = frozenset(
 )
 # Characters that a shell or PowerShell would interpret inside a double-quoted argument.
 SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
+REVIEW_GUARD_ACTIONS = 3
+REVIEW_NOT_STARTED = (
+    "No review round yet: run `craftsman review prepare`, launch at least one "
+    "craftsman-reviewer subagent on its packet, then record findings and verdicts."
+)
 REVIEWER_STOP_REASON = (
     "Before finishing, record coverage (`craftsman review cover ...`) for the slice you "
     "examined, and a finding (`craftsman review add ...`) for every defect you found."
@@ -286,8 +308,11 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     reply = Reply(platform, event)
     session = open_session(hook.cwd)
     caller = GateOwner(platform, hook.session_id)
-    if event == "prompt" and session is not None and is_review_prompt(hook.prompt):
-        mark_hooks_active(session.ledger_path, caller)
+    if event == "prompt" and session is not None:
+        if is_review_prompt(hook.prompt):
+            mark_hooks_active(session.ledger_path, caller)
+        elif not is_continuation_prompt(hook.prompt):
+            end_review_guard(session.ledger_path, caller)  # the user moved on to something else
     if event == "pre-tool":
         return on_pre_tool(hook, reply, session, caller)
     if session is None:
@@ -319,7 +344,7 @@ def serve(
     if event == "prompt":
         return on_prompt(session, state, hook, reply, caller)
     if event == "stop":
-        return on_stop(session, state, reply)
+        return on_stop(session, state, reply, caller)
     active = state is not None and state.active
     if event == "subagent-start":
         return state, on_subagent_start(session, active, hook, reply)
@@ -395,15 +420,74 @@ def _shell_safe(text: str) -> str:
 # --- stop -----------------------------------------------------------------------------------
 
 
-def on_stop(session: Session, state: GateState | None, reply: Reply) -> tuple[GateState | None, Output]:
+def on_stop(
+    session: Session, state: GateState | None, reply: Reply, caller: GateOwner | None = None
+) -> tuple[GateState | None, Output]:
     if state is None or not state.active:
-        return state, reply.allow()
+        guard = review_stop_guard(session, reply, caller) if caller is not None else reply.allow()
+        return state, guard
     decision = decide_stop(state, session.root)
     if decision.block_reason is not None:
         return decision.state, reply.block(decision.block_reason)
     if decision.notice is not None:
         return decision.state, notice(reply, decision.notice)
     return decision.state, reply.allow()
+
+
+def _review_outcome_issues(session: Session, marker: ReviewMarker) -> list[GateIssue]:
+    """What `craftsman review check --review-only` still lacks for a review begun at `marker`."""
+    ledger = load(session.ledger_path)
+    started = parse_timestamp(marker.at)
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    touched = latest is not None and (
+        parse_timestamp(latest.prepared_at) >= started
+        or any(parse_timestamp(item.recorded_at) >= started for item in ledger.coverage)
+        or any(parse_timestamp(item.recorded_at) >= started for item in ledger.findings)
+    )
+    if not touched:
+        return [GateIssue("no-round", REVIEW_NOT_STARTED)]
+    workspace = Workspace(session.root, None, session.ledger_path)
+    policy = GatePolicy(deep=effective_deep(ledger), isolation_evidence="hooks")
+    snap = workspace.snapshot(ledger)
+    return list(evaluate(ledger, snap, policy, review_only=True).issues)
+
+
+def review_stop_guard(session: Session, reply: Reply, caller: GateOwner) -> Output:
+    """Keep a session that invoked the review skill working until its review-only outcome exists.
+
+    The prompt hook marked the session; a review that skipped `craftsman review prepare`, or left
+    hunks uncovered, findings unjudged or no reviewer run, is sent back like a gate. After
+    `MAX_CONTINUATIONS` reminders without progress the guard lets go with a note.
+    """
+    marker = read_marker(session.ledger_path)
+    if marker is None or not marker.guarding or not marker.is_of(caller):
+        return reply.allow()
+    try:
+        issues = _review_outcome_issues(session, marker)
+    except (DiffScanError, LedgerError, GateStateError) as exc:
+        end_review_guard(session.ledger_path, caller)
+        return notice(reply, f"Craftsman review guard could not check the review ({exc}); not enforced.")
+    if not issues:
+        end_review_guard(session.ledger_path, caller)
+        return reply.allow()
+    count = len(issues)
+    forced = 0 if marker.best is not None and count < marker.best else marker.forced
+    best = count if marker.best is None else min(marker.best, count)
+    if forced >= MAX_CONTINUATIONS:
+        end_review_guard(session.ledger_path, caller)
+        return notice(
+            reply,
+            f"Craftsman review guard: the review is still incomplete after {forced} reminders; "
+            "letting the agent stop. `craftsman review check --review-only` lists what is missing.",
+        )
+    write_marker(session.ledger_path, replace(marker, forced=forced + 1, best=best))
+    header = f"{REVIEW_CONTINUATION_HEADER} {forced + 1}/{MAX_CONTINUATIONS}]"
+    actions = render_next_actions(issues, max_items=REVIEW_GUARD_ACTIONS)
+    return reply.block(
+        f"{header} {format_blocker_summary(GateReport(tuple(issues), (), ''))}.\n"
+        + "\n".join(actions)
+        + "\nFinish with `craftsman review check --review-only` passing."
+    )
 
 
 def notice(reply: Reply, message: str) -> Output:

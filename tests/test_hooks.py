@@ -263,6 +263,140 @@ class PromptTests(HookTestCase):
         )
 
 
+class ReviewStopGuardTests(HookTestCase):
+    """A session that invoked the review skill cannot end its turn without a review outcome."""
+
+    def prompt(self, text: str, **extra: Any) -> dict[str, Any]:
+        return call_hook(
+            "prompt", "claude", claude("UserPromptSubmit", self.root, prompt=text, **extra)
+        )[0]
+
+    def stop(self, **extra: Any) -> dict[str, Any]:
+        return call_hook("stop", "claude", claude("Stop", self.root, **extra))[0]
+
+    def guarding(self) -> bool:
+        marker = json.loads((self.repo.ledger_dir / "review_hooks.json").read_text(encoding="utf-8"))
+        return bool(marker["guarding"])
+
+    def begin_review(self, prompt: str = "/craftsman:craft-review the cart") -> None:
+        self.prompt(prompt)
+        self.repo.write("cart.py", CHANGE)
+
+    def test_a_review_that_skipped_the_protocol_cannot_stop(self) -> None:
+        self.begin_review()
+
+        out = self.stop()
+
+        self.assertEqual(out["decision"], "block")
+        self.assertIn(f"[CRAFTSMAN REVIEW 1/{MAX_CONTINUATIONS}]", out["reason"])
+        self.assertIn("craftsman review prepare", out["reason"])
+        self.assertIn("craftsman-reviewer", out["reason"])
+        self.assertFalse((self.repo.ledger_dir / "craftsman_state.json").exists())
+
+    def test_the_legacy_command_is_guarded_too(self) -> None:
+        self.begin_review("/code-review ultracraft")
+
+        self.assertEqual(self.stop()["decision"], "block")
+
+    def test_a_round_without_coverage_or_a_reviewer_is_named(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+
+        reason = self.stop()["reason"]
+
+        self.assertIn("1 hunk not covered", reason)
+        self.assertIn("[uncovered]", reason)
+
+    def test_covered_hunks_still_need_a_reviewer_run(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+
+        self.assertIn("[no-isolation]", self.stop()["reason"])
+
+    def test_a_finished_review_lets_the_agent_stop_once(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+        self.run_reviewer()
+
+        self.assertEqual(self.stop(), {})
+        self.assertFalse(self.guarding())
+        self.repo.write("cart.py", CHANGE + "# later edit\n")
+        self.assertEqual(self.stop(), {})
+
+    def test_an_old_round_does_not_satisfy_a_new_review(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+        self.run_reviewer()
+        self.assertEqual(self.stop(), {})
+
+        self.prompt("/craft-review again")
+
+        self.assertEqual(self.stop()["decision"], "block")
+
+    def test_the_guard_lets_go_after_the_continuation_cap(self) -> None:
+        self.begin_review()
+        for count in range(1, MAX_CONTINUATIONS + 1):
+            self.assertIn(f"[CRAFTSMAN REVIEW {count}/", self.stop()["reason"])
+
+        out = self.stop()
+
+        self.assertEqual(set(out), {"systemMessage"})
+        self.assertIn("still incomplete after", out["systemMessage"])
+        self.assertEqual(self.stop(), {})
+
+    def test_a_continuation_prompt_keeps_the_guard(self) -> None:
+        self.begin_review()
+        reason = self.stop()["reason"]
+
+        self.prompt(reason)
+
+        self.assertTrue(self.guarding())
+
+    def test_nothing_to_review_is_an_outcome(self) -> None:
+        self.prompt("/craft-review")
+
+        self.repo.cli("review", "prepare")
+
+        self.assertEqual(self.stop(), {})
+
+    def test_a_prompt_without_the_review_skill_is_never_guarded(self) -> None:
+        self.repo.write("cart.py", CHANGE)
+        self.prompt("explain the cart module")
+        self.assertEqual(self.stop(), {})
+
+    def test_moving_on_to_another_request_ends_the_guard(self) -> None:
+        self.begin_review()
+
+        self.prompt("thanks, now rename the variable")
+
+        self.assertEqual(self.stop(), {})
+
+    def test_another_session_is_not_guarded(self) -> None:
+        self.begin_review()
+
+        self.assertEqual(self.stop(session_id="someone-else"), {})
+
+    def test_copilot_sessions_are_guarded_in_the_copilot_dialect(self) -> None:
+        call_hook("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="/craft-review"))
+        self.repo.write("cart.py", CHANGE)
+
+        out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
+
+        self.assertEqual(out["decision"], "block")
+        self.assertEqual(out["hookSpecificOutput"]["decision"], "block")
+
+    def test_a_craftsman_gate_keeps_its_own_behavior(self) -> None:
+        self.init()
+        self.repo.write("cart.py", CHANGE)
+
+        reason = self.stop()["reason"]
+
+        self.assertIn("[CRAFTSMAN GATE 1/", reason)
+
+
 class StopTests(HookTestCase):
     def open_unsatisfied_gate(self) -> None:
         self.init()

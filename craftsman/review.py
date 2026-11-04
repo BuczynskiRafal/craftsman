@@ -100,7 +100,7 @@ from craftsman.records import (
 from craftsman.scout import Scout, parse_target
 from craftsman.text import inline_md, one_line
 from craftsman.usage import usage_json, usage_lines
-from craftsman.workspace import Workspace, open_workspace
+from craftsman.workspace import Workspace, end_review_guard, open_workspace
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
@@ -192,6 +192,7 @@ def _prepare(args: argparse.Namespace) -> int:
         ws, ledger, args, base_sha, full_snap
     )
     if snap.is_empty:
+        end_review_guard(ws.ledger_path)  # nothing to review is a review outcome
         return _print_empty_prepare(scope, snap, full_snap)
     snap = stable_hunk_ids(ledger, snap)
     owned = _owns_gate(ws)

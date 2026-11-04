@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,23 +17,63 @@ from craftsman.records import IsolationEvidence, Ledger, format_timestamp
 HOOKS_MARKER = "review_hooks.json"
 
 
-def mark_hooks_active(ledger_path: Path, caller: GateOwner) -> None:
-    """Note that the prompt hook saw `caller`'s session invoke the review command.
+@dataclass(frozen=True)
+class ReviewMarker:
+    """What the prompt hook noted about a session that invoked the review command.
 
-    A review-only run has no gate state to say that hooks serve its session; this file does.
+    A review-only run has no gate state to say that hooks serve its session; this file does. While
+    `guarding`, the Stop hook keeps the session working until the review-only outcome exists;
+    `forced` and `best` count those reminders like the gate's continuations.
     """
-    if caller.session_id is None:
-        return
-    marker = {
-        "platform": caller.platform,
-        "session_id": caller.session_id,
-        "at": format_timestamp(datetime.now(timezone.utc)),
-    }
+
+    platform: str
+    session_id: str
+    at: str
+    guarding: bool = True
+    forced: int = 0
+    best: int | None = None
+
+    def is_of(self, caller: GateOwner) -> bool:
+        return self.platform == caller.platform and self.session_id == caller.session_id
+
+
+def read_marker(ledger_path: Path) -> ReviewMarker | None:
+    try:
+        raw = json.loads((ledger_path.parent / HOOKS_MARKER).read_text(encoding="utf-8"))
+        best = raw.get("best")
+        return ReviewMarker(
+            str(raw["platform"]),
+            str(raw["session_id"]),
+            str(raw["at"]),
+            guarding=raw.get("guarding") is True,
+            forced=int(raw.get("forced", 0)),
+            best=best if isinstance(best, int) else None,
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def write_marker(ledger_path: Path, marker: ReviewMarker) -> None:
     try:
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(ledger_path.parent / HOOKS_MARKER, json.dumps(marker) + "\n")
+        write_text_atomic(ledger_path.parent / HOOKS_MARKER, json.dumps(asdict(marker)) + "\n")
     except OSError:
         pass  # without the marker a review-only run is only advisory about isolation
+
+
+def mark_hooks_active(ledger_path: Path, caller: GateOwner) -> None:
+    """Note that the prompt hook saw `caller`'s session invoke the review command."""
+    if caller.session_id is None:
+        return
+    now = format_timestamp(datetime.now(timezone.utc))
+    write_marker(ledger_path, ReviewMarker(caller.platform, caller.session_id, now))
+
+
+def end_review_guard(ledger_path: Path, caller: GateOwner | None = None) -> None:
+    """Stop holding the session (of `caller`, if given) to a finished or abandoned review."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding and (caller is None or marker.is_of(caller)):
+        write_marker(ledger_path, replace(marker, guarding=False, forced=0, best=None))
 
 
 @dataclass(frozen=True)
@@ -61,17 +101,8 @@ class Workspace:
 
     def _hooks_saw_this_session(self) -> bool:
         caller = cli_caller(None, os.environ)
-        if caller.session_id is None:
-            return False
-        try:
-            marker = json.loads(self.hooks_marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return False
-        return (
-            isinstance(marker, dict)
-            and marker.get("platform") == caller.platform
-            and marker.get("session_id") == caller.session_id
-        )
+        marker = read_marker(self.ledger_path)
+        return marker is not None and caller.session_id is not None and marker.is_of(caller)
 
     @property
     def hooks_marker(self) -> Path:
