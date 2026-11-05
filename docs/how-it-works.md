@@ -17,7 +17,7 @@ flowchart TD
     prepare --> brief["Intent brief<br/>3-8 claims, each tied to a line"]
     brief --> hunt["Hunt: craftsman-reviewer hunters<br/>fresh context, in parallel"]
     hunt --> verify["Verify: craftsman-verifier<br/>proven, probable, question, dismissed"]
-    verify --> more{"New proven or<br/>probable finding?"}
+    verify --> more{"New proven<br/>finding?"}
     more -- "yes: wave k+1, 3 generations at most" --> hunt
     more -- no --> fix["Fix at the root cause<br/>confirm each fix"]
     fix --> recheck["review prepare: fix-delta round<br/>one fresh hunter checks for regressions"]
@@ -49,18 +49,20 @@ flowchart TD
      the risk map suggests or the orchestrator's own reading calls for. Risk signals are pattern
      matches for a few languages: a floor, not a verdict. Deep assigns every lens;
    - `craft` and `design` go to a separate simplicity hunter so they never take attention from bug
-     hunting. On Claude Code it runs on a cheaper model (`haiku`); bug hunters, verifiers and the
-     orchestrator never do;
+     hunting. On Claude Code it runs on a cheaper model (`haiku`); bug hunters and the orchestrator
+     never do;
    - 1-3 lenses per hunter, and large changes split by files (roughly 400 changed lines per hunter);
    - with two or more hunters, one also runs `sweep` over the whole diff;
    - a tiny change may get one hunter with all core lenses.
 6. **Verify.** When findings exist, `craftsman-verifier` subagents run in parallel, one per cluster
    of related findings. They merge duplicates, try to disprove each finding, reproduce it where the
-   code is runnable, and record a verdict.
-7. **Saturate.** If wave k produced a finding judged `proven` or `probable`, wave k+1 runs: one
-   variant hunter per confirmed root cause plus one fresh hunter with a different partition or unused
+   code is runnable, and record a verdict. On Claude Code, a verifier whose cluster holds only
+   `minor` or `nit` findings runs on the cheaper model (`haiku`); a cluster with any `blocker` or
+   `major` finding gets the full model, and so does a verifier resumed to confirm a fix.
+7. **Saturate.** If wave k produced a finding judged `proven` (reproduced), wave k+1 runs: one
+   variant hunter per `proven` root cause plus one fresh hunter with a different partition or unused
    lenses, told nothing about earlier findings. The hunt stops at the first wave that adds nothing
-   confirmed. Waves count as generations: a variant of a variant of a variant spawns nothing. That is
+   proven. Waves count as generations: a variant of a variant of a variant spawns nothing. That is
    at most 3 per round, and deep runs at least 2.
 8. **Fix, confirm, re-check.** Three separate jobs.
    - *Fix.* Every `proven` or `probable` finding is fixed at the root cause, with a regression test
@@ -121,7 +123,8 @@ A review costs agents times turns times context, so the inputs are kept small.
   affected hunks.
 - **Pipelining.** Where agents run in the background (Claude Code, Antigravity async subagents), a
   hunter's verifier starts when that hunter finishes, a variant hunter starts when a finding is judged
-  `proven` or `probable`, and the fresh hunter starts with wave 1. Where parallel subagents are a
+  `proven`, and the fresh hunter starts at the first `proven` verdict (with wave 1 when deep, which
+  needs a second wave anyway). Where parallel subagents are a
   barrier (Copilot), the waves stay as they are.
 - **Remaining work.** `craftsman review show --hunks` lists the hunks still to cover.
   `review show` also prints each finding's scenario and verdict evidence, so a verifier needs no

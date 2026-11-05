@@ -82,8 +82,8 @@ Guidance (deviate when the change calls for it):
   lens the risk map suggests or your reading calls for. Docs-only: `intent`, `craft`. Deep:
   every lens.
 - `craft` and `design` go to a separate **simplicity hunter**, so they never distract bug
-  hunting. On Claude Code launch it with the Agent tool's `model: "haiku"`; bug hunters,
-  verifiers and you never get a cheaper model.
+  hunting. On Claude Code launch it with the Agent tool's `model: "haiku"`. Bug hunters and you
+  always keep the full model; verifiers too, except as step 4 says.
 - 1-3 lenses per hunter. Split large changes by files so each slice stays readable (<= ~400
   changed lines per hunter).
 - With two or more hunters, one also runs `sweep` over the whole diff. A tiny change gets one
@@ -107,24 +107,30 @@ one per cluster of related findings or files (no shared root cause across cluste
 as in step 3, with its finding ids. They merge duplicates, try to disprove, reproduce, and record
 the verdicts. No findings, no verification.
 
+On Claude Code, launch a verifier whose cluster holds only `minor` or `nit` findings with the
+Agent tool's `model: "haiku"`. A cluster with any `blocker` or `major` finding gets the full model.
+Use the clusters you formed; do not split them by severity. A resumed verifier (step 6) keeps the
+model it had.
+
 Where agents run in the background (Claude Code, Antigravity async subagents), launch a hunter's
 verifier as soon as it finishes. Where parallel subagents are a barrier (Copilot), keep the waves.
 
 ## 5. Saturate
 
-If wave k produced at least one finding judged `proven` or `probable`, run wave k+1 (at most 3
+If wave k produced at least one finding judged `proven` (reproduced), run wave k+1 (at most 3
 waves per round, counted as generations: a variant of a variant of a variant spawns nothing; at
 least 2 when deep). Wave k+1 launches together:
-- one **variant hunter** per confirmed root cause, with a mini-slice instead of the whole slice:
+- one **variant hunter** per `proven` root cause, with a mini-slice instead of the whole slice:
   the root cause, its location, `craftsman review view --hunks <affected ids>`, and the task to
   grep for the same pattern across the diff and the code it touches or is touched by;
 - one **fresh hunter** with a different partition of the files, or with lenses nobody applied yet.
   Do not tell it earlier findings (it must not be anchored).
 
-When pipelining, start a variant hunter the moment a finding is judged `proven`/`probable`, and
-the fresh hunter together with wave 1.
+When pipelining, start a variant hunter the moment a finding is judged `proven`, and the fresh
+hunter at the first `proven` verdict instead of with wave 1 (when deep, with wave 1: it needs a
+second wave anyway).
 
-Verify the new findings (step 4). Stop at the first wave that adds nothing confirmed. Every hunk
+Verify the new findings (step 4). Stop at the first wave that adds nothing proven. Every hunk
 needs a `cover`: `craftsman review show --hunks` lists what is left.
 
 ## 6. Fix, confirm, re-check, test (when asked to fix, and always in a gate session)

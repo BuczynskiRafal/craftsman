@@ -54,9 +54,9 @@ All notable changes to Craftsman are recorded here. The format follows
 - **New review protocol** (`/craft-review` is the single source; `/craftsman` follows it):
   `review prepare` freezes the diff and prints a risk map, the orchestrator writes an intent brief and
   an adaptive hunt plan, and `craftsman-reviewer` hunters (recall) run in parallel, followed by
-  `craftsman-verifier` subagents (precision). While a wave produces `proven` or `probable` findings,
-  another wave runs (a variant hunter per confirmed root cause plus a fresh unanchored hunter), at most
-  3 waves per round. There is no inline-only review: every review uses a fresh-context hunter where the
+  `craftsman-verifier` subagents (precision). While a wave produces a `proven` (reproduced) finding,
+  another wave runs (a variant hunter per proven root cause plus a fresh unanchored hunter), at most
+  3 waves per round; a `probable` finding alone does not start one. There is no inline-only review: every review uses a fresh-context hunter where the
   platform has subagents. The prompts are rewritten to teach how to hunt and how to judge, and are much
   shorter.
 - **No flags for users.** `/craftsman <task>` and `/craft-review <plain words>` ("review PR 42 and fix
@@ -88,9 +88,10 @@ All notable changes to Craftsman are recorded here. The format follows
   `-` marks and `[H3]` markers, and hunter views drop the lens table and the recording cheat sheet.
   Hunters and verifiers get briefs that start with an identical shared block (served from the prompt
   cache), then the slice, then the lenses. Where agents run in the background (Claude Code, Antigravity
-  async subagents) a verifier starts when its hunter finishes, a variant hunter when a finding is judged
-  `proven` or `probable`, and the fresh hunter with wave 1; variant hunters get a mini-slice. The
-  simplicity hunter (`craft`, `design`) runs on a cheaper model on Claude Code. The orchestrator writes
+  async subagents) a verifier starts when its hunter finishes, and a variant hunter and the fresh hunter
+  when a finding is judged `proven` (the fresh hunter starts with wave 1 when deep); variant hunters get
+  a mini-slice. On Claude Code the simplicity hunter (`craft`, `design`) and every verifier whose
+  cluster holds only `minor` or `nit` findings run on a cheaper model. The orchestrator writes
   the intent brief from `git diff <base>` and the risk map, not from the full packet. The SubagentStart
   briefing carries the round, the packet path and the open work, without the packet.
 - **Fix confirmation is separate from the regression check.** A `proven` finding is confirmed by a

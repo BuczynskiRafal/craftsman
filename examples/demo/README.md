@@ -26,7 +26,7 @@ Pagination invites subtle boundary defects:
    20.
 3. **Verify.** Separate verifier subagents try to disprove each candidate and reproduce the survivors
    with `craftsman run --kind repro`, proving the boundary defects against the real code.
-4. **Saturate.** Because the hunt found confirmed defects, the agent runs another wave: variant
+4. **Saturate.** Because the hunt proved defects, the agent runs another wave: variant
    hunters look for the same mistake elsewhere, plus one fresh hunter with no knowledge of the
    earlier findings.
 5. **Stop hook.** If the agent tries to finish early, the hook sends it back with the list of what is

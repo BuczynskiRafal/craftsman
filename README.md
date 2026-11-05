@@ -70,7 +70,7 @@ Depth never goes down during a session. The final report explains what the agent
 The agent builds with no gate activity. Then the diff is frozen into a round, fresh-context hunters
 record every candidate defect with a concrete trigger, and separate verifiers try to disprove each one
 and reproduce the survivors. Hunters maximize recall; verifiers maximize precision. While a wave
-confirms defects, another one runs. Confirmed defects are fixed at the root cause, the fix delta is
+proves a defect, another one runs. Confirmed defects are fixed at the root cause, the fix delta is
 re-checked by a fresh hunter, and the tests run through `craftsman run` on the final code.
 `/craft-review` runs the same hunt on an existing change, and fixes only when you ask.
 
