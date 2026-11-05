@@ -25,9 +25,8 @@ from craftsman.diffscan import (
     reference_kind,
 )
 from craftsman.ledger import reopened_mentions
-from craftsman.lenses import LENSES, LensPick
+from craftsman.lenses import LENSES
 from craftsman.records import FieldError, Ledger, QualitySignal, Round, SignalKind
-from craftsman.text import inline_md
 
 MAX_PACKET_CHARS = 120_000
 MAX_VIEW_CHARS = 60_000
@@ -102,31 +101,11 @@ HUNKS_LEGEND = (
     "unchanged; numbers are HEAD lines; `[H3]` … `[/H3]` bracket hunk H3. More context: "
     "`craftsman review scout H3` (base version, callers, tests) or `craftsman review scout <symbol>`."
 )
-CHEAT_SHEET = (
-    "- Cover your slice (free-text note, >= 20 chars: what you examined and tried): "
-    '`craftsman review cover --hunks H1,H3-H5 --note "..."`, or `--files <paths>` for every open '
-    'hunk of those files, or `--from-json - <<\'EOF\'` with `[{"hunks": ["H1"], "note": "..."}]`',
-    "- Finding (one per root cause; several via `--from-json - <<'EOF'`): "
-    "`craftsman review add --lens <lens> --file <path> --line <n> --severity "
-    'blocker|major|minor|nit --title "..." --scenario "<trigger -> wrong outcome>" '
-    '--suggestion "..."`; duplicates of one root cause: `craftsman review merge F1 F2` (only when '
-    "ONE fix removes every consequence)",
-    "- Verdict (several via `craftsman review verdict --from-json - <<'EOF'`): "
-    '`craftsman review verdict F1 --as proven --run R1 --evidence "..."` · '
-    '`--as probable --evidence "static: <file.py:42 chain>"` (or `"no-repro: <why>; <chain>"`) · '
-    '`--as question --evidence "intent: <source>; <file.py:42 trade-off>"` · '
-    '`--as dismissed --evidence "<guard at file.py:42>"`',
-    "- Run (tests, repro, e2e): `craftsman run --kind test|e2e|repro|lint|build -- <command>`",
-    "- Progress: `craftsman review show` · gate: `craftsman review check` "
-    "(review-only: `craftsman review check --review-only`, `craftsman review report --review-only`)",
-)
-
 
 @dataclass(frozen=True)
 class PacketContext:
     snap: DiffSnapshot
     round: Round
-    picks: tuple[LensPick, ...]
     task: str
     commits: tuple[str, ...]
     conventions: tuple[str, ...]
@@ -145,7 +124,6 @@ def collect_context(
     root: Path,
     snap: DiffSnapshot,
     round_: Round,
-    picks: Sequence[LensPick],
     task: str,
     *,
     symbols: Mapping[str, tuple[str, ...]],
@@ -159,7 +137,6 @@ def collect_context(
     return PacketContext(
         snap=snap,
         round=round_,
-        picks=tuple(picks),
         task=task.strip(),
         commits=_commits(root, snap.base_sha),
         conventions=_conventions(root, snap.files),
@@ -312,15 +289,12 @@ def expand_hunk_spec(raw: str, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
 
 
 def render_packet(ctx: PacketContext) -> str:
-    """Render the packet: every hunk of the round in full."""
+    """Render the packet: every hunk of the round in full, in the same layout as a view."""
     return _render(ctx, assigned=None)
 
 
 def render_packet_view(ctx: PacketContext, *, assigned_hunks: Collection[str]) -> str:
-    """Render a per-reviewer view: its hunks in full and the other hunks as an index.
-
-    A view leaves out the lens table and the recording cheat sheet the orchestrator's packet keeps.
-    """
+    """Render a per-reviewer view: its hunks in full and the other hunks as an index."""
     return _render(ctx, assigned=frozenset(assigned_hunks))
 
 
@@ -381,21 +355,16 @@ def _omit_diffs(
 
 
 def _preamble(ctx: PacketContext, assigned: frozenset[str] | None, *, list_hints: bool = True) -> str:
-    """The opening sections; a reviewer view (`assigned` set) has no lens table or cheat sheet."""
-    if assigned is None:
-        parts = [
-            _header(ctx),
-            _intent(ctx),
-            _conventions_section(ctx),
-            _lenses_section(ctx),
-            "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
-        ]
-    else:
-        parts = [_header(ctx), _intent(ctx), _conventions_section(ctx)]
-        if ctx.unscanned_files:
-            parts.append(_unscanned_note(ctx))
-    hints = _quality_signals_section(ctx, assigned, list_hints=list_hints)
-    return "\n\n".join([*parts, hints] if hints else parts)
+    """The opening sections: only what a hunter lacks elsewhere; a section with nothing to say is left out.
+
+    Lens suggestions are in the risk map `prepare` prints, and the recording commands are in the
+    hunter's agent definition and playbooks.
+    """
+    parts = [_header(ctx), _intent(ctx), _conventions_section(ctx)]
+    if ctx.unscanned_files:
+        parts.append(_unscanned_note(ctx))
+    parts.append(_quality_signals_section(ctx, assigned, list_hints=list_hints))
+    return "\n\n".join(part for part in parts if part)
 
 
 def _assemble(
@@ -540,32 +509,19 @@ def _header(ctx: PacketContext) -> str:
 
 
 def _intent(ctx: PacketContext) -> str:
-    task = ctx.task or "(not recorded — infer from commits and diff)"
-    commits = (
-        "\n".join(f"- {commit}" for commit in ctx.commits) or "- (none — the change is uncommitted)"
-    )
-    return f"## Intent\n**Task:** {task}\n\n**Commits since base:**\n{commits}"
+    """The task and the commits since base, whichever exist."""
+    parts = []
+    if ctx.task:
+        parts.append(f"**Task:** {ctx.task}")
+    if ctx.commits:
+        parts.append("**Commits since base:**\n" + "\n".join(f"- {commit}" for commit in ctx.commits))
+    return "## Intent\n" + "\n\n".join(parts) if parts else ""
 
 
 def _conventions_section(ctx: PacketContext) -> str:
-    listed = "\n".join(f"- {path}" for path in ctx.conventions) or "- (none found)"
-    return f"## Conventions to read first\n{listed}"
-
-
-def _lenses_section(ctx: PacketContext) -> str:
-    rows = ["| Lens | Why suggested | Focus |", "| :--- | :--- | :--- |"]
-    for pick in ctx.picks:
-        rows.append(
-            f"| `{pick.lens.id}` — {pick.lens.title} | {inline_md(pick.reason, table=True)} | {pick.lens.focus} |"
-        )
-    section = "## Suggested lenses\n" + "\n".join(rows)
-    if ctx.unscanned_files:
-        files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
-        section += (
-            f"\n\nNot scanned for risk signals (no patterns for their language): {files}. "
-            "No signal there does not mean no risk."
-        )
-    return section
+    if not ctx.conventions:
+        return ""
+    return "## Conventions to read first\n" + "\n".join(f"- {path}" for path in ctx.conventions)
 
 
 def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
@@ -784,8 +740,11 @@ def _symbol_lines(
                 lines.append(f"- `{symbol}`: (shown at {owner})")
                 continue
             refs = ctx.references.get(symbol, ())
-            lines.append(_reference_line(symbol, refs, trim=symbol in trimmed_symbols))
-            test_files = ctx.test_files_by_symbol.get(symbol, ())
+            trim = symbol in trimmed_symbols
+            lines.append(_reference_line(symbol, refs, trim=trim))
+            # A test file already named by a listed reference, or the file of the hunk, adds nothing.
+            known = {ref.path for ref in _listed_references(refs, trim=trim)} | {hunk.path}
+            test_files = [path for path in ctx.test_files_by_symbol.get(symbol, ()) if path not in known]
             if test_files:
                 lines.append(f"Tests referencing `{symbol}`: " + ", ".join(f"`{p}`" for p in test_files))
     open_ids = [h.id for h in ctx.snap.hunks if h.id not in ctx.carried_from]
@@ -794,8 +753,12 @@ def _symbol_lines(
     return lines
 
 
+def _listed_references(refs: Sequence[Reference], *, trim: bool) -> Sequence[Reference]:
+    return refs[: TRIMMED_REFERENCES_PER_SYMBOL if trim else MAX_REFERENCES_PER_SYMBOL]
+
+
 def _reference_line(symbol: str, refs: Sequence[Reference], *, trim: bool) -> str:
-    shown = refs[: TRIMMED_REFERENCES_PER_SYMBOL if trim else MAX_REFERENCES_PER_SYMBOL]
+    shown = _listed_references(refs, trim=trim)
     listed = " · ".join(
         f"{inline_code(f'{ref.path}:{ref.line}')} {inline_code(ref.text)}" for ref in shown
     )

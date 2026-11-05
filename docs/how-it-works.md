@@ -111,9 +111,10 @@ H7)`. Inside a gate session, `--deep` raises the gate for good. Depth never goes
 A review costs agents times turns times context, so the inputs are kept small.
 
 - **Packet.** Each hunk appears once, inside its enclosing scope at HEAD, with `+` and `-` marks on
-  the changed lines and `[H3]` markers around each hunk. A `review view` (what a hunter reads) is
-  slimmer than the packet the orchestrator uses: it drops the lens table and the recording cheat
-  sheet and keeps each hunk's risk signals.
+  the changed lines and `[H3]` markers around each hunk, plus callers, tests and the hunk's risk
+  signals. It has no lens table or recording cheat sheet (the risk map and the hunter's agent
+  definition already carry them), so a small diff costs a hunter little more than its code context.
+  A `review view` is the same layout for some of the hunks.
 - **Scout.** `craftsman review scout <H#|path:line|symbol>` answers with code, deterministically and
   without a model: the base version of the enclosing scope, callers, and tests, capped at 12,000
   characters. Hunters ask the scout before opening whole files.

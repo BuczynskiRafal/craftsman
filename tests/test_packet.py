@@ -20,7 +20,6 @@ from craftsman.diffscan import (
     resolve_base_sha,
     snapshot,
 )
-from craftsman.lenses import select_lenses
 from craftsman.packet import (
     PacketContext,
     collect_context,
@@ -56,14 +55,6 @@ def round_for(snap: DiffSnapshot, *, carried: frozenset[str] = frozenset()) -> R
     )
 
 
-def picks() -> tuple[Any, ...]:
-    return tuple(
-        pick
-        for pick in select_lenses({}, deep=False, docs_only=False)
-        if pick.lens.id in ("intent", "sweep")
-    )
-
-
 def build_context(*hunks: Hunk, **overrides: Any) -> PacketContext:
     """A context for `hunks` (default: H1) with no scopes, symbols or references unless given."""
     shown = hunks or (H1,)
@@ -71,7 +62,6 @@ def build_context(*hunks: Hunk, **overrides: Any) -> PacketContext:
     fields: dict[str, Any] = {
         "snap": snap,
         "round": round_for(snap, carried=frozenset(overrides.get("carried_from", {}))),
-        "picks": picks(),
         "task": "",
         "commits": (),
         "conventions": (),
@@ -101,7 +91,6 @@ class CollectContextTests(unittest.TestCase):
             self.repo.root,
             snap,
             round_for(snap),
-            picks(),
             "task",
             symbols=symbols,
             ledger=ledger or Ledger(),
@@ -202,11 +191,22 @@ class CollectContextTests(unittest.TestCase):
 
     def test_tests_referencing_changed_symbol_are_listed(self) -> None:
         self.repo.write("tests/test_calc.py", "from calc import compute_total\n")
+        for index in range(7):  # more calls than the packet lists: the test file is cut from them
+            self.repo.write(f"a{index}.py", "result = compute_total([1])\n")
         base = self.edit_compute_total()
 
         text = render_packet(self.context(base))
 
         self.assertIn("Tests referencing `compute_total`: `tests/test_calc.py`", text)
+
+    def test_a_test_file_named_by_a_listed_reference_is_not_repeated(self) -> None:
+        self.repo.write("tests/test_calc.py", "from calc import compute_total\n")
+        base = self.edit_compute_total()
+
+        text = render_packet(self.context(base))
+
+        self.assertIn("`tests/test_calc.py:1`", text)
+        self.assertNotIn("Tests referencing", text)
 
     def test_tests_are_found_behind_many_production_callers(self) -> None:
         for index in range(12):
@@ -280,7 +280,7 @@ class RenderTests(unittest.TestCase):
         scope = Scope("pkg/a.py", "f", "function", 1, 50, "\n".join(f"line {i}" for i in range(50)))
         ctx = build_context(scopes={"H1": scope})
 
-        with mock.patch.object(packet, "MAX_PACKET_CHARS", 1500):
+        with mock.patch.object(packet, "MAX_PACKET_CHARS", 900):
             text = render_packet(ctx)
 
         self.assertIn("Enclosing scope omitted for size — open pkg/a.py:L1–L50", text)
@@ -662,12 +662,12 @@ class ViewDietTests(unittest.TestCase):
         ctx = replace(base, round=replace(base.round, signals=signals), unscanned_files=("db/x.sql",))
         return render_packet_view(ctx, assigned_hunks=("H1",)), render_packet(ctx)
 
-    def test_a_view_has_neither_the_lens_table_nor_the_recording_cheat_sheet(self) -> None:
+    def test_neither_a_view_nor_the_packet_has_the_lens_table_or_the_recording_cheat_sheet(self) -> None:
         view, whole = self.view_and_packet()
 
         for text in ("## Suggested lenses", "## Recording cheat sheet", "craftsman review cover"):
             self.assertNotIn(text, view)
-            self.assertIn(text, whole)
+            self.assertNotIn(text, whole)
 
     def test_a_view_keeps_the_risk_signals_of_its_hunks_with_their_lenses(self) -> None:
         view, _ = self.view_and_packet()
@@ -681,10 +681,11 @@ class ViewDietTests(unittest.TestCase):
         self.assertNotIn("**S2**", view)
         self.assertIn("**S2**", whole)
 
-    def test_a_view_keeps_the_note_about_files_without_signal_patterns(self) -> None:
-        view, _ = self.view_and_packet()
+    def test_a_view_and_the_packet_keep_the_note_about_files_without_signal_patterns(self) -> None:
+        view, whole = self.view_and_packet()
 
-        self.assertIn("Not scanned for risk signals (no patterns for their language): `db/x.sql`", view)
+        for text in (view, whole):
+            self.assertIn("Not scanned for risk signals (no patterns for their language): `db/x.sql`", text)
 
     def test_a_view_points_at_the_scout(self) -> None:
         view, _ = self.view_and_packet()
@@ -711,13 +712,11 @@ class LayoutTests(unittest.TestCase):
         headings = [line for line in render_packet(self.context()).splitlines() if line.startswith("#")]
 
         self.assertEqual(
-            headings[:7],
+            headings[:5],
             [
                 "# Craftsman review packet — round 2",
                 "## Intent",
                 "## Conventions to read first",
-                "## Suggested lenses",
-                "## Recording cheat sheet",
                 "## Hunks",
                 "### H1 · `pkg/a.py` L1–L2 · modified · signals: errors (→ failure)",
             ],
@@ -732,6 +731,58 @@ class LayoutTests(unittest.TestCase):
         text = render_packet(self.context())
 
         self.assertIn("````diff\n@@ -1,1 +1,2 @@ def f():\n x = 1\n+y = ```\n````", text)
+
+
+class LeanPacketTests(unittest.TestCase):
+    """A small diff costs a hunter its code context and little else."""
+
+    SCOPE = Scope("pkg/a.py", "f", "function", 1, 3, "def f():\n    x = 1\n    return x")
+    REFS = {"f": (Reference("pkg/use.py", 7, "f()"),)}
+
+    def small(self, **overrides: Any) -> PacketContext:
+        fields: dict[str, Any] = {
+            "scopes": {"H1": self.SCOPE},
+            "symbols": {"H1": ("f",)},
+            "references": self.REFS,
+            "signals_by_hunk": {"H1": ("errors",)},
+        }
+        return build_context(**{**fields, **overrides})
+
+    def test_a_small_packet_opens_with_its_header_and_then_the_hunks(self) -> None:
+        text = render_packet(self.small())
+
+        self.assertRegex(text, r"\A# Craftsman review packet — round 2\nBase `b+` · [^\n]*\n\n## Hunks\n")
+
+    def test_sections_with_nothing_to_say_are_left_out(self) -> None:
+        text = render_packet(self.small())
+
+        for placeholder in ("## Intent", "## Conventions", "(none", "(not recorded", "Commits since base"):
+            self.assertNotIn(placeholder, text)
+
+    def test_the_task_commits_and_conventions_appear_when_there_are_some(self) -> None:
+        text = render_packet(self.small(task="Add f", commits=("abc1234 feat: f",), conventions=("AGENTS.md",)))
+
+        self.assertIn("## Intent\n**Task:** Add f\n\n**Commits since base:**\n- abc1234 feat: f", text)
+        self.assertIn("## Conventions to read first\n- AGENTS.md", text)
+        self.assertNotIn("(not recorded", render_packet(self.small(commits=("abc1234 feat: f",))))
+        self.assertNotIn("Commits since base", render_packet(self.small(task="Add f")))
+
+    def test_a_small_packet_has_no_lens_table_or_cheat_sheet_but_all_the_code_context(self) -> None:
+        text = render_packet(self.small(test_files_by_symbol={"f": ("tests/test_a.py",)}))
+
+        for dropped in ("Suggested lenses", "cheat sheet", "craftsman review add", "craftsman review cover"):
+            self.assertNotIn(dropped, text)
+        self.assertIn("signals: errors (→ failure)", text)
+        self.assertIn("Scope: `f` (function, L1–L3)", text)
+        self.assertIn("def f():", text)
+        self.assertIn("[H1]", text)
+        self.assertIn("- `f`: `pkg/use.py:7` `f()`", text)
+        self.assertIn("Tests referencing `f`: `tests/test_a.py`", text)
+
+    def test_a_view_of_every_hunk_is_the_packet(self) -> None:
+        ctx = self.small()
+
+        self.assertEqual(render_packet_view(ctx, assigned_hunks=("H1",)), render_packet(ctx))
 
 
 class HunkSpecTests(unittest.TestCase):

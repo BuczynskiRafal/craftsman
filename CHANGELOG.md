@@ -85,7 +85,9 @@ All notable changes to Craftsman are recorded here. The format follows
   always included (subject to the trimming ladder), callers are capped at 6 per symbol instead of 3,
   and risk signals show per hunk with the lenses they suggest.
 - **Cheaper reviews.** The packet shows each hunk once, inside its enclosing scope at HEAD, with `+` and
-  `-` marks and `[H3]` markers, and hunter views drop the lens table and the recording cheat sheet.
+  `-` marks and `[H3]` markers. The packet and the hunter views share one layout with no lens table, no
+  recording cheat sheet and no empty sections, which makes a small diff's packet about 30% smaller; test
+  files a listed caller already names are not repeated.
   Hunters and verifiers get briefs that start with an identical shared block (served from the prompt
   cache), then the slice, then the lenses. Where agents run in the background (Claude Code, Antigravity
   async subagents) a verifier starts when its hunter finishes, and a variant hunter and the fresh hunter

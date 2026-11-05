@@ -242,9 +242,7 @@ def _prepare(args: argparse.Namespace) -> int:
     packet = Path(round_.packet_path)
     picks = _lens_picks(round_, snap)
     if created or not packet.is_file():
-        ctx = _packet_context(
-            ws, snap, ledger, round_, index, symbols, task=args.task or ws.task, picks=picks
-        )
+        ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=args.task or ws.task)
         _write_text(packet, render_packet(ctx))
     hint = None if round_.deep else deep_hint(detect_deep_hint_signals(snap.only(round_.open_hunk_ids).hunks))
     _print_prepare_summary(round_, packet, snap, picks, hint, created=created, raised=raised)
@@ -502,14 +500,12 @@ def _packet_context(
     symbols: Mapping[str, tuple[str, ...]],
     *,
     task: str,
-    picks: Sequence[LensPick] | None = None,
 ) -> PacketContext:
-    """What the packet of `round_` shows, with the lenses suggested for the round."""
+    """What the packet of `round_` shows."""
     return collect_context(
         ws.root,
         snap,
         round_,
-        _lens_picks(round_, snap) if picks is None else picks,
         task,
         symbols=symbols,
         ledger=ledger,
