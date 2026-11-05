@@ -204,6 +204,29 @@ class StateFileTests(unittest.TestCase):
             load_state(self.path)
 
 
+class ContinuationPromptTests(unittest.TestCase):
+    def test_prompts_the_platform_sends_on_the_sessions_behalf_are_continuations(self) -> None:
+        for prompt in (
+            'Another Claude session sent a message:\n<agent-message from="a1">done</agent-message>',
+            '  \n<agent-message from="a1">done</agent-message>',
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
+            "\t <task-notification>x</task-notification>",
+        ):
+            with self.subTest(prompt=prompt[:40]):
+                self.assertTrue(is_continuation_prompt(prompt))
+
+    def test_the_users_own_words_are_not(self) -> None:
+        for prompt in (
+            "thanks, now rename the variable",
+            "please explain what an <agent-message> block is",
+            "Another session? No: sent a message is not it.",
+            "/craft-review the cart",
+            "",
+        ):
+            with self.subTest(prompt=prompt[:40]):
+                self.assertFalse(is_continuation_prompt(prompt))
+
+
 class DecideStopTests(RepoTestCase):
     def setUp(self) -> None:
         super().setUp()

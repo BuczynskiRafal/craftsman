@@ -15,7 +15,6 @@ from craftsman.diffscan import DiffSnapshot
 from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
     REVIEWER_AGENT,
-    AgentEvent,
     IsolationEvidence,
     Ledger,
     LedgerError,
@@ -322,60 +321,67 @@ class _ReviewerRun:
     records: tuple[str, ...] | None  # None: no transcript evidence, so records go by time
 
     def vouches_for(self, token: str, recorded_at: datetime) -> bool:
-        if self.records is not None:
-            return token in self.records
-        return self.started <= recorded_at <= self.stopped
+        """Whether this run wrote the record `token` names, made at `recorded_at`.
+
+        By time always: nobody writes a record before it started or after it stopped, so a reviewer
+        resumed across `review reset` (which restarts the numbering) cannot claim a new record with
+        an old token. By identity as well where the transcript was read.
+        """
+        if not self.started <= recorded_at <= self.stopped:
+            return False
+        return self.records is None or token in self.records
 
 
 def _reviewer_runs(ledger: Ledger) -> list[_ReviewerRun]:
     """Every finished `craftsman-reviewer` run.
 
-    A stop with an agent id starts at the latest start of that id. A stop without one is paired
-    first-in, first-out with the unpaired starts of its name, so parallel runs of one name keep
-    their union window. A stop without a start counts from the round that was current.
+    A stop with an agent id starts at the latest start of that id, which then leaves the queue of
+    unpaired starts. Any other stop (no id, or an id no start carries, as Copilot starts by name
+    only) is paired first-in, first-out with the unpaired starts of its name, so parallel runs of
+    one name keep their union window. A stop without a start counts from the round that was current.
     """
     runs: list[_ReviewerRun] = []
-    unpaired: dict[str, list[datetime]] = {}
+    starts: list[tuple[str, str, datetime]] = []  # (agent name, agent id, when)
+    taken: set[int] = set()  # indexes into `starts` that a stop has claimed
     for event in ledger.agents:
         if event.event == "start":
-            unpaired.setdefault(event.agent, []).append(parse_timestamp(event.at))
+            starts.append((event.agent, event.agent_id, parse_timestamp(event.at)))
         elif agent_role(event.agent) == "reviewer":
             stopped = parse_timestamp(event.at)
-            if event.agent_id:
-                started = _reviewer_run_started(ledger, event)
+            by_id = [i for i, (_, agent_id, _) in enumerate(starts) if event.agent_id and agent_id == event.agent_id]
+            by_name = [i for i, (name, _, _) in enumerate(starts) if name == event.agent and i not in taken]
+            chosen = by_id[-1] if by_id else by_name[0] if by_name else None
+            if chosen is not None:
+                taken.add(chosen)
+                started = starts[chosen][2]
             else:
-                started = unpaired[event.agent].pop(0) if unpaired.get(event.agent) else None
-            if started is None:
                 current = [r for r in ledger.rounds if parse_timestamp(r.prepared_at) <= stopped]
                 started = parse_timestamp(current[-1].prepared_at) if current else stopped
             runs.append(_ReviewerRun(started, stopped, event.records))
     return runs
 
 
-def _reviewer_run_started(ledger: Ledger, stop: AgentEvent) -> datetime | None:
-    """When the reviewer run of the agent id that ended with `stop` started, if a start says so."""
-    stop_at = parse_timestamp(stop.at)
-    starts = [
-        parse_timestamp(event.at)
-        for event in ledger.agents
-        if event.event == "start" and event.agent_id == stop.agent_id and parse_timestamp(event.at) <= stop_at
-    ]
-    return max(starts, default=None)
+def _record_times(ledger: Ledger) -> dict[str, datetime]:
+    """When each record was made, by token: `C<n>` is `ledger.coverage[n - 1]`, `F<n>` the finding."""
+    times = {f"C{index}": parse_timestamp(item.recorded_at) for index, item in enumerate(ledger.coverage, 1)}
+    times.update({item.id: parse_timestamp(item.recorded_at) for item in ledger.findings})
+    return times
 
 
 def _latest_has_reviewer(ledger: Ledger, runs: Sequence[_ReviewerRun]) -> bool:
-    """Whether a reviewer finished, having recorded something, while the latest round was current."""
+    """Whether a reviewer finished, having recorded something, while the latest round was current.
+
+    Where a run's transcript was read, one of its own records must date from this round and from
+    the run's window: a run whose tokens all belong to an earlier round does not count. Tokens no
+    record carries are ignored.
+    """
     start = parse_timestamp(ledger.rounds[-1].prepared_at)
-    recorded = [parse_timestamp(item.recorded_at) for item in ledger.coverage] + [
-        parse_timestamp(item.recorded_at) for item in ledger.findings
-    ]
+    times = _record_times(ledger)
     for run in runs:
         if run.stopped < start:
             continue
-        if run.records is not None:
-            if run.records:
-                return True
-        elif any(max(start, run.started) <= at <= run.stopped for at in recorded):
+        mine = times.values() if run.records is None else [times[t] for t in run.records if t in times]
+        if any(max(start, run.started) <= at <= run.stopped for at in mine):
             return True
     return False
 
@@ -445,8 +451,9 @@ def _isolation_issues(ledger: Ledger, policy: GatePolicy) -> list[GateIssue]:
         listed = _listed(outside)
         latest.append(
             f"Hunks {listed} of round {latest_number} were covered outside any finished "
-            f"{REVIEWER_AGENT} run. A reviewer still running counts once it finishes; otherwise a "
-            f"{REVIEWER_AGENT} must examine them and record its own coverage "
+            f"{REVIEWER_AGENT} run. Only a {REVIEWER_AGENT}'s own coverage counts, once it finishes: "
+            f"if the reviewer covering these hunks is still running, wait for it; otherwise have a "
+            f"{REVIEWER_AGENT} examine them and record its own coverage "
             f'(`craftsman review cover --hunks {",".join(outside[:MAX_LISTED_HUNKS])} --note "..."`).'
         )
     messages = [" ".join(latest)] if latest else []

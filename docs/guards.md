@@ -44,13 +44,16 @@ session that invoked it, and the Stop hook holds that session to the review-only
   `craftsman review check --review-only`. Hooks count as evidence when the marker names the session the command runs in
   (Claude Code only; other platforms export no session id to commands) or when a reviewer or verifier event arrived
   after the current round was prepared. Events of an earlier session prove nothing about this one.
+- The guard ends when the user moves on to another request, not when the platform speaks for the session: a stop hook's
+  own block reason and a background subagent's report (`<task-notification>`, `Another Claude session sent a message:`)
+  leave it armed.
 - Running `craftsman review prepare` counts as starting the review even when the diff is unchanged or the depth was
   only raised.
 - While a Craftsman reviewer or verifier that started in this review has not stopped (a background subagent), the guard
   lets the agent wait for it: its completion wakes the session, and no reminder is spent.
 - Otherwise a review with hunks uncovered, findings without a verdict, no reviewer run or hunks covered outside any
   reviewer run is sent back, up to six times without progress. Coverage must come from a `craftsman-reviewer`, which
-  Claude Code attributes by the reviewer's own transcript and other platforms by time; findings may come from anyone.
+  Claude Code attributes by the reviewer's own transcript within its run's time window, and other platforms (or an unclear transcript) by time alone; findings may come from anyone.
 
 ---
 

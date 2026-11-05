@@ -29,6 +29,9 @@ ROLE_LABELS: Mapping[AgentRole, str] = {"reviewer": "hunters", "verifier": "veri
 # What a successful recording call prints; see `review._record_coverage` and `review._add_one`.
 _COVERAGE_TOKEN_RE = re.compile(r"Coverage recorded \((C\d+)\)")
 _FINDING_TOKEN_RE = re.compile(r"\b(F\d+) recorded \(")
+# A `craftsman review cover|add` invocation, however it is spelled: `craftsman`, `craftsman.exe`,
+# `python3 -m craftsman.cli`, `scripts/craftsman-cli.py`, with any spacing.
+_RECORDING_CALL_RE = re.compile(r"craftsman\S*\s+review\s+(?:cover|add)\b")
 # Output of a recording call that recorded nothing, which is not a failure to read it.
 _NOTHING_RECORDED = ("Nothing to record", "Check passed")
 _TOKEN_KEYS = (
@@ -73,8 +76,10 @@ class TranscriptFacts:
     """What one transcript tells: the agent's usage and the records it made.
 
     `records` is None when the transcript cannot vouch for them: it was unreadable, oversized, had
-    a line that is not JSON, or a recording call whose outcome is unclear (no result, or output
-    that shows neither a token nor that nothing was recorded, e.g. because it was piped away).
+    a line that is not JSON, a recording call whose outcome is unclear (no result, or output
+    that shows neither a token nor that nothing was recorded, e.g. because it was piped away), or a
+    token anywhere in the text that no recognized recording call printed (a call shape this reader
+    does not know), so it fails safe to the time window instead of proving the agent recorded nothing.
     """
 
     usage: AgentUsage | None = None
@@ -106,9 +111,12 @@ def _read_transcript(path: Path) -> TranscriptFacts:
     active_s = 0.0
     calls: set[str] = set()  # recording calls still waiting for their result
     tokens: list[str] = []
+    mentioned: set[str] = set()  # every token the raw text shows, from any kind of entry
     vouched = True
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
+            mentioned.update(_COVERAGE_TOKEN_RE.findall(line))
+            mentioned.update(_FINDING_TOKEN_RE.findall(line))
             entry = _entry(line)
             if entry is None:
                 vouched = vouched and not line.strip()
@@ -134,7 +142,8 @@ def _read_transcript(path: Path) -> TranscriptFacts:
                     seen[name] = max(seen[name], value)
             else:
                 anonymous.append(counts)
-    records = tuple(dict.fromkeys(tokens)) if vouched and not calls else None
+    vouched = vouched and not calls and mentioned.issubset(tokens)
+    records = tuple(dict.fromkeys(tokens)) if vouched else None
     messages = [*by_message.values(), *anonymous]
     if not messages:
         return TranscriptFacts(None, records)
@@ -181,7 +190,7 @@ def _follow_recording_calls(content: Any, calls: set[str], tokens: list[str]) ->
 
 def _is_recording_call(tool_input: Any) -> bool:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    return isinstance(command, str) and ("review cover" in command or "review add" in command)
+    return isinstance(command, str) and _RECORDING_CALL_RE.search(command) is not None
 
 
 def _result_text(content: Any) -> str:

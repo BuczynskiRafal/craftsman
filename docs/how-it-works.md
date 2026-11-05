@@ -200,8 +200,10 @@ The gate reports an issue list. It passes when the list is empty:
 
 - **Isolation is checked per round.** Coverage must come from a `craftsman-reviewer`: every hunk a round's
   coverage holds needs a finished reviewer behind at least one of its records. Claude Code hands over the
-  reviewer's own transcript, so the records it printed (`Coverage recorded (C3)`) are credited to it; where
-  the platform gives no transcript, a record counts when it was made while a reviewer ran. The latest round
+  reviewer's own transcript, so the records it printed (`Coverage recorded (C3)`) are credited to it, provided they were made inside its run; where
+  the platform gives no transcript, or the transcript shows a token that no recognized recording call printed,
+  a record counts when it was made while a reviewer ran. A stop whose agent id matches no start is paired
+  first-in, first-out with the unpaired starts of its agent name. The latest round
   with non-carried hunks also needs a reviewer that finished and recorded something while it was current.
   A round replaced before anything was covered in it needs none. Findings may come from anyone (the
   orchestrator records intent findings itself; verifiers judge every one). A reviewer must record coverage

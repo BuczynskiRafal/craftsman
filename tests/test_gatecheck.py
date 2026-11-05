@@ -553,6 +553,9 @@ class CoverageAttributionTests(unittest.TestCase):
         self.assertEqual(codes(report), ["no-isolation"])
         message = report.issues[0].message
         self.assertIn("Hunks H1,H2 of round 1 were covered outside any finished craftsman-reviewer run", message)
+        self.assertIn("Only a craftsman-reviewer's own coverage counts, once it finishes", message)
+        self.assertIn("if the reviewer covering these hunks is still running, wait for it", message)
+        self.assertNotIn("A reviewer still running counts", message)
         self.assertIn("craftsman review cover --hunks H1,H2", message)
         self.assertNotIn("reset", message)
         self.assertNotIn("spawn", message)
@@ -629,6 +632,70 @@ class CoverageAttributionTests(unittest.TestCase):
         report = self.check(ledger)
 
         self.assertTrue(report.passed, render_report(report))
+
+    def test_a_token_whose_record_lies_outside_the_run_window_is_not_credited(self) -> None:
+        for covered_at in (2, 40):  # before the run started, after it stopped
+            with self.subTest(covered_at=covered_at):
+                ledger = self.run_events(self.one_round(covered_at), 5, 30, records=("C1",))
+
+                report = self.check(ledger)
+
+                self.assertEqual(codes(report), ["no-isolation"])
+                self.assertIn("No independent review finished", report.issues[0].message)
+
+    def test_a_resumed_reviewer_cannot_claim_a_new_record_with_an_old_token(self) -> None:
+        ledger = self.run_events(self.one_round(10), 5, 30, records=("C1",))  # the run's own C1
+        reset = replace(ledger, coverage=(replace(ledger.coverage[0], recorded_at=shifted(T0, 60)),))  # C1 after a reset
+
+        self.assertTrue(self.check(ledger).passed)
+        self.assertEqual(codes(self.check(reset)), ["no-isolation"])
+
+    def test_the_latest_round_ignores_a_run_whose_tokens_all_predate_it(self) -> None:
+        ledger = RoundIsolationTests().two_rounds()  # round 1 prepared at 0, round 2 at 100; C1 at 10, C2 at 110
+        ledger = add_agent_event(add_agent_event(ledger, agent_event("start", 5, "a")), agent_event("stop", 120, "a", ("C1",)))
+
+        report = evaluate(ledger, changed_snap("fp2"), ISOLATED)
+
+        self.assertEqual(codes(report), ["no-isolation"])
+        self.assertIn("No independent review finished since round 2 was prepared", report.issues[0].message)
+
+    def test_the_latest_round_counts_a_run_with_one_of_its_own_current_records(self) -> None:
+        ledger = RoundIsolationTests().two_rounds()
+        for tokens in (("C1", "C2"), ("C9", "C1", "F9", "C2")):
+            with self.subTest(tokens=tokens):
+                events = add_agent_event(add_agent_event(ledger, agent_event("start", 5, "a")), agent_event("stop", 120, "a", tokens))
+
+                self.assertTrue(evaluate(events, changed_snap("fp2"), ISOLATED).passed)
+
+    def test_tokens_no_record_carries_are_ignored(self) -> None:
+        ledger = self.run_events(self.one_round(10), 5, 30, records=("C9", "F9"))
+
+        self.assertEqual(codes(self.check(ledger)), ["no-isolation"])
+
+    def test_a_stop_with_an_id_no_start_carries_pairs_with_the_unpaired_starts_of_its_name(self) -> None:
+        for covered_at, passes in ((6, False), (10, True)):  # before the reviewer started, while it ran
+            with self.subTest(covered_at=covered_at):
+                ledger = add_agent_event(self.one_round(covered_at), agent_event("start", 8, ""))
+                ledger = add_agent_event(ledger, agent_event("stop", 20, "copilot-id"))  # Copilot: start by name only
+
+                self.assertEqual(self.check(ledger).passed, passes)
+
+    def test_a_start_taken_by_an_id_match_is_not_paired_again(self) -> None:
+        ledger = self.one_round(6)
+        for kind, seconds, agent_id, records in (
+            ("start", 5, "a", None),
+            ("start", 8, "b", None),
+            ("stop", 20, "a", ("F9",)),  # takes the start at 5
+            ("stop", 25, "", None),  # pairs with the start at 8, so C1 at 6 is not its
+        ):
+            ledger = add_agent_event(ledger, agent_event(kind, seconds, agent_id, records))
+
+        self.assertEqual(codes(self.check(ledger)), ["no-isolation"])
+
+    def test_a_stop_with_no_start_at_all_counts_from_the_round_that_was_current(self) -> None:
+        ledger = add_agent_event(self.one_round(6), agent_event("stop", 20, "x"))
+
+        self.assertTrue(self.check(ledger).passed)
 
     def test_a_record_in_an_earlier_round_is_judged_in_its_own_round(self) -> None:
         ledger = self.run_events(RoundIsolationTests().two_rounds(), 100, 120, records=("C2",))

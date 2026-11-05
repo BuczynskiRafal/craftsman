@@ -27,9 +27,15 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Claude Code reviewers are identified by their own transcript, not by time.** `review cover` prints a token
   (`Coverage recorded (C12): ...`, as findings print `F3 recorded`), and the stop hook stores the tokens the
   reviewer's own transcript shows on its stop event, so the orchestrator's records written while a background
-  reviewer runs no longer count as the reviewer's. Without a readable transcript (Copilot, Antigravity, an unclear
-  call) the gate falls back to the reviewer's start-to-stop window; parallel runs without agent ids are paired first
-  in, first out.
+  reviewer runs no longer count as the reviewer's. A record counts only inside its reviewer's start-to-stop window.
+  The reader fails safe: without a readable transcript (Copilot, Antigravity) or with a token that no recognized
+  `review cover|add` call printed, the gate goes by the window alone instead of concluding the reviewer recorded
+  nothing. A stop whose start cannot be matched by agent id (Copilot starts by name only) pairs first in, first out
+  with the unpaired starts of its name.
+- **A background agent's report no longer ends the review guard.** Claude Code delivers a background subagent's
+  report as a prompt, which the prompt hook took for the user moving on: it disarmed the `/craft-review` stop guard
+  (a session could then stop with findings unjudged) and reset an active gate's continuation count. Such prompts
+  now count as the platform's, like a stop hook's continuation.
 - **Agent time counts active time.** A subagent's `duration_s` adds up the gaps between transcript entries of
   at most 5 minutes instead of spanning first to last entry, so a resumed agent no longer counts the time it
   sat idle between runs.

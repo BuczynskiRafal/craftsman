@@ -423,6 +423,30 @@ class ReviewStopGuardTests(HookTestCase):
 
         self.assertTrue(self.guarding())
 
+    def test_a_background_agents_report_keeps_the_guard_and_blocks_the_next_stop(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")
+        self.repo.cover_all()
+        self.add_finding()  # no verdict yet
+        self.run_reviewer()
+        reports = (
+            'Another Claude session sent a message:\n<agent-message from="a1">Hunt done: F1</agent-message>',
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
+        )
+        for report in reports:
+            with self.subTest(report=report[:30]):
+                self.prompt(report)
+
+                self.assertTrue(self.guarding())
+                self.assertIn("[no-verdict]", self.stop()["reason"])
+
+    def test_an_ordinary_prompt_that_mentions_agent_message_ends_the_guard(self) -> None:
+        self.begin_review()
+
+        self.prompt("thanks, now explain the <agent-message> format")
+
+        self.assertEqual(self.stop(), {})
+
     def test_nothing_to_review_is_an_outcome(self) -> None:
         self.prompt("/craft-review")
 

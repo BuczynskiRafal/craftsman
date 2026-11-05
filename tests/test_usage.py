@@ -77,11 +77,61 @@ class ReadRecordsTests(TranscriptCase):
             tool_result("t2", [{"type": "text", "text": "F2 recorded (major, intent, a.py:1)\nL1: x"}]),
             shell_call("t3", "craftsman review cover --from-json -"),
             tool_result("t3", "Coverage recorded (C4): H2 in round 1\nCoverage recorded (C5): cart.py in round 1"),
-            shell_call("t4", "craftsman review show --json"),
-            tool_result("t4", "Coverage recorded (C9)"),  # not a recording call
         )
 
         self.assertEqual(records, ("C3", "F2", "C4", "C5"))
+
+    def test_the_recording_call_is_recognized_by_its_shape_not_its_spelling(self) -> None:
+        commands = (
+            "craftsman  review   cover --hunks H1 --note x",
+            "python3 -m craftsman.cli review cover --hunks H1 --note x",
+            "cd /repo && scripts/craftsman-cli.py review cover --hunks H1 --note x",
+            "craftsman.exe review cover --hunks H1 --note x",
+        )
+        for number, command in enumerate(commands, 1):
+            with self.subTest(command=command):
+                records = self.records(shell_call("t1", command), tool_result("t1", f"Coverage recorded (C{number}): H1"))
+
+                self.assertEqual(records, (f"C{number}",))
+
+    def test_a_command_that_merely_mentions_a_recording_call_must_still_show_a_token(self) -> None:
+        searching = self.records(
+            shell_call("t1", 'grep -rn "craftsman review cover" docs'), tool_result("t1", "docs/a.md:3: ...")
+        )
+        mentioning = self.records(shell_call("t1", 'grep "review cover" notes.txt'), tool_result("t1", "none"))
+
+        self.assertIsNone(searching)  # looks like a recording call with an unreadable outcome
+        self.assertEqual(mentioning, ())  # not one, and no token anywhere
+
+    def test_a_token_that_only_an_unrecognized_call_printed_makes_the_transcript_unreadable(self) -> None:
+        for command in ("craftsman review show --json", "craftsman review cvr --hunks H1 --note x"):
+            with self.subTest(command=command):
+                records = self.records(shell_call("t1", command), tool_result("t1", "Coverage recorded (C9): H1"))
+
+                self.assertIsNone(records)
+        self.assertIsNone(self.records(shell_call("t1", "ls"), tool_result("t1", "F4 recorded (major, intent, a.py:1)")))
+
+    def test_a_renamed_command_key_or_tool_use_type_fails_safe(self) -> None:
+        output = tool_result("t1", "Coverage recorded (C1): H1 in round 1")
+        renamed_key = shell_call("t1", "craftsman review cover --hunks H1 --note x")
+        renamed_key["message"]["content"][0]["input"] = {"cmd": "craftsman review cover --hunks H1 --note x"}
+        renamed_type = shell_call("t1", "craftsman review cover --hunks H1 --note x")
+        renamed_type["message"]["content"][0]["type"] = "server_tool_use"
+
+        self.assertIsNone(self.records(renamed_key, output))
+        self.assertIsNone(self.records(renamed_type, output))
+
+    def test_tokens_the_reviewer_quotes_in_its_final_message_are_already_recognized(self) -> None:
+        final = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done: C1 and F2 recorded (see Coverage recorded (C1))."}]}}
+        records = self.records(
+            shell_call("t1", "craftsman review cover --hunks H1 --note x"),
+            tool_result("t1", "Coverage recorded (C1): H1 in round 1"),
+            shell_call("t2", "craftsman review add --lens intent --file a.py --line 1"),
+            tool_result("t2", "F2 recorded (major, intent, a.py:1)"),
+            final,
+        )  # fmt: skip
+
+        self.assertEqual(records, ("C1", "F2"))
 
     def test_a_transcript_without_recording_calls_shows_none(self) -> None:
         self.assertEqual(self.records(shell_call("t1", "ls"), tool_result("t1", "a.py")), ())

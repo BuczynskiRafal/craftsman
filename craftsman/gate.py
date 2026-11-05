@@ -467,9 +467,19 @@ def continuation_reason(header: str, report: GateReport | None, evidence_error: 
     return "\n".join(lines)
 
 
+# What Claude Code sends as a user prompt when a background subagent reports back: the current
+# builds wrap it in "Another Claude session sent a message:" and `<agent-message>`, older ones in
+# `<task-notification>`.
+AGENT_REPORT_PREFIXES = ("<task-notification>", "Another Claude session sent a message:", "<agent-message")
+
+
 def is_continuation_prompt(prompt: str) -> bool:
-    """True for a stop hook's block reason, which some platforms send back as a user prompt."""
-    return prompt.lstrip().startswith((CONTINUATION_HEADER, REVIEW_CONTINUATION_HEADER))
+    """True for a prompt the platform sends on the session's behalf, not the user's words.
+
+    That is a stop hook's block reason, which some platforms send back as a user prompt, or the
+    report of a background subagent.
+    """
+    return prompt.lstrip().startswith((CONTINUATION_HEADER, REVIEW_CONTINUATION_HEADER, *AGENT_REPORT_PREFIXES))
 
 
 def archive_ledger_for_new_base(root: Path, base_sha: str) -> None:
