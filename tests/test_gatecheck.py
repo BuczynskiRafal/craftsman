@@ -398,7 +398,7 @@ class RoundIsolationTests(unittest.TestCase):
         report = self.check(ledger)
 
         self.assertEqual(codes(report), ["no-isolation"])
-        self.assertIn("Round 1 recorded coverage or findings", report.issues[0].message)
+        self.assertIn("Round 1 has coverage that no craftsman-reviewer run examined", report.issues[0].message)
 
     def test_the_new_hunks_of_a_later_round_need_their_own_reviewer(self) -> None:
         ledger = add_agent_event(self.two_rounds(), reviewer_stop(20))
@@ -511,6 +511,133 @@ class RoundIsolationTests(unittest.TestCase):
         report = evaluate(ledger, two_hunks(), GatePolicy(isolation_evidence="transcript"))
 
         self.assertIn("transcript when your turn ends", report.issues[0].message)
+
+
+def agent_event(kind: str, seconds: int, agent_id: str, records: tuple[str, ...] | None = None) -> AgentEvent:
+    return AgentEvent(
+        "claude", kind, "craftsman-reviewer", agent_id, shifted(T0, seconds), records=records  # type: ignore[arg-type]
+    )
+
+
+def finding_at(ledger: Ledger, seconds: int) -> Ledger:
+    """`ledger` with a dismissed intent finding, recorded `seconds` after T0 by whoever."""
+    ledger = record_finding(ledger, lens="intent")
+    finding = replace(ledger.findings[-1], recorded_at=shifted(T0, seconds))
+    ledger = replace(ledger, findings=(*ledger.findings[:-1], finding))
+    return set_verdict(ledger, finding.id, "dismissed", DISMISSED, None)[0]
+
+
+class CoverageAttributionTests(unittest.TestCase):
+    """Coverage must come from a reviewer; findings may come from anyone."""
+
+    def one_round(self, *coverage_at: int) -> Ledger:
+        """Round 1 (H1, H2) prepared at T0, covered by one record per time in `coverage_at`."""
+        ledger, _ = prepared(two_hunks())
+        for _ in coverage_at:
+            ledger = cover_open_hunks(ledger)
+        return record_run(retimed(ledger, rounds=(0,), coverage=coverage_at))
+
+    def check(self, ledger: Ledger) -> GateReport:
+        return evaluate(ledger, two_hunks(), ISOLATED)
+
+    def run_events(self, ledger: Ledger, start: int, stop: int, records: tuple[str, ...] | None = None) -> Ledger:
+        ledger = add_agent_event(ledger, agent_event("start", start, "a"))
+        return add_agent_event(ledger, agent_event("stop", stop, "a", records))
+
+    def test_coverage_the_orchestrator_recorded_outside_any_run_fails_the_latest_round(self) -> None:
+        ledger = finding_at(self.one_round(10), 25)  # the reviewer ran 20-30 and only added a finding
+        ledger = self.run_events(ledger, 20, 30)
+
+        report = self.check(ledger)
+
+        self.assertEqual(codes(report), ["no-isolation"])
+        message = report.issues[0].message
+        self.assertIn("Hunks H1,H2 of round 1 were covered outside any finished craftsman-reviewer run", message)
+        self.assertIn("craftsman review cover --hunks H1,H2", message)
+        self.assertNotIn("reset", message)
+        self.assertNotIn("spawn", message)
+
+    def test_a_reviewer_covering_those_hunks_again_clears_it(self) -> None:
+        ledger = self.run_events(self.one_round(10, 25), 20, 30)
+
+        self.assertTrue(self.check(ledger).passed, render_report(self.check(ledger)))
+
+    def orchestrator_then_reviewer(self) -> Ledger:
+        """C1 covers H1 and H2, C2 covers H1 again; both were recorded inside the run 5-30."""
+        ledger, _ = prepared(two_hunks())
+        ledger, _ = add_coverage(ledger, ["H1", "H2"], coverage_note(["H1", "H2"]))
+        ledger, _ = add_coverage(ledger, ["H1"], coverage_note(["H1"]))
+        return record_run(retimed(ledger, rounds=(0,), coverage=(10, 15)))
+
+    def test_with_transcript_evidence_a_cover_inside_the_window_is_not_the_reviewers(self) -> None:
+        ledger = self.orchestrator_then_reviewer()
+
+        mine = self.check(self.run_events(ledger, 5, 30, records=("C2",)))
+        everything = self.check(self.run_events(ledger, 5, 30, records=("C1",)))
+
+        self.assertEqual(codes(mine), ["no-isolation"])
+        self.assertIn("Hunks H2 of round 1 were covered outside", mine.issues[0].message)
+        self.assertTrue(everything.passed)
+        by_time = self.check(self.run_events(ledger, 5, 30, records=None))
+        self.assertTrue(by_time.passed)  # without transcript evidence the window decides
+
+    def test_an_intent_finding_recorded_outside_every_run_needs_no_reviewer(self) -> None:
+        ledger = finding_at(self.run_events(self.one_round(25), 20, 30), 5)
+
+        self.assertTrue(self.check(ledger).passed, render_report(self.check(ledger)))
+
+    def test_an_intent_finding_of_an_earlier_round_needs_no_reviewer(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
+        ledger, _ = prepared(changed_snap("fp2"), ledger=ledger)
+        ledger = retimed(cover_open_hunks(ledger), rounds=(0, 100), coverage=(10, 110))
+        ledger = finding_at(record_run(ledger, fingerprint="fp2"), 50)  # round 1, between the two reviewers
+        ledger = add_agent_event(add_agent_event(ledger, reviewer_stop(20)), reviewer_stop(120))
+
+        report = evaluate(ledger, changed_snap("fp2"), ISOLATED)
+
+        self.assertTrue(report.passed, render_report(report))
+
+    def test_parallel_reviewers_are_attributed_separately(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger, _ = add_coverage(ledger, ["H1"], coverage_note(["H1"]))
+        ledger, _ = add_coverage(ledger, ["H2"], coverage_note(["H2"]))
+        ledger = record_run(retimed(ledger, rounds=(0,), coverage=(10, 12)))
+        both_run = add_agent_event(add_agent_event(ledger, agent_event("start", 5, "a")), agent_event("start", 6, "b"))
+
+        def stopped(a: tuple[str, ...], b: tuple[str, ...]) -> GateReport:
+            events = add_agent_event(both_run, agent_event("stop", 30, "a", a))
+            return self.check(add_agent_event(events, agent_event("stop", 31, "b", b)))
+
+        self.assertTrue(stopped(("C1",), ("C2",)).passed)
+        self.assertTrue(stopped(("C2", "C1"), ()).passed)  # one reviewer did both
+        unclaimed = stopped(("C1",), ("F1",))  # both windows hold C2, neither run printed it
+        self.assertIn("Hunks H2 of round 1 were covered outside", unclaimed.issues[0].message)
+
+    def test_a_transcript_that_shows_no_records_credits_nothing_by_time(self) -> None:
+        ledger = self.one_round(10)
+
+        self.assertTrue(self.check(self.run_events(ledger, 5, 30, records=None)).passed)
+        silent = self.check(self.run_events(ledger, 5, 30, records=()))
+        self.assertIn("spawn the craftsman-reviewer", silent.issues[0].message)
+
+    def test_stops_without_an_agent_id_pair_with_the_earliest_unpaired_start(self) -> None:
+        ledger = self.one_round(6)  # recorded while the first of two parallel runs was going
+        for kind, seconds in (("start", 5), ("start", 8), ("stop", 20), ("stop", 25)):
+            ledger = add_agent_event(ledger, agent_event(kind, seconds, ""))
+
+        report = self.check(ledger)
+
+        self.assertTrue(report.passed, render_report(report))
+
+    def test_a_record_in_an_earlier_round_is_judged_in_its_own_round(self) -> None:
+        ledger = self.run_events(RoundIsolationTests().two_rounds(), 100, 120, records=("C2",))
+
+        report = evaluate(ledger, changed_snap("fp2"), ISOLATED)
+
+        self.assertEqual(codes(report), ["no-isolation"])
+        self.assertIn("Round 1 has coverage that no craftsman-reviewer run examined (hunks H1,H2)", report.issues[0].message)
+        self.assertIn("reset", report.issues[0].message)
 
 
 class ReviewOnlyTests(unittest.TestCase):

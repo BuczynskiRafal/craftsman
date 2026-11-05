@@ -968,9 +968,10 @@ def _record_coverage(
     skipped = f" ({len(carried)} carried hunk(s) skipped)" if carried else ""
     updated, _ = add_coverage(current, open_ids, note)
     left = len(uncovered_hunks(updated, round_))
+    token = f"C{len(updated.coverage)}"  # the gate matches a reviewer's transcript to its records
     label = ", ".join(targets if target_kind == "files" else open_ids)
     return updated, (
-        f"Coverage recorded: {label} in round {round_.number}{skipped}; "
+        f"Coverage recorded ({token}): {label} in round {round_.number}{skipped}; "
         f"{left} hunk(s) left to cover in this round."
     )
 

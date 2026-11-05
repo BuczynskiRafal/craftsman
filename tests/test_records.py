@@ -63,6 +63,24 @@ class SerializationTests(unittest.TestCase):
 
         self.assertEqual(Ledger.from_json(json.loads(json.dumps(ledger.to_json()))), ledger)
 
+    def test_a_stop_event_round_trips_with_and_without_records(self) -> None:
+        stop = AgentEvent("claude", "stop", "craftsman-reviewer", "a", "2026-01-01T00:05:00.000Z")
+        for records in (None, (), ("C1", "F2")):
+            with self.subTest(records=records):
+                event = replace(stop, records=records)
+                raw = json.loads(json.dumps(event.to_json()))
+
+                self.assertEqual(AgentEvent.from_json(raw), event)
+                self.assertEqual("records" in raw, records is not None)
+
+    def test_records_are_machine_tokens_of_a_stop_event(self) -> None:
+        stop = AgentEvent("claude", "stop", "craftsman-reviewer", "a", "2026-01-01T00:05:00.000Z")
+        for bad in (("H1",), ("C",), ("c1",), ("C1 ",)):
+            with self.subTest(records=bad), self.assertRaises(LedgerError):
+                replace(stop, records=bad)
+        with self.assertRaises(LedgerError):
+            replace(stop, event="start", records=("C1",))
+
     def test_signal_kind_is_stored_as_its_name(self) -> None:
         self.assertEqual(ledger_json()["rounds"][0]["signals"][0]["kind"], "long-function")
 

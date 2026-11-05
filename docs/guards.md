@@ -48,8 +48,9 @@ session that invoked it, and the Stop hook holds that session to the review-only
   only raised.
 - While a Craftsman reviewer or verifier that started in this review has not stopped (a background subagent), the guard
   lets the agent wait for it: its completion wakes the session, and no reminder is spent.
-- Otherwise a review with hunks uncovered, findings without a verdict or no reviewer run is sent back, up to six
-  times without progress.
+- Otherwise a review with hunks uncovered, findings without a verdict, no reviewer run or hunks covered outside any
+  reviewer run is sent back, up to six times without progress. Coverage must come from a `craftsman-reviewer`, which
+  Claude Code attributes by the reviewer's own transcript and other platforms by time; findings may come from anyone.
 
 ---
 

@@ -30,6 +30,16 @@ STARTED = (
 REVIEW_ONLY_VERIFIER = {"agent_id": "v-ro", "agent_type": "craftsman-verifier"}
 
 
+def shell_run(call_id: str, command: str, output: str) -> list[str]:
+    """Transcript lines of an agent running `command` and seeing `output`."""
+    call = {"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": command}}
+    result = {"type": "tool_result", "tool_use_id": call_id, "content": output}
+    return [
+        json.dumps({"type": "assistant", "message": {"content": [call]}}),
+        json.dumps({"type": "user", "message": {"content": [result]}}),
+    ]
+
+
 def header(continuation: int) -> str:
     return f"[CRAFTSMAN GATE {continuation}/{MAX_CONTINUATIONS}] "
 
@@ -95,15 +105,28 @@ class HookTestCase(unittest.TestCase):
         self.repo.cli("gate", "--init", *(["--deep"] if deep else []), "--cwd", ".")
 
     def run_reviewer(self, agent_type: str = "craftsman-reviewer", agent_id: str = "a1") -> None:
-        """A reviewer that starts, records coverage of the first hunk and stops, as hunters do."""
+        """A reviewer that starts, covers every open hunk (again, if the main session did) and stops."""
         reviewer = {"agent_id": agent_id, "agent_type": agent_type}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
-        self.repo.cli("review", "cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+        self.repo.cover_all(again=True)
         call_hook(
             "subagent-stop",
             "claude",
             claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
         )
+
+    def stop_with_transcript(self, reviewer: dict[str, str], *lines: str, **extra: Any) -> dict[str, Any]:
+        """A subagent stops; its own transcript consists of `lines`."""
+        path = self.tmp / f"agent-{reviewer['agent_id']}.jsonl"  # outside the work tree: it is not part of the diff
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        payload = claude("SubagentStop", self.root, agent_transcript_path=str(path), **reviewer, **extra)
+        return call_hook("subagent-stop", "claude", payload)[0]
+
+    def cover_h1(self) -> tuple[str, list[str]]:
+        """Cover H1 from the command line: the command, and the transcript lines of an agent that ran it."""
+        command = 'craftsman review cover --hunks H1 --note "x"'
+        proc = self.repo.cli("review", "cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+        return command, shell_run("cover-1", command, proc.stdout)
 
     def ledger(self) -> dict[str, Any]:
         loaded = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))
@@ -528,6 +551,54 @@ class StopTests(HookTestCase):
         self.assertEqual(call_hook("stop", "claude", claude("Stop", self.root))[0], {})
         self.assertEqual(self.state()["stage"], "completed")
 
+    def start_hooked_review(self) -> dict[str, str]:
+        """A hooked gate with a test run and a reviewer that started, before anything is covered."""
+        self.open_unsatisfied_gate()
+        self.repo.cli("review", "prepare")
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
+        reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        return reviewer
+
+    def test_the_orchestrators_cover_inside_a_reviewers_run_is_not_the_reviewers(self) -> None:
+        reviewer = self.start_hooked_review()
+        self.repo.cover_all()  # the orchestrator covers while the reviewer runs: C1
+        self.assertEqual(self.stop_with_transcript(reviewer, *shell_run("t1", "ls", "cart.py")).get("decision"), "block")
+        self.stop_with_transcript(reviewer, *shell_run("t1", "ls", "cart.py"), stop_hook_active=True)
+        self.assertEqual(self.ledger()["agents"][-1]["records"], [])
+
+        blocked, _ = call_hook("stop", "claude", claude("Stop", self.root))
+
+        self.assertIn("[no-isolation]", blocked["reason"])
+
+    def test_the_reviewers_own_cover_is_credited_by_its_transcript(self) -> None:
+        reviewer = self.start_hooked_review()
+        self.repo.cover_all()  # C1, the orchestrator's
+        _, covered = self.cover_h1()  # C2, the reviewer's own
+        self.stop_with_transcript(reviewer, *covered, stop_hook_active=True)
+        self.assertEqual(self.ledger()["agents"][-1]["records"], ["C2"])
+
+        self.assertEqual(call_hook("stop", "claude", claude("Stop", self.root))[0], {})
+
+    def test_a_cover_only_the_orchestrator_made_fails_the_latest_round_naming_the_hunks(self) -> None:
+        reviewer = self.start_hooked_review()
+        self.repo.cover_all()  # C1, the orchestrator's
+        _, finding = self.add_finding_lines()
+        self.stop_with_transcript(reviewer, *finding, stop_hook_active=True)  # the reviewer only added a finding
+
+        blocked, _ = call_hook("stop", "claude", claude("Stop", self.root))
+
+        self.assertIn("Hunks H1 of round 1 were covered outside any finished craftsman-reviewer run", blocked["reason"])
+
+    def add_finding_lines(self) -> tuple[str, list[str]]:
+        command = "craftsman review add --lens contracts --file cart.py --line 2 --severity major"
+        proc = self.repo.cli(
+            "review", "add", "--lens", "contracts", "--file", "cart.py", "--line", "2",
+            "--severity", "major", "--title", "Strings are summed without a check",
+            "--scenario", "total(['a']) raises TypeError instead of a clear error",
+        )  # fmt: skip
+        return command, shell_run("add-1", command, proc.stdout)
+
     def test_continuation_prompt_keeps_the_streak(self) -> None:
         self.open_unsatisfied_gate()
         self.update_state(forced_continuations=4, best_issue_count=2)
@@ -731,12 +802,17 @@ class SubagentTests(HookTestCase):
         self.assertNotIn("craftsman review verdict", context)
         self.assertNotIn("packet", context)
 
-    def stop_recording_coverage(self, **extra: Any) -> dict[str, Any]:
-        """A reviewer that covered its hunk stops; return the stop event the ledger got."""
+    def stop_recording_coverage(self, transcript: tuple[str, ...] | None = None, **extra: Any) -> dict[str, Any]:
+        """A reviewer that covered its hunk stops; return the stop event the ledger got.
+
+        With `transcript` lines, the agent's own transcript is those plus its cover call.
+        """
         self.repo.cli("review", "prepare")
         reviewer = {"agent_id": "r-t", "agent_type": "craftsman-reviewer"}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
-        self.repo.cli("review", "cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+        _, covered = self.cover_h1()
+        if transcript is not None:
+            extra["agent_transcript_path"] = str(self.agent_transcript(*transcript, *covered))
         out, _ = call_hook(
             "subagent-stop", "claude", claude("SubagentStop", self.root, **reviewer, **extra)
         )
@@ -751,7 +827,7 @@ class SubagentTests(HookTestCase):
         return path
 
     def test_stop_records_the_agents_token_usage_and_time_from_its_own_transcript(self) -> None:
-        path = self.agent_transcript(
+        lines = (
             json.dumps({"type": "assistant", "timestamp": "2026-10-21T10:00:00.000Z", "message": {
                 "id": "m1", "usage": {"input_tokens": 3, "output_tokens": 40,
                                       "cache_read_input_tokens": 500, "cache_creation_input_tokens": 60}}}),
@@ -759,12 +835,13 @@ class SubagentTests(HookTestCase):
                 "id": "m2", "usage": {"input_tokens": 1, "output_tokens": 2}}}),
         )  # fmt: skip
 
-        event = self.stop_recording_coverage(agent_transcript_path=str(path))
+        event = self.stop_recording_coverage(lines)
 
         self.assertEqual(
             event["usage"],
             {"input_tokens": 4, "output_tokens": 42, "cache_read_tokens": 500, "cache_write_tokens": 60, "duration_s": 120.0},
         )
+        self.assertEqual(event["records"], ["C1"])
 
     def test_the_stop_is_recorded_before_the_transcript_is_read(self) -> None:
         self.repo.cli("review", "prepare")
@@ -772,7 +849,7 @@ class SubagentTests(HookTestCase):
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         path = self.agent_transcript("{}")
 
-        with mock.patch("craftsman.hooks.read_usage", side_effect=KeyboardInterrupt):
+        with mock.patch("craftsman.hooks.read_transcript", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):  # the hook is killed while it reads
                 call_hook(
                     "subagent-stop",
@@ -800,7 +877,7 @@ class SubagentTests(HookTestCase):
                 self.assertNotIn("usage", event)
 
     def test_a_telemetry_crash_never_fails_the_stop(self) -> None:
-        with mock.patch("craftsman.hooks.read_usage", side_effect=RuntimeError("boom")):
+        with mock.patch("craftsman.hooks.read_transcript", side_effect=RuntimeError("boom")):
             event = self.stop_recording_coverage(agent_transcript_path=str(self.root / "x.jsonl"))
 
         self.assertNotIn("usage", event)

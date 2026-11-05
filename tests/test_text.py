@@ -318,6 +318,7 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "AgentEvent.agent_id",
         "AgentEvent.at",
         "AgentEvent.usage",
+        "AgentEvent.records",
         # AgentUsage
         "AgentUsage.input_tokens",
         "AgentUsage.output_tokens",

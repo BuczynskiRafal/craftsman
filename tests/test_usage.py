@@ -7,9 +7,18 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from craftsman.records import AgentEvent, AgentUsage, FieldError, Ledger
-from craftsman.usage import read_usage, role_totals, usage_json, usage_lines, usage_summary
+from craftsman.usage import (
+    TranscriptFacts,
+    read_transcript,
+    read_usage,
+    role_totals,
+    usage_json,
+    usage_lines,
+    usage_summary,
+)
 
 AT = "2026-10-21T10:00:00.000Z"
 
@@ -21,6 +30,18 @@ def assistant(message_id: str | None, at: str, **usage: int) -> dict[str, Any]:
     return {"type": "assistant", "timestamp": at, "message": message}
 
 
+def shell_call(call_id: str, command: str) -> dict[str, Any]:
+    block = {"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": command}}
+    return {"type": "assistant", "message": {"role": "assistant", "content": [block]}}
+
+
+def tool_result(call_id: str, output: str | list[dict[str, str]], *, error: bool = False) -> dict[str, Any]:
+    block: dict[str, Any] = {"type": "tool_result", "tool_use_id": call_id, "content": output}
+    if error:
+        block["is_error"] = True
+    return {"type": "user", "message": {"role": "user", "content": [block]}}
+
+
 def stop(agent: str, agent_id: str, usage: AgentUsage | None, at: str = AT) -> AgentEvent:
     return AgentEvent("claude", "stop", agent, agent_id, at, usage)
 
@@ -29,7 +50,7 @@ def used(out: int, seconds: float = 60.0) -> AgentUsage:
     return AgentUsage(input_tokens=10, output_tokens=out, cache_read_tokens=1000, cache_write_tokens=200, duration_s=seconds)
 
 
-class ReadUsageTests(unittest.TestCase):
+class TranscriptCase(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -42,6 +63,97 @@ class ReadUsageTests(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+
+class ReadRecordsTests(TranscriptCase):
+    def records(self, *entries: dict[str, Any] | str) -> tuple[str, ...] | None:
+        return read_transcript(self.transcript(*entries)).records
+
+    def test_the_tokens_of_successful_cover_and_add_calls_are_listed(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review cover --hunks H1 --note x"),
+            tool_result("t1", "Coverage recorded (C3): H1 in round 1; 0 hunk(s) left to cover in this round."),
+            shell_call("t2", "craftsman review add --lens intent --file a.py --line 1"),
+            tool_result("t2", [{"type": "text", "text": "F2 recorded (major, intent, a.py:1)\nL1: x"}]),
+            shell_call("t3", "craftsman review cover --from-json -"),
+            tool_result("t3", "Coverage recorded (C4): H2 in round 1\nCoverage recorded (C5): cart.py in round 1"),
+            shell_call("t4", "craftsman review show --json"),
+            tool_result("t4", "Coverage recorded (C9)"),  # not a recording call
+        )
+
+        self.assertEqual(records, ("C3", "F2", "C4", "C5"))
+
+    def test_a_transcript_without_recording_calls_shows_none(self) -> None:
+        self.assertEqual(self.records(shell_call("t1", "ls"), tool_result("t1", "a.py")), ())
+
+    def test_calls_that_recorded_nothing_are_still_readable(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review cover --hunks H1 --note x"),
+            tool_result("t1", "Nothing to record: H1 already covered in an earlier round (carried over); 0 hunk(s) left."),
+            shell_call("t2", "craftsman review add --from-json - --check"),
+            tool_result("t2", "Check passed: 2 entries valid; nothing was recorded."),
+        )  # fmt: skip
+
+        self.assertEqual(records, ())
+
+    def test_a_failed_call_records_nothing(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review cover --hunks H9 --note x"),
+            tool_result("t1", "error: unknown hunk ids in round 1: H9", error=True),
+        )
+
+        self.assertEqual(records, ())
+
+    def test_a_token_printed_before_a_later_failure_still_counts(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review cover --hunks H1 --note x && false"),
+            tool_result("t1", "Coverage recorded (C7): H1 in round 1; 0 hunk(s) left to cover in this round.", error=True),
+        )
+
+        self.assertEqual(records, ("C7",))
+
+    def test_output_that_was_piped_away_makes_the_transcript_unreadable(self) -> None:
+        for command in ("craftsman review cover --hunks H1 --note x | tail -1", "craftsman review add -h > /dev/null"):
+            with self.subTest(command=command):
+                records = self.records(shell_call("t1", command), tool_result("t1", "done"))
+
+                self.assertIsNone(records)
+
+    def test_a_call_without_a_result_makes_the_transcript_unreadable(self) -> None:
+        self.assertIsNone(self.records(shell_call("t1", "craftsman review cover --hunks H1 --note x")))
+
+    def test_a_line_that_is_not_json_makes_the_transcript_unreadable(self) -> None:
+        self.assertIsNone(self.records(shell_call("t1", "ls"), "not json"))
+
+    def test_a_missing_unreadable_or_oversized_transcript_has_no_evidence(self) -> None:
+        path = self.transcript(shell_call("t1", "ls"), tool_result("t1", "a.py"))
+        binary = self.dir / "binary.jsonl"
+        binary.write_bytes(b"\xff\xfe\x00\x01" * 100)
+
+        with mock.patch("craftsman.usage.MAX_TRANSCRIPT_BYTES", 10):
+            oversized = read_transcript(path)
+
+        self.assertEqual(read_transcript(path).records, ())
+        for facts in (read_transcript(self.dir / "absent.jsonl"), read_transcript(self.dir), oversized):
+            self.assertEqual(facts, TranscriptFacts(None, None))
+        self.assertIsNone(read_transcript(binary).records)
+
+    def test_one_pass_reads_usage_and_records(self) -> None:
+        path = self.transcript(
+            assistant("m1", AT, output_tokens=5),
+            shell_call("t1", "craftsman review cover --hunks H1 --note x"),
+            tool_result("t1", "Coverage recorded (C1): H1 in round 1"),
+        )
+
+        facts = read_transcript(path)
+
+        self.assertEqual(facts.records, ("C1",))
+        assert facts.usage is not None
+        self.assertEqual(facts.usage.output_tokens, 5)
+        self.assertEqual(read_usage(path), facts.usage)
+
+
+class ReadUsageTests(TranscriptCase):
 
     def test_tokens_are_summed_over_messages_and_time_adds_up_the_gaps(self) -> None:
         path = self.transcript(

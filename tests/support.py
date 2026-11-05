@@ -356,9 +356,14 @@ class EvidenceRepo(GitRepo):
         assert isinstance(payload, dict)
         return payload
 
-    def cover_all(self) -> None:
-        """Cover every open hunk of the latest round in one call."""
-        missing = list(self.show()["coverage"]["missing"])
+    def cover_all(self, *, again: bool = False) -> None:
+        """Cover every open hunk of the latest round in one call; `again` also those already covered."""
+        shown = self.show()
+        missing = (
+            [hunk["id"] for hunk in shown["hunks"] if not hunk["carried"]]
+            if again
+            else list(shown["coverage"]["missing"])
+        )
         if missing:
             self.cli(
                 "review", "cover", "--hunks", ",".join(missing), "--note", coverage_note(missing)

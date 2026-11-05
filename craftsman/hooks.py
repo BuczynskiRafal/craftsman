@@ -69,7 +69,6 @@ from craftsman.records import (
     AgentEvent,
     AgentEventKind,
     AgentRole,
-    AgentUsage,
     Ledger,
     LedgerError,
     agent_role,
@@ -83,7 +82,7 @@ from craftsman.scope import (
     load_scope_policy,
 )
 from craftsman.trigger import detect_trigger, is_review_prompt, task_from_prompt
-from craftsman.usage import read_usage
+from craftsman.usage import TranscriptFacts, read_transcript
 from craftsman.workspace import (
     ReviewMarker,
     Workspace,
@@ -547,14 +546,15 @@ def record_agent_event(
     return before, event
 
 
-def attach_agent_usage(session: Session, event: AgentEvent, usage: AgentUsage) -> None:
-    """Add `usage` to `event`, recorded earlier: reading a transcript can take long, and the
-    event, which proves isolation, must not wait for it."""
-    attached = replace(event, usage=usage)
+def attach_transcript_facts(session: Session, event: AgentEvent, facts: TranscriptFacts) -> None:
+    """Add the usage and records read from the agent's transcript to `event`, recorded earlier:
+    reading a transcript can take long, and the event, which proves isolation, must not wait."""
+    attached = replace(event, usage=facts.usage, records=facts.records)
 
     def swap(ledger: Ledger) -> tuple[Ledger, None]:
-        agents = tuple(attached if recorded == event else recorded for recorded in ledger.agents)
-        return replace(ledger, agents=agents), None
+        agents = list(ledger.agents)
+        agents[agents.index(event)] = attached  # the first equal event: twins stop in turn
+        return replace(ledger, agents=tuple(agents)), None
 
     mutate(session.ledger_path, swap)
 
@@ -632,26 +632,32 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
     if not active and (agent_role(hook.agent) is None or not _has_current_round(session)):
         return reply.allow()
     before, event = record_agent_event(session, hook, "stop", reply.platform)
-    answer = _stop_answer(before, hook, reply)
-    usage = _agent_usage(hook)  # after the event: a slow or killed read must not lose the evidence
-    if usage is not None:
+    facts = _agent_transcript(hook)  # after the event: a slow or killed read must not lose the evidence
+    answer = _stop_answer(before, hook, reply, facts.records)
+    if facts.usage is not None or facts.records is not None:
         try:
-            attach_agent_usage(session, event, usage)
-        except (LedgerError, OSError):
-            pass  # telemetry only
+            attach_transcript_facts(session, event, facts)
+        except (LedgerError, OSError, ValueError):
+            pass  # the gate then goes by time; usage is telemetry only
     return answer
 
 
-def _stop_answer(before: Ledger, hook: HookInput, reply: Reply) -> Output:
-    """Whether the stopping agent may finish: `before` is the ledger without its stop event."""
+def _stop_answer(before: Ledger, hook: HookInput, reply: Reply, records: tuple[str, ...] | None) -> Output:
+    """Whether the stopping agent may finish: `before` is the ledger without its stop event.
+
+    `records` are the record tokens its transcript shows, None when there is no such evidence.
+    """
     role = agent_role(hook.agent)
     if role is None or hook.stop_hook_active or not before.rounds:
         return reply.allow()
     since = _run_started_at(before, hook)
     if _stopped_since(before, hook, since):
         return reply.allow()  # already sent back once
-    # Records carry no agent id, so "recorded since this run started" is the best evidence that
-    # this run did its part; with parallel runs another agent's record can satisfy it.
+    # Without the transcript, records carry no agent id, so "recorded since this run started" is
+    # the best evidence that this run did its part; with parallel runs another agent's record can
+    # satisfy it.
+    if role == "reviewer" and records is not None:
+        return reply.allow() if records else reply.block(REVIEWER_STOP_REASON)
     if role == "reviewer":
         recorded = any(parse_timestamp(item.recorded_at) >= since for item in before.coverage) or any(
             parse_timestamp(item.recorded_at) >= since for item in before.findings
@@ -673,17 +679,17 @@ def _stop_answer(before: Ledger, hook: HookInput, reply: Reply) -> Output:
     )
 
 
-def _agent_usage(hook: HookInput) -> AgentUsage | None:
-    """The agent's token usage from its own transcript, if the payload names one; never raises.
+def _agent_transcript(hook: HookInput) -> TranscriptFacts:
+    """The agent's usage and records from its own transcript, if the payload names one; never raises.
 
     The payload's plain `transcript_path` is the parent session's, so it is not read here.
     """
     if not hook.agent_transcript_path:
-        return None
+        return TranscriptFacts()
     try:
-        return read_usage(Path(hook.agent_transcript_path))
+        return read_transcript(Path(hook.agent_transcript_path))
     except Exception:  # noqa: BLE001 - telemetry must never fail the hook
-        return None
+        return TranscriptFacts()
 
 
 def _with_started_agent_name(session: Session, hook: HookInput) -> HookInput:

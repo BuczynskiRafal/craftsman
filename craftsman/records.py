@@ -344,6 +344,10 @@ class Fields:
             _require(isinstance(value, str), f"{key}[{index}]", "must be a string")
         return tuple(values)
 
+    def optional_texts_if_present(self, key: str) -> tuple[str, ...] | None:
+        """A list of strings; None when it is left out or null."""
+        return None if self._absent(key) else self.optional_texts(key)
+
     def texts_or_empty(self, key: str) -> tuple[str, ...]:
         """A list of strings; empty when it is left out."""
         return () if self._absent(key) else self.texts(key)
@@ -871,6 +875,9 @@ class AgentUsage:
         )
 
 
+RECORD_TOKEN_RE = re.compile(r"[CF]\d+")
+
+
 @dataclass(frozen=True)
 class AgentEvent:
     platform: str
@@ -879,17 +886,24 @@ class AgentEvent:
     agent_id: str
     at: str
     usage: AgentUsage | None = None  # a stop event only, and only when the transcript was readable
+    # A stop event only: the record tokens (`C3`, `F2`) the run's own transcript shows it printed;
+    # None when no transcript was readable, so the gate attributes records by time instead.
+    records: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.platform, "platform")
         _require_choice(self.event, AGENT_EVENT_KINDS, "event")
         _require_timestamp(self.at, "at")
         _require(self.usage is None or self.event == "stop", "usage", "is only allowed on a stop event")
+        _require(self.records is None or self.event == "stop", "records", "is only allowed on a stop event")
+        for index, token in enumerate(self.records or ()):
+            _require(RECORD_TOKEN_RE.fullmatch(token) is not None, f"records[{index}]", "must look like C3 or F2")
 
     def to_json(self) -> dict[str, Any]:
         data = _record_json(self)
-        if self.usage is None:
-            del data["usage"]  # ledgers without telemetry stay byte-identical
+        for optional in ("usage", "records"):
+            if getattr(self, optional) is None:
+                del data[optional]  # ledgers without telemetry or transcripts stay byte-identical
         return data
 
     @classmethod
@@ -903,6 +917,7 @@ class AgentEvent:
                 agent_id=f.text("agent_id"),
                 at=f.text("at"),
                 usage=f.optional_record_if_present("usage", AgentUsage.from_json),
+                records=f.optional_texts_if_present("records"),
             )
         )
 

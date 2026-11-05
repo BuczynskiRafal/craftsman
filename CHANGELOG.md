@@ -18,10 +18,18 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Review-only isolation evidence is per review, not per ledger.** A subagent event from an earlier session or
   platform no longer makes a terminal or hookless review need a reviewer run it can never record; hooks count only
   for the session that invoked `/craft-review`, or once a subagent event follows the current round.
-- **A replaced round no longer demands a reviewer for good.** An earlier round needs a `craftsman-reviewer` only for
-  the coverage and findings recorded while it was current, and a reviewer that finished after the next round was
-  prepared still counts for what it recorded. A round replaced before any review, with nothing recorded in it, needs
-  nothing; its hunks are open in the next round.
+- **Coverage must come from a `craftsman-reviewer`, in every round.** The latest round used to pass once any
+  reviewer had recorded anything, so the orchestrator could cover the remaining hunks itself; now every covered hunk
+  needs a reviewer behind its coverage, and the gate names the hunks that lack one (a reviewer re-covers them, no
+  reset needed). Findings need no reviewer, so an intent finding the orchestrator records no longer fails an earlier
+  round. A round replaced before any review holds no coverage and needs nothing; a reviewer that finished after the
+  next round was prepared still counts for what it recorded.
+- **Claude Code reviewers are identified by their own transcript, not by time.** `review cover` prints a token
+  (`Coverage recorded (C12): ...`, as findings print `F3 recorded`), and the stop hook stores the tokens the
+  reviewer's own transcript shows on its stop event, so the orchestrator's records written while a background
+  reviewer runs no longer count as the reviewer's. Without a readable transcript (Copilot, Antigravity, an unclear
+  call) the gate falls back to the reviewer's start-to-stop window; parallel runs without agent ids are paired first
+  in, first out.
 - **Agent time counts active time.** A subagent's `duration_s` adds up the gaps between transcript entries of
   at most 5 minutes instead of spanning first to last entry, so a resumed agent no longer counts the time it
   sat idle between runs.
@@ -75,8 +83,8 @@ All notable changes to Craftsman are recorded here. The format follows
   `deep: bool` instead of a tier. The gate issues are `no-round`, `stale-round`, `uncovered`,
   `no-verdict`, `unresolved`, `no-passing-run`, `no-e2e-run` (deep only), `failing-run`,
   `no-isolation`, and `round-cap`. A very large diff is now a warning in `prepare` and the report, not
-  a `needs_human` hand-off. Whenever the platform provides isolation evidence, every round with
-  non-carried hunks needs a finished `craftsman-reviewer`, in gate sessions and in review-only mode.
+  a `needs_human` hand-off. Whenever the platform provides isolation evidence, the coverage of every
+  round must come from a finished `craftsman-reviewer`, in gate sessions and in review-only mode.
   Owner binding, `MAX_CONTINUATIONS`, the round cap, run rules, evidence rules, and the frozen
   review-only scope are unchanged.
 - **Restored risk triggers.** `filesystem` signals suggest `state`, `trust`, and `platform` again, and

@@ -337,7 +337,7 @@ class CoverTests(RepoTestCase):
 
         covered = self.cover("H1")
 
-        self.assertIn("Coverage recorded: H1 in round 1; 1 hunk(s) left to cover", covered.stdout)
+        self.assertIn("Coverage recorded (C1): H1 in round 1; 1 hunk(s) left to cover", covered.stdout)
 
     def test_cover_accepts_hunk_ranges(self) -> None:
         self.repo.write("notes.py", "LABEL = 'cart'\n")
@@ -345,14 +345,14 @@ class CoverTests(RepoTestCase):
 
         covered = self.review("cover", "--hunks", "H1-H2", "--note", "walked both files end to end")
 
-        self.assertIn("Coverage recorded: H1, H2 in round 1; 0 hunk(s) left", covered.stdout)
+        self.assertIn("Coverage recorded (C1): H1, H2 in round 1; 0 hunk(s) left", covered.stdout)
 
     def test_cover_files_covers_every_open_hunk_of_the_file(self) -> None:
         self.prepare_bug()
 
         covered = self.review("cover", "--files", "cart.py", "--note", "read cart.py and its callers")
 
-        self.assertIn("Coverage recorded: cart.py in round 1; 0 hunk(s) left", covered.stdout)
+        self.assertIn("Coverage recorded (C1): cart.py in round 1; 0 hunk(s) left", covered.stdout)
 
     def test_cover_refuses_a_stale_round(self) -> None:
         self.prepare_bug()
@@ -427,7 +427,7 @@ class SecondRoundTests(RepoTestCase):
     def test_a_range_over_carried_hunks_covers_the_open_ones(self) -> None:
         covered = self.review("cover", "--hunks", "H1-H3", "--note", "walked the whole range once")
 
-        self.assertIn("Coverage recorded: H3 in round 2 (1 carried hunk(s) skipped)", covered.stdout)
+        self.assertIn("Coverage recorded (C2): H3 in round 2 (1 carried hunk(s) skipped)", covered.stdout)
         self.assertEqual(self.missing(), [])
 
     def test_a_file_of_carried_hunks_is_a_no_op(self) -> None:
@@ -454,7 +454,7 @@ class SecondRoundTests(RepoTestCase):
                 path = Path(self.review("view", "--files", spelling).stdout.strip())
                 self.assertEqual(path.name, f"packet-2.{view_slug(files=('cart.py',))}.md")
         covered = self.review("cover", "--files", "./cart.py", "--note", "read the open hunk twice")
-        self.assertIn("Coverage recorded: cart.py in round 2", covered.stdout)
+        self.assertIn("Coverage recorded (C2): cart.py in round 2", covered.stdout)
         self.assertEqual(self.missing(), [])
 
 
@@ -783,6 +783,8 @@ class FromJsonTests(RepoTestCase):
         covered = self.from_json("cover", entries)
 
         self.assertEqual(len(covered.stdout.splitlines()), 2)
+        self.assertIn("Coverage recorded (C1): H1 in round 1", covered.stdout)
+        self.assertIn("Coverage recorded (C2): cart.py in round 1", covered.stdout)
         self.assertIn("0 hunk(s) left to cover", covered.stdout)
 
     def test_add_reads_a_file(self) -> None:
