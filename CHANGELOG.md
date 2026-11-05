@@ -107,7 +107,9 @@ All notable changes to Craftsman are recorded here. The format follows
   async subagents) a verifier starts when its hunter finishes, and a variant hunter and the fresh hunter
   when a finding is judged `proven` (the fresh hunter starts with wave 1 when deep); variant hunters get
   a mini-slice. On Claude Code the simplicity hunter (`craft`, `design`) and every verifier whose
-  cluster holds only `minor` or `nit` findings run on a cheaper model. The orchestrator writes
+  cluster holds only `minor` or `nit` findings run on a cheaper model. The orchestrator ends its turn while
+  background agents run instead of polling for them (a leftover timer kept one benchmark session open for
+  8 minutes after its review was done). The orchestrator writes
   the intent brief from `git diff <base>` and the risk map, not from the full packet. The SubagentStart
   briefing carries the round, the packet path and the open work, without the packet.
 - **Fix confirmation is separate from the regression check.** A `proven` finding is confirmed by a

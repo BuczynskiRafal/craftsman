@@ -114,6 +114,8 @@ model it had.
 
 Where agents run in the background (Claude Code, Antigravity async subagents), launch a hunter's
 verifier as soon as it finishes. Where parallel subagents are a barrier (Copilot), keep the waves.
+A background agent wakes you when it finishes: end your turn instead of polling for it (no `sleep`,
+timers or repeated `review show`); a pending timer also keeps a headless session open after the review.
 
 ## 5. Saturate
 
