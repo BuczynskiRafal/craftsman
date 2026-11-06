@@ -6,6 +6,8 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-06
+
 ### Fixed
 
 - **The host's `/code-review` no longer arms the review stop guard** (nor opens a gate). Only Craftsman's
@@ -529,7 +531,8 @@ All notable changes to Craftsman are recorded here. The format follows
 - Hook parsers, verdict detection and worktree state handling were hardened (see the v2.1.0
   follow-up fixes).
 
-[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...HEAD
+[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...v5.0.0
 [4.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/a4458c4...v4.1.0
 [4.0.0]: https://github.com/BuczynskiRafal/craftsman/commit/a4458c4
 [3.3.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.2.0...v3.3.0

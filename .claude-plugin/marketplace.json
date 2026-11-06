@@ -9,7 +9,7 @@
     {
       "name": "craftsman",
       "description": "Make AI coding agents prove they reviewed and tested their change.",
-      "version": "4.1.0",
+      "version": "5.0.0",
       "source": "./"
     }
   ]

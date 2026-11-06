@@ -47,7 +47,7 @@ body:
     attributes:
       label: Craftsman Version
       description: Output of `craftsman --version`
-      placeholder: craftsman 4.1.0
+      placeholder: craftsman 5.0.0
     validations:
       required: true
 
