@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -19,19 +19,11 @@ from craftsman.attribution import (
     agent_runs,
     distinct_verdict_runs,
     identity,
-    slot_work,
     verdict_vouched,
     vouching_runs,
 )
 from craftsman.diffscan import DiffSnapshot
-from craftsman.huntplan import (
-    SWEEP,
-    credited_upto,
-    required_slots,
-    slot_complete,
-    slot_hunks,
-    slot_order,
-)
+from craftsman.huntplan import plan_due_waves, required_slots, slots_missing
 from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
     REVIEWER_AGENT,
@@ -198,7 +190,13 @@ def evaluate(
 
     An enforced round with a hunt plan is judged by the hunt rules: its slots must be finished by
     vouched subagents and every finding judged by a verifier. Any other round keeps the 5.0 rules.
-    `now` (default: the current time) only matters for deciding whether a hunter is still running.
+    `now` (default: the current time) decides whether a hunter is still running and when a due wave is
+    planned.
+
+    `evaluate` never writes, yet a wave that is due but not stored yet (`plan_due_waves` runs under the
+    lock at `review check`, `report`, `brief` and `prepare`) must not let a caller finish: for an
+    enforced round the slots of such a wave are judged as if they were stored, so they are pending and
+    unlaunched until the next `review brief` stores them.
     """
     if snap.is_empty:
         summary = f"Nothing to review: the work tree matches base {snap.base_sha[:12]}."
@@ -214,8 +212,14 @@ def evaluate(
             *_failing_run_issues(ledger),
         )
     )
+    moment = _utc(now)
+    if latest is not None and latest.plan is not None and latest.enforced:
+        planned = plan_due_waves(ledger, moment)  # in memory only: the due wave is judged, not stored
+        latest = planned.rounds[-1]
+    else:
+        planned = ledger
     runs = agent_runs(ledger) if latest is not None and latest.plan is not None else ()
-    state = _hunt_state(ledger, latest, _utc(now), runs) if latest is not None and latest.plan is not None else None
+    state = _hunt_state(planned, latest, moment, runs) if latest is not None and latest.plan is not None else None
     slots = state.statuses if state is not None else ()
     if latest is not None and state is not None and latest.enforced:
         round_issues = _round_issues(ledger, snap)
@@ -351,60 +355,28 @@ def slot_statuses(ledger: Ledger, round_: Round, now: datetime) -> tuple[SlotSta
 
 
 def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[AgentRun]) -> _HuntState:
-    """The statuses of `round_`'s slots, and how many hunters are starting.
+    """The statuses of `round_`'s stored slots, and how many hunters are starting.
 
-    A generation 1 slot is done when every one of its (hunk, lens) pairs is credited. The plan lists a
-    hunk in a slot only because the hunk owes one of the slot's lenses, and a slot's own coverage credits
-    all its lenses, so crediting from any slot (earlier coverage of the same code included) is enough.
-    This holds for a `sweep` slot too, whose lens no hunk requires: it counts only when credited, and
-    `huntplan.credited_upto` credits it only to a slot whose own coverage spans every hunk it lists. A later
-    generation slot is done when its own vouched coverage, recorded at or after its trigger, covers all
-    its hunks.
+    A slot is done when `huntplan.slots_missing` finds nothing missing: that module owns the one definition
+    of "done" (credit for a generation 1 slot, the sweep judged by the slot's own coverage, own vouched
+    coverage at or after the trigger for a wave slot), which the planner's barriers use as well.
     """
     slots = required_slots(ledger, round_)
     if not slots:
         return _HuntState(now, ())
-    order, hunks = slot_order(ledger), slot_hunks(ledger)
-    credit = credited_upto(ledger, round_.number, runs=runs, enforced=round_.enforced)
-    work = slot_work(ledger, runs, order, slot_hunks=hunks)
+    missing = slots_missing(ledger, round_, runs=runs)
     signs = _hunter_signs(ledger, round_, runs, now)
-    digest_of = {ref.id: ref.digest for ref in round_.hunks}
     statuses: list[SlotStatus] = []
     for slot in slots:
-        if slot.generation == 1:
-            wanted = frozenset(slot.lenses)
-            missing = tuple(
-                hunk_id for hunk_id in slot.hunks if not wanted <= credit.get(digest_of[hunk_id], frozenset())
-            )
-            if SWEEP in wanted and missing:
-                # The sweep is credited only to a slot whose coverage spans all its hunks, so every hunk
-                # lacks it until then: name the ones that coverage under this slot has not reached.
-                done = work.get((round_.number, slot.id))
-                reached = done.digests if done is not None else frozenset()
-                core = wanted - {SWEEP}
-                missing = tuple(
-                    hunk_id
-                    for hunk_id in slot.hunks
-                    if digest_of[hunk_id] not in reached or not core <= credit.get(digest_of[hunk_id], frozenset())
-                )
-        else:
-            # A slot that names no trigger time counts coverage from the moment the round was prepared.
-            current = replace(slot, since=slot.since or round_.prepared_at)
-            done = work.get((round_.number, slot.id))
-            covered = done.digests if done is not None else frozenset()
-            missing = (
-                ()
-                if slot_complete(round_, current, work)
-                else tuple(h for h in slot.hunks if digest_of[h] not in covered) or slot.hunks
-            )
-        if not missing:
+        lacking = missing[slot.id]
+        if not lacking:
             statuses.append(SlotStatus(slot, "done"))
         elif signs.running.get(slot.id):
-            statuses.append(SlotStatus(slot, "running", missing, min(signs.running[slot.id])))
+            statuses.append(SlotStatus(slot, "running", lacking, min(signs.running[slot.id])))
         elif signs.ended.get(slot.id):
-            statuses.append(SlotStatus(slot, "dead", missing, max(signs.ended[slot.id])))
+            statuses.append(SlotStatus(slot, "dead", lacking, max(signs.ended[slot.id])))
         else:
-            statuses.append(SlotStatus(slot, "unlaunched", missing))
+            statuses.append(SlotStatus(slot, "unlaunched", lacking))
     return _HuntState(now, tuple(statuses), signs.starting)
 
 

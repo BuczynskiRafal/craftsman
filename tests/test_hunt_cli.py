@@ -113,12 +113,16 @@ class HuntTestCase(unittest.TestCase):
         self.assertIsNone(re.search(r"verdict recorded \(V\d+\)", text), text)
         self.assertIsNone(re.search(r"Brief issued \(B\d+\)", text), text)
 
-    def finish_hunter(self, slot: str, hunks: str | None = None) -> None:
-        """Run the hunter of `slot` as the hooks would see it: brief, cover, then a start and stop event."""
+    def finish_hunter(self, slot: str, hunks: str | None = None, *, briefed: bool = True) -> None:
+        """Run the hunter of `slot` as the hooks would see it: brief, cover, then a start and stop event.
+
+        `briefed=False` skips the brief (which plans the waves that are due, as every judging command does).
+        """
         started = format_timestamp(datetime.now(timezone.utc) - timedelta(seconds=1))
-        brief = self.review("brief", slot).stdout
-        claim = re.search(r"Brief issued \((B\d+)\)", brief)
-        assert claim is not None
+        claim = None
+        if briefed:
+            claim = re.search(r"Brief issued \((B\d+)\)", self.review("brief", slot).stdout)
+            assert claim is not None
         ids = hunks or ",".join(next(s for s in self.latest().plan.slots if s.id == slot).hunks)  # type: ignore[union-attr]
         cover = self.review(
             "cover", "--hunter", slot, "--hunks", ids, "--note", coverage_note(ids.split(","))
@@ -129,8 +133,19 @@ class HuntTestCase(unittest.TestCase):
         agent_id = f"agent-{slot}"
         self.add_events(
             AgentEvent("claude", "start", "craftsman-reviewer", agent_id, started),
-            AgentEvent("claude", "stop", "craftsman-reviewer", agent_id, stopped, records=(claim.group(1), recorded.group(1))),
+            AgentEvent(
+                "claude", "stop", "craftsman-reviewer", agent_id, stopped,
+                records=((claim.group(1),) if claim is not None else ()) + (recorded.group(1),),
+            ),
         )  # fmt: skip
+
+    def finish_generation_one(self, *, briefed: bool = True) -> None:
+        """Every generation 1 slot of the latest round hunted to the end, so that its waves are due."""
+        plan = self.latest().plan
+        assert plan is not None
+        for slot in plan.slots:
+            if slot.generation == 1:
+                self.finish_hunter(slot.id, briefed=briefed)
 
     def add_events(self, *events: AgentEvent) -> None:
         def record(current: Ledger) -> tuple[Ledger, None]:
@@ -604,10 +619,11 @@ class BriefTests(HuntTestCase):
         self.assertIn("(simplicity slot, generation 1)", out)
         self.assertIn("craftsman skill show craft-review --lenses craft,design", out)
 
-    def test_a_variant_brief_names_the_defect_and_stores_the_slot(self) -> None:
+    def test_a_variant_brief_names_the_defect_and_claims_the_planned_slot(self) -> None:
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
-        self.assertNotIn("W2-F1", self.slot_ids())
+        self.finish_generation_one(briefed=False)
+        self.assertNotIn("W2-F1", self.slot_ids())  # finishing a hunt plans nothing by itself
 
         out = self.review("brief", "W2-F1", env=CLAUDE).stdout
 
@@ -616,11 +632,12 @@ class BriefTests(HuntTestCase):
             "The defect: F1 (major, lens contracts) at cart.py:3 - Empty cart divides by zero", out
         )
         self.assertIn("Hunt the same root cause across the diff", out)
-        self.assertIn("W2-F1", self.slot_ids())  # the slot someone acts on is stored in the plan
+        self.assertIn("W2-F1", self.slot_ids())  # the brief plans the due wave under the lock, then claims
 
     def test_a_fresh_brief_forbids_reading_other_findings(self) -> None:
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        self.finish_generation_one()
 
         out = self.review("brief", "W2-X1", env=CLAUDE).stdout
 
@@ -703,6 +720,7 @@ class HostileTextTests(HuntTestCase):
         )  # fmt: skip
 
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        self.finish_generation_one()
 
         for args in (("W1-1",), ("W2-F1",), ("--verifier", "F1")):
             for env in (None, AGY):
@@ -891,15 +909,19 @@ class CoverHunterTests(HuntTestCase):
         self.assertIn("Coverage recorded (C2) for W1-1: H2 in round 1", tagged)
         self.assert_error(unknown, 1, "unknown slot W1-9")
 
-    def test_a_derived_slot_is_stored_when_it_is_covered(self) -> None:
+    def test_a_wave_slot_can_be_covered_only_once_it_is_planned(self) -> None:
         self.review("prepare")
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        self.finish_generation_one(briefed=False)
         self.assertNotIn("W2-F1", self.slot_ids())
 
-        out = self.cover("--hunter", "W2-F1", "--hunks", "H1").stdout
+        refused = self.cover("--hunter", "W2-F1", "--hunks", "H1", check=False)
+        self.review("check", "--review-only", check=False)  # plans the wave that is due
+        planned = self.cover("--hunter", "W2-F1", "--hunks", "H1").stdout
 
-        self.assertIn("Coverage recorded (C1) for W2-F1: H1 in round 1", out)
+        self.assert_error(refused, 1, "unknown slot W2-F1 in round 1")
+        self.assertIn("for W2-F1: H1 in round 1", planned)
         self.assertIn("W2-F1", self.slot_ids())
 
     def test_the_caller_identity_is_stored(self) -> None:
@@ -1258,6 +1280,84 @@ class CheckAndReportTests(HuntTestCase):
 
         self.assertNotIn("ABANDONED", self.review("check", "--review-only", check=False).stdout)
         self.assertNotIn("ABANDONED", self.review("report", "--review-only").stdout)
+
+
+class StoredWaveTests(HuntTestCase):
+    """Waves are planned at discrete points (check, report, brief, prepare) and stored; nothing derives them on read."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_cart()
+        self.arm()
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+
+    def wave_ids(self) -> list[str]:
+        return [slot_id for slot_id in self.slot_ids() if slot_id.startswith(("W2", "W3"))]
+
+    def test_nothing_is_planned_while_the_first_generation_is_unfinished(self) -> None:
+        before = self.ledger_path.read_bytes()
+
+        out = self.review("check", "--review-only", check=False).stdout
+
+        self.assertEqual(self.wave_ids(), [])
+        self.assertEqual(self.ledger_path.read_bytes(), before)  # a check with nothing due writes nothing
+        self.assertNotIn("W2-", out)
+
+    def test_check_plans_the_due_wave_once(self) -> None:
+        self.finish_generation_one(briefed=False)
+
+        out = self.review("check", "--review-only", check=False).stdout
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertIn("wave slots of round 1 not finished", out)
+        plan = self.latest().plan
+        assert plan is not None
+        self.assertEqual([(w.generation, w.considered, w.slots) for w in plan.waves], [(2, ("F1",), ("W2-X1", "W2-F1"))])
+        again = self.ledger_path.read_bytes()
+        self.review("check", "--review-only", check=False)
+        self.assertEqual(self.ledger_path.read_bytes(), again)  # planning is idempotent
+
+    def test_report_plans_the_due_wave_too(self) -> None:
+        self.finish_generation_one(briefed=False)
+
+        payload = json.loads(self.review("report", "--review-only", "--json").stdout)
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertIn("W2-F1", [slot["id"] for slot in payload["slots"]])
+
+    def test_a_dismissed_trigger_does_not_take_a_planned_slot_back(self) -> None:
+        self.finish_generation_one(briefed=False)
+        self.review("check", "--review-only", check=False)
+
+        self.review("verdict", "F1", "--as", "dismissed", "--evidence", "guarded by cart.py:2, which returns 0 early")
+
+        self.review("check", "--review-only", check=False)
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_a_brief_of_a_wave_slot_that_is_not_due_is_refused(self) -> None:
+        proc = self.review("brief", "W2-F1", check=False)
+
+        self.assert_error(proc, 2, "Slot W2-F1 is no longer required in round 1")
+        self.assertEqual(self.wave_ids(), [])
+
+    def test_prepare_plans_the_wave_of_a_finding_judged_after_the_next_round_opened(self) -> None:
+        self.review("reset")
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.repo.write("cart.py", CART_EDITED)
+        self.review("prepare")
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        self.finish_generation_one(briefed=False)
+        self.assertEqual(self.latest().number, 2)
+        self.assertEqual(self.wave_ids(), [])
+
+        out = self.review("prepare").stdout
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertIn("New slots since the last prepare: W2-X1, W2-F1", out)
+        self.assertEqual(self.ledger().rounds[0].plan.waves, ())  # type: ignore[union-attr]
 
 
 class AntigravitySyncTests(HuntTestCase):

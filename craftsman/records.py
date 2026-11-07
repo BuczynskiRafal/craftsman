@@ -50,6 +50,8 @@ MIN_READABLE_SCHEMA = 3
 # The `hunter` of work that is not a hunt slot: the orchestrator's own findings. It never credits coverage.
 LEAD_HUNTER = "lead"
 # W<generation>-<n> (generation 1 slots), W<g>-X<j> (fresh set), W<g>-F<n> (variant of finding F<n>).
+# The last hunt generation: findings of this generation call for no further wave.
+MAX_GENERATION = 3
 SLOT_ID_RE = re.compile(r"W([1-3])-(?:([1-9]\d*)|X([1-9]\d*)|F([1-9]\d*))")
 # What `craftsman review merge` writes as the verdict evidence of a duplicate; no verdict may start with it.
 GROUPED_EVIDENCE_PREFIX = "Grouped into "
@@ -643,14 +645,71 @@ class Slot:
 
 
 @dataclass(frozen=True)
+class Wave:
+    """One decision to plan a wave: the trigger findings it answered and the slots it stored.
+
+    `generation` is the generation of the slots planned. A decision about findings of the last generation
+    plans none (`slots` empty) and carries `MAX_GENERATION`: it only records that those findings were
+    decided. A finding named in any wave's `considered` is answered for good.
+    """
+
+    generation: int
+    planned_at: str
+    considered: tuple[str, ...]
+    slots: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require(2 <= self.generation <= MAX_GENERATION, "generation", f"must be 2..{MAX_GENERATION}")
+        _require_timestamp(self.planned_at, "planned_at")
+        _require(bool(self.considered), "considered", "must name at least one finding")
+        _require_unique(self.considered, "considered")
+        for index, finding_id in enumerate(self.considered):
+            _require_id(finding_id, "F", f"considered[{index}]")
+        _require_unique(self.slots, "slots")
+        for index, slot_id in enumerate(self.slots):
+            _require_slot_id(slot_id, f"slots[{index}]")
+            _require(
+                slot_generation(slot_id) == self.generation,
+                f"slots[{index}]",
+                f"{slot_id} is not a slot of generation {self.generation}",
+            )
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> Wave:
+        f = Fields(raw)
+        return f.done(
+            cls(
+                generation=f.integer("generation"),
+                planned_at=f.text("planned_at"),
+                considered=f.texts("considered"),
+                slots=f.texts("slots"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class HuntPlan:
-    """What a round must examine: why it is as deep as it is, and the slots that cover it."""
+    """What a round must examine: why it is as deep as it is, the slots that cover it, and the waves planned.
+
+    The slots are the whole truth about what the round requires. `waves` is the durable record of which
+    findings called for the later-generation slots among them. A finding is answered once: no finding id
+    is named by two of the waves.
+    """
 
     reasons: tuple[str, ...]
     slots: tuple[Slot, ...]
+    waves: tuple[Wave, ...] = ()
 
     def __post_init__(self) -> None:
         _require_unique([slot.id for slot in self.slots], "slots")
+        stored = {slot.id for slot in self.slots}
+        _require_unique([finding_id for wave in self.waves for finding_id in wave.considered], "waves")
+        for index, wave in enumerate(self.waves):
+            stray = [slot_id for slot_id in wave.slots if slot_id not in stored]
+            _require(not stray, f"waves[{index}].slots", f"are not slots of this plan: {stray}")
 
     def slot(self, slot_id: str) -> Slot | None:
         return next((slot for slot in self.slots if slot.id == slot_id), None)
@@ -661,7 +720,13 @@ class HuntPlan:
     @classmethod
     def from_json(cls, raw: Any) -> HuntPlan:
         f = Fields(raw)
-        return f.done(cls(reasons=f.texts("reasons"), slots=f.records("slots", Slot.from_json)))
+        return f.done(
+            cls(
+                reasons=f.texts("reasons"),
+                slots=f.records("slots", Slot.from_json),
+                waves=f.records_or_empty("waves", Wave.from_json),
+            )
+        )
 
 
 @dataclass(frozen=True)

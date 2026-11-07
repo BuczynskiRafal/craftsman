@@ -25,6 +25,7 @@ from craftsman.records import (
     Slot,
     SlotClaim,
     VerdictEvent,
+    Wave,
     slot_generation,
 )
 
@@ -417,6 +418,51 @@ class HuntPlanTests(unittest.TestCase):
     def test_slot_ids_are_unique_within_a_plan(self) -> None:
         with self.assertRaisesRegex(LedgerError, "slots must not repeat an id"):
             HuntPlan((), (make_slot("W1-1"), make_slot("W1-1")))
+
+    def test_a_plan_keeps_its_waves_through_json_and_reads_one_without(self) -> None:
+        slots = (make_slot("W1-1"), make_slot("W2-X1", trigger="F1"), make_slot("W2-F1"))
+        plan = HuntPlan(("normal",), slots, (Wave(2, at(5), ("F1", "F2"), ("W2-X1", "W2-F1")),))
+        raw = json.loads(json.dumps(plan.to_json()))
+
+        self.assertEqual(HuntPlan.from_json(raw), plan)
+        del raw["waves"]  # a plan written before waves were recorded
+        self.assertEqual(HuntPlan.from_json(raw), replace(plan, waves=()))
+        self.assertEqual(HuntPlan((), slots).waves, ())
+
+    def test_a_wave_may_only_name_slots_of_its_plan(self) -> None:
+        with self.assertRaisesRegex(LedgerError, r"waves\[0\]\.slots are not slots of this plan: \['W2-X1'\]"):
+            HuntPlan((), (make_slot("W1-1"),), (Wave(2, at(1), ("F1",), ("W2-X1",)),))
+
+    def test_a_wave_is_a_decision_about_findings_of_a_later_generation(self) -> None:
+        for kwargs, message in (
+            ({"generation": 1}, "generation must be 2..3"),
+            ({"generation": 4}, "generation must be 2..3"),
+            ({"planned_at": "yesterday"}, "planned_at must be an ISO-8601 timestamp"),
+            ({"considered": ()}, "considered must name at least one finding"),
+            ({"considered": ("F1", "F1")}, "considered must not repeat an id"),
+            ({"considered": ("X1",)}, r"considered\[0\] must look like F1"),
+            ({"slots": ("W2-X1", "W2-X1")}, "slots must not repeat an id"),
+            ({"slots": ("nope",)}, r"slots\[0\] must look like W1-1"),
+            ({"slots": ("W3-X1",)}, r"slots\[0\] W3-X1 is not a slot of generation 2"),
+            ({"slots": ("W2-X1", "W1-1")}, r"slots\[1\] W1-1 is not a slot of generation 2"),
+        ):
+            with self.subTest(message=message):
+                base: dict[str, Any] = {"generation": 2, "planned_at": at(1), "considered": ("F1",), "slots": ()}
+                with self.assertRaisesRegex(LedgerError, message):
+                    Wave(**{**base, **kwargs})
+
+    def test_a_finding_is_answered_by_one_wave_of_a_plan_only(self) -> None:
+        slots = (make_slot("W1-1"), make_slot("W2-X1"), make_slot("W3-X1"))
+        waves = (Wave(2, at(1), ("F1", "F2"), ("W2-X1",)), Wave(3, at(2), ("F2",), ("W3-X1",)))
+
+        with self.assertRaisesRegex(LedgerError, "waves must not repeat an id"):
+            HuntPlan((), slots, waves)
+
+    def test_the_last_generation_decides_findings_without_planning_slots(self) -> None:
+        wave = Wave(3, at(2), ("F4",))
+
+        self.assertEqual(wave.slots, ())
+        self.assertEqual(Wave.from_json(json.loads(json.dumps(wave.to_json()))), wave)
 
     def test_a_round_carries_its_plan_through_json(self) -> None:
         ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))

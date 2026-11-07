@@ -198,7 +198,7 @@ class PrepareTests(RepoTestCase):
 
         out = self.review("prepare").stdout
 
-        self.assertRegex(out, r"W1-2  H1-H2  contracts, failure, sweep")
+        self.assertRegex(out, r"W1-2  H2 +contracts, failure, sweep")  # the sweep never grows a slot onto the prose
 
     def test_prose_changes_get_the_docs_lenses(self) -> None:
         self.repo.write("README.md", "# Cart\n")

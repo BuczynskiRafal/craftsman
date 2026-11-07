@@ -363,18 +363,17 @@ def _plan_round(
 ) -> _Prepared:
     """Open the next round for the snapshot (or take the latest one as it is) and give it its hunt plan.
 
-    The steps follow the planner's contract: a changed diff first seals the plan of the round it replaces;
-    the lenses each hunk requires and has been credited are computed on that ledger; `open_round` carries
-    over the hunks that owe nothing; the plan is built for what the open hunks still owe, appending to the
-    plan the round already has (so re-preparing an unchanged diff never changes an existing slot).
+    The steps follow the planner's contract: the lenses each hunk requires and has been credited are
+    computed on the ledger; `open_round` carries over the hunks that owe nothing; the plan is built for
+    what the open hunks still owe, appending to the plan the round already has (so re-preparing an
+    unchanged diff never changes an existing slot); finally the waves that are due are stored in it.
     """
     snap = ctx.snap
-    changed = not round_unchanged(current, snap, ctx.scope)
-    base = huntplan.seal_round(current) if changed else current
+    base = current
     required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep)
     enforced, platform = review_enforcement(ctx.ws, current, ctx.env, ctx.now)
     have = huntplan.credited(base, enforced=enforced)
-    carry_sweep = changed and huntplan.sweep_pending(base)
+    carry_sweep = not round_unchanged(current, snap, ctx.scope) and huntplan.sweep_pending(base)
     packet = packet_path(ctx.ws.ledger_path, len(base.rounds) + 1)
     opened, round_ = open_round(
         base, snap, ctx.depth.deep, str(packet), ctx.symbols,
@@ -410,13 +409,16 @@ def _plan_round(
         task=task,
         signals=signals_for(round_.open_hunk_ids) if created else round_.signals,
     )
-    updated = replace(opened, rounds=(*opened.rounds[:-1], prepared))
+    updated = huntplan.plan_due_waves(replace(opened, rounds=(*opened.rounds[:-1], prepared)), ctx.now)
+    prepared = updated.rounds[-1]
     return _Prepared(
         ledger=updated,
         round=prepared,
         created=created,
         raised=previous is not None and not previous.deep and prepared.deep,
-        added_slots=tuple(slot.id for slot in plan.slots if slot.id not in known) if not created else (),
+        added_slots=tuple(slot.id for slot in prepared.plan.slots if slot.id not in known)
+        if not created and prepared.plan is not None
+        else (),
         task_changed=not created and task != round_.task,
     )
 
@@ -1071,8 +1073,11 @@ def _brief(args: argparse.Namespace) -> int:
                 f"round {round_.number} has no hunt plan (it was prepared by an older craftsman); "
                 "run `craftsman review reset` and prepare again"
             )
-        required = huntplan.required_slots(current, round_)
-        slot = next((item for item in required if item.id == slot_id), None)
+        current = huntplan.plan_due_waves(current, datetime.now(timezone.utc))
+        round_ = current.rounds[round_.number - 1]
+        assert round_.plan is not None
+        required = round_.plan.slots
+        slot = round_.plan.slot(slot_id)
         if slot is None:
             if slot_generation(slot_id) == 1:
                 raise LedgerError(f"unknown slot {slot_id} in round {round_.number}; slots of round {round_.number}: {_slot_list(required)}")
@@ -1080,8 +1085,6 @@ def _brief(args: argparse.Namespace) -> int:
                 f"Slot {slot_id} is no longer required in round {round_.number} (the findings changed). "
                 "Reply exactly that to the agent that launched you and stop."
             )
-        if round_.plan.slot(slot_id) is None:
-            current = huntplan.materialize(current, round_.number, [slot_id])
         updated, issued = add_claim(current, slot_id, by=by)
         hunters = sum(item.generation == slot.generation for item in required)
         return updated, (issued, updated.rounds[-1], slot, hunters)
@@ -1292,7 +1295,7 @@ def _record_coverage(
     hunter: str | None = None,
     by: str | None = None,
 ) -> tuple[Ledger, str]:
-    current, slot = _resolve_hunter(current, round_, hunter, allow_lead=False)
+    slot = _resolve_hunter(current, round_, hunter, allow_lead=False)
     if slot is not None:
         return _record_slot_coverage(current, slot, targets, note, target_kind=target_kind, by=by)
     open_ids, carried = plan_coverage(round_, targets, target_kind=target_kind)
@@ -1353,44 +1356,41 @@ def _record_slot_coverage(
 
 def _resolve_hunter(
     current: Ledger, round_: Round, hunter: str | None, *, allow_lead: bool
-) -> tuple[Ledger, Slot | None]:
-    """The slot a `--hunter` names, stored in the round's plan (a derived wave slot is stored now).
+) -> Slot | None:
+    """The slot a `--hunter` names, from the round's stored plan.
 
     No `--hunter` is an error in an enforced round that has a plan, and fine elsewhere. `lead` (the
-    orchestrator, or extra work) names no slot. A slot the round does not require is an error that lists
+    orchestrator, or extra work) names no slot. A slot the plan does not store is an error that lists
     the ones it does.
     """
-    round_ = current.rounds[round_.number - 1]  # the caller's copy may predate a slot stored by an earlier entry
+    round_ = current.rounds[round_.number - 1]  # the caller's copy may predate an entry of the same batch
     number = round_.number
     if hunter is None:
         if round_.enforced and round_.plan is not None:
             lead = f" (or `{LEAD_HUNTER}` for your own findings)" if allow_lead else ""
             raise LedgerError(
                 f"name your hunter slot with --hunter (your brief says it){lead}; "
-                f"slots of round {number}: {_slot_list(huntplan.required_slots(current, round_))}",
+                f"slots of round {number}: {_slot_list(round_.plan.slots) if round_.plan else 'none'}",
                 field="hunter",
             )
-        return current, None
+        return None
     if hunter == LEAD_HUNTER:
         if not allow_lead:
             raise FieldError(
                 "hunter", f"'{LEAD_HUNTER}' never credits coverage; name the slot that was examined"
             )
-        return current, None
+        return None
     if slot_generation(hunter) is None:
         raise FieldError("hunter", f"{hunter!r} is not a slot id (like W1-1)")
     if round_.plan is None:
         raise LedgerError(f"round {number} has no hunt plan, so there is no slot to name; leave out --hunter", field="hunter")
-    required = huntplan.required_slots(current, round_)
-    if all(slot.id != hunter for slot in required):
-        raise LedgerError(f"unknown slot {hunter} in round {number}; slots of round {number}: {_slot_list(required)}", field="hunter")
-    if round_.plan.slot(hunter) is None:
-        current = huntplan.materialize(current, number, [hunter])
-    stored = current.rounds[number - 1].plan
-    slot = stored.slot(hunter) if stored is not None else None
-    if slot is None:  # materialize stores what it offered, so this is a planner bug, not a user error
-        raise LedgerError(f"slot {hunter} could not be stored in the plan of round {number}")
-    return current, slot
+    slot = round_.plan.slot(hunter)
+    if slot is None:
+        raise LedgerError(
+            f"unknown slot {hunter} in round {number}; slots of round {number}: {_slot_list(round_.plan.slots)}",
+            field="hunter",
+        )
+    return slot
 
 
 def _slot_list(slots: Sequence[Slot]) -> str:
@@ -1428,7 +1428,7 @@ def _add_one(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, Finding]:
         round_ = require_current_round(current, snap)
-        current, hunter = _finding_hunter(current, round_, args.hunter)
+        hunter = _finding_hunter(current, round_, args.hunter)
         return add_finding(
             current,
             lens=args.lens,
@@ -1493,12 +1493,11 @@ def _add_one_from_json(
                 path = found
                 if not reader.failed("line"):
                     lines = _attempt(sink, lambda: _source_lines(ws.root, found, line), None)
-        tagged: tuple[Ledger, str | None] = (current, None)
+        hunter: str | None = None
         if not reader.failed("hunter"):
-            tagged = _attempt(sink, lambda: _finding_hunter(current, current.rounds[-1], named_hunter), tagged)
-        state, hunter = tagged
+            hunter = _attempt(sink, lambda: _finding_hunter(current, current.rounds[-1], named_hunter), None)
         updated, finding = add_finding(
-            state,
+            current,
             lens=lens,
             path=path,
             line=line,
@@ -1514,15 +1513,15 @@ def _add_one_from_json(
     return reader.finish(record)
 
 
-def _finding_hunter(current: Ledger, round_: Round, hunter: str | None) -> tuple[Ledger, str | None]:
-    """The tag for a new finding: a slot of the round (stored now if it was only derived), `lead` or none.
+def _finding_hunter(current: Ledger, round_: Round, hunter: str | None) -> str | None:
+    """The tag for a new finding: a slot of the round's stored plan, `lead` or none.
 
     The tag is required in an enforced round that has a plan.
     """
     if hunter == LEAD_HUNTER:
-        return current, LEAD_HUNTER
-    current, slot = _resolve_hunter(current, round_, hunter, allow_lead=True)
-    return current, slot.id if slot is not None else None
+        return LEAD_HUNTER
+    slot = _resolve_hunter(current, round_, hunter, allow_lead=True)
+    return slot.id if slot is not None else None
 
 
 def _print_recorded(finding: Finding, lines: Sequence[str] | None) -> None:
@@ -1952,11 +1951,25 @@ def _evaluate(
             "--review-only is not allowed during an active /craftsman gate session; "
             "in /craftsman the full gate applies (run `craftsman review check` without --review-only)"
         )
-    ledger = load(ws.ledger_path)
+    ledger = _with_due_waves(ws)
     deep = effective_deep(ledger, ws.state is not None and ws.state.deep)
     snap = ws.snapshot(ledger)
     policy = GatePolicy(deep=deep, isolation_evidence=ws.isolation_evidence(ledger))
     return ledger, snap, deep, evaluate(ledger, snap, policy, review_only=review_only)
+
+
+def _with_due_waves(ws: Workspace) -> Ledger:
+    """The ledger with the waves that are due stored in the plan of its latest round (under the lock, only if any are)."""
+    now = datetime.now(timezone.utc)
+    ledger = load(ws.ledger_path)
+    if huntplan.plan_due_waves(ledger, now) is ledger:
+        return ledger  # the usual case: take no lock
+
+    def plan(current: Ledger) -> tuple[Ledger, Ledger]:
+        planned = huntplan.plan_due_waves(current, now)
+        return planned, planned
+
+    return mutate(ws.ledger_path, plan)
 
 
 ABANDONED_BANNER = "REVIEW ABANDONED - NOT COMPLETE"

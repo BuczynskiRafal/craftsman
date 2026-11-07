@@ -28,7 +28,7 @@ from craftsman.gatecheck import (
     verifier_clusters,
 )
 from craftsman.hooks import REVIEW_GUARD_ACTIONS
-from craftsman.huntplan import materialize, required_slots
+from craftsman.huntplan import plan_due_waves, required_slots
 from craftsman.ledger import (
     add_agent_event,
     add_coverage,
@@ -1287,10 +1287,49 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertTrue(report.enforced)
         self.assertFalse(report.self_reviewed)
 
-    def test_dynamic_variants_and_fresh_sets_are_wave_slots_with_their_own_issue(self) -> None:
+    def due_wave_ledger(self) -> Ledger:
+        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
+        return with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
+
+    def test_a_wave_that_is_due_but_not_stored_is_pending_and_the_ledger_stays_as_it_was(self) -> None:
+        ledger = self.due_wave_ledger()
+
+        report = check(ledger)
+
+        self.assertEqual(codes(report), ["wave-pending"])
+        self.assertEqual([item.slot.id for item in report.slots], ["W1-1", "W2-X1", "W2-F1"])
+        self.assertEqual({item.slot.id: item.state for item in report.slots}["W2-F1"], "unlaunched")
+        self.assertEqual([slot.id for slot in required_slots(ledger, ledger.rounds[0])], ["W1-1"])  # evaluate wrote nothing
+
+    def test_a_full_gate_cannot_pass_while_a_wave_is_due_whatever_became_of_the_finding(self) -> None:
+        ledger = self.due_wave_ledger()
+        accepted = replace(
+            ledger.findings[0], resolution="accepted", resolution_note="Accepted: the risk is understood and tracked."
+        )
+        ledger = replace(ledger, findings=(accepted,))
+
+        report = check(ledger, review_only=False, snap=hunt_snap(1))
+
+        self.assertIn("wave-pending", codes(report))
+        self.assertFalse(report.passed)
+
+    def test_a_wave_that_is_not_due_yet_adds_nothing(self) -> None:
+        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+
+        self.assertEqual([item.slot.id for item in check(ledger).slots], ["W1-1"])  # F1 has no verdict: the barrier holds
+        self.assertNotIn("wave-pending", codes(check(ledger)))
+
+    def test_an_advisory_round_plans_no_wave_in_the_gate(self) -> None:
+        ledger = replace(self.due_wave_ledger(), rounds=(replace(self.due_wave_ledger().rounds[0], enforced=False),))
+
+        self.assertEqual([item.slot.id for item in check(ledger).slots], ["W1-1"])
+
+    def test_planned_variants_and_fresh_sets_are_wave_slots_with_their_own_issue(self) -> None:
         ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
+        ledger = plan_due_waves(ledger, moment(80))
 
         report = check(ledger)
 
@@ -1299,22 +1338,23 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertIn("W2-X1, W2-F1", report.issues[0].message)
         self.assertEqual({item.slot.id: item.state for item in report.slots}["W2-F1"], "unlaunched")
 
-    def test_a_materialized_wave_slot_stays_pending_after_its_finding_is_dismissed(self) -> None:
+    def test_a_planned_wave_slot_stays_pending_after_its_finding_is_dismissed(self) -> None:
         ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
-        ledger = materialize(ledger, 1, ["W2-F1"])  # what `brief W2-F1` does
+        ledger = plan_due_waves(ledger, moment(80))  # once planned, it runs
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)), VerdictEvent("V2", "dismissed", at(90)))
 
         report = check(ledger, 300)
 
         self.assertIn("wave-pending", codes(report))
-        self.assertEqual([item.slot.id for item in report.slots if item.state != "done"], ["W2-F1"])
+        self.assertEqual([item.slot.id for item in report.slots if item.state != "done"], ["W2-X1", "W2-F1"])
 
     def test_a_wave_hunter_that_finished_after_the_trigger_clears_the_wave(self) -> None:
         ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
+        ledger = plan_due_waves(ledger, moment(80))
         ledger = hunted(ledger, "W2-X1", "h2", 100, 150)
         ledger = hunted(ledger, "W2-F1", "h3", 200, 250)
 
@@ -1324,18 +1364,19 @@ class EnforcedIssueTests(unittest.TestCase):
         ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(120)))
         ledger = with_agents(ledger, *run_events("v1", 115, 125, agent=VERIFIER, records=("V1",)))
-        ledger = hunted(ledger, "W2-F1", "h3", 70, 110)  # judged probable only at 120
+        ledger = plan_due_waves(ledger, moment(130))
+        ledger = hunted(ledger, "W2-F1", "h3", 70, 110)  # planned only at 130
 
         report = check(ledger, 300)
 
         self.assertEqual(codes(report), ["wave-pending"])
 
     def test_issues_come_in_the_documented_order(self) -> None:
-        ledger = hunted(hunt("W1-1", "W1-2", count=2), "W1-1", "h1", 10, 60)
+        ledger = hunted(hunt("W1-1", "W1-2", "W2-F2", count=2), "W1-1", "h1", 10, 60)  # a wave planned earlier
         ledger = with_findings(
             ledger, ("minor", "f1.py", "intent"), ("major", "f2.py", "failure"), ("major", "f2.py", "ripple")
         )
-        ledger = judged(ledger, "F2", VerdictEvent("V1", "probable", at(70)))  # unverified; triggers a wave
+        ledger = judged(ledger, "F2", VerdictEvent("V1", "probable", at(70)))  # unverified
         ledger = judged(ledger, "F3", VerdictEvent("V2", "dismissed", at(71)))  # one verifier only
         ledger = with_agents(ledger, *run_events("v", 65, 75, agent=VERIFIER, records=("V2",)))
 
@@ -1356,7 +1397,7 @@ class EnforcedIssueTests(unittest.TestCase):
         by_code = {issue.code: issue for issue in report.issues}
         self.assertEqual(by_code["hunt-pending"].missing, 1)  # W1-2 only: the wave slots are counted apart
         waves = sum(item.slot.generation >= 2 and item.state != "done" for item in report.slots)
-        self.assertGreaterEqual(waves, 1)
+        self.assertEqual(waves, 1)
         self.assertEqual(by_code["wave-pending"].missing, waves)
         summary = format_blocker_summary(report)
         self.assertIn("1 hunter slot pending", summary)
