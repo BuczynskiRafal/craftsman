@@ -11,9 +11,11 @@ from craftsman.attribution import (
     AgentRun,
     SlotWork,
     agent_runs,
+    bound_slots,
     credited_lenses,
     distinct_verdict_runs,
     evidence_counter,
+    finding_slots,
     identity,
     slot_work,
     verdict_vouched,
@@ -830,6 +832,79 @@ class EvidenceCounterTests(unittest.TestCase):
         seen.append(self.counter(ledger))
 
         self.assertEqual(seen, sorted(set(seen)))
+
+
+class FindingSlotsTests(unittest.TestCase):
+    """Which slot is bound to the run that recorded a finding (the generation of a finding rests on it)."""
+
+    def ledger(self, *, by: str | None = None, seconds: float = 3) -> Ledger:
+        ledger = hunt_ledger(("W1-1", "W1-2"))
+        ledger, finding = add_finding(ledger, **{**FINDING, "severity": "major"}, by=by)
+        return replace(ledger, findings=(replace(finding, recorded_at=at(seconds)),))
+
+    def slots(self, ledger: Ledger) -> frozenset[str]:
+        return finding_slots(ledger, ledger.findings[0], agent_runs(ledger), order_of(ledger))
+
+    def test_the_slot_of_the_run_that_recorded_the_finding_by_identity(self) -> None:
+        ledger = self.ledger(by="antigravity:a")
+        ledger, _ = cover(ledger, "W1-2", 2, by="antigravity:a")
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        self.assertEqual(self.slots(ledger), {"W1-2"})
+
+    def test_the_slot_of_the_run_whose_transcript_shows_the_finding(self) -> None:
+        ledger = self.ledger()
+        ledger, token = cover(ledger, "W1-1", 2)
+        ledger = with_agents(ledger, *run_events("a", 0, 5, records=(token, "F1")))
+
+        self.assertEqual(self.slots(ledger), {"W1-1"})
+
+    def test_a_run_answers_for_one_slot_even_when_it_covered_two(self) -> None:
+        ledger = self.ledger(by="antigravity:a")
+        ledger, _ = cover(ledger, "W1-2", 2, by="antigravity:a")
+        ledger, _ = cover(ledger, "W1-1", 3, by="antigravity:a")
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        self.assertEqual(self.slots(ledger), {"W1-1"})  # the first in plan order
+
+    def test_a_claim_binds_before_any_coverage(self) -> None:
+        ledger = self.ledger(by="antigravity:a")
+        ledger, claim_token = claim(ledger, "W1-2", 1, by="antigravity:a")
+        ledger, _ = cover(ledger, "W1-1", 2, by="antigravity:a")
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        self.assertEqual(claim_token, "B1")
+        self.assertEqual(self.slots(ledger), {"W1-2"})
+
+    def test_a_time_window_cannot_tell_which_slot_a_finding_belongs_to(self) -> None:
+        ledger = self.ledger()
+        ledger, _ = cover(ledger, "W1-1", 2)
+        ledger = with_agents(ledger, *run_events("a", 0, 5))
+
+        self.assertEqual(self.slots(ledger), frozenset())
+
+    def test_the_orchestrators_finding_outside_every_run_has_no_slot(self) -> None:
+        ledger = self.ledger(by="antigravity:a", seconds=30)
+        ledger, _ = cover(ledger, "W1-1", 2, by="antigravity:a")
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        self.assertEqual(self.slots(ledger), frozenset())
+
+    def test_a_verifier_run_does_not_count(self) -> None:
+        ledger = self.ledger(by="antigravity:v")
+        ledger = with_agents(ledger, *run_events("v", 0, 5, agent=VERIFIER, platform=AGY))
+
+        self.assertEqual(self.slots(ledger), frozenset())
+
+    def test_a_table_computed_once_gives_the_same_answer(self) -> None:
+        ledger = self.ledger(by="antigravity:a")
+        ledger, _ = cover(ledger, "W1-2", 2, by="antigravity:a")
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+        runs = agent_runs(ledger)
+        table = bound_slots(ledger, runs, order_of(ledger))
+
+        self.assertEqual(finding_slots(ledger, ledger.findings[0], runs, order_of(ledger), bound=table), {"W1-2"})
+        self.assertEqual(sorted(table.values()), ["W1-2"])
 
 
 if __name__ == "__main__":

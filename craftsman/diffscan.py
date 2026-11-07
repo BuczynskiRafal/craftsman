@@ -1399,6 +1399,27 @@ def _is_config(path: str) -> bool:
     )
 
 
+def is_config_path(path: str) -> bool:
+    """Configuration by file type or name: manifests, lockfiles, CI workflows, `Dockerfile`, `Makefile`."""
+    return _is_config(path)
+
+
+_GENERATED_NAMES = frozenset({"go.sum"})
+_GENERATED_SUFFIXES = (".min.js", ".min.css", ".map")
+
+
+def is_data_path(path: str) -> bool:
+    """Data, lockfiles and generated files: changes there are mechanical, not code to read line by line.
+
+    Covers the data suffixes (`.json`, `.lock`, `.svg`, ...), `go.sum` and minified or source-map files.
+    """
+    posix = PurePosixPath(path)
+    name = posix.name.lower()
+    return (
+        posix.suffix.lower() in _DATA_SUFFIXES or name in _GENERATED_NAMES or name.endswith(_GENERATED_SUFFIXES)
+    )
+
+
 def is_test_path(path: str) -> bool:
     """Test code by location or name, e.g. `tests/x.py`, `test_x.py`, `x.spec.ts`, `x_test.go`."""
     posix = PurePosixPath(path)
@@ -1469,6 +1490,11 @@ def detect_deep_hint_signals(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]
             if pattern.search(content):
                 fired.setdefault(name, []).append(hunk.id)
     return {name: tuple(ids) for name, ids in fired.items()}
+
+
+def is_docs_hunk(hunk: Hunk) -> bool:
+    """Whether the hunk alone is documentation: its path (and its old path, for a rename) is prose, not an agent prompt."""
+    return hunks_docs_only([hunk])
 
 
 def _is_docs_hunk(hunk: Hunk) -> bool:

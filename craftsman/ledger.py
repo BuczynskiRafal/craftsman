@@ -345,12 +345,21 @@ def open_round(
     scope: Sequence[str] | None = None,
     allow_scope_expansion: bool = False,
     out_of_scope: Sequence[str] = (),
+    required: Mapping[str, frozenset[str]] | None = None,
+    credited: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op.
 
     Asking for `deep` on an unchanged diff raises the latest round in place: its hunks and
     coverage stay, only the lens suggestions grow.
+
+    Given both `required` (hunk id -> the lenses the hunk must be examined with) and `credited` (hunk
+    digest -> the lenses accepted coverage has examined it with), a hunk is carried over only when
+    it is not reopened and everything it requires is credited. Without them a hunk is carried when
+    any coverage reviewed its digest, as before. Giving only one of the two is an error.
     """
+    if (required is None) != (credited is None):
+        raise LedgerError("lens-aware carry-over needs both `required` and `credited`, or neither")
     normalized_scope = None if scope is None else tuple(sorted(scope))
     if ledger.rounds:
         _validate_round_continuation(
@@ -365,7 +374,7 @@ def open_round(
     unknown = sorted(set(symbols_by_hunk) - {hunk.id for hunk in snap.hunks})
     if unknown:
         raise LedgerError(f"symbols given for hunks not in the snapshot: {', '.join(unknown)}")
-    carried, reopened = _carry_over(ledger, snap.hunks, symbols_by_hunk)
+    carried, reopened = _carry_over(ledger, snap.hunks, symbols_by_hunk, required, credited)
     round_ = Round(
         number=len(ledger.rounds) + 1,
         fingerprint=snap.fingerprint,
@@ -413,15 +422,32 @@ def _reopened_hunk_ids(
 
 
 def _carry_over(
-    ledger: Ledger, hunks: Sequence[Hunk], symbols_by_hunk: Mapping[str, Sequence[str]]
+    ledger: Ledger,
+    hunks: Sequence[Hunk],
+    symbols_by_hunk: Mapping[str, Sequence[str]],
+    required: Mapping[str, frozenset[str]] | None = None,
+    credited: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """Ids of the hunks of the next round that are carried over, and of those that are reopened."""
+    """Ids of the hunks of the next round that are carried over, and of those that are reopened.
+
+    With `required` and `credited` (the planned path) a hunk is carried only when all it requires is
+    credited; a hunk without an entry in `required` is never carried.
+    """
     if not ledger.rounds:
         return frozenset(), frozenset()
     reviewed = covered_digests(ledger, len(ledger.rounds))
     previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
     reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk)
-    carried = {hunk.id for hunk in hunks if hunk.id not in reopened and hunk.digest in reviewed}
+    if required is not None and credited is not None:
+        carried = {
+            hunk.id
+            for hunk in hunks
+            if hunk.id not in reopened
+            and hunk.id in required
+            and required[hunk.id] <= credited.get(hunk.digest, frozenset())
+        }
+    else:
+        carried = {hunk.id for hunk in hunks if hunk.id not in reopened and hunk.digest in reviewed}
     return frozenset(carried), frozenset(reopened)
 
 

@@ -303,6 +303,43 @@ def slot_work(
     return work
 
 
+def bound_slots(
+    ledger: Ledger, runs: Sequence[AgentRun], slot_order: SlotOrder
+) -> dict[tuple[int, str], str]:
+    """The one slot each exactly attributed agent answers for in each round, keyed by (round, agent).
+
+    The agent key is opaque: look a run up with `finding_slots`, not by building the key. See
+    `slot_work` for what binding means.
+    """
+    return _bound_slots(ledger, runs, _tagged_records(ledger, runs), slot_order)
+
+
+def finding_slots(
+    ledger: Ledger,
+    finding: Finding,
+    runs: Sequence[AgentRun],
+    slot_order: SlotOrder,
+    *,
+    bound: Mapping[tuple[int, str], str] | None = None,
+) -> frozenset[str]:
+    """The slots bound to the reviewer runs that vouch for the record of `finding` (its `F<n>` token).
+
+    Only an exact voucher (identity or transcript) has a bound slot; a finding that only a time
+    window vouches for belongs to no slot. `bound` is the result of `bound_slots`, when the caller
+    asks about many findings and has it already.
+    """
+    table = bound_slots(ledger, runs, slot_order) if bound is None else bound
+    vouchers = vouching_runs(
+        runs,
+        role="reviewer",
+        token=finding.id,
+        recorded_at=parse_timestamp(finding.recorded_at),
+        by=finding.by,
+    )
+    slots = (table.get((finding.round, _run_key(v.run, v.index))) for v in vouchers if v.exact)
+    return frozenset(slot for slot in slots if slot is not None)
+
+
 def credited_lenses(
     ledger: Ledger,
     upto: int,

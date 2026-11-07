@@ -30,6 +30,7 @@ from craftsman.ledger import (
     mutate,
     next_claim_token,
     next_verdict_token,
+    open_round,
     plan_coverage,
     reopened_mentions,
     resolve,
@@ -905,6 +906,88 @@ class PersistenceTests(unittest.TestCase):
             self.assertRaisesRegex(LedgerError, "cannot locate"),
         ):
             ledger_path_for(outside)
+
+
+class LensAwareCarryOverTests(unittest.TestCase):
+    """With `required` and `credited` a hunk is carried only when everything it requires is credited."""
+
+    INTENT_TESTS = frozenset({"intent", "tests"})
+
+    def reviewed(self) -> tuple[Ledger, Any, Any]:
+        h1, h2 = make_hunk("H1", "a.py"), make_hunk("H2", "b.py")
+        ledger = fully_reviewed(make_snap(h1, h2))
+        return ledger, h1, h2
+
+    def open_next(self, ledger: Ledger, *hunks: Any, **maps: Any) -> Any:
+        snap = make_snap(*hunks, fingerprint="fp2")
+        _, round_ = open_round(ledger, snap, False, "packet.md", maps.pop("symbols", {}), **maps)
+        return round_
+
+    def test_a_hunk_is_carried_when_its_required_lenses_are_all_credited(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        h3 = make_hunk("H3", "c.py")
+        required = {h.id: self.INTENT_TESTS for h in (h1, h2, h3)}
+        credited = {h1.digest: frozenset({"intent", "tests", "craft"}), h2.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(ledger, h1, h2, h3, required=required, credited=credited)
+
+        self.assertEqual([h.carried for h in round_.hunks], [True, True, False])
+
+    def test_a_missing_lens_keeps_the_hunk_open_although_it_was_covered(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        required = {"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}
+        credited = {h1.digest: frozenset({"intent"}), h2.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(ledger, h1, h2, make_hunk("H3", "c.py"), required={**required, "H3": self.INTENT_TESTS}, credited=credited)
+
+        self.assertEqual([h.carried for h in round_.hunks], [False, True, False])
+        self.assertEqual([h.reopened for h in round_.hunks], [False, False, False])
+
+    def test_the_old_rule_applies_without_the_maps(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+
+        round_ = self.open_next(ledger, h1, h2, make_hunk("H3", "c.py"))
+
+        self.assertEqual([h.carried for h in round_.hunks], [True, True, False])
+
+    def test_giving_only_one_of_the_maps_is_an_error_not_a_silent_fallback(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        h3 = make_hunk("H3", "c.py")
+        for maps in (
+            {"required": {"H1": self.INTENT_TESTS}},
+            {"credited": {h1.digest: self.INTENT_TESTS}},
+        ):
+            with self.subTest(given=sorted(maps)), self.assertRaisesRegex(LedgerError, "both"):
+                self.open_next(ledger, h1, h2, h3, **maps)
+
+    def test_a_hunk_without_an_entry_in_required_is_never_carried(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        credited = {h1.digest: self.INTENT_TESTS, h2.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(ledger, h1, h2, required={"H1": self.INTENT_TESTS}, credited=credited)
+
+        self.assertEqual([h.carried for h in round_.hunks], [True, False])
+
+    def test_a_reopened_hunk_stays_reopened_whatever_is_credited(self) -> None:
+        caller = make_hunk("H1", "a.py", (" total = compute_total(x)", "+y = 1"))
+        ledger = fully_reviewed(make_snap(caller))
+        changed = make_hunk("H2", "c.py", ("-def compute_total(items):", "+def compute_total(items, rate):"))
+        required = {"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}
+        credited = {caller.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(
+            ledger, caller, changed, required=required, credited=credited, symbols={"H2": ["compute_total"]}
+        )
+
+        self.assertEqual([(h.carried, h.reopened) for h in round_.hunks], [(False, True), (False, False)])
+
+    def test_a_first_round_has_nothing_to_carry(self) -> None:
+        h1 = make_hunk("H1")
+        _, round_ = open_round(
+            Ledger(), make_snap(h1), False, "packet.md", {}, required={"H1": self.INTENT_TESTS}, credited={h1.digest: self.INTENT_TESTS}
+        )
+
+        self.assertFalse(round_.hunks[0].carried)
 
 
 if __name__ == "__main__":
