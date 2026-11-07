@@ -55,8 +55,8 @@ Implement in small steps that each leave the project working. Write or extend te
 the code — at least the main path, the edge cases settled in step 3, and one error path. Run them
 through `craftsman run --kind test` as you go.
 
-## 6. Hand over to the quality loop
-Inside `/craftsman`, continue with its Stage 2. Standalone, run `/simplify`, `/code-review`, and
+## 6. Hand over to the final review
+Inside `/craftsman`, run `/simplify`, then continue with its Stage 2. Standalone, run `/simplify`, `/craft-review`, and
 `/verify` on the result.
 
 ## 7. Summarize

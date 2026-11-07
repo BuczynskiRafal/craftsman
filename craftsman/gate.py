@@ -28,7 +28,6 @@ from typing import Any, Literal, TypeVar, get_args
 
 from craftsman.diffscan import (
     DiffScanError,
-    DiffSnapshot,
     git_dir,
     resolve_base_sha,
     snapshot,
@@ -42,15 +41,13 @@ from craftsman.evidence import (
 )
 from craftsman.files import write_text_atomic
 from craftsman.gatecheck import (
-    QUICK_TIER_MAX_CHANGED_LINES,
+    SELF_REVIEWED_BANNER,
     GateReport,
     format_blocker_summary,
-    has_unresolved_diff_size,
     render_next_actions,
     render_report,
 )
-from craftsman.ledger import locked
-from craftsman.lenses import Tier
+from craftsman.ledger import locked, locked_unless_held
 from craftsman.records import (
     ISOLATION_EVIDENCES,
     FieldError,
@@ -60,25 +57,18 @@ from craftsman.records import (
     format_timestamp,
 )
 
-GateTier = Literal["auto", "quick", "standard", "deep"]
 GatePlatform = Literal["copilot", "claude", "antigravity", "cli"]
-GATE_TIERS: tuple[GateTier, ...] = get_args(GateTier)
 GATE_PLATFORMS: tuple[GatePlatform, ...] = get_args(GatePlatform)
-# `auto` ranks between `quick` and `standard`: it may still resolve to either.
-TIER_RANK: dict[GateTier, int] = {"quick": 0, "auto": 1, "standard": 2, "deep": 3}
 
 STATE_FILENAME = "craftsman_state.json"
+OLDER_STATE_SUFFIX = ".v4.bak"
 MAX_CONTINUATIONS = 6
-QUICK_TIER_MAX_FILES = 2
 MAX_CONTINUATION_REASON_CHARS = 1800
 MAX_ERROR_CHARS = 400
 CONTINUATION_HEADER = "[CRAFTSMAN GATE"
+REVIEW_CONTINUATION_HEADER = "[CRAFTSMAN REVIEW"
 TAKEOVER_HINT = "start a new gate with `craftsman gate --init --takeover`"
 NO_ACTIVE_GATE = "no active gate in this work tree; open one with `craftsman gate --init`"
-OVERSIZED_NOTICE = (
-    "Craftsman gate: the change exceeds the diff-size budget. The decision belongs to the user; "
-    "`craftsman review report` lists the top files by growth and a split suggestion."
-)
 ROUND_CAP_NOTICE = (
     "Craftsman gate: the review reached its round cap. The remaining issues need your decision; "
     "`craftsman review report` lists them. Start `/craftsman` again to restart."
@@ -171,7 +161,7 @@ class GateState:
 
     owner: GateOwner
     base_sha: str
-    tier: GateTier
+    deep: bool
     task: str
     started_at: str
     active: bool = True
@@ -186,17 +176,15 @@ class GateState:
     def __post_init__(self) -> None:
         if not self.base_sha:
             raise GateStateError("base_sha must not be empty")
-        if self.tier not in GATE_TIERS:
-            raise GateStateError(f"unknown tier {self.tier!r}")
         if self.isolation_evidence not in ISOLATION_EVIDENCES:
             raise GateStateError(f"unknown isolation evidence {self.isolation_evidence!r}")
         if self.forced_continuations < 0 or (self.best_issue_count or 0) < 0:
             raise GateStateError("counters must not be negative")
 
     @classmethod
-    def open(cls, owner: GateOwner, base_sha: str, tier: GateTier, task: str, **extra: Any) -> GateState:
+    def open(cls, owner: GateOwner, base_sha: str, deep: bool, task: str, **extra: Any) -> GateState:
         """A new active gate starting now."""
-        return cls(owner, base_sha, tier, task, format_timestamp(datetime.now(timezone.utc)), **extra)
+        return cls(owner, base_sha, deep, task, format_timestamp(datetime.now(timezone.utc)), **extra)
 
     @classmethod
     def from_json(cls, raw: object) -> GateState:
@@ -208,7 +196,7 @@ class GateState:
         state = cls(
             owner=fields.record("owner", GateOwner.from_fields),
             base_sha=fields.text("base_sha"),
-            tier=fields.choice("tier", GATE_TIERS),
+            deep=fields.flag("deep"),
             task=fields.text("task"),
             started_at=fields.text("started_at"),
             active=fields.flag("active"),
@@ -229,17 +217,24 @@ class GateState:
         data["stage"] = self.stage.value
         return data
 
-    def closed(self, report: GateReport, tier: Tier) -> GateState:
-        """The state after the ledger passed the gate on `tier`.
+    def closed(self, report: GateReport) -> GateState:
+        """The state after the ledger passed the gate.
 
-        A self-reviewed `deep` task stays active and waits for the user: the deep tier promises
-        an independent review that did not happen.
+        Without isolation evidence a self-reviewed task closes with the SELF-REVIEWED banner,
+        deep or not: the platform cannot prove a reviewer ran, so that is no reason to hold the
+        user up. A deep gate still needed its end-to-end run to get here.
         """
-        if report.self_reviewed and tier == "deep":
-            return replace(self, awaiting_user=False, stage=Stage.NEEDS_HUMAN)
-        unisolated = report.self_reviewed and tier != "quick"
-        stage = Stage.COMPLETE_UNISOLATED if unisolated else Stage.COMPLETED
+        stage = Stage.COMPLETE_UNISOLATED if report.self_reviewed else Stage.COMPLETED
         return replace(self, active=False, awaiting_user=False, stage=stage)
+
+    @property
+    def required_isolation(self) -> IsolationEvidence:
+        """Where proof of an isolated reviewer must come from for this gate.
+
+        An Antigravity gate always has the transcript as evidence, even before the Stop hook,
+        the only reader of the transcript, has served it.
+        """
+        return "transcript" if self.owner.platform == "antigravity" else self.isolation_evidence
 
 
 def _parsed(raw: object, parse: Callable[[object], P], where: str) -> P:
@@ -247,11 +242,6 @@ def _parsed(raw: object, parse: Callable[[object], P], where: str) -> P:
         return parse(raw)
     except FieldError as exc:
         raise GateStateError(f"{where}: {exc}") from None
-
-
-def raised_tier(current: GateTier, requested: GateTier) -> GateTier:
-    """The stricter of two tiers: an active gate's tier can rise, never drop."""
-    return requested if TIER_RANK[requested] > TIER_RANK[current] else current
 
 
 # --- persistence ----------------------------------------------------------------------------
@@ -263,7 +253,11 @@ def state_path_for(cwd: str | Path) -> Path:
 
 
 def load_state(path: Path) -> GateState | None:
-    """The gate state stored at `path`, or None when no gate was ever opened there."""
+    """The gate state stored at `path`, or None when no gate was ever opened there.
+
+    A state file from Craftsman 4.x (it has `tier` where 5.x has `deep`) is set aside with a
+    notice and read as absent, so an upgrade never leaves a work tree without a way forward.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -271,9 +265,46 @@ def load_state(path: Path) -> GateState | None:
     except (OSError, UnicodeDecodeError) as exc:
         raise GateStateError(f"cannot read {path}: {exc}") from exc
     try:
-        return GateState.from_json(json.loads(text))
-    except (json.JSONDecodeError, GateStateError) as exc:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
         raise GateStateError(f"{path} is not a valid gate state ({exc}); {TAKEOVER_HINT}") from exc
+    if _is_older_state(raw):
+        _set_aside_older_state(path)
+        return load_state(path)  # the old state is gone: absent, or a new gate written meanwhile
+    try:
+        return GateState.from_json(raw)
+    except GateStateError as exc:
+        raise GateStateError(f"{path} is not a valid gate state ({exc}); {TAKEOVER_HINT}") from exc
+
+
+def _is_older_state(raw: object) -> bool:
+    """Whether `raw` is the gate state of Craftsman 4.x: it knows a `tier` and no `deep`."""
+    return isinstance(raw, dict) and "tier" in raw and "deep" not in raw
+
+
+def _set_aside_older_state(path: Path) -> None:
+    """Rename a 4.x gate state, under the lock and after reading it again: a 5.x gate written
+    meanwhile must stay where it is."""
+    backup = path.with_name(f"{path.name}{OLDER_STATE_SUFFIX}")
+    try:
+        with locked_unless_held(path):
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return  # gone, or unreadable: not ours to set aside
+            if not _is_older_state(current):
+                return
+            os.replace(path, backup)
+    except LedgerError as exc:
+        raise GateStateError(f"cannot archive the Craftsman 4.x gate state {path}: {exc}") from exc
+    except FileNotFoundError:
+        return  # another process set it aside first
+    except OSError as exc:
+        raise GateStateError(f"cannot archive the Craftsman 4.x gate state {path}: {exc}") from exc
+    sys.stderr.write(
+        f"[craftsman] Archived the gate state of an older craftsman to {backup.name}; "
+        "continuing without a gate.\n"
+    )
 
 
 def save_state(path: Path, state: GateState) -> None:
@@ -331,55 +362,29 @@ def foreign_gate_refusal(root: Path, active: GateState, action: str) -> str:
 # --- evaluation -----------------------------------------------------------------------------
 
 
-def task_tier(configured: GateTier, snap: DiffSnapshot) -> Tier:
-    """The concrete tier of a task; `auto` is `quick` while the diff stays within the quick limits.
-
-    A binary or oversized file exceeds the limits: its size in lines is unknown.
-    """
-    if configured != "auto":
-        return configured
-    small = (
-        len(snap.files) <= QUICK_TIER_MAX_FILES
-        and snap.added + snap.deleted <= QUICK_TIER_MAX_CHANGED_LINES
-        and not snap.skipped
-    )
-    return "quick" if small else "standard"
-
-
-def current_tier(state: GateState, root: Path) -> Tier:
-    """The concrete tier of `state`'s task for the work tree `root` as it is now."""
-    if state.tier != "auto":
-        return state.tier
-    return task_tier(state.tier, snapshot(root, state.base_sha))
-
-
 def evaluate_task(state: GateState, root: Path) -> Evaluation:
     """Evaluate the evidence ledger of the work tree `root` for the task of `state`.
 
     Raises `DiffScanError` or `LedgerError` when the work tree or the ledger cannot be read.
     """
     snap = snapshot(root, state.base_sha)
-    return evaluate_evidence(root, snap, task_tier(state.tier, snap), state.isolation_evidence)
+    return evaluate_evidence(root, snap, state.deep, state.required_isolation)
 
 
 class Outcome(Enum):
     PASSED = "passed"
-    OVERSIZED = "oversized"
     ROUND_CAP = "round-cap"
     UNSATISFIED = "unsatisfied"
 
 
 def judge(evaluation: Evaluation) -> Outcome:
     """Whether an evaluated task passed, needs the user's decision, or needs more work."""
-    if has_unresolved_diff_size(evaluation.ledger):
-        return Outcome.OVERSIZED
     if any(issue.code == "round-cap" for issue in evaluation.report.issues):
         return Outcome.ROUND_CAP
     return Outcome.PASSED if evaluation.report.passed else Outcome.UNSATISFIED
 
 
 HUMAN_NOTICES: dict[Outcome, str] = {
-    Outcome.OVERSIZED: OVERSIZED_NOTICE,
     Outcome.ROUND_CAP: ROUND_CAP_NOTICE,
 }
 
@@ -406,7 +411,7 @@ def decide_stop(state: GateState, root: Path) -> StopDecision:
     if outcome in HUMAN_NOTICES:
         return StopDecision(replace(state, stage=Stage.NEEDS_HUMAN), notice=HUMAN_NOTICES[outcome])
     if outcome is Outcome.PASSED:
-        return StopDecision(state.closed(evaluation.report, evaluation.tier))
+        return StopDecision(state.closed(evaluation.report))
     return _continue(state, evaluation.report, None)
 
 
@@ -462,9 +467,19 @@ def continuation_reason(header: str, report: GateReport | None, evidence_error: 
     return "\n".join(lines)
 
 
+# What Claude Code sends as a user prompt when a background subagent reports back: the current
+# builds wrap it in "Another Claude session sent a message:" and `<agent-message>`, older ones in
+# `<task-notification>`.
+AGENT_REPORT_PREFIXES = ("<task-notification>", "Another Claude session sent a message:", "<agent-message")
+
+
 def is_continuation_prompt(prompt: str) -> bool:
-    """True for a stop hook's block reason, which some platforms send back as a user prompt."""
-    return prompt.lstrip().startswith(CONTINUATION_HEADER)
+    """True for a prompt the platform sends on the session's behalf, not the user's words.
+
+    That is a stop hook's block reason, which some platforms send back as a user prompt, or the
+    report of a background subagent.
+    """
+    return prompt.lstrip().startswith((CONTINUATION_HEADER, REVIEW_CONTINUATION_HEADER, *AGENT_REPORT_PREFIXES))
 
 
 def archive_ledger_for_new_base(root: Path, base_sha: str) -> None:
@@ -506,7 +521,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="craftsman gate",
         description=(
             "Open, update and close the Craftsman quality gate of the current git work tree. "
-            "Without an action, --tier and --task update the active gate."
+            "Without an action, --deep and --task update the active gate."
         ),
     )
     action = parser.add_mutually_exclusive_group()
@@ -522,11 +537,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cwd", help="A directory inside the work tree (default: the current one).")
     parser.add_argument(
-        "--tier",
-        choices=GATE_TIERS,
-        help=f"auto (quick while the diff stays within {QUICK_TIER_MAX_FILES} files and "
-        f"{QUICK_TIER_MAX_CHANGED_LINES} lines, else standard), quick, standard or deep. An active "
-        "gate's tier can only rise.",
+        "--deep",
+        action="store_true",
+        help="A deep gate: every lens is suggested and an end-to-end run is required. "
+        "An active gate can only be raised to deep.",
     )
     parser.add_argument("--task", help="One-line description of the task (shown in review packets).")
     parser.add_argument("--base-sha", help="With --init: the base commit (default HEAD).")
@@ -553,10 +567,10 @@ def _check_combinations(parser: argparse.ArgumentParser, args: argparse.Namespac
     ]
     if init_only and not args.init:
         parser.error(f"{', '.join(init_only)}: only valid with --init")
-    if (args.complete or args.await_user or args.resume) and (args.tier or args.task):
-        parser.error("--tier and --task apply with --init or on their own")
-    if not (args.init or args.complete or args.await_user or args.resume or args.tier or args.task):
-        parser.error("choose --init, --complete, --await-user or --resume, or update --tier/--task")
+    if (args.complete or args.await_user or args.resume) and (args.deep or args.task):
+        parser.error("--deep and --task apply with --init or on their own")
+    if not (args.init or args.complete or args.await_user or args.resume or args.deep or args.task):
+        parser.error("choose --init, --complete, --await-user or --resume, or update --deep/--task")
 
 
 def run_cli(argv: list[str], env: Mapping[str, str]) -> int:
@@ -588,22 +602,23 @@ def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -
     with state_lock(path):
         previous = _replaceable_state(path, takeover=args.takeover)
         owner = caller
-        tier: GateTier = args.tier or "auto"
+        deep = bool(args.deep)
         isolation: IsolationEvidence = "none"
         takeover_from: GateOwner | None = None
         if previous is not None and previous.active and previous.owner.admits(caller):
-            # Re-opening its own gate keeps what the hooks proved about the session, and its tier
-            # can only rise, so a re-init cannot shed the isolated reviewer requirement.
+            # Re-opening its own gate keeps what the hooks proved about the session, and it can
+            # only become deep, so a re-init cannot shed the deep requirements.
             owner, isolation = previous.owner.claimed_by(caller), previous.isolation_evidence
-            tier = raised_tier(previous.tier, args.tier or previous.tier)
+            deep = previous.deep or deep
         elif previous is not None and previous.active:
             if not args.takeover:
                 raise ForeignGateError(foreign_gate_refusal(root, previous, "initialize"))
-            takeover_from = previous.owner
+            # Taking a gate over never makes it shallower.
+            takeover_from, deep = previous.owner, previous.deep or deep
         state = GateState.open(
             owner,
             base_sha,
-            tier,
+            deep,
             args.task or "",
             isolation_evidence=isolation,
             takeover_from=takeover_from,
@@ -628,7 +643,7 @@ def _updated(state: GateState, args: argparse.Namespace) -> GateState:
         return replace(state, awaiting_user=bool(args.await_user))
     return replace(
         state,
-        tier=raised_tier(state.tier, args.tier) if args.tier else state.tier,
+        deep=state.deep or bool(args.deep),
         task=args.task or state.task,
     )
 
@@ -644,7 +659,7 @@ def _close_gate(
         return replace(state, stage=Stage.NEEDS_HUMAN), (1, failure)
     if outcome is Outcome.UNSATISFIED:
         return state, (1, f"[CRAFTSMAN GATE] Cannot complete:\n{render_report(evaluation.report)}\n")
-    closed = state.closed(evaluation.report, evaluation.tier)
+    closed = state.closed(evaluation.report)
     return closed, (0, closed_gate_line(evaluation, closed))
 
 
@@ -659,17 +674,16 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
 
 
 def closed_gate_line(evaluation: Evaluation, state: GateState) -> str:
-    if state.active:
-        return (
-            f"Craftsman gate passed without an isolated review on the {evaluation.tier} tier; it "
-            "stays open for the user's decision. Run `craftsman review report` for them.\n"
-        )
     findings = evaluation.ledger.findings
     fixed = sum(finding.resolution == "fixed" for finding in findings)
     accepted = sum(finding.resolution == "accepted" for finding in findings)
+    unisolated = (
+        f" {SELF_REVIEWED_BANNER}." if state.stage is Stage.COMPLETE_UNISOLATED else ""
+    )
     return (
-        f"Craftsman gate closed: round {len(evaluation.ledger.rounds)}, tier {evaluation.tier}, "
-        f"{fixed} findings fixed, {accepted} accepted.\n"
+        f"Craftsman gate closed: round {len(evaluation.ledger.rounds)}"
+        f"{', deep' if evaluation.deep else ''}, "
+        f"{fixed} findings fixed, {accepted} accepted.{unisolated}\n"
     )
 
 

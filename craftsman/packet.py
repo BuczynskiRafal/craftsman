@@ -6,10 +6,9 @@ collected context so its layout can be tested without a repository.
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from craftsman.diffscan import (
@@ -23,23 +22,24 @@ from craftsman.diffscan import (
     files_without_signal_patterns,
     git_output,
     is_test_path,
+    reference_kind,
 )
-from craftsman.ledger import reopened_mentions, valid_facts_for_hunk
-from craftsman.lenses import LensPick
-from craftsman.records import SWEEP_LENS, Fact, FieldError, Ledger, Round
-from craftsman.text import inline_md
+from craftsman.ledger import reopened_mentions
+from craftsman.lenses import LENSES
+from craftsman.records import FieldError, Ledger, QualitySignal, Round, SignalKind
 
 MAX_PACKET_CHARS = 120_000
-MAX_QUICK_PACKET_CHARS = 40_000
 MAX_VIEW_CHARS = 60_000
 MAX_SCOPE_LINES = 60
-SCOPE_CONTEXT_RADIUS = 15
+SCOPE_CONTEXT_RADIUS = 8
 MAX_COMMITS = 50
-MAX_REFERENCES_PER_SYMBOL = 8
+MAX_HINTS_LISTED = 12
+MAX_HINTS_PER_KIND = 4
+MAX_REFERENCES_PER_SYMBOL = 6
 TRIMMED_REFERENCES_PER_SYMBOL = 3
 MAX_TEST_FILES_PER_SYMBOL = 5
-REFERENCE_SEARCH_LIMIT = 40
-MAX_SUGGESTED_SHARDS = 4
+REFERENCE_SEARCH_LIMIT = 40  # ranked references kept per symbol; the render shows fewer
+_KIND_RANK = {"call": 0, "test": 1, "import": 2, "docs": 3}
 
 _CONVENTION_FILES = (
     "AGENTS.md",
@@ -96,42 +96,16 @@ _FENCE_LANGUAGES = {
     ".md": "markdown",
 }
 _BACKTICK_RUN_RE = re.compile(r"`+")
-CHEAT_SHEET = (
-    "- Cover (1–4 hunks per call; combine assigned lenses with `\"lenses\"` — >= 2 lenses need >= 80 "
-    "chars/hunk, 20 concrete; 1 lens >= 40):\n"
-    '  `craftsman review cover --from-json - <<\'EOF\'` with `[{"lenses": ["intent", "contracts", '
-    '"failure"], "hunks": ["H1"], "note": "H1 parse_cfg: x=None -> L42 TypeError, raw=\'\' -> '
-    'default {} at cfg.py:18, callers cli.py:19 ok"}]`, or single '
-    '`craftsman review cover --lens intent,contracts --hunks H1 --note "..."`; `design` takes '
-    '`--files a.py` (`"files"` in JSON)',
-    "- Finding (one per root cause; >1 entry via `--from-json - <<'EOF'`; `craftsman review merge "
-    "F1 F2` only when ONE fix removes every consequence — different fixes stay separate findings):\n"
-    '  `craftsman review add --from-json - <<\'EOF\'` with `[{"lens": "<lens>", "file": "<path>", '
-    '"line": 42, "severity": "major", "title": "...", "scenario": "<root cause -> wrong outcomes>", '
-    '"suggestion": "..."}]`, or single:\n'
-    "  `craftsman review add --lens <lens> --file <path> --line <n> --severity "
-    'blocker|major|minor|nit --title "..." --scenario "<root cause -> wrong outcomes>" '
-    '--suggestion "..."`',
-    "- Verdict (for >1 entry, prefer `craftsman review verdict --from-json - <<'EOF'` with "
-    '`[{"id": "F1", "as": "probable", "evidence": "static: <file.py:42 chain>"}]`): '
-    '`craftsman review verdict F1 --as proven --run R1 --evidence "..."` · '
-    '`--as probable --evidence "static: <file.py:42 chain>"` (or `"no-repro: <why>; <chain>"`) · '
-    '`--as question --evidence "intent: <source>; <file.py:42 trade-off>"` · '
-    '`--as dismissed --evidence "<guard at file.py:42>"`',
-    "- PowerShell / rejections: `@'` / `[...]` / `'@ | craftsman review <cmd> --from-json -` (ASCII "
-    "in PS 5.1) or `Set-Content -LiteralPath <path> -Encoding utf8` to `craftsman review inbox "
-    "<cover|add|verdict>`; fix all rejected entries in one edit, resend once",
-    "- Run (tests, repro, e2e): `craftsman run --kind test|e2e|repro|lint|build -- <command>`",
-    "- Progress: `craftsman review show` · gate status: `craftsman review check` "
-    "(review-only: `craftsman review check --review-only`, `craftsman review report --review-only`)",
+HUNKS_LEGEND = (
+    "Each hunk is shown inside its enclosing scope at HEAD: `+` added, `-` removed, unmarked "
+    "unchanged; numbers are HEAD lines; `[H3]` … `[/H3]` bracket hunk H3. More context: "
+    "`craftsman review scout H3` (base version, callers, tests) or `craftsman review scout <symbol>`."
 )
-
 
 @dataclass(frozen=True)
 class PacketContext:
     snap: DiffSnapshot
     round: Round
-    picks: tuple[LensPick, ...]
     task: str
     commits: tuple[str, ...]
     conventions: tuple[str, ...]
@@ -143,7 +117,6 @@ class PacketContext:
     reopened: Mapping[str, tuple[tuple[str, str], ...]]
     test_files_by_symbol: Mapping[str, tuple[str, ...]]
     last_runs: tuple[str, ...]
-    facts_by_hunk: Mapping[str, tuple[Fact, ...]]
     unscanned_files: tuple[str, ...] = ()  # changed code the risk-signal patterns cannot read
 
 
@@ -151,7 +124,6 @@ def collect_context(
     root: Path,
     snap: DiffSnapshot,
     round_: Round,
-    picks: Sequence[LensPick],
     task: str,
     *,
     symbols: Mapping[str, tuple[str, ...]],
@@ -165,7 +137,6 @@ def collect_context(
     return PacketContext(
         snap=snap,
         round=round_,
-        picks=tuple(picks),
         task=task.strip(),
         commits=_commits(root, snap.base_sha),
         conventions=_conventions(root, snap.files),
@@ -177,7 +148,6 @@ def collect_context(
         reopened=reopened_mentions(round_, snap.hunks, symbols),
         test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
         last_runs=_last_runs(ledger, snap),
-        facts_by_hunk=valid_facts_for_hunk(ledger, root),
         unscanned_files=files_without_signal_patterns(snap),
     )
 
@@ -213,18 +183,24 @@ def _conventions(root: Path, changed_files: Sequence[str]) -> tuple[str, ...]:
 def _references(
     index: WorktreeIndex, hunks: Sequence[Hunk], symbols: Mapping[str, tuple[str, ...]]
 ) -> dict[str, tuple[Reference, ...]]:
-    """References to each symbol, excluding the changed lines of the hunks that define it."""
+    """Ranked references to each symbol, excluding the changed lines of the hunks that define it.
+
+    Real call sites come first, then test uses, imports and prose. The list is cut only after
+    ranking, and the render shows fewer than are kept so it can say how many more there are.
+    """
     owners: dict[str, list[Hunk]] = {}
     for hunk in hunks:
         for symbol in symbols.get(hunk.id, ()):
             owners.setdefault(symbol, []).append(hunk)
     references: dict[str, tuple[Reference, ...]] = {}
     for symbol, defining in owners.items():
-        found = index.references(
-            symbol, limit=REFERENCE_SEARCH_LIMIT, defined_in={hunk.path for hunk in defining}
-        )
-        outside = [ref for ref in found if not any(_inside(ref, hunk) for hunk in defining)]
-        references[symbol] = tuple(outside[:MAX_REFERENCES_PER_SYMBOL])
+        defined_in = {hunk.path for hunk in defining}
+        outside = [
+            ref for ref in index.mentions(symbol) if not any(inside_hunk(ref, hunk) for hunk in defining)
+        ]
+        # Stable: `mentions` lists each file's lines together, in path order.
+        outside.sort(key=lambda ref: (_KIND_RANK[reference_kind(ref)], ref.path in defined_in))
+        references[symbol] = tuple(outside[:REFERENCE_SEARCH_LIMIT])
     return references
 
 
@@ -253,7 +229,8 @@ def _last_runs(ledger: Ledger, snap: DiffSnapshot) -> tuple[str, ...]:
     return tuple(lines)
 
 
-def _inside(ref: Reference, hunk: Hunk) -> bool:
+def inside_hunk(ref: Reference, hunk: Hunk) -> bool:
+    """Whether `ref` points at a line the hunk adds or keeps."""
     return ref.path == hunk.path and hunk.new_start <= ref.line < hunk.new_start + hunk.new_len
 
 
@@ -263,6 +240,12 @@ def _signals_by_hunk(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]]:
         for hunk_id in hunk_ids:
             by_hunk.setdefault(hunk_id, []).append(signal)
     return {hunk_id: tuple(signals) for hunk_id, signals in by_hunk.items()}
+
+
+def _signal_label(signal: str) -> str:
+    """A risk signal with the lenses it suggests, e.g. `process (→ failure, trust, platform)`."""
+    lenses = [lens.id for lens in LENSES if signal in lens.triggers]
+    return f"{signal} (→ {', '.join(lenses)})" if lenses else signal
 
 
 def _carried_from(ledger: Ledger, round_: Round) -> dict[str, int]:
@@ -279,69 +262,6 @@ def _carried_from(ledger: Ledger, round_: Round) -> dict[str, int]:
 
 
 _HUNK_RANGE_RE = re.compile(r"^H(\d+)-H(\d+)$")
-_SHARD_SPEC_RE = re.compile(r"^(-?\d+)/(-?\d+)$")
-
-
-@dataclass(frozen=True)
-class PacketShard:
-    index: int
-    total: int
-    files: tuple[str, ...]
-    hunk_ids: tuple[str, ...]
-
-
-def parse_shard_spec(raw: str, open_file_count: int) -> tuple[int, int]:
-    """Parse and validate a `K/N` shard selector against the round's open file count."""
-    match = _SHARD_SPEC_RE.match(raw.strip())
-    if match is None:
-        raise FieldError("shard", f"must look like K/N (e.g. 1/2), got {raw!r}")
-    index, total = int(match.group(1)), int(match.group(2))
-    if not (1 <= index <= total):
-        raise FieldError("shard", f"must satisfy 1 <= K <= N (got {raw!r})")
-    if open_file_count < 1:
-        raise FieldError("shard", "round has no open files to shard")
-    if total > open_file_count:
-        msg = f"cannot split {open_file_count} open file(s) into {total} shards (N <= {open_file_count})"
-        raise FieldError("shard", msg)
-    return index, total
-
-
-def suggested_shard_count(open_file_count: int, packet_chars: int) -> int:
-    """Suggested reviewer shard count (1..4), bounded by open files and packet size."""
-    return min(MAX_SUGGESTED_SHARDS, max(1, open_file_count), max(1, math.ceil(packet_chars / MAX_VIEW_CHARS)))
-
-
-def plan_shards(ctx: PacketContext, total: int) -> tuple[PacketShard, ...]:
-    """Partition open hunks into `total` file-disjoint shards balanced by rendered size."""
-    open_files = ctx.round.open_files
-    parse_shard_spec(f"1/{total}", len(open_files))
-    open_ids = set(ctx.round.open_hunk_ids)
-    by_file: dict[str, list[Hunk]] = {path: [] for path in open_files}
-    for hunk in ctx.snap.hunks:
-        if hunk.id in open_ids:
-            by_file.setdefault(hunk.path, []).append(hunk)
-    sizes: list[tuple[int, str]] = []
-    for path in open_files:
-        owners = _Owners.of(ctx, by_file[path])
-        sizes.append((sum(len(_hunk_section(ctx, hunk, owners)) for hunk in by_file[path]), path))
-    ranked = sorted(sizes, key=lambda item: (-item[0], item[1]))
-    totals, buckets = [0] * total, [set[str]() for _ in range(total)]
-    for size, path in ranked:
-        target = min(range(total), key=lambda idx: (totals[idx], idx))
-        buckets[target].add(path)
-        totals[target] += size
-    shards: list[PacketShard] = []
-    for idx in range(total):
-        files = tuple(path for path in open_files if path in buckets[idx])
-        hunk_ids = tuple(hunk.id for path in files for hunk in by_file[path])
-        shards.append(PacketShard(idx + 1, total, files, hunk_ids))
-    return tuple(shards)
-
-
-def select_shard(ctx: PacketContext, raw: str) -> PacketShard:
-    """Return shard `K` from a validated `K/N` shard specification."""
-    index, total = parse_shard_spec(raw, len(ctx.round.open_files))
-    return plan_shards(ctx, total)[index - 1]
 
 
 def expand_hunk_spec(raw: str, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
@@ -369,48 +289,44 @@ def expand_hunk_spec(raw: str, all_hunk_ids: Sequence[str]) -> tuple[str, ...]:
 
 
 def render_packet(ctx: PacketContext) -> str:
-    """Render the packet: every lens and every hunk of the round in full."""
-    return _render(ctx, lenses=None, assigned=None, shard=None)
+    """Render the packet: every hunk of the round in full, in the same layout as a view."""
+    return _render(ctx, assigned=None)
 
 
-def render_packet_view(
-    ctx: PacketContext, *, lenses: Collection[str], assigned_hunks: Collection[str], shard: PacketShard | None = None
-) -> str:
-    """Render a per-reviewer view: its lenses, its hunks in full and the other hunks as an index."""
-    return _render(ctx, lenses=frozenset(lenses), assigned=frozenset(assigned_hunks), shard=shard)
+def render_packet_view(ctx: PacketContext, *, assigned_hunks: Collection[str]) -> str:
+    """Render a per-reviewer view: its hunks in full and the other hunks as an index."""
+    return _render(ctx, assigned=frozenset(assigned_hunks))
 
 
-def _render(
-    ctx: PacketContext, *, lenses: frozenset[str] | None, assigned: frozenset[str] | None, shard: PacketShard | None
-) -> str:
+def _render(ctx: PacketContext, *, assigned: frozenset[str] | None) -> str:
     """Trim scopes, then symbol references, then largest hunk diffs to stay within budget."""
-    preamble = _preamble(ctx, lenses, shard)
+    preamble = _preamble(ctx, assigned)
     shown = [hunk for hunk in ctx.snap.hunks if assigned is None or hunk.id in assigned]
     owners = _Owners.of(ctx, shown)
-    sections = {hunk.id: _hunk_section(ctx, hunk, owners) for hunk in shown}
+    detail = _Detail()
+    sections = {hunk.id: _hunk_section(ctx, hunk, owners, detail) for hunk in shown}
     index = [_hunk_summary_line(ctx, hunk) for hunk in ctx.snap.hunks if hunk.id not in sections]
-    budget = _char_budget(ctx, len(shown), assigned, shard)
-    no_scope: set[str] = set()
-    if ctx.round.tier != "quick":
-        for _, hunk in _scope_savings(ctx, shown, owners):
-            if len(_assemble(preamble, sections, index)) <= budget:
-                break
-            no_scope.add(hunk.id)
-            sections[hunk.id] = _hunk_section(ctx, hunk, owners, omit_scope=True)
-    trimmed: set[str] = set()
+    budget = MAX_PACKET_CHARS if assigned is None else MAX_VIEW_CHARS
+    if len(_assemble(preamble, sections, index)) > budget:
+        # The preamble counts against the budget: cut the listed hints to their counts first.
+        preamble = _preamble(ctx, assigned, list_hints=False)
+    for _, hunk in _scope_savings(ctx, shown, owners):
+        if len(_assemble(preamble, sections, index)) <= budget:
+            break
+        detail.no_scope.add(hunk.id)
+        sections[hunk.id] = _hunk_section(ctx, hunk, owners, detail)
     for _, symbol, hunk in _reference_savings(ctx, shown, owners):
         if len(_assemble(preamble, sections, index)) <= budget:
             break
-        trimmed.add(symbol)
-        sections[hunk.id] = _hunk_section(ctx, hunk, owners, omit_scope=hunk.id in no_scope, trimmed_symbols=trimmed)
-    omitted = _omit_diffs(ctx, shown, owners, preamble, sections, index, budget, no_scope, trimmed)
+        detail.trimmed.add(symbol)
+        sections[hunk.id] = _hunk_section(ctx, hunk, owners, detail)
+    omitted = _omit_diffs(ctx, shown, owners, preamble, sections, index, budget, detail)
     return _assemble(preamble, sections, index, omitted)
 
 
 def _omit_diffs(
     ctx: PacketContext, shown: Sequence[Hunk], owners: _Owners, preamble: str,
-    sections: dict[str, str], index: Sequence[str], budget: int,
-    no_scope: Collection[str], trimmed: Collection[str],
+    sections: dict[str, str], index: Sequence[str], budget: int, detail: _Detail,
 ) -> tuple[str, ...]:
     baseline = len(_assemble(preamble, sections, index))
     if baseline <= budget:
@@ -420,43 +336,35 @@ def _omit_diffs(
         key=lambda item: item[0],
         reverse=True,
     )
+    by_id = {hunk.id: hunk for hunk in shown}
     before, chosen = dict(sections), set[str]()
     ordered: tuple[str, ...] = ()
     for _, hunk in candidates:
         chosen.add(hunk.id)
-        sections[hunk.id] = _hunk_section(
-            ctx, hunk, owners, omit_scope=hunk.id in no_scope, trimmed_symbols=trimmed, omit_diff=True
-        )
+        detail.omitted.add(hunk.id)
+        for hunk_id in dict.fromkeys((hunk.id, owners.owner_of(ctx, hunk))):
+            sections[hunk_id] = _hunk_section(ctx, by_id[hunk_id], owners, detail)
         ordered = tuple(h.id for h in shown if h.id in chosen)
         if len(_assemble(preamble, sections, index, ordered)) <= budget:
             break
     if len(_assemble(preamble, sections, index, ordered)) >= baseline:
         sections.update(before)
+        detail.omitted.clear()
         return ()
     return ordered
 
 
-def _char_budget(
-    ctx: PacketContext, shown: int, assigned: frozenset[str] | None, shard: PacketShard | None
-) -> int:
-    """Full packet gets the tier budget; a shard gets MAX_VIEW_CHARS; a hunk view gets its share."""
-    if shard is not None:
-        return MAX_VIEW_CHARS
-    packet_budget = MAX_QUICK_PACKET_CHARS if ctx.round.tier == "quick" else MAX_PACKET_CHARS
-    return packet_budget if assigned is None else packet_budget * max(1, shown) // max(1, len(ctx.snap.hunks))
+def _preamble(ctx: PacketContext, assigned: frozenset[str] | None, *, list_hints: bool = True) -> str:
+    """The opening sections: only what a hunter lacks elsewhere; a section with nothing to say is left out.
 
-
-def _preamble(ctx: PacketContext, lenses: frozenset[str] | None, shard: PacketShard | None = None) -> str:
-    parts = [
-        _header(ctx, shard),
-        _intent(ctx),
-        _conventions_section(ctx),
-        _lenses_section(ctx, lenses),
-        "## Recording cheat sheet\n" + "\n".join(CHEAT_SHEET),
-    ]
-    if ctx.round.signals:
-        parts.append(_quality_signals_section(ctx))
-    return "\n\n".join(parts)
+    Lens suggestions are in the risk map `prepare` prints, and the recording commands are in the
+    hunter's agent definition and playbooks.
+    """
+    parts = [_header(ctx), _intent(ctx), _conventions_section(ctx)]
+    if ctx.unscanned_files:
+        parts.append(_unscanned_note(ctx))
+    parts.append(_quality_signals_section(ctx, assigned, list_hints=list_hints))
+    return "\n\n".join(part for part in parts if part)
 
 
 def _assemble(
@@ -466,109 +374,154 @@ def _assemble(
     parts = [preamble]
     if omitted_diffs:
         parts.append("## Omitted hunk bodies\n" + ", ".join(omitted_diffs))
-    parts.append(f"## Hunks\n\n{hunks}")
+    parts.append(f"## Hunks\n{HUNKS_LEGEND}\n\n{hunks}")
     if index:
         parts.append("### Other hunks (index)\n" + "\n".join(index))
     return "\n\n".join(parts) + "\n"
 
 
-def _quality_signals_section(ctx: PacketContext) -> str:
+def bound_hints(signals: Sequence[QualitySignal]) -> tuple[list[QualitySignal], str]:
+    """The hints worth listing and a one-line count of them all.
+
+    A diff can raise one hint per pair of similar functions, so at most `MAX_HINTS_PER_KIND` of
+    each kind and `MAX_HINTS_LISTED` in all are listed; the line says how many more there are.
+    """
+    per_kind: dict[SignalKind, int] = {}
+    listed: list[QualitySignal] = []
+    for sig in signals:
+        per_kind[sig.kind] = per_kind.get(sig.kind, 0) + 1
+        if per_kind[sig.kind] <= MAX_HINTS_PER_KIND and len(listed) < MAX_HINTS_LISTED:
+            listed.append(sig)
+    counts = ", ".join(f"{kind.value} {count}" for kind, count in per_kind.items())
+    more = len(signals) - len(listed)
+    summary = f"{len(signals)} hints ({counts})" + (f"; +{more} more not listed" if more else "")
+    return listed, summary
+
+
+def _quality_signals_section(
+    ctx: PacketContext, assigned: frozenset[str] | None, *, list_hints: bool = True
+) -> str:
+    """The round's quality hints, bounded; a view keeps those on the files of its hunks."""
+    paths = None if assigned is None else {hunk.path for hunk in ctx.snap.hunks if hunk.id in assigned}
+    signals = [sig for sig in ctx.round.signals if paths is None or sig.file in paths]
+    if not signals:
+        return ""
+    listed, summary = bound_hints(signals)
     lines = [
-        "## Quality signals",
-        "Every signal below must be resolved before `craftsman review check` passes: either "
-        "record a finding with `craftsman review add ... --signal <ID>` or acknowledge it with "
-        '`craftsman review ack <ID> --reason "<concrete reason, >= 40 chars>"`.',
-        "",
+        "## Quality hints",
+        "Deterministic hints for the simplicity review; they are not obligations.",
+        summary,
     ]
-    for sig in ctx.round.signals:
-        lines.append(f"- **{sig.id}** (`{sig.kind.value}`) `{sig.file}:{sig.line}` — {sig.detail}")
+    if list_hints:
+        lines.append("")
+        for sig in listed:
+            lines.append(f"- **{sig.id}** (`{sig.kind.value}`) `{sig.file}:{sig.line}` — {sig.detail}")
     return "\n".join(lines)
+
+
+def _unscanned_note(ctx: PacketContext) -> str:
+    files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
+    return (
+        f"Not scanned for risk signals (no patterns for their language): {files}. "
+        "No signal there does not mean no risk."
+    )
+
+
+@dataclass
+class _Detail:
+    """What the size guard has cut so far: scope bodies (by owner hunk), references, hunk bodies."""
+
+    no_scope: set[str] = field(default_factory=set)
+    trimmed: set[str] = field(default_factory=set)
+    omitted: set[str] = field(default_factory=set)
+
+
+_ScopeKey = tuple[str, str, int, int]
 
 
 @dataclass(frozen=True)
 class _Owners:
     """The shown hunk that renders each shared scope and each symbol's references; others link to it."""
 
-    scope: Mapping[tuple[str, str, int, int], str]
+    scope: Mapping[_ScopeKey, str]
     symbol: Mapping[str, str]
+    unit: Mapping[_ScopeKey, tuple[Hunk, ...]]  # the hunks that share each scope's code block
 
     @classmethod
     def of(cls, ctx: PacketContext, shown: Sequence[Hunk]) -> _Owners:
-        scope: dict[tuple[str, str, int, int], str] = {}
+        scope: dict[_ScopeKey, str] = {}
         symbol: dict[str, str] = {}
+        unit: dict[_ScopeKey, list[Hunk]] = {}
         for hunk in shown:
             if hunk.id in ctx.carried_from:
                 continue
             found = ctx.scopes.get(hunk.id)
-            if found is not None:
-                scope.setdefault(_scope_key(hunk, found), hunk.id)
+            if found is not None and not _has_notes(hunk):
+                key = _scope_key(hunk, found)
+                scope.setdefault(key, hunk.id)
+                unit.setdefault(key, []).append(hunk)
             for name in ctx.symbols.get(hunk.id, ()):
                 symbol.setdefault(name, hunk.id)
-        return cls(scope, symbol)
+        return cls(scope, symbol, {key: tuple(items) for key, items in unit.items()})
+
+    def owner_of(self, ctx: PacketContext, hunk: Hunk) -> str:
+        """The hunk whose section holds the code of `hunk`: itself unless it shares a scope."""
+        found = ctx.scopes.get(hunk.id)
+        if found is None or _has_notes(hunk):
+            return hunk.id
+        return self.scope.get(_scope_key(hunk, found), hunk.id)
 
 
-def _scope_key(hunk: Hunk, scope: Scope) -> tuple[str, str, int, int]:
+def _has_notes(hunk: Hunk) -> bool:
+    """Whether the hunk carries `~` notes (a mode change or rename); those stay a plain diff."""
+    return any(line.startswith("~") for line in hunk.lines)
+
+
+def _scope_key(hunk: Hunk, scope: Scope) -> _ScopeKey:
     return (hunk.path, scope.name, scope.start, scope.end)
 
 
 def _scope_savings(ctx: PacketContext, shown: Sequence[Hunk], owners: _Owners) -> list[tuple[int, Hunk]]:
-    """Characters saved by omitting each rendered scope, largest first; savings of 0 are left out."""
+    """Characters saved by cutting each scope body, largest first; savings of 0 are left out."""
     savings = []
     for hunk in shown:
         scope = ctx.scopes.get(hunk.id)
-        if scope is None or owners.scope.get(_scope_key(hunk, scope)) != hunk.id:
+        if scope is None or hunk.id in ctx.carried_from or owners.scope.get(_scope_key(hunk, scope)) != hunk.id:
             continue
-        saved = len(_scope_block(hunk, scope)) - len(_omitted_scope_line(scope))
-        if saved > 0:
-            savings.append((saved, hunk))
+        group = owners.unit[_scope_key(hunk, scope)]
+        full = len(_unit_block(group, scope, bare=False))
+        bare = len(_unit_block(group, scope, bare=True)) + len(_omitted_scope_line(scope))
+        if full > bare:
+            savings.append((full - bare, hunk))
     return sorted(savings, key=lambda item: item[0], reverse=True)
 
 
-def _header(ctx: PacketContext, shard: PacketShard | None = None) -> str:
+def _header(ctx: PacketContext) -> str:
     snap = ctx.snap
     carried = sum(hunk.carried for hunk in ctx.round.hunks)
-    shard_tag = f" (shard {shard.index}/{shard.total})" if shard is not None else ""
-    shard_files = f"\nFiles in this shard: {', '.join(shard.files)}" if shard is not None else ""
     return (
-        f"# Craftsman review packet — round {ctx.round.number}{shard_tag}\n"
-        f"Base `{snap.base_sha[:7]}` · fingerprint `{snap.fingerprint[:12]}` · tier `{ctx.round.tier}` · "
+        f"# Craftsman review packet — round {ctx.round.number}\n"
+        f"Base `{snap.base_sha[:7]}` · fingerprint `{snap.fingerprint[:12]}` · "
+        f"{'deep round · ' if ctx.round.deep else ''}"
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines, "
-        f"{len(snap.hunks)} hunks ({carried} carried){shard_files}"
+        f"{len(snap.hunks)} hunks ({carried} carried)"
     )
 
 
 def _intent(ctx: PacketContext) -> str:
-    task = ctx.task or "(not recorded — infer from commits and diff)"
-    commits = (
-        "\n".join(f"- {commit}" for commit in ctx.commits) or "- (none — the change is uncommitted)"
-    )
-    return f"## Intent\n**Task:** {task}\n\n**Commits since base:**\n{commits}"
+    """The task and the commits since base, whichever exist."""
+    parts = []
+    if ctx.task:
+        parts.append(f"**Task:** {ctx.task}")
+    if ctx.commits:
+        parts.append("**Commits since base:**\n" + "\n".join(f"- {commit}" for commit in ctx.commits))
+    return "## Intent\n" + "\n\n".join(parts) if parts else ""
 
 
 def _conventions_section(ctx: PacketContext) -> str:
-    listed = "\n".join(f"- {path}" for path in ctx.conventions) or "- (none found)"
-    return f"## Conventions to read first\n{listed}"
-
-
-def _lenses_section(ctx: PacketContext, only: frozenset[str] | None) -> str:
-    rows = ["| Lens | Why selected | Focus |", "| :--- | :--- | :--- |"]
-    for pick in ctx.picks:
-        if only is not None and pick.lens.id not in only:
-            continue
-        reason = pick.reason
-        if pick.lens.id == SWEEP_LENS:
-            reason += " (run after all other lenses)"
-        rows.append(
-            f"| `{pick.lens.id}` — {pick.lens.title} | {inline_md(reason, table=True)} | {pick.lens.focus} |"
-        )
-    section = "## Lenses in this round\n" + "\n".join(rows)
-    if ctx.unscanned_files:
-        files = ", ".join(f"`{path}`" for path in ctx.unscanned_files)
-        section += (
-            f"\n\nNot scanned for risk signals (no patterns for their language): {files}. "
-            "No signal there does not mean no risk."
-        )
-    return section
+    if not ctx.conventions:
+        return ""
+    return "## Conventions to read first\n" + "\n".join(f"- {path}" for path in ctx.conventions)
 
 
 def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
@@ -582,40 +535,55 @@ def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
     return f"- {hunk.id} · {hunk.path} · {label}"
 
 
-def _hunk_section(
-    ctx: PacketContext, hunk: Hunk, owners: _Owners, *,
-    omit_scope: bool = False, trimmed_symbols: Collection[str] = (), omit_diff: bool = False,
-) -> str:
+def _hunk_section(ctx: PacketContext, hunk: Hunk, owners: _Owners, detail: _Detail) -> str:
     title = f"### {hunk.id} · `{hunk.path}`{_line_span(hunk)}"
     if hunk.id in ctx.carried_from:
         return f"{title} · carried (covered in round {ctx.carried_from[hunk.id]}, unchanged)"
     status = f"renamed from `{hunk.old_path}`" if hunk.old_path else hunk.status
     signals = ctx.signals_by_hunk.get(hunk.id, ())
-    title += f" · {status}" + (f" · signals: {', '.join(signals)}" if signals else "")
+    title += f" · {status}" + (f" · signals: {', '.join(_signal_label(s) for s in signals)}" if signals else "")
     mentions = ctx.reopened.get(hunk.id, ())
     if mentions:
         title += " · reopened: mentions " + ", ".join(
             f"{symbol} (changed in {owner})" for symbol, owner in mentions
         )
-    lines = [title]
-    scope = ctx.scopes.get(hunk.id)
-    inline_scopes = ctx.round.tier != "quick"
-    owner = owners.scope.get(_scope_key(hunk, scope), hunk.id) if scope is not None else hunk.id
-    if scope is not None:
-        if inline_scopes and owner != hunk.id:
-            lines.append(f"Scope: `{scope.name}` — shown at {owner}")
-        else:
-            lines.append(f"Scope: `{scope.name}` ({scope.kind}, L{scope.start}–L{scope.end})")
-    lines.append(_omitted_diff_line(ctx, hunk) if omit_diff else _diff_block(hunk))
-    if inline_scopes and scope is not None and owner == hunk.id:
-        lines.append(_omitted_scope_line(scope) if omit_scope else _scope_block(hunk, scope))
-    lines.extend(_symbol_lines(ctx, hunk, owners, trimmed_symbols))
+    lines = [title, *_code_lines(ctx, hunk, owners, detail)]
+    lines.extend(_symbol_lines(ctx, hunk, owners, detail.trimmed))
     return "\n".join(lines)
+
+
+def _code_lines(ctx: PacketContext, hunk: Hunk, owners: _Owners, detail: _Detail) -> list[str]:
+    """The scope line and the code of a hunk: its scope's block if it owns it, else a pointer to it."""
+    scope = ctx.scopes.get(hunk.id)
+    omitted_line = [_omitted_diff_line(ctx, hunk)] if hunk.id in detail.omitted else []
+    if scope is None:
+        return omitted_line or [_diff_block(hunk)]
+    if _has_notes(hunk):
+        return [_scope_line(scope, ()), *(omitted_line or [_diff_block(hunk)])]
+    key = _scope_key(hunk, scope)
+    owner = owners.scope[key]
+    if owner != hunk.id:
+        return [f"Scope: `{scope.name}` — shown at {owner}", *omitted_line]
+    group = owners.unit[key]
+    cut = detail.omitted & {member.id for member in group}
+    bare = hunk.id in detail.no_scope or bool(cut)
+    lines = [_scope_line(scope, [member.id for member in group if member.id != hunk.id]), *omitted_line]
+    block = _unit_block(group, scope, bare=bare, omitted=cut)
+    if block:
+        lines.append(block)
+    if bare:
+        lines.append(_omitted_scope_line(scope))
+    return lines
+
+
+def _scope_line(scope: Scope, also: Sequence[str]) -> str:
+    shared = f" — also covers {', '.join(also)}" if also else ""
+    return f"Scope: `{scope.name}` ({scope.kind}, L{scope.start}–L{scope.end}){shared}"
 
 
 def _diff_block(hunk: Hunk) -> str:
     header = f"@@ -{hunk.old_start},{hunk.old_len} +{hunk.new_start},{hunk.new_len} @@ {hunk.header}"
-    return _fenced("diff", [header.rstrip(), *hunk.lines])
+    return fenced("diff", [header.rstrip(), *hunk.lines])
 
 
 def _omitted_diff_line(ctx: PacketContext, hunk: Hunk) -> str:
@@ -641,34 +609,116 @@ def _signature_line_count(raw_lines: Sequence[str]) -> int:
     return 1
 
 
-def _scope_block(hunk: Hunk, scope: Scope) -> str:
-    raw_lines = scope.text.split("\n")
-    hunk_end = hunk.new_start + max(1, hunk.new_len) - 1
-    if hunk.new_len > 10 and scope.start >= hunk.new_start and scope.end <= hunk_end:
-        return f"Enclosing scope ({hunk.path}:{scope.start}-{scope.end}) — shown in diff above"
-    if len(raw_lines) <= MAX_SCOPE_LINES:
-        fenced = _fenced(_fence_language(hunk.path), raw_lines)
-        return f"Enclosing scope (L{scope.start}–L{scope.end}):\n{fenced}"
-    fenced = _fenced(_fence_language(hunk.path), _trimmed_scope(hunk, scope, raw_lines))
-    return f"Enclosing scope ({hunk.path}:{scope.start}-{scope.end}):\n{fenced}"
+@dataclass(frozen=True)
+class _Row:
+    """One line of a scope's code block: HEAD text, or a removed line (no number)."""
+
+    tag: str  # " " unchanged, "+" added, "-" removed, "\\" the no-newline note
+    number: int | None  # the HEAD line number; None for removed lines and notes
+    text: str
+    hunk: str | None  # the hunk the line belongs to; None for scope lines no hunk touches
 
 
-def _trimmed_scope(hunk: Hunk, scope: Scope, raw_lines: Sequence[str]) -> list[str]:
-    """The scope's signature and the lines around the hunk; the gaps name the lines left out."""
-    sig_end = _signature_line_count(raw_lines)
-    center = max(scope.start, hunk.new_start) - scope.start
-    ctx_lo = max(sig_end, center - SCOPE_CONTEXT_RADIUS)
-    ctx_hi = min(len(raw_lines), center + 1 + SCOPE_CONTEXT_RADIUS)
-    trimmed = list(raw_lines[:sig_end])
-    if ctx_lo > sig_end:
-        trimmed.append(_omission_marker(scope.start + sig_end, scope.start + ctx_lo - 1))
-    trimmed.extend(raw_lines[ctx_lo:ctx_hi])
-    if ctx_hi < len(raw_lines):
-        trimmed.append(_omission_marker(scope.start + ctx_hi, scope.end))
-    return trimmed
+def _unit_block(
+    group: Sequence[Hunk], scope: Scope, *, bare: bool, omitted: Collection[str] = ()
+) -> str:
+    """The fenced code of the scope with the changes of every hunk of `group` marked in place."""
+    hunks = [hunk for hunk in group if hunk.id not in omitted]
+    if not hunks:
+        return ""
+    rows = _unit_rows(hunks, scope)
+    return fenced(fence_language(group[0].path), _display_lines(rows, scope, bare=bare))
 
 
-def _omission_marker(first: int, last: int) -> str:
+def _unit_rows(hunks: Sequence[Hunk], scope: Scope) -> list[_Row]:
+    """The scope's lines at HEAD with each hunk's added, removed and context lines overlaid.
+
+    A removed line sits just before the HEAD line that follows it; the keys order the rows
+    `(HEAD line, removed lines < the line < notes, order of appearance)`.
+    """
+    keyed: dict[tuple[int, int, int], _Row] = {}
+    for offset, text in enumerate(scope.text.split("\n")):
+        keyed[(scope.start + offset, 1, 0)] = _Row(" ", scope.start + offset, text, None)
+    order = 0
+    for hunk in hunks:
+        number = hunk.new_start
+        last: tuple[int, int, int] | None = None
+        for line in hunk.lines:
+            tag, text = line[:1], line[1:]
+            order += 1
+            if tag == "-":
+                last = (number, 0, order)
+                keyed[last] = _Row("-", None, text, hunk.id)
+            elif tag in (" ", "+"):
+                last = (number, 1, 0)
+                keyed[last] = _Row(tag, number, text, hunk.id)
+                number += 1
+            elif tag == "\\" and last is not None:
+                keyed[(last[0], last[1] * 2, order)] = _Row("\\", None, text, hunk.id)
+    return [keyed[key] for key in sorted(keyed)]
+
+
+def _display_lines(rows: Sequence[_Row], scope: Scope, *, bare: bool) -> list[str]:
+    """Number and mark the rows to show; `[H3]`..`[/H3]` bracket a hunk, gaps name the lines left out."""
+    keep = _kept_rows(rows, scope, bare=bare)
+    top = max((row.number for row in rows if row.number is not None), default=0)
+    width = max(2, len(str(top)))
+    lines: list[str] = []
+    open_hunk: str | None = None
+    gap: list[int] = []
+    for row, kept in zip(rows, keep, strict=True):
+        if not kept:
+            if row.number is not None:
+                gap.append(row.number)
+            continue
+        if gap or row.hunk != open_hunk:
+            if open_hunk is not None:
+                lines.append(f"[/{open_hunk}]")
+            open_hunk = None
+        if gap:
+            if not bare:
+                lines.append(omission_marker(gap[0], gap[-1]))
+            gap = []
+        if row.hunk != open_hunk:
+            open_hunk = row.hunk
+            if open_hunk is not None:
+                lines.append(f"[{open_hunk}]")
+        lines.append(_row_text(row, width))
+    if open_hunk is not None:
+        lines.append(f"[/{open_hunk}]")
+    if gap and not bare:
+        lines.append(omission_marker(gap[0], gap[-1]))
+    return lines
+
+
+def _kept_rows(rows: Sequence[_Row], scope: Scope, *, bare: bool) -> list[bool]:
+    """Which rows to show: the hunks only when bare; a long scope as its signature and hunk windows."""
+    if bare:
+        return [row.hunk is not None for row in rows]
+    if scope.end - scope.start + 1 <= MAX_SCOPE_LINES:
+        return [True] * len(rows)
+    keep = [False] * len(rows)
+    for position, row in enumerate(rows):
+        if row.hunk is not None:
+            for near in range(max(0, position - SCOPE_CONTEXT_RADIUS), position + SCOPE_CONTEXT_RADIUS + 1):
+                if near < len(rows):
+                    keep[near] = True
+    signature = _signature_line_count(scope.text.split("\n"))
+    for position, row in enumerate(rows):
+        if row.number is not None and scope.start <= row.number < scope.start + signature:
+            keep[position] = True
+    return keep
+
+
+def _row_text(row: _Row, width: int) -> str:
+    if row.tag == "\\":
+        return f"\\{row.text}"
+    if row.number is None:
+        return f"{row.tag}{' ' * width} {row.text}"
+    return f"{row.tag}{row.number:>{width}} {row.text}"
+
+
+def omission_marker(first: int, last: int) -> str:
     # Not a comment of any one language: the block may hold Python, Go, SQL or YAML.
     return f"[… L{first}–L{last} omitted …]"
 
@@ -690,22 +740,27 @@ def _symbol_lines(
                 lines.append(f"- `{symbol}`: (shown at {owner})")
                 continue
             refs = ctx.references.get(symbol, ())
-            lines.append(_reference_line(symbol, refs, trim=symbol in trimmed_symbols))
-            test_files = ctx.test_files_by_symbol.get(symbol, ())
+            trim = symbol in trimmed_symbols
+            lines.append(_reference_line(symbol, refs, trim=trim))
+            # A test file already named by a listed reference, or the file of the hunk, adds nothing.
+            known = {ref.path for ref in _listed_references(refs, trim=trim)} | {hunk.path}
+            test_files = [path for path in ctx.test_files_by_symbol.get(symbol, ()) if path not in known]
             if test_files:
                 lines.append(f"Tests referencing `{symbol}`: " + ", ".join(f"`{p}`" for p in test_files))
     open_ids = [h.id for h in ctx.snap.hunks if h.id not in ctx.carried_from]
     if ctx.last_runs and (len(open_ids) <= 5 or (open_ids and hunk.id == open_ids[0])):
         lines.append("Last runs: " + " · ".join(ctx.last_runs))
-    for fact in ctx.facts_by_hunk.get(hunk.id, ()):
-        lines.append(f"Facts: {fact.id} {inline_md(fact.text)} (source {fact.source.path}:{fact.source.line})")
     return lines
 
 
+def _listed_references(refs: Sequence[Reference], *, trim: bool) -> Sequence[Reference]:
+    return refs[: TRIMMED_REFERENCES_PER_SYMBOL if trim else MAX_REFERENCES_PER_SYMBOL]
+
+
 def _reference_line(symbol: str, refs: Sequence[Reference], *, trim: bool) -> str:
-    shown = refs[:TRIMMED_REFERENCES_PER_SYMBOL] if trim else refs
+    shown = _listed_references(refs, trim=trim)
     listed = " · ".join(
-        f"{_inline_code(f'{ref.path}:{ref.line}')} {_inline_code(ref.text)}" for ref in shown
+        f"{inline_code(f'{ref.path}:{ref.line}')} {inline_code(ref.text)}" for ref in shown
     )
     more = len(refs) - len(shown)
     suffix = f" (+{more} more: git grep -n {symbol})" if more > 0 else ""
@@ -729,14 +784,14 @@ def _reference_savings(
     return sorted(savings, key=lambda item: (-item[0], item[1]))
 
 
-def _fence_language(path: str) -> str:
+def fence_language(path: str) -> str:
     posix = PurePosixPath(path)
     if posix.name == "Jenkinsfile" or posix.name.startswith("Jenkinsfile."):
         return "groovy"
     return _FENCE_LANGUAGES.get(posix.suffix.lower(), "")
 
 
-def _inline_code(text: str) -> str:
+def inline_code(text: str) -> str:
     """Wrap `text` in a code span that backticks inside it cannot close early (CommonMark)."""
     longest = max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0)
     fence = "`" * (longest + 1)
@@ -744,7 +799,7 @@ def _inline_code(text: str) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
-def _fenced(language: str, lines: Sequence[str]) -> str:
+def fenced(language: str, lines: Sequence[str]) -> str:
     """Fence `lines` with more backticks than any run inside them so the block cannot break."""
     longest = max((len(run) for line in lines for run in _BACKTICK_RUN_RE.findall(line)), default=0)
     fence = "`" * max(3, longest + 1)

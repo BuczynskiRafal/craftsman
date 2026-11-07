@@ -18,10 +18,9 @@ from typing import Any
 from unittest import mock
 
 from craftsman.diffscan import ChangeStatus, DiffSnapshot, Hunk
-from craftsman.gate import GateOwner, GateState, GateTier, save_state, state_path_for
+from craftsman.gate import GateOwner, GateState, save_state, state_path_for
 from craftsman.install import install_main
 from craftsman.ledger import add_coverage, add_finding, add_run, open_round
-from craftsman.lenses import Tier
 from craftsman.manifest import (
     InstallManifest,
     TargetKind,
@@ -30,7 +29,6 @@ from craftsman.manifest import (
     save_manifest,
 )
 from craftsman.records import (
-    Coverage,
     Ledger,
     QualitySignal,
     Round,
@@ -82,7 +80,6 @@ FINDING = {
     "title": "Empty list crashes total()",
     "scenario": "Calling total([]) divides by len(items) == 0 and raises.",
     "suggestion": "Return 0 for an empty list.",
-    "signal_id": None,
 }
 
 
@@ -128,7 +125,6 @@ def make_snap(*hunks: Hunk, fingerprint: str = "fp1", base: str = BASE_SHA) -> D
         fingerprint=fingerprint,
         hunks=hunks,
         files=tuple(dict.fromkeys(hunk.path for hunk in hunks)),
-        skipped=(),
         added=sum(line.startswith("+") for hunk in hunks for line in hunk.lines),
         deleted=sum(line.startswith("-") for hunk in hunks for line in hunk.lines),
     )
@@ -140,24 +136,20 @@ def two_hunks(fingerprint: str = "fp1") -> DiffSnapshot:
 
 def prepared(
     snap: DiffSnapshot,
-    lenses: Sequence[str] = ("intent", "craft"),
-    tier: Tier = "quick",
+    deep: bool = False,
     ledger: Ledger | None = None,
     symbols: Mapping[str, Sequence[str]] | None = None,
     signals: tuple[QualitySignal, ...] = (),
 ) -> tuple[Ledger, Round]:
-    return open_round(
-        ledger or Ledger(), snap, tier, lenses, "packet.md", symbols or {}, signals=signals
-    )
+    return open_round(ledger or Ledger(), snap, deep, "packet.md", symbols or {}, signals=signals)
 
 
-def cover_open_hunks(ledger: Ledger, lens: str) -> Ledger:
-    """Cover every open hunk (or file, for `design`) of the latest round with `lens`."""
-    round_ = ledger.rounds[-1]
-    targets = round_.open_files if lens == "design" else round_.open_hunk_ids
-    for start in range(0, len(targets), 4):
-        batch = list(targets[start : start + 4])
-        ledger, _ = add_coverage(ledger, lens, batch, coverage_note(batch))
+def cover_open_hunks(ledger: Ledger) -> Ledger:
+    """Cover every open hunk of the latest round in one record."""
+    batch = list(ledger.rounds[-1].open_hunk_ids)
+    if not batch:
+        return ledger
+    ledger, _ = add_coverage(ledger, batch, coverage_note(batch))
     return ledger
 
 
@@ -186,30 +178,15 @@ def record_run(
     return ledger
 
 
-def fully_reviewed(
-    snap: DiffSnapshot, lenses: Sequence[str] = ("intent", "craft"), tier: Tier = "quick"
-) -> Ledger:
-    """A round for `snap` covered by every lens, with a passing test run at its fingerprint."""
-    ledger, _ = prepared(snap, lenses, tier)
-    for lens in lenses:
-        ledger = cover_open_hunks(ledger, lens)
-    return record_run(ledger, fingerprint=snap.fingerprint)
+def fully_reviewed(snap: DiffSnapshot, deep: bool = False) -> Ledger:
+    """A round for `snap` with every hunk covered and a passing test run at its fingerprint."""
+    ledger, _ = prepared(snap, deep)
+    return record_run(cover_open_hunks(ledger), fingerprint=snap.fingerprint)
 
 
 def record_finding(ledger: Ledger, severity: Severity = "major", **overrides: Any) -> Ledger:
     ledger, _ = add_finding(ledger, **{**FINDING, "severity": severity, **overrides})
     return ledger
-
-
-def coverage_record(round_number: int, lens: str, digests: list[str], at: str) -> Coverage:
-    return Coverage(round_number, lens, tuple(digests), coverage_note(["H1"]), at)
-
-
-def swept(snap: DiffSnapshot) -> Ledger:
-    """A standard round with `intent` and `sweep`, both covered in order, and a passing run."""
-    ledger, _ = prepared(snap, lenses=("intent", "sweep"), tier="standard")
-    ledger = cover_open_hunks(ledger, "intent")
-    return record_run(cover_open_hunks(ledger, "sweep"), fingerprint=snap.fingerprint)
 
 
 def shifted(timestamp: str, seconds: float) -> str:
@@ -230,13 +207,13 @@ def open_gate(
     root: Path,
     base_sha: str,
     *,
-    tier: GateTier = "standard",
+    deep: bool = False,
     task: str = "",
     owner: GateOwner | None = None,
     **fields: Any,
 ) -> GateState:
     """Store an active gate for the work tree `root`, as `craftsman gate --init` would."""
-    state = GateState.open(owner or GateOwner("cli"), base_sha, tier, task, **fields)
+    state = GateState.open(owner or GateOwner("cli"), base_sha, deep, task, **fields)
     save_state(state_path_for(root), state)
     return state
 
@@ -368,35 +345,36 @@ class EvidenceRepo(GitRepo):
             )
         return proc
 
+    def state(self) -> dict[str, Any]:
+        """The stored gate state."""
+        raw = json.loads((self.ledger_dir / "craftsman_state.json").read_text(encoding="utf-8"))
+        assert isinstance(raw, dict)
+        return raw
+
     def show(self) -> dict[str, Any]:
         payload = json.loads(self.cli("review", "show", "--json").stdout)
         assert isinstance(payload, dict)
         return payload
 
-    def cover_all(self) -> None:
-        """Cover every open hunk/file with every lens of the latest round, sweep last."""
-        for lens, entry in self.show()["coverage"].items():
-            missing = list(entry["missing"])
-            flag = "--files" if lens == "design" else "--hunks"
-            for start in range(0, len(missing), 4):
-                batch = missing[start : start + 4]
-                self.cli(
-                    "review",
-                    "cover",
-                    "--lens",
-                    lens,
-                    flag,
-                    ",".join(batch),
-                    "--note",
-                    coverage_note(batch),
-                )
+    def cover_all(self, *, again: bool = False) -> None:
+        """Cover every open hunk of the latest round in one call; `again` also those already covered."""
+        shown = self.show()
+        missing = (
+            [hunk["id"] for hunk in shown["hunks"] if not hunk["carried"]]
+            if again
+            else list(shown["coverage"]["missing"])
+        )
+        if missing:
+            self.cli(
+                "review", "cover", "--hunks", ",".join(missing), "--note", coverage_note(missing)
+            )
 
-    def record_full_evidence(self, tier: str) -> None:
-        """Everything the gate needs for `tier` at the current code: a round, coverage and runs."""
-        self.cli("review", "prepare", "--tier", tier)
+    def record_full_evidence(self, deep: bool = False) -> None:
+        """Everything the gate needs at the current code: a round, coverage and runs."""
+        self.cli("review", "prepare", *(["--deep"] if deep else []))
         self.cover_all()
         self.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('tests ok')")
-        if tier == "deep":
+        if deep:
             self.cli("run", "--kind", "e2e", "--", sys.executable, "-c", "print('e2e ok')")
 
 

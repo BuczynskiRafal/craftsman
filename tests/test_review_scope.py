@@ -130,30 +130,28 @@ class RoundScopeValidationTests(unittest.TestCase):
         _, round_ = open_round(
             Ledger(),
             make_snap(make_hunk("H1", "a.py"), fingerprint=f"fp{number}", base=BASE_SHA),
-            "quick",
-            ("intent", "craft"),
+            False,
             f"packet-{number}.md",
             {},
-            signals=(),
             scope=scope,
         )
         return replace(round_, number=number)
 
     def test_schema_errors_distinguish_older_from_newer_ledgers(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 2)
+        self.assertEqual(SCHEMA_VERSION, 3)
         base_payload = Ledger().to_json()
 
         with self.assertRaises(LedgerError) as old_ctx:
-            Ledger.from_json({**base_payload, "schema": 1})
+            Ledger.from_json({**base_payload, "schema": 2})
         self.assertIn(
-            "schema 1 is from an older craftsman; run `craftsman review reset` to archive it",
+            "schema 2 is from an older craftsman; run `craftsman review reset` to archive it",
             str(old_ctx.exception),
         )
 
         with self.assertRaises(LedgerError) as future_ctx:
-            Ledger.from_json({**base_payload, "schema": 3})
+            Ledger.from_json({**base_payload, "schema": 4})
         self.assertIn(
-            "schema 3 is not supported (expected 2); upgrade craftsman",
+            "schema 4 is not supported (expected 3); upgrade craftsman",
             str(future_ctx.exception),
         )
 
@@ -213,11 +211,9 @@ class RoundScopeValidationTests(unittest.TestCase):
                     open_round(
                         ledger1,
                         make_snap(make_hunk("H1", "b.py"), fingerprint="fp2", base=BASE_SHA),
-                        "quick",
-                        ("intent", "craft"),
+                        False,
                         "packet-2.md",
                         {},
-                        signals=(),
                         scope=bad_scope,
                     )
         widened, round2 = open_round(
@@ -228,11 +224,9 @@ class RoundScopeValidationTests(unittest.TestCase):
                 fingerprint="fp2",
                 base=BASE_SHA,
             ),
-            "quick",
-            ("intent", "craft"),
+            False,
             "packet-2.md",
             {},
-            signals=(),
             scope=("a.py", "b.py"),
             allow_scope_expansion=True,
         )
@@ -250,11 +244,9 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
     def review(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return self.repo.cli("review", *args, check=check)
 
-    def cover(self, lens: str, *hunks: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def cover(self, *hunks: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return self.review(
             "cover",
-            "--lens",
-            lens,
             "--hunks",
             ",".join(hunks),
             "--note",
@@ -276,7 +268,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
     def test_review_only_freezes_initial_scope_against_new_files(self) -> None:
         self.repo.write("app.py", "x = 2\n")
 
-        prepared = self.review("prepare", "--tier", "quick").stdout
+        prepared = self.review("prepare").stdout
 
         self.assertEqual(self.ledger().rounds[0].scope, ("app.py",))
         self.assertIn("Scope: 1 file(s), frozen for this review.", prepared)
@@ -286,7 +278,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.repo.write("PLAN.md", "# Scratch plan\n")
 
         # Round 1 remains current for cover, show, status and subagent hooks.
-        self.cover("intent", "H1")
+        self.cover("H1")
         show_text = self.review("show").stdout
         show_json = self.repo.show()
         self.assertNotIn("PLAN.md", show_text)
@@ -311,7 +303,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.assertIn("Craftsman review round 1", json.dumps(hook_reply))
         self.assertEqual(len(self.ledger().agents), 1)
 
-        again = self.review("prepare", "--tier", "quick").stdout
+        again = self.review("prepare").stdout
         self.assertIn("Round 1 unchanged", again)
         self.assertIn("Scope: 1 file(s), frozen for this review.", again)
         self.assertIn("Ignored (outside the review scope): PLAN.md", again)
@@ -319,20 +311,20 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         # More than 5 ignored files truncate cleanly with `(+K more)`.
         for index in range(6):
             self.repo.write(f"extra_{index}.md", f"note {index}\n")
-        many = self.review("prepare", "--tier", "quick").stdout
+        many = self.review("prepare").stdout
         self.assertIn("(+2 more)", many)
 
     def test_editing_in_scope_file_opens_next_round_keeping_scope(self) -> None:
         self.repo.write("app.py", "x = 2\n")
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
         self.repo.write("PLAN.md", "# Scratch plan\n")
         self.repo.write("app.py", "x = 3\n")
 
-        stale = self.cover("intent", "H1", check=False)
+        stale = self.cover("H1", check=False)
         self.assert_error(stale, 1, "Code changed since round 1")
 
-        round2_out = self.review("prepare", "--tier", "quick").stdout
-        self.assertIn("Round 2 prepared (quick)", round2_out)
+        round2_out = self.review("prepare").stdout
+        self.assertIn("Round 2 prepared", round2_out)
         self.assertIn("Ignored (outside the review scope): PLAN.md", round2_out)
         round2 = self.ledger().rounds[1]
         self.assertEqual(round2.scope, ("app.py",))
@@ -340,19 +332,19 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.assertNotIn("PLAN.md", self.packet(2))
 
     def test_active_gate_keeps_unbounded_worktree_scope(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         self.repo.write("app.py", "x = 2\n")
 
-        round1_out = self.review("prepare", "--tier", "quick").stdout
+        round1_out = self.review("prepare").stdout
         self.assertIsNone(self.ledger().rounds[0].scope)
         self.assertNotIn("frozen for this review", round1_out)
 
         self.repo.write("PLAN.md", "# New file during gate task\n")
-        stale = self.cover("intent", "H1", check=False)
+        stale = self.cover("H1", check=False)
         self.assert_error(stale, 1, "Code changed since round 1")
 
-        round2_out = self.review("prepare", "--tier", "quick").stdout
-        self.assertIn("Round 2 prepared (quick): 2 hunks", round2_out)
+        round2_out = self.review("prepare").stdout
+        self.assertIn("Round 2 prepared: 2 files, 2 hunks", round2_out)
         round2 = self.ledger().rounds[1]
         self.assertIsNone(round2.scope)
         self.assertEqual([hunk.path for hunk in round2.hunks], ["PLAN.md", "app.py"])
@@ -362,7 +354,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.repo.write("b.py", "b = 1\n")
         self.repo.commit("add a and b")
 
-        nothing_staged = self.review("prepare", "--tier", "quick", "--staged", check=False)
+        nothing_staged = self.review("prepare", "--staged", check=False)
         self.assert_error(nothing_staged, 1, "nothing staged against base")
 
         self.repo.write("a.py", "a = 2\n")
@@ -372,12 +364,12 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.repo.write("b.py", "b = 2\n")
         self.repo.write("c.py", "c = 1\n")
 
-        out = self.review("prepare", "--tier", "quick", "--staged").stdout
+        out = self.review("prepare", "--staged").stdout
 
         self.assertEqual(self.ledger().rounds[0].scope, ("a.py",))
         self.assertIn("Scope: 1 file(s), frozen for this review.", out)
         self.assertIn("Ignored (outside the review scope): b.py, c.py", out)
-        self.assertIn("+a_worktree = 3", self.packet(1))
+        self.assertIn("+ 2 a_worktree = 3", self.packet(1))
         self.assertNotIn("b.py", self.packet(1))
         self.assertNotIn("c.py", self.packet(1))
 
@@ -385,7 +377,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.repo.write("app.py", "x = 2\n")
         self.repo.write("PLAN.md", "# Pre-existing scratch plan\n")
 
-        out = self.review("prepare", "--tier", "quick", "--tracked").stdout
+        out = self.review("prepare", "--tracked").stdout
 
         self.assertEqual(self.ledger().rounds[0].scope, ("app.py",))
         self.assertIn("Scope: 1 file(s), frozen for this review.", out)
@@ -405,40 +397,58 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         unmatched = self.review("prepare", "--paths", "b.py", check=False)
         self.assert_error(unmatched, 1, "--paths 'b.py' matched no changed files")
 
-        self.review("prepare", "--tier", "quick", "--paths", "a.py")
+        self.review("prepare", "--paths", "a.py")
         self.assertEqual(self.ledger().rounds[0].scope, ("a.py",))
 
         # Requesting a different `--paths` in Round 2 fails whether `b.py` is unchanged or changed.
-        diff_unchanged = self.review("prepare", "--tier", "quick", "--paths", "b.py", check=False)
+        diff_unchanged = self.review("prepare", "--paths", "b.py", check=False)
         self.assert_error(diff_unchanged, 1, FIXED_SCOPE_ERROR)
 
         self.repo.write("b.py", "b = 2\n")
-        diff_changed = self.review("prepare", "--tier", "quick", "--paths", "b.py", check=False)
+        diff_changed = self.review("prepare", "--paths", "b.py", check=False)
         self.assert_error(diff_changed, 1, FIXED_SCOPE_ERROR)
 
         # Passing the same `--paths a.py` succeeds and opens Round 2 when `a.py` changes.
         self.repo.write("a.py", "a = 3\n")
-        same_scope = self.review("prepare", "--tier", "quick", "--paths", "a.py").stdout
-        self.assertIn("Round 2 prepared (quick)", same_scope)
+        same_scope = self.review("prepare", "--paths", "a.py").stdout
+        self.assertIn("Round 2 prepared", same_scope)
         self.assertEqual(self.ledger().rounds[1].scope, ("a.py",))
 
-    def test_cli_rejects_older_schema_ledger_with_reset_hint(self) -> None:
+    def test_cli_archives_an_older_schema_ledger_and_goes_on(self) -> None:
         self.repo.ledger_dir.mkdir(parents=True, exist_ok=True)
         (self.repo.ledger_dir / "ledger.json").write_text(
-            json.dumps({**Ledger().to_json(), "schema": 1}),
+            json.dumps({**Ledger().to_json(), "schema": 2}),
             encoding="utf-8",
         )
 
         proc = self.review("show", check=False)
 
-        self.assert_error(
-            proc,
-            1,
-            "schema 1 is from an older craftsman; run `craftsman review reset` to archive it",
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr.count("Archived the review ledger of an older craftsman"), 1)
+        self.assertTrue((self.repo.ledger_dir / "ledger.v2.bak.json").is_file())
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+
+    def test_reset_and_prepare_work_over_the_state_and_ledger_of_craftsman_4(self) -> None:
+        self.repo.write("app.py", "x = 2\n")
+        self.repo.ledger_dir.mkdir(parents=True, exist_ok=True)
+        (self.repo.ledger_dir / "ledger.json").write_text(
+            json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8"
+        )
+        (self.repo.ledger_dir / "craftsman_state.json").write_text(
+            json.dumps({"owner": {"platform": "claude", "session_id": "s1"}, "tier": "standard",
+                        "base_sha": "abc", "task": "t", "started_at": "2026-01-01T00:00:00.000Z",
+                        "active": False, "stage": "completed"}),
+            encoding="utf-8",
         )
 
+        self.assertEqual(self.review("reset", check=False).returncode, 0)
+        prepared = self.review("prepare", check=False)
+
+        self.assertEqual(prepared.returncode, 0, prepared.stderr)
+        self.assertTrue((self.repo.ledger_dir / "craftsman_state.json.v4.bak").is_file())
+
     def test_scope_flags_are_rejected_during_active_gate(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         self.repo.write("app.py", "x = 2\n")
 
         for flags in (
@@ -448,7 +458,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
             ("--tracked",),
         ):
             with self.subTest(flags=flags):
-                proc = self.review("prepare", "--tier", "quick", *flags, check=False)
+                proc = self.review("prepare", *flags, check=False)
                 self.assert_error(
                     proc,
                     1,
@@ -468,7 +478,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
             "line_1 = 1\nline_2 = 2\nline_3 = 3\nline_4 = 4\nline_5 = 5\nline_6 = 6\n",
         )
 
-        out = self.review("prepare", "--tier", "quick").stdout
+        out = self.review("prepare").stdout
 
         round0 = self.ledger().rounds[0]
         self.assertEqual(round0.scope, ("new.py", "old.py"))
@@ -480,7 +490,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.assertEqual(scoped_snap.hunks[0].path, "new.py")
 
         # Subsequent commands compute the identical rename snapshot and do not see a stale round.
-        self.cover("intent", "H1")
+        self.cover("H1")
 
     def test_directory_paths_freeze_matched_files_only(self) -> None:
         self.repo.write("src/a/one.py", "one = 1\n")
@@ -490,7 +500,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         self.repo.write("src/a/one.py", "one = 2\n")
         self.repo.write("src/b/x.py", "x = 2\n")
 
-        out = self.review("prepare", "--tier", "quick", "--paths", "src/b/").stdout
+        out = self.review("prepare", "--paths", "src/b/").stdout
 
         self.assertEqual(self.ledger().rounds[0].scope, ("src/b/x.py",))
         self.assertIn("Scope: 1 file(s), frozen for this review.", out)
@@ -498,15 +508,15 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
 
         # A new untracked file inside `src/b/` is NOT included because concrete paths were frozen.
         self.repo.write("src/b/PLAN.md", "# Local dir notes\n")
-        self.cover("intent", "H1")
+        self.cover("H1")
 
-        again = self.review("prepare", "--tier", "quick").stdout
+        again = self.review("prepare").stdout
         self.assertIn("Round 1 unchanged", again)
         self.assertIn("Ignored (outside the review scope): src/a/one.py, src/b/PLAN.md", again)
 
     def test_recorded_run_stays_current_across_out_of_scope_writes(self) -> None:
         self.repo.write("app.py", "x = 2\n")
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
         self.repo.write("PLAN.md", "# Out-of-scope plan\n")
 
         run_proc = self.repo.cli(
@@ -544,7 +554,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         first_round_err = self.review("prepare", "--add-paths", "calc.py", check=False)
         self.assert_error(first_round_err, 1, "--add-paths extends an existing review scope")
 
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
         self.assertEqual(self.ledger().current_scope, ("calc.py",))
         self.repo.cover_all()
 
@@ -556,8 +566,9 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         unmatched = self.review("prepare", "--add-paths", "missing.py", check=False)
         self.assert_error(unmatched, 1, "--add-paths 'missing.py' matched no changed files")
 
-        r2_out = self.review("prepare", "--tier", "quick", "--add-paths", "tests/").stdout
-        self.assertIn("Round 2 prepared (quick): 2 hunks", r2_out)
+        r2_out = self.review("prepare", "--add-paths", "tests/").stdout
+        self.assertIn("Round 2 prepared: 2 files, 2 hunks", r2_out)
+        self.assertIn("0 hunks carried, 2 to review.", r2_out)
         self.assertIn("Scope: 2 file(s), frozen for this review.", r2_out)
         self.assertIn("Ignored (outside the review scope): PLAN.md", r2_out)
         self.assertEqual(self.ledger().current_scope, ("calc.py", "tests/test_calc.py"))
@@ -572,23 +583,24 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
             "tests/test_calc.py",
             "from calc import add\nassert add(2, 3) == 5\nassert add(-1, 1) == 0\n",
         )
-        r3_out = self.review("prepare", "--tier", "quick").stdout
-        self.assertIn("Round 3 prepared (quick): 2 hunks, 1 carried, 1 to review.", r3_out)
+        r3_out = self.review("prepare").stdout
+        self.assertIn("Round 3 prepared: 2 files, 2 hunks", r3_out)
+        self.assertIn("1 hunks carried, 1 to review.", r3_out)
         self.assertEqual(self.ledger().rounds[2].scope, ("calc.py", "tests/test_calc.py"))
 
     def test_completed_review_with_out_of_scope_edits_hints_reset(self) -> None:
         self.repo.write("app.py", "x = 2\n")
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
         self.repo.write("next_day.py", "y = 1\n")
 
         # While Round 1 is still incomplete, `prepare` must NOT suggest `review reset`.
-        in_progress = self.review("prepare", "--tier", "quick").stdout
+        in_progress = self.review("prepare").stdout
         self.assertIn("Ignored (outside the review scope): next_day.py", in_progress)
         self.assertNotIn("already complete", in_progress)
 
         # Once Round 1 is complete, `prepare` explicitly hints to run `craftsman review reset`.
         self.repo.cover_all()
-        completed_out = self.review("prepare", "--tier", "quick").stdout
+        completed_out = self.review("prepare").stdout
         self.assertIn("Ignored (outside the review scope): next_day.py", completed_out)
         self.assertIn(
             "Hint: round 1 is already complete; run `craftsman review reset`", completed_out
@@ -597,7 +609,7 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
         # If the previously reviewed file is reverted to HEAD while new files are modified,
         # `prepare` explains that the frozen scope is empty and points to `review reset`.
         self.repo.git("checkout", "--", "app.py")
-        empty_scoped = self.review("prepare", "--tier", "quick").stdout
+        empty_scoped = self.review("prepare").stdout
         self.assertIn("Nothing to review within the frozen scope", empty_scoped)
         self.assertIn("changed files outside scope: next_day.py", empty_scoped)
         self.assertIn("craftsman review reset", empty_scoped)

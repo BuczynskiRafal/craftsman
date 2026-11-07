@@ -14,7 +14,7 @@ Events:
 - `pre-tool`: guards shell commands against work-tree violations and enforces search scope.
 
 The first event of the owning session claims an active gate for the hooks: from then on the gate
-requires an isolated reviewer on the `standard` and `deep` tiers. Events of other sessions leave
+requires an isolated reviewer for every round with hunks to review. Events of other sessions leave
 the gate alone.
 
 A hook never crashes the session it serves. When an event cannot be handled, `pre-tool` asks the
@@ -34,20 +34,28 @@ from pathlib import Path
 from typing import Any, Literal, NoReturn, get_args
 
 from craftsman.diffscan import DiffScanError, resolve_base_sha, snapshot, worktree_root
-from craftsman.evidence import archive_ledger, packet_path
+from craftsman.evidence import archive_ledger, effective_deep
 from craftsman.gate import (
+    MAX_CONTINUATIONS,
+    REVIEW_CONTINUATION_HEADER,
     GateOwner,
     GateState,
     GateStateError,
-    GateTier,
     Stage,
     archive_ledger_for_new_base,
     decide_stop,
     is_continuation_prompt,
     load_state,
-    raised_tier,
     state_path_for,
     update_state,
+)
+from craftsman.gatecheck import (
+    GateIssue,
+    GatePolicy,
+    GateReport,
+    evaluate,
+    format_blocker_summary,
+    render_next_actions,
 )
 from craftsman.ledger import (
     GROUPED_EVIDENCE_PREFIX,
@@ -55,11 +63,9 @@ from craftsman.ledger import (
     ledger_path_for,
     load,
     mutate,
-    uncovered_by_lens,
+    uncovered_hunks,
 )
-from craftsman.packet import CHEAT_SHEET
 from craftsman.records import (
-    SWEEP_LENS,
     AgentEvent,
     AgentEventKind,
     AgentRole,
@@ -75,7 +81,17 @@ from craftsman.scope import (
     is_scope_checked_tool,
     load_scope_policy,
 )
-from craftsman.trigger import detect_trigger, task_from_prompt
+from craftsman.trigger import detect_trigger, is_review_prompt, task_from_prompt
+from craftsman.usage import TranscriptFacts, read_transcript
+from craftsman.workspace import (
+    ReviewMarker,
+    Workspace,
+    cli_visible,
+    end_review_guard,
+    mark_hooks_active,
+    read_marker,
+    write_marker,
+)
 from craftsman.worktree_guard import find_worktree_mutation
 
 Platform = Literal["copilot", "claude"]
@@ -96,8 +112,15 @@ SHELL_TOOLS = frozenset(
 )
 # Characters that a shell or PowerShell would interpret inside a double-quoted argument.
 SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
+REVIEW_GUARD_ACTIONS = 3
+# A subagent that started longer ago and never stopped is taken for dead, not for running.
+AGENT_RUNNING_MAX_AGE = timedelta(minutes=30)
+REVIEW_NOT_STARTED = (
+    "No review round yet: run `craftsman review prepare`, launch at least one "
+    "craftsman-reviewer subagent on its packet, then record findings and verdicts."
+)
 REVIEWER_STOP_REASON = (
-    "Before finishing, record coverage (`craftsman review cover ...`) for every lens you "
+    "Before finishing, record coverage (`craftsman review cover ...`) for the slice you "
     "examined, and a finding (`craftsman review add ...`) for every defect you found."
 )
 
@@ -128,6 +151,7 @@ class HookInput:
     tool_input: dict[str, Any]
     transcript_path: str
     session_id: str | None = None
+    agent_transcript_path: str = ""  # a subagent's own transcript (Claude Code SubagentStop)
 
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> HookInput:
@@ -143,6 +167,7 @@ class HookInput:
             tool_input=_tool_input(payload),
             transcript_path=_text(payload, "transcript_path", "transcriptPath"),
             session_id=_text(payload, "session_id", "sessionId").strip() or None,
+            agent_transcript_path=_text(payload, "agent_transcript_path", "agentTranscriptPath"),
         )
 
 
@@ -285,6 +310,11 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     reply = Reply(platform, event)
     session = open_session(hook.cwd)
     caller = GateOwner(platform, hook.session_id)
+    if event == "prompt" and session is not None:
+        if is_review_prompt(hook.prompt):
+            mark_hooks_active(session.ledger_path, caller)
+        elif not is_continuation_prompt(hook.prompt):
+            end_review_guard(session.ledger_path, caller)  # the user moved on to something else
     if event == "pre-tool":
         return on_pre_tool(hook, reply, session, caller)
     if session is None:
@@ -316,7 +346,7 @@ def serve(
     if event == "prompt":
         return on_prompt(session, state, hook, reply, caller)
     if event == "stop":
-        return on_stop(session, state, reply)
+        return on_stop(session, state, reply, caller)
     active = state is not None and state.active
     if event == "subagent-start":
         return state, on_subagent_start(session, active, hook, reply)
@@ -338,35 +368,40 @@ def on_non_owner_prompt(session: Session, state: GateState, hook: HookInput, rep
     )
 
 
-def after_user_prompt(state: GateState, prompt: str, tier: GateTier | None) -> GateState:
-    """An active gate after its user wrote `prompt`: a new streak, and the tier can rise."""
+def after_user_prompt(state: GateState, prompt: str, deep: bool | None) -> GateState:
+    """An active gate after its user wrote `prompt`: a new streak, and the gate can become deep."""
     if not is_continuation_prompt(prompt):
         state = replace(state, awaiting_user=False, forced_continuations=0, best_issue_count=None)
-    if tier is not None and state.stage is not Stage.NEEDS_HUMAN:
-        state = replace(state, tier=raised_tier(state.tier, tier))
+    if deep and state.stage is not Stage.NEEDS_HUMAN:
+        state = replace(state, deep=True)
     return state
 
 
 def on_prompt(
     session: Session, state: GateState | None, hook: HookInput, reply: Reply, caller: GateOwner
 ) -> tuple[GateState | None, Output]:
-    tier = detect_trigger(hook.prompt)
+    deep = detect_trigger(hook.prompt)
     owner = caller
+    restarted_deep = False  # a restart after a needs-human stop starts as deep as that gate was
     if state is not None and state.active:
-        state = after_user_prompt(state, hook.prompt, tier)
-        if tier is None or state.stage is not Stage.NEEDS_HUMAN:
+        state = after_user_prompt(state, hook.prompt, deep)
+        if deep is None or state.stage is not Stage.NEEDS_HUMAN:
             return state, reply.allow()
         archive_ledger(session.ledger_path)  # the review needed a human; a new request starts over
-        owner = state.owner
-    elif tier is None:
+        owner, restarted_deep = state.owner, state.deep
+    elif deep is None:
         return state, reply.allow()
     base_sha = resolve_base_sha(session.root, None)
     started = GateState.open(
-        owner, base_sha, tier, task_from_prompt(hook.prompt), isolation_evidence="hooks"
+        owner,
+        base_sha,
+        bool(deep) or restarted_deep,
+        task_from_prompt(hook.prompt),
+        isolation_evidence="hooks",
     )
     archive_ledger_for_new_base(session.root, base_sha)
     return started, reply.inject(
-        f"Craftsman session started (tier {tier}, base {base_sha[:7]}). Follow the /craftsman "
+        f"Craftsman session started ({'deep, ' if started.deep else ''}base {base_sha[:7]}). Follow the /craftsman "
         f"skill (Stage 0 command: `{init_command(started)}`); the gate will block finishing "
         "until `craftsman review check` passes.\n"
         f"Scope: work only inside {session.root}; see Search scope."
@@ -376,7 +411,8 @@ def on_prompt(
 def init_command(state: GateState) -> str:
     """The Stage 0 command for `state`, safe to paste into a POSIX shell or PowerShell."""
     session = f" --session-id {_shell_safe(state.owner.session_id)}" if state.owner.session_id else ""
-    return f'craftsman gate --init{session} --tier {state.tier} --task "{_shell_safe(state.task)}"'
+    deep = " --deep" if state.deep else ""
+    return f'craftsman gate --init{session}{deep} --task "{_shell_safe(state.task)}"'
 
 
 def _shell_safe(text: str) -> str:
@@ -386,15 +422,104 @@ def _shell_safe(text: str) -> str:
 # --- stop -----------------------------------------------------------------------------------
 
 
-def on_stop(session: Session, state: GateState | None, reply: Reply) -> tuple[GateState | None, Output]:
+def on_stop(
+    session: Session, state: GateState | None, reply: Reply, caller: GateOwner | None = None
+) -> tuple[GateState | None, Output]:
     if state is None or not state.active:
-        return state, reply.allow()
+        guard = review_stop_guard(session, reply, caller) if caller is not None else reply.allow()
+        return state, guard
     decision = decide_stop(state, session.root)
     if decision.block_reason is not None:
         return decision.state, reply.block(decision.block_reason)
     if decision.notice is not None:
         return decision.state, notice(reply, decision.notice)
     return decision.state, reply.allow()
+
+
+def _review_outcome_issues(session: Session, marker: ReviewMarker, caller: GateOwner) -> list[GateIssue]:
+    """What `craftsman review check --review-only` still lacks for a review begun at `marker`.
+
+    Judged by the same rules and evidence as that command, as it runs for `caller`'s session.
+    """
+    ledger = load(session.ledger_path)
+    started = parse_timestamp(marker.at)
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    touched = latest is not None and (
+        (marker.touched_at is not None and parse_timestamp(marker.touched_at) >= started)
+        or parse_timestamp(latest.prepared_at) >= started
+        or any(parse_timestamp(item.recorded_at) >= started for item in ledger.coverage)
+        or any(parse_timestamp(item.recorded_at) >= started for item in ledger.findings)
+    )
+    if not touched:
+        return [GateIssue("no-round", REVIEW_NOT_STARTED)]
+    workspace = Workspace(session.root, None, session.ledger_path)
+    policy = GatePolicy(
+        deep=effective_deep(ledger),
+        isolation_evidence=workspace.isolation_evidence(ledger, cli_visible(caller)),
+    )
+    snap = workspace.snapshot(ledger)
+    return list(evaluate(ledger, snap, policy, review_only=True).issues)
+
+
+def _agent_running(ledger: Ledger, since: datetime) -> bool:
+    """Whether a Craftsman reviewer or verifier started after `since` and has not stopped yet."""
+    now = datetime.now(timezone.utc)
+    for event in ledger.agents:
+        if event.event != "start" or agent_role(event.agent) is None:
+            continue
+        started = parse_timestamp(event.at)
+        if started < since or now - started > AGENT_RUNNING_MAX_AGE:
+            continue
+        if not any(
+            other.event == "stop"
+            and (other.agent_id == event.agent_id if event.agent_id else other.agent == event.agent)
+            and parse_timestamp(other.at) >= started
+            for other in ledger.agents
+        ):
+            return True
+    return False
+
+
+def review_stop_guard(session: Session, reply: Reply, caller: GateOwner) -> Output:
+    """Keep a session that invoked the review skill working until its review-only outcome exists.
+
+    The prompt hook marked the session; a review that skipped `craftsman review prepare`, or left
+    hunks uncovered, findings unjudged or no reviewer run, is sent back like a gate. After
+    `MAX_CONTINUATIONS` reminders without progress the guard lets go with a note.
+    """
+    marker = read_marker(session.ledger_path)
+    if marker is None or not marker.guarding or not marker.is_of(caller):
+        return reply.allow()
+    try:
+        issues = _review_outcome_issues(session, marker, caller)
+    except (DiffScanError, LedgerError, GateStateError) as exc:
+        end_review_guard(session.ledger_path, caller)
+        return notice(reply, f"Craftsman review guard could not check the review ({exc}); not enforced.")
+    if not issues:
+        end_review_guard(session.ledger_path, caller)
+        return reply.allow()
+    if _agent_running(load(session.ledger_path), parse_timestamp(marker.at)):
+        # Background subagents report back when they finish and wake the session; a block now
+        # would only burn reminders while the agent waits for them.
+        return reply.allow()
+    count = len(issues)
+    forced = 0 if marker.best is not None and count < marker.best else marker.forced
+    best = count if marker.best is None else min(marker.best, count)
+    if forced >= MAX_CONTINUATIONS:
+        end_review_guard(session.ledger_path, caller)
+        return notice(
+            reply,
+            f"Craftsman review guard: the review is still incomplete after {forced} reminders; "
+            "letting the agent stop. `craftsman review check --review-only` lists what is missing.",
+        )
+    write_marker(session.ledger_path, replace(marker, forced=forced + 1, best=best))
+    header = f"{REVIEW_CONTINUATION_HEADER} {forced + 1}/{MAX_CONTINUATIONS}]"
+    actions = render_next_actions(issues, max_items=REVIEW_GUARD_ACTIONS)
+    return reply.block(
+        f"{header} {format_blocker_summary(GateReport(tuple(issues), (), ''))}.\n"
+        + "\n".join(actions)
+        + "\nFinish with `craftsman review check --review-only` passing."
+    )
 
 
 def notice(reply: Reply, message: str) -> Output:
@@ -406,8 +531,10 @@ def notice(reply: Reply, message: str) -> Output:
 # --- subagents ------------------------------------------------------------------------------
 
 
-def record_agent_event(session: Session, hook: HookInput, kind: AgentEventKind, platform: str) -> Ledger:
-    """Append the event under the ledger lock and return the ledger as it was before."""
+def record_agent_event(
+    session: Session, hook: HookInput, kind: AgentEventKind, platform: str
+) -> tuple[Ledger, AgentEvent]:
+    """Append the event under the ledger lock; return the ledger as it was before, and the event."""
     event = AgentEvent(
         platform=platform,
         event=kind,
@@ -415,7 +542,21 @@ def record_agent_event(session: Session, hook: HookInput, kind: AgentEventKind, 
         agent_id=hook.agent_id,
         at=format_timestamp(datetime.now(timezone.utc)),
     )
-    return mutate(session.ledger_path, lambda ledger: (add_agent_event(ledger, event), ledger))
+    before = mutate(session.ledger_path, lambda ledger: (add_agent_event(ledger, event), ledger))
+    return before, event
+
+
+def attach_transcript_facts(session: Session, event: AgentEvent, facts: TranscriptFacts) -> None:
+    """Add the usage and records read from the agent's transcript to `event`, recorded earlier:
+    reading a transcript can take long, and the event, which proves isolation, must not wait."""
+    attached = replace(event, usage=facts.usage, records=facts.records)
+
+    def swap(ledger: Ledger) -> tuple[Ledger, None]:
+        agents = list(ledger.agents)
+        agents[agents.index(event)] = attached  # the first equal event: twins stop in turn
+        return replace(ledger, agents=tuple(agents)), None
+
+    mutate(session.ledger_path, swap)
 
 
 def _has_current_round(session: Session) -> bool:
@@ -443,38 +584,30 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
     role = agent_role(hook.agent)
     if not active and (role is None or not _has_current_round(session)):
         return reply.allow()
-    ledger = record_agent_event(session, hook, "start", reply.platform)
+    ledger, _ = record_agent_event(session, hook, "start", reply.platform)
     if role is None or not ledger.rounds:
         return reply.allow()
-    return reply.inject(briefing(role, ledger, session, review_only=not active))
+    return reply.inject(briefing(role, ledger))
 
 
-def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: bool) -> str:
-    """What a Craftsman reviewer or verifier needs to know about the current round."""
+def briefing(role: AgentRole, ledger: Ledger) -> str:
+    """The round and the open work, with the commands to read it; the templates hold the rest.
+
+    No packet path: it holds every hunter's hunks, and only the orchestrator reads it.
+    """
     latest = ledger.rounds[-1]
-    lines = [
-        f"Craftsman review round {latest.number}. "
-        f"Packet: {latest.packet_path or packet_path(session.ledger_path, latest.number)}",
-        f"Scope: work only inside {session.root}; see Search scope.",
-    ]
+    lines = [f"Craftsman review round {latest.number}."]
     if role == "reviewer":
-        missing = {lens: ids for lens, ids in uncovered_by_lens(ledger, latest).items() if ids}
+        missing = uncovered_hunks(ledger, latest)
         if missing:
-            lines.append("Lenses with uncovered items (take only the lenses you were assigned):")
-            lines.extend(
-                f"- {lens}: {', '.join(ids)}" + (" (run last)" if lens == SWEEP_LENS else "")
-                for lens, ids in missing.items()
-            )
+            lines.append(f"Hunks not covered yet (take only your assigned slice): {', '.join(missing)}")
         else:
-            lines.append("Every lens of this round is covered.")
+            lines.append("Every hunk of this round is covered.")
+        lines.append(
+            "Read your slice: `craftsman review view --hunks <ids>`; context before opening files: "
+            "`craftsman review scout H#` or `craftsman review scout <symbol>`."
+        )
     else:
-        sweep_missing = uncovered_by_lens(ledger, latest).get(SWEEP_LENS, [])
-        if review_only and sweep_missing:
-            lines.append(
-                f"Uncovered `{SWEEP_LENS}` hunks (in review-only mode without --fix, cover `{SWEEP_LENS}` "
-                f"in Step 0 before verdicts): {', '.join(sweep_missing)} "
-                f"(with --fix, a separate `craftsman-reviewer` covers `{SWEEP_LENS}`)."
-            )
         pending = [finding for finding in ledger.findings if finding.verdict is None]
         if pending:
             lines.append("Findings without a verdict:")
@@ -484,8 +617,10 @@ def briefing(role: AgentRole, ledger: Ledger, session: Session, *, review_only: 
             )
         else:
             lines.append("No finding is waiting for a verdict.")
-    lines.append("Recording commands:")
-    lines.extend(CHEAT_SHEET)
+        lines.append(
+            "Lens and scenario of each: `craftsman review show`; code context: "
+            "`craftsman review scout <symbol>`."
+        )
     return "\n".join(lines)
 
 
@@ -496,15 +631,33 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
     hook = _with_started_agent_name(session, hook)
     if not active and (agent_role(hook.agent) is None or not _has_current_round(session)):
         return reply.allow()
-    before = record_agent_event(session, hook, "stop", reply.platform)
+    before, event = record_agent_event(session, hook, "stop", reply.platform)
+    facts = _agent_transcript(hook)  # after the event: a slow or killed read must not lose the evidence
+    answer = _stop_answer(before, hook, reply, facts.records)
+    if facts.usage is not None or facts.records is not None:
+        try:
+            attach_transcript_facts(session, event, facts)
+        except (LedgerError, OSError, ValueError):
+            pass  # the gate then goes by time; usage is telemetry only
+    return answer
+
+
+def _stop_answer(before: Ledger, hook: HookInput, reply: Reply, records: tuple[str, ...] | None) -> Output:
+    """Whether the stopping agent may finish: `before` is the ledger without its stop event.
+
+    `records` are the record tokens its transcript shows, None when there is no such evidence.
+    """
     role = agent_role(hook.agent)
     if role is None or hook.stop_hook_active or not before.rounds:
         return reply.allow()
     since = _run_started_at(before, hook)
     if _stopped_since(before, hook, since):
         return reply.allow()  # already sent back once
-    # Records carry no agent id, so "recorded since this run started" is the best evidence that
-    # this run did its part; with parallel runs another agent's record can satisfy it.
+    # Without the transcript, records carry no agent id, so "recorded since this run started" is
+    # the best evidence that this run did its part; with parallel runs another agent's record can
+    # satisfy it.
+    if role == "reviewer" and records is not None:
+        return reply.allow() if records else reply.block(REVIEWER_STOP_REASON)
     if role == "reviewer":
         recorded = any(parse_timestamp(item.recorded_at) >= since for item in before.coverage) or any(
             parse_timestamp(item.recorded_at) >= since for item in before.findings
@@ -524,6 +677,19 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
         '`craftsman review verdict <id> --as proven|probable|question|dismissed --evidence "..."` '
         "before finishing."
     )
+
+
+def _agent_transcript(hook: HookInput) -> TranscriptFacts:
+    """The agent's usage and records from its own transcript, if the payload names one; never raises.
+
+    The payload's plain `transcript_path` is the parent session's, so it is not read here.
+    """
+    if not hook.agent_transcript_path:
+        return TranscriptFacts()
+    try:
+        return read_transcript(Path(hook.agent_transcript_path))
+    except Exception:  # noqa: BLE001 - telemetry must never fail the hook
+        return TranscriptFacts()
 
 
 def _with_started_agent_name(session: Session, hook: HookInput) -> HookInput:
@@ -579,7 +745,7 @@ def _review_in_progress(session: Session) -> int | None:
     latest = ledger.rounds[-1]
     if datetime.now(timezone.utc) - parse_timestamp(latest.prepared_at) > REVIEW_IN_PROGRESS_MAX_AGE:
         return None
-    has_open = any(uncovered_by_lens(ledger, latest).values()) or any(
+    has_open = bool(uncovered_hunks(ledger, latest)) or any(
         finding.verdict is None for finding in ledger.findings
     )
     return latest.number if has_open else None

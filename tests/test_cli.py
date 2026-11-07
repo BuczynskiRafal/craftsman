@@ -37,17 +37,17 @@ class StatusTests(unittest.TestCase):
         assert isinstance(payload, dict)
         return payload
 
-    def test_status_counts_design_coverage_per_file(self) -> None:
+    def test_status_counts_uncovered_hunks(self) -> None:
         lines = [f"value_{index} = {index}\n" for index in range(30)]
         self.repo.write("app.py", "".join(lines))
         self.repo.git("commit", "-qam", "values")
         self.repo.write("app.py", "".join(["first = 0\n", *lines[1:-1], "last = 0\n"]))
-        self.repo.cli("review", "prepare", "--tier", "standard", "--base", "HEAD")
+        self.repo.cli("review", "prepare", "--base", "HEAD")
 
         ledger = self.status()["ledger"]
 
-        lenses = len(self.repo.show()["round"]["lenses"])
-        self.assertEqual(ledger["coverage"], {"covered": 0, "total": 2 * (lenses - 1) + 1})
+        self.assertEqual(ledger["coverage"], {"covered": 0, "total": 2})
+        self.assertFalse(ledger["deep"])
 
     def test_status_without_gate_is_idle(self) -> None:
         payload = self.status()
@@ -58,21 +58,12 @@ class StatusTests(unittest.TestCase):
         diff = self.status()["diff"]
         self.assertEqual((diff["changed_files"], diff["total_changed_lines"]), (1, 3))
 
-    def test_small_change_gets_the_quick_gear(self) -> None:
-        self.repo.write("app.py", "x = 2\n")
-        self.assertEqual(self.status()["effective_gear"], "quick")
-
-    def test_change_beyond_the_quick_file_limit_gets_the_standard_gear(self) -> None:
-        for name in ("app.py", "u1.py", "u2.py"):
-            self.repo.write(name, "a = 9\n")
-        self.assertEqual(self.status()["effective_gear"], "standard")
-
     def test_status_reports_the_active_gate(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, tier="deep", owner=GateOwner("claude", "s1"))
+        open_gate(self.repo.root, self.repo.base_sha, deep=True, owner=GateOwner("claude", "s1"))
         payload = self.status()
         self.assertEqual(
-            (payload["active"], payload["effective_gear"], payload["owner"]),
-            (True, "deep", {"platform": "claude", "session_id": "s1"}),
+            (payload["active"], payload["deep"], payload["owner"]),
+            (True, True, {"platform": "claude", "session_id": "s1"}),
         )
 
     def test_status_text_names_the_owner(self) -> None:
@@ -116,9 +107,9 @@ class SkillCommandTests(unittest.TestCase):
         )
 
     def test_show_prints_a_companion_file(self) -> None:
-        result = self.skill("show", "code-review", "--file", "lenses.md")
+        result = self.skill("show", "craft-review", "--file", "lenses.md")
 
-        lenses = (REPO_ROOT / "skills" / "code-review" / "lenses.md").read_text(encoding="utf-8")
+        lenses = (REPO_ROOT / "skills" / "craft-review" / "lenses.md").read_text(encoding="utf-8")
         self.assertEqual(result.out, lenses)
 
     def test_unknown_skill_is_a_usage_error(self) -> None:
@@ -130,23 +121,23 @@ class SkillCommandTests(unittest.TestCase):
     def test_file_outside_the_skill_is_refused(self) -> None:
         for bad_file in ("../craftsman/SKILL.md", "/etc/passwd", "missing.md", ""):
             with self.subTest(file=bad_file):
-                result = self.skill("show", "code-review", "--file", bad_file)
+                result = self.skill("show", "craft-review", "--file", bad_file)
                 self.assertEqual(result.code, 2)
                 self.assertIn("craftsman skill: error:", result.err)
 
     def test_file_symlinked_out_of_the_skill_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp).resolve() / "repo"
-            skill_dir = repo / "skills" / "code-review"
+            skill_dir = repo / "skills" / "craft-review"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text(
-                "---\nname: code-review\ndescription: x\n---\nbody\n", encoding="utf-8"
+                "---\nname: craft-review\ndescription: x\n---\nbody\n", encoding="utf-8"
             )
             (repo.parent / "secret.md").write_text("top secret\n", encoding="utf-8")
             (skill_dir / "escape.md").symlink_to(repo.parent / "secret.md")
 
             result = run_main(
-                skill_main, "show", "code-review", "--file", "escape.md", "--repo-dir", str(repo)
+                skill_main, "show", "craft-review", "--file", "escape.md", "--repo-dir", str(repo)
             )
 
         self.assertEqual(result.code, 2)

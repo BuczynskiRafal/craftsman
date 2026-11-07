@@ -81,12 +81,12 @@ class AgentTemplateTests(AssetsTestCase):
                     load_agent_templates(self.fake_repo(directive + "\n"))
 
     def test_includes_follow_symlinked_skill_folders(self) -> None:
-        repo = self.fake_repo("{{include skills/code-review/lenses.md}}\n")
-        elsewhere = self.tmp / "checkout" / "code-review"
+        repo = self.fake_repo("{{include skills/craft-review/lenses.md}}\n")
+        elsewhere = self.tmp / "checkout" / "craft-review"
         elsewhere.mkdir(parents=True)
         (elsewhere / "lenses.md").write_text("Lens text.\n", encoding="utf-8")
         (repo / "skills").mkdir()
-        (repo / "skills" / "code-review").symlink_to(elsewhere, target_is_directory=True)
+        (repo / "skills" / "craft-review").symlink_to(elsewhere, target_is_directory=True)
 
         (template,) = load_agent_templates(repo)
 

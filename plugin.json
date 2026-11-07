@@ -1,6 +1,6 @@
 {
   "name": "craftsman",
-  "version": "4.1.0",
+  "version": "5.0.0",
   "license": "MIT",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
   "skills": [
@@ -12,7 +12,7 @@
     "./skills/audit-types",
     "./skills/batch",
     "./skills/code-quality",
-    "./skills/code-review",
+    "./skills/craft-review",
     "./skills/craftsman",
     "./skills/extreme-optimizer",
     "./skills/feature-dev",

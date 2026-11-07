@@ -327,7 +327,7 @@ def _render_plugin_manifest(agent_names: list[str]) -> str:
         "homepage": PLUGIN_REPOSITORY,
         "repository": PLUGIN_REPOSITORY,
         "license": "MIT",
-        "keywords": ["ai-agents", "claude-code", "code-review", "quality-gate", "testing"],
+        "keywords": ["ai-agents", "claude-code", "code-review", "craft-review", "quality-gate", "testing"],
         # Replaces the default agents/ folder, which holds the unrendered templates.
         "agents": [f"./{PLUGIN_AGENTS_DIR}/{name}.md" for name in agent_names],
         "hooks": _plugin_hooks(),

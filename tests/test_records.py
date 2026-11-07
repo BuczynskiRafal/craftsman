@@ -7,13 +7,11 @@ import unittest
 from dataclasses import replace
 from typing import Any
 
-from craftsman.ledger import ack_signal, add_agent_event, add_lenses, resolve, set_verdict
+from craftsman.ledger import add_agent_event, resolve, set_verdict
 from craftsman.records import (
     AgentEvent,
-    FieldError,
     Ledger,
     LedgerError,
-    LensAddition,
     QualitySignal,
     SignalKind,
 )
@@ -34,11 +32,10 @@ LONG_FUNCTION = QualitySignal("S1", SignalKind.LONG_FUNCTION, "a.py", 1, "`f` sp
 def full_ledger() -> Ledger:
     snap = make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py"))
     ledger, _ = prepared(snap, signals=(LONG_FUNCTION,))
-    ledger = cover_open_hunks(ledger, "intent")
-    ledger = record_run(record_finding(ledger, signal_id="S1"), kind="repro", exit_code=1)
+    ledger = cover_open_hunks(ledger)
+    ledger = record_run(record_finding(ledger), kind="repro", exit_code=1)
     ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
     ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list in total().", fingerprint="fp2")
-    ledger, _ = ack_signal(ledger, "S1", "`f` in a.py:1 is a flat table of 50 literal cases")
     event = AgentEvent(
         platform="claude",
         event="stop",
@@ -66,6 +63,24 @@ class SerializationTests(unittest.TestCase):
 
         self.assertEqual(Ledger.from_json(json.loads(json.dumps(ledger.to_json()))), ledger)
 
+    def test_a_stop_event_round_trips_with_and_without_records(self) -> None:
+        stop = AgentEvent("claude", "stop", "craftsman-reviewer", "a", "2026-01-01T00:05:00.000Z")
+        for records in (None, (), ("C1", "F2")):
+            with self.subTest(records=records):
+                event = replace(stop, records=records)
+                raw = json.loads(json.dumps(event.to_json()))
+
+                self.assertEqual(AgentEvent.from_json(raw), event)
+                self.assertEqual("records" in raw, records is not None)
+
+    def test_records_are_machine_tokens_of_a_stop_event(self) -> None:
+        stop = AgentEvent("claude", "stop", "craftsman-reviewer", "a", "2026-01-01T00:05:00.000Z")
+        for bad in (("H1",), ("C",), ("c1",), ("C1 ",)):
+            with self.subTest(records=bad), self.assertRaises(LedgerError):
+                replace(stop, records=bad)
+        with self.assertRaises(LedgerError):
+            replace(stop, event="start", records=("C1",))
+
     def test_signal_kind_is_stored_as_its_name(self) -> None:
         self.assertEqual(ledger_json()["rounds"][0]["signals"][0]["kind"], "long-function")
 
@@ -82,10 +97,10 @@ class SerializationTests(unittest.TestCase):
             (broken({"verdict_run": "R9"}), "findings[0].verdict_run references an unknown run"),
             (broken({"digest": 5}, "rounds"), "rounds[0].digest is not a known field"),
             (
-                {**ledger_json(), "schema": 1},
-                "schema 1 is from an older craftsman; run `craftsman review reset` to archive it",
+                {**ledger_json(), "schema": 2},
+                "schema 2 is from an older craftsman; run `craftsman review reset` to archive it",
             ),
-            ({**ledger_json(), "schema": 3}, "schema 3 is not supported"),
+            ({**ledger_json(), "schema": 4}, "schema 4 is not supported"),
             ([], "ledger.json: must be a JSON object"),
         ]
         for raw, message in cases:
@@ -100,10 +115,9 @@ class SerializationTests(unittest.TestCase):
 
     def test_every_record_field_is_required(self) -> None:
         cases = [
-            ("signal_acks", None, "signal_acks is missing"),
-            ("facts", None, "facts is missing"),
+            ("coverage", None, "coverage is missing"),
             ("rounds", "signals", "rounds[0].signals is missing"),
-            ("findings", "signal_id", "findings[0].signal_id is missing"),
+            ("findings", "title", "findings[0].title is missing"),
         ]
         for section, field, message in cases:
             raw = ledger_json()
@@ -122,30 +136,11 @@ class SerializationTests(unittest.TestCase):
 
 
 class LedgerConsistencyTests(unittest.TestCase):
-    def test_finding_must_name_a_signal_of_its_round(self) -> None:
-        raw = ledger_json()
-        raw["findings"][0]["signal_id"] = "S7"
-
-        assert_rejected(self, raw, "findings[0].signal_id names an unknown quality signal 'S7'")
-
-    def test_signal_ack_must_name_a_signal_of_its_round(self) -> None:
-        raw = ledger_json()
-        raw["signal_acks"][0]["signal_id"] = "S7"
-
-        assert_rejected(self, raw, "signal_acks[0].signal_id names an unknown quality signal 'S7'")
-
-    def test_signal_ack_must_match_the_fingerprint_of_its_round(self) -> None:
-        raw = ledger_json()
-        raw["signal_acks"][0]["fingerprint"] = "other"
-
-        assert_rejected(self, raw, "signal_acks[0].fingerprint must match round 1")
-
     def test_coverage_must_cover_hunks_of_its_round(self) -> None:
         raw = ledger_json()
         raw["coverage"] = [
             {
                 "round": 1,
-                "lens": "intent",
                 "digests": ["not-a-digest"],
                 "note": "H1 f_1.py:1: x=1 -> returns 2 on boundary input",
                 "recorded_at": "2026-01-01T00:00:00.000Z",
@@ -153,56 +148,6 @@ class LedgerConsistencyTests(unittest.TestCase):
         ]
 
         assert_rejected(self, raw, "coverage[0].digests are not in round 1")
-
-
-ADDED_REASON = "Jenkinsfile:12 the sh step interpolates env.DEPLOY_URL"
-
-
-def ledger_with_added_trust() -> Ledger:
-    snap = make_snap(make_hunk("H1", "Jenkinsfile"))
-    ledger, round_ = prepared(snap, lenses=("intent", "trust"))
-    return add_lenses(ledger, round_.number, {"trust": ADDED_REASON})
-
-
-class LensAdditionTests(unittest.TestCase):
-    def test_round_trip_keeps_the_addition(self) -> None:
-        ledger = ledger_with_added_trust()
-
-        self.assertEqual(Ledger.from_json(json.loads(json.dumps(ledger.to_json()))), ledger)
-        self.assertEqual(ledger.added_lenses, {"trust": ADDED_REASON})
-
-    def test_ledger_written_before_lens_additions_still_loads(self) -> None:
-        raw = ledger_json()
-        del raw["lens_additions"]
-
-        self.assertEqual(Ledger.from_json(raw).lens_additions, ())
-
-    def test_addition_must_name_a_risk_lens_and_cite_the_code(self) -> None:
-        cases = [
-            ("security", ADDED_REASON, "lens must be one of"),
-            ("sweep", ADDED_REASON, "`sweep` is not a risk lens"),
-            ("trust", "too short", "reason must have at least 20 characters"),
-            ("trust", "the Jenkinsfile shells out with user input", "reason must cite the changed code"),
-        ]
-        for lens, reason, message in cases:
-            with self.subTest(message=message), self.assertRaises(FieldError) as caught:
-                LensAddition(lens, reason, 1, "2026-01-01T00:00:00.000Z")
-            self.assertIn(message, str(caught.exception))
-
-    def test_added_lens_must_stay_in_every_later_round(self) -> None:
-        ledger = ledger_with_added_trust()
-        snap = make_snap(make_hunk("H1", "Jenkinsfile"), fingerprint="fp2")
-
-        with self.assertRaises(FieldError) as caught:
-            prepared(snap, lenses=("intent",), ledger=ledger)
-
-        self.assertIn("was added in round 1 but is missing from round 2", str(caught.exception))
-
-    def test_a_lens_is_added_once(self) -> None:
-        raw = json.loads(json.dumps(ledger_with_added_trust().to_json()))
-        raw["lens_additions"].append(raw["lens_additions"][0])
-
-        assert_rejected(self, raw, "lens_additions must not repeat a lens")
 
 
 class RunRecordTests(unittest.TestCase):

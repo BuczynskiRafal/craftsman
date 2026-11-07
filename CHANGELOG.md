@@ -6,6 +6,185 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Diagrams are Excalidraw scenes again.** The five Mermaid diagrams (workflow, evidence ledger, finding
+  lifecycle, hooks and guards, stop gate) are redrawn for the 5.0 protocol as editable
+  `docs/diagrams/*.excalidraw` scenes with rendered PNGs, and the README shows the workflow diagram again.
+
+## [5.0.0] - 2026-11-06
+
+### Fixed
+
+- **The host's `/code-review` no longer arms the review stop guard** (nor opens a gate). Only Craftsman's
+  `/craft-review` and `/craftsman:craft-review` do; there is no alias for the old name.
+- **The review stop guard agrees with `craftsman review check --review-only`.** It uses the same isolation
+  evidence (on Copilot, where no session id reaches the CLI, the two used to disagree), and re-running
+  `review prepare` on an unchanged diff or raising its depth counts as starting the review instead of repeating
+  "no review round yet". A session that waits for a background reviewer or verifier is no longer sent back and no
+  longer spends reminders; benchmark reviews used to be stopped 2 to 6 times for that.
+- **Review-only isolation evidence is per review, not per ledger.** A subagent event from an earlier session or
+  platform no longer makes a terminal or hookless review need a reviewer run it can never record; hooks count only
+  for the session that invoked `/craft-review`, or once a subagent event follows the current round.
+- **Coverage must come from a `craftsman-reviewer`, in every round.** The latest round used to pass once any
+  reviewer had recorded anything, so the orchestrator could cover the remaining hunks itself; now every covered hunk
+  needs a reviewer behind its coverage, and the gate names the hunks that lack one (a reviewer re-covers them, no
+  reset needed). Findings need no reviewer, so an intent finding the orchestrator records no longer fails an earlier
+  round. A round replaced before any review holds no coverage and needs nothing; a reviewer that finished after the
+  next round was prepared still counts for what it recorded.
+- **Claude Code reviewers are identified by their own transcript, not by time.** `review cover` prints a token
+  (`Coverage recorded (C12): ...`, as findings print `F3 recorded`), and the stop hook stores the tokens the
+  reviewer's own transcript shows on its stop event, so the orchestrator's records written while a background
+  reviewer runs no longer count as the reviewer's. A record counts only inside its reviewer's start-to-stop window.
+  The reader fails safe: without a readable transcript (Copilot, Antigravity) or with a token that no recognized
+  `review cover|add` call printed, the gate goes by the window alone instead of concluding the reviewer recorded
+  nothing. A stop whose start cannot be matched by agent id (Copilot starts by name only) pairs first in, first out
+  with the unpaired starts of its name.
+- **A background agent's report no longer ends the review guard.** Claude Code delivers a background subagent's
+  report as a prompt, which the prompt hook took for the user moving on: it disarmed the `/craft-review` stop guard
+  (a session could then stop with findings unjudged) and reset an active gate's continuation count. Such prompts
+  now count as the platform's, like a stop hook's continuation.
+- **Agent time counts active time.** A subagent's `duration_s` adds up the gaps between transcript entries of
+  at most 5 minutes instead of spanning first to last entry, so a resumed agent no longer counts the time it
+  sat idle between runs.
+- **The "session started" text after a needs-human restart** says `deep` when the restarted gate is deep.
+- **`evals` `agent` continues run numbering** per arm and case from the results file and the logs folder. Repeats
+  added later no longer restart at 1 and replace earlier runs, logs and kept ledgers (which skewed `rescore` and
+  the ranges of `compare`).
+- **Safer upgrades from Craftsman 4.x.** The old gate state and ledger are set aside only under their lock, after
+  reading the file again, so a 5.x gate or ledger written in between is never renamed to the backup.
+- **`review prepare` no longer holds the ledger lock while it parses the changed Python files** for quality hints,
+  so a `SubagentStop` event that proves isolation cannot time out behind it.
+- **A reviewer's stop event is written before its transcript is read** for token usage; a hook killed while reading
+  a huge transcript no longer loses the isolation evidence.
+
+### Changed
+
+- **BREAKING: the review skill is now `/craft-review`** (was `/code-review`), because Claude Code ships a
+  built-in `/code-review` and the two names collided. The skill lives in `skills/craft-review/`, and the
+  playbooks are read with `craftsman skill show craft-review --lenses <ids>`. There is no alias:
+  `craftsman skill show code-review` fails with the unknown-skill error that lists the valid names.
+- **Upgrade cleanup of the old `code-review` skill**: `craftsman install` and `craftsman uninstall` remove
+  the `code-review` skill an earlier version put in the Antigravity, Copilot and Claude Code folders, but
+  only when Craftsman owns it (an install manifest records it, or its files carry the generated marker);
+  a `code-review` skill of your own is kept. `craftsman doctor` reports a leftover one.
+- **BREAKING: "Build freely, review hard" redesign.** Recall dropped after 3.3.0 because the review
+  was optimized for cost and for satisfying the ledger. The agent now builds without review loops or
+  ledger bookkeeping; the gate judges outcomes on the final diff only: the diff was frozen, fresh-context
+  hunters covered every hunk, every finding has a verdict with checkable evidence, and the tests ran on
+  the final code.
+- **New review protocol** (`/craft-review` is the single source; `/craftsman` follows it):
+  `review prepare` freezes the diff and prints a risk map, the orchestrator writes an intent brief and
+  an adaptive hunt plan, and `craftsman-reviewer` hunters (recall) run in parallel, followed by
+  `craftsman-verifier` subagents (precision). While a wave produces a `proven` (reproduced) finding,
+  another wave runs (a variant hunter per proven root cause plus a fresh unanchored hunter), at most
+  3 waves per round; a `probable` finding alone does not start one. There is no inline-only review: every review uses a fresh-context hunter where the
+  platform has subagents. The prompts are rewritten to teach how to hunt and how to judge, and are much
+  shorter.
+- **No flags for users.** `/craftsman <task>` and `/craft-review <plain words>` ("review PR 42 and fix
+  what you find", "review my staged changes", "be thorough") are enough: the agent infers target, scope,
+  fixing, and depth. Flags remain optional shortcuts for agents and power users.
+- **One adaptive depth.** The agent goes deep on its own for security-relevant code, concurrency or
+  clocks, persistent data or migrations, public API or file formats, removed guarantees, and large or
+  cross-cutting diffs, or when the user asks for care. `review prepare` prints a
+  `Depth: deep suggested (signals: ...)` hint, and `review prepare --deep` inside a gate session raises
+  the gate to deep for good. Depth never goes down. `ultracraft` is `/craftsman --deep`.
+- **Cheaper bookkeeping.** `review cover` takes `--hunks` or `--files` (every open hunk of those files)
+  and one free-text note of at least 20 characters. There are no per-hunk note segments, no 80-character
+  rule, and no batch-size limit.
+- **Ledger schema 3** and a simpler gate. Coverage records hold hunk digests and a note, with no lens;
+  a hunk is covered when this round or an earlier one holds its digest. Gate state and rounds carry
+  `deep: bool` instead of a tier. The gate issues are `no-round`, `stale-round`, `uncovered`,
+  `no-verdict`, `unresolved`, `no-passing-run`, `no-e2e-run` (deep only), `failing-run`,
+  `no-isolation`, and `round-cap`. A very large diff is now a warning in `prepare` and the report, not
+  a `needs_human` hand-off. Whenever the platform provides isolation evidence, the coverage of every
+  round must come from a finished `craftsman-reviewer`, in gate sessions and in review-only mode.
+  Owner binding, `MAX_CONTINUATIONS`, the round cap, run rules, evidence rules, and the frozen
+  review-only scope are unchanged.
+- **Restored risk triggers.** `filesystem` signals suggest `state`, `trust`, and `platform` again, and
+  `process` suggests `platform`. Both were narrowed in 3.3.0.
+- **Larger review packet.** One 120k budget and one format for every round. Enclosing scope bodies are
+  always included (subject to the trimming ladder), callers are capped at 6 per symbol instead of 3,
+  and risk signals show per hunk with the lenses they suggest.
+- **Cheaper reviews.** The packet shows each hunk once, inside its enclosing scope at HEAD, with `+` and
+  `-` marks and `[H3]` markers. The packet and the hunter views share one layout with no lens table, no
+  recording cheat sheet and no empty sections, which makes a small diff's packet about 30% smaller; test
+  files a listed caller already names are not repeated.
+  Hunters and verifiers get briefs that start with an identical shared block (served from the prompt
+  cache), then the slice, then the lenses. Where agents run in the background (Claude Code, Antigravity
+  async subagents) a verifier starts when its hunter finishes, and a variant hunter and the fresh hunter
+  when a finding is judged `proven` (the fresh hunter starts with wave 1 when deep); variant hunters get
+  a mini-slice. On Claude Code the simplicity hunter (`craft`, `design`) and every verifier whose
+  cluster holds only `minor` or `nit` findings run on a cheaper model. The orchestrator ends its turn while
+  background agents run instead of polling for them (a leftover timer kept one benchmark session open for
+  8 minutes after its review was done). The orchestrator writes
+  the intent brief from `git diff <base>` and the risk map, not from the full packet. The SubagentStart
+  briefing carries the round, the packet path and the open work, without the packet.
+- **Fix confirmation is separate from the regression check.** A `proven` finding is confirmed by a
+  regression test that fails before the fix and passes after; a `probable` one by the resumed verifier
+  that judged it (or a fresh verifier given the fix diff). The regression check is a fresh, unanchored
+  hunter on the fix-delta round plus the test run.
+- **Gate behavior.** Hunk ids are stable and never reused, so a round's ids can be sparse. `review cover`
+  skips carried hunks, and `--files` accepts `./x`, backslashes, absolute paths, and the old path of a
+  renamed file. A reviewer must record coverage or a finding before it stops. Deep needs both a test run
+  and an e2e run. With no isolation evidence the gate closes with the `SELF-REVIEWED` banner, deep or
+  not. Isolation is checked per round, and on Antigravity reviewers are recorded when the turn ends.
+  `ultracraft` inside `/craft-review` means a deep review and never opens a gate. Every review
+  launches at least one hunter wherever the platform has subagents.
+- **Docs** rewritten around plain-language usage; `docs/harness-architecture.md` roughly halved. The
+  Excalidraw diagrams (which still showed tiers and per-lens coverage) are replaced by Mermaid diagrams
+  in `docs/how-it-works.md`, `docs/guards.md`, and `docs/harness-architecture.md`, and the README
+  shows a short text flow. `docs/how-it-works.md` is the one full explanation of the protocol, its
+  lens table follows `craftsman/lenses.py`, and the depth triggers live only in the `craft-review`
+  skill.
+
+### Added
+
+- **Scout:** `craftsman review scout <H#|path:line|symbol>` prints the base version of the enclosing
+  scope, callers, and tests, deterministically and capped at 12,000 characters, so hunters need not open
+  whole files.
+- **`craftsman review show --hunks`** lists the hunks still to cover, and `review show` prints each
+  finding's scenario and verdict evidence.
+- **Agent usage.** Where the platform hands over a subagent transcript, tokens and agent time are
+  recorded per subagent, and `craftsman review report` and `craftsman status` total them per role
+  (hunters, verifiers).
+- **Inbox fallback.** When a heredoc needs approval, subagents write their JSON to the path that
+  `craftsman review inbox` prints and pass `--from-json <path>`.
+- **Public seeded-defect suite** in [`evals/`](evals/README.md): six small Python projects with 15 seeded
+  defects and decoys, run with `python3 -m evals.run` and described in
+  [`docs/benchmark.md`](docs/benchmark.md).
+
+### Removed
+
+- **Tiers.** The `quick` / `standard` / `deep` tiers, `--tier`, and automatic tier selection (including
+  the review-only `quick` default up to 250 changed lines). `--quick` and `--standard` right after
+  `/craftsman` are still accepted and ignored (stripped from the task text).
+- **Commands and flags.** `review ack`, `review fact`, `review prepare --add-lens`,
+  `review add --signal`, `review cover --lens` (and the `"lens"` / `"lenses"` JSON keys),
+  `review view --lenses` and `--shard`, and the `R1`-`R4` reviewer groups in
+  `craftsman skill show craft-review --lenses`.
+- **Concepts.** Signal acknowledgements, shared facts, lens additions, per-lens coverage, per-lens views,
+  reviewer shards and groups, and the gate issues `tier-too-low`, `sweep-too-early`, the quality-signal
+  issues, and design-file coverage. Quality signals (`S#`) stay as display hints.
+- The `{{reviewer_groups}}` placeholder in `templates/AGENTS.md`.
+
+### Migration
+
+- **Old ledgers and gate state migrate on their own.** The first command that reads a pre-5.0 gate state
+  or a schema 2 ledger archives it (`craftsman_state.json.v4.bak`, `ledger.v2.bak.json`) and starts
+  fresh, so neither `gate --init --takeover` nor `review reset` is needed. Nothing is converted. Re-run
+  `craftsman install` to refresh the skills, agents, and `AGENTS.md` block.
+- `gate --init --tier deep` and `review prepare --tier deep` become `--deep`. `--tier quick` and
+  `--tier standard` become nothing: omit the flag and the agent chooses.
+- `review cover --lens a,b --hunks H1,H2 --note "..."` becomes
+  `review cover --hunks H1,H2 --note "..."`; drop `"lens"` / `"lenses"` from `--from-json` entries.
+- `review add --signal S#` and `review ack S#`: drop them. Mention the point in a finding if it is a
+  real defect.
+- `review prepare --add-lens`: assign the lens to a hunter in the hunt plan instead.
+- `review view --shard K/N` and `--lenses`: use `--files <csv>` or `--hunks <ids>` to give each hunter
+  a slice; the lenses go in the hunter's brief.
+- Scripts that read `tier` from `craftsman status` or the state file: read the deep flag.
+
 ## [4.1.0] - 2026-11-02
 
 ### Added
@@ -358,7 +537,8 @@ All notable changes to Craftsman are recorded here. The format follows
 - Hook parsers, verdict detection and worktree state handling were hardened (see the v2.1.0
   follow-up fixes).
 
-[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...HEAD
+[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...v5.0.0
 [4.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/a4458c4...v4.1.0
 [4.0.0]: https://github.com/BuczynskiRafal/craftsman/commit/a4458c4
 [3.3.0]: https://github.com/BuczynskiRafal/craftsman/compare/v3.2.0...v3.3.0

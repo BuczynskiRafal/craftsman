@@ -79,7 +79,7 @@ class CommandLineTests(unittest.TestCase):
 
         self.assertEqual(result.code, 0, result.err)
         self.assertFalse(home.exists())
-        self.assertTrue((self.tmp / "skills" / "code-review" / "lenses.md").is_file())
+        self.assertTrue((self.tmp / "skills" / "craft-review" / "lenses.md").is_file())
 
     def test_each_target_is_reported_once(self) -> None:
         skills = self.tmp / "skills"

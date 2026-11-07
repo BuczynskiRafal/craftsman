@@ -1,67 +1,108 @@
 # Usage Guide
 
-Craftsman provides both conversational chat commands for AI coding assistants and CLI commands for direct inspection and orchestration.
+You describe the work in plain words. The agent infers the rest.
 
 ---
 
-## Chat Commands
+## Ask in Plain Words
 
-In Copilot Chat, Claude Code, or Google Antigravity:
+In Claude Code, Copilot Chat, or Google Antigravity:
+
+```text
+/craftsman add pagination to the catalog search
+/craftsman migrate the session store to Redis, this is critical
+/craft-review review my staged changes
+/craft-review review my staged changes and fix what you find
+/craft-review review PR 42
+/craft-review review the changes in src/api/ against main
+/craft-review be thorough, this touches authentication
+ultracraft rewrite the token refresh logic
+```
+
+- `/craftsman <task>` builds the change, reviews the final diff, fixes what the review confirms,
+  runs the tests, and closes the gate.
+- `/craft-review <words>` reviews an existing change. It fixes only when you say so ("and fix what
+  you find").
+- `ultracraft` in a request starts `/craftsman` at full depth. Inside `/craft-review` it means a deep
+  review; it never opens a gate.
+
+To mention a trigger word without starting a session, put it in backticks or quotes.
+
+---
+
+## What the Agent Decides
+
+You never have to choose these. The agent reads the request and the repository.
+
+| Decision | How it decides |
+| :--- | :--- |
+| **Target** | Nothing named: the working tree against the gate's base commit, else `HEAD`. A branch or commit: that ref. A PR number or URL: it checks the PR out and reviews against its merge base. "Staged changes", "tracked files", or a path freezes that scope for the review. |
+| **Fixing** | `/craftsman` always fixes. `/craft-review` fixes when the words ask for it; otherwise it only reports. |
+| **Depth** | One adaptive depth, `deep`: every lens, at least two waves, an end-to-end run in addition to the tests. The agent goes deep for risky changes or when you ask for care ("critical", "be thorough", `ultracraft`); the list of triggers is under **Depth** in the [`craft-review` skill](../skills/craft-review/SKILL.md). Depth never goes down within a session. |
+| **Hunt plan** | How many hunters, which lenses each gets, how the diff is split between them, and whether another wave is worth running. |
+| **When to ask you** | Only for an ambiguity that changes what gets built, to accept a `major` finding instead of fixing it, and when the round cap is reached. |
+
+---
+
+## What the Report Explains
+
+The final report is plain Markdown for a human reader:
+
+- what was built or reviewed, file by file;
+- the agent's decisions in plain words: the depth and why, the hunters and their lenses, the waves
+  and why another one ran or stopped, how findings were verified (reproduced, or read statically);
+- findings fixed, accepted (with reasons), and dismissed (count), by severity;
+- the verification commands and their results;
+- the agent usage per role (hunters, verifiers), where the platform provides it;
+- what the gate did not assess, and a `SELF-REVIEWED` banner when the platform could not confirm that
+  separate subagents did the review.
+
+`/craft-review` without fixes ends with a review-only report. `partial` marks a review in which some
+slices stayed uncovered after retries and lists them under `Not covered`.
+
+---
+
+## Frozen Scope, Archives, and First Commits
+
+- **Review-only scope.** The first round of a standalone `/craft-review` freezes the list of changed
+  files (including both paths of a rename). Files that change outside that scope while the review
+  runs, such as a plan file written by another process, appear under `Ignored (outside the review
+  scope)` and do not invalidate the round. When fixing needs a new file, such as a regression test,
+  the agent extends the scope with `--add-paths`.
+- **Archives.** Packets, views, and ledger snapshots live in `.git/craftsman/`. Superseded packets
+  are pruned on every `review prepare`; archives keep the newest `CRAFTSMAN_KEEP_ARCHIVES` entries
+  (default `5`). `craftsman review reset` archives the current ledger before an independent review. A
+  pre-5.0 gate state or schema 2 ledger is archived automatically, so there is nothing to reset when
+  upgrading.
+- **Initial commit.** In a repository with no commits, the empty tree is the base, so the first
+  bootstrap can be reviewed too.
+
+---
+
+## Inspecting a Session
 
 ```bash
-/craftsman add pagination to the catalog search          # full engineering loop (implement, review, test)
-/craftsman --deep migrate session store to Redis         # deep gear (all 12 lenses, tests + e2e)
-/code-review                                             # review-only mode (quick tier up to 250 changed lines)
-/code-review --staged                                    # review only currently staged files
-/code-review --paths src/api/                            # review only changed files under src/api/
-/code-review --fix                                       # review, fix confirmed bugs, re-review
+craftsman status                       # deep flag, round, coverage, findings and verdicts, latest runs, agent usage
+craftsman review show --hunks          # the hunks still to cover (H# -> file:lines)
+craftsman review scout H3              # base version, callers and tests of a hunk (or path:line, or a symbol)
+craftsman review report                # the final report, with agent usage per role
+craftsman skill show craft-review --lenses trust,state   # lens playbooks
 ```
 
 ---
 
-## CLI Inspection
+## Optional Flags (Reference)
 
-Inspect the active session and review ledger directly:
+Flags are shortcuts that agents use and that power users may type. None is required; the plain
+words above do the same.
 
-```bash
-craftsman status                                         # gear, round, missing evidence, active gate
-craftsman review show --hunks                            # compact H# -> file:lines map for verifiers
-craftsman review view --lenses intent,contracts          # bounded reviewer packet view
-craftsman review view --shard 1/2                        # file-disjoint shard view for parallel reviewers
-craftsman review report                                  # final markdown report
-craftsman skill show code-review --lenses trust,state    # view specific lens playbooks
-```
-
----
-
-## Review-Only Mode & Frozen Scope
-
-In standalone review-only mode (`/code-review` without an active `/craftsman` gate session):
-1. **Scope freezing**: The first round (`review prepare`, optionally with `--staged`, `--tracked`, or `--paths <csv>`) freezes the list of changed files in `Round.scope` (including both old and new paths of renamed files).
-2. **Ignoring out-of-scope files**: Files created or modified outside the frozen scope (e.g. by concurrent processes or temporary scripts) are reported as `Ignored (outside the review scope): ...` and do not invalidate the active round.
-3. **Scope expansion**: In `--fix` mode, if addressing a bug requires modifying or adding files (such as a new regression test), `craftsman review prepare --add-paths <csv>` extends the frozen scope monotonically.
-4. **Adding lenses**: Reviewers can dynamically escalate review rigor by adding custom lenses:
-   ```bash
-   craftsman review prepare --add-lens "trust=deploy.sh:14 pipes installer into sh"
-   ```
-   An added lens remains required across all subsequent rounds and cannot be removed.
-5. **Partial reports**: If a reviewer subagent encounters timeouts or rate limits after a sequential retry, the review can complete partially with:
-   ```bash
-   craftsman review report --review-only --partial
-   ```
-   This generates a `PARTIAL (review-only, N open items)` report with unreviewed areas clearly itemized under `## Not covered`.
-
----
-
-## Archive Management
-
-Review packets, views, and ledger snapshots are maintained in `.git/craftsman/`:
-- **Pruning rule**: Archives are pruned when a new one is created. Superseded packet views and older packets are cleaned up during `craftsman review prepare`.
-- **Retention limit**: Archival snapshots (`archive-*` directories and `ledger-*.json`) retain the newest entries defined by `CRAFTSMAN_KEEP_ARCHIVES` (default `5`).
-- **Review reset**: Run `craftsman review reset` to cleanly archive the current ledger and packets before starting an independent review session.
-
----
-
-## Initial Commit Review
-
-Craftsman supports reviewing repositories before the first Git commit. When no prior commits exist, the empty tree hash is automatically used as the base commit, enabling full review and verification of initial project bootstraps.
+| Flag | Where | Effect |
+| :--- | :--- | :--- |
+| `--deep` | `/craftsman`, `/craft-review`, `gate --init`, `review prepare` | Starts or raises the review to deep. Inside a gate session it raises the gate for good; nothing lowers it. |
+| `--base <ref>` | `/craft-review`, `review prepare` | Review against this ref instead of the default base. |
+| `--staged` / `--tracked` / `--paths <csv>` | `/craft-review`, `review prepare` | Freeze the review-only scope to the index, to tracked changes, or to these files and directories. |
+| `--add-paths <csv>` | `review prepare` | Extend a frozen scope, for example with a new regression test. |
+| `--fix` | `/craft-review` | Fix confirmed findings, re-check the fix delta, and run the tests. |
+| `--comment` | `/craft-review` | Post the report on the PR with `gh pr comment`. |
+| `--partial` | `review report --review-only` | Report a review that stayed incomplete after retries. |
+| `--takeover` | `gate --init` | Take over a gate opened by another session. |

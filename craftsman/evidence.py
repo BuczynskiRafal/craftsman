@@ -24,7 +24,6 @@ from craftsman.diffscan import DiffSnapshot
 from craftsman.files import replace_with_retry
 from craftsman.gatecheck import GatePolicy, GateReport, evaluate
 from craftsman.ledger import ledger_path_for, load, locked
-from craftsman.lenses import Tier, strictest_tier
 from craftsman.records import IsolationEvidence, Ledger, LedgerError
 
 PACKET_GLOB = "packet-*.md"
@@ -50,39 +49,35 @@ ArchiveStampKey = tuple[str, int]
 
 @dataclass(frozen=True)
 class Evaluation:
-    """The gate's verdict on a work tree: its diff, its ledger, and the tier the gate applied."""
+    """The gate's verdict on a work tree: its diff, its ledger, and whether it applied `deep`."""
 
     snap: DiffSnapshot
     ledger: Ledger
-    tier: Tier
+    deep: bool
     report: GateReport
 
 
 def evaluate_evidence(
-    root: Path, snap: DiffSnapshot, tier: Tier, isolation: IsolationEvidence
+    root: Path, snap: DiffSnapshot, deep: bool, isolation: IsolationEvidence
 ) -> Evaluation:
     """Evaluate the ledger of the work tree `root` against its diff `snap`.
 
-    The gate applies `tier` or, when the latest round was prepared for a stricter tier, that one:
-    a review that chose to go deeper is held to it.
+    The gate is deep when `deep` or when the latest round was prepared deep: a review that chose
+    to go deeper is held to it.
     """
     ledger = load(ledger_path_for(root))
-    strictest = effective_tier(ledger, tier)
-    report = evaluate(ledger, snap, GatePolicy(tier=strictest, isolation_evidence=isolation))
-    return Evaluation(snap, ledger, strictest, report)
+    effective = effective_deep(ledger, deep)
+    report = evaluate(ledger, snap, GatePolicy(deep=effective, isolation_evidence=isolation))
+    return Evaluation(snap, ledger, effective, report)
 
 
-def effective_tier(ledger: Ledger, tier: Tier, *others: Tier) -> Tier:
-    """The strictest of the given tiers and the tier of the latest review round."""
-    return strictest_tier(tier, *others, *(round_.tier for round_ in ledger.rounds[-1:]))
+def effective_deep(ledger: Ledger, *requested: bool) -> bool:
+    """Whether any of `requested` or the latest review round is deep."""
+    return any(requested) or any(round_.deep for round_ in ledger.rounds[-1:])
 
 
 def packet_path(ledger_path: Path, round_number: int) -> Path:
     return ledger_path.parent / f"packet-{round_number}.md"
-
-
-def inbox_dir_for(craftsman_dir: Path) -> Path:
-    return craftsman_dir / INBOX_DIRNAME
 
 
 def _has_link_reparse_tag(st: os.stat_result) -> bool:

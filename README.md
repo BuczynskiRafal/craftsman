@@ -1,74 +1,24 @@
 # Craftsman
 
 [![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-4.1.0-emerald.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/plugin.json)
+[![Version](https://img.shields.io/badge/version-5.0.0-emerald.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/plugin.json)
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE)
 
-Craftsman adds a layer to an AI coding agent that checks the quality and simplicity of the code it
-delivers. The agent cannot finish its work until an independent reviewer has examined the change.
-Craftsman enforces a review loop in which every reported defect is verified and resolved, and at the
-end the tests must pass on the final version of the code.
+Craftsman makes an AI coding agent prove its change was reviewed and tested. The idea is **build
+freely, review hard**: while building, the agent works without review loops or ceremony. When it
+finishes, the final diff is frozen and attacked by fresh-context hunter subagents that did not write
+the code, independent verifiers try to disprove every finding, and the hunt continues while it keeps
+turning up real defects. The agent cannot finish until the tests pass on the final code.
 
-Craftsman keeps a ledger in the `.git` directory, where it collects evidence from review,
-verification, and tests. When the agent tries to finish, a platform hook checks the ledger and, if
-anything is missing, sends the agent back with a list of what is missing.
+Craftsman keeps a ledger in the `.git` directory with the evidence: which hunks the hunters covered,
+what each finding was judged to be and why, and the test runs. A platform hook checks the ledger when
+the agent tries to stop and sends it back with a list of what is missing. The gate checks outcomes,
+not effort.
 
 It works with Claude Code, GitHub Copilot, and Google Antigravity. In Codex and Cursor, the same
 protocol runs without hooks.
-
-## How It Works
-
-![Craftsman engineering loop](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
-
-1. `/craftsman <task>` records the base commit that the diff is computed from.
-2. The agent implements the change and cleans it up with `/simplify`.
-3. Craftsman splits the diff into hunks and attaches to each one the context the diff does not show:
-   the rest of the function, its call sites, and risk signals. Defects usually sit where the change
-   meets that code.
-4. Reviewer subagents that did not write the change examine every hunk through several lenses (for
-   example contracts, error handling, tests, security) and record suspected defects.
-5. A separate verifier tries to disprove or reproduce each suspected defect. Searching and judging
-   are kept apart so that the reviewer does not drop leads too early.
-6. The agent fixes confirmed defects. Every piece of evidence in the ledger is tied to a diff
-   fingerprint, so a code change invalidates the old review; the next round covers only the changed
-   parts.
-7. The agent runs the tests through `craftsman run`, which records the exit code.
-8. The stop hook lets the agent finish once the ledger is complete for the current version of the
-   code. The agent prints a report: what was reviewed, what was found, what was fixed, what was
-   dismissed, and what the gate did not assess.
-
-The level of rigor depends on the gear: `quick` for small changes (review in the current context),
-`standard` by default (subagents and a verifier), `deep` for risky changes (all lenses, tests, and
-e2e).
-
-`/code-review` runs only the review of an existing change, without fixes.
-
-## Platforms
-
-| Platform | What blocks completion |
-| :--- | :--- |
-| Claude Code | `Stop` hook |
-| GitHub Copilot in VS Code | `Stop` hook |
-| GitHub Copilot CLI | `agentStop` hook |
-| Google Antigravity | `Stop` hook |
-| Codex, Cursor, and other tools that read `AGENTS.md` | `craftsman gate --complete` |
-
-Where the platform cannot confirm that a separate subagent performed the review, the report marks it
-as `SELF-REVIEWED`.
-
-## Measurements
-
-Pilot on [SWR-Bench](https://doi.org/10.1145/3808144): 5 PRs from `pytest`, `flask`, and `requests`,
-9 confirmed defects, 1 repetition per configuration. The sample is too small for statistical
-conclusions. Details and Claude Code runs: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
-
-| Configuration | Defects: without → with Craftsman | Avg. time per PR |
-| :--- | :---: | :---: |
-| Antigravity · Gemini 4 Argon `low` | 2/9 → 4/9 | 1.5 → 4.7 min |
-| Antigravity · Gemini 4 Argon `medium` | 2/9 → 5/9 | 2.0 → 6.7 min |
-| Antigravity · Gemini 4 Argon `high` | 3/9 → 7/9 | 15.6 → 26.3 min |
 
 ## Installation
 
@@ -89,19 +39,79 @@ agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
 
 ## Usage
 
+Type a request in plain words. There are no flags to remember.
+
 ```
 /craftsman add pagination to the catalog search
-/craftsman --deep migrate the session store to Redis
-/code-review
+/craftsman migrate the session store to Redis, this is critical
+/craft-review review my staged changes and fix what you find
+/craft-review review PR 42
+/craft-review be thorough, this touches authentication
 ```
 
-`craftsman status` shows the current gear, round, and missing evidence.
+The agent works out the target (working tree, staged changes, a branch, a PR), whether to fix what it
+finds, and how deep to go. It goes deep on its own for risky changes or when you ask for care
+("critical", "be thorough", `ultracraft`); the list of triggers is under **Depth** in the
+[`craft-review` skill](https://github.com/BuczynskiRafal/craftsman/blob/main/skills/craft-review/SKILL.md).
+Depth never goes down during a session. The final report explains what the agent decided and why. See
+[docs/usage.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md).
+
+`craftsman status` shows the current round, coverage, and missing evidence.
+
+## How It Works
+
+![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
+
+```text
+/craftsman <task>  ->  build freely  ->  review prepare (freeze the diff, risk map)
+  ->  hunters (fresh context, parallel)  ->  verifiers try to disprove every finding
+  ->  another wave while it finds real defects  ->  fix, confirm, re-check the fix delta
+  ->  craftsman run (tests on the final code)  ->  stop hook lets the agent finish  ->  report
+```
+
+The agent builds with no gate activity. Then the diff is frozen into a round, fresh-context hunters
+record every candidate defect with a concrete trigger, and separate verifiers try to disprove each one
+and reproduce the survivors. Hunters maximize recall; verifiers maximize precision. While a wave
+proves a defect, another one runs. Confirmed defects are fixed at the root cause, the fix delta is
+re-checked by a fresh hunter, and the tests run through `craftsman run` on the final code.
+`/craft-review` runs the same hunt on an existing change, and fixes only when you ask.
+
+The full protocol, with diagrams, is in
+[docs/how-it-works.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md).
+
+## Platforms
+
+| Platform | What blocks completion |
+| :--- | :--- |
+| Claude Code | `Stop` hook |
+| GitHub Copilot in VS Code | `Stop` hook |
+| GitHub Copilot CLI | `agentStop` hook |
+| Google Antigravity | `Stop` hook |
+| Codex, Cursor, and other tools that read `AGENTS.md` | `craftsman gate --complete` |
+
+Where the platform cannot confirm that a separate subagent performed the review, the gate still
+closes and the report marks it as `SELF-REVIEWED`.
+
+## Measurements
+
+Pilot on [SWR-Bench](https://doi.org/10.1145/3808144): 5 PRs from `pytest`, `flask`, and `requests`,
+9 confirmed defects, 1 repetition per configuration. The sample is too small for statistical
+conclusions. Details and Claude Code runs: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
+These numbers were measured on an earlier protocol. The repository also ships a public seeded-defect
+suite, [`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md), to measure
+recall on any agent platform.
+
+| Configuration | Defects: without → with Craftsman | Avg. time per PR |
+| :--- | :---: | :---: |
+| Antigravity · Gemini 4 Argon `low` | 2/9 → 4/9 | 1.5 → 4.7 min |
+| Antigravity · Gemini 4 Argon `medium` | 2/9 → 5/9 | 2.0 → 6.7 min |
+| Antigravity · Gemini 4 Argon `high` | 3/9 → 7/9 | 15.6 → 26.3 min |
 
 ## Documentation
 
-- [How it works](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md): ledger, lenses, gears, platform enforcement
+- [Usage](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md): example requests, what the agent decides, optional flags
+- [How it works](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md): the protocol in full, what hunters read, ledger, gate, lenses, platform enforcement
 - [Installation](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md): flags, platform setup, uninstall, `craftsman doctor`
-- [Usage](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md): commands, review-only mode
 - [Guards](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/guards.md): gate state machine, search scope guard
 - [Skills](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md): catalog of bundled skills
 - [Benchmark](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md): methodology, results, replication

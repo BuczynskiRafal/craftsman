@@ -2,14 +2,98 @@
 
 from __future__ import annotations
 
+import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 from craftsman.diffscan import DiffSnapshot, resolve_base_sha, snapshot, worktree_root
-from craftsman.gate import GateState, load_state, state_path_for
-from craftsman.ledger import ledger_path_for, load
-from craftsman.records import IsolationEvidence, Ledger
+from craftsman.files import write_text_atomic
+from craftsman.gate import GateOwner, GateState, cli_caller, load_state, state_path_for
+from craftsman.ledger import ledger_path_for, load, stable_hunk_ids
+from craftsman.records import IsolationEvidence, Ledger, format_timestamp, parse_timestamp
+
+HOOKS_MARKER = "review_hooks.json"
+
+
+@dataclass(frozen=True)
+class ReviewMarker:
+    """What the prompt hook noted about a session that invoked the review command.
+
+    A review-only run has no gate state to say that hooks serve its session; this file does. While
+    `guarding`, the Stop hook keeps the session working until the review-only outcome exists;
+    `forced` and `best` count those reminders like the gate's continuations.
+    """
+
+    platform: str
+    session_id: str
+    at: str
+    guarding: bool = True
+    forced: int = 0
+    best: int | None = None
+    touched_at: str | None = None  # when `review prepare` last ran for this review, changed or not
+
+    def is_of(self, caller: GateOwner) -> bool:
+        return self.platform == caller.platform and self.session_id == caller.session_id
+
+
+def read_marker(ledger_path: Path) -> ReviewMarker | None:
+    try:
+        raw = json.loads((ledger_path.parent / HOOKS_MARKER).read_text(encoding="utf-8"))
+        best = raw.get("best")
+        return ReviewMarker(
+            str(raw["platform"]),
+            str(raw["session_id"]),
+            str(raw["at"]),
+            guarding=raw.get("guarding") is True,
+            forced=int(raw.get("forced", 0)),
+            best=best if isinstance(best, int) else None,
+            touched_at=str(raw["touched_at"]) if raw.get("touched_at") else None,
+        )
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def write_marker(ledger_path: Path, marker: ReviewMarker) -> None:
+    try:
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(ledger_path.parent / HOOKS_MARKER, json.dumps(asdict(marker)) + "\n")
+    except OSError:
+        pass  # without the marker a review-only run is only advisory about isolation
+
+
+def mark_hooks_active(ledger_path: Path, caller: GateOwner) -> None:
+    """Note that the prompt hook saw `caller`'s session invoke the review command."""
+    if caller.session_id is None:
+        return
+    now = format_timestamp(datetime.now(timezone.utc))
+    write_marker(ledger_path, ReviewMarker(caller.platform, caller.session_id, now))
+
+
+def cli_visible(caller: GateOwner) -> GateOwner:
+    """`caller` as a `craftsman` command run by that session sees it.
+
+    Only Claude Code exports its session id to the commands it runs; on other platforms a command
+    cannot tell which session it serves.
+    """
+    return caller if caller.platform == "claude" else GateOwner(caller.platform, None)
+
+
+def touch_review(ledger_path: Path) -> None:
+    """Note that `review prepare` ran for the guarded review: re-preparing an unchanged diff, or
+    raising its depth, leaves the round as it was but is still the agent doing its part."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding:
+        now = format_timestamp(datetime.now(timezone.utc))
+        write_marker(ledger_path, replace(marker, touched_at=now))
+
+
+def end_review_guard(ledger_path: Path, caller: GateOwner | None = None) -> None:
+    """Stop holding the session (of `caller`, if given) to a finished or abandoned review."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding and (caller is None or marker.is_of(caller)):
+        write_marker(ledger_path, replace(marker, guarding=False, forced=0, best=None))
 
 
 @dataclass(frozen=True)
@@ -24,9 +108,30 @@ class Workspace:
     def task(self) -> str:
         return self.state.task if self.state is not None else ""
 
-    @property
-    def isolation_evidence(self) -> IsolationEvidence:
-        return self.state.isolation_evidence if self.state is not None else "none"
+    def isolation_evidence(self, ledger: Ledger, caller: GateOwner | None = None) -> IsolationEvidence:
+        """Where proof of an isolated reviewer can come from for this review.
+
+        A gate knows what its platform proved. Without a gate (review-only), hooks serve this review
+        when the prompt hook saw `caller` (default: the session this command runs in) invoke the
+        review command, or when a subagent event arrived after the current round was prepared. An
+        event of an earlier session or platform proves nothing about this one.
+        """
+        if self.state is not None:
+            return self.state.required_isolation
+        if self._hooks_saw(caller or cli_caller(None, os.environ)) or self._agent_event_since_round(ledger):
+            return "hooks"
+        return "none"
+
+    def _hooks_saw(self, caller: GateOwner) -> bool:
+        marker = read_marker(self.ledger_path)
+        return marker is not None and caller.session_id is not None and marker.is_of(caller)
+
+    @staticmethod
+    def _agent_event_since_round(ledger: Ledger) -> bool:
+        if not ledger.rounds:
+            return False
+        prepared = parse_timestamp(ledger.rounds[-1].prepared_at)
+        return any(parse_timestamp(event.at) >= prepared for event in ledger.agents)
 
     def base_sha(self, ledger: Ledger, explicit: str | None = None) -> str:
         """`explicit`, else the latest round's base, else the active task's base, else HEAD."""
@@ -38,7 +143,7 @@ class Workspace:
         """The diff since the base the review (or else the active task) is measured against."""
         current = load(self.ledger_path) if ledger is None else ledger
         scope = None if self.state is not None else current.current_scope
-        return snapshot(self.root, self.base_sha(current), scope)
+        return stable_hunk_ids(current, snapshot(self.root, self.base_sha(current), scope))
 
 
 def open_workspace(cwd: str | None) -> Workspace:

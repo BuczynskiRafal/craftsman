@@ -2,36 +2,35 @@
 
 from __future__ import annotations
 
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
-from dataclasses import replace
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from craftsman import ledger as ledger_module
 from craftsman.ledger import (
-    COVERAGE_NOTE_EXAMPLE,
-    ack_signal,
     add_coverage,
-    add_fact,
-    add_multi_coverage,
-    coverage_units_for_targets,
-    file_sha256,
+    covered_digests,
     ledger_path_for,
     load,
     locked,
     merge_findings,
     mutate,
+    plan_coverage,
     reopened_mentions,
     resolve,
     save,
     set_verdict,
-    uncovered_by_lens,
-    valid_facts_for_hunk,
+    stable_hunk_ids,
+    uncovered_hunks,
     waive_run,
 )
 from craftsman.records import (
@@ -43,22 +42,18 @@ from craftsman.records import (
     LedgerError,
     QualitySignal,
     SignalKind,
-    SourceRef,
 )
 
 from tests.support import (
     EvidenceRepo,
     cover_open_hunks,
     coverage_note,
-    coverage_record,
     fully_reviewed,
     make_hunk,
     make_snap,
     prepared,
     record_finding,
     record_run,
-    shifted,
-    swept,
     two_hunks,
 )
 
@@ -66,9 +61,6 @@ EVIDENCE = "Reproduced via tests/test_app.py::test_empty (fails before fix)."
 PROBABLE = "no-repro: needs a live database; app.py:3 divides by len(items) == 0"
 DISMISSED = "guarded by app.py:2, which returns 0 for an empty list"
 LONG_FUNCTION = QualitySignal("S1", SignalKind.LONG_FUNCTION, "a.py", 1, "`f` spans 50 lines")
-TEST_NAME = QualitySignal("S2", SignalKind.TEST_NAME, "t.py", 3, "`test_x_and_y` contains `_and_`")
-DIFF_SIZE = QualitySignal("S3", SignalKind.DIFF_SIZE, "a.py", 1, "+900 production lines added")
-CONCRETE_REASON = "`f` in a.py:1 is a flat table of 50 literal cases"
 
 
 class OpenRoundTests(unittest.TestCase):
@@ -86,29 +78,31 @@ class OpenRoundTests(unittest.TestCase):
         self.assertIs(again, ledger)
         self.assertEqual(same, first)
 
-    def test_a_stricter_tier_opens_a_new_round_for_the_same_diff(self) -> None:
+    def test_asking_for_deep_raises_the_round_of_an_unchanged_diff_in_place(self) -> None:
         snap = make_snap(make_hunk("H1"))
         ledger, _ = prepared(snap)
+        ledger = cover_open_hunks(ledger)
 
-        _, second = prepared(snap, tier="deep", ledger=ledger)
+        raised, round_ = prepared(snap, deep=True, ledger=ledger)
 
-        self.assertEqual(second.number, 2)
+        self.assertEqual((round_.number, round_.deep, len(raised.rounds)), (1, True, 1))
+        self.assertEqual(raised.coverage, ledger.coverage)
+        self.assertEqual(prepared(snap, deep=False, ledger=raised)[1], round_)
 
     def test_a_changed_base_requires_a_reset(self) -> None:
         ledger, _ = prepared(make_snap(make_hunk("H1")))
         with self.assertRaisesRegex(LedgerError, "craftsman review reset"):
             prepared(make_snap(make_hunk("H1"), base="c" * 40, fingerprint="fp2"), ledger=ledger)
 
-    def test_hunks_fully_covered_earlier_are_carried(self) -> None:
+    def test_hunks_covered_earlier_are_carried(self) -> None:
         h1, h2 = make_hunk("H1", "a.py"), make_hunk("H2", "b.py")
         ledger, _ = prepared(make_snap(h1, h2))
-        ledger, _ = add_coverage(ledger, "intent", ["H1", "H2"], coverage_note(["H1", "H2"]))
-        ledger, _ = add_coverage(ledger, "craft", ["H1"], coverage_note(["H1"]))
+        ledger, _ = add_coverage(ledger, ["H1", "H2"], coverage_note(["H1", "H2"]))
 
         h3 = make_hunk("H3", "c.py")
         _, round_ = prepared(make_snap(h1, h2, h3, fingerprint="fp2"), ledger=ledger)
 
-        self.assertEqual([hunk.carried for hunk in round_.hunks], [True, False, False])
+        self.assertEqual([hunk.carried for hunk in round_.hunks], [True, True, False])
 
     def test_carried_hunk_is_reopened_when_it_mentions_a_changed_symbol(self) -> None:
         caller = make_hunk("H1", "a.py", (" total = compute_total(x)", "+y = 1"))
@@ -159,10 +153,6 @@ class OpenRoundTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "H9"):
             prepared(make_snap(make_hunk("H1")), symbols={"H9": ["x"]})
 
-    def test_unknown_lens_is_rejected(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "lenses must be one of"):
-            prepared(make_snap(make_hunk("H1")), lenses=("intent", "security"))
-
 
 class ReopenedMentionsTests(unittest.TestCase):
     def test_mentions_name_the_symbol_with_its_defining_hunk(self) -> None:
@@ -181,172 +171,130 @@ class ReopenedMentionsTests(unittest.TestCase):
 class CoverageTests(unittest.TestCase):
     def setUp(self) -> None:
         hunks = [make_hunk(f"H{index}", f"f{index}.py") for index in range(1, 11)]
-        self.ledger, self.round = prepared(make_snap(*hunks), lenses=("intent", "craft"))
+        self.ledger, self.round = prepared(make_snap(*hunks))
 
     def test_records_digests_against_the_latest_round(self) -> None:
         note = coverage_note(["H2", "H1"])
-        ledger, record = add_coverage(self.ledger, "intent", ["H2", "H1"], f"  {note}  ")
+        ledger, record = add_coverage(self.ledger, ["H2", "H1"], f"  {note}  ")
 
         self.assertEqual(record.round, 1)
         self.assertEqual(record.digests, (self.round.hunks[1].digest, self.round.hunks[0].digest))
         self.assertEqual(record.note, note)
         self.assertEqual(ledger.coverage, (record,))
 
-    def test_rejections_explain_what_is_valid(self) -> None:
-        five = ["H1", "H2", "H3", "H4", "H5"]
-        cases = [
-            ("security", ["H1"], coverage_note(["H1"]), "unknown lens 'security'; valid lenses:"),
-            ("trust", ["H1"], coverage_note(["H1"]), "not selected in round 1; selected lenses:"),
-            ("intent", [], "", "cover 1..4 hunks per call"),
-            ("intent", five, coverage_note(five), "got 5"),
-            ("intent", ["H1", "H1"], coverage_note(["H1"]), "hunks must not repeat"),
-            ("intent", ["H42"], coverage_note(["H42"]), "unknown hunk ids in round 1: H42"),
-            ("intent", ["H1", "H2"], coverage_note(["H1", "H12"]), "missing: H2"),
-        ]
-        for lens, ids, note, message in cases:
-            with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
-                add_coverage(self.ledger, lens, ids, note)
+    def test_there_is_no_batch_size_limit(self) -> None:
+        ids = [f"H{index}" for index in range(1, 11)]
 
-    def test_note_rejection_stores_example_separately(self) -> None:
-        with self.assertRaises(FieldError) as caught:
-            add_coverage(self.ledger, "intent", ["H1", "H2"], coverage_note(["H1", "H12"]))
+        ledger, record = add_coverage(self.ledger, ids, "walked every hunk of the slice end to end")
 
-        self.assertEqual(caught.exception.field, "note")
-        self.assertEqual(caught.exception.example, COVERAGE_NOTE_EXAMPLE)
-        self.assertNotIn("Example:", str(caught.exception))
+        self.assertEqual(len(record.digests), 10)
+        self.assertEqual(uncovered_hunks(ledger, ledger.rounds[-1]), [])
 
-    def test_note_reports_every_bad_target_in_one_pass(self) -> None:
-        vague = "H3 examined every branch across the whole implementation without finding flaws"
-        note = f"H1 short; {vague}"
-
-        with self.assertRaises(FieldError) as caught:
-            add_coverage(self.ledger, "intent", ["H1", "H2", "H3", "H4"], note)
-
-        exc = caught.exception
-        self.assertEqual(exc.field, "note")
-        self.assertEqual(exc.example, COVERAGE_NOTE_EXAMPLE)
-        self.assertNotIn("Example:", str(exc))
-        self.assertEqual(
-            exc.problem,
-            "must name every covered hunk and what was tried on it; missing: H2, H4; "
-            "needs at least 40 characters per hunk or file, 20 of them beyond generic praise; "
-            "too little concrete detail: H1; "
-            "must include a concrete detail (file:line, number/literal, ->, or symbol name): H3",
+    def test_files_cover_every_open_hunk_of_those_files(self) -> None:
+        snap = make_snap(
+            make_hunk("H1", "a.py"), make_hunk("H2", "a.py", ("+y = 2",), new_start=9), make_hunk("H3", "b.py")
         )
+        ledger, round_ = prepared(snap)
+        open_ids, carried = plan_coverage(round_, ["a.py"], target_kind="files")
 
-    def test_field_error_within_preserves_example(self) -> None:
-        nested = FieldError("note", "too short", example=COVERAGE_NOTE_EXAMPLE).within("entries[0]")
+        ledger, record = add_coverage(ledger, open_ids, "read a.py and its callers")
 
-        self.assertEqual(nested.field, "entries[0].note")
-        self.assertEqual(nested.example, COVERAGE_NOTE_EXAMPLE)
+        self.assertEqual((open_ids, carried), (("H1", "H2"), ()))
+        self.assertEqual(len(record.digests), 2)
+        self.assertEqual(uncovered_hunks(ledger, ledger.rounds[-1]), ["H3"])
+
+    def test_rejections_explain_what_is_valid(self) -> None:
+        note = "examined the slice and tried None"
+        cases = [
+            ([], note, "name at least one of the hunks to cover"),
+            (["H42"], note, "not an open hunk of round 1: H42"),
+            (["H1"], "too short", "note must have at least 20 characters"),
+        ]
+        for ids, text, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
+                add_coverage(self.ledger, ids, text)
+        for targets, kind, message in (
+            (["H42"], "hunks", "unknown hunk ids in round 1: H42"),
+            (["nope.py"], "files", "unknown files in round 1: nope.py; changed files: f1.py"),
+            ([], "hunks", "name at least one of the hunks to cover"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
+                plan_coverage(self.round, targets, target_kind=kind)  # type: ignore[arg-type]
+
+    def test_repeated_targets_are_recorded_once(self) -> None:
+        _, record = add_coverage(self.ledger, ["H1", "H1"], coverage_note(["H1"]))
+
+        self.assertEqual(len(record.digests), 1)
 
     def test_batch_rejected_tracks_entry_problems(self) -> None:
         with self.assertRaises(ValueError):
             BatchRejected("cover", (), 1)
 
-        problem = EntryProblem(2, "intent", "note", "missing: H2", example=COVERAGE_NOTE_EXAMPLE)
+        problem = EntryProblem(2, "H2", "note", "must have at least 20 characters")
         single = BatchRejected("cover", (problem,), 1)
         self.assertEqual(str(single), "cover: 1 of 1 entry rejected; nothing was recorded.")
         plural = BatchRejected("cover", (problem,), 3)
         self.assertEqual(str(plural), "cover: 1 of 3 entries rejected; nothing was recorded.")
         self.assertEqual((plural.command, plural.problems, plural.total), ("cover", (problem,), 3))
 
-    def test_note_may_follow_a_hunk_id_with_an_arrow(self) -> None:
-        note = "H1->L42 total([]) raises ZeroDivisionError at cart.py:9 for an empty cart"
-
-        _, record = add_coverage(self.ledger, "intent", ["H1"], note)
-
-        self.assertEqual(record.note, note)
-
-    def test_short_note_names_the_per_hunk_minimum(self) -> None:
-        with self.assertRaises(FieldError) as caught:
-            add_coverage(self.ledger, "intent", ["H1"], "H1 looked at it")
-
-        self.assertIn("needs at least 40 characters per hunk or file, 20 of them", str(caught.exception))
-
-    def test_note_of_praise_needs_a_concrete_detail(self) -> None:
-        note = "H1 looks good, clean, readable and consistent; reviewed and checked"
-
-        with self.assertRaisesRegex(FieldError, "too little concrete detail"):
-            add_coverage(self.ledger, "intent", ["H1"], note)
-
-    def test_one_note_segment_may_not_describe_more_than_three_hunks(self) -> None:
-        ledger = self.ledger
-        segment = "parse_cfg: x=None -> L42 TypeError; callers cli.py:19 ok"
-        ledger, _ = add_coverage(ledger, "intent", ["H1", "H2"], f"H1 {segment} H2 {segment}")
-
-        with self.assertRaisesRegex(FieldError, "reuses the same note segment"):
-            add_coverage(ledger, "intent", ["H3", "H4"], f"H3 {segment} H4 {segment}")
-
     def test_requires_a_round(self) -> None:
         with self.assertRaisesRegex(LedgerError, "craftsman review prepare"):
-            add_coverage(Ledger(), "intent", ["H1"], coverage_note(["H1"]))
+            add_coverage(Ledger(), ["H1"], coverage_note(["H1"]))
 
     def test_carried_hunks_cannot_be_covered_again(self) -> None:
-        ledger = self.ledger
-        for lens in ("intent", "craft"):
-            ledger, _ = add_coverage(ledger, lens, ["H1"], coverage_note(["H1"]))
+        ledger, _ = add_coverage(self.ledger, ["H1"], coverage_note(["H1"]))
         snap = make_snap(
             *(make_hunk(f"H{index}", f"f{index}.py") for index in range(1, 11)), fingerprint="fp2"
         )
         ledger, _ = prepared(snap, ledger=ledger)
 
-        with self.assertRaisesRegex(LedgerError, "H1 already covered in an earlier round"):
-            add_coverage(ledger, "intent", ["H1"], coverage_note(["H1"]))
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(ledger, ["H1"], coverage_note(["H1"]))
+        self.assertEqual(plan_coverage(ledger.rounds[-1], ["f1.py"], target_kind="files"), ((), ("H1",)))
 
 
-class DesignCoverageTests(unittest.TestCase):
-    def setUp(self) -> None:
-        snap = make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "a.py", ("+y = 2",), new_start=9))
-        self.ledger, _ = prepared(snap, lenses=("intent", "design"), tier="standard")
-
-    def test_design_lens_covers_a_changed_file(self) -> None:
-        ledger, record = add_coverage(
-            self.ledger, "design", ["a.py"], "a.py total(): 2 branches -> L9 returns 0 for an empty cart"
+class StableHunkIdTests(unittest.TestCase):
+    def test_an_unchanged_hunk_keeps_its_id_and_a_new_one_never_reuses_an_old_id(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))
+        rewritten = make_snap(
+            make_hunk("H1", "b.py"), make_hunk("H2", "c.py", ("+z = 3",)), fingerprint="fp2"
         )
 
-        self.assertEqual(uncovered_by_lens(ledger, ledger.rounds[-1])["design"], [])
-        self.assertEqual(len(record.digests), 1)
+        stable = stable_hunk_ids(ledger, rewritten)
 
-    def test_design_lens_rejects_hunk_ids(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "unknown files in round 1: H1; files to cover: a.py"):
-            add_coverage(self.ledger, "design", ["H1"], "H1 total(): 2 branches -> L9 returns 0")
+        self.assertEqual([(h.path, h.id) for h in stable.hunks], [("b.py", "H2"), ("c.py", "H3")])
 
-    def test_design_lens_rejects_a_repeated_file(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "files must not repeat: a.py, a.py"):
-            add_coverage(self.ledger, "design", ["a.py", "a.py"], "x")
+    def test_a_first_round_is_numbered_in_order(self) -> None:
+        snap = make_snap(make_hunk("H7", "a.py"), make_hunk("H8", "b.py"))
 
-    def test_note_naming_a_longer_path_does_not_cover_the_file(self) -> None:
-        note = "src/a.py total(): 2 branches -> L9 returns 0 for an empty cart"
+        self.assertEqual([h.id for h in stable_hunk_ids(Ledger(), snap).hunks], ["H1", "H2"])
 
-        with self.assertRaisesRegex(LedgerError, "missing: a.py"):
-            add_coverage(self.ledger, "design", ["a.py"], note)
+    def test_plan_coverage_splits_open_and_carried_hunks(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))
+        ledger = cover_open_hunks(ledger)
+        ledger, round_ = prepared(
+            make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py", ("+y",)), fingerprint="fp2"),
+            ledger=ledger,
+        )
 
-    def test_design_count_error_names_files(self) -> None:
-        targets = ["a.py", "b.py", "c.py", "d.py", "e.py"]
-
-        with self.assertRaises(LedgerError) as caught:
-            add_coverage(self.ledger, "design", targets, "x")
-
-        self.assertEqual(caught.exception.field, "files")
-        self.assertIn("cover 1..4 files per call", str(caught.exception))
+        self.assertEqual(plan_coverage(round_, ["H1", "H2"]), (("H2",), ("H1",)))
+        self.assertEqual(plan_coverage(round_, ["a.py"], target_kind="files"), ((), ("H1",)))
+        with self.assertRaisesRegex(LedgerError, "unknown hunk ids"):
+            plan_coverage(round_, ["H9"])
 
 
 class CoverageAccountingTests(unittest.TestCase):
-    def test_partially_covered_reopened_hunks_need_every_lens_again(self) -> None:
+    def test_reopened_hunks_need_coverage_again(self) -> None:
         caller = make_hunk("H1", "a.py", (" total = compute_total(x)", "+y = 1"))
         definer = make_hunk("H2", "b.py", ("+def compute_total(items):",))
         ledger, _ = prepared(make_snap(caller, definer))
-        ledger, _ = add_coverage(ledger, "intent", ["H1", "H2"], coverage_note(["H1", "H2"]))
-        ledger, _ = add_coverage(ledger, "craft", ["H2"], coverage_note(["H2"]))
+        ledger, _ = add_coverage(ledger, ["H1", "H2"], coverage_note(["H1", "H2"]))
 
         changed = make_hunk("H2", "b.py", ("+def compute_total(items, rate):",))
         snap = make_snap(caller, changed, fingerprint="fp2")
         ledger, round_ = prepared(snap, ledger=ledger, symbols={"H2": ["compute_total"]})
 
-        self.assertEqual(
-            uncovered_by_lens(ledger, round_), {"intent": ["H1", "H2"], "craft": ["H1", "H2"]}
-        )
+        self.assertEqual(uncovered_hunks(ledger, round_), ["H1", "H2"])
 
     def test_a_hunk_reopened_in_an_abandoned_round_keeps_needing_coverage(self) -> None:
         caller = make_hunk("H1", "a.py", (" total = compute_total(x)", "+y = 1"))
@@ -356,106 +304,19 @@ class CoverageAccountingTests(unittest.TestCase):
         ledger, _ = prepared(
             make_snap(caller, changed, fingerprint="fp2"), ledger=ledger, symbols=symbols
         )
-        ledger, _ = add_coverage(ledger, "intent", ["H1"], coverage_note(["H1"]))
 
         snap = make_snap(caller, changed, make_hunk("H3", "c.py"), fingerprint="fp3")
         ledger, round_ = prepared(snap, ledger=ledger, symbols=symbols)
 
         self.assertFalse(round_.hunks[0].reopened)
-        self.assertEqual(uncovered_by_lens(ledger, round_)["craft"], ["H1", "H2", "H3"])
-        self.assertEqual(uncovered_by_lens(ledger, round_)["intent"], ["H2", "H3"])
+        self.assertEqual(uncovered_hunks(ledger, round_), ["H1", "H2", "H3"])
 
-    def test_sweep_cannot_be_recorded_before_the_other_lenses(self) -> None:
-        ledger, _ = prepared(two_hunks(), lenses=("intent", "sweep"), tier="standard")
+    def test_coverage_of_an_earlier_round_counts_for_the_same_digest(self) -> None:
+        ledger, round_ = prepared(two_hunks())
+        ledger = cover_open_hunks(ledger)
 
-        with self.assertRaisesRegex(LedgerError, "still uncovered in round 1: intent H1,H2"):
-            add_coverage(ledger, "sweep", ["H1", "H2"], coverage_note(["H1", "H2"]))
-
-    def test_sweep_marks_uncovered_targets_from_rejected_entries(self) -> None:
-        snap = make_snap(
-            make_hunk("H1", "a.py"), make_hunk("H2", "b.py"), make_hunk("H3", "c.py")
-        )
-        ledger, _ = prepared(snap, lenses=("intent", "contracts", "craft", "sweep"), tier="standard")
-        ledger, _ = add_coverage(ledger, "intent", ["H1"], coverage_note(["H1"]))
-        rejected_by = {
-            ("intent", "H2"): 2,
-            ("intent", "H3"): 2,
-            ("contracts", "H1"): 4,
-            ("contracts", "H3"): 4,
-        }
-
-        with self.assertRaises(LedgerError) as caught:
-            add_multi_coverage(
-                ledger,
-                ("sweep",),
-                ["H1", "H2", "H3"],
-                coverage_note(["H1", "H2", "H3"]),
-                rejected_by=rejected_by,
-            )
-
-        self.assertIn(
-            "still uncovered in round 1: "
-            "intent H2,H3 (depends on entry 2); "
-            "contracts H1,H3 (depends on entry 4); "
-            "contracts H2; "
-            "craft H1,H2,H3. Cover those first",
-            str(caught.exception),
-        )
-
-    def test_coverage_units_map_open_hunks_or_files_best_effort(self) -> None:
-        snap = make_snap(
-            make_hunk("H1", "src/a.py"),
-            make_hunk("H2", "src/a.py", ("+y = 2",), new_start=10),
-            make_hunk("H3", "pkg1/u.py"),
-            make_hunk("H4", "pkg2/u.py"),
-        )
-        _, std_round = prepared(
-            snap, lenses=("intent", "design", "sweep"), tier="standard"
-        )
-        self.assertEqual(
-            coverage_units_for_targets(std_round, ["intent", "sweep", "nope"], ["H1", "H99", "a.py"]),
-            (("intent", "H1"),),
-        )
-        self.assertEqual(
-            coverage_units_for_targets(std_round, ["design"], ["a.py", "u.py", "pkg1/u.py"]),
-            (("design", "src/a.py"), ("design", "pkg1/u.py")),
-        )
-
-        _, quick_round = prepared(
-            snap, lenses=("intent", "contracts", "failure"), tier="quick"
-        )
-        self.assertEqual(
-            coverage_units_for_targets(quick_round, ["intent", "contracts"], ["a.py", "u.py"]),
-            (
-                ("intent", "H1"),
-                ("intent", "H2"),
-                ("contracts", "H1"),
-                ("contracts", "H2"),
-            ),
-        )
-
-    def test_a_tier_upgrade_keeps_lens_coverage_but_needs_a_fresh_sweep(self) -> None:
-        ledger, round_ = prepared(two_hunks(), ("intent", "craft", "sweep"), "deep", swept(two_hunks()))
-
-        self.assertEqual(
-            uncovered_by_lens(ledger, round_),
-            {"intent": [], "craft": ["H1", "H2"], "sweep": ["H1", "H2"]},
-        )
-
-    def test_a_premature_sweep_is_never_carried_into_a_later_round(self) -> None:
-        h1 = two_hunks().hunks[0]
-        ledger, round_ = prepared(make_snap(h1), lenses=("intent", "sweep"), tier="standard")
-        start = round_.prepared_at
-        coverage = (
-            coverage_record(1, "sweep", [h1.digest], shifted(start, 1)),
-            coverage_record(1, "intent", [h1.digest], shifted(start, 2)),
-        )
-
-        _, later = prepared(
-            two_hunks("fp2"), ("intent", "sweep"), "standard", replace(ledger, coverage=coverage)
-        )
-
-        self.assertEqual([hunk.carried for hunk in later.hunks], [False, False])
+        self.assertEqual(uncovered_hunks(ledger, round_), [])
+        self.assertEqual(covered_digests(ledger, 1), {hunk.digest for hunk in round_.hunks})
 
 
 class FindingTests(unittest.TestCase):
@@ -484,15 +345,6 @@ class FindingTests(unittest.TestCase):
         for change, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 record_finding(self.ledger, **change)
-
-    def test_finding_may_resolve_a_signal_of_the_round(self) -> None:
-        ledger = record_finding(self.ledger, signal_id="S1")
-
-        self.assertEqual(ledger.findings[0].signal_id, "S1")
-
-    def test_finding_for_an_unknown_signal_is_rejected(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "unknown quality signal 'S9' in round 1; known: S1"):
-            record_finding(self.ledger, signal_id="S9")
 
     def test_requires_a_round(self) -> None:
         with self.assertRaisesRegex(LedgerError, "craftsman review prepare"):
@@ -647,7 +499,7 @@ class ResolutionTests(unittest.TestCase):
 
 class MergeTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.ledger, _ = prepared(make_snap(make_hunk("H1")), signals=(LONG_FUNCTION, TEST_NAME))
+        self.ledger, _ = prepared(make_snap(make_hunk("H1")), signals=(LONG_FUNCTION,))
 
     def finding(self, ledger: Ledger, scenario: str, **overrides: Any) -> Ledger:
         return record_finding(ledger, scenario=scenario, **overrides)
@@ -683,31 +535,6 @@ class MergeTests(unittest.TestCase):
 
         self.assertEqual(target.scenario.count(shared), 1)
 
-    def test_target_resolves_the_signal_of_a_duplicate(self) -> None:
-        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
-        ledger = self.finding(ledger, "total() mixes parsing and summing.", signal_id="S1")
-
-        _, target, _ = merge_findings(ledger, "F1", ["F2"])
-
-        self.assertEqual(target.signal_id, "S1")
-
-    def test_signal_of_another_round_is_not_merged(self) -> None:
-        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
-        ledger, _ = prepared(
-            make_snap(make_hunk("H1"), fingerprint="fp2"), ledger=ledger, signals=(TEST_NAME,)
-        )
-        ledger = self.finding(ledger, "The test name packs two behaviors.", signal_id="S2")
-
-        with self.assertRaisesRegex(LedgerError, "F2 resolve a quality signal of another round"):
-            merge_findings(ledger, "F1", ["F2"])
-
-    def test_findings_about_different_signals_are_not_merged(self) -> None:
-        ledger = self.finding(self.ledger, "total() mixes parsing and summing.", signal_id="S1")
-        ledger = self.finding(ledger, "The test name packs two behaviors.", signal_id="S2")
-
-        with self.assertRaisesRegex(LedgerError, "different quality signals \\(S1, S2\\)"):
-            merge_findings(ledger, "F1", ["F2"])
-
     def test_judged_findings_are_not_merged(self) -> None:
         ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
         ledger = self.finding(ledger, "An empty cart shows an error page.")
@@ -729,89 +556,6 @@ class MergeTests(unittest.TestCase):
         for target, duplicates, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 merge_findings(ledger, target, duplicates)
-
-
-class SignalAckTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.ledger, _ = prepared(make_snap(make_hunk("H1")), signals=(LONG_FUNCTION, DIFF_SIZE))
-
-    def test_ack_records_the_reason_for_the_round(self) -> None:
-        _, ack = ack_signal(self.ledger, "S1", f"  {CONCRETE_REASON}  ")
-
-        self.assertEqual((ack.signal_id, ack.round, ack.reason), ("S1", 1, CONCRETE_REASON))
-
-    def test_acking_again_replaces_the_earlier_ack(self) -> None:
-        ledger, _ = ack_signal(self.ledger, "S1", CONCRETE_REASON)
-        ledger, _ = ack_signal(ledger, "S1", CONCRETE_REASON + " (see a.py:9)")
-
-        self.assertEqual(len(ledger.signal_acks), 1)
-
-    def test_unknown_signal_is_rejected(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "unknown quality signal 'S9'"):
-            ack_signal(self.ledger, "S9", CONCRETE_REASON)
-
-    def test_diff_size_cannot_be_acknowledged(self) -> None:
-        with self.assertRaisesRegex(LedgerError, "S3 \\(`diff-size`\\) cannot be acknowledged"):
-            ack_signal(self.ledger, "S3", CONCRETE_REASON)
-
-    def test_short_reason_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "reason must have at least 40 characters"):
-            ack_signal(self.ledger, "S1", "a.py:1 is fine")
-
-    def test_reason_without_a_code_detail_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "must include a concrete code detail"):
-            ack_signal(self.ledger, "S1", "this function is long but it is easy to read as it is")
-
-
-class FactTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.ledger, _ = prepared(make_snap(make_hunk("H1"), make_hunk("H2", "b.py")))
-        self.source = SourceRef("app.py", 1)
-        self.text = "total() returns 0 for an empty list at app.py:1"
-
-    def record(self, ledger: Ledger, hunks: list[str], digest: str = "d1") -> Ledger:
-        ledger, _ = add_fact(
-            ledger,
-            hunks=hunks,
-            source=self.source,
-            text=self.text,
-            source_digest=digest,
-            author_lens="contracts",
-        )
-        return ledger
-
-    def test_facts_get_sequential_ids(self) -> None:
-        ledger = self.record(self.record(self.ledger, ["H1"]), ["H2"])
-
-        self.assertEqual([fact.id for fact in ledger.facts], ["F-1", "F-2"])
-
-    def test_fact_about_an_unknown_hunk_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "hunks are not in round 1: H9"):
-            self.record(self.ledger, ["H9"])
-
-    def test_fact_with_a_judgement_is_rejected(self) -> None:
-        with self.assertRaisesRegex(FieldError, "without judgement words \\('bug' found"):
-            add_fact(
-                self.ledger,
-                hunks=["H1"],
-                source=self.source,
-                text="total() has a bug when the list at app.py:1 is empty",
-                source_digest="d1",
-                author_lens="contracts",
-            )
-
-    def test_fact_is_valid_while_its_source_file_is_unchanged(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("x = 1\n", encoding="utf-8")
-            digest = file_sha256(root, "app.py")
-            assert digest is not None
-            ledger = self.record(self.ledger, ["H1"], digest)
-            self.assertEqual(list(valid_facts_for_hunk(ledger, root)), ["H1"])
-
-            (root / "app.py").write_text("x = 2\n", encoding="utf-8")
-
-            self.assertEqual(valid_facts_for_hunk(ledger, root), {})
 
 
 class RunTests(unittest.TestCase):
@@ -847,12 +591,56 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(load(self.path), Ledger())
 
     def test_save_round_trips_without_leaving_temporary_files(self) -> None:
-        ledger = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))), "intent")
+        ledger = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))))
 
         save(self.path, ledger)
 
         self.assertEqual(load(self.path), ledger)
         self.assertEqual([p.name for p in self.path.parent.iterdir()], [LEDGER_FILENAME])
+
+    def test_an_older_ledger_is_set_aside_under_the_lock(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8")
+        taken: list[bool] = []
+        real = ledger_module.locked
+
+        @contextmanager
+        def watching(path: Path) -> Iterator[None]:
+            with real(path):
+                taken.append(True)
+                yield
+
+        with mock.patch.object(ledger_module, "locked", watching), redirect_stderr(io.StringIO()):
+            self.assertEqual(load(self.path), Ledger())
+
+        self.assertEqual(taken, [True])
+        self.assertTrue(self.path.with_name("ledger.v2.bak.json").is_file())
+
+    def test_a_ledger_written_while_the_old_one_was_set_aside_is_left_alone(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8")
+        newer = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))))
+
+        @contextmanager
+        def replaced_first(path: Path) -> Iterator[None]:
+            save(path, newer)  # a concurrent craftsman wrote its ledger before this one got the lock
+            yield
+
+        with mock.patch.object(ledger_module, "locked_unless_held", replaced_first):
+            loaded = load(self.path)
+
+        self.assertEqual(loaded, newer)
+        self.assertEqual(load(self.path), newer)
+        self.assertFalse(self.path.with_name("ledger.v2.bak.json").exists())
+
+    def test_setting_an_older_ledger_aside_inside_mutate_does_not_deadlock(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 2}), encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()):
+            number = mutate(self.path, lambda ledger: (record_run(ledger), len(ledger.runs) + 1))
+
+        self.assertEqual(number, 1)
 
     def test_corrupt_json_raises(self) -> None:
         self.path.parent.mkdir(parents=True)

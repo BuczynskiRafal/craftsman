@@ -28,7 +28,6 @@ from craftsman.gate import (
     GateOwner,
     GateState,
     GateStateError,
-    GateTier,
     archive_ledger_for_new_base,
     decide_stop,
     state_path_for,
@@ -118,7 +117,7 @@ def _opened_by_request(
 ) -> GateState | None:
     """The gate, opened for a `/craftsman` request the agent did not open a gate for."""
     if state is not None and state.active:
-        return state
+        return _raised_by_request(state, entries)
     if state is not None and state.owner.admits(caller):
         if state.request_step is None:
             # Closed with `craftsman gate --complete` before any stop: the request was handled.
@@ -130,16 +129,28 @@ def _opened_by_request(
     request = _latest_trigger(entries, handled_step)
     if request is None:
         return state
-    step, tier, prompt = request
+    step, deep, prompt = request
     base_sha = resolve_base_sha(root, None)
     if snapshot(root, base_sha).is_empty:
         return state  # nothing changed yet, so there is nothing to gate
     archive_ledger_for_new_base(root, base_sha)
-    return GateState.open(caller, base_sha, tier, task_from_prompt(prompt), request_step=step)
+    return GateState.open(caller, base_sha, deep, task_from_prompt(prompt), request_step=step)
 
 
-def _latest_trigger(entries: Sequence[Entry], after_step: int) -> tuple[int, GateTier, str] | None:
-    """The step, tier and text of the latest user input after `after_step` that invokes Craftsman."""
+def _raised_by_request(state: GateState, entries: Sequence[Entry]) -> GateState:
+    """An active gate, made deep when a later user input asked for `/craftsman --deep` or `ultracraft`."""
+    if state.deep or state.request_step is None:
+        return state
+    for position, entry in enumerate(entries, 1):
+        if step_of(entry, position) <= state.request_step or entry.get("type") != "USER_INPUT":
+            continue
+        if detect_trigger(str(entry.get("content") or "")) is True:
+            return replace(state, deep=True)
+    return state
+
+
+def _latest_trigger(entries: Sequence[Entry], after_step: int) -> tuple[int, bool, str] | None:
+    """The step, deep flag and text of the latest user input after `after_step` that invokes Craftsman."""
     for position in range(len(entries), 0, -1):
         entry = entries[position - 1]
         step = step_of(entry, position)
@@ -148,9 +159,9 @@ def _latest_trigger(entries: Sequence[Entry], after_step: int) -> tuple[int, Gat
         if entry.get("type") != "USER_INPUT":
             continue
         prompt = str(entry.get("content") or "")
-        tier = detect_trigger(prompt)
-        if tier is not None:
-            return step, tier, prompt
+        deep = detect_trigger(prompt)
+        if deep is not None:
+            return step, deep, prompt
     return None
 
 

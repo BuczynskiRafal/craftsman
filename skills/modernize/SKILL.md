@@ -58,5 +58,5 @@ Run the characterization and golden tests on the result, compare outputs, error 
 performance on the same inputs, and list every intended difference with the rule it changes.
 
 ## 6. Hand over
-Inside `/craftsman`, continue with its quality loop. Finish with a table of rules (preserved /
+Inside `/craftsman`, continue with its Stage 2 (final review). Finish with a table of rules (preserved /
 intentionally changed), structural improvements, and verification results.

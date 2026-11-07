@@ -75,9 +75,9 @@ class CopilotAgentRenderingTests(CopilotTestCase):
 
     def test_reviewer_loads_assigned_lenses_without_inlining_playbook(self) -> None:
         reviewer = render_copilot_agent(self.templates()["craftsman-reviewer"])
-        lenses = (REPO_ROOT / "skills" / "code-review" / "lenses.md").read_text(encoding="utf-8")
+        lenses = (REPO_ROOT / "skills" / "craft-review" / "lenses.md").read_text(encoding="utf-8")
 
-        self.assertIn("craftsman skill show code-review --lenses", reviewer)
+        self.assertIn("craftsman skill show craft-review --lenses", reviewer)
         self.assertIn("## Search scope", reviewer)
         self.assertNotIn(lenses.strip().splitlines()[-1], reviewer)
         self.assertNotIn("{{include", reviewer)
@@ -86,19 +86,19 @@ class CopilotAgentRenderingTests(CopilotTestCase):
 class CopilotSkillExportTests(CopilotTestCase):
     def test_skill_folders_get_every_file_of_the_skill(self) -> None:
         out = self.tmp / "skills"
-        (out / "code-review").mkdir(parents=True)
-        (out / "code-review" / "SKILL.md").write_text(CRAFTSMAN_GENERATED_MARKER, encoding="utf-8")
-        (out / "code-review" / "mine.md").write_text("user file\n", encoding="utf-8")
+        (out / "craft-review").mkdir(parents=True)
+        (out / "craft-review" / "SKILL.md").write_text(CRAFTSMAN_GENERATED_MARKER, encoding="utf-8")
+        (out / "craft-review" / "mine.md").write_text("user file\n", encoding="utf-8")
 
         export_to_copilot_skills(REPO_ROOT, out)
 
         self.assertEqual(
-            (out / "code-review" / "lenses.md").read_bytes(),
-            (REPO_ROOT / "skills" / "code-review" / "lenses.md").read_bytes(),
+            (out / "craft-review" / "lenses.md").read_bytes(),
+            (REPO_ROOT / "skills" / "craft-review" / "lenses.md").read_bytes(),
         )
-        skill_md = (out / "code-review" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertTrue(skill_md.startswith("---\nname: code-review\n"))
-        self.assertEqual((out / "code-review" / "mine.md").read_text(encoding="utf-8"), "user file\n")
+        skill_md = (out / "craft-review" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(skill_md.startswith("---\nname: craft-review\n"))
+        self.assertEqual((out / "craft-review" / "mine.md").read_text(encoding="utf-8"), "user file\n")
 
     def test_users_skill_folder_is_moved_aside(self) -> None:
         out = self.tmp / "skills"
@@ -116,14 +116,14 @@ class CopilotSkillExportTests(CopilotTestCase):
         source_copy = self.tmp / "source-lenses.md"
         source_copy.write_text("original\n", encoding="utf-8")
         out = self.tmp / "skills"
-        (out / "code-review").mkdir(parents=True)
-        (out / "code-review" / "SKILL.md").write_text(CRAFTSMAN_GENERATED_MARKER, encoding="utf-8")
-        (out / "code-review" / "lenses.md").symlink_to(source_copy)
+        (out / "craft-review").mkdir(parents=True)
+        (out / "craft-review" / "SKILL.md").write_text(CRAFTSMAN_GENERATED_MARKER, encoding="utf-8")
+        (out / "craft-review" / "lenses.md").symlink_to(source_copy)
 
         export_to_copilot_skills(REPO_ROOT, out)
 
         self.assertEqual(source_copy.read_text(encoding="utf-8"), "original\n")
-        self.assertFalse((out / "code-review" / "lenses.md").is_symlink())
+        self.assertFalse((out / "craft-review" / "lenses.md").is_symlink())
 
     def test_instructions_reach_every_vscode_profile(self) -> None:
         prompts = self.tmp / "Code" / "User" / "prompts"

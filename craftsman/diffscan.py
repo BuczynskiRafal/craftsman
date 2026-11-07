@@ -21,7 +21,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from craftsman.diffscan_signals import CONTENT_SIGNAL_PATTERNS
+from craftsman.diffscan_signals import CONTENT_SIGNAL_PATTERNS, DEEP_HINT_PATTERNS
 
 ChangeStatus = Literal["modified", "added", "deleted", "renamed"]
 ScopeKind = Literal["function", "class", "block"]
@@ -236,7 +236,6 @@ class DiffSnapshot:
     fingerprint: str
     hunks: tuple[Hunk, ...]
     files: tuple[str, ...]
-    skipped: tuple[str, ...]
     added: int
     deleted: int
 
@@ -246,8 +245,20 @@ class DiffSnapshot:
 
     @property
     def docs_only(self) -> bool:
-        renamed_from = (hunk.old_path for hunk in self.hunks if hunk.old_path is not None)
-        return bool(self.files) and all(is_docs_path(path) for path in (*self.files, *renamed_from))
+        return hunks_docs_only(self.hunks)
+
+    def only(self, hunk_ids: Collection[str]) -> DiffSnapshot:
+        """The part of this snapshot made of the hunks named in `hunk_ids`."""
+        keep = set(hunk_ids)
+        hunks = tuple(hunk for hunk in self.hunks if hunk.id in keep)
+        lines = [line for hunk in hunks for line in hunk.lines]
+        return replace(
+            self,
+            hunks=hunks,
+            files=tuple(sorted({hunk.path for hunk in hunks})),
+            added=sum(1 for line in lines if line.startswith("+")),
+            deleted=sum(1 for line in lines if line.startswith("-")),
+        )
 
 
 @dataclass(frozen=True)
@@ -528,7 +539,6 @@ def _assemble(base: str, chunks: Sequence[_FileDiff]) -> DiffSnapshot:
         fingerprint=fingerprint.hexdigest(),
         hunks=tuple(hunks),
         files=tuple(sorted({chunk.path for chunk in chunks})),
-        skipped=tuple(sorted({chunk.path for chunk in chunks if chunk.skipped})),
         added=sum(1 for line in content_lines if line.startswith("+")),
         deleted=sum(1 for line in content_lines if line.startswith("-")),
     )
@@ -1045,6 +1055,11 @@ class WorktreeIndex:
             found.extend(itertools.islice(matches, REFERENCES_PER_FILE))
         return tuple(found)
 
+    def lines(self, path: str) -> tuple[str, ...] | None:
+        """The lines of a work tree text file; None when it is missing, binary or too large."""
+        source = self._source(path)
+        return None if source is None else source.lines
+
     def _source(self, path: str) -> _Source | None:
         if path not in self._sources:
             self._sources[path] = _load_source(self.root, self._real_root, path)
@@ -1063,6 +1078,48 @@ class WorktreeIndex:
         if code != 0:
             raise DiffScanError(f"`git grep` for {symbol!r} failed (exit {code}): {err.strip()}")
         return [path for path in out.split("\0") if path]
+
+
+def file_at_revision(cwd: str | Path, revision: str, path: str) -> str | None:
+    """The text of `path` as committed at `revision`; None when it did not exist there or is binary."""
+    root = worktree_root(cwd)
+    _repo_file(root, path)  # rejects absolute and `..` paths
+    code, data, _ = _git_bytes(root, "show", f"{revision}:{path}")
+    if code != 0 or b"\0" in data[:BINARY_SNIFF_BYTES] or len(data) > MAX_SOURCE_BYTES:
+        return None
+    return _decode(data)
+
+
+def text_scope_at(path: str, text: str, line: int) -> Scope | None:
+    """The innermost function/class (or block window) around `line` of `text`, as `scope` finds it."""
+    return _scope_at(_Source(path, text), line)
+
+
+def text_scope_named(path: str, text: str, name: str, near: int = 1) -> Scope | None:
+    """The definition called `name` in `text`; of several, the one starting closest to `near`.
+
+    `name` is a scope name as `Scope.name` spells it (`Class.method` for Python), or its last part.
+    """
+    source = _Source(path, text)
+    short = name.rsplit(".", 1)[-1]
+    found: list[Scope] = []
+    if source.python_spans is not None:
+        spans = [span for span in source.python_spans if span.name == name] or [
+            span for span in source.python_spans if span.name.rsplit(".", 1)[-1] == short
+        ]
+        found = [scope for span in spans if (scope := _scope_at(source, span.header_line)) is not None]
+    else:
+        for index in range(len(source.lines)):
+            if _looks_like_definition(source.lines, index) and _definition_name(source.lines[index].strip())[0] == short:
+                scope = _scope_at(source, index + 1)
+                if scope is not None and scope.name == short:
+                    found.append(scope)
+    return min(found, key=lambda scope: abs(scope.start - near), default=None)
+
+
+def defines_symbol(path: str, line_text: str, symbol: str) -> bool:
+    """Whether the single line `line_text` defines `symbol` (a `def`, `class`, `function`, ...)."""
+    return _defined_name(line_text, python=_is_python(path)) == symbol
 
 
 def _load_source(root: Path, real_root: Path, path: str) -> _Source | None:
@@ -1348,9 +1405,70 @@ def is_test_path(path: str) -> bool:
     return bool(_TEST_DIRS.intersection(posix.parts[:-1])) or _name_matches(posix.name, _TEST_NAME_GLOBS)
 
 
+_IMPORT_LINE_RE = re.compile(
+    r"^(?:from\s+\S+\s+import\b|import\b|use\s|using\s|#\s*include\b|require\b|extern\s+crate\b"
+    r"|(?:const|let|var)\b.*\brequire\()"
+)
+
+
+def reference_kind(ref: Reference) -> Literal["call", "test", "import", "docs"]:
+    """What a reference most likely is, so real uses can rank before imports and prose."""
+    if is_docs_path(ref.path):
+        return "docs"
+    if _IMPORT_LINE_RE.match(ref.text):
+        return "import"
+    return "test" if is_test_path(ref.path) else "call"
+
+
 def is_docs_path(path: str) -> bool:
     """Prose by file type alone: a `docs/` folder can hold code (e.g. Sphinx's conf.py)."""
     return PurePosixPath(path).suffix.lower() in _DOCS_SUFFIXES and not _is_config(path)
+
+
+_AGENT_PROMPT_NAMES = frozenset({"skill.md", "agents.md", "claude.md", "gemini.md"})
+_AGENT_PROMPT_DIRS = frozenset({"agents", "rules"})
+_AGENT_PROMPT_NAME_GLOBS = ("*.prompt.md", "*.instructions.md")
+
+
+def is_agent_prompt_path(path: str) -> bool:
+    """A prompt file that steers an agent: its prose is behavior, not documentation.
+
+    `SKILL.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `*.prompt.md`, `copilot-instructions.md`,
+    Markdown under a `rules/` or `agents/` folder.
+    """
+    posix = PurePosixPath(path)
+    name = posix.name.lower()
+    if posix.suffix.lower() not in _DOCS_SUFFIXES:
+        return False
+    return (
+        name in _AGENT_PROMPT_NAMES
+        or name == "copilot-instructions.md"
+        or _name_matches(name, _AGENT_PROMPT_NAME_GLOBS)
+        or bool(_AGENT_PROMPT_DIRS.intersection(part.lower() for part in posix.parts[:-1]))
+    )
+
+
+def hunks_docs_only(hunks: Sequence[Hunk]) -> bool:
+    """Whether every changed path (renames included) is documentation, not code or an agent prompt."""
+    paths = [path for hunk in hunks for path in (hunk.path, hunk.old_path) if path is not None]
+    return bool(paths) and all(is_docs_path(path) and not is_agent_prompt_path(path) for path in paths)
+
+
+def detect_deep_hint_signals(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]]:
+    """The hunks with real security or concurrency usage, in production code only.
+
+    Tests, configuration and documentation never count, and a bare word such as `token` does not:
+    the hint needs a call or usage pattern.
+    """
+    fired: dict[str, list[str]] = {}
+    for hunk in hunks:
+        if is_test_path(hunk.path) or _is_config(hunk.path) or _is_docs_hunk(hunk):
+            continue
+        content = "\n".join(text for _, text in (*hunk.added_lines, *hunk.removed_lines))
+        for name, pattern in DEEP_HINT_PATTERNS.items():
+            if pattern.search(content):
+                fired.setdefault(name, []).append(hunk.id)
+    return {name: tuple(ids) for name, ids in fired.items()}
 
 
 def _is_docs_hunk(hunk: Hunk) -> bool:

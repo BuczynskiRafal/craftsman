@@ -227,12 +227,12 @@ class ClaudeSkillExportTests(ClaudeTestCase):
 
         export_to_claude_user(REPO_ROOT, self.tmp / "claude")
 
-        review = (self.tmp / "claude" / "commands" / "code-review.md").read_text(encoding="utf-8")
+        review = (self.tmp / "claude" / "commands" / "craft-review.md").read_text(encoding="utf-8")
         verify = (self.tmp / "claude" / "commands" / "verify.md").read_text(encoding="utf-8")
         self.assertNotIn("## Appendix: lenses.md", review)
         self.assertNotIn("## Appendix", review)
         self.assertNotIn("## Appendix", verify)
-        self.assertIn("craftsman skill show code-review --lenses", review)
+        self.assertIn("craftsman skill show craft-review --lenses", review)
 
     def test_users_agent_file_is_moved_aside(self) -> None:
         mine = self.tmp / "agents" / "craftsman-reviewer.md"

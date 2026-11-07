@@ -110,7 +110,7 @@ class PlatformReportTests(DoctorTestCase):
 
     def test_missing_lenses_file_is_a_problem(self) -> None:
         self.install_user_copilot()
-        (self.tmp / ".copilot" / "skills" / "code-review" / "lenses.md").unlink()
+        (self.tmp / ".copilot" / "skills" / "craft-review" / "lenses.md").unlink()
 
         code, report = self.doctor()
 
@@ -169,13 +169,30 @@ class PlatformReportTests(DoctorTestCase):
 
     def test_text_report_lists_the_problems(self) -> None:
         self.install_user_copilot()
-        (self.tmp / ".copilot" / "skills" / "code-review" / "lenses.md").unlink()
+        (self.tmp / ".copilot" / "skills" / "craft-review" / "lenses.md").unlink()
 
         proc = self.run_doctor()
 
         self.assertIn("[ISSUES DETECTED]", proc.stdout)
         self.assertIn("[ERROR]", proc.stderr)
         self.assertIn("has no lenses.md", proc.stderr)
+
+    def test_prompts_of_the_old_protocol_are_stale(self) -> None:
+        export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
+        agent = self.tmp / ".claude" / "agents" / "craftsman-reviewer.md"
+        agent.write_text(agent.read_text(encoding="utf-8") + "\nrun `craftsman review ack S1`\n", encoding="utf-8")
+
+        code, report = self.doctor()
+
+        self.assertEqual(code, 1)
+        self.assertTrue(any("review ack" in problem and "craftsman install" in problem for problem in report["problems"]))
+
+    def test_current_claude_prompts_are_not_stale(self) -> None:
+        export_to_claude_user(REPO_ROOT, self.tmp / ".claude")
+
+        _, report = self.doctor()
+
+        self.assertFalse(any("before 5.0" in problem for problem in report["problems"]), report["problems"])
 
     def test_claude_agents_without_hooks_are_reported(self) -> None:
         export_to_claude_user(REPO_ROOT, self.tmp / ".claude")

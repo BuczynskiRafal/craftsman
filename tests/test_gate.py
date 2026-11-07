@@ -6,12 +6,13 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Iterator
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from craftsman import gate
-from craftsman.diffscan import snapshot
 from craftsman.gate import (
     MAX_CONTINUATIONS,
     GateOwner,
@@ -22,8 +23,9 @@ from craftsman.gate import (
     decide_stop,
     is_continuation_prompt,
     load_state,
+    save_state,
     state_path_for,
-    task_tier,
+    update_state,
 )
 
 from tests.support import EvidenceRepo, open_gate
@@ -105,7 +107,7 @@ class GateStateJsonTests(unittest.TestCase):
         self.state = GateState.open(
             GateOwner("claude", "s1"),
             "a" * 40,
-            "deep",
+            True,
             "fix it",
             takeover_from=GateOwner("copilot"),
             best_issue_count=3,
@@ -152,9 +154,49 @@ class StateFileTests(unittest.TestCase):
         self.assertIsNone(load_state(self.path))
 
     def test_invalid_state_file_names_the_takeover_remedy(self) -> None:
-        self.path.write_text(json.dumps({"active": True, "tier": "auto"}), encoding="utf-8")
+        self.path.write_text(json.dumps({"active": True}), encoding="utf-8")
         with self.assertRaisesRegex(GateStateError, "--init --takeover"):
             load_state(self.path)
+
+    def test_state_of_craftsman_4_is_archived_and_read_as_absent(self) -> None:
+        self.path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+        err = io.StringIO()
+
+        with redirect_stderr(err):
+            loaded = load_state(self.path)
+
+        self.assertIsNone(loaded)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(
+            json.loads(self.path.with_name("craftsman_state.json.v4.bak").read_text("utf-8")), OLD_STATE
+        )
+        self.assertEqual(err.getvalue().count("\n"), 1)
+        self.assertIn("Archived the gate state of an older craftsman", err.getvalue())
+
+    def test_a_gate_written_while_the_old_state_was_set_aside_is_left_alone(self) -> None:
+        self.path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+        newer = GateState.open(GateOwner("claude", "s2"), "abc", True, "new task")
+
+        @contextmanager
+        def replaced_first(path: Path) -> Iterator[None]:
+            save_state(path, newer)  # a concurrent 5.x gate was opened before this one got the lock
+            yield
+
+        with mock.patch.object(gate, "locked_unless_held", replaced_first):
+            loaded = load_state(self.path)
+
+        self.assertEqual(loaded, newer)
+        self.assertEqual(load_state(self.path), newer)
+        self.assertFalse(self.path.with_name("craftsman_state.json.v4.bak").exists())
+
+    def test_an_old_state_met_inside_update_state_does_not_deadlock(self) -> None:
+        self.path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()):
+            seen = update_state(self.path, lambda state: (None, state))
+
+        self.assertIsNone(seen)
+        self.assertTrue(self.path.with_name("craftsman_state.json.v4.bak").is_file())
 
     def test_state_file_that_is_not_json_is_invalid(self) -> None:
         self.path.write_text("{", encoding="utf-8")
@@ -162,42 +204,34 @@ class StateFileTests(unittest.TestCase):
             load_state(self.path)
 
 
-class TaskTierTests(RepoTestCase):
-    def tier_of_current_diff(self) -> str:
-        return task_tier("auto", snapshot(self.repo.root, self.repo.base_sha))
+class ContinuationPromptTests(unittest.TestCase):
+    def test_prompts_the_platform_sends_on_the_sessions_behalf_are_continuations(self) -> None:
+        for prompt in (
+            'Another Claude session sent a message:\n<agent-message from="a1">done</agent-message>',
+            '  \n<agent-message from="a1">done</agent-message>',
+            "<task-notification>\n<status>completed</status>\n</task-notification>",
+            "\t <task-notification>x</task-notification>",
+        ):
+            with self.subTest(prompt=prompt[:40]):
+                self.assertTrue(is_continuation_prompt(prompt))
 
-    def test_auto_tier_is_quick_for_a_small_change(self) -> None:
-        self.repo.write_lines("app.py", 5)
-        self.assertEqual(self.tier_of_current_diff(), "quick")
-
-    def test_auto_tier_is_standard_beyond_the_quick_file_limit(self) -> None:
-        for name in ("a.py", "b.py", "c.py"):
-            self.repo.write(name, "x = 1\n")
-        self.assertEqual(self.tier_of_current_diff(), "standard")
-
-    def test_auto_tier_is_standard_beyond_the_quick_line_limit(self) -> None:
-        self.repo.write_lines("app.py", 60)
-        self.assertEqual(self.tier_of_current_diff(), "standard")
-
-    def test_auto_tier_is_standard_for_a_binary_file(self) -> None:
-        (self.repo.root / "blob.bin").write_bytes(b"\0" * 64)
-        self.assertEqual(self.tier_of_current_diff(), "standard")
-
-    def test_auto_tier_is_standard_for_an_oversized_file(self) -> None:
-        self.repo.write("huge.txt", "x\n" * 600_000)
-        self.assertEqual(self.tier_of_current_diff(), "standard")
-
-    def test_explicit_tier_ignores_the_diff_size(self) -> None:
-        self.repo.write_lines("app.py", 60)
-        snap = snapshot(self.repo.root, self.repo.base_sha)
-        self.assertEqual(task_tier("quick", snap), "quick")
+    def test_the_users_own_words_are_not(self) -> None:
+        for prompt in (
+            "thanks, now rename the variable",
+            "please explain what an <agent-message> block is",
+            "Another session? No: sent a message is not it.",
+            "/craft-review the cart",
+            "",
+        ):
+            with self.subTest(prompt=prompt[:40]):
+                self.assertFalse(is_continuation_prompt(prompt))
 
 
 class DecideStopTests(RepoTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.repo.write_lines("app.py", 5)
-        self.state = GateState.open(GateOwner("cli"), self.repo.base_sha, "quick", "")
+        self.state = GateState.open(GateOwner("cli"), self.repo.base_sha, False, "")
 
     def test_unsatisfied_gate_blocks_with_next_actions(self) -> None:
         decision = decide_stop(self.state, self.repo.root)
@@ -243,57 +277,107 @@ class DecideStopTests(RepoTestCase):
         self.assertIn("Cannot evaluate the evidence ledger", decision.block_reason)
 
     def test_passing_ledger_closes_the_gate(self) -> None:
-        self.repo.record_full_evidence("quick")
+        self.repo.record_full_evidence()
         decision = decide_stop(self.state, self.repo.root)
         self.assertIsNone(decision.block_reason)
-        self.assertEqual((decision.state.active, decision.state.stage), (False, Stage.COMPLETED))
+        self.assertEqual(
+            (decision.state.active, decision.state.stage), (False, Stage.COMPLETE_UNISOLATED)
+        )
+
+
+OLD_STATE = {
+    "owner": {"platform": "claude", "session_id": "s1"},
+    "base_sha": "abc",
+    "tier": "standard",
+    "task": "t",
+    "started_at": "2026-01-01T00:00:00.000Z",
+    "active": True,
+    "stage": "implement",
+    "awaiting_user": False,
+    "isolation_evidence": "hooks",
+    "forced_continuations": 0,
+    "best_issue_count": None,
+    "takeover_from": None,
+    "request_step": None,
+}
 
 
 class ClosedStateTests(RepoTestCase):
-    def complete_without_isolation(self, tier: str) -> GateState:
+    def complete_without_isolation(self, *flags: str) -> GateState:
         self.repo.write_lines("app.py", 5)
-        self.assertEqual(self.run_gate("--init", "--tier", tier)[0], 0)
-        self.repo.record_full_evidence(tier)
+        self.assertEqual(self.run_gate("--init", *flags)[0], 0)
+        self.repo.record_full_evidence(deep="--deep" in flags)
         code, _, err = self.run_gate("--complete")
         self.assertEqual(code, 0, err)
         return self.stored()
 
-    def test_standard_gate_without_isolation_closes_as_unisolated(self) -> None:
-        state = self.complete_without_isolation("standard")
+    def test_gate_without_isolation_closes_as_unisolated(self) -> None:
+        state = self.complete_without_isolation()
         self.assertEqual((state.active, state.stage), (False, Stage.COMPLETE_UNISOLATED))
 
-    def test_self_reviewed_deep_gate_stays_open_for_the_user(self) -> None:
-        state = self.complete_without_isolation("deep")
-        self.assertEqual((state.active, state.stage), (True, Stage.NEEDS_HUMAN))
+    def test_self_reviewed_deep_gate_closes_with_the_banner(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.assertEqual(self.run_gate("--init", "--deep")[0], 0)
+        self.repo.record_full_evidence(deep=True)
+
+        code, out, err = self.run_gate("--complete")
+
+        self.assertEqual(code, 0, err)
+        self.assertIn("SELF-REVIEWED", out)
+        state = self.stored()
+        self.assertEqual((state.active, state.stage), (False, Stage.COMPLETE_UNISOLATED))
+
+    def test_self_reviewed_deep_gate_still_needs_its_e2e_run(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.assertEqual(self.run_gate("--init", "--deep")[0], 0)
+        self.repo.record_full_evidence()
+
+        code, _, err = self.run_gate("--complete")
+
+        self.assertEqual(code, 1)
+        self.assertIn("no-e2e-run", err)
+        self.assertTrue(self.stored().active)
+
+    def test_an_antigravity_gate_needs_the_transcript_evidence_to_close(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("antigravity", "conv-1"))
+        self.repo.record_full_evidence()
+
+        code, _, err = self.run_gate("--complete", "--session-id", "conv-1")
+
+        self.assertEqual(code, 1)
+        self.assertIn("[no-isolation]", err)
+        self.assertIn("transcript when your turn ends", err)
+        self.assertTrue(self.stored().active)
 
 
 class InitTests(RepoTestCase):
     def test_init_opens_an_active_gate_at_head(self) -> None:
-        code, _, err = self.run_gate("--init", "--tier", "deep", "--task", "add totals")
+        code, _, err = self.run_gate("--init", "--deep", "--task", "add totals")
         self.assertEqual(code, 0, err)
         state = self.stored()
         self.assertEqual(
-            (state.active, state.base_sha, state.tier, state.task),
-            (True, self.repo.base_sha, "deep", "add totals"),
+            (state.active, state.base_sha, state.deep, state.task),
+            (True, self.repo.base_sha, True, "add totals"),
         )
 
     def test_init_archives_a_ledger_from_another_base(self) -> None:
         self.repo.write_lines("app.py", 5)
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
         self.repo.git("commit", "-qam", "next")
         self.run_gate("--init")
         self.assertTrue(self.ledger_is_archived())
 
     def test_init_keeps_a_ledger_from_the_same_base(self) -> None:
         self.repo.write_lines("app.py", 5)
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
         self.run_gate("--init")
         self.assertFalse(self.ledger_is_archived())
         self.assertTrue((self.repo.ledger_dir / "ledger.json").is_file())
 
     def test_init_compares_a_base_ref_by_its_commit(self) -> None:
         self.repo.write_lines("app.py", 5)
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
         self.run_gate("--init", "--base-sha", "HEAD")
         self.assertFalse(self.ledger_is_archived())
         self.assertEqual(self.stored().base_sha, self.repo.base_sha)
@@ -362,35 +446,42 @@ class InitTests(RepoTestCase):
         self.run_gate("--init", "--session-id", "s1", env=CLAUDE_ENV)
         self.assertEqual(self.stored().isolation_evidence, "hooks")
 
-    def test_reopening_never_lowers_the_tier(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"), tier="deep")
-        code, _, err = self.run_gate("--init", "--session-id", "s1", "--tier", "quick", env=CLAUDE_ENV)
+    def test_reopening_without_deep_keeps_a_deep_gate_deep(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"), deep=True)
+        code, _, err = self.run_gate("--init", "--session-id", "s1", env=CLAUDE_ENV)
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.stored().tier, "deep")
+        self.assertTrue(self.stored().deep)
 
-    def test_reopening_without_a_tier_keeps_the_tier(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"), tier="deep")
-        self.run_gate("--init", "--session-id", "s1", env=CLAUDE_ENV)
-        self.assertEqual(self.stored().tier, "deep")
+    def test_takeover_of_a_deep_gate_stays_deep(self) -> None:
+        open_gate(
+            self.repo.root, self.repo.base_sha, deep=True, owner=GateOwner("claude", "s1")
+        )
 
-    def test_reopening_raises_the_tier(self) -> None:
-        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"), tier="quick")
-        self.run_gate("--init", "--session-id", "s1", "--tier", "standard", env=CLAUDE_ENV)
-        self.assertEqual(self.stored().tier, "standard")
+        code, _, err = self.run_gate(
+            "--init", "--takeover", "--task", "x", env={**CLAUDE_ENV, "CLAUDE_CODE_SESSION_ID": "s2"}
+        )
 
-    def test_init_refuses_an_invalid_state_file(self) -> None:
+        self.assertEqual(code, 0, err)
+        state = self.stored()
+        self.assertEqual((state.owner.session_id, state.deep), ("s2", True))
+
+    def test_init_over_the_state_and_ledger_of_craftsman_4_needs_no_takeover(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps({"active": True}), encoding="utf-8")
-        code, _, err = self.run_gate("--init")
-        self.assertEqual(code, 1)
-        self.assertIn("--takeover", err)
+        self.state_path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
+        (self.repo.ledger_dir / "ledger.json").write_text(
+            json.dumps({"schema": 2, "rounds": []}), encoding="utf-8"
+        )
 
-    def test_takeover_replaces_an_invalid_state_file(self) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(json.dumps({"active": True}), encoding="utf-8")
-        code, _, err = self.run_gate("--init", "--takeover")
+        code, _, err = self.run_gate("--init", "--task", "after the upgrade")
+
         self.assertEqual(code, 0, err)
         self.assertTrue(self.stored().active)
+        self.assertTrue((self.repo.ledger_dir / "craftsman_state.json.v4.bak").is_file())
+
+    def test_reopening_with_deep_raises_the_gate(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))
+        self.run_gate("--init", "--session-id", "s1", "--deep", env=CLAUDE_ENV)
+        self.assertTrue(self.stored().deep)
 
 
 class CallerTests(unittest.TestCase):
@@ -409,15 +500,16 @@ class CallerTests(unittest.TestCase):
 class UpdateTests(RepoTestCase):
     def setUp(self) -> None:
         super().setUp()
-        open_gate(self.repo.root, self.repo.base_sha, tier="standard", task="first")
+        open_gate(self.repo.root, self.repo.base_sha, task="first")
 
-    def test_tier_update_raises_the_tier(self) -> None:
-        self.run_gate("--tier", "deep")
-        self.assertEqual(self.stored().tier, "deep")
+    def test_deep_update_raises_the_gate(self) -> None:
+        self.run_gate("--deep")
+        self.assertTrue(self.stored().deep)
 
-    def test_tier_update_never_lowers_the_tier(self) -> None:
-        self.run_gate("--tier", "quick")
-        self.assertEqual(self.stored().tier, "standard")
+    def test_a_plain_update_never_lowers_a_deep_gate(self) -> None:
+        self.run_gate("--deep")
+        self.run_gate("--task", "second")
+        self.assertTrue(self.stored().deep)
 
     def test_task_update_replaces_the_task(self) -> None:
         self.run_gate("--task", "second")
@@ -455,7 +547,7 @@ class UpdateTests(RepoTestCase):
 class CompleteTests(RepoTestCase):
     def test_complete_refuses_until_the_ledger_passes(self) -> None:
         self.repo.write_lines("app.py", 5)
-        self.run_gate("--init", "--tier", "quick")
+        self.run_gate("--init")
         code, _, err = self.run_gate("--complete")
         self.assertEqual(code, 1)
         self.assertIn("[no-round]", err)
@@ -463,12 +555,12 @@ class CompleteTests(RepoTestCase):
 
     def test_complete_closes_a_passing_gate(self) -> None:
         self.repo.write_lines("app.py", 5)
-        self.run_gate("--init", "--tier", "quick")
-        self.repo.record_full_evidence("quick")
+        self.run_gate("--init")
+        self.repo.record_full_evidence()
         code, out, err = self.run_gate("--complete")
         self.assertEqual(code, 0, err)
         self.assertIn("Craftsman gate closed", out)
-        self.assertEqual(self.stored().stage, Stage.COMPLETED)
+        self.assertEqual(self.stored().stage, Stage.COMPLETE_UNISOLATED)
 
     def test_complete_without_changes_closes_the_gate(self) -> None:
         self.run_gate("--init")
@@ -504,8 +596,8 @@ class ArgumentTests(RepoTestCase):
             with self.subTest(flag=flag[0]):
                 self.assert_usage_error("--complete", *flag)
 
-    def test_tier_cannot_change_while_completing(self) -> None:
-        self.assert_usage_error("--complete", "--tier", "quick")
+    def test_deep_cannot_change_while_completing(self) -> None:
+        self.assert_usage_error("--complete", "--deep")
 
     def test_actions_are_mutually_exclusive(self) -> None:
         self.assert_usage_error("--await-user", "--resume")

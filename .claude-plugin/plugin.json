@@ -1,6 +1,6 @@
 {
   "name": "craftsman",
-  "version": "4.1.0",
+  "version": "5.0.0",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
   "author": {
     "name": "Rafał Buczyński",
@@ -13,6 +13,7 @@
     "ai-agents",
     "claude-code",
     "code-review",
+    "craft-review",
     "quality-gate",
     "testing"
   ],

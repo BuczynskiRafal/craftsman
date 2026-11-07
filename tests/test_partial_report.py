@@ -67,12 +67,11 @@ class _RepoTestCase(unittest.TestCase):
 
 class PartialReportCliTests(_RepoTestCase):
 
-    def test_partial_report_shows_uncovered_lenses_with_unverified_finding(self) -> None:
+    def test_partial_report_shows_uncovered_hunks_with_unverified_finding(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)
-        self.review("prepare", "--tier", "quick")
-        self.review(
-            "cover", "--lens", "intent", "--hunks", "H1", "--note", coverage_note(["H1"])
-        )
+        self.repo.write("notes.py", "LABEL = 'cart'\n")
+        self.review("prepare")
+        self.review("cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
         self.review("add", "--file", "cart.py", "--line", "3", *FINDING_FLAGS)
 
         proc = self.review("report", "--review-only", "--partial")
@@ -81,8 +80,7 @@ class PartialReportCliTests(_RepoTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("- Review: PARTIAL (review-only,", report)
         self.assertIn("\n## Not covered\n", report)
-        self.assertIn("- `contracts`: H1", report)
-        self.assertNotIn("- `intent`:", report)
+        self.assertIn("- Hunks: H2", report)
         self.assertIn("\n## Findings\n", report)
         self.assertIn("F1 · major · `cart.py:3`", report)
         self.assertIn("(unverified)", report)
@@ -90,12 +88,11 @@ class PartialReportCliTests(_RepoTestCase):
         payload = self.json_of("report", "--review-only", "--partial")
         self.assertTrue(payload["partial"])
         self.assertFalse(payload["passed"])
-        self.assertEqual(payload["not_covered"]["contracts"], ["H1"])
-        self.assertNotIn("intent", payload["not_covered"])
+        self.assertEqual(payload["not_covered"], ["H2"])
 
     def test_partial_report_is_complete_when_no_open_items_remain(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
         self.repo.cover_all()
         self.review("add", "--file", "cart.py", "--line", "3", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC_EVIDENCE)
@@ -108,18 +105,18 @@ class PartialReportCliTests(_RepoTestCase):
         self.assertNotIn("(unverified)", report)
         self.assertTrue(payload["partial"])
         self.assertTrue(payload["passed"])
-        self.assertEqual(payload["not_covered"], {})
+        self.assertEqual(payload["not_covered"], [])
 
     def test_partial_without_review_only_is_rejected(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         proc = self.review("report", "--partial", check=False)
 
         assert_cli_error(self, proc, 1, "--partial requires --review-only")
 
     def test_partial_is_refused_during_an_active_gate(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         self.repo.write("cart.py", BUGGY_CART)
 
         proc = self.review("report", "--review-only", "--partial", check=False)
@@ -128,7 +125,7 @@ class PartialReportCliTests(_RepoTestCase):
 
     def test_review_check_is_unchanged(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         checked = self.review("check", "--review-only", check=False)
         checked_json = json.loads(
@@ -157,7 +154,7 @@ class PartialReportCliTests(_RepoTestCase):
         self.assertIn("## Not covered", dirty_partial.stdout)
         self.assertTrue(dirty_json["partial"])
         self.assertEqual(dirty_json["rounds"], 0)
-        self.assertEqual(dirty_json["not_covered"], {})
+        self.assertEqual(dirty_json["not_covered"], [])
 
 
 class ShowHunksTests(_RepoTestCase):
@@ -177,7 +174,7 @@ class ShowHunksTests(_RepoTestCase):
         )
         self.repo.write("notes.py", "LABEL = 'cart'\n")
         (self.repo.root / "old.py").unlink()
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         snap = snapshot(self.repo.root, self.repo.base_sha)
         by_path = {hunk.path: hunk for hunk in snap.hunks}
@@ -188,34 +185,57 @@ class ShowHunksTests(_RepoTestCase):
         lines = proc.stdout.strip().splitlines()
 
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(len(lines), 3)
         self.assertEqual(
             lines,
             [
                 f"{by_path['notes.py'].id}  notes.py:1-1  added",
                 f"{by_path['old.py'].id}  old.py:1-2  deleted",
                 f"{a_hunk.id}  {a_range}  compute_total",
+                "3 left to cover",
             ],
         )
 
         payload = json.loads(self.review("show", "--hunks", "--json").stdout)
         self.assertFalse(payload["stale"])
+        self.assertEqual([item["covered"] for item in payload["hunks"]], [False, False, False])
         self.assertEqual([item["path"] for item in payload["hunks"]], ["notes.py", "old.py", "src/a.py"])
         a_json = next(item for item in payload["hunks"] if item["path"] == "src/a.py")
         self.assertEqual(a_json["scope"], "compute_total")
         self.assertEqual(a_json["status"], "modified")
         self.assertEqual(a_json["end_line"], a_hunk.new_start + a_hunk.new_len - 1)
 
+    def test_show_hunks_lists_only_the_hunks_still_to_cover(self) -> None:
+        self.repo.write("a.py", "".join(f"v{i} = {i}\n" for i in range(30)))
+        self.repo.write("b.py", "".join(f"w{i} = {i}\n" for i in range(30)))
+        self.repo.base_sha = self.repo.commit("seed")
+        self.repo.write("a.py", "".join(f"v{i} = {-i}\n" for i in range(30)))
+        self.repo.write("b.py", "".join(f"w{i} = {-i}\n" for i in range(30)))
+        self.review("prepare")
+        self.review("cover", "--hunks", "H1", "--note", coverage_note(["H1"]))
+
+        lines = self.review("show", "--hunks").stdout.strip().splitlines()
+        payload = json.loads(self.review("show", "--hunks", "--json").stdout)
+
+        self.assertEqual([line.split()[0] for line in lines[:-1]], ["H2"])
+        self.assertEqual(lines[-1], "1 left to cover")
+        self.assertEqual({item["id"]: item["covered"] for item in payload["hunks"]}, {"H1": True, "H2": False})
+
+        self.review("cover", "--hunks", "H2", "--note", coverage_note(["H2"]))
+
+        self.assertEqual(
+            self.review("show", "--hunks").stdout.strip(), "0 left to cover: every hunk is covered"
+        )
+
     def test_show_hunks_omits_carried_hunks_until_round_becomes_stale(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)
         self.repo.write("notes.py", "LABEL = 'cart'\n")
-        self.repo.record_full_evidence("quick")
+        self.repo.record_full_evidence()
 
         self.repo.write("cart.py", BUGGY_CART.replace(" / len(items)", ""))
-        self.review("prepare", "--tier", "quick")
+        self.review("prepare")
 
         current_lines = self.review("show", "--hunks").stdout.strip().splitlines()
-        self.assertEqual(current_lines, ["H1  cart.py:1-3  total"])
+        self.assertEqual(current_lines, ["H3  cart.py:1-3  total", "1 left to cover"])
 
         # Edit cart.py without re-running `prepare`: round 2 becomes stale.
         self.repo.write("cart.py", "def total(items):\n    return 0\n")
@@ -226,7 +246,7 @@ class ShowHunksTests(_RepoTestCase):
         self.assertEqual(
             stale_lines,
             [
-                "H1  cart.py:1-3  [open]",
+                "H3  cart.py:1-3  [open]",
                 "H2  notes.py:1-1  [carried]",
                 "stale: run `craftsman review prepare`",
             ],
@@ -238,7 +258,7 @@ class ShowHunksTests(_RepoTestCase):
             stale_json["hunks"],
             [
                 {
-                    "id": "H1",
+                    "id": "H3",
                     "path": "cart.py",
                     "new_start": 1,
                     "new_len": 3,

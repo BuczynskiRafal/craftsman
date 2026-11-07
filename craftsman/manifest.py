@@ -6,6 +6,7 @@ The manifest is the only record uninstall works from: a path it does not list is
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -96,6 +97,12 @@ class InstallManifest:
     @property
     def created_dirs(self) -> tuple[str, ...]:
         return _union(target.created_dirs for target in self.targets.values())
+
+    def records(self, path: Path) -> bool:
+        """Whether a target created `path`, or a folder above it."""
+        owned = set(self.created_paths)
+        absolute = Path(os.path.abspath(path))
+        return str(absolute) in owned or any(str(parent) in owned for parent in absolute.parents)
 
     def paths_of_others(self, kind: TargetKind) -> frozenset[str]:
         """The paths created by every target but `kind`, which uninstalling `kind` must keep."""

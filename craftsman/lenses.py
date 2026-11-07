@@ -1,26 +1,21 @@
-"""Catalog of review lenses and the policy that selects them for a change.
+"""Catalog of review lenses and the policy that suggests them for a change.
 
 A lens is one focused review perspective. This module is the single source of truth for lens
-ids and selection; the long-form review protocol for each lens lives in the skills.
+ids and suggestions; the long-form playbook for each lens lives in the skills. Suggestions are
+hints for the orchestrating agent, never a gate input.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, get_args
 
-Tier = Literal["quick", "standard", "deep"]
-
-TIERS: tuple[Tier, ...] = get_args(Tier)
 MAX_REASON_HUNK_IDS = 6
-REVIEW_ONLY_QUICK_MAX_LINES = 250
-QUICK_TRUST_TRIGGERS: frozenset[str] = frozenset({"sql", "deserialization", "auth", "process"})
-
-_ALL_TIERS: frozenset[Tier] = frozenset(TIERS)
-_STANDARD_AND_DEEP: frozenset[Tier] = frozenset({"standard", "deep"})
-_DEEP_ONLY: frozenset[Tier] = frozenset({"deep"})
 _DOCS_ONLY_LENSES = ("intent", "craft")
+DEEP_REASON = "deep round"
+MAX_HINT_HUNK_IDS = 3
+# Signals that suggest a deep round: the security signals and concurrency.
+DEEP_HINT_SIGNALS = ("process", "sql", "deserialization", "auth", "concurrency")
 
 
 @dataclass(frozen=True)
@@ -28,7 +23,7 @@ class Lens:
     id: str
     title: str
     focus: str
-    always_in: frozenset[Tier]
+    always: str | None  # why the lens is suggested for every non-docs change, if it is
     triggers: frozenset[str]
 
 
@@ -43,125 +38,92 @@ LENSES: tuple[Lens, ...] = (
         id="intent",
         title="Intent & completeness",
         focus="Does the change do all it claims, everywhere it should, and nothing else?",
-        always_in=_ALL_TIERS,
+        always="core lens",
         triggers=frozenset(),
     ),
     Lens(
         id="contracts",
         title="Inputs, boundaries & contracts",
         focus="Does each changed function handle the full range of inputs it can receive?",
-        always_in=_ALL_TIERS,
+        always="core lens",
         triggers=frozenset(),
     ),
     Lens(
         id="failure",
         title="Failure paths & error handling",
         focus="When an operation fails, does the code fail loudly, precisely and cleanly?",
-        always_in=_ALL_TIERS,
+        always="core lens",
         triggers=frozenset({"errors", "process", "filesystem", "network", "sql"}),
     ),
     Lens(
         id="ripple",
         title="Ripple effects on callers & removed behavior",
         focus="Do the callers, configs and users of what changed or disappeared still work?",
-        always_in=_STANDARD_AND_DEEP,
+        always="core lens",
         triggers=frozenset({"deletion", "config"}),
     ),
     Lens(
         id="state",
         title="State, data flow, resources & concurrency",
         focus="Is shared state consistent, are resources released, are repeated runs safe?",
-        always_in=_DEEP_ONLY,
-        triggers=frozenset({"concurrency", "time"}),
+        always=None,
+        triggers=frozenset({"concurrency", "filesystem", "time"}),
     ),
     Lens(
         id="trust",
         title="Trust boundaries & security",
         focus="Can untrusted input reach a dangerous sink, or a permission check be bypassed?",
-        always_in=_DEEP_ONLY,
-        triggers=frozenset({"process", "sql", "deserialization", "auth", "network", "regex"}),
+        always=None,
+        triggers=frozenset(
+            {"process", "sql", "deserialization", "auth", "network", "regex", "filesystem"}
+        ),
     ),
     Lens(
         id="tests",
         title="Test evidence",
         focus="Would the tests fail if the changed behavior broke, and do they hit risky paths?",
-        always_in=_STANDARD_AND_DEEP,
-        triggers=frozenset({"tests"}),
+        always="core lens",
+        triggers=frozenset(),
     ),
     Lens(
         id="platform",
         title="Environment & portability",
         focus="Does the change hold on every supported OS, shell, encoding, locale and time zone?",
-        always_in=_DEEP_ONLY,
-        triggers=frozenset({"platform", "time"}),
+        always=None,
+        triggers=frozenset({"platform", "time", "process", "filesystem"}),
     ),
     Lens(
         id="model",
         title="Data model & invariants",
         focus="Do the types make illegal states unrepresentable and keep invariants on every path?",
-        always_in=_DEEP_ONLY,
+        always=None,
         triggers=frozenset({"datamodel"}),
     ),
     Lens(
         id="craft",
         title="Clarity, reuse & simplicity",
         focus="Is this the simplest clear code, reusing what exists, at the right abstraction level?",
-        always_in=_STANDARD_AND_DEEP,
+        always="simplicity lens",
         triggers=frozenset(),
     ),
     Lens(
         id="design",
         title="Design & size — the change as a whole",
         focus="Is this the smallest clear design for the task? What could be deleted?",
-        always_in=_STANDARD_AND_DEEP,
+        always="simplicity lens",
         triggers=frozenset(),
     ),
     Lens(
         id="sweep",
         title="Final sweep — interactions between hunks",
         focus="Do hunks that are each correct still agree with each other, the docs and the config?",
-        always_in=_STANDARD_AND_DEEP,
+        always="whole-diff lens",
         triggers=frozenset(),
     ),
 )
 LENS_IDS: frozenset[str] = frozenset(lens.id for lens in LENSES)
 
-REVIEWER_GROUPS: dict[str, tuple[str, ...]] = {
-    "R1": ("intent", "contracts", "ripple", "tests"),
-    "R2": ("failure", "state", "trust", "model"),
-    "R3": ("platform", "craft"),
-    "R4": ("design",),
-}
-REVIEWER_GROUP_TITLES: dict[str, str] = {
-    "R1": "callers & contracts",
-    "R2": "failure paths & state",
-    "R3": "environment & clarity",
-    "R4": "whole-change design",
-}
-
 _LENSES_BY_ID = {lens.id: lens for lens in LENSES}
-
-
-def render_reviewer_groups_markdown() -> str:
-    """Render the fixed reviewer groups from `REVIEWER_GROUPS` as a Markdown bullet list."""
-    lines = [
-        f"- **{gid}** ({REVIEWER_GROUP_TITLES[gid]}): " + ", ".join(f"`{lens}`" for lens in lenses)
-        for gid, lenses in REVIEWER_GROUPS.items()
-    ]
-    lines.append("- **Verifier / sweep**: `sweep` (after all reviewer groups finish)")
-    return "\n".join(lines)
-
-
-def review_only_tier(changed_lines: int, *, has_skipped: bool, docs_only: bool) -> Tier:
-    """Default review-only tier: `quick` for docs-only or small diffs without skipped files."""
-    if docs_only or (changed_lines <= REVIEW_ONLY_QUICK_MAX_LINES and not has_skipped):
-        return "quick"
-    return "standard"
-
-
-def strictest_tier(tier: Tier, *others: Tier) -> Tier:
-    """The most demanding of the given tiers."""
-    return max((tier, *others), key=TIERS.index)
 
 
 def get_lens(lens_id: str) -> Lens:
@@ -172,52 +134,47 @@ def get_lens(lens_id: str) -> Lens:
         raise KeyError(f"unknown lens {lens_id!r}; valid lenses: {valid}") from None
 
 
-def _triggers_for(tier: Tier, lens: Lens) -> frozenset[str]:
-    if tier != "quick":
-        return lens.triggers
-    if lens.id == "trust":
-        return QUICK_TRUST_TRIGGERS
-    return lens.triggers if tier in lens.always_in else frozenset()
-
-
 def select_lenses(
-    tier: Tier,
-    signals: Mapping[str, Sequence[str]],
-    *,
-    docs_only: bool,
-    added: Mapping[str, str] | None = None,
+    signals: Mapping[str, Sequence[str]], *, deep: bool, docs_only: bool
 ) -> tuple[LensPick, ...]:
-    """Pick the lenses for a change, in catalog order, each with the reason it was selected.
+    """Suggest the lenses for a change, in catalog order, each with the reasons behind it.
 
-    `added` maps lenses the agent added on top of the policy to the reason it gave.
+    Every non-docs change gets the core and simplicity lenses; a lens whose risk signals fired
+    is added with the hunks that fired it; a deep round suggests every lens, a docs-only change
+    included.
     """
-    if tier not in TIERS:
-        raise ValueError(f"unknown tier {tier!r}; valid tiers: {', '.join(TIERS)}")
-    added = added or {}
-    for lens_id in added:
-        get_lens(lens_id)
     picks: list[LensPick] = []
     for lens in LENSES:
-        if docs_only:
+        if docs_only and not deep:
             reasons = ["docs-only change"] if lens.id in _DOCS_ONLY_LENSES else []
         else:
-            reasons = _policy_reasons(tier, lens, signals)
-        if lens.id in added:
-            reasons.append(f"added by the agent: {added[lens.id]}")
+            reasons = _reasons(lens, signals, deep=deep)
         if reasons:
             picks.append(LensPick(lens, "; ".join(reasons)))
     return tuple(picks)
 
 
-def _policy_reasons(tier: Tier, lens: Lens, signals: Mapping[str, Sequence[str]]) -> list[str]:
-    fired = [signal for signal in sorted(_triggers_for(tier, lens)) if signals.get(signal)]
-    detail = ", ".join(f"{signal} ({_format_hunk_ids(signals[signal])})" for signal in fired)
-    reasons = [f"always in {tier}"] if tier in lens.always_in else []
+def _reasons(lens: Lens, signals: Mapping[str, Sequence[str]], *, deep: bool) -> list[str]:
+    reasons = [lens.always] if lens.always else []
+    fired = [signal for signal in sorted(lens.triggers) if signals.get(signal)]
     if fired:
+        detail = ", ".join(f"{signal} ({_format_hunk_ids(signals[signal])})" for signal in fired)
         reasons.append(f"signals: {detail}")
+    if deep and not reasons:
+        reasons.append(DEEP_REASON)
     return reasons
 
 
 def _format_hunk_ids(hunk_ids: Sequence[str]) -> str:
     shown = ", ".join(hunk_ids[:MAX_REASON_HUNK_IDS])
     return f"{shown}, …" if len(hunk_ids) > MAX_REASON_HUNK_IDS else shown
+
+
+def deep_hint(signals: Mapping[str, Sequence[str]]) -> str | None:
+    """A hint that the change deserves a deep round, from its security and concurrency signals."""
+    fired = [
+        f"{signal} {','.join(signals[signal][:MAX_HINT_HUNK_IDS])}"
+        for signal in DEEP_HINT_SIGNALS
+        if signals.get(signal)
+    ]
+    return f"Depth: deep suggested (signals: {', '.join(fired)})" if fired else None

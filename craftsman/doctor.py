@@ -6,6 +6,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -23,6 +24,7 @@ from craftsman.legacy_githooks import (
     is_craftsman_hooks_path,
     legacy_git_hooks_bases,
 )
+from craftsman.legacy_skills import inspect_legacy_skills
 from craftsman.manifest import InstallError, TargetKind, load_manifest
 from craftsman.paths import (
     default_claude_dir,
@@ -87,7 +89,7 @@ class HooksReport:
 class SkillsReport:
     path: str
     installed: bool
-    code_review_lenses: bool | None  # None when code-review itself is not installed
+    craft_review_lenses: bool | None  # None when craft-review itself is not installed
 
 
 @dataclass(frozen=True)
@@ -381,7 +383,7 @@ def _agents_installed(directory: Path, names: tuple[str, ...], suffix: str) -> b
 
 
 def _skills_report(skills_dir: Path) -> SkillsReport:
-    review = skills_dir / "code-review"
+    review = skills_dir / "craft-review"
     lenses = (review / "lenses.md").is_file() if (review / "SKILL.md").is_file() else None
     return SkillsReport(str(skills_dir), (skills_dir / "craftsman" / "SKILL.md").is_file(), lenses)
 
@@ -637,6 +639,46 @@ def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
     return problems
 
 
+def inspect_leftover_review_skills(workspace: Path | None, home: Path) -> list[str]:
+    """Problems for the `code-review` skill of Craftsman < 5 that Craftsman still owns."""
+    bases = [
+        (home / ".gemini" / "config", TargetKind.ANTIGRAVITY),
+        (default_claude_dir(home), TargetKind.CLAUDE),
+        (default_copilot_home(home), TargetKind.COPILOT),
+    ]
+    if workspace is not None:
+        bases.append((workspace, TargetKind.COPILOT_WORKSPACE))
+    return [problem for base, kind in bases for problem in inspect_legacy_skills((kind,), base)]
+
+
+# Commands and flags that Craftsman < 5 prompts tell the agent to run and that no longer exist.
+STALE_PROMPT_RE = re.compile(
+    r"review (?:ack|fact)\b|--tier\b|--add-lens\b|--shard\b|--signal\b|skill show code-review"
+)
+STALE_PROMPT_PROBLEM = (
+    "{path} is a prompt of Craftsman before 5.0 (it uses `{marker}`, which was removed); "
+    "run `craftsman install`"
+)
+
+
+def inspect_stale_prompts(workspace: Path | None, home: Path) -> list[str]:
+    """Problems for installed Craftsman commands and agents that still follow the old protocol."""
+    claude, copilot = default_claude_dir(home), default_copilot_home(home)
+    folders = [claude / "commands", claude / "agents", copilot / "agents"]
+    if workspace is not None:
+        folders.append(workspace / ".github" / "agents")
+    problems: list[str] = []
+    for folder in folders:
+        for path in sorted(folder.glob("*craftsman*.md")) if folder.is_dir() else ():
+            try:
+                found = STALE_PROMPT_RE.search(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                continue
+            if found:
+                problems.append(STALE_PROMPT_PROBLEM.format(path=path, marker=found.group(0)))
+    return problems
+
+
 # --- report ---------------------------------------------------------------------------------
 
 
@@ -709,9 +751,9 @@ def _platform_problems(
     copilot: CopilotReport, claude: ClaudeReport, claude_dir: Path | None = None
 ) -> list[str]:
     problems = [
-        f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
+        f"{entry.path}/craft-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
         for entry in copilot.skills
-        if entry.code_review_lenses is False
+        if entry.craft_review_lenses is False
     ]
     hooks = copilot.user_hooks
     if hooks.error is not None:
@@ -801,6 +843,8 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         *inspect_legacy_git_hooks(git.hooks_path, home),
         *inspect_legacy_distribution(),
         *inspect_agy_plugin_duplicate(home),
+        *inspect_leftover_review_skills(workspace, home),
+        *inspect_stale_prompts(workspace, home),
     )
     healthy = (
         skill_count == expected_skills
