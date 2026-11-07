@@ -22,8 +22,8 @@ from craftsman.quality import collect_quality_signals
 from craftsman.review import normalize_round_files, view_slug
 from craftsman.scope import ScopePolicy, evaluate_scope
 
+from tests.ambient import AMBIENT_PLATFORM_ENV_VARS
 from tests.support import (
-    AMBIENT_PLATFORM_ENV_VARS,
     REPO_ROOT,
     CliResult,
     EvidenceRepo,
@@ -1116,7 +1116,8 @@ class ReviewOnlyTests(RepoTestCase):
 
         refused = self.review("check", "--review-only", check=False)
 
-        self.assert_error(refused, 1, "--review-only is not allowed during an active /craftsman gate")
+        self.assert_error(refused, 1, "--review-only is not allowed: this checkout has an active /craftsman gate (")
+        self.assertIn("without --review-only", refused.stderr)
 
 
 class QualityHintTests(RepoTestCase):
@@ -1688,6 +1689,7 @@ class InboxCliTests(FastCliTestCase):
 
         with mock.patch.object(Path, "unlink", self._locked_unlink(locked_inbox)):
             prep = self.cli_fast("review", "prepare")
+            self.repo.cover_all()
             report = self.cli_fast("review", "report", "--review-only")
             reset = self.cli_fast("review", "reset")
             self.assertEqual(self.cli_fast("gate", "--init").code, 0)
@@ -1719,6 +1721,12 @@ class InboxCliTests(FastCliTestCase):
         self.assertIn("Pruned 1 inbox file(s):", next_round.err)
 
         second_orphan = self._new_inbox_path("add")
+        unfinished = self.cli_fast("review", "report", "--review-only")
+        self.assertEqual(unfinished.code, 0)
+        self.assertTrue(second_orphan.is_file(), "a report of an unfinished review prunes nothing")
+        self.assertNotIn("Pruned", unfinished.err)
+
+        self.repo.cover_all()
         report_ro = self.cli_fast("review", "report", "--review-only")
         self.assertEqual(report_ro.code, 0)
         self.assertFalse(second_orphan.exists())

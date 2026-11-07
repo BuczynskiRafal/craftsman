@@ -48,6 +48,7 @@ from craftsman.gatecheck import (
     SlotStatus,
     evaluate,
     hunt_line,
+    hunt_slots,
     large_diff_warning,
     passing_runs,
     render_report,
@@ -114,7 +115,7 @@ from craftsman.records import (
     slot_generation,
 )
 from craftsman.scout import Scout, parse_target
-from craftsman.text import inline_md, one_line
+from craftsman.text import defang_tokens, inline_md, one_line
 from craftsman.usage import usage_json, usage_lines
 from craftsman.workspace import (
     Workspace,
@@ -204,6 +205,7 @@ def _print_empty_prepare(
 
 
 MAX_TASK_CHARS = 4000
+GATE_SESSION_CHARS = 8
 
 
 class CommandRefused(LedgerError):
@@ -348,7 +350,9 @@ def _prepare(args: argparse.Namespace) -> int:
     if result.created or result.raised or result.task_changed or not packet.is_file():
         pctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task)
         _write_text(packet, render_packet(pctx))
-    _print_prepare_summary(result, packet, snap, depth, now)
+    if ws.state is not None and not owned:
+        print(_foreign_gate_note(ws.state))
+    _print_prepare_summary(result, packet, snap, depth, now, check=_check_command(ws))
     _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
     if result.created and not result.raised:
@@ -457,6 +461,23 @@ def _scope_from_hunks(hunks: Sequence[Hunk]) -> tuple[str, ...]:
         if hunk.old_path is not None:
             paths.add(hunk.old_path)
     return tuple(sorted(paths))
+
+
+def _gate_label(state: GateState) -> str:
+    """`claude session 1a2b3c4d`: whose gate it is, as a person can tell sessions apart."""
+    return f"{state.owner.platform} session {(state.owner.session_id or 'unknown')[:GATE_SESSION_CHARS]}"
+
+
+def _foreign_gate_note(state: GateState) -> str:
+    return (
+        f"This checkout has an active /craftsman gate ({_gate_label(state)}); this round follows it. "
+        "For a separate review use its own worktree: git worktree add <path>."
+    )
+
+
+def _check_command(ws: Workspace) -> str:
+    """The command that judges this checkout's review now (see `huntview.check_command`)."""
+    return huntview.check_command(gate_active=ws.state is not None)
 
 
 def _owns_gate(ws: Workspace, env: Mapping[str, str]) -> bool:
@@ -674,8 +695,9 @@ def _packet_context(
     symbols: Mapping[str, tuple[str, ...]],
     *,
     task: str,
+    full_hunks: Sequence[str] = (),
 ) -> PacketContext:
-    """What the packet of `round_` shows."""
+    """What the packet of `round_` shows; `full_hunks` are shown in full even when carried (slice views)."""
     return collect_context(
         ws.root,
         snap,
@@ -684,6 +706,7 @@ def _packet_context(
         symbols=symbols,
         ledger=ledger,
         index=index,
+        full_hunks=full_hunks,
     )
 
 
@@ -712,7 +735,7 @@ def _enforcement_line(round_: Round) -> str:
 
 
 def _print_prepare_summary(
-    result: _Prepared, packet: Path, snap: DiffSnapshot, depth: huntplan.Depth, now: datetime
+    result: _Prepared, packet: Path, snap: DiffSnapshot, depth: huntplan.Depth, now: datetime, *, check: str
 ) -> None:
     round_ = result.round
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
@@ -740,17 +763,17 @@ def _print_prepare_summary(
     warning = large_diff_warning(round_)
     if warning is not None:
         print(f"Warning: {warning}")
-    _print_hunt_plan(result, now)
+    _print_hunt_plan(result, now, check=check)
 
 
-def _print_hunt_plan(result: _Prepared, now: datetime) -> None:
+def _print_hunt_plan(result: _Prepared, now: datetime, *, check: str) -> None:
     """The plan table and what to do next. A re-prepared round shows where each slot stands."""
     round_ = result.round
     statuses = slot_statuses(result.ledger, round_, now)
     print(f"Hunt plan, round {round_.number}:")
     if not statuses:
         print("  (no slot: every hunk is carried over from earlier rounds)")
-        print("Nothing is owed. Run `craftsman review check --review-only` (in a /craftsman gate: `craftsman review check`).")
+        print(f"Nothing is owed. Run `{check}`.")
         return
     for line in huntview.plan_lines(statuses, with_state=not result.created):
         print(line)
@@ -761,13 +784,10 @@ def _print_hunt_plan(result: _Prepared, now: datetime) -> None:
     if running:
         print(f"Running: {', '.join(running)} - do not launch these again; end your turn and wait for their reports.")
     if todo:
-        for line in huntview.launch_lines(todo):
+        for line in huntview.launch_lines(todo, check=check):
             print(line)
     elif not running:
-        print(
-            "Every slot is done. Run `craftsman review check --review-only` "
-            "(in a /craftsman gate: `craftsman review check`)."
-        )
+        print(f"Every slot is done. Run `{check}`.")
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -844,7 +864,7 @@ def _view(args: argparse.Namespace) -> int:
     assigned = _view_hunk_ids(round_, args, files)
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task or ws.task)
+    ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task or ws.task, full_hunks=assigned)
     slug = view_slug(hunks=assigned) if args.hunks is not None else view_slug(files=files or ())
     view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
     _write_text(view_path, render_packet_view(ctx, assigned_hunks=assigned))
@@ -1339,10 +1359,16 @@ def _record_slot_coverage(
         )
     updated, _ = add_coverage(current, chosen, note, hunter=slot.id, by=by)
     digest_of = {ref.id: ref.digest for ref in round_.hunks}
+    # Only what `check` could credit this caller with: records of the slot made since it was planned (a wave
+    # slot ignores coverage recorded before its trigger) and, where the caller can prove who it is, by it.
+    since = parse_timestamp(slot.since) if slot.since is not None else None
     seen = {
         digest
         for item in updated.coverage
-        if item.round == round_.number and item.hunter == slot.id
+        if item.round == round_.number
+        and item.hunter == slot.id
+        and (since is None or parse_timestamp(item.recorded_at) >= since)
+        and (by is None or item.by == by)
         for digest in item.digests
     }
     left = sum(digest_of[hunk_id] not in seen for hunk_id in slot.hunks)
@@ -1350,7 +1376,7 @@ def _record_slot_coverage(
     label = ", ".join(targets if target_kind == "files" else chosen)
     return updated, (
         f"Coverage recorded ({token}) for {slot.id}: {label} in round {round_.number}; "
-        f"slot {slot.id}: {left} hunk(s) left."
+        f"slot {slot.id}: {left} hunk(s) left in your records (`craftsman review check` decides)."
     )
 
 
@@ -1724,14 +1750,15 @@ def _show(args: argparse.Namespace) -> int:
             raise LedgerError("no review round yet; run `craftsman review prepare`")
         print(str(Path(latest.packet_path).resolve()))
         return 0
+    slots = hunt_slots(ledger)
     if args.hunks:
-        missing = uncovered_hunks(ledger, latest) if latest else []
-        return _show_hunks(ws.root, latest, snap, missing, as_json=args.json)
+        return _show_hunks(ws.root, latest, snap, _not_covered(ledger, slots), slots, as_json=args.json)
     if args.json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
-            "coverage": _coverage_json(ledger, latest) if latest else {},
+            "coverage": _coverage_json(ledger, latest, slots) if latest else {},
             "hunks": _hunks_json(ws.root, latest, snap) if latest else [],
+            **({} if slots is None else {"slots": _slots_json(slots)}),
             "findings": [finding.to_json() for finding in ledger.findings],
             "runs": [run.to_json() for run in ledger.runs[-SHOW_RECENT_RUNS:]],
         }
@@ -1743,8 +1770,7 @@ def _show(args: argparse.Namespace) -> int:
         print(_round_line(latest, snap))
         print(f"Packet: {Path(latest.packet_path).resolve()}")
         print()
-        print("Coverage (covered/total non-carried hunks):")
-        print(_coverage_line(ledger, latest))
+        print("\n".join(_progress_lines(ledger, latest, slots)))
     print()
     print("\n".join(_findings_table(ledger.findings)))
     details = _finding_details(ledger.findings)
@@ -1757,20 +1783,27 @@ def _show(args: argparse.Namespace) -> int:
 
 
 def _show_hunks(
-    root: Path, latest: Round | None, snap: DiffSnapshot, missing: Sequence[str], *, as_json: bool
+    root: Path,
+    latest: Round | None,
+    snap: DiffSnapshot,
+    missing: Sequence[str],
+    slots: Sequence[SlotStatus] | None,
+    *,
+    as_json: bool,
 ) -> int:
     if as_json:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
             "stale": bool(latest is not None and latest.fingerprint != snap.fingerprint),
             "hunks": _hunks_json(root, latest, snap, missing) if latest else [],
+            **({} if slots is None else {"slots": _slots_json(slots)}),
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     if latest is None:
         print("No review round yet; run `craftsman review prepare`.")
         return 0
-    print("\n".join(_hunk_map_lines(root, latest, snap, missing)))
+    print("\n".join(_hunk_map_lines(root, latest, snap, missing, slots)))
     return 0
 
 
@@ -1829,10 +1862,13 @@ def _format_span(path: str, start: int, end: int, has_range: bool, *, bare_zero:
     return path if bare_zero else f"{path}:{start}"
 
 
-def _hunk_map_lines(root: Path, round_: Round, snap: DiffSnapshot, missing: Sequence[str]) -> list[str]:
+def _hunk_map_lines(
+    root: Path, round_: Round, snap: DiffSnapshot, missing: Sequence[str], slots: Sequence[SlotStatus] | None = None
+) -> list[str]:
     """One compact `H#  path:start-end  scope|status` line per hunk still to cover, then `N left`.
 
-    A stale round lists its HunkRef fields instead: its coverage no longer matches the code.
+    A stale round lists its HunkRef fields instead: its coverage no longer matches the code. A round judged
+    by slots (`slots` is given) lists, per slot that is not done, the hunks that slot still misses.
     """
     entries = _hunks_json(root, round_, snap)
     if round_.fingerprint != snap.fingerprint:
@@ -1843,13 +1879,30 @@ def _hunk_map_lines(root: Path, round_: Round, snap: DiffSnapshot, missing: Sequ
         ]
         lines.append("stale: run `craftsman review prepare`")
         return lines
-    lines = [
-        f"{e['id']}  "
-        f"{_format_span(e['path'], e['start_line'], e['end_line'], e['end_line'] > 0, bare_zero=True)}  "
-        f"{e['scope'] or e['status']}"
-        for e in entries
-        if e["id"] in missing
-    ]
+    by_id = {e["id"]: e for e in entries}
+
+    def hunk_line(hunk_id: str) -> str:
+        entry = by_id.get(hunk_id)
+        if entry is None:  # a carried hunk that a slot lists: the round keeps no scope for it
+            ref = next(ref for ref in round_.hunks if ref.id == hunk_id)
+            end = ref.new_start + ref.new_len - 1 if ref.new_len > 0 else ref.new_start
+            return f"{hunk_id}  {_format_span(ref.path, ref.new_start, end, ref.new_len > 0)}  [carried]"
+        span = _format_span(entry["path"], entry["start_line"], entry["end_line"], entry["end_line"] > 0, bare_zero=True)
+        return f"{hunk_id}  {span}  {entry['scope'] or entry['status']}"
+
+    if slots is not None:
+        pending = [status for status in slots if status.state != "done"]
+        lines = [
+            line
+            for status in pending
+            for line in (
+                f"{status.slot.id} [{huntview.STATE_LABELS[status.state]}] still misses "
+                f"{huntview.hunk_ranges(status.missing)}:",
+                *(f"  {hunk_line(hunk_id)}" for hunk_id in sorted(status.missing, key=lambda item: int(item[1:]))),
+            )
+        ]
+        return [*lines, f"{len(pending)} slot(s) left to cover" if pending else "0 left to cover: every slot is done"]
+    lines = [hunk_line(e["id"]) for e in entries if e["id"] in missing]
     if not entries:
         return ["(no open hunks)"]
     return [*lines, f"{len(lines)} left to cover" if lines else "0 left to cover: every hunk is covered"]
@@ -1881,7 +1934,15 @@ def _round_json(round_: Round, snap: DiffSnapshot) -> dict[str, Any]:
     }
 
 
-def _coverage_json(ledger: Ledger, round_: Round) -> dict[str, Any]:
+def _coverage_json(ledger: Ledger, round_: Round, slots: Sequence[SlotStatus] | None = None) -> dict[str, Any]:
+    """Hunk coverage of `round_`; for a round judged by `slots`, the slots done and the hunks they still miss."""
+    if slots is not None:
+        return {
+            "unit": "slots",
+            "done": sum(status.state == "done" for status in slots),
+            "total": len(slots),
+            "missing": _slot_missing(slots),
+        }
     missing = uncovered_hunks(ledger, round_)
     total = len(round_.open_hunk_ids)
     return {"covered": total - len(missing), "total": total, "missing": missing}
@@ -1891,6 +1952,31 @@ def _coverage_line(ledger: Ledger, round_: Round) -> str:
     entry = _coverage_json(ledger, round_)
     missing = f" (missing {','.join(entry['missing'])})" if entry["missing"] else ""
     return f"  {entry['covered']}/{entry['total']} hunks{missing}"
+
+
+def _slot_missing(slots: Sequence[SlotStatus]) -> list[str]:
+    """The hunks that some slot still misses, in hunk order."""
+    return sorted({hunk_id for status in slots for hunk_id in status.missing}, key=lambda hunk_id: int(hunk_id[1:]))
+
+
+def _not_covered(ledger: Ledger, slots: Sequence[SlotStatus] | None) -> list[str]:
+    """The hunks of the latest round that are not covered, by the measure that round is judged by.
+
+    `slots` is `hunt_slots(ledger)`. A round judged by slots (enforced, with a plan) lacks the hunks that some
+    slot misses: its hunk coverage proves nothing, since only a slot's own vouched coverage counts. Any other
+    round lacks the hunks that no coverage record names.
+    """
+    if not ledger.rounds:
+        return []
+    return uncovered_hunks(ledger, ledger.rounds[-1]) if slots is None else _slot_missing(slots)
+
+
+def _progress_lines(ledger: Ledger, round_: Round, slots: Sequence[SlotStatus] | None) -> list[str]:
+    """How far the latest round is, as the gate counts it (see `_not_covered`)."""
+    if slots is None:
+        return ["Coverage (covered/total non-carried hunks):", _coverage_line(ledger, round_)]
+    missing = ", ".join(_slot_missing(slots)) or "none"
+    return [hunt_line(slots), f"Hunks still missing from some slot: {missing}"]
 
 
 def _findings_table(findings: Sequence[Finding]) -> list[str]:
@@ -1922,12 +2008,18 @@ def _finding_details(findings: Sequence[Finding]) -> list[str]:
 
 
 def _flat(text: str) -> str:
-    return " ".join(text.split())
+    """Prose on one line, unable to pass for the output of a recording command (see `defang_tokens`)."""
+    return " ".join(defang_tokens(text).split())
 
 
 def _cell(text: str) -> str:
-    """Text safe for one Markdown table cell: pipes escaped, line breaks flattened."""
-    return inline_md(text, table=True)
+    """Text safe for one Markdown table cell: pipes escaped, line breaks flattened, record shapes defanged."""
+    return defang_tokens(inline_md(text, table=True))
+
+
+def _prose(text: str) -> str:
+    """Stored prose inline in Markdown, unable to pass for the output of a recording command."""
+    return defang_tokens(inline_md(text))
 
 
 def _run_lines(runs: Sequence[Run], snap: DiffSnapshot) -> list[str]:
@@ -1948,8 +2040,8 @@ def _evaluate(
 ) -> tuple[Ledger, DiffSnapshot, bool, GateReport]:
     if review_only and ws.state is not None:
         raise LedgerError(
-            "--review-only is not allowed during an active /craftsman gate session; "
-            "in /craftsman the full gate applies (run `craftsman review check` without --review-only)"
+            f"--review-only is not allowed: this checkout has an active /craftsman gate ({_gate_label(ws.state)}); "
+            "the full gate applies to every review command here (run `craftsman review check` without --review-only)"
         )
     ledger = _with_due_waves(ws)
     deep = effective_deep(ledger, ws.state is not None and ws.state.deep)
@@ -2042,19 +2134,25 @@ def _report_json(report: GateReport, ledger: Ledger, *, abandoned: bool = False)
 
 
 def _report(args: argparse.Namespace) -> int:
+    ws = open_workspace(args.cwd)
     if args.partial and not args.review_only:
+        if ws.state is not None:
+            raise LedgerError(
+                f"--partial is for a review-only report, which is refused here: this checkout has an active "
+                f"/craftsman gate ({_gate_label(ws.state)}); run `craftsman review report`"
+            )
         raise LedgerError(
             "--partial requires --review-only; pass `craftsman review report --review-only --partial`"
         )
-    ws = open_workspace(args.cwd)
     sync_antigravity_runs(ws, os.environ)
     ledger, snap, deep, report = _evaluate(ws, review_only=args.review_only)
     if args.partial:
-        _require_hunters_launched(ledger)
+        _require_hunters_launched(ws, ledger)
         report = replace(report, partial=True)
     abandoned = _abandoned(ws, ledger, report)
     groups = _finding_groups(ledger.findings)
     runs = passing_runs(ledger, snap.fingerprint)
+    slots = hunt_slots(ledger)
     if args.json:
         payload = {
             **_report_json(report, ledger, abandoned=abandoned),
@@ -2062,7 +2160,7 @@ def _report(args: argparse.Namespace) -> int:
             "rounds": len(ledger.rounds),
             "base_sha": snap.base_sha,
             "diff": {"files": len(snap.files), "added": snap.added, "deleted": snap.deleted},
-            "not_covered": _not_covered(ledger),
+            "not_covered": _not_covered(ledger, slots),
             "findings": {name: [f.to_json() for f in items] for name, items in groups.items()},
             "runs": [run.to_json() for run in runs],
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
@@ -2070,11 +2168,13 @@ def _report(args: argparse.Namespace) -> int:
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
-        print("\n".join(_report_lines(ledger, snap, deep, report, groups, runs, abandoned=abandoned)))
+        print("\n".join(_report_lines(ledger, snap, deep, report, groups, runs, slots, abandoned=abandoned)))
         _warn_new_out_of_scope(ws, ledger)
-    if args.partial:
-        _end_guard_of_caller(ws, os.environ)  # the caller chose to end this review with what it has
-    if args.review_only:
+    if args.review_only and report.passed:
+        # Only a review that passed is over. A report of an unfinished one ends nothing: pruning would delete the
+        # repro scripts and inbox files of work in progress, and ending the guard would let a session out of an
+        # enforced review (`--partial` after one hunter is not a way out; the guard has its own exits).
+        _end_guard_of_caller(ws, os.environ)
         prune_all_temp_dirs(ws.ledger_path.parent)
     return 0
 
@@ -2089,7 +2189,7 @@ def _end_guard_of_caller(ws: Workspace, env: Mapping[str, str]) -> None:
     end_review_guard(ws.ledger_path, caller if caller.session_id is not None else None)
 
 
-def _require_hunters_launched(ledger: Ledger) -> None:
+def _require_hunters_launched(ws: Workspace, ledger: Ledger) -> None:
     """A partial report of an enforced round needs at least one hunter launched in it (a claim or a start/stop).
 
     Otherwise nothing was reviewed independently and `--partial` would only be a way out of the review.
@@ -2110,7 +2210,11 @@ def _require_hunters_launched(ledger: Ledger) -> None:
         for status in slot_statuses(ledger, latest, datetime.now(timezone.utc))
         if status.state != "done"
     ]
-    launch = "\n".join(huntview.launch_lines(pending)) if pending else "Run `craftsman review prepare`."
+    launch = (
+        "\n".join(huntview.launch_lines(pending, check=_check_command(ws)))
+        if pending
+        else "Run `craftsman review prepare`."
+    )
     raise CommandRefused(
         f"no Craftsman hunter was launched for round {latest.number}, so a partial report would describe a diff "
         f"nobody reviewed. Launch the hunters first.\n{launch}"
@@ -2163,22 +2267,20 @@ def _report_status_line(report: GateReport) -> str:
     line = f"- {subject}: {report.status_label}"
     if report.passed:
         return line
+    # The check that judges what the report just judged (a review-only report is never made under a gate).
     check = (
-        "craftsman review check --review-only"
-        if report.review_only or report.partial
-        else "craftsman review check"
+        huntview.REVIEW_ONLY_CHECK_COMMAND if report.review_only or report.partial else huntview.CHECK_COMMAND
     )
     return f"{line} — {report.issue_codes}; see `{check}`"
 
 
-def _not_covered(ledger: Ledger) -> list[str]:
-    return uncovered_hunks(ledger, ledger.rounds[-1]) if ledger.rounds else []
-
-
-def _not_covered_lines(ledger: Ledger, snap: DiffSnapshot, report: GateReport) -> list[str]:
-    missing = _not_covered(ledger)
+def _not_covered_lines(
+    ledger: Ledger, snap: DiffSnapshot, report: GateReport, slots: Sequence[SlotStatus] | None
+) -> list[str]:
+    missing = _not_covered(ledger, slots)
     if missing:
-        return ["", "## Not covered", f"- Hunks: {', '.join(missing)}"]
+        what = "Hunks" if slots is None else "Hunks still missing from some slot"
+        return ["", "## Not covered", f"- {what}: {', '.join(missing)}"]
     if report.partial and not ledger.rounds and not snap.is_empty:
         return ["", "## Not covered", "- No review round prepared yet."]
     return []
@@ -2194,20 +2296,20 @@ def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> l
     if not ledger.findings:
         return ["No findings recorded."]
     detail: dict[str, Callable[[Finding], str]] = {
-        "fixed": lambda f: f"Fix: {inline_md(f.resolution_note)}",
-        "accepted": lambda f: f"Accepted because: {inline_md(f.resolution_note)}",
+        "fixed": lambda f: f"Fix: {_prose(f.resolution_note)}",
+        "accepted": lambda f: f"Accepted because: {_prose(f.resolution_note)}",
         "open": lambda f: (
             f"Verdict: {f.verdict}" if f.verdict is not None else "Verdict: none yet (unverified)"
         ),
-        "question": lambda f: f"Question: {inline_md(f.verdict_evidence)}",
-        "dismissed": lambda f: f"Dismissed: {inline_md(f.verdict_evidence)}",
+        "question": lambda f: f"Question: {_prose(f.verdict_evidence)}",
+        "dismissed": lambda f: f"Dismissed: {_prose(f.verdict_evidence)}",
     }
     lines: list[str] = []
     for name, items in groups.items():
         if items:
             lines.append(f"**{name.capitalize()} ({len(items)})**")
             lines.extend(
-                f"- {f.id} · {f.severity} · `{f.path}:{f.line}` — {inline_md(f.title)}. {detail[name](f)}"
+                f"- {f.id} · {f.severity} · `{f.path}:{f.line}` — {_prose(f.title)}. {detail[name](f)}"
                 for f in items
             )
     return lines
@@ -2215,16 +2317,18 @@ def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> l
 
 def _not_assessed_lines(report: GateReport) -> list[str]:
     if report.self_reviewed:
-        isolation = SELF_REVIEWED_BANNER
+        isolation = f"Reviewer isolation status: {SELF_REVIEWED_BANNER}."
+    elif report.passed:
+        isolation = "Reviewer isolation status: verified via subagent stop events in the ledger."
     else:
-        isolation = "verified via subagent stop events in the ledger"
+        isolation = "Reviewer isolation: not established yet (review incomplete)."
     return [
         "",
         "## Not assessed by the gate",
         "- Business requirements fit and domain behavior not exercised by recorded runs.",
         "- Naming quality and domain clarity.",
         "- Architecture and invariants outside the changed files.",
-        f"- Reviewer isolation status: {isolation}.",
+        f"- {isolation}",
     ]
 
 
@@ -2241,7 +2345,7 @@ def _waived_run_lines(ledger: Ledger) -> list[str]:
         "",
         "## Waived runs",
         *(
-            f"- {run.id} `{run.command}` ({run.kind}, exit {run.exit_code}) — {inline_md(waiver.reason)}"
+            f"- {run.id} `{run.command}` ({run.kind}, exit {run.exit_code}) — {_prose(waiver.reason)}"
             for run, waiver in waived
         ),
     ]
@@ -2254,6 +2358,7 @@ def _report_lines(
     report: GateReport,
     groups: dict[str, list[Finding]],
     runs: Sequence[Run],
+    slots: Sequence[SlotStatus] | None,
     *,
     abandoned: bool = False,
 ) -> list[str]:
@@ -2272,7 +2377,7 @@ def _report_lines(
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
         *_hunt_report_lines(report),
-        *_not_covered_lines(ledger, snap, report),
+        *_not_covered_lines(ledger, snap, report, slots),
         "",
         "## Findings",
         *_report_finding_lines(ledger, groups),
@@ -2524,12 +2629,18 @@ def _add_inspection_parsers(sub: Any, common: argparse.ArgumentParser) -> None:
         sub.choices[name].add_argument(
             "--review-only",
             action="store_true",
-            help="Check only review completeness (round, coverage, verdicts), without requiring fixes or test runs",
+            help=(
+                "Check only review completeness (round, coverage, verdicts), without requiring fixes or test runs; "
+                "refused while a /craftsman gate is active in the checkout"
+            ),
         )
     sub.choices["report"].add_argument(
         "--partial",
         action="store_true",
-        help="Render a partial review-only report when some hunks or verdicts could not be completed",
+        help=(
+            "Print a partial review-only report when some hunks or verdicts could not be completed. It ends "
+            "nothing: the review guard stays armed and scratch/inbox files are kept until the review passes"
+        ),
     )
     reset = sub.add_parser("reset", parents=[common], help="Archive the ledger and packets")
     reset.set_defaults(handler=_reset)

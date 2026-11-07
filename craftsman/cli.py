@@ -19,6 +19,7 @@ from craftsman.doctor import run_doctor
 from craftsman.export import main as export_main
 from craftsman.gate import GateState, GateStateError, load_state, state_path_for
 from craftsman.gate import main as gate_main
+from craftsman.gatecheck import hunt_slots
 from craftsman.generated import ExportError
 from craftsman.hooks import main as hook_main
 from craftsman.install import install_main
@@ -60,12 +61,21 @@ class Coverage:
 
 
 @dataclass(frozen=True)
+class Hunt:
+    """Progress of a round judged by its hunt slots (an enforced round with a plan)."""
+
+    done: int
+    total: int
+
+
+@dataclass(frozen=True)
 class LedgerOverview:
     """A compact summary of the evidence ledger for `craftsman status`."""
 
     rounds: int
     deep: bool
-    coverage: Coverage | None
+    coverage: Coverage | None  # the latest round's hunk coverage; None for no round or a round judged by slots
+    hunt: Hunt | None  # the latest round's slots done; None unless it is judged by slots
     findings: int
     verdicts: dict[str, int]
     resolved: int
@@ -75,8 +85,11 @@ class LedgerOverview:
     @classmethod
     def of(cls, ledger: Ledger) -> LedgerOverview:
         latest = ledger.rounds[-1] if ledger.rounds else None
-        coverage = None
-        if latest is not None:
+        coverage, hunt = None, None
+        slots = hunt_slots(ledger)
+        if slots is not None:
+            hunt = Hunt(sum(status.state == "done" for status in slots), len(slots))
+        elif latest is not None:
             total = len(latest.open_hunk_ids)
             coverage = Coverage(total - len(uncovered_hunks(ledger, latest)), total)
         verdicts = dict.fromkeys((*VERDICTS, "none"), 0)
@@ -86,6 +99,7 @@ class LedgerOverview:
             rounds=len(ledger.rounds),
             deep=latest is not None and latest.deep,
             coverage=coverage,
+            hunt=hunt,
             findings=len(ledger.findings),
             verdicts=verdicts,
             resolved=sum(finding.resolution is not None for finding in ledger.findings),
@@ -96,8 +110,19 @@ class LedgerOverview:
             agent_usage=usage_json(ledger),
         )
 
+    def __post_init__(self) -> None:
+        progress_given = (self.coverage is not None) + (self.hunt is not None)
+        if progress_given != (1 if self.rounds else 0):
+            raise ValueError("a ledger with rounds has exactly one of coverage and hunt; one without has neither")
+
+    def _progress(self) -> str:
+        if self.hunt is not None:
+            return f"hunt {self.hunt.done}/{self.hunt.total} slots done"
+        assert self.coverage is not None  # guaranteed by __post_init__
+        return f"coverage {self.coverage.covered}/{self.coverage.total} hunks"
+
     def describe(self) -> str:
-        if self.coverage is None:
+        if self.rounds == 0:
             return "no review round yet (`craftsman review prepare`)"
         verdicts = ", ".join(
             f"{'no verdict' if name == 'none' else name} {count}"
@@ -105,8 +130,7 @@ class LedgerOverview:
         )
         runs = ", ".join(f"{run.id} {run.kind} exit {run.exit_code}" for run in self.latest_runs)
         return (
-            f"{self.rounds} round(s){', deep' if self.deep else ''}, coverage "
-            f"{self.coverage.covered}/{self.coverage.total} hunks; findings {self.findings} ({verdicts}, "
+            f"{self.rounds} round(s){', deep' if self.deep else ''}, {self._progress()}; findings {self.findings} ({verdicts}, "
             f"resolved {self.resolved}); latest runs: {runs or 'none'}{usage_summary(self.agent_usage)}"
         )
 

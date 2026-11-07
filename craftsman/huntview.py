@@ -6,21 +6,19 @@ whole instruction of one hunter (or of a verifier) and is the only thing its lau
 
 from __future__ import annotations
 
-import re
 from collections.abc import Sequence
 
 from craftsman.gatecheck import SlotState, SlotStatus
 from craftsman.records import Finding, Round, Slot
+from craftsman.text import defang_tokens
 
 LAUNCH_PROMPT = "You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly."
 LAUNCH_MECHANICS = (
     "Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer.",
     "Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.",
 )
-WAIT_AND_CHECK = (
-    "Then end your turn while they run. When they report back, run `craftsman review check --review-only`",
-    "(in a /craftsman gate: `craftsman review check`) and do exactly what it lists.",
-)
+CHECK_COMMAND = "craftsman review check"
+REVIEW_ONLY_CHECK_COMMAND = "craftsman review check --review-only"
 PLATFORM_LABELS = {
     "claude": "Claude Code",
     "copilot": "Copilot",
@@ -49,20 +47,24 @@ KIND_LINES = {
 }
 NO_TASK_TEXT = "(no task text recorded)"
 MAX_BRIEF_SCENARIO_CHARS = 1200
-# `recorded (C4)`, `issued (B2)`, `recorded (`: the shapes a recording command prints, which a transcript
-# reader takes for the proof of a record.
-_RECORD_SHAPE_RE = re.compile(r"\b(recorded|issued)\s*\(([^()]*)\)")
-_OPEN_RECORD_SHAPE_RE = re.compile(r"\b(recorded|issued)\s*\(")
 
 
-def _plain(text: str) -> str:
-    """`text` from the ledger or the user, made unable to pass for the output of a recording command.
+def check_command(*, gate_active: bool) -> str:
+    """The command that judges the review the state of this checkout accepts.
 
-    A brief echoes free text (the task, a finding's title and scenario). A reader of the transcript that
-    finds `Coverage recorded (C7)` in it would take a record to have been made, or give up reading
-    the transcript, so the shapes are rewritten with square brackets.
+    Inside a `/craftsman` gate the full gate applies and `--review-only` is refused; outside one, the
+    review-only check is the one that asks for nothing but the review. Every line that tells the reader what
+    to run next asks this function.
     """
-    return _OPEN_RECORD_SHAPE_RE.sub(r"\1 [", _RECORD_SHAPE_RE.sub(r"\1 [\2]", text))
+    return CHECK_COMMAND if gate_active else REVIEW_ONLY_CHECK_COMMAND
+
+
+def wait_and_check(check: str) -> tuple[str, ...]:
+    """The last lines of the launch block: end the turn, then run `check` and do what it lists."""
+    return (
+        "Then end your turn while they run. When they report back, run "
+        f"`{check}` and do exactly what it lists.",
+    )
 
 
 # --- hunks and slots -------------------------------------------------------------------------
@@ -118,15 +120,15 @@ def _row_note(status: SlotStatus, *, with_state: bool) -> str:
     return " ".join(notes)
 
 
-def launch_lines(slot_ids: Sequence[str]) -> list[str]:
-    """The block that tells the orchestrator to launch `slot_ids` now, all in one step."""
+def launch_lines(slot_ids: Sequence[str], *, check: str) -> list[str]:
+    """The block that tells the orchestrator to launch `slot_ids` now, all in one step, then run `check`."""
     noun = "hunter" if len(slot_ids) == 1 else "hunters"
     return [
         f"Launch {'all ' if len(slot_ids) > 1 else ''}{len(slot_ids)} {noun} now, in one step. "
         "Each is a craftsman-reviewer subagent whose whole prompt is:",
         f"  {LAUNCH_PROMPT}",
         *(f"  {line}" for line in LAUNCH_MECHANICS),
-        *WAIT_AND_CHECK,
+        *wait_and_check(check),
     ]
 
 
@@ -167,7 +169,7 @@ def hunter_brief(
         " to other hunters.",
         KIND_LINES[slot.kind],
         "",
-        f"Task: {_plain(round_.task.strip()) or NO_TASK_TEXT}",
+        f"Task: {defang_tokens(round_.task.strip()) or NO_TASK_TEXT}",
         f"Base ref: {round_.base_sha}",
         "",
         f"Your slice is {len(slot.hunks)} hunk(s), {slot.changed_lines} changed lines: {ranges}. Read only your slice:",
@@ -212,13 +214,13 @@ def _wave_lines(slot: Slot, trigger: Finding | None) -> list[str]:
         return []
     lines = [""]
     if trigger is not None:
-        scenario = _plain(" ".join(trigger.scenario.split())[:MAX_BRIEF_SCENARIO_CHARS])
+        scenario = defang_tokens(" ".join(trigger.scenario.split())[:MAX_BRIEF_SCENARIO_CHARS])
         lines.append(
-            f"The defect: {trigger.id} ({trigger.severity}, lens {trigger.lens}) at {_plain(trigger.path)}:"
-            f"{trigger.line} - {_plain(trigger.title)}. Scenario: {scenario}"
+            f"The defect: {trigger.id} ({trigger.severity}, lens {trigger.lens}) at {defang_tokens(trigger.path)}:"
+            f"{trigger.line} - {defang_tokens(trigger.title)}. Scenario: {scenario}"
         )
     else:
-        lines.append(f"The defect: {_plain(str(slot.trigger))}; `craftsman review show` has its details.")
+        lines.append(f"The defect: {defang_tokens(str(slot.trigger))}; `craftsman review show` has its details.")
     lines.append(
         "Hunt the same root cause across the diff and the code it touches: the same mistake in other places,"
         " callers that depend on it, and the same pattern in sibling functions."
@@ -238,16 +240,16 @@ def verifier_brief(
         f"You are an independent Craftsman verifier for {ids}. You did not write this code and you did not hunt"
         " these findings: be skeptical in both directions.",
         "",
-        f"Task: {_plain(task.strip()) or NO_TASK_TEXT}",
+        f"Task: {defang_tokens(task.strip()) or NO_TASK_TEXT}",
         f"Base ref: {base_sha}" + (f" (round {round_.number})" if round_ is not None else ""),
         "",
         "Findings to judge:",
     ]
     for finding in findings:
-        scenario = _plain(" ".join(finding.scenario.split())[:MAX_BRIEF_SCENARIO_CHARS])
+        scenario = defang_tokens(" ".join(finding.scenario.split())[:MAX_BRIEF_SCENARIO_CHARS])
         lines += [
-            f"- {finding.id} ({finding.severity}, lens {finding.lens}) {_plain(finding.path)}:{finding.line}"
-            f" - {_plain(finding.title)}",
+            f"- {finding.id} ({finding.severity}, lens {finding.lens}) {defang_tokens(finding.path)}:{finding.line}"
+            f" - {defang_tokens(finding.title)}",
             f"  Scenario: {scenario}",
         ]
     lines += [

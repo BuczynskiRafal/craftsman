@@ -40,7 +40,7 @@ from craftsman.records import (
     agent_role,
     parse_timestamp,
 )
-from craftsman.text import inline_md
+from craftsman.text import defang_tokens, inline_md
 from craftsman.triviality import command_without_env, is_trivial_run
 
 IssueCode = Literal[
@@ -202,7 +202,6 @@ def evaluate(
         summary = f"Nothing to review: the work tree matches base {snap.base_sha[:12]}."
         issues = () if review_only else tuple(_unresolved_issues(ledger, snap))
         return GateReport(issues, (), summary, review_only=review_only)
-    latest = ledger.rounds[-1] if ledger.rounds else None
     fix_and_test = (
         ()
         if review_only
@@ -213,13 +212,7 @@ def evaluate(
         )
     )
     moment = _utc(now)
-    if latest is not None and latest.plan is not None and latest.enforced:
-        planned = plan_due_waves(ledger, moment)  # in memory only: the due wave is judged, not stored
-        latest = planned.rounds[-1]
-    else:
-        planned = ledger
-    runs = agent_runs(ledger) if latest is not None and latest.plan is not None else ()
-    state = _hunt_state(planned, latest, moment, runs) if latest is not None and latest.plan is not None else None
+    latest, runs, state = _judged_hunt(ledger, moment)
     slots = state.statuses if state is not None else ()
     if latest is not None and state is not None and latest.enforced:
         round_issues = _round_issues(ledger, snap)
@@ -257,6 +250,40 @@ def evaluate(
         self_reviewed=self_reviewed,
         slots=slots,
     )
+
+
+def _judged_hunt(
+    ledger: Ledger, moment: datetime
+) -> tuple[Round | None, Sequence[AgentRun], _HuntState | None]:
+    """The latest round as `evaluate` judges it (with its due wave planned in memory), the agent runs and the hunt state.
+
+    The one place that decides which slots a round has: for an enforced round with a plan the waves that are
+    due are planned in memory (`evaluate` never writes), so the slots of a wave that is not stored yet count.
+    The state is None for a round without a plan.
+    """
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    if latest is None or latest.plan is None:
+        return latest, (), None
+    planned = plan_due_waves(ledger, moment) if latest.enforced else ledger
+    latest = planned.rounds[-1]
+    runs = agent_runs(ledger)
+    return latest, runs, _hunt_state(planned, latest, moment, runs)
+
+
+def hunt_slots(ledger: Ledger, now: datetime | None = None) -> tuple[SlotStatus, ...] | None:
+    """The slots the latest round is judged by, as `evaluate` sees them, or None when it is not judged by slots.
+
+    A round is judged by slots when it is enforced and has a plan; every other round (advisory, or without a
+    plan) is judged by its hunk coverage. Slots a due wave would add are included although the stored plan does
+    not hold them yet, exactly as in `evaluate`. Every display that reports the progress of the latest round
+    asks this, so that none of them claims a coverage the gate does not accept.
+    """
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    if latest is None or latest.plan is None or not latest.enforced:
+        return None
+    state = _judged_hunt(ledger, _utc(now))[2]
+    assert state is not None  # the round has a plan
+    return state.statuses
 
 
 def require_current_round(ledger: Ledger, snap: DiffSnapshot) -> Round:
@@ -314,7 +341,7 @@ def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
     return [
         GateIssue(
             "no-verdict",
-            f"Finding {finding.id} ({finding.severity}: {inline_md(finding.title)}) has no verdict; verify it "
+            f"Finding {finding.id} ({finding.severity}: {defang_tokens(inline_md(finding.title))}) has no verdict; verify it "
             f"independently and run `craftsman review verdict {finding.id} "
             '--as proven|probable|question|dismissed --evidence "..."`.',
         )
@@ -778,7 +805,7 @@ def _verification_issues(ledger: Ledger, round_: Round, runs: Sequence[AgentRun]
 def _unresolved_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
     issues: list[GateIssue] = []
     for finding in ledger.findings:
-        label = f"Finding {finding.id} ({finding.severity}: {inline_md(finding.title)})"
+        label = f"Finding {finding.id} ({finding.severity}: {defang_tokens(inline_md(finding.title))})"
         if finding.verdict in ("proven", "probable") and finding.resolution is None:
             alternative = "" if finding.severity == "blocker" else ' (or `--as accepted --note "why"`)'
             issues.append(
@@ -1207,6 +1234,8 @@ def render_next_actions(issues: Sequence[GateIssue], *, max_items: int = MAX_NEX
 
 def hunt_line(slots: Sequence[SlotStatus]) -> str:
     """`Hunt: 5 slots - 3 done, 1 running (W1-4), 1 pending (W2-X1)`; stopped hunters are listed too."""
+    if not slots:
+        return "Hunt: no slots"
     parts: list[str] = []
     done = sum(status.state == "done" for status in slots)
     if done:

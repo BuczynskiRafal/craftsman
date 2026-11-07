@@ -8,8 +8,10 @@ gate (`craftsman review check`), at most `MAX_CONTINUATIONS` times in a row with
 `craftsman gate --complete` closes the gate, which is the only enforcement on platforms without
 stop hooks.
 
-Each gate belongs to the agent session that opened it (`GateOwner`), so a parallel session in the
-same checkout neither triggers nor changes it.
+Each gate belongs to the agent session that opened it (`GateOwner`): its Stop hooks hold only that
+owner, and only the owner raises or closes it. Every review command in the checkout follows the active
+gate whoever runs it (one evidence ledger per checkout, and an Antigravity hunter is a conversation of its
+own, never the owner), so parallel work in one checkout needs separate worktrees.
 """
 
 from __future__ import annotations

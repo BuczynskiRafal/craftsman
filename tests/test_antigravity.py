@@ -247,8 +247,18 @@ class ReviewerRecordTests(AntigravityTestCase):
         self.stop()
         self.assertEqual(len(self.reviewer_stops()), 1)
 
+    def record_evidence_before_the_gate(self) -> None:
+        """A full review recorded by a session no gate governed: a gate that proved isolation enforces every round after it."""
+        state_file = state_path_for(self.repo.root)
+        saved = state_file.read_bytes()
+        state_file.unlink()
+        try:
+            self.repo.record_full_evidence()
+        finally:
+            state_file.write_bytes(saved)
+
     def test_recorded_reviewer_proves_an_isolated_review(self) -> None:
-        self.repo.record_full_evidence()
+        self.record_evidence_before_the_gate()
         self.write_transcript(
             user_input(1, "go"),
             invoke_subagent(2, REVIEWER),
@@ -262,7 +272,7 @@ class ReviewerRecordTests(AntigravityTestCase):
         self.assertEqual(state.stage, Stage.COMPLETED)
 
     def test_review_without_a_recorded_reviewer_is_not_isolated(self) -> None:
-        self.repo.record_full_evidence()
+        self.record_evidence_before_the_gate()
         self.write_transcript(user_input(1, "go"))
         answer, _ = self.stop()
         self.assertEqual(answer["decision"], "continue")

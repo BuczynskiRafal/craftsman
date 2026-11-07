@@ -9,6 +9,8 @@ import os
 import shutil
 import tempfile
 
+from tests.ambient import AMBIENT_PLATFORM_ENV_VARS
+
 _HOME = tempfile.mkdtemp(prefix="craftsman-tests-home-")
 atexit.register(shutil.rmtree, _HOME, ignore_errors=True)
 os.environ.update(
@@ -19,14 +21,7 @@ os.environ.update(
         "GIT_CONFIG_NOSYSTEM": "1",
     }
 )
-# The platform markers hooks read to tell which agent runs them; tests set the one they need.
-for _variable in (
-    "XDG_CONFIG_HOME",
-    "APPDATA",
-    "CRAFTSMAN_HOME",
-    "CLAUDECODE",
-    "VSCODE_PID",
-    "TERM_PROGRAM",
-    "AGY_MANAGED_ENV",
-):
+# The platform markers hooks read to tell which agent runs them (the shared list, so that a test run started
+# from inside an agent session sees none of them); tests set the ones they need.
+for _variable in (*sorted(AMBIENT_PLATFORM_ENV_VARS), "XDG_CONFIG_HOME", "APPDATA", "CRAFTSMAN_HOME"):
     os.environ.pop(_variable, None)

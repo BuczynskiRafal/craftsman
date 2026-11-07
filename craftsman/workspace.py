@@ -212,12 +212,14 @@ def review_enforcement(
 ) -> tuple[bool, str]:
     """Whether the hooks hold this review to its hunt plan, and the platform that serves it.
 
-    Enforced when (a) the caller owns an active gate whose platform proved isolation, or (b) a guarding
-    review marker was touched within `MARKER_FRESH_FOR` of `now` (by the PreToolUse hook of this very
-    command), or (c) the latest round was enforced, which is sticky: a review does not become advisory
-    because a later command ran without a hook. Otherwise the round is advisory: `(False, "cli")`.
+    Enforced when (a) the checkout has an active gate whose platform proved isolation, whoever runs the
+    command: one gate governs the review of its checkout (the ledger is shared), and on Antigravity every
+    hunter is a conversation of its own and never the gate's owner; the platform is the owner's. Or (b) a
+    guarding review marker was touched within `MARKER_FRESH_FOR` of `now` (by the PreToolUse hook of this
+    very command), or (c) the latest round was enforced, which is sticky: a review does not become
+    advisory because a later command ran without a hook. Otherwise the round is advisory: `(False, "cli")`.
     """
-    if ws.state is not None and ws.state.required_isolation != "none" and ws.owns_gate(env):
+    if ws.state is not None and ws.state.required_isolation != "none":
         return True, ws.state.owner.platform
     marker = read_marker(ws.ledger_path)
     if marker is not None and marker.guarding and marker.platform in HOOKED_PLATFORMS and _just_touched(marker, now):

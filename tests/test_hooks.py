@@ -894,11 +894,17 @@ class SubagentTests(HookTestCase):
 
         self.assertNotIn("usage", event)
 
-    def test_an_unreadable_agent_transcript_never_fails_the_stop(self) -> None:
-        for broken in (str(self.root / "missing.jsonl"), str(self.root)):
-            with self.subTest(path=broken):
-                event = self.stop_recording_coverage(agent_transcript_path=broken)
-                self.assertNotIn("usage", event)
+    # One test per path: once a hook proved isolation, a later `prepare` of the same checkout is enforced
+    # and would no longer take the untagged coverage `stop_recording_coverage` records.
+    def test_a_missing_agent_transcript_never_fails_the_stop(self) -> None:
+        event = self.stop_recording_coverage(agent_transcript_path=str(self.root / "missing.jsonl"))
+
+        self.assertNotIn("usage", event)
+
+    def test_an_agent_transcript_that_is_a_directory_never_fails_the_stop(self) -> None:
+        event = self.stop_recording_coverage(agent_transcript_path=str(self.root))
+
+        self.assertNotIn("usage", event)
 
     def test_a_telemetry_crash_never_fails_the_stop(self) -> None:
         with mock.patch("craftsman.hooks.read_transcript", side_effect=RuntimeError("boom")):

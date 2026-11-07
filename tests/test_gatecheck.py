@@ -21,6 +21,7 @@ from craftsman.gatecheck import (
     SlotStatus,
     evaluate,
     format_blocker_summary,
+    hunt_slots,
     passing_runs,
     render_next_actions,
     render_report,
@@ -1199,6 +1200,43 @@ class WaveSlotTests(unittest.TestCase):
         early = hunted(ledger, "W2-X1", "h2", 10, 60)
 
         self.assertEqual(statuses(early, 200)["W2-X1"].state, "dead")
+
+
+class HuntSlotsTests(unittest.TestCase):
+    """`hunt_slots` is what every display asks: the slots `evaluate` judges, or None for a hunk-judged round."""
+
+    def test_only_an_enforced_round_with_a_plan_is_judged_by_slots(self) -> None:
+        plain, _ = prepared(hunt_snap())
+
+        self.assertIsNone(hunt_slots(Ledger()))
+        self.assertIsNone(hunt_slots(plain))
+        self.assertIsNone(hunt_slots(hunt("W1-1", enforced=False)))
+        self.assertIsNotNone(hunt_slots(hunt("W1-1")))
+
+    def test_they_are_the_slots_the_report_carries(self) -> None:
+        ledger = hunted(hunt("W1-1", "W1-2"), "W1-1", "h1", 10, 60)
+
+        shown = hunt_slots(ledger, moment(100))
+
+        assert shown is not None
+        self.assertEqual(shown, check(ledger).slots)
+        self.assertEqual([(item.slot.id, item.state) for item in shown], [("W1-1", "done"), ("W1-2", "unlaunched")])
+
+    def test_a_round_with_a_plan_and_no_slot_has_an_empty_tuple_not_none(self) -> None:
+        self.assertEqual(hunt_slots(hunt()), ())
+
+    def test_a_wave_that_is_due_but_not_stored_is_in_them_exactly_as_in_the_report(self) -> None:
+        ledger = with_findings(hunt("W1-1", count=1), ("major", "f1.py", "contracts"))
+        ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(5), None))
+        ledger = hunted(ledger, "W1-1", "h1", 10, 60)
+        stored = [slot.id for slot in required_slots(ledger, ledger.rounds[-1])]
+
+        shown = hunt_slots(ledger, moment(100))
+
+        assert shown is not None
+        self.assertEqual(stored, ["W1-1"])
+        self.assertGreater(len(shown), 1)
+        self.assertEqual(shown, check(ledger, snap=hunt_snap(1)).slots)
 
 
 class EnforcedIssueTests(unittest.TestCase):

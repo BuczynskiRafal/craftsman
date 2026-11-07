@@ -121,7 +121,7 @@ class PartialReportCliTests(_RepoTestCase):
 
         proc = self.review("report", "--review-only", "--partial", check=False)
 
-        assert_cli_error(self, proc, 1, "--review-only is not allowed during an active /craftsman gate")
+        assert_cli_error(self, proc, 1, "--review-only is not allowed: this checkout has an active /craftsman gate (")
 
     def test_review_check_is_unchanged(self) -> None:
         self.repo.write("cart.py", BUGGY_CART)

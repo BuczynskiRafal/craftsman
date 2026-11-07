@@ -67,15 +67,29 @@ class PlanLinesTests(unittest.TestCase):
 
 
 class LaunchLinesTests(unittest.TestCase):
+    CHECK = "craftsman review check --review-only"
+
     def test_several_hunters_are_launched_all_in_one_step(self) -> None:
-        text = "\n".join(huntview.launch_lines(["W1-1", "W1-2"]))
+        text = "\n".join(huntview.launch_lines(["W1-1", "W1-2"], check=self.CHECK))
 
         self.assertIn("Launch all 2 hunters now, in one step.", text)
         self.assertIn("Run `craftsman review brief <ID>` and follow it exactly.", text)
         self.assertIn("end your turn while they run", text)
 
     def test_one_hunter_is_not_all(self) -> None:
-        self.assertTrue(huntview.launch_lines(["W1-3"])[0].startswith("Launch 1 hunter now"))
+        self.assertTrue(huntview.launch_lines(["W1-3"], check=self.CHECK)[0].startswith("Launch 1 hunter now"))
+
+    def test_the_check_command_is_the_one_the_caller_names(self) -> None:
+        text = "\n".join(huntview.launch_lines(["W1-1"], check="craftsman review check"))
+
+        self.assertIn("run `craftsman review check` and do exactly what it lists", text)
+        self.assertNotIn("--review-only", text)
+
+
+class CheckCommandTests(unittest.TestCase):
+    def test_a_gate_takes_the_full_check_and_anything_else_the_review_only_one(self) -> None:
+        self.assertEqual(huntview.check_command(gate_active=True), "craftsman review check")
+        self.assertEqual(huntview.check_command(gate_active=False), "craftsman review check --review-only")
 
 
 class BriefTests(unittest.TestCase):

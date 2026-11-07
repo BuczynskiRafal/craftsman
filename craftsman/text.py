@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import sys
 
-__all__ = ["ONE_LINE_WARNING", "inline_md", "one_line"]
+__all__ = ["ONE_LINE_WARNING", "defang_tokens", "inline_md", "one_line"]
 
 ONE_LINE_WARNING = "wrote one line: literal \\n replaced; put code in backticks"
 
@@ -28,6 +28,11 @@ _OPENING_PUNCTUATION = "([<\"'"
 _PATH_PREFIX_RE = re.compile(r"[A-Za-z]:[\\/]|\.{1,2}[\\/]")
 _EXTENSION_END_RE = re.compile(r"\.[A-Za-z0-9_]+(?::\d+)*[)\]>\"',.;:]*\Z")
 _TABLE_PIPE_RE = re.compile(r"(\\*)\|")
+# `recorded (C4)`, `issued (B2)`, `recorded (`: the shapes the recording commands print (`Coverage recorded (C4)`,
+# `F3 recorded (major, ...)`, `F3 verdict recorded (V7)`, `Brief issued (B2)`), which a transcript reader takes
+# for the proof of a record.
+_RECORD_SHAPE_RE = re.compile(r"\b(recorded|issued)(\s*)\(([^()]*)\)")
+_OPEN_RECORD_SHAPE_RE = re.compile(r"\b(recorded|issued)(\s*)\(")
 
 
 def _code_spans(text: str) -> list[tuple[int, int]]:
@@ -110,3 +115,16 @@ def inline_md(text: str, *, table: bool = False) -> str:
     """
     cleaned = one_line(text, warn=False)
     return _TABLE_PIPE_RE.sub(_escape_table_pipe, cleaned) if table else cleaned
+
+
+def defang_tokens(text: str) -> str:
+    """`text` from the ledger, the user or the repository, made unable to pass for the output of a recording command.
+
+    Every command that records something prints a token in the shape `recorded (C7)` or `issued (B2)`; a
+    reader of an agent's transcript takes such a line for the proof that the record exists, and gives up
+    attributing the agent's work when the transcript shows one the agent did not make. Prose that Craftsman
+    echoes (the task, commit subjects, a finding's title, scenario and evidence) is therefore printed with
+    those shapes in square brackets. Line breaks and everything else stay as they are. Never apply this to
+    code or diff lines, which must stay byte-exact.
+    """
+    return _OPEN_RECORD_SHAPE_RE.sub(r"\1\2[", _RECORD_SHAPE_RE.sub(r"\1\2[\3]", text))

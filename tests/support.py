@@ -44,27 +44,10 @@ from craftsman.records import (
 )
 from craftsman.uninstall import uninstall_main
 
+from tests.ambient import AMBIENT_PLATFORM_ENV_VARS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_COUNT = len(json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))["skills"])
-AMBIENT_PLATFORM_ENV_VARS = frozenset(
-    {
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_SESSION_ID",
-        "CLAUDE_CODE_SESSION_ID",
-        "ANTIGRAVITY_AGENT",
-        "AGY_MANAGED_ENV",
-        "ANTIGRAVITY_CONVERSATION_ID",
-        "ANTIGRAVITY_SESSION_ID",
-        "COPILOT_CLI",
-        "GITHUB_COPILOT_CLI",
-        "COPILOT_SESSION_ID",
-        "VSCODE_PID",
-        "VSCODE_IPC_HOOK",
-        "TERM_PROGRAM",
-        "CRAFTSMAN_SESSION_ID",
-    }
-)
 
 
 def coverage_note(hunk_ids: Sequence[str]) -> str:

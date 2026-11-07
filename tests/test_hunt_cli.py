@@ -6,10 +6,15 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from collections.abc import Mapping
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from craftsman import review
@@ -20,11 +25,12 @@ from craftsman.records import AgentEvent, Ledger, Round, format_timestamp
 from craftsman.usage import _COVERAGE_TOKEN_RE, _FINDING_TOKEN_RE
 from craftsman.workspace import HOOKS_MARKER, ReviewMarker, read_marker, write_marker
 
+from tests.ambient import AMBIENT_PLATFORM_ENV_VARS
 from tests.support import (
-    AMBIENT_PLATFORM_ENV_VARS,
     EvidenceRepo,
     assert_cli_error,
     coverage_note,
+    make_slot,
     open_gate,
     run_main,
 )
@@ -43,6 +49,7 @@ FINDING_FLAGS = (
     "--scenario", "total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError",
 )  # fmt: skip
 STATIC = "static: cart.py:3 divides by len(items), which raises ZeroDivisionError on []"
+LEFT = "hunk(s) left in your records (`craftsman review check` decides)."
 CLAUDE = {"CLAUDECODE": "1"}
 AGY = {"ANTIGRAVITY_CONVERSATION_ID": "conv-9"}
 
@@ -804,11 +811,12 @@ class CoverHunterTests(HuntTestCase):
         second = self.cover("--hunter", "W1-1", "--files", "reader.py").stdout
 
         self.assertEqual(
-            first.strip(), "Coverage recorded (C1) for W1-1: H1 in round 1; slot W1-1: 1 hunk(s) left."
+            first.strip(),
+            f"Coverage recorded (C1) for W1-1: H1 in round 1; slot W1-1: 1 {LEFT}",
         )
         self.assertEqual(
             second.strip(),
-            "Coverage recorded (C2) for W1-1: reader.py in round 1; slot W1-1: 0 hunk(s) left.",
+            f"Coverage recorded (C2) for W1-1: reader.py in round 1; slot W1-1: 0 {LEFT}",
         )
         record = self.ledger().coverage[0]
         self.assertEqual((record.hunter, record.by), ("W1-1", None))
@@ -862,8 +870,8 @@ class CoverHunterTests(HuntTestCase):
         self.assertEqual(
             out.splitlines(),
             [
-                "Coverage recorded (C1) for W1-1: H1 in round 1; slot W1-1: 1 hunk(s) left.",
-                "Coverage recorded (C2) for W1-1: reader.py in round 1; slot W1-1: 0 hunk(s) left.",
+                f"Coverage recorded (C1) for W1-1: H1 in round 1; slot W1-1: 1 {LEFT}",
+                f"Coverage recorded (C2) for W1-1: reader.py in round 1; slot W1-1: 0 {LEFT}",
             ],
         )
 
@@ -1098,7 +1106,7 @@ class PartialReportTests(HuntTestCase):
         assert marker is not None
         self.assertTrue(marker.guarding)
 
-    def test_a_fetched_brief_counts_as_a_launched_hunter_and_ends_the_guard(self) -> None:
+    def test_a_fetched_brief_counts_as_a_launched_hunter_but_leaves_the_guard_armed(self) -> None:
         self.arm()
         self.review("prepare")
         self.review("brief", "W1-1")
@@ -1108,7 +1116,7 @@ class PartialReportTests(HuntTestCase):
         self.assertIn("PARTIAL", proc.stdout)
         marker = read_marker(self.ledger_path)
         assert marker is not None
-        self.assertFalse(marker.guarding)
+        self.assertTrue(marker.guarding)
 
     def test_a_reviewer_start_event_counts_too(self) -> None:
         self.arm()
@@ -1168,7 +1176,7 @@ class PartialReportTests(HuntTestCase):
         assert marker is not None
         self.assertTrue(marker.guarding)
 
-    def test_the_guard_of_the_calling_session_ends(self) -> None:
+    def test_the_guard_of_the_calling_session_stays_armed_too(self) -> None:
         self.arm()
         self.review("prepare")
         self.review("brief", "W1-1")
@@ -1177,7 +1185,7 @@ class PartialReportTests(HuntTestCase):
 
         marker = read_marker(self.ledger_path)
         assert marker is not None
-        self.assertFalse(marker.guarding)
+        self.assertTrue(marker.guarding)
 
 
 class CheckAndReportTests(HuntTestCase):
@@ -1360,17 +1368,678 @@ class StoredWaveTests(HuntTestCase):
         self.assertEqual(self.ledger().rounds[0].plan.waves, ())  # type: ignore[union-attr]
 
 
+OWNER = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s1"}
+RAW_SHAPES = re.compile(r"\b(?:recorded|issued)\s*\(")
+HOSTILE_TASK = "Why did F9 recorded (major) and Coverage recorded (C9) fail?"
+
+
+class SliceViewCarriedTests(HuntTestCase):
+    """A slice view shows every hunk it is asked for; only the overview packet keeps the carried stub."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("cart.py", CART)
+        self.repo.write("notes.py", "LABEL = 'cart-notes'\n")
+        self.arm()
+        self.review("prepare")
+        for slot in self.slot_ids():
+            self.finish_hunter(slot)
+        self.repo.write("cart.py", CART_EDITED)
+        self.arm()
+        self.review("prepare")
+        self.carried = next(ref.id for ref in self.latest().hunks if ref.path == "notes.py")
+        self.open = next(ref.id for ref in self.latest().hunks if ref.path == "cart.py")
+
+    def own_both_with_a_sweep(self) -> None:
+        def add(current: Ledger) -> tuple[Ledger, None]:
+            latest = current.rounds[-1]
+            assert latest.plan is not None
+            sweep = make_slot("W1-9", hunks=(self.open, self.carried), lenses=("sweep",), kind="sweep")
+            plan = replace(latest.plan, slots=(*latest.plan.slots, sweep))
+            return replace(current, rounds=(*current.rounds[:-1], replace(latest, plan=plan))), None
+
+        mutate(self.ledger_path, add)
+
+    def test_the_view_of_a_slot_that_owns_a_carried_hunk_shows_its_code_and_diff(self) -> None:
+        self.assertTrue(next(ref for ref in self.latest().hunks if ref.id == self.carried).carried)
+        self.own_both_with_a_sweep()
+
+        view = Path(self.review("view", "--hunks", f"{self.open},{self.carried}").stdout.strip()).read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("LABEL = 'cart-notes'", view)
+        self.assertIn(f"### {self.carried} · `notes.py`", view)
+        self.assertNotIn("carried (covered in round", view)
+        self.assertIn("max(len(items), 1)", view)
+
+    def test_the_overview_packet_keeps_the_one_line_stub(self) -> None:
+        self.own_both_with_a_sweep()
+        self.review("view", "--hunks", f"{self.open},{self.carried}")
+
+        packet = Path(self.latest().packet_path).read_text(encoding="utf-8")
+
+        self.assertIn("carried (covered in round 1, unchanged)", packet)
+        self.assertNotIn("LABEL = 'cart-notes'", packet)
+
+    def test_show_hunks_lists_a_carried_hunk_a_slot_owns_in_hunk_order(self) -> None:
+        self.own_both_with_a_sweep()
+
+        out = self.review("show", "--hunks", check=False).stdout
+
+        first, second = sorted((self.open, self.carried), key=lambda hunk_id: int(hunk_id[1:]))
+        self.assertIn(f"W1-9 [not launched] still misses {first}-{second}:", out)
+        self.assertRegex(out, rf"{self.carried}  notes.py:1-1  \[carried\]")
+        section = out[out.index("W1-9") :]
+        self.assertLess(section.index(f"  {first}  "), section.index(f"  {second}  "), out)
+
+    def test_show_hunks_of_a_stale_slot_round_keeps_the_stale_listing(self) -> None:
+        self.own_both_with_a_sweep()
+        self.repo.write("cart.py", CART_EDITED + "\n# edited again\n")
+
+        out = self.review("show", "--hunks", check=False).stdout
+
+        self.assertTrue(out.rstrip().endswith("stale: run `craftsman review prepare`"), out)
+        self.assertNotIn("slot(s) left to cover", out)
+
+    def test_a_view_that_does_not_ask_for_the_carried_hunk_still_stubs_it(self) -> None:
+        self.own_both_with_a_sweep()
+
+        view = Path(self.review("view", "--hunks", self.open).stdout.strip()).read_text(encoding="utf-8")
+
+        self.assertNotIn("LABEL = 'cart-notes'", view)
+        self.assertIn(f"{self.carried} · notes.py", view)
+
+
+class ForeignGateTests(HuntTestCase):
+    """One active gate governs its checkout: every review command follows it, whoever runs it."""
+
+    NOTE_START = "This checkout has an active /craftsman gate (claude session s1); this round follows it."
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_cart()
+        open_gate(
+            self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"), isolation_evidence="hooks"
+        )
+
+    def test_a_plain_terminal_prepare_is_enforced_for_the_gates_platform(self) -> None:
+        out = self.review("prepare").stdout
+
+        self.assertEqual((self.latest().enforced, self.latest().platform), (True, "claude"))
+        self.assertIn(
+            f"{self.NOTE_START} For a separate review use its own worktree: git worktree add <path>.", out
+        )
+        self.assertLess(out.index(self.NOTE_START), out.index("Hunt plan, round 1:"))
+        self.assertIn("Enforced: Claude Code hooks serve this review", out)
+
+    def test_no_next_step_suggests_the_review_only_check_under_a_gate(self) -> None:
+        outputs = [self.review("prepare").stdout]
+        outputs.append(self.review("brief", "W1-1").stdout)
+        for slot in self.slot_ids():
+            self.finish_hunter(slot)
+        outputs.append(self.review("prepare").stdout)  # every slot is done
+        outputs.append(self.review("check", check=False).stdout)
+        outputs.append(self.review("report", check=False).stdout)
+        outputs.append(self.review("show").stdout)
+
+        for text in outputs:
+            self.assertNotIn("--review-only", text)
+        self.assertIn("run `craftsman review check` and do exactly what it lists", outputs[0])
+        self.assertIn("Every slot is done. Run `craftsman review check`.", outputs[2])
+
+    def a_reviewer_started(self) -> None:
+        started = format_timestamp(datetime.now(timezone.utc) + timedelta(seconds=1))
+        self.add_events(AgentEvent("claude", "start", "craftsman-reviewer", "a1", started))
+
+    def test_the_owner_prints_no_note_and_is_judged_by_the_hunt_rules(self) -> None:
+        mine = self.review("prepare", env=OWNER).stdout
+        self.a_reviewer_started()
+
+        self.assertNotIn("active /craftsman gate (", mine)
+        payload = json.loads(self.review("check", "--json", check=False, env=OWNER).stdout)
+        self.assertTrue(payload["enforced"])
+        self.assertEqual([slot["state"] for slot in payload["slots"]], ["unlaunched"] * 3)
+        self.assertIn("hunt-pending", {issue["code"] for issue in payload["issues"]})
+
+    def test_the_round_a_stranger_prepared_is_judged_by_the_hunt_rules_on_the_owners_next_check(self) -> None:
+        self.review("prepare")
+        self.a_reviewer_started()
+
+        payload = json.loads(self.review("check", "--json", check=False, env=OWNER).stdout)
+
+        self.assertTrue(payload["enforced"])
+        self.assertEqual(payload["platform"], "claude")
+        self.assertIn("hunt-pending", {issue["code"] for issue in payload["issues"]})
+
+    def test_a_non_owner_sees_the_round_and_the_snapshot_of_the_owner(self) -> None:
+        self.review("prepare", env=OWNER)
+
+        theirs = self.review("show", "--json").stdout
+        mine = self.review("show", "--json", env=OWNER).stdout
+        view_theirs = self.review("view", "--hunks", "H1").stdout
+        view_mine = self.review("view", "--hunks", "H1", env=OWNER).stdout
+        brief = self.review("brief", "W1-1").stdout
+        cover = self.review("cover", "--hunter", "W1-1", "--hunks", "H1", "--note", NOTE).stdout
+
+        self.assertEqual(json.loads(theirs)["round"], json.loads(mine)["round"])
+        self.assertEqual(view_theirs, view_mine)
+        self.assertIn("Brief issued (B1) for W1-1, round 1.", brief)
+        self.assertIn("Coverage recorded (C1) for W1-1: H1 in round 1", cover)
+        self.assertEqual(len(self.ledger().rounds), 1)
+
+    def test_a_stranger_cannot_raise_the_gate_to_deep(self) -> None:
+        out = self.review("prepare", "--deep").stdout
+
+        self.assertIn("Note: --deep ignored: the active gate belongs to another session", out)
+        self.assertFalse(self.repo.state()["deep"])
+
+    def test_the_review_only_refusal_says_whose_gate_it_is(self) -> None:
+        proc = self.review("check", "--review-only", check=False)
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("this checkout has an active /craftsman gate (claude session s1)", proc.stderr)
+        self.assertIn("run `craftsman review check` without --review-only", proc.stderr)
+
+    def test_the_note_names_an_unknown_session_and_cuts_a_long_id(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude"), isolation_evidence="hooks")
+        self.assertIn("active /craftsman gate (claude session unknown)", self.review("prepare", env=AGY).stdout)
+
+        open_gate(
+            self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "0123456789abcdef"), isolation_evidence="hooks"
+        )
+        self.review("reset")
+        self.assertIn("active /craftsman gate (claude session 01234567)", self.review("prepare").stdout)
+
+    def test_a_gate_without_proof_of_isolation_leaves_the_round_advisory(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))
+
+        self.review("prepare")
+
+        self.assertFalse(self.latest().enforced)
+
+    def test_the_partial_flag_names_the_gate_that_refuses_the_review_only_report(self) -> None:
+        proc = self.review("report", "--partial", check=False)
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("active /craftsman gate (claude session s1)", proc.stderr)
+        self.assertNotIn("pass `craftsman review report --review-only --partial`", proc.stderr)
+
+
+class DisplaysAgreeWithTheGateTests(HuntTestCase):
+    """In an enforced round with a plan the displays count slots, as the gate does, never raw hunk coverage."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_cart_and_reader()
+
+    def self_cover_every_hunk(self) -> None:
+        """The orchestrator records coverage for every slot itself: hunk coverage is complete, no slot is."""
+        plan = self.latest().plan
+        assert plan is not None
+        for slot in plan.slots:
+            self.review(
+                "cover", "--hunter", slot.id, "--hunks", ",".join(slot.hunks), "--note", coverage_note(list(slot.hunks))
+            )
+
+    def text_of(self, *args: str) -> str:
+        return self.review(*args, check=False).stdout
+
+    def test_show_prints_the_hunt_and_the_hunks_some_slot_misses(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.self_cover_every_hunk()
+
+        out = self.text_of("show")
+
+        count = len(self.slot_ids())
+        self.assertRegex(out, rf"Hunt: {count} slots - {count} pending \(W1-1")
+        self.assertIn("Hunks still missing from some slot: H1, H2", out)
+        self.assertNotIn("Coverage (covered/total", out)
+
+    def test_show_says_none_once_every_slot_is_done(self) -> None:
+        self.arm()
+        self.review("prepare")
+        for slot in self.slot_ids():
+            self.finish_hunter(slot)
+
+        out = self.text_of("show")
+
+        count = len(self.slot_ids())
+        self.assertIn(f"Hunt: {count} slots - {count} done", out)
+        self.assertIn("Hunks still missing from some slot: none", out)
+
+    def test_show_hunks_lists_per_pending_slot_what_it_misses(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.self_cover_every_hunk()
+
+        out = self.text_of("show", "--hunks")
+
+        self.assertIn("W1-1 [not launched] still misses H1-H2:", out)
+        self.assertIn("W1-2 [not launched] still misses H1-H2:", out)
+        self.assertIn(f"{len(self.slot_ids())} slot(s) left to cover", out)
+        self.assertNotIn("0 left to cover", out)
+
+    def test_show_hunks_says_zero_only_when_every_slot_is_done(self) -> None:
+        self.arm()
+        self.review("prepare")
+        slots = self.slot_ids()
+        for slot in slots[:-1]:
+            self.finish_hunter(slot)
+
+        partial = self.text_of("show", "--hunks")
+        self.finish_hunter(slots[-1])
+        done = self.text_of("show", "--hunks")
+
+        self.assertIn("1 slot(s) left to cover", partial)
+        self.assertNotIn("W1-1 [", partial)
+        self.assertIn(f"{slots[-1]} [not launched] still misses", partial)
+        self.assertIn("0 left to cover: every slot is done", done)
+
+    def test_show_json_has_the_slots_and_counts_slots(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.self_cover_every_hunk()
+        self.finish_hunter("W1-1")
+
+        payload = json.loads(self.text_of("show", "--json"))
+
+        self.assertEqual(
+            payload["coverage"], {"unit": "slots", "done": 1, "total": len(self.slot_ids()), "missing": ["H1", "H2"]}
+        )
+        self.assertEqual([slot["id"] for slot in payload["slots"]], self.slot_ids())
+        hunks = json.loads(self.text_of("show", "--hunks", "--json"))
+        self.assertEqual([hunk["covered"] for hunk in hunks["hunks"]], [False, False])
+
+    def test_status_counts_slots(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.self_cover_every_hunk()
+        self.finish_hunter("W1-1")
+
+        out = self.repo.cli("status").stdout
+        ledger = json.loads(self.repo.cli("status", "--json").stdout)["ledger"]
+
+        total = len(self.slot_ids())
+        self.assertIn(f"hunt 1/{total} slots done", out)
+        self.assertNotIn("coverage 2/2 hunks", out)
+        self.assertEqual((ledger["hunt"], ledger["coverage"]), ({"done": 1, "total": total}, None))
+
+    def test_report_lists_the_union_of_what_pending_slots_miss(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.self_cover_every_hunk()
+
+        text = self.text_of("report", "--review-only")
+        payload = json.loads(self.text_of("report", "--review-only", "--json"))
+
+        self.assertIn("## Not covered\n- Hunks still missing from some slot: H1, H2", text)
+        self.assertEqual(payload["not_covered"], ["H1", "H2"])
+        self.assertEqual([slot["id"] for slot in payload["slots"]], self.slot_ids())
+
+    def test_report_has_no_not_covered_section_when_every_slot_is_done(self) -> None:
+        self.arm()
+        self.review("prepare")
+        for slot in self.slot_ids():
+            self.finish_hunter(slot)
+
+        text = self.text_of("report", "--review-only")
+        payload = json.loads(self.text_of("report", "--review-only", "--json"))
+
+        self.assertNotIn("## Not covered", text)
+        self.assertEqual(payload["not_covered"], [])
+
+    def test_report_lists_only_the_hunks_of_slots_that_are_not_done(self) -> None:
+        self.arm()
+        self.review("prepare")
+        plan = self.latest().plan
+        assert plan is not None
+        simplicity = next(slot for slot in plan.slots if slot.kind == "simplicity")
+        for slot in plan.slots:
+            if slot.id != simplicity.id:
+                self.finish_hunter(slot.id)
+
+        payload = json.loads(self.text_of("report", "--review-only", "--json"))
+        text = self.text_of("report", "--review-only")
+
+        states = {slot["id"]: slot["state"] for slot in payload["slots"]}
+        self.assertEqual([slot for slot, state in states.items() if state != "done"], [simplicity.id])
+        self.assertEqual(payload["not_covered"], list(simplicity.hunks))
+        self.assertIn(f"- Hunks still missing from some slot: {', '.join(simplicity.hunks)}", text)
+
+    def test_advisory_and_planless_rounds_keep_the_hunk_displays(self) -> None:
+        self.review("prepare")
+        self.review("cover", "--hunks", "H1", "--note", NOTE)
+
+        shown = self.text_of("show")
+        hunks = self.text_of("show", "--hunks")
+        status = self.repo.cli("status").stdout
+        report = json.loads(self.text_of("report", "--review-only", "--json"))
+
+        self.assertIn("Coverage (covered/total non-carried hunks):\n  1/2 hunks (missing H2)", shown)
+        self.assertNotIn("Hunks still missing from some slot", shown)
+        self.assertIn("1 left to cover", hunks)
+        self.assertIn("coverage 1/2 hunks", status)
+        self.assertEqual(report["not_covered"], ["H2"])
+
+    def test_a_wave_that_is_due_but_not_stored_shows_the_slots_the_gate_judges(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        self.finish_generation_one(briefed=False)
+        stored = [slot.id for slot in self.latest().plan.slots]  # type: ignore[union-attr]
+        self.assertNotIn("W2-F1", stored)
+
+        shown = json.loads(self.text_of("show", "--json"))
+        status = self.repo.cli("status").stdout
+        self.assertEqual([slot.id for slot in self.latest().plan.slots], stored)  # type: ignore[union-attr]
+        checked = json.loads(self.text_of("check", "--review-only", "--json"))
+
+        self.assertIn("W2-F1", [slot["id"] for slot in shown["slots"]])
+        self.assertEqual([slot["id"] for slot in shown["slots"]], [slot["id"] for slot in checked["slots"]])
+        done = sum(slot["state"] == "done" for slot in checked["slots"])
+        self.assertIn(f"hunt {done}/{len(checked['slots'])} slots done", status)
+
+
+class RecordTokenLeakTests(HuntTestCase):
+    """Prose that Craftsman echoes never carries the shape of a recording command's output."""
+
+    CODE_PHRASE = "Coverage recorded (CODE7)"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("msg.py", f'MESSAGE = "{self.CODE_PHRASE}"\n')
+        self.repo.commit("F9 recorded (major) then Coverage recorded (C9)")
+        self.repo.write("msg.py", f'MESSAGE = "{self.CODE_PHRASE}"\nOTHER = 1\n')
+
+    def prepare(self) -> None:
+        self.review("prepare", "--base", self.repo.base_sha, "--task", HOSTILE_TASK)
+
+    def test_the_packet_and_the_slice_view_defang_the_task_and_the_commit_subjects(self) -> None:
+        self.prepare()
+        view = Path(self.review("view", "--hunks", "H1").stdout.strip()).read_text(encoding="utf-8")
+        packet = Path(self.latest().packet_path).read_text(encoding="utf-8")
+
+        for name, text in (("packet", packet), ("view", view)):
+            with self.subTest(name):
+                self.assertIn("Why did F9 recorded [major] and Coverage recorded [C9] fail?", text)
+                self.assertIn("F9 recorded [major] then Coverage recorded [C9]", text)
+                self.assertNotIn("F9 recorded (", text)
+                self.assertNotIn("Coverage recorded (C9)", text)
+
+    def test_code_that_contains_the_phrase_stays_verbatim(self) -> None:
+        self.prepare()
+        view = Path(self.review("view", "--hunks", "H1").stdout.strip()).read_text(encoding="utf-8")
+        packet = Path(self.latest().packet_path).read_text(encoding="utf-8")
+
+        self.assertIn(self.CODE_PHRASE, view)
+        self.assertIn(self.CODE_PHRASE, packet)
+
+    def test_show_check_and_report_defang_the_findings_text(self) -> None:
+        self.prepare()
+        self.review(
+            "add", "--file", "msg.py", "--line", "1", "--lens", "contracts", "--severity", "major",
+            "--title", "Prints F9 recorded (major) to the log",
+            "--scenario", "A caller sees Coverage recorded (C9) and trusts it",
+        )  # fmt: skip
+        self.review(
+            "verdict", "F1", "--as", "probable", "--evidence", "static: msg.py:1 emits F8 recorded (x) as text"
+        )
+        self.review("resolve", "F1", "--as", "accepted", "--note", "kept: Brief issued (B4) is a literal")
+
+        outputs = {
+            "show": self.review("show").stdout,
+            "check": self.review("check", "--review-only", check=False).stdout,
+            "gate check": self.review("check", check=False).stdout,
+            "report": self.review("report", "--review-only", check=False).stdout,
+        }
+
+        for name, text in outputs.items():
+            with self.subTest(name):
+                self.assertIsNone(RAW_SHAPES.search(text), text)
+        self.assertIn("Prints F9 recorded [major] to the log", outputs["show"])
+        self.assertIn("A caller sees Coverage recorded [C9] and trusts it", outputs["show"])
+        self.assertIn("emits F8 recorded [x] as text", outputs["show"])
+        self.assertIn("kept: Brief issued [B4] is a literal", outputs["report"])
+
+    def test_the_unresolved_finding_message_of_the_check_defangs_the_title(self) -> None:
+        self.prepare()
+        self.review(
+            "add", "--file", "msg.py", "--line", "1", "--lens", "contracts", "--severity", "major",
+            "--title", "Prints F9 recorded (major)", "--scenario", "A caller reads the log and trusts it blindly",
+        )  # fmt: skip
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+
+        out = self.review("check", check=False).stdout
+
+        self.assertIn("Finding F1 (major: Prints F9 recorded [major])", out)
+        self.assertIsNone(RAW_SHAPES.search(out), out)
+
+    def test_the_no_verdict_message_of_a_round_without_a_plan_defangs_the_title(self) -> None:
+        self.prepare()  # nobody armed a review: advisory, so the legacy verdict check runs
+        self.review(
+            "add", "--file", "msg.py", "--line", "1", "--lens", "contracts", "--severity", "major",
+            "--title", "F9 recorded (major)", "--scenario", "A caller reads the log and trusts it blindly",
+        )  # fmt: skip
+
+        out = self.review("check", "--review-only", check=False).stdout
+
+        self.assertIn("Finding F1 (major: F9 recorded [major]) has no verdict", out)
+        self.assertIsNone(RAW_SHAPES.search(out), out)
+
+    def test_a_waiver_reason_is_defanged_in_the_report(self) -> None:
+        self.prepare()
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "raise SystemExit(1)", check=False)
+        self.review("waive-run", "R1", "--reason", "ignore Coverage recorded (C9)")
+
+        text = self.review("report", "--review-only", check=False).stdout
+
+        self.assertIn("ignore Coverage recorded [C9]", text)
+        self.assertIsNone(RAW_SHAPES.search(text), text)
+
+    def test_a_literal_escape_between_the_word_and_the_parenthesis_cannot_rejoin_the_shape(self) -> None:
+        self.prepare()
+        self.review(
+            "add", "--file", "msg.py", "--line", "1", "--lens", "contracts", "--severity", "major",
+            "--title", "Prints a line", "--scenario", "A caller reads the log and trusts it blindly",
+        )  # fmt: skip
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+
+        def legacy_title(current: Ledger) -> tuple[Ledger, None]:  # stored before titles were one-lined on write
+            finding = replace(current.findings[0], title="Prints Coverage recorded\\n(C9)")
+            return replace(current, findings=(finding, *current.findings[1:])), None
+
+        mutate(self.ledger_path, legacy_title)
+
+        outputs = {
+            "gate check": self.review("check", check=False).stdout,
+            "report": self.review("report", "--review-only", check=False).stdout,
+        }
+
+        for name, text in outputs.items():
+            with self.subTest(name):
+                self.assertIsNone(RAW_SHAPES.search(text), text)
+
+
+class SlotProgressLineTests(HuntTestCase):
+    """`cover --hunter` counts what `check` could credit this caller with, not every record of the slot."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("a.py", "def a(x):\n    return x + 1\n")
+        self.repo.write("b.py", "def b(x):\n    return x + 1\n")
+
+    def cover(self, hunk: str, conversation: str | None) -> str:
+        env = {"ANTIGRAVITY_CONVERSATION_ID": conversation} if conversation else None
+        return self.review("cover", "--hunter", "W1-1", "--hunks", hunk, "--note", NOTE, env=env).stdout
+
+    def test_what_the_orchestrator_recorded_does_not_count_for_the_hunter(self) -> None:
+        self.arm(platform="antigravity")
+        self.review("prepare", env={"ANTIGRAVITY_CONVERSATION_ID": "orch"})
+        slot = next(item for item in self.latest().plan.slots if item.id == "W1-1")  # type: ignore[union-attr]
+        self.assertEqual(slot.hunks, ("H1", "H2"))
+
+        by_orchestrator = self.cover("H2", "orch")
+        by_hunter = self.cover("H1", "hunter-1")
+        again = self.cover("H2", "hunter-1")
+
+        self.assertIn(f"slot W1-1: 1 {LEFT}", by_orchestrator)
+        self.assertIn(f"slot W1-1: 1 {LEFT}", by_hunter)  # H2 was recorded by someone else
+        self.assertIn(f"slot W1-1: 0 {LEFT}", again)
+
+    def test_without_an_identity_every_record_of_the_slot_counts(self) -> None:
+        self.arm()
+        self.review("prepare")
+
+        self.cover("H2", None)
+
+        self.assertIn(f"slot W1-1: 0 {LEFT}", self.cover("H1", None))
+
+    def test_records_from_before_the_slot_was_planned_do_not_count(self) -> None:
+        self.arm()
+        self.review("prepare")
+        self.cover("H1", None)
+        planned = format_timestamp(datetime.now(timezone.utc) + timedelta(milliseconds=1))
+        time.sleep(0.05)
+
+        def late(current: Ledger) -> tuple[Ledger, None]:
+            latest = current.rounds[-1]
+            assert latest.plan is not None
+            slots = tuple(replace(slot, since=planned) if slot.id == "W1-1" else slot for slot in latest.plan.slots)
+            return replace(current, rounds=(*current.rounds[:-1], replace(latest, plan=replace(latest.plan, slots=slots)))), None
+
+        mutate(self.ledger_path, late)
+
+        self.assertIn(f"slot W1-1: 1 {LEFT}", self.cover("H2", None))
+
+    def test_what_another_slot_recorded_does_not_count_for_this_one(self) -> None:
+        self.arm()
+        self.review("prepare")
+        plan = self.latest().plan
+        assert plan is not None
+        other = next(slot for slot in plan.slots if slot.id == "W1-2")
+        self.assertEqual(other.hunks, ("H1", "H2"))
+        self.review("cover", "--hunter", "W1-2", "--hunks", "H1,H2", "--note", coverage_note(["H1", "H2"]))
+
+        self.assertIn(f"slot W1-1: 1 {LEFT}", self.cover("H1", None))
+
+    def test_what_an_earlier_round_recorded_for_the_slot_does_not_count_in_this_one(self) -> None:
+        self.arm()
+        self.review("prepare")
+        for slot in self.slot_ids():
+            self.finish_hunter(slot)
+        self.repo.write("b.py", "def b(x):\n    return x + 2\n")
+        self.arm()
+        self.review("prepare")
+        latest = self.latest()
+        by_path = {ref.path: ref.id for ref in latest.hunks}
+        self.assertTrue(next(ref for ref in latest.hunks if ref.path == "a.py").carried)
+
+        def own_both(current: Ledger) -> tuple[Ledger, None]:
+            last = current.rounds[-1]
+            assert last.plan is not None
+            slots = tuple(
+                replace(slot, hunks=(by_path["a.py"], by_path["b.py"])) if slot.id == "W1-1" else slot
+                for slot in last.plan.slots
+            )
+            return replace(current, rounds=(*current.rounds[:-1], replace(last, plan=replace(last.plan, slots=slots)))), None
+
+        mutate(self.ledger_path, own_both)
+
+        out = self.cover(by_path["b.py"], None)
+
+        self.assertIn(f"slot W1-1: 1 {LEFT}", out)  # a.py was covered in round 1; the gate asks for it in round 2
+
+
+class ReportHonestyTests(HuntTestCase):
+    """A report of an unfinished review claims nothing it cannot back and ends nothing."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_cart()
+        self.arm()
+        self.review("prepare")
+        self.inbox = Path(self.review("inbox", "cover").stdout.strip())
+        self.scratch = Path(self.review("scratch").stdout.strip())
+
+    def guarding(self) -> bool:
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        return marker.guarding
+
+    def test_an_incomplete_enforced_review_does_not_claim_verified_isolation(self) -> None:
+        text = self.review("report", "--review-only", check=False).stdout
+
+        self.assertIn("- Reviewer isolation: not established yet (review incomplete).", text)
+        self.assertNotIn("verified via subagent stop events", text)
+
+    def test_an_unfinished_report_prunes_nothing_and_leaves_the_guard_armed(self) -> None:
+        proc = self.review("report", "--review-only", check=False)
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertTrue(self.inbox.exists())
+        self.assertTrue(self.scratch.is_dir())
+        self.assertTrue(self.guarding())
+
+    def test_a_partial_report_prunes_nothing_and_leaves_the_guard_armed(self) -> None:
+        self.review("brief", "W1-1")
+
+        proc = self.review("report", "--review-only", "--partial")
+
+        self.assertIn("PARTIAL", proc.stdout)
+        self.assertTrue(self.inbox.exists())
+        self.assertTrue(self.scratch.is_dir())
+        self.assertTrue(self.guarding())
+
+    def test_the_json_report_of_an_unfinished_review_changes_nothing_either(self) -> None:
+        self.review("report", "--review-only", "--json", check=False)
+
+        self.assertTrue(self.inbox.exists())
+        self.assertTrue(self.guarding())
+
+    def test_a_passed_review_is_verified_pruned_and_ends_the_guard(self) -> None:
+        for slot in self.slot_ids():
+            self.finish_hunter(slot)
+
+        text = self.review("report", "--review-only").stdout
+
+        self.assertIn("- Reviewer isolation status: verified via subagent stop events in the ledger.", text)
+        self.assertFalse(self.inbox.exists())
+        self.assertFalse(self.scratch.exists())
+        self.assertFalse(self.guarding())
+
+    def test_the_self_reviewed_text_is_unchanged(self) -> None:
+        self.review("reset")
+        self.write_cart()
+        self.arm(guarding=False)
+        self.review("prepare")  # no hook saw this session: advisory
+        self.review("cover", "--hunks", "H1", "--note", NOTE)
+
+        text = self.review("report", "--review-only").stdout
+
+        self.assertIn("- Reviewer isolation status: SELF-REVIEWED", text)
+
+
 class AntigravitySyncTests(HuntTestCase):
     """`prepare`, `brief`, `check` and `report` call the Antigravity sync before they judge anything."""
 
-    def run_in_process(self, *args: str) -> tuple[int, mock.MagicMock]:
+    def run_in_process(self, *args: str) -> tuple[int, list[tuple[Path, dict[str, str]]]]:
+        """Run `review.main` without the ambient platform variables; what the sync was called with, copied at the call."""
         env = {k: v for k, v in os.environ.items() if k not in AMBIENT_PLATFORM_ENV_VARS}
+        calls: list[tuple[Path, dict[str, str]]] = []
+
+        def record(workspace: Any, environ: Mapping[str, str]) -> None:
+            # A copy taken now: `environ` may be `os.environ` itself, which `mock.patch.dict` restores later.
+            calls.append((Path(workspace.root), dict(environ)))
+
         with (
             mock.patch.dict(os.environ, env, clear=True),
-            mock.patch("craftsman.review.sync_antigravity_runs") as sync,
+            mock.patch("craftsman.review.sync_antigravity_runs", side_effect=record),
         ):
             result = run_main(review.main, *args, "--cwd", str(self.repo.root))
-        return result.code, sync
+        return result.code, calls
 
     def test_every_judging_command_syncs_first(self) -> None:
         self.write_cart()
@@ -1385,12 +2054,12 @@ class AntigravitySyncTests(HuntTestCase):
         )
         for args in commands:
             with self.subTest(args=args):
-                code, sync = self.run_in_process(*args)
+                code, calls = self.run_in_process(*args)
                 self.assertIn(code, (0, 1))
-                sync.assert_called_once()
-                workspace, env = sync.call_args.args
-                self.assertEqual(Path(workspace.root).resolve(), self.repo.root.resolve())
-                self.assertNotIn("ANTIGRAVITY_CONVERSATION_ID", env)
+                self.assertEqual(len(calls), 1)
+                root, env = calls[0]
+                self.assertEqual(root.resolve(), self.repo.root.resolve())
+                self.assertTrue(AMBIENT_PLATFORM_ENV_VARS.isdisjoint(env), sorted(AMBIENT_PLATFORM_ENV_VARS & env.keys()))
 
 
 if __name__ == "__main__":

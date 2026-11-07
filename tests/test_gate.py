@@ -340,8 +340,8 @@ class ClosedStateTests(RepoTestCase):
 
     def test_an_antigravity_gate_needs_the_transcript_evidence_to_close(self) -> None:
         self.repo.write_lines("app.py", 5)
+        self.repo.record_full_evidence()  # before the gate opens: a gate that proved isolation enforces every round after it
         open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("antigravity", "conv-1"))
-        self.repo.record_full_evidence()
 
         code, _, err = self.run_gate("--complete", "--session-id", "conv-1")
 

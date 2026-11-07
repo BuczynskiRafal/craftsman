@@ -203,11 +203,17 @@ class EnforcementTests(WorkspaceTestCase):
 
         self.assertEqual(self.enforcement(env=env), (False, "cli"))
 
-    def test_the_gate_of_another_session_does_not_enforce_for_this_one(self) -> None:
+    def test_the_gate_of_another_session_governs_the_checkout_for_every_caller(self) -> None:
         open_gate(self.repo.root, self.head, owner=GateOwner("claude", "sess-1"), isolation_evidence="hooks")
-        env = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sess-2"}
+        callers = {
+            "another claude session": {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sess-2"},
+            "a plain terminal": {},
+            "an antigravity conversation": {"ANTIGRAVITY_CONVERSATION_ID": "hunter-1"},
+        }
 
-        self.assertEqual(self.enforcement(env=env), (False, "cli"))
+        for name, env in callers.items():
+            with self.subTest(name):
+                self.assertEqual(self.enforcement(env=env), (True, "claude"))
 
     def test_an_antigravity_gate_always_has_transcript_evidence(self) -> None:
         open_gate(self.repo.root, self.head, owner=GateOwner("antigravity", None))
