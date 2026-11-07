@@ -120,58 +120,77 @@ class PrepareTests(RepoTestCase):
         self.assertIn("**Task:** Add cart totals", self.packet())
         self.assertIn("Scope: `total` (function, L1–L3)", self.packet())
 
-    def test_prepare_prints_the_risk_map(self) -> None:
+    def test_prepare_prints_the_depth_and_the_hunt_plan(self) -> None:
         self.repo.write("cart.py", BUGGY_TOTAL)
 
         out = self.review("prepare").stdout
 
-        self.assertIn("Risk map (suggested lenses):\n  intent — core lens\n", out)
-        self.assertIn("  craft — simplicity lens\n", out)
-        self.assertNotIn("  trust", out)
+        self.assertIn("Depth: normal (no deep signal; 3 changed production lines <= 250)\n", out)
+        self.assertIn("Hunt plan, round 1:\n  W1-1  H1  intent, ripple, tests", out)
+        self.assertRegex(out, r"  W1-2  H1  contracts, failure, sweep +3 lines")
+        self.assertRegex(out, r"  W1-3  H1  craft, design \(simplicity\) +3 lines  \[Claude Code: model haiku\]")
+        self.assertIn("Launch all 3 hunters now, in one step.", out)
+        self.assertIn("You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly.", out)
+        self.assertIn("run `craftsman review check --review-only`", out)
+        self.assertNotIn("Risk map", out)
+        self.assertNotIn("decide the hunt", out)
+        self.assertNotIn("trust", out)
         self.assertIn(f"Packet: {self.repo.ledger_dir / 'packet-1.md'}", out)
 
-    def test_risk_map_names_signals_and_hunks_and_hints_at_depth(self) -> None:
+    def test_a_security_signal_makes_the_round_deep_and_adds_the_conditional_slots(self) -> None:
         self.repo.write("run.py", SHELL_OUT)
 
         out = self.review("prepare").stdout
 
-        self.assertRegex(out, r"  trust — signals: process \(H1\)")
-        self.assertIn("Depth: deep suggested (signals: process H1)", out)
+        self.assertIn("Round 1 prepared (deep)", out)
+        self.assertIn("Depth: deep (process signal in H1)\n", out)
+        self.assertRegex(out, r"W1-3\s+H1\s+state, platform")
+        self.assertRegex(out, r"W1-4\s+H1\s+trust, model")
+        self.assertRegex(out, r"W2-X1\s+H1\s+intent, contracts, failure \(fresh look\)")
         self.assertIn("signals: process (→ failure, trust, platform)", self.packet())
 
-    def test_a_deep_round_suggests_every_lens_and_needs_no_depth_hint(self) -> None:
+    def test_deep_names_why_the_round_is_deep(self) -> None:
         self.repo.write("run.py", SHELL_OUT)
 
         out = self.review("prepare", "--deep").stdout
 
         self.assertIn("Round 1 prepared (deep)", out)
-        self.assertIn("  model — deep round\n", out)
-        self.assertNotIn("Depth:", out)
+        self.assertIn("Depth: deep (requested with --deep; process signal in H1)\n", out)
 
-    def test_the_depth_hint_is_not_repeated_under_a_deep_gate(self) -> None:
+    def test_a_big_production_change_is_deep_by_size(self) -> None:
+        self.repo.write_lines("big.py", 260)
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Depth: deep (260 changed production lines > 250)\n", out)
+
+    def test_a_deep_gate_makes_the_round_deep_without_raising_it(self) -> None:
         self.repo.cli("gate", "--init", "--deep")
         self.repo.write("run.py", SHELL_OUT)
 
         out = self.review("prepare").stdout
 
         self.assertIn("Round 1 prepared (deep)", out)
-        self.assertNotIn("Depth:", out)
+        self.assertIn("Depth: deep (the gate is deep; process signal in H1)\n", out)
+        self.assertNotIn("Gate raised", out)
 
-    def test_the_depth_hint_needs_real_usage_in_production_code(self) -> None:
+    def test_a_signal_in_a_deep_signal_free_context_does_not_make_the_round_deep(self) -> None:
         self.repo.write("login.py", "def check(token, session_id):\n    return token == session_id\n")
         self.repo.write("tests/test_run.py", SHELL_OUT)
         self.repo.write("deploy.yaml", "token: abc\nrun: os.system(rm)\n")
 
         out = self.review("prepare").stdout
 
-        self.assertNotIn("Depth:", out)
+        self.assertIn("Depth: normal", out)
 
-    def test_a_deep_round_over_docs_still_suggests_every_lens(self) -> None:
+    def test_a_deep_round_over_docs_plans_the_docs_lenses_only(self) -> None:
         self.repo.write("README.md", "# Cart\n\nTotals.\n")
 
         out = self.review("prepare", "--deep").stdout
 
-        self.assertIn("  trust — deep round\n", out)
+        self.assertIn("Depth: deep (requested with --deep)\n", out)
+        self.assertRegex(out, r"  W1-1  H1  intent, craft +3 lines\n")
+        self.assertNotIn("trust", out)
 
     def test_an_agent_prompt_file_is_not_a_docs_change(self) -> None:
         self.repo.write("skills/x/SKILL.md", "# Skill\n\nRun `rm -rf build` first.\n")
@@ -179,23 +198,23 @@ class PrepareTests(RepoTestCase):
 
         out = self.review("prepare").stdout
 
-        self.assertNotIn("docs-only change", out)
-        self.assertIn("  contracts — core lens\n", out)
+        self.assertRegex(out, r"W1-2  H1-H2  contracts, failure, sweep")
 
     def test_prose_changes_get_the_docs_lenses(self) -> None:
         self.repo.write("README.md", "# Cart\n")
 
         out = self.review("prepare").stdout
 
-        self.assertIn("  intent — docs-only change\n", out)
-        self.assertNotIn("  contracts", out)
+        self.assertRegex(out, r"  W1-1  H1  intent, craft +1 line\n")
+        self.assertNotIn("contracts", out)
+        self.assertNotIn("W1-2", out)
 
     def test_later_rounds_read_signals_from_the_open_hunks_only(self) -> None:
         self.repo.write("run.py", SHELL_OUT)
         self.repo.write("big.py", LONG_FUNCTION)
         self.repo.write("cart.py", BUGGY_TOTAL)
         first = self.review("prepare").stdout
-        self.assertIn("Depth: deep suggested", first)
+        self.assertIn("Depth: deep (process signal in H3)", first)
         self.assertIn("Quality hints:", first)
         self.repo.record_full_evidence()
         self.repo.write("cart.py", BUGGY_TOTAL.replace("/ len(items)", ""))
@@ -203,9 +222,8 @@ class PrepareTests(RepoTestCase):
         out = self.review("prepare").stdout
 
         self.assertIn("2 hunks carried, 1 to review.", out)
-        self.assertNotIn("Depth:", out)
+        self.assertIn("Depth: deep (an earlier round was deep; process signal in H3)", out)
         self.assertNotIn("Quality hints:", out)
-        self.assertNotIn("trust", out)
         rounds = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))["rounds"]
         self.assertTrue(rounds[0]["signals"])
         self.assertEqual(rounds[1]["signals"], [])
@@ -668,17 +686,17 @@ class VerdictTests(RepoTestCase):
         )
 
         self.assertIn("R1 recorded (repro, exit 1", run.stderr)
-        self.assertEqual(judged.stdout.strip(), "F1 verdict recorded: proven (run R1)")
+        self.assertEqual(judged.stdout.strip(), "F1 verdict recorded (V1): proven (R1)")
 
     def test_a_severity_marker_may_precede_the_evidence_prefix(self) -> None:
         probable = self.verdict("F1", "probable", f"[severity: minor] {STATIC_EVIDENCE}")
-        self.assertEqual(probable.stdout.strip(), "F1 verdict recorded: probable")
+        self.assertEqual(probable.stdout.strip(), "F1 verdict recorded (V1): probable")
 
         self.add()
         question = self.verdict(
             "F2", "question", "[severity: nit] intent: task asks for totals, cart.py:3 averages"
         )
-        self.assertEqual(question.stdout.strip(), "F2 verdict recorded: question")
+        self.assertEqual(question.stdout.strip(), "F2 verdict recorded (V2): question")
 
     def test_the_marker_does_not_replace_the_required_prefix(self) -> None:
         proc = self.verdict("F1", "probable", "[severity: minor] it is probably wrong at cart.py:3", check=False)
@@ -694,7 +712,7 @@ class VerdictTests(RepoTestCase):
 
         out = self.review("verdict", "--from-json", "-", stdin=json.dumps([entry])).stdout
 
-        self.assertEqual(out.strip(), "F1 verdict recorded: proven (run R1)")
+        self.assertEqual(out.strip(), "F1 verdict recorded (V1): proven (R1)")
 
     def test_proven_verdict_without_a_run_is_refused(self) -> None:
         no_run = self.verdict("F1", "proven", "it obviously crashes on empty input", check=False)
@@ -741,7 +759,10 @@ class MergeTests(RepoTestCase):
     def test_merge_folds_duplicates_into_the_target(self) -> None:
         merged = self.review("merge", "F1", "F2")
 
-        self.assertEqual(merged.stdout.strip(), "F2 merged into F1 (major, cart.py:3)")
+        self.assertEqual(
+            merged.stdout.splitlines(),
+            ["F2 merged into F1 (major, cart.py:3)", "F2 verdict recorded (V1): dismissed (merged into F1)"],
+        )
         report = self.json_of("report")
         self.assertEqual([f["id"] for f in report["findings"]["dismissed"]], ["F2"])
 
@@ -810,7 +831,7 @@ class FromJsonTests(RepoTestCase):
 
         self.assertEqual(
             judged.stdout.splitlines(),
-            ["F1 verdict recorded: probable", "F2 verdict recorded: dismissed"],
+            ["F1 verdict recorded (V1): probable", "F2 verdict recorded (V2): dismissed"],
         )
 
     def test_a_bad_cover_entry_records_nothing(self) -> None:

@@ -578,12 +578,19 @@ def add_coverage(
     note of what was tried. `plan_coverage` turns what a user named into those ids.
 
     `hunter` names the plan slot the coverage answers and `by` the caller's identity, when known;
-    whether the slot exists and owns these hunks is for the caller to check against the plan.
+    whether the slot exists and owns these hunks is for the caller to check against the plan. Coverage
+    tagged with a slot of the round's stored plan may also name the carried hunks that slot lists (a
+    sweep or a fresh set looks at the whole round); untagged coverage never does.
     """
     round_ = _latest_round(ledger)
     if not hunk_ids:
         raise LedgerError("name at least one of the hunks to cover", field="hunks")
-    by_id = {hunk.id: hunk for hunk in round_.hunks if not hunk.carried}
+    slot = round_.plan.slot(hunter) if hunter is not None and round_.plan is not None else None
+    by_id = {
+        hunk.id: hunk
+        for hunk in round_.hunks
+        if not hunk.carried or (slot is not None and hunk.id in slot.hunks)
+    }
     closed = [hunk_id for hunk_id in dict.fromkeys(hunk_ids) if hunk_id not in by_id]
     if closed:
         raise LedgerError(

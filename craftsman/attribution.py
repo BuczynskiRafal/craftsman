@@ -27,6 +27,7 @@ from craftsman.records import (
     Coverage,
     Finding,
     Ledger,
+    Round,
     VerdictEvent,
     agent_role,
     craftsman_agent_name,
@@ -475,13 +476,18 @@ def credited_lenses(
     *,
     runs: Sequence[AgentRun] | None = None,
     slot_hunks: SlotHunks | None = None,
+    enforced: bool = False,
 ) -> dict[str, frozenset[str]]:
     """Per hunk digest, the lenses that acceptable coverage of rounds up to `upto` has examined it with.
 
     A slot's coverage credits that slot's lenses (`slot_lenses` returns None for a slot it does not
     know, which credits nothing). Coverage from before the latest round that reopened a digest does
-    not count for it, as in `ledger.covered_digests`. Untagged coverage, which is all 5.0 knew,
-    credits every lens when its round has no hunt plan and nothing when it has one. With `slot_hunks`,
+    not count for it, as in `ledger.covered_digests`. Coverage of a round without a hunt plan (5.0) and
+    unvouched coverage of an advisory round credit every lens, tagged with a slot or not: nothing vouches
+    for a hunter there, so the 5.0 rules apply. When the work is judged for an `enforced` round, or the
+    covered round was itself enforced, unvouched coverage of a planned round credits nothing: only a
+    slot's hunter may credit there, so neither an orchestrator that covers hunks itself nor a
+    self-review of an earlier advisory round pays for the hunt an enforced round owes. With `slot_hunks`,
     a slot credits only the hunks it owns (see `slot_work`).
     """
     reopened = reopened_in(ledger, upto)
@@ -495,12 +501,21 @@ def credited_lenses(
             if number >= reopened.get(digest, 1):
                 credit[digest].update(lenses)
     for record in ledger.coverage:
-        if record.hunter is not None or record.round > upto or ledger.rounds[record.round - 1].plan is not None:
+        if record.round > upto or _unvouched_counts_for_nothing(ledger.rounds[record.round - 1], enforced):
             continue
         for digest in record.digests:
             if record.round >= reopened.get(digest, 1):
                 credit[digest].update(LENS_IDS)
     return {digest: frozenset(lenses) for digest, lenses in credit.items()}
+
+
+def _unvouched_counts_for_nothing(covered: Round, enforced: bool) -> bool:
+    """Whether coverage of `covered` that no hunter run vouches for credits nothing.
+
+    True for a round with a hunt plan that the hooks hold to it (`Round.enforced`), and for any round with
+    a plan when the credit is wanted for an enforced round. A round without a plan is a 5.0 round.
+    """
+    return covered.plan is not None and (covered.enforced or enforced)
 
 
 # --- verdicts -------------------------------------------------------------------------------

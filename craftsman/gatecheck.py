@@ -365,7 +365,7 @@ def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[Age
     if not slots:
         return _HuntState(now, ())
     order, hunks = slot_order(ledger), slot_hunks(ledger)
-    credit = credited_upto(ledger, round_.number, runs=runs)
+    credit = credited_upto(ledger, round_.number, runs=runs, enforced=round_.enforced)
     work = slot_work(ledger, runs, order, slot_hunks=hunks)
     signs = _hunter_signs(ledger, round_, runs, now)
     digest_of = {ref.id: ref.digest for ref in round_.hunks}

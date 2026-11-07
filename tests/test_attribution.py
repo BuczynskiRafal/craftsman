@@ -70,11 +70,15 @@ def moment(seconds: float) -> datetime:
     return parse_timestamp(at(seconds))
 
 
-def hunt_ledger(slots: Sequence[str] = ("W1-1", "W1-2", "W1-3", "W1-4")) -> Ledger:
-    """One round at `T0` with a hunk per slot (slot n owns Hn) and a plan of `slots`."""
+def hunt_ledger(slots: Sequence[str] = ("W1-1", "W1-2", "W1-3", "W1-4"), *, enforced: bool = True) -> Ledger:
+    """One round at `T0` with a hunk per slot (slot n owns Hn) and a plan of `slots`.
+
+    The round is enforced, as the hooks hold it when their hunters vouch for their records;
+    `enforced=False` is an advisory round, which no hunter run can vouch for.
+    """
     snap = make_snap(*(make_hunk(f"H{n}", f"f{n}.py") for n in range(1, len(slots) + 1)))
     ledger, _ = prepared(snap)
-    ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0),))
+    ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0, enforced=enforced),))
     return planned(
         ledger,
         *(make_slot(slot, hunks=(f"H{n}",), lenses=SLOT_LENSES.get(slot, ("intent",))) for n, slot in enumerate(slots, 1)),
@@ -992,11 +996,45 @@ class CreditedLensesTests(unittest.TestCase):
 
         self.assertEqual(self.credited(ledger), {digest: frozenset(LENS_IDS)})
 
-    def test_untagged_coverage_of_a_round_with_a_plan_credits_nothing(self) -> None:
+    def test_untagged_coverage_of_an_enforced_round_with_a_plan_credits_nothing(self) -> None:
         ledger = hunt_ledger(("W1-1",))
         ledger, _ = cover(ledger, None, 1)
 
         self.assertEqual(self.credited(ledger), {})
+
+    def test_untagged_coverage_of_an_advisory_round_with_a_plan_credits_every_lens(self) -> None:
+        ledger = hunt_ledger(("W1-1",), enforced=False)
+        ledger, _ = cover(ledger, None, 1)
+
+        digest = ledger.rounds[0].hunks[0].digest
+        self.assertEqual(self.credited(ledger), {digest: frozenset(LENS_IDS)})
+
+    def test_tagged_coverage_of_an_advisory_round_credits_every_lens(self) -> None:
+        ledger = hunt_ledger(("W1-1",), enforced=False)
+        ledger, _ = cover(ledger, "W1-1", 1)
+
+        digest = ledger.rounds[0].hunks[0].digest
+        self.assertEqual(self.credited(ledger), {digest: frozenset(LENS_IDS)})
+
+    def test_judging_for_an_enforced_round_ignores_unvouched_coverage_of_any_planned_round(self) -> None:
+        ledger = hunt_ledger(("W1-1",), enforced=False)
+        ledger, _ = cover(ledger, None, 1)
+        tagged, _ = cover(hunt_ledger(("W1-1",), enforced=False), "W1-1", 1)
+
+        for covered in (ledger, tagged):
+            self.assertEqual(
+                credited_lenses(covered, 1, lambda number, slot: None, order_of(covered), enforced=True), {}
+            )
+
+    def test_judging_for_an_enforced_round_still_credits_coverage_of_a_round_without_a_plan(self) -> None:
+        snap = make_snap(make_hunk("H1", "f1.py"))
+        ledger, _ = prepared(snap)
+        digest = ledger.rounds[0].hunks[0].digest
+        ledger = replace(ledger, coverage=(Coverage(1, (digest,), coverage_note(["H1"]), at(1)),))
+
+        credit = credited_lenses(ledger, 1, lambda number, slot: None, order_of(ledger), enforced=True)
+
+        self.assertEqual(credit, {digest: frozenset(LENS_IDS)})
 
     def test_legacy_coverage_after_a_reopening_is_still_reopened_aware(self) -> None:
         snap = make_snap(make_hunk("H1", "f1.py"))

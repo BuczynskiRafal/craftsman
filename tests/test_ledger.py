@@ -62,7 +62,9 @@ from tests.support import (
     coverage_note,
     fully_reviewed,
     make_hunk,
+    make_slot,
     make_snap,
+    planned,
     prepared,
     record_finding,
     record_run,
@@ -263,6 +265,44 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
             add_coverage(ledger, ["H1"], coverage_note(["H1"]))
         self.assertEqual(plan_coverage(ledger.rounds[-1], ["f1.py"], target_kind="files"), ((), ("H1",)))
+
+
+class SlotCoverageTests(unittest.TestCase):
+    """Coverage tagged with a slot of the stored plan may name the carried hunks the slot lists."""
+
+    def setUp(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))
+        ledger = cover_open_hunks(ledger)
+        ledger, round_ = prepared(
+            make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py", ("+y",)), fingerprint="fp2"), ledger=ledger
+        )
+        self.ledger = planned(
+            ledger,
+            make_slot("W1-1", hunks=("H2",), lenses=("intent",)),
+            make_slot("W1-2", hunks=("H1", "H2"), lenses=("sweep",), kind="sweep"),
+        )
+        self.round = round_
+
+    def test_a_slot_that_lists_a_carried_hunk_may_cover_it(self) -> None:
+        ledger, record = add_coverage(
+            self.ledger, ["H1", "H2"], coverage_note(["H1", "H2"]), hunter="W1-2", by="antigravity:c1"
+        )
+
+        self.assertEqual(record.digests, (self.round.hunks[0].digest, self.round.hunks[1].digest))
+        self.assertEqual((record.hunter, record.by), ("W1-2", "antigravity:c1"))
+        self.assertEqual(ledger.coverage[-1], record)
+
+    def test_untagged_coverage_still_refuses_a_carried_hunk(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]))
+
+    def test_a_slot_that_does_not_list_the_carried_hunk_may_not_cover_it(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]), hunter="W1-1")
+
+    def test_a_slot_the_plan_does_not_store_cannot_open_the_carried_hunk(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]), hunter="W1-9")
 
 
 class StableHunkIdTests(unittest.TestCase):

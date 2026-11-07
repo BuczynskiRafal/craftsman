@@ -1071,14 +1071,15 @@ def slot_hunks(ledger: Ledger) -> SlotHunks:
 
 
 def credited_upto(
-    ledger: Ledger, upto: int, *, runs: Sequence[AgentRun] | None = None
+    ledger: Ledger, upto: int, *, runs: Sequence[AgentRun] | None = None, enforced: bool = False
 ) -> dict[str, frozenset[str]]:
     """Per hunk digest, the lenses accepted coverage of rounds up to `upto` has examined it with.
 
     A slot's coverage credits its lenses, except `sweep`: the sweep looks across the hunks of its
     slot, so it counts only when the slot's coverage spans every hunk it lists (`slot_complete`). A core
     slot that hosts the sweep and covered some of its hunks credits its core lenses to those and the
-    sweep to none; sweeps of different rounds never add up.
+    sweep to none; sweeps of different rounds never add up. `enforced`: the credit is wanted for an enforced
+    round, so unvouched coverage of any planned round counts for nothing (see `credited_lenses`).
     """
     seen = agent_runs(ledger) if runs is None else runs
     required = _Required(ledger)
@@ -1092,12 +1093,14 @@ def credited_upto(
             return tuple(lens for lens in slot.lenses if lens != SWEEP) or None
         return slot.lenses
 
-    return credited_lenses(ledger, upto, lenses, required.order, runs=seen, slot_hunks=required.hunks)
+    return credited_lenses(
+        ledger, upto, lenses, required.order, runs=seen, slot_hunks=required.hunks, enforced=enforced
+    )
 
 
-def credited(ledger: Ledger) -> dict[str, frozenset[str]]:
+def credited(ledger: Ledger, *, enforced: bool = False) -> dict[str, frozenset[str]]:
     """Per hunk digest, the lenses accepted coverage of all rounds so far has examined it with."""
-    return credited_upto(ledger, len(ledger.rounds))
+    return credited_upto(ledger, len(ledger.rounds), enforced=enforced)
 
 
 def sweep_pending(ledger: Ledger) -> bool:

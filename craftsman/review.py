@@ -8,18 +8,20 @@ import json
 import os
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
+from craftsman import huntplan, huntview
+from craftsman.agy_sync import sync_antigravity_runs
+from craftsman.assets import TemplateRole, load_agent_templates
 from craftsman.diffscan import (
     IGNORE_FILE,
     DiffScanError,
     DiffSnapshot,
     Hunk,
     WorktreeIndex,
-    detect_deep_hint_signals,
-    detect_signals,
     files_without_signal_patterns,
     snapshot,
     staged_paths,
@@ -43,15 +45,20 @@ from craftsman.gatecheck import (
     SELF_REVIEWED_BANNER,
     GatePolicy,
     GateReport,
+    SlotStatus,
     evaluate,
+    hunt_line,
     large_diff_warning,
     passing_runs,
     render_report,
     require_current_round,
+    slot_statuses,
 )
+from craftsman.generated import ExportError
 from craftsman.ledger import (
     FIXED_SCOPE_ERROR,
     TargetKind,
+    add_claim,
     add_coverage,
     add_finding,
     load,
@@ -62,12 +69,13 @@ from craftsman.ledger import (
     plan_coverage,
     relocate_finding,
     resolve,
+    round_unchanged,
     set_verdict,
     stable_hunk_ids,
     uncovered_hunks,
     waive_run,
 )
-from craftsman.lenses import LENS_IDS, LensPick, deep_hint, select_lenses
+from craftsman.lenses import LENS_IDS
 from craftsman.packet import (
     PacketContext,
     bound_hints,
@@ -76,8 +84,10 @@ from craftsman.packet import (
     render_packet,
     render_packet_view,
 )
+from craftsman.paths import default_repo_dir
 from craftsman.quality import collect_quality_signals
 from craftsman.records import (
+    LEAD_HUNTER,
     RESOLUTIONS,
     SEVERITIES,
     VERDICTS,
@@ -89,18 +99,33 @@ from craftsman.records import (
     Ledger,
     LedgerError,
     MultiFieldError,
+    QualitySignal,
     Round,
     Run,
     Severity,
+    Slot,
+    SlotClaim,
     Verdict,
+    agent_role,
     as_choice,
     check_coverage_note,
     collecting_problems,
+    parse_timestamp,
+    slot_generation,
 )
 from craftsman.scout import Scout, parse_target
 from craftsman.text import inline_md, one_line
 from craftsman.usage import usage_json, usage_lines
-from craftsman.workspace import Workspace, end_review_guard, open_workspace, touch_review
+from craftsman.workspace import (
+    Workspace,
+    brief_platform,
+    caller_identity,
+    end_review_guard,
+    open_workspace,
+    read_marker,
+    review_enforcement,
+    touch_review,
+)
 
 PROG = "craftsman review"
 SHOW_RECENT_RUNS = 5
@@ -129,6 +154,9 @@ FIELD_FLAGS = {
     "resolution": "--as",
     "resolution_note": "--note",
     "reason": "--reason",
+    "hunter": "--hunter",
+    "slot": "slot",
+    "verifier": "--verifier",
 }
 S = TypeVar("S", bound=str)
 R = TypeVar("R")
@@ -139,14 +167,6 @@ JSON_FIELD_NAMES = {
     "verdict_evidence": "evidence",
     "verdict_run": "run",
 }
-
-
-def resolve_deep(ws: Workspace, ledger: Ledger, requested: bool) -> bool:
-    """Whether the round is deep: `--deep`, the active gate or an earlier round asked for it.
-
-    Depth is never lowered inside a review.
-    """
-    return effective_deep(ledger, requested, ws.state is not None and ws.state.deep)
 
 
 # --- subcommands ----------------------------------------------------------------------------
@@ -183,8 +203,86 @@ def _print_empty_prepare(
     return 0
 
 
+MAX_TASK_CHARS = 4000
+
+
+class CommandRefused(LedgerError):
+    """A command the caller must not run (or not run yet): reported like an error, with its own exit code."""
+
+    def __init__(self, message: str, exit_code: int = 2) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+@dataclass(frozen=True)
+class _PrepareContext:
+    """Everything `prepare` decides before it takes the ledger lock."""
+
+    ws: Workspace
+    env: Mapping[str, str]
+    snap: DiffSnapshot
+    scope: tuple[str, ...] | None
+    allow_scope_expansion: bool
+    out_of_scope: tuple[str, ...]
+    depth: huntplan.Depth
+    symbols: Mapping[str, tuple[str, ...]]
+    explicit_task: str
+    marker_task: str
+    now: datetime
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """What `prepare` did to the ledger."""
+
+    ledger: Ledger
+    round: Round
+    created: bool
+    raised: bool
+    added_slots: tuple[str, ...]  # slots a re-prepare of the same diff appended to the plan
+    task_changed: bool = False  # a re-prepare of the same diff gave the round a different task text
+
+
+def _read_task_file(source: str) -> str:
+    """The task text of `--task-file` (`-` is stdin): trimmed, at most `MAX_TASK_CHARS` characters."""
+    label = "stdin" if source == "-" else source
+    try:
+        data = sys.stdin.buffer.read() if source == "-" else Path(source).read_bytes()
+    except OSError as exc:
+        raise LedgerError(f"cannot read {label}: {exc}") from exc
+    return _decode_json_bytes(data, label).strip()[:MAX_TASK_CHARS]
+
+
+def _explicit_task(args: argparse.Namespace) -> str:
+    if args.task is not None and args.task_file is not None:
+        raise LedgerError("pass either --task or --task-file, not both")
+    raw = args.task if args.task is not None else _read_task_file(args.task_file) if args.task_file else ""
+    return raw.strip()[:MAX_TASK_CHARS]
+
+
+def _depth_floor(
+    args: argparse.Namespace, ws: Workspace, ledger: Ledger, marker_deep: bool, *, owned: bool
+) -> tuple[bool, str | None]:
+    """Whether something already asks for a deep round (never lowered inside a review), and what."""
+    reasons = [
+        reason
+        for asked, reason in (
+            (bool(args.deep) and owned, "requested with --deep"),
+            (ws.state is not None and ws.state.deep, "the gate is deep"),
+            (any(round_.deep for round_ in ledger.rounds), "an earlier round was deep"),
+            (marker_deep, "a deep review was requested"),
+        )
+        if asked
+    ]
+    return bool(reasons), (reasons[0] if reasons else None)
+
+
 def _prepare(args: argparse.Namespace) -> int:
+    env = os.environ
+    now = datetime.now(timezone.utc)
     ws = open_workspace(args.cwd)
+    explicit_task = _explicit_task(args)
+    sync_antigravity_runs(ws, env)
     ledger = load(ws.ledger_path)
     base_sha = ws.base_sha(ledger, args.base)
     full_snap = snapshot(ws.root, base_sha)
@@ -195,64 +293,146 @@ def _prepare(args: argparse.Namespace) -> int:
         end_review_guard(ws.ledger_path)  # nothing to review is a review outcome
         return _print_empty_prepare(scope, snap, full_snap)
     snap = stable_hunk_ids(ledger, snap)
-    owned = _owns_gate(ws)
+    owned = _owns_gate(ws, env)
     if not owned and args.deep:
         print(
             "Note: --deep ignored: the active gate belongs to another session, "
             "which alone can raise it."
         )
-    deep = resolve_deep(ws, ledger, bool(args.deep) and owned)
-    if ws.state is not None and owned and deep and not ws.state.deep:
+    marker = read_marker(ws.ledger_path)
+    marker_live = marker is not None and marker.guarding
+    floor, floor_reason = _depth_floor(
+        args, ws, ledger, marker is not None and marker_live and marker.deep, owned=owned
+    )
+    depth = huntplan.decide_depth(snap, floor=floor, floor_reason=floor_reason)
+    if ws.state is not None and owned and depth.deep and not ws.state.deep:
         update_state(state_path_for(ws.root), lambda current: (_raised_to_deep(current), None))
         print("Gate raised to deep: a passing end-to-end run is now required.")
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-
-    def open_it(current: Ledger) -> tuple[Ledger, Round]:
-        packet = packet_path(ws.ledger_path, len(current.rounds) + 1)
-        out_of_scope = tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else ()
-        return open_round(
-            current, snap, deep, str(packet), symbols,
-            scope=scope, allow_scope_expansion=allow_scope_expansion, out_of_scope=out_of_scope,
-        )  # fmt: skip
+    ctx = _PrepareContext(
+        ws=ws,
+        env=env,
+        snap=snap,
+        scope=scope,
+        allow_scope_expansion=allow_scope_expansion,
+        out_of_scope=tuple(sorted(set(full_snap.files) - set(scope))) if scope is not None else (),
+        depth=depth,
+        symbols=symbols,
+        explicit_task=explicit_task,
+        marker_task=marker.task.strip() if marker is not None and marker_live else "",
+        now=now,
+    )
 
     # The hints parse every changed Python file: compute them before the ledger lock is taken, for
     # the hunks this round will have to review (carried hunks were reviewed already).
-    planned, planned_round = open_it(ledger)
-    hint_hunks = planned_round.open_hunk_ids if len(planned.rounds) > len(ledger.rounds) else None
-    hints = collect_quality_signals(ws.root, snap.only(hint_hunks)) if hint_hunks is not None else ()
+    planned = _plan_round(ledger, ctx, lambda _ids: ())
+    hint_ids = planned.round.open_hunk_ids if planned.created else None
+    hints = collect_quality_signals(ws.root, snap.only(hint_ids)) if hint_ids is not None else ()
 
-    def open_next(current: Ledger) -> tuple[Ledger, tuple[Ledger, Round, bool]]:
+    def signals_for(open_ids: tuple[str, ...]) -> tuple[QualitySignal, ...]:
+        if open_ids == hint_ids:
+            return hints
+        return collect_quality_signals(ws.root, snap.only(open_ids))  # coverage landed meanwhile: rare, slow path
+
+    def open_next(current: Ledger) -> tuple[Ledger, _Prepared]:
         if stable_hunk_ids(current, snap) != snap:
             raise LedgerError("the ledger changed while the round was prepared; run prepare again")
-        updated, round_ = open_it(current)
-        if len(updated.rounds) > len(current.rounds):
-            fits = round_.open_hunk_ids == hint_hunks  # else coverage landed meanwhile: rare, slow path
-            round_ = replace(
-                round_,
-                signals=hints if fits else collect_quality_signals(ws.root, snap.only(round_.open_hunk_ids)),
-            )
-            updated = replace(updated, rounds=(*updated.rounds[:-1], round_))
-        return updated, (updated, round_, updated is not current)
+        result = _plan_round(current, ctx, signals_for)
+        return result.ledger, result
 
-    before = len(ledger.rounds)
-    ledger, round_, created = mutate(ws.ledger_path, open_next)
+    result = mutate(ws.ledger_path, open_next)
+    ledger, round_ = result.ledger, result.round
     touch_review(ws.ledger_path)
-    raised = created and round_.number <= before
     packet = Path(round_.packet_path)
-    picks = _lens_picks(round_, snap)
-    if created or not packet.is_file():
-        ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=args.task or ws.task)
-        _write_text(packet, render_packet(ctx))
-    hint = None if round_.deep else deep_hint(detect_deep_hint_signals(snap.only(round_.open_hunk_ids).hunks))
-    _print_prepare_summary(round_, packet, snap, picks, hint, created=created, raised=raised)
+    if result.created or result.raised or result.task_changed or not packet.is_file():
+        pctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task)
+        _write_text(packet, render_packet(pctx))
+    _print_prepare_summary(result, packet, snap, depth, now)
     _print_unscanned_files(snap)
     _print_scope_summary(ws, ledger, round_, snap, full_snap)
-    if created and not raised:
+    if result.created and not result.raised:
         prune_round_files(ws.ledger_path.parent, round_.number)
         # Scratch directories outlive rounds: a repro written in round 1 is re-run after the fix.
         prune_inbox_files(ws.ledger_path.parent)
     return 0
+
+
+def _plan_round(
+    current: Ledger, ctx: _PrepareContext, signals_for: Callable[[tuple[str, ...]], tuple[QualitySignal, ...]]
+) -> _Prepared:
+    """Open the next round for the snapshot (or take the latest one as it is) and give it its hunt plan.
+
+    The steps follow the planner's contract: a changed diff first seals the plan of the round it replaces;
+    the lenses each hunk requires and has been credited are computed on that ledger; `open_round` carries
+    over the hunks that owe nothing; the plan is built for what the open hunks still owe, appending to the
+    plan the round already has (so re-preparing an unchanged diff never changes an existing slot).
+    """
+    snap = ctx.snap
+    changed = not round_unchanged(current, snap, ctx.scope)
+    base = huntplan.seal_round(current) if changed else current
+    required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep)
+    enforced, platform = review_enforcement(ctx.ws, current, ctx.env, ctx.now)
+    have = huntplan.credited(base, enforced=enforced)
+    carry_sweep = changed and huntplan.sweep_pending(base)
+    packet = packet_path(ctx.ws.ledger_path, len(base.rounds) + 1)
+    opened, round_ = open_round(
+        base, snap, ctx.depth.deep, str(packet), ctx.symbols,
+        scope=ctx.scope, allow_scope_expansion=ctx.allow_scope_expansion, out_of_scope=ctx.out_of_scope,
+        required=required, credited=have,
+    )  # fmt: skip
+    created = len(opened.rounds) > len(base.rounds)
+    previous = base.rounds[-1] if base.rounds and not created else None
+    earlier = base.rounds if created else base.rounds[:-1]
+    open_ids = set(round_.open_hunk_ids)
+    open_hunks = [hunk for hunk in snap.hunks if hunk.id in open_ids]
+    pending = huntplan.pending_wave_slots(base, open_hunks=open_hunks, round_hunks=snap.hunks) if created else ()
+    plan = huntplan.build_plan(
+        open_hunks,
+        huntplan.owed_lenses(required, round_.hunks, have),
+        depth=ctx.depth,
+        round_number=round_.number,
+        first_deep_round=ctx.depth.deep and not any(item.deep for item in earlier),
+        existing=round_.plan,
+        pending_wave_slots=pending,
+        round_hunks=snap.hunks,
+        carry_sweep=carry_sweep,
+    )
+    if round_.enforced:  # sticky: the round keeps the platform that first held it
+        enforced, platform = True, round_.platform
+    known = {slot.id for slot in round_.plan.slots} if round_.plan is not None and not created else set()
+    task = _round_task(ctx, base, round_, created=created)
+    prepared = replace(
+        round_,
+        plan=plan,
+        enforced=enforced,
+        platform=platform,
+        task=task,
+        signals=signals_for(round_.open_hunk_ids) if created else round_.signals,
+    )
+    updated = replace(opened, rounds=(*opened.rounds[:-1], prepared))
+    return _Prepared(
+        ledger=updated,
+        round=prepared,
+        created=created,
+        raised=previous is not None and not previous.deep and prepared.deep,
+        added_slots=tuple(slot.id for slot in plan.slots if slot.id not in known) if not created else (),
+        task_changed=not created and task != round_.task,
+    )
+
+
+def _round_task(ctx: _PrepareContext, base: Ledger, round_: Round, *, created: bool) -> str:
+    """What the round says the change is for.
+
+    The explicit text wins. A re-prepared round otherwise keeps its own; a new one falls back on the review
+    marker's, the gate's and finally the previous round's.
+    """
+    if created:
+        previous = base.rounds[-1].task if base.rounds else ""
+        candidates = (ctx.explicit_task, ctx.marker_task, ctx.ws.task.strip(), previous)
+    else:
+        candidates = (ctx.explicit_task, round_.task, ctx.marker_task, ctx.ws.task.strip())
+    return next((text for text in candidates if text), "")
 
 
 def _used_scope_flags(args: argparse.Namespace) -> list[str]:
@@ -277,9 +457,9 @@ def _scope_from_hunks(hunks: Sequence[Hunk]) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
-def _owns_gate(ws: Workspace) -> bool:
+def _owns_gate(ws: Workspace, env: Mapping[str, str]) -> bool:
     """Whether this command acts for the session that owns the active gate (true without one)."""
-    return ws.state is None or ws.state.owner.admits(cli_caller(None, os.environ))
+    return ws.state is None or ws.owns_gate(env)
 
 
 def _raised_to_deep(state: GateState | None) -> GateState | None:
@@ -469,14 +649,6 @@ def _print_scope_summary(
             )
 
 
-def _lens_picks(round_: Round, snap: DiffSnapshot) -> tuple[LensPick, ...]:
-    """The lenses suggested for the hunks still open in `round_`; carried hunks were reviewed."""
-    open_snap = snap.only(round_.open_hunk_ids)
-    return select_lenses(
-        detect_signals(open_snap.hunks), deep=round_.deep, docs_only=open_snap.docs_only
-    )
-
-
 def _print_unscanned_files(snap: DiffSnapshot) -> None:
     unscanned = files_without_signal_patterns(snap)
     if not unscanned:
@@ -513,42 +685,87 @@ def _packet_context(
     )
 
 
+def _production_lines(snap: DiffSnapshot) -> int:
+    return sum(huntplan.changed_lines(hunk) for hunk in snap.hunks if huntplan.is_production_hunk(hunk))
+
+
+def _depth_line(depth: huntplan.Depth, snap: DiffSnapshot) -> str:
+    if depth.deep:
+        return f"Depth: deep ({'; '.join(depth.reasons)})"
+    lines = _production_lines(snap)
+    return (
+        f"Depth: normal (no deep signal; {lines} changed production lines <= "
+        f"{huntplan.DEEP_MIN_PRODUCTION_LINES - 1})"
+    )
+
+
+def _enforcement_line(round_: Round) -> str:
+    if round_.enforced:
+        who = huntview.PLATFORM_LABELS.get(round_.platform, "Craftsman")
+        return f"Enforced: {who} hooks serve this review; finishing requires every slot below."
+    return (
+        "Advisory: no Craftsman hook saw this session, so the review will be SELF-REVIEWED "
+        "(run `craftsman doctor`)."
+    )
+
+
 def _print_prepare_summary(
-    round_: Round,
-    packet: Path,
-    snap: DiffSnapshot,
-    picks: Sequence[LensPick],
-    hint: str | None,
-    *,
-    created: bool,
-    raised: bool = False,
+    result: _Prepared, packet: Path, snap: DiffSnapshot, depth: huntplan.Depth, now: datetime
 ) -> None:
+    round_ = result.round
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
     changed = snap.added + snap.deleted
-    deep = " (deep)" if round_.deep and not raised else ""
-    state = "raised to deep (same diff)" if raised else "prepared" if created else "unchanged (same diff)"
+    deep = " (deep)" if round_.deep and not result.raised else ""
+    state = (
+        "raised to deep (same diff)"
+        if result.raised
+        else "prepared"
+        if result.created
+        else "unchanged (same diff)"
+    )
     print(
         f"Round {round_.number} {state}{deep}: {len(snap.files)} files, {len(snap.hunks)} hunks, "
         f"{changed} changed lines; {carried} hunks carried, {len(round_.open_hunk_ids)} to review."
     )
     print(f"Packet: {packet}")
-    print("Risk map (suggested lenses):")
-    for pick in picks:
-        print(f"  {pick.lens.id} — {pick.reason}")
+    print(_depth_line(depth, snap))
+    print(_enforcement_line(round_))
     if round_.signals:
         listed, summary = bound_hints(round_.signals)
         print(f"Quality hints: {summary}")
         for sig in listed:
             print(f"  {sig.id} {sig.kind.value} {sig.file}:{sig.line} — {sig.detail}")
-    if hint is not None:
-        print(hint)
     warning = large_diff_warning(round_)
     if warning is not None:
         print(f"Warning: {warning}")
-    print(
-        "Next: decide the hunt (lenses, hunters, slices), then have hunters record "
-        "`craftsman review add` / `craftsman review cover`."
-    )
+    _print_hunt_plan(result, now)
+
+
+def _print_hunt_plan(result: _Prepared, now: datetime) -> None:
+    """The plan table and what to do next. A re-prepared round shows where each slot stands."""
+    round_ = result.round
+    statuses = slot_statuses(result.ledger, round_, now)
+    print(f"Hunt plan, round {round_.number}:")
+    if not statuses:
+        print("  (no slot: every hunk is carried over from earlier rounds)")
+        print("Nothing is owed. Run `craftsman review check --review-only` (in a /craftsman gate: `craftsman review check`).")
+        return
+    for line in huntview.plan_lines(statuses, with_state=not result.created):
+        print(line)
+    if result.added_slots:
+        print(f"New slots since the last prepare: {', '.join(result.added_slots)}")
+    todo = [status.slot.id for status in statuses if status.state in ("unlaunched", "dead")]
+    running = [status.slot.id for status in statuses if status.state == "running"]
+    if running:
+        print(f"Running: {', '.join(running)} - do not launch these again; end your turn and wait for their reports.")
+    if todo:
+        for line in huntview.launch_lines(todo):
+            print(line)
+    elif not running:
+        print(
+            "Every slot is done. Run `craftsman review check --review-only` "
+            "(in a /craftsman gate: `craftsman review check`)."
+        )
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -625,7 +842,7 @@ def _view(args: argparse.Namespace) -> int:
     assigned = _view_hunk_ids(round_, args, files)
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=ws.task)
+    ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task or ws.task)
     slug = view_slug(hunks=assigned) if args.hunks is not None else view_slug(files=files or ())
     view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
     _write_text(view_path, render_packet_view(ctx, assigned_hunks=assigned))
@@ -817,6 +1034,101 @@ def _scratch(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- briefs ---------------------------------------------------------------------------------
+
+
+def _role_text(role: TemplateRole) -> str | None:
+    """The body of the agent template for `role` (includes expanded), or None when the assets are not found."""
+    try:
+        return next((item.body for item in load_agent_templates(default_repo_dir()) if item.role == role), None)
+    except (ExportError, OSError):
+        return None
+
+
+def _inline_role_text(env: Mapping[str, str]) -> bool:
+    """Whether a reader on this platform needs the role text in its brief (Claude Code and Copilot load it)."""
+    return brief_platform(env) in ("antigravity", "cli")
+
+
+def _brief(args: argparse.Namespace) -> int:
+    if (args.slot is None) == (args.verifier is None):
+        raise LedgerError("pass exactly one of a slot id (your launch prompt names it) or --verifier F1,F2")
+    env = os.environ
+    ws = open_workspace(args.cwd)
+    sync_antigravity_runs(ws, env)
+    if args.verifier is not None:
+        return _brief_verifier(ws, env, args.verifier)
+    slot_id = str(args.slot).strip()
+    if slot_generation(slot_id) is None:
+        raise FieldError("slot", f"{slot_id!r} is not a slot id (like W1-1)")
+    snap = ws.snapshot()
+    by = caller_identity(env)
+
+    def claim(current: Ledger) -> tuple[Ledger, tuple[SlotClaim, Round, Slot, int]]:
+        round_ = require_current_round(current, snap)
+        if round_.plan is None:
+            raise LedgerError(
+                f"round {round_.number} has no hunt plan (it was prepared by an older craftsman); "
+                "run `craftsman review reset` and prepare again"
+            )
+        required = huntplan.required_slots(current, round_)
+        slot = next((item for item in required if item.id == slot_id), None)
+        if slot is None:
+            if slot_generation(slot_id) == 1:
+                raise LedgerError(f"unknown slot {slot_id} in round {round_.number}; slots of round {round_.number}: {_slot_list(required)}")
+            raise CommandRefused(
+                f"Slot {slot_id} is no longer required in round {round_.number} (the findings changed). "
+                "Reply exactly that to the agent that launched you and stop."
+            )
+        if round_.plan.slot(slot_id) is None:
+            current = huntplan.materialize(current, round_.number, [slot_id])
+        updated, issued = add_claim(current, slot_id, by=by)
+        hunters = sum(item.generation == slot.generation for item in required)
+        return updated, (issued, updated.rounds[-1], slot, hunters)
+
+    issued, round_, slot, hunters = mutate(ws.ledger_path, claim)
+    ledger = load(ws.ledger_path)
+    trigger = next((item for item in ledger.findings if item.id == slot.trigger), None) if slot.kind == "variant" else None
+    print(f"Brief issued ({issued.token}) for {slot.id}, round {round_.number}.\n")
+    print(
+        huntview.hunter_brief(
+            slot=slot,
+            round_=round_,
+            hunters=hunters,
+            trigger=trigger,
+            role_text=_role_text("reviewer") if _inline_role_text(env) else None,
+            antigravity=brief_platform(env) == "antigravity",
+        ),
+        end="",
+    )
+    return 0
+
+
+def _brief_verifier(ws: Workspace, env: Mapping[str, str], raw_ids: str) -> int:
+    """The verifier's instruction for the named findings. Records nothing: a verifier's work is its verdicts."""
+    ids = list(dict.fromkeys(_comma_list(raw_ids)))
+    if not ids:
+        raise FieldError("verifier", "must name at least one finding id (F1,F2)")
+    ledger = load(ws.ledger_path)
+    by_id = {finding.id: finding for finding in ledger.findings}
+    unknown = [finding_id for finding_id in ids if finding_id not in by_id]
+    if unknown:
+        known = ", ".join(by_id) or "none"
+        raise LedgerError(f"unknown finding(s): {', '.join(unknown)}; findings in the ledger: {known}")
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    print(
+        huntview.verifier_brief(
+            findings=[by_id[finding_id] for finding_id in ids],
+            round_=latest,
+            base_sha=latest.base_sha if latest is not None else ws.base_sha(ledger),
+            task=(latest.task if latest is not None else "") or ws.task,
+            role_text=_role_text("verifier") if _inline_role_text(env) else None,
+        ),
+        end="",
+    )
+    return 0
+
+
 # --- coverage -------------------------------------------------------------------------------
 
 
@@ -837,11 +1149,15 @@ def _cover_one(args: argparse.Namespace) -> int:
     def files_of(round_: Round) -> Callable[[str], list[str]]:
         return lambda raw: normalize_round_files(ws.root, _cwd(args), raw, round_, snap)
 
+    by = caller_identity(os.environ)
+
     def record(current: Ledger) -> tuple[Ledger, str]:
         round_ = require_current_round(current, snap)
         raw = args.files if args.files is not None else args.hunks
         targets = _cover_targets(round_, target_kind, raw, files_of(round_))
-        return _record_coverage(current, round_, targets, args.note, target_kind=target_kind)
+        return _record_coverage(
+            current, round_, targets, args.note, target_kind=target_kind, hunter=args.hunter, by=by
+        )
 
     return _run_single(ws, bool(args.check), record, print)
 
@@ -900,7 +1216,7 @@ def _cover_entry_label(raw: Any) -> str | None:
 
 
 def _cover_one_from_json(
-    state: Ledger, round_: Round, raw: Any, files: Callable[[str], list[str]]
+    state: Ledger, round_: Round, raw: Any, files: Callable[[str], list[str]], by: str | None
 ) -> tuple[Ledger, str]:
     reader = _EntryReader(raw)
     present = [key for key in ("hunks", "files") if key in raw]
@@ -915,10 +1231,11 @@ def _cover_one_from_json(
     else:
         reader.errors.append(FieldError("hunks", "is missing; pass 'hunks' or 'files'"))
     note = reader.read("note", lambda f: f.text("note"), "")
+    hunter = reader.read("hunter", lambda f: f.text_if_present("hunter"), None)
     reader.reject_unknown()
 
     def record(sink: list[LedgerError]) -> tuple[Ledger, str] | None:
-        if reader.failed(kind) or not present:
+        if reader.failed(kind, "hunter") or not present:
             return None
         targets = _attempt(
             sink, lambda: _cover_targets(round_, kind, ",".join(listed), files), None
@@ -928,17 +1245,23 @@ def _cover_one_from_json(
                 check_coverage_note(one_line(note, warn=False))
             return None
         return _attempt(
-            sink, lambda: _record_coverage(state, round_, targets, note, target_kind=kind), None
+            sink,
+            lambda: _record_coverage(state, round_, targets, note, target_kind=kind, hunter=hunter, by=by),
+            None,
         )
 
     return reader.finish(record)
 
 
 def _cover_from_json(args: argparse.Namespace) -> int:
-    _reject_flags_with_from_json({"--hunks": args.hunks, "--files": args.files, "--note": args.note})
+    _reject_flags_with_from_json(
+        {"--hunks": args.hunks, "--files": args.files, "--note": args.note, "--hunter": args.hunter}
+    )
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
     snap = ws.snapshot()
+
+    by = caller_identity(os.environ)
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
         round_ = require_current_round(current, snap)
@@ -948,7 +1271,11 @@ def _cover_from_json(args: argparse.Namespace) -> int:
             current,
             lambda _index, raw: _cover_entry_label(raw),
             lambda _index, state, raw: _cover_one_from_json(
-                state, round_, raw, lambda value: normalize_round_files(ws.root, _cwd(args), value, round_, snap)
+                state,
+                round_,
+                raw,
+                lambda value: normalize_round_files(ws.root, _cwd(args), value, round_, snap),
+                by,
             ),
         )
 
@@ -956,8 +1283,18 @@ def _cover_from_json(args: argparse.Namespace) -> int:
 
 
 def _record_coverage(
-    current: Ledger, round_: Round, targets: Sequence[str], note: str, *, target_kind: TargetKind
+    current: Ledger,
+    round_: Round,
+    targets: Sequence[str],
+    note: str,
+    *,
+    target_kind: TargetKind,
+    hunter: str | None = None,
+    by: str | None = None,
 ) -> tuple[Ledger, str]:
+    current, slot = _resolve_hunter(current, round_, hunter, allow_lead=False)
+    if slot is not None:
+        return _record_slot_coverage(current, slot, targets, note, target_kind=target_kind, by=by)
     open_ids, carried = plan_coverage(round_, targets, target_kind=target_kind)
     if not open_ids:
         left = len(uncovered_hunks(current, round_))
@@ -974,6 +1311,90 @@ def _record_coverage(
         f"Coverage recorded ({token}): {label} in round {round_.number}{skipped}; "
         f"{left} hunk(s) left to cover in this round."
     )
+
+
+def _record_slot_coverage(
+    current: Ledger, slot: Slot, targets: Sequence[str], note: str, *, target_kind: TargetKind, by: str | None
+) -> tuple[Ledger, str]:
+    """Coverage tagged with `slot`: it may name only the slot's hunks, carried ones included."""
+    round_ = current.rounds[-1]
+    plan_coverage(round_, targets, target_kind=target_kind)  # unknown ids and files, empty lists
+    owned = set(slot.hunks)
+    if target_kind == "files":
+        outside = [path for path in targets if not any(ref.path == path and ref.id in owned for ref in round_.hunks)]
+        chosen = [ref.id for ref in round_.hunks if ref.path in set(targets) and ref.id in owned]
+        field = "files"
+    else:
+        outside = [hunk_id for hunk_id in targets if hunk_id not in owned]
+        chosen = list(dict.fromkeys(targets))
+        field = "hunks"
+    if outside:
+        raise LedgerError(
+            f"{', '.join(outside)} not part of slot {slot.id} in round {round_.number}; "
+            f"the hunks of {slot.id}: {huntview.hunk_ranges(slot.hunks)}",
+            field=field,
+        )
+    updated, _ = add_coverage(current, chosen, note, hunter=slot.id, by=by)
+    digest_of = {ref.id: ref.digest for ref in round_.hunks}
+    seen = {
+        digest
+        for item in updated.coverage
+        if item.round == round_.number and item.hunter == slot.id
+        for digest in item.digests
+    }
+    left = sum(digest_of[hunk_id] not in seen for hunk_id in slot.hunks)
+    token = f"C{len(updated.coverage)}"  # the gate matches a reviewer's transcript to its records
+    label = ", ".join(targets if target_kind == "files" else chosen)
+    return updated, (
+        f"Coverage recorded ({token}) for {slot.id}: {label} in round {round_.number}; "
+        f"slot {slot.id}: {left} hunk(s) left."
+    )
+
+
+def _resolve_hunter(
+    current: Ledger, round_: Round, hunter: str | None, *, allow_lead: bool
+) -> tuple[Ledger, Slot | None]:
+    """The slot a `--hunter` names, stored in the round's plan (a derived wave slot is stored now).
+
+    No `--hunter` is an error in an enforced round that has a plan, and fine elsewhere. `lead` (the
+    orchestrator, or extra work) names no slot. A slot the round does not require is an error that lists
+    the ones it does.
+    """
+    round_ = current.rounds[round_.number - 1]  # the caller's copy may predate a slot stored by an earlier entry
+    number = round_.number
+    if hunter is None:
+        if round_.enforced and round_.plan is not None:
+            lead = f" (or `{LEAD_HUNTER}` for your own findings)" if allow_lead else ""
+            raise LedgerError(
+                f"name your hunter slot with --hunter (your brief says it){lead}; "
+                f"slots of round {number}: {_slot_list(huntplan.required_slots(current, round_))}",
+                field="hunter",
+            )
+        return current, None
+    if hunter == LEAD_HUNTER:
+        if not allow_lead:
+            raise FieldError(
+                "hunter", f"'{LEAD_HUNTER}' never credits coverage; name the slot that was examined"
+            )
+        return current, None
+    if slot_generation(hunter) is None:
+        raise FieldError("hunter", f"{hunter!r} is not a slot id (like W1-1)")
+    if round_.plan is None:
+        raise LedgerError(f"round {number} has no hunt plan, so there is no slot to name; leave out --hunter", field="hunter")
+    required = huntplan.required_slots(current, round_)
+    if all(slot.id != hunter for slot in required):
+        raise LedgerError(f"unknown slot {hunter} in round {number}; slots of round {number}: {_slot_list(required)}", field="hunter")
+    if round_.plan.slot(hunter) is None:
+        current = huntplan.materialize(current, number, [hunter])
+    stored = current.rounds[number - 1].plan
+    slot = stored.slot(hunter) if stored is not None else None
+    if slot is None:  # materialize stores what it offered, so this is a planner bug, not a user error
+        raise LedgerError(f"slot {hunter} could not be stored in the plan of round {number}")
+    return current, slot
+
+
+def _slot_list(slots: Sequence[Slot]) -> str:
+    return ", ".join(slot.id for slot in slots) or "none"
 
 
 # --- findings -------------------------------------------------------------------------------
@@ -1003,8 +1424,11 @@ def _add_one(args: argparse.Namespace) -> int:
     path = _finding_path(ws.root, _cwd(args), args.file, snap)
     lines = _source_lines(ws.root, path, args.line)
 
+    by = caller_identity(os.environ)
+
     def record(current: Ledger) -> tuple[Ledger, Finding]:
-        require_current_round(current, snap)
+        round_ = require_current_round(current, snap)
+        current, hunter = _finding_hunter(current, round_, args.hunter)
         return add_finding(
             current,
             lens=args.lens,
@@ -1014,6 +1438,8 @@ def _add_one(args: argparse.Namespace) -> int:
             title=args.title,
             scenario=args.scenario,
             suggestion=args.suggestion or "",
+            hunter=hunter,
+            by=by,
         )
 
     return _run_single(ws, bool(args.check), record, lambda finding: _print_recorded(finding, lines))
@@ -1023,10 +1449,12 @@ def _add_from_json(args: argparse.Namespace) -> int:
     _reject_flags_with_from_json(
         {**_required_finding_flags(args), "--suggestion": args.suggestion}
     )
+    _reject_flags_with_from_json({"--hunter": args.hunter})
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
     snap = ws.snapshot()
     cwd = _cwd(args)
+    by = caller_identity(os.environ)
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[tuple[Finding, list[str] | None]]]:
         require_current_round(current, snap)
@@ -1036,14 +1464,14 @@ def _add_from_json(args: argparse.Namespace) -> int:
             raw_entries,
             current,
             lambda index, _raw: f"F{base_number + index - 1}",
-            lambda _index, state, raw: _add_one_from_json(ws, cwd, snap, state, raw),
+            lambda _index, state, raw: _add_one_from_json(ws, cwd, snap, state, raw, by),
         )
 
     return _run_batch(ws, args, record_batch, lambda pair: _print_recorded(pair[0], pair[1]))
 
 
 def _add_one_from_json(
-    ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any
+    ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any, by: str | None
 ) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
     reader = _EntryReader(raw)
     lens = reader.read("lens", lambda f: f.choice("lens", tuple(sorted(LENS_IDS))), "intent")
@@ -1053,6 +1481,7 @@ def _add_one_from_json(
     title = reader.read("title", lambda f: f.text("title"), "")
     scenario = reader.read("scenario", lambda f: f.text("scenario"), "")
     suggestion = reader.read("suggestion", lambda f: f.text_or("suggestion", ""), "")
+    named_hunter = reader.read("hunter", lambda f: f.text_if_present("hunter"), None)
     reader.reject_unknown()
 
     def record(sink: list[LedgerError]) -> tuple[Ledger, tuple[Finding, list[str] | None]] | None:
@@ -1064,8 +1493,12 @@ def _add_one_from_json(
                 path = found
                 if not reader.failed("line"):
                     lines = _attempt(sink, lambda: _source_lines(ws.root, found, line), None)
+        tagged: tuple[Ledger, str | None] = (current, None)
+        if not reader.failed("hunter"):
+            tagged = _attempt(sink, lambda: _finding_hunter(current, current.rounds[-1], named_hunter), tagged)
+        state, hunter = tagged
         updated, finding = add_finding(
-            current,
+            state,
             lens=lens,
             path=path,
             line=line,
@@ -1073,10 +1506,23 @@ def _add_one_from_json(
             title=title,
             scenario=scenario,
             suggestion=suggestion,
+            hunter=hunter,
+            by=by,
         )
         return updated, (finding, lines)
 
     return reader.finish(record)
+
+
+def _finding_hunter(current: Ledger, round_: Round, hunter: str | None) -> tuple[Ledger, str | None]:
+    """The tag for a new finding: a slot of the round (stored now if it was only derived), `lead` or none.
+
+    The tag is required in an enforced round that has a plan.
+    """
+    if hunter == LEAD_HUNTER:
+        return current, LEAD_HUNTER
+    current, slot = _resolve_hunter(current, round_, hunter, allow_lead=True)
+    return current, slot.id if slot is not None else None
 
 
 def _print_recorded(finding: Finding, lines: Sequence[str] | None) -> None:
@@ -1116,6 +1562,7 @@ def _move(args: argparse.Namespace) -> int:
 
 def _merge(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
+    by = caller_identity(os.environ)
 
     def record(current: Ledger) -> tuple[Ledger, tuple[Finding, tuple[Finding, ...]]]:
         updated, target, duplicates = merge_findings(
@@ -1125,12 +1572,16 @@ def _merge(args: argparse.Namespace) -> int:
             title=args.title,
             scenario=args.scenario,
             suggestion=args.suggestion,
+            by=by,
         )
         return updated, (target, duplicates)
 
     target, duplicates = mutate(ws.ledger_path, record)
     dup_ids = ", ".join(item.id for item in duplicates)
     print(f"{dup_ids} merged into {target.id} ({target.severity}, {target.path}:{target.line})")
+    for item in duplicates:
+        if item.verdict_log:  # the token a verifier's transcript shows it printed
+            print(f"{item.id} verdict recorded ({item.verdict_log[-1].token}): dismissed (merged into {target.id})")
     return 0
 
 
@@ -1187,15 +1638,16 @@ def _verdict(args: argparse.Namespace) -> int:
 def _verdict_one(args: argparse.Namespace) -> int:
     _require_flags(args, {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence})
     ws = open_workspace(args.cwd)
+    by = caller_identity(os.environ)
     return _run_single(
         ws,
         bool(args.check),
-        lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run),
+        lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run, by=by),
         _print_verdict,
     )
 
 
-def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
+def _verdict_one_from_json(state: Ledger, raw: Any, by: str | None) -> tuple[Ledger, Finding]:
     reader = _EntryReader(raw)
     finding_id = reader.read("id", lambda f: f.text("id"), "")
     verdict: Verdict = reader.read("as", lambda f: f.choice("as", VERDICTS), "dismissed")
@@ -1206,7 +1658,7 @@ def _verdict_one_from_json(state: Ledger, raw: Any) -> tuple[Ledger, Finding]:
     def record(sink: list[LedgerError]) -> tuple[Ledger, Finding] | None:
         if reader.failed("id", "as", "evidence", "run"):
             return None
-        return set_verdict(state, finding_id, verdict, evidence, run_id)
+        return set_verdict(state, finding_id, verdict, evidence, run_id, by=by)
 
     return reader.finish(record)
 
@@ -1217,6 +1669,7 @@ def _verdict_from_json(args: argparse.Namespace) -> int:
     )
     raw_entries = _load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
+    by = caller_identity(os.environ)
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[Finding]]:
         return _record_entries(
@@ -1224,15 +1677,17 @@ def _verdict_from_json(args: argparse.Namespace) -> int:
             raw_entries,
             current,
             lambda _index, raw: _entry_label(raw, "id"),
-            lambda _index, state, raw: _verdict_one_from_json(state, raw),
+            lambda _index, state, raw: _verdict_one_from_json(state, raw, by),
         )
 
     return _run_batch(ws, args, record_batch, _print_verdict)
 
 
 def _print_verdict(finding: Finding) -> None:
-    run = f" (run {finding.verdict_run})" if finding.verdict_run else ""
-    print(f"{finding.id} verdict recorded: {finding.verdict}{run}")
+    """`F3 verdict recorded (V7): proven (R2)`: the token is what a verifier's transcript shows it printed."""
+    token = f" ({finding.verdict_log[-1].token})" if finding.verdict_log else ""
+    run = f" ({finding.verdict_run})" if finding.verdict_run else ""
+    print(f"{finding.id} verdict recorded{token}: {finding.verdict}{run}")
 
 
 def _resolve(args: argparse.Namespace) -> int:
@@ -1504,23 +1959,69 @@ def _evaluate(
     return ledger, snap, deep, evaluate(ledger, snap, policy, review_only=review_only)
 
 
+ABANDONED_BANNER = "REVIEW ABANDONED - NOT COMPLETE"
+ABANDONED_NOTE = (
+    "the Stop hook gave up on this review after repeated reminders; do not present it as complete"
+)
+
+
+def _abandoned(ws: Workspace, ledger: Ledger, report: GateReport) -> bool:
+    """Whether the Stop hook gave up on this review and it is still not complete.
+
+    The marker outlives the review it guarded, so its `abandoned_at` counts only when it is not older than the
+    latest round (a `reset` or a newer round starts afresh) and the report has not passed since.
+    """
+    marker = read_marker(ws.ledger_path)
+    if marker is None or marker.abandoned_at is None or not ledger.rounds or report.passed:
+        return False
+    try:
+        return parse_timestamp(marker.abandoned_at) >= parse_timestamp(ledger.rounds[-1].prepared_at)
+    except ValueError:
+        return False  # a stamp that cannot be read proves nothing
+
+
 def _check(args: argparse.Namespace) -> int:
     ws = open_workspace(args.cwd)
+    sync_antigravity_runs(ws, os.environ)
     ledger, _, _, report = _evaluate(ws, review_only=args.review_only)
+    abandoned = _abandoned(ws, ledger, report)
     if args.json:
-        print(json.dumps(_report_json(report), indent=2, ensure_ascii=False))
+        print(json.dumps(_report_json(report, ledger, abandoned=abandoned), indent=2, ensure_ascii=False))
     else:
+        if abandoned:
+            print(f"**{ABANDONED_BANNER}**: {ABANDONED_NOTE}.\n")
         print(render_report(report))
+        if report.slots:
+            print("\n**Hunt slots**")
+            print("\n".join(huntview.plan_lines(report.slots, with_state=True)))
         if args.review_only:
             _warn_new_out_of_scope(ws, ledger)
     return 0 if report.passed else 1
 
 
-def _report_json(report: GateReport) -> dict[str, Any]:
+def _slots_json(slots: Sequence[SlotStatus]) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": status.slot.id,
+            "state": status.state,
+            "lenses": list(status.slot.lenses),
+            "hunks": list(status.slot.hunks),
+            "missing": list(status.missing),
+        }
+        for status in slots
+    ]
+
+
+def _report_json(report: GateReport, ledger: Ledger, *, abandoned: bool = False) -> dict[str, Any]:
+    latest = ledger.rounds[-1] if ledger.rounds else None
     return {
         "passed": report.passed,
         "partial": report.partial,
         "self_reviewed": report.self_reviewed,
+        "enforced": report.enforced,
+        "platform": latest.platform if latest is not None else "cli",
+        "abandoned": abandoned,
+        "slots": _slots_json(report.slots),
         "issues": [{"code": issue.code, "message": issue.message} for issue in report.issues],
         "warnings": list(report.warnings),
         "summary": report.summary,
@@ -1533,14 +2034,17 @@ def _report(args: argparse.Namespace) -> int:
             "--partial requires --review-only; pass `craftsman review report --review-only --partial`"
         )
     ws = open_workspace(args.cwd)
+    sync_antigravity_runs(ws, os.environ)
     ledger, snap, deep, report = _evaluate(ws, review_only=args.review_only)
     if args.partial:
+        _require_hunters_launched(ledger)
         report = replace(report, partial=True)
+    abandoned = _abandoned(ws, ledger, report)
     groups = _finding_groups(ledger.findings)
     runs = passing_runs(ledger, snap.fingerprint)
     if args.json:
         payload = {
-            **_report_json(report),
+            **_report_json(report, ledger, abandoned=abandoned),
             "deep": deep,
             "rounds": len(ledger.rounds),
             "base_sha": snap.base_sha,
@@ -1553,11 +2057,51 @@ def _report(args: argparse.Namespace) -> int:
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
-        print("\n".join(_report_lines(ledger, snap, deep, report, groups, runs)))
+        print("\n".join(_report_lines(ledger, snap, deep, report, groups, runs, abandoned=abandoned)))
         _warn_new_out_of_scope(ws, ledger)
+    if args.partial:
+        _end_guard_of_caller(ws, os.environ)  # the caller chose to end this review with what it has
     if args.review_only:
         prune_all_temp_dirs(ws.ledger_path.parent)
     return 0
+
+
+def _end_guard_of_caller(ws: Workspace, env: Mapping[str, str]) -> None:
+    """End the review guard if it holds the session that runs this command, not another live session's.
+
+    Only Claude Code exports a session id to the commands it runs. A command that cannot tell which
+    session it serves can only be the one the single guard of this ledger holds, so it ends it.
+    """
+    caller = cli_caller(None, env)
+    end_review_guard(ws.ledger_path, caller if caller.session_id is not None else None)
+
+
+def _require_hunters_launched(ledger: Ledger) -> None:
+    """A partial report of an enforced round needs at least one hunter launched in it (a claim or a start/stop).
+
+    Otherwise nothing was reviewed independently and `--partial` would only be a way out of the review.
+
+    A bare claim counts although the orchestrator could fetch a brief itself: a session whose hooks recorded
+    no start event must not be trapped, and the Phase F PreToolUse hook denies `brief` to the main session.
+    """
+    latest = ledger.rounds[-1] if ledger.rounds else None
+    if latest is None or not latest.enforced or latest.plan is None:
+        return
+    prepared = parse_timestamp(latest.prepared_at)
+    if any(claim.round == latest.number for claim in ledger.claims) or any(
+        agent_role(event.agent) == "reviewer" and parse_timestamp(event.at) >= prepared for event in ledger.agents
+    ):
+        return
+    pending = [
+        status.slot.id
+        for status in slot_statuses(ledger, latest, datetime.now(timezone.utc))
+        if status.state != "done"
+    ]
+    launch = "\n".join(huntview.launch_lines(pending)) if pending else "Run `craftsman review prepare`."
+    raise CommandRefused(
+        f"no Craftsman hunter was launched for round {latest.number}, so a partial report would describe a diff "
+        f"nobody reviewed. Launch the hunters first.\n{launch}"
+    )
 
 
 def _warn_new_out_of_scope(ws: Workspace, ledger: Ledger) -> None:
@@ -1627,6 +2171,12 @@ def _not_covered_lines(ledger: Ledger, snap: DiffSnapshot, report: GateReport) -
     return []
 
 
+def _hunt_report_lines(report: GateReport) -> list[str]:
+    if not report.slots:
+        return []
+    return ["", "## Hunt", hunt_line(report.slots), "```", *huntview.plan_lines(report.slots, with_state=True), "```"]
+
+
 def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> list[str]:
     if not ledger.findings:
         return ["No findings recorded."]
@@ -1691,8 +2241,12 @@ def _report_lines(
     report: GateReport,
     groups: dict[str, list[Finding]],
     runs: Sequence[Run],
+    *,
+    abandoned: bool = False,
 ) -> list[str]:
     banner = [f"**{SELF_REVIEWED_BANNER}**"] if report.self_reviewed else []
+    if abandoned:
+        banner.append(f"**{ABANDONED_BANNER}**: {ABANDONED_NOTE}.")
     run_lines = [
         f"- {run.id} `{run.command}` ({run.kind}) → exit {run.exit_code} in {run.duration_s:.1f}s"
         for run in runs
@@ -1704,6 +2258,7 @@ def _report_lines(
         f"- Base `{snap.base_sha[:7]}` · {'deep · ' if deep else ''}{len(ledger.rounds)} review round(s) · "
         f"{len(snap.files)} files, +{snap.added}/−{snap.deleted} lines",
         _report_status_line(report),
+        *_hunt_report_lines(report),
         *_not_covered_lines(ledger, snap, report),
         "",
         "## Findings",
@@ -1764,6 +2319,11 @@ def _add_prepare_parser(sub: Any, common: argparse.ArgumentParser) -> None:
     prepare.add_argument("--base", help="Base commit (default: the active task's base or HEAD)")
     prepare.add_argument("--task", help="One-line description of what the change is for")
     prepare.add_argument(
+        "--task-file",
+        metavar="PATH",
+        help="Read the description of what the change is for from a file (use - for stdin; at most 4000 characters)",
+    )
+    prepare.add_argument(
         "--paths", help="Comma-separated file or directory paths to freeze as the review scope"
     )
     prepare.add_argument(
@@ -1812,11 +2372,29 @@ def _add_view_and_cover_parsers(sub: Any, common: argparse.ArgumentParser) -> No
     )
     cover.add_argument("--note", help="What you examined and tried (one line, >= 20 characters)")
     cover.add_argument(
+        "--hunter",
+        metavar="SLOT",
+        help="The hunt-plan slot this coverage answers (your brief names it; required in an enforced review)",
+    )
+    cover.add_argument(
         "--from-json",
         metavar="PATH",
-        help='Bulk JSON list of {"hunks"|"files", "note"} objects (use - for stdin)',
+        help='Bulk JSON list of {"hunks"|"files", "note", "hunter"?} objects (use - for stdin)',
     )
     cover.set_defaults(handler=_cover, subparser=cover)
+
+    brief = sub.add_parser(
+        "brief",
+        parents=[common],
+        help="The whole instruction of one hunter slot, or of a verifier",
+        description=(
+            "`brief SLOT` records that you took the slot, then prints your slice, lenses and the commands that "
+            "record your work. `brief --verifier F1,F2` prints a verifier's instruction and records nothing."
+        ),
+    )
+    brief.add_argument("slot", metavar="SLOT", nargs="?", help="Slot id from the hunt plan, e.g. W1-2")
+    brief.add_argument("--verifier", metavar="IDS", help="Comma-separated finding ids to verify, e.g. F1,F2")
+    brief.set_defaults(handler=_brief)
 
 
 def _add_finding_parsers(sub: Any, common: argparse.ArgumentParser, lenses: Sequence[str]) -> None:
@@ -1829,9 +2407,14 @@ def _add_finding_parsers(sub: Any, common: argparse.ArgumentParser, lenses: Sequ
     add.add_argument("--scenario", help="Trigger -> wrong outcome")
     add.add_argument("--suggestion", default=None)
     add.add_argument(
+        "--hunter",
+        metavar="SLOT",
+        help="The hunt-plan slot that found it, or `lead` for the orchestrator's own (required in an enforced review)",
+    )
+    add.add_argument(
         "--from-json",
         metavar="PATH",
-        help='Bulk JSON list of {"lens", "file", "line", "severity", "title", "scenario", "suggestion"?} objects (use - for stdin)',
+        help='Bulk JSON list of {"lens", "file", "line", "severity", "title", "scenario", "suggestion"?, "hunter"?} objects (use - for stdin)',
     )
     add.set_defaults(handler=_add, subparser=add)
 
@@ -1987,6 +2570,9 @@ def main(argv: list[str] | None = None) -> int:
     except BatchRejected as exc:
         sys.stderr.write(f"{format_batch_rejection(exc)}\n")
         return 1
+    except CommandRefused as exc:
+        sys.stderr.write(f"{PROG}: error: {exc}\n")
+        return exc.exit_code
     except (LedgerError, DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"{PROG}: error: {describe_error(exc)}\n")
         return 1

@@ -636,7 +636,7 @@ def hunt(hunks: Sequence[Hunk], *, deep: bool = False, first_deep: bool = False)
     snap = make_snap(*hunks)
     ledger, round_ = prepared(snap, deep)
     ledger = record_run(ledger, kind="repro", exit_code=1)  # R1, which a "proven" verdict cites
-    ledger = replace(ledger, rounds=(replace(round_, prepared_at=at(0)),))
+    ledger = replace(ledger, rounds=(replace(round_, prepared_at=at(0), enforced=True),))  # vouched hunters
     plan = plan_of(hunks, deep=deep, first_deep=first_deep)
     return planned(ledger, *plan.slots, reasons=plan.reasons)
 
@@ -674,10 +674,10 @@ def advance(
     if not round_unchanged(ledger, snap, None):
         ledger = seal_round(ledger)  # what `prepare` does before it opens a new round
     required = required_by_hunk(snap.hunks, deep=deep)
-    have = credited(ledger)
+    have = credited(ledger, enforced=True)
     carry_sweep = sweep_pending(ledger)
     opened, round_ = open_round(ledger, snap, deep, "p.md", {}, required=required, credited=have)
-    round_ = replace(round_, prepared_at=at(5000 + 1000 * len(ledger.rounds)))
+    round_ = replace(round_, prepared_at=at(5000 + 1000 * len(ledger.rounds)), enforced=True)
     open_hunks = [hunk for hunk in snap.hunks if hunk.id in round_.open_hunk_ids]
     pending = pending_wave_slots(ledger, open_hunks=open_hunks, round_hunks=snap.hunks)
     plan = build_plan(
