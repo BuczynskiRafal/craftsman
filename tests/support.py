@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -29,11 +29,16 @@ from craftsman.manifest import (
     save_manifest,
 )
 from craftsman.records import (
+    AgentEvent,
+    AgentEventKind,
+    HuntPlan,
     Ledger,
     QualitySignal,
     Round,
     RunKind,
     Severity,
+    Slot,
+    SlotKind,
     format_timestamp,
     parse_timestamp,
 )
@@ -73,7 +78,7 @@ def coverage_note(hunk_ids: Sequence[str]) -> str:
 # --- in-memory ledgers ----------------------------------------------------------------------
 
 BASE_SHA = "b" * 40
-FINDING = {
+FINDING: dict[str, Any] = {
     "lens": "intent",
     "path": "app.py",
     "line": 3,
@@ -192,6 +197,61 @@ def record_finding(ledger: Ledger, severity: Severity = "major", **overrides: An
 def shifted(timestamp: str, seconds: float) -> str:
     """`timestamp` moved by `seconds`, in the ledger's timestamp format."""
     return format_timestamp(parse_timestamp(timestamp) + timedelta(seconds=seconds))
+
+
+def make_slot(
+    slot_id: str = "W1-1",
+    *,
+    hunks: Sequence[str] = ("H1",),
+    lenses: Sequence[str] = ("intent",),
+    kind: SlotKind | None = None,
+    trigger: str | None = None,
+    changed_lines: int = 1,
+) -> Slot:
+    """A valid slot for `slot_id`; its generation and kind follow the id unless `kind` says otherwise."""
+    suffix = slot_id.split("-", 1)[1]
+    default_kind: SlotKind = "fresh" if suffix.startswith("X") else "variant" if suffix.startswith("F") else "bug"
+    if trigger is None and suffix.startswith("X"):
+        trigger = "deep"
+    if trigger is None and suffix.startswith("F"):
+        trigger = suffix
+    return Slot(
+        id=slot_id,
+        generation=int(slot_id[1]),
+        kind=kind or default_kind,
+        hunks=tuple(hunks),
+        lenses=tuple(lenses),
+        changed_lines=changed_lines,
+        trigger=trigger,
+    )
+
+
+def planned(ledger: Ledger, *slots: Slot, reasons: Sequence[str] = ()) -> Ledger:
+    """`ledger` with the hunt plan `slots` attached to its latest round."""
+    plan = HuntPlan(tuple(reasons), tuple(slots))
+    latest = replace(ledger.rounds[-1], plan=plan)
+    return replace(ledger, rounds=(*ledger.rounds[:-1], latest))
+
+
+T0 = "2026-01-01T00:00:00.000Z"
+
+
+def at(seconds: float) -> str:
+    """The timestamp `seconds` after `T0`: a fixed clock for ledgers whose record times matter."""
+    return shifted(T0, seconds)
+
+
+def agent_event(
+    event: AgentEventKind,
+    agent: str,
+    agent_id: str,
+    seconds: float,
+    *,
+    platform: str = "claude",
+    records: tuple[str, ...] | None = None,
+) -> AgentEvent:
+    """A subagent start or stop event `seconds` after `T0`."""
+    return AgentEvent(platform, event, agent, agent_id, at(seconds), records=records)
 
 
 def assert_cli_error(

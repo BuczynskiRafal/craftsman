@@ -138,7 +138,7 @@ class RoundScopeValidationTests(unittest.TestCase):
         return replace(round_, number=number)
 
     def test_schema_errors_distinguish_older_from_newer_ledgers(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertEqual(SCHEMA_VERSION, 4)
         base_payload = Ledger().to_json()
 
         with self.assertRaises(LedgerError) as old_ctx:
@@ -149,9 +149,9 @@ class RoundScopeValidationTests(unittest.TestCase):
         )
 
         with self.assertRaises(LedgerError) as future_ctx:
-            Ledger.from_json({**base_payload, "schema": 4})
+            Ledger.from_json({**base_payload, "schema": 5})
         self.assertIn(
-            "schema 4 is not supported (expected 3); upgrade craftsman",
+            "schema 5 is not supported (expected 4); upgrade craftsman",
             str(future_ctx.exception),
         )
 

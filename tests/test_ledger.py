@@ -11,19 +11,25 @@ import tempfile
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from craftsman import ledger as ledger_module
 from craftsman.ledger import (
+    GROUPED_EVIDENCE_PREFIX,
+    add_claim,
     add_coverage,
+    add_finding,
     covered_digests,
     ledger_path_for,
     load,
     locked,
     merge_findings,
     mutate,
+    next_claim_token,
+    next_verdict_token,
     plan_coverage,
     reopened_mentions,
     resolve,
@@ -31,6 +37,7 @@ from craftsman.ledger import (
     set_verdict,
     stable_hunk_ids,
     uncovered_hunks,
+    verdict_since,
     waive_run,
 )
 from craftsman.records import (
@@ -42,10 +49,13 @@ from craftsman.records import (
     LedgerError,
     QualitySignal,
     SignalKind,
+    VerdictEvent,
 )
 
 from tests.support import (
+    FINDING,
     EvidenceRepo,
+    at,
     cover_open_hunks,
     coverage_note,
     fully_reviewed,
@@ -558,6 +568,150 @@ class MergeTests(unittest.TestCase):
                 merge_findings(ledger, target, duplicates)
 
 
+class VerdictEventTests(unittest.TestCase):
+    def setUp(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1")))
+        ledger = record_finding(record_finding(ledger, scenario="Calling total([]) raises ZeroDivisionError."))
+        self.ledger = record_finding(ledger, scenario="An empty cart shows an error page.")
+
+    def test_each_verdict_gets_the_next_token_across_all_findings(self) -> None:
+        ledger = self.ledger
+        tokens: list[str] = []
+        for finding_id, verdict, evidence in (
+            ("F1", "probable", PROBABLE),
+            ("F2", "dismissed", DISMISSED),
+            ("F1", "dismissed", DISMISSED),
+        ):
+            ledger, finding = set_verdict(ledger, finding_id, verdict, evidence, None, by="antigravity:conv-1")  # type: ignore[arg-type]
+            tokens.append(finding.verdict_log[-1].token)
+
+        self.assertEqual(tokens, ["V1", "V2", "V3"])
+        self.assertEqual(next_verdict_token(ledger), "V4")
+        first = ledger.findings[0]
+        self.assertEqual([event.verdict for event in first.verdict_log], ["probable", "dismissed"])
+        self.assertEqual(first.verdict, "dismissed")
+        self.assertEqual({event.by for event in first.verdict_log}, {"antigravity:conv-1"})
+
+    def test_the_event_time_is_the_time_of_the_update(self) -> None:
+        _, finding = set_verdict(self.ledger, "F1", "probable", PROBABLE, None)
+
+        self.assertEqual(finding.verdict_log[-1].at, finding.updated_at)
+        self.assertIsNone(finding.verdict_log[-1].by)
+
+    def test_the_wording_of_a_merge_is_reserved_for_merge(self) -> None:
+        for evidence in (
+            f"{GROUPED_EVIDENCE_PREFIX}F1 (app.py:3): same root cause.",
+            f"   {GROUPED_EVIDENCE_PREFIX}F1 (app.py:3): same root cause.",
+            "Grouped into\nF1 (app.py:3): same root cause.",
+            "Grouped\u00a0into F1 (app.py:3): same root cause.",
+            "Grouped  into F1 (app.py:3): same root cause.",
+            "\tGrouped into F1 (app.py:3): same root cause.",
+            "Grouped into\\nF1 (app.py:3): same root cause.",
+        ):
+            with self.subTest(evidence=evidence), self.assertRaises(FieldError) as caught:
+                set_verdict(self.ledger, "F2", "dismissed", evidence, None)
+            self.assertEqual(caught.exception.field, "verdict_evidence")
+            self.assertIn("craftsman review merge", str(caught.exception))
+        self.assertEqual(self.ledger.findings[1].verdict_log, ())
+
+    def test_merging_records_one_event_per_duplicate_and_points_at_the_target(self) -> None:
+        ledger, _ = set_verdict(self.ledger, "F3", "probable", PROBABLE, None)
+
+        merged, target, duplicates = merge_findings(ledger, "F1", ["F2"], by="antigravity:conv-2")
+
+        (dup,) = duplicates
+        self.assertEqual(dup.merged_into, "F1")
+        self.assertEqual([(e.token, e.verdict, e.by) for e in dup.verdict_log], [("V2", "dismissed", "antigravity:conv-2")])
+        self.assertEqual(dup.verdict_log[-1].at, dup.updated_at)
+        self.assertEqual((target.merged_into, target.verdict_log), (None, ()))
+        self.assertEqual(next_verdict_token(merged), "V3")
+
+    def test_merging_several_duplicates_numbers_their_events_in_order(self) -> None:
+        _, _, duplicates = merge_findings(self.ledger, "F1", ["F3", "F2"])
+
+        self.assertEqual([(d.id, d.verdict_log[-1].token) for d in duplicates], [("F3", "V1"), ("F2", "V2")])
+
+    def test_a_merged_duplicate_cannot_be_given_another_verdict_than_dismissed(self) -> None:
+        merged, _, _ = merge_findings(self.ledger, "F1", ["F2"])
+
+        with self.assertRaises(LedgerError) as caught:
+            set_verdict(merged, "F2", "probable", PROBABLE, None)
+        self.assertNotIsInstance(caught.exception, FieldError)
+        self.assertIn("F2 was merged into F1", str(caught.exception))
+        self.assertIn("judge F1", str(caught.exception))
+        self.assertEqual(merged.findings[1].verdict, "dismissed")
+
+    def test_verdict_since_is_the_first_event_of_the_current_verdict(self) -> None:
+        finding = self.ledger.findings[0]
+        self.assertIsNone(verdict_since(finding))
+        events = (
+            VerdictEvent("V1", "probable", at(1)),
+            VerdictEvent("V2", "dismissed", at(2)),
+            VerdictEvent("V3", "dismissed", at(3)),
+            VerdictEvent("V4", "dismissed", at(4)),
+        )
+
+        def judged(*log: VerdictEvent) -> str | None:
+            evidence = DISMISSED if log[-1].verdict == "dismissed" else PROBABLE
+            return verdict_since(replace(finding, verdict=log[-1].verdict, verdict_evidence=evidence, verdict_log=log))
+
+        self.assertEqual(judged(*events[:1]), at(1))
+        self.assertEqual(judged(*events), at(2))  # repeating the verdict does not move the time
+        flipped = (*events, VerdictEvent("V5", "probable", at(5)))
+        self.assertEqual(judged(*flipped), at(5))  # a different verdict does
+        back = (*flipped, VerdictEvent("V6", "dismissed", at(6)))
+        self.assertEqual(judged(*back), at(6))
+
+    def test_a_verdict_from_before_events_existed_dates_from_the_last_update(self) -> None:
+        legacy = replace(self.ledger.findings[0], verdict="probable", verdict_evidence=PROBABLE)
+
+        self.assertEqual(verdict_since(legacy), legacy.updated_at)
+
+
+class SlotAttributionRecordingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ledger, _ = prepared(make_snap(make_hunk("H1")))
+
+    def test_coverage_and_findings_record_their_hunter_and_caller(self) -> None:
+        ledger, record = add_coverage(
+            self.ledger, ["H1"], coverage_note(["H1"]), hunter="W1-2", by="antigravity:conv-1"
+        )
+        ledger, finding = add_finding(
+            ledger, **{**FINDING, "severity": "major"}, hunter="lead", by="antigravity:conv-1"
+        )
+
+        self.assertEqual((record.hunter, record.by), ("W1-2", "antigravity:conv-1"))
+        self.assertEqual((finding.hunter, finding.by), ("lead", "antigravity:conv-1"))
+        self.assertEqual(ledger.coverage[0], record)
+
+    def test_hunter_and_caller_are_optional(self) -> None:
+        ledger, record = add_coverage(self.ledger, ["H1"], coverage_note(["H1"]))
+        _, finding = add_finding(ledger, **{**FINDING, "severity": "major"})
+
+        self.assertEqual((record.hunter, record.by, finding.hunter, finding.by), (None, None, None, None))
+
+    def test_coverage_cannot_be_credited_to_the_lead(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "never credits coverage"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]), hunter="lead")
+
+    def test_claims_get_sequential_tokens_and_the_latest_round(self) -> None:
+        ledger, first = add_claim(self.ledger, "W1-1", by="antigravity:conv-1")
+        ledger, again = add_claim(ledger, "W1-1")  # a relaunched hunter claims the slot again
+        later, _ = prepared(make_snap(make_hunk("H2", "b.py"), fingerprint="fp2"), ledger=ledger)
+        later, third = add_claim(later, "W1-2")
+
+        self.assertEqual([c.token for c in later.claims], ["B1", "B2", "B3"])
+        self.assertEqual((first.round, first.slot, first.by), (1, "W1-1", "antigravity:conv-1"))
+        self.assertEqual((again.round, again.by), (1, None))
+        self.assertEqual((third.round, next_claim_token(later)), (2, "B4"))
+
+    def test_a_claim_needs_a_round_and_a_slot_id(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "craftsman review prepare"):
+            add_claim(Ledger(), "W1-1")
+        with self.assertRaisesRegex(LedgerError, "slot must look like W1-1"):
+            add_claim(self.ledger, "lead")
+
+
 class RunTests(unittest.TestCase):
     def test_runs_get_sequential_ids(self) -> None:
         ledger = record_run(record_run(Ledger()))
@@ -641,6 +795,41 @@ class PersistenceTests(unittest.TestCase):
             number = mutate(self.path, lambda ledger: (record_run(ledger), len(ledger.runs) + 1))
 
         self.assertEqual(number, 1)
+
+    def test_older_schemas_are_set_aside_under_the_name_of_their_own_schema(self) -> None:
+        for schema in (1, 2):
+            with self.subTest(schema=schema):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(json.dumps({**Ledger().to_json(), "schema": schema}), encoding="utf-8")
+
+                with redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(load(self.path), Ledger())
+
+                self.assertTrue(self.path.with_name(f"ledger.v{schema}.bak.json").is_file())
+                self.assertFalse(self.path.exists())
+                self.assertIn(f"ledger.v{schema}.bak.json", err.getvalue())
+
+    def test_a_schema_3_ledger_is_kept_and_written_as_schema_4_on_the_next_save(self) -> None:
+        ledger = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))))
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**ledger.to_json(), "schema": 3}), encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()) as err:
+            loaded = load(self.path)
+
+        self.assertEqual(loaded, ledger)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], [LEDGER_FILENAME])
+        mutate(self.path, lambda current: (record_run(current), None))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["schema"], 4)
+
+    def test_a_newer_schema_is_an_error_and_is_not_set_aside(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 5}), encoding="utf-8")
+
+        with self.assertRaisesRegex(LedgerError, r"schema 5 is not supported \(expected 4\)"):
+            load(self.path)
+        self.assertTrue(self.path.is_file())
 
     def test_corrupt_json_raises(self) -> None:
         self.path.parent.mkdir(parents=True)

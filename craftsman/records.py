@@ -26,6 +26,7 @@ RunKind = Literal["test", "e2e", "repro", "lint", "build", "other"]
 AgentEventKind = Literal["start", "stop"]
 AgentRole = Literal["reviewer", "verifier"]
 IsolationEvidence = Literal["hooks", "transcript", "none"]
+SlotKind = Literal["bug", "simplicity", "sweep", "fresh", "variant"]
 
 SEVERITIES: tuple[Severity, ...] = get_args(Severity)
 VERDICTS: tuple[Verdict, ...] = get_args(Verdict)
@@ -33,6 +34,7 @@ RESOLUTIONS: tuple[Resolution, ...] = get_args(Resolution)
 RUN_KINDS: tuple[RunKind, ...] = get_args(RunKind)
 AGENT_EVENT_KINDS: tuple[AgentEventKind, ...] = get_args(AgentEventKind)
 ISOLATION_EVIDENCES: tuple[IsolationEvidence, ...] = get_args(IsolationEvidence)
+SLOT_KINDS: tuple[SlotKind, ...] = get_args(SlotKind)
 REVIEWER_AGENT = "craftsman-reviewer"
 VERIFIER_AGENT = "craftsman-verifier"
 ORCHESTRATOR_AGENT = "craftsman"
@@ -42,7 +44,13 @@ CRAFTSMAN_AGENTS = frozenset({ORCHESTRATOR_AGENT, *AGENT_ROLES})
 # as `craftsman:craftsman-reviewer`.
 PLUGIN_AGENT_PREFIX = "craftsman:"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# Ledgers of schema 3 (Craftsman 5.0) load as they are; older ones are set aside by `ledger.load`.
+MIN_READABLE_SCHEMA = 3
+# The `hunter` of work that is not a hunt slot: the orchestrator's own findings. It never credits coverage.
+LEAD_HUNTER = "lead"
+# W<generation>-<n> (generation 1 slots), W<g>-X<j> (fresh set), W<g>-F<n> (variant of finding F<n>).
+SLOT_ID_RE = re.compile(r"W([1-3])-(?:([1-9]\d*)|X([1-9]\d*)|F([1-9]\d*))")
 LEDGER_FILENAME = "ledger.json"
 OUTPUT_TAIL_CHARS = 4000
 MIN_TITLE_CHARS = 8
@@ -79,7 +87,7 @@ QUESTION_EVIDENCE_EXAMPLE = (
     "which keeps the worker busy when the server is down for good"
 )
 DISMISSED_EVIDENCE_EXAMPLE = "guarded by cli.py:19, which rejects an empty list before total() runs"
-_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S")}
+_ID_PATTERNS = {prefix: re.compile(rf"{prefix}[1-9]\d*") for prefix in ("H", "F", "R", "S", "V", "B")}
 
 T = TypeVar("T")
 S = TypeVar("S", bound=str)
@@ -220,6 +228,11 @@ def _require_text(value: str, field: str, *, min_chars: int = 1, max_chars: int 
         _require(length >= min_chars, field, f"must have at least {min_chars} characters (got {length})")
 
 
+def _require_optional_text(value: str | None, field: str) -> None:
+    if value is not None:
+        _require_text(value, field)
+
+
 def _require_choice(value: str, choices: Sequence[str], field: str) -> None:
     _require(value in choices, field, f"must be one of {', '.join(choices)} (got {value!r})")
 
@@ -243,6 +256,20 @@ def _require_timestamp(value: str, field: str) -> None:
         raise FieldError(
             field, f"must be an ISO-8601 timestamp with a time zone (got {value!r})"
         ) from None
+
+
+def slot_generation(slot_id: str) -> int | None:
+    """The hunt generation a slot id belongs to (`W2-X1` -> 2); None when `slot_id` is not a slot id."""
+    match = SLOT_ID_RE.fullmatch(slot_id)
+    return None if match is None else int(match.group(1))
+
+
+def _require_slot_id(value: str, field: str) -> None:
+    _require(
+        SLOT_ID_RE.fullmatch(value) is not None,
+        field,
+        f"must look like W1-1, W2-X1 or W2-F3 (got {value!r})",
+    )
 
 
 def as_choice(value: str, choices: Iterable[S]) -> S | None:
@@ -288,6 +315,10 @@ class Fields:
         """A string input field; `default` when it is left out."""
         return default if self._absent(key) else self.text(key)
 
+    def optional_text_if_present(self, key: str) -> str | None:
+        """A string or null field; None when it is left out (older ledgers do not have it)."""
+        return None if self._absent(key) else self.optional_text(key)
+
     def text_if_present(self, key: str) -> str | None:
         """A string input field; None when it is left out."""
         return None if self._absent(key) else self.text(key)
@@ -306,6 +337,10 @@ class Fields:
     def flag(self, key: str) -> bool:
         value: bool = self._value(key, bool, "true or false")
         return value
+
+    def flag_or(self, key: str, default: bool) -> bool:
+        """A boolean field; `default` when it is left out."""
+        return default if self._absent(key) else self.flag(key)
 
     def choice(self, key: str, choices: tuple[S, ...]) -> S:
         value = self.text(key)
@@ -361,6 +396,10 @@ class Fields:
             except FieldError as exc:
                 raise exc.within(f"{key}[{index}]") from None
         return tuple(parsed)
+
+    def records_or_empty(self, key: str, parse: Callable[[Any], T]) -> tuple[T, ...]:
+        """A list of records; empty when it is left out."""
+        return () if self._absent(key) else self.records(key, parse)
 
     def record(self, key: str, parse: Callable[[Any], T]) -> T:
         value: dict[str, Any] = self._value(key, dict, "an object")
@@ -510,6 +549,118 @@ def _require_scope(scope: tuple[str, ...] | None) -> None:
 
 
 @dataclass(frozen=True)
+class Slot:
+    """One unit of the hunt plan: the hunks a single hunter reads and the lenses it applies.
+
+    The id says where the slot comes from: `W1-<n>` is a generation 1 slot (bug, simplicity or sweep),
+    `W<g>-X<j>` a fresh slot and `W<g>-F<n>` the variant slot of finding `F<n>`, both of a later
+    generation. `since` is set when the slot was carried into a later round (see the hunt plan).
+    """
+
+    id: str
+    generation: int
+    kind: SlotKind
+    hunks: tuple[str, ...]
+    lenses: tuple[str, ...]
+    changed_lines: int
+    trigger: str | None = None
+    since: str | None = None
+
+    def __post_init__(self) -> None:
+        match = SLOT_ID_RE.fullmatch(self.id)
+        _require_slot_id(self.id, "id")
+        _require_choice(self.kind, SLOT_KINDS, "kind")
+        if match is not None:
+            self._check_against_id(match)
+        _require(bool(self.hunks), "hunks", "must list at least one hunk")
+        _require_unique(self.hunks, "hunks")
+        for index, hunk_id in enumerate(self.hunks):
+            _require_id(hunk_id, "H", f"hunks[{index}]")
+        _require(bool(self.lenses), "lenses", "must list at least one lens")
+        _require_unique(self.lenses, "lenses")
+        for index, lens in enumerate(self.lenses):
+            _require_choice(lens, sorted(LENS_IDS), f"lenses[{index}]")
+        _require(self.changed_lines >= 0, "changed_lines", "must be >= 0")
+        if self.since is not None:
+            _require_timestamp(self.since, "since")
+
+    def _check_against_id(self, match: re.Match[str]) -> None:
+        generation = int(match.group(1))
+        _require(
+            self.generation == generation,
+            "generation",
+            f"must be {generation} to match the id {self.id}",
+        )
+        numbered, fresh, variant = match.group(2), match.group(3), match.group(4)
+        if numbered is not None:
+            _require(generation == 1, "id", "a numbered slot belongs to generation 1")
+            _require(
+                self.kind in ("bug", "simplicity", "sweep"),
+                "kind",
+                f"of {self.id} must be bug, simplicity or sweep (got {self.kind!r})",
+            )
+            _require(self.trigger is None, "trigger", "must be null for a generation 1 slot")
+            return
+        _require(generation >= 2, "id", "a fresh or variant slot belongs to generation 2 or 3")
+        if fresh is not None:
+            _require(self.kind == "fresh", "kind", f"of {self.id} must be fresh (got {self.kind!r})")
+            _require(
+                self.trigger is not None
+                and (self.trigger == "deep" or _ID_PATTERNS["F"].fullmatch(self.trigger) is not None),
+                "trigger",
+                'of a fresh slot must be "deep" or the id of a finding',
+            )
+        else:
+            _require(self.kind == "variant", "kind", f"of {self.id} must be variant (got {self.kind!r})")
+            _require(
+                self.trigger == f"F{variant}",
+                "trigger",
+                f"of a variant slot must be the finding F{variant} named by its id",
+            )
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> Slot:
+        f = Fields(raw)
+        return f.done(
+            cls(
+                id=f.text("id"),
+                generation=f.integer("generation"),
+                kind=f.choice("kind", SLOT_KINDS),
+                hunks=f.texts("hunks"),
+                lenses=f.texts("lenses"),
+                changed_lines=f.integer("changed_lines"),
+                trigger=f.optional_text("trigger"),
+                since=f.optional_text("since"),
+            )
+        )
+
+
+@dataclass(frozen=True)
+class HuntPlan:
+    """What a round must examine: why it is as deep as it is, and the slots that cover it."""
+
+    reasons: tuple[str, ...]
+    slots: tuple[Slot, ...]
+
+    def __post_init__(self) -> None:
+        _require_unique([slot.id for slot in self.slots], "slots")
+
+    def slot(self, slot_id: str) -> Slot | None:
+        return next((slot for slot in self.slots if slot.id == slot_id), None)
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> HuntPlan:
+        f = Fields(raw)
+        return f.done(cls(reasons=f.texts("reasons"), slots=f.records("slots", Slot.from_json)))
+
+
+@dataclass(frozen=True)
 class Round:
     number: int
     fingerprint: str
@@ -521,6 +672,11 @@ class Round:
     signals: tuple[QualitySignal, ...]
     scope: tuple[str, ...] | None = None
     out_of_scope: tuple[str, ...] = ()
+    # The hunt plan; None for a round prepared without one (schema 3, or an advisory round of 5.0 rules).
+    plan: HuntPlan | None = None
+    platform: str = "cli"  # where the round was prepared, as the review marker named it
+    enforced: bool = False  # the Stop hooks hold the caller to the plan
+    task: str = ""
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
@@ -534,6 +690,12 @@ class Round:
         _require_scope(self.scope)
         for index, path in enumerate(self.out_of_scope):
             _require_text(path, f"out_of_scope[{index}]")
+        _require_text(self.platform, "platform")
+        if self.plan is not None:
+            known = set(hunk_ids)
+            for slot in self.plan.slots:
+                stray = [hunk_id for hunk_id in slot.hunks if hunk_id not in known]
+                _require(not stray, f"plan.slots.{slot.id}.hunks", f"are not hunks of this round: {stray}")
 
     @property
     def open_hunk_ids(self) -> tuple[str, ...]:
@@ -557,6 +719,10 @@ class Round:
                 signals=f.records("signals", QualitySignal.from_json),
                 scope=f.optional_texts("scope"),
                 out_of_scope=f.texts_or_empty("out_of_scope"),
+                plan=f.optional_record_if_present("plan", HuntPlan.from_json),
+                platform=f.text_or("platform", "cli"),
+                enforced=f.flag_or("enforced", False),
+                task=f.text_or("task", ""),
             )
         )
 
@@ -567,12 +733,22 @@ class Coverage:
     digests: tuple[str, ...]
     note: str
     recorded_at: str
+    hunter: str | None = None  # the plan slot this coverage answers; None for coverage of 5.0
+    by: str | None = None  # the caller's identity when the CLI could know it (`antigravity:<id>`)
 
     def __post_init__(self) -> None:
         _require(self.round >= 1, "round", "must be >= 1")
         _require(bool(self.digests), "digests", "must list at least one hunk digest")
         check_coverage_note(self.note)
         _require_timestamp(self.recorded_at, "recorded_at")
+        if self.hunter is not None:
+            _require(
+                self.hunter != LEAD_HUNTER,
+                "hunter",
+                f"'{LEAD_HUNTER}' never credits coverage; name the slot that was examined",
+            )
+            _require_slot_id(self.hunter, "hunter")
+        _require_optional_text(self.by, "by")
 
     def to_json(self) -> dict[str, Any]:
         return _record_json(self)
@@ -586,6 +762,8 @@ class Coverage:
                 digests=f.texts("digests"),
                 note=f.text("note"),
                 recorded_at=f.text("recorded_at"),
+                hunter=f.optional_text_if_present("hunter"),
+                by=f.optional_text_if_present("by"),
             )
         )
 
@@ -650,6 +828,37 @@ def _check_verdict_evidence(verdict: Verdict, evidence: str, run_id: str | None)
 
 
 @dataclass(frozen=True)
+class VerdictEvent:
+    """One recording of a verdict. The token `V<k>` is what a verifier's transcript shows it printed."""
+
+    token: str
+    verdict: Verdict
+    at: str
+    by: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_id(self.token, "V", "token")
+        _require_choice(self.verdict, VERDICTS, "verdict")
+        _require_timestamp(self.at, "at")
+        _require_optional_text(self.by, "by")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> VerdictEvent:
+        f = Fields(raw)
+        return f.done(
+            cls(
+                token=f.text("token"),
+                verdict=f.choice("verdict", VERDICTS),
+                at=f.text("at"),
+                by=f.optional_text("by"),
+            )
+        )
+
+
+@dataclass(frozen=True)
 class Finding:
     id: str
     round: int
@@ -668,6 +877,11 @@ class Finding:
     resolution_note: str
     recorded_at: str
     updated_at: str
+    hunter: str | None = None  # the slot that found it, LEAD_HUNTER for the orchestrator; None before 5.1
+    by: str | None = None
+    # Every verdict ever recorded, oldest first; `verdict` is the last one. Empty before 5.1.
+    verdict_log: tuple[VerdictEvent, ...] = ()
+    merged_into: str | None = None  # the finding this duplicate was folded into
 
     def __post_init__(self) -> None:
         _require_id(self.id, "F", "id")
@@ -681,6 +895,7 @@ class Finding:
         _require_text(self.fingerprint, "fingerprint")
         _require_timestamp(self.recorded_at, "recorded_at")
         _require_timestamp(self.updated_at, "updated_at")
+        self._check_attribution()
         if self.verdict is None:
             _require(self.verdict_run is None, "verdict_run", "must be null without a verdict")
         else:
@@ -704,6 +919,27 @@ class Finding:
                 not (self.severity == "blocker" and self.resolution == "accepted"),
                 "resolution",
                 "'accepted' is not allowed for blocker findings; fix the code",
+            )
+
+    def _check_attribution(self) -> None:
+        if self.hunter is not None and self.hunter != LEAD_HUNTER:
+            _require_slot_id(self.hunter, "hunter")
+        _require_optional_text(self.by, "by")
+        tokens = [event.token for event in self.verdict_log]
+        _require_unique(tokens, "verdict_log")
+        if self.verdict_log:
+            _require(
+                self.verdict_log[-1].verdict == self.verdict,
+                "verdict_log",
+                "must end with the current verdict",
+            )
+        if self.merged_into is not None:
+            _require_id(self.merged_into, "F", "merged_into")
+            _require(self.merged_into != self.id, "merged_into", "must name another finding")
+            _require(
+                self.verdict == "dismissed",
+                "merged_into",
+                "is only allowed for a dismissed finding: a merged duplicate stays dismissed",
             )
 
     def to_json(self) -> dict[str, Any]:
@@ -731,6 +967,10 @@ class Finding:
                 resolution_note=f.text("resolution_note"),
                 recorded_at=f.text("recorded_at"),
                 updated_at=f.text("updated_at"),
+                hunter=f.optional_text_if_present("hunter"),
+                by=f.optional_text_if_present("by"),
+                verdict_log=f.records_or_empty("verdict_log", VerdictEvent.from_json),
+                merged_into=f.optional_text_if_present("merged_into"),
             )
         )
 
@@ -875,7 +1115,8 @@ class AgentUsage:
         )
 
 
-RECORD_TOKEN_RE = re.compile(r"[CF]\d+")
+# The tokens a command prints for what it recorded: a claim B, coverage C, finding F, verdict V.
+RECORD_TOKEN_RE = re.compile(r"[BCFV]\d+")
 
 
 @dataclass(frozen=True)
@@ -886,7 +1127,7 @@ class AgentEvent:
     agent_id: str
     at: str
     usage: AgentUsage | None = None  # a stop event only, and only when the transcript was readable
-    # A stop event only: the record tokens (`C3`, `F2`) the run's own transcript shows it printed;
+    # A stop event only: the record tokens (`B1`, `C3`, `F2`, `V4`) the run's own transcript shows it printed;
     # None when no transcript was readable, so the gate attributes records by time instead.
     records: tuple[str, ...] | None = None
 
@@ -897,7 +1138,7 @@ class AgentEvent:
         _require(self.usage is None or self.event == "stop", "usage", "is only allowed on a stop event")
         _require(self.records is None or self.event == "stop", "records", "is only allowed on a stop event")
         for index, token in enumerate(self.records or ()):
-            _require(RECORD_TOKEN_RE.fullmatch(token) is not None, f"records[{index}]", "must look like C3 or F2")
+            _require(RECORD_TOKEN_RE.fullmatch(token) is not None, f"records[{index}]", "must look like B1, C3, F2 or V4")
 
     def to_json(self) -> dict[str, Any]:
         data = _record_json(self)
@@ -922,6 +1163,40 @@ class AgentEvent:
         )
 
 
+@dataclass(frozen=True)
+class SlotClaim:
+    """A hunter taking a slot: `craftsman review brief <slot>` records it as its first act."""
+
+    round: int
+    slot: str
+    token: str
+    at: str
+    by: str | None = None
+
+    def __post_init__(self) -> None:
+        _require(self.round >= 1, "round", "must be >= 1")
+        _require_slot_id(self.slot, "slot")
+        _require_id(self.token, "B", "token")
+        _require_timestamp(self.at, "at")
+        _require_optional_text(self.by, "by")
+
+    def to_json(self) -> dict[str, Any]:
+        return _record_json(self)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> SlotClaim:
+        f = Fields(raw)
+        return f.done(
+            cls(
+                round=f.integer("round"),
+                slot=f.text("slot"),
+                token=f.text("token"),
+                at=f.text("at"),
+                by=f.optional_text("by"),
+            )
+        )
+
+
 def scope_contains(superset: tuple[str, ...] | None, subset: tuple[str, ...] | None) -> bool:
     """True when `superset` covers every path in `subset` (`None` means the full work tree)."""
     if superset is None:
@@ -938,6 +1213,7 @@ class Ledger:
     findings: tuple[Finding, ...] = ()
     runs: tuple[Run, ...] = ()
     agents: tuple[AgentEvent, ...] = ()
+    claims: tuple[SlotClaim, ...] = ()
 
     @property
     def current_scope(self) -> tuple[str, ...] | None:
@@ -968,6 +1244,12 @@ class Ledger:
                     )
         _require_unique([run.id for run in self.runs], "runs")
         _require_unique([finding.id for finding in self.findings], "findings")
+        _require_unique([claim.token for claim in self.claims], "claims")
+        _require_unique(
+            [event.token for finding in self.findings for event in finding.verdict_log], "verdict_log"
+        )
+        for index, claim in enumerate(self.claims):
+            self._round(claim.round, f"claims[{index}]")
         for index, coverage in enumerate(self.coverage):
             self._check_coverage(coverage, f"coverage[{index}]")
         for index, finding in enumerate(self.findings):
@@ -986,6 +1268,11 @@ class Ledger:
     def _check_finding(self, finding: Finding, where: str) -> None:
         self._round(finding.round, where)
         _require(
+            finding.merged_into is None or any(item.id == finding.merged_into for item in self.findings),
+            f"{where}.merged_into",
+            f"references an unknown finding {finding.merged_into!r}",
+        )
+        _require(
             finding.verdict_run is None or any(run.id == finding.verdict_run for run in self.runs),
             f"{where}.verdict_run",
             f"references an unknown run {finding.verdict_run!r}",
@@ -999,13 +1286,13 @@ class Ledger:
         try:
             f = Fields(raw)
             schema = f.integer("schema")
-            if schema < SCHEMA_VERSION:
+            if schema < MIN_READABLE_SCHEMA:
                 raise FieldError(
                     "schema",
                     f"{schema} is from an older craftsman; run `craftsman review reset` to archive it",
                 )
             _require(
-                schema == SCHEMA_VERSION,
+                schema <= SCHEMA_VERSION,
                 "schema",
                 f"{schema} is not supported (expected {SCHEMA_VERSION}); upgrade craftsman",
             )
@@ -1016,6 +1303,7 @@ class Ledger:
                     findings=f.records("findings", Finding.from_json),
                     runs=f.records("runs", Run.from_json),
                     agents=f.records("agents", AgentEvent.from_json),
+                    claims=f.records_or_empty("claims", SlotClaim.from_json),
                 )
             )
         except FieldError as exc:
