@@ -33,6 +33,7 @@ from craftsman.ledger import (
     plan_coverage,
     reopened_mentions,
     resolve,
+    round_unchanged,
     save,
     set_verdict,
     stable_hunk_ids,
@@ -1097,6 +1098,44 @@ class LensAwareCarryOverTests(unittest.TestCase):
         )
 
         self.assertEqual([(h.carried, h.reopened) for h in round_.hunks], [(False, True), (False, False)])
+
+    def test_raising_an_unchanged_round_to_deep_releases_carried_hunks_that_lack_a_required_lens(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        h3 = make_hunk("H3", "c.py")
+        snap = make_snap(h1, h2, h3, fingerprint="fp2")
+        normal = {h.id: self.INTENT_TESTS for h in (h1, h2, h3)}
+        credited = {h1.digest: self.INTENT_TESTS, h2.digest: self.INTENT_TESTS | {"state"}}
+        ledger, second = open_round(ledger, snap, False, "packet.md", {}, required=normal, credited=credited)
+        self.assertEqual(second.open_hunk_ids, ("H3",))
+
+        deep = {h.id: self.INTENT_TESTS | {"state"} for h in (h1, h2, h3)}
+        raised_ledger, raised = open_round(ledger, snap, True, "packet.md", {}, required=deep, credited=credited)
+
+        self.assertTrue(raised.deep)
+        self.assertEqual(len(raised_ledger.rounds), 2)
+        self.assertEqual([(h.id, h.carried) for h in raised.hunks], [("H1", False), ("H2", True), ("H3", False)])
+
+    def test_raising_does_not_carry_again_what_was_open(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        snap = make_snap(h1, h2, fingerprint="fp2")
+        ledger, second = open_round(ledger, snap, False, "packet.md", {}, required={"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}, credited={})
+        self.assertEqual(second.open_hunk_ids, ("H1", "H2"))
+        full = {h1.digest: self.INTENT_TESTS, h2.digest: self.INTENT_TESTS}
+
+        _, raised = open_round(ledger, snap, True, "packet.md", {}, required={"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}, credited=full)
+
+        self.assertEqual(raised.open_hunk_ids, ("H1", "H2"))
+
+    def test_round_unchanged_is_the_fingerprint_and_scope_test_of_open_round(self) -> None:
+        h1 = make_hunk("H1")
+        ledger = fully_reviewed(make_snap(h1))
+        same, other = make_snap(h1), make_snap(h1, fingerprint="fp2")
+
+        self.assertTrue(round_unchanged(ledger, same, None))
+        self.assertFalse(round_unchanged(ledger, other, None))
+        self.assertFalse(round_unchanged(ledger, same, ["a.py"]))  # a different scope is a new round
+        self.assertFalse(round_unchanged(Ledger(), same, None))
+        self.assertIs(open_round(ledger, same, False, "p.md", {})[0], ledger)
 
     def test_a_first_round_has_nothing_to_carry(self) -> None:
         h1 = make_hunk("H1")

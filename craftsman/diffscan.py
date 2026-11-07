@@ -1392,7 +1392,7 @@ def _outside_signal_patterns(path: str) -> bool:
 def _is_config(path: str) -> bool:
     posix = PurePosixPath(path)
     return (
-        posix.suffix in _CONFIG_SUFFIXES
+        posix.suffix.lower() in _CONFIG_SUFFIXES
         or posix.name in _CONFIG_NAMES
         or _name_matches(posix.name, _CONFIG_NAME_GLOBS)
         or posix.parts[:2] == (".github", "workflows")

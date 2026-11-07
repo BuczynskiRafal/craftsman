@@ -201,6 +201,7 @@ class SlotWork:
     slot: str
     digests: frozenset[str]  # digests covered under this slot by acceptable records
     first_at: datetime | None  # earliest acceptable record time
+    last_at: Mapping[str, datetime]  # per covered digest, the latest acceptable record time that covers it
     runs: tuple[str, ...]  # agent ids of the runs whose records were accepted (the run key for a platform without ids)
 
 
@@ -383,6 +384,11 @@ def slot_work(
                 v for v in item.vouchers if not v.exact and (number, _run_key(v.run, v.index)) not in bound
             ):
                 windowed.append((item, window))
+        exact_tokens = {item.token for item, _ in accepted}
+        exact_covered: dict[str, frozenset[str]] = {}
+        for item, _ in accepted:
+            assert item.record.hunter is not None
+            exact_covered[item.record.hunter] = exact_covered.get(item.record.hunter, frozenset()) | digests_of[item.token]
         window_candidates = _window_candidates(windowed, accepted, digests_of)
         vouched_by: dict[str, set[str]] = defaultdict(set)
         for item, vouchers in window_candidates:
@@ -393,11 +399,24 @@ def slot_work(
         for slot in dict.fromkeys(item.record.hunter for item, _ in accepted):
             assert slot is not None
             mine = [(item, vouchers) for item, vouchers in accepted if item.record.hunter == slot]
+            # What a record adds to the slot: all its digests, except that a window top-up for a slot an
+            # exact hunter holds adds only digests no exact record covers (it must not refresh the time of
+            # a digest the exact hunter covered).
+            held = exact_covered.get(slot, frozenset())
+            added = {
+                item.token: digests_of[item.token] - (held if item.token not in exact_tokens else frozenset())
+                for item, _ in mine
+            }
+            covered = frozenset(digest for digests in added.values() for digest in digests)
             work[(number, slot)] = SlotWork(
                 round=number,
                 slot=slot,
-                digests=frozenset(digest for item, _ in mine for digest in digests_of[item.token]),
+                digests=covered,
                 first_at=min(item.at for item, _ in mine),
+                last_at={
+                    digest: max(item.at for item, _ in mine if digest in added[item.token])
+                    for digest in covered
+                },
                 runs=tuple(
                     sorted(
                         {

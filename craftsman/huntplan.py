@@ -52,11 +52,11 @@ from craftsman.lenses import DEEP_HINT_SIGNALS, LENSES, get_lens
 from craftsman.records import (
     LEAD_HUNTER,
     SEVERITIES,
-    SLOT_ID_RE,
     Finding,
     HunkRef,
     HuntPlan,
     Ledger,
+    LedgerError,
     Round,
     Slot,
     SlotKind,
@@ -71,6 +71,7 @@ MAX_VARIANTS_PER_WAVE = 3
 MAX_GENERATION = 3
 MAX_FRESH_LENSES = 3
 MAX_REASON_HUNK_IDS = 6
+_MAX_DERIVATION_PASSES = 4  # see `_derived_slots`
 
 CORE_LENSES = ("intent", "contracts", "failure", "ripple", "tests")
 CONDITIONAL_LENSES = ("state", "trust", "platform", "model")
@@ -383,8 +384,8 @@ def build_plan(
     weight = {hunk.id: changed_lines(hunk) for hunk in (*open_hunks, *scope)}
     docs = {hunk.id: is_docs_hunk(hunk) for hunk in taking}
 
-    new, slice_count = _generation_one(taking, needs, docs, weight, kept, round_number)
-    new = _with_sweep(new, slice_count, kept, taking, scope, weight, carry_sweep=carry_sweep)
+    new, slice_count, delta = _generation_one(taking, needs, docs, weight, kept, round_number)
+    new = _with_sweep(new, slice_count, kept, taking, scope, weight, carry_sweep=carry_sweep, delta=delta)
 
     taken_ids = {slot.id for slot in (*kept, *new)}
     pending = [slot for slot in pending_wave_slots if slot.id not in taken_ids]
@@ -392,11 +393,12 @@ def build_plan(
     holds_fresh = any(slot.id.startswith("W2-X") for slot in (*kept, *pending))
     if depth.deep and first_deep_round and not holds_fresh:
         generation_one = [slot for slot in (*kept, *new) if slot.generation == 1]
-        units = [unit for unit in _units(taking) if not unit.docs] or [
-            unit for unit in _units(scope) if not unit.docs
-        ]
         fresh = _fresh_set(
-            units, 2, "deep", None, lambda _, ids: _complement(ids, generation_one)
+            [unit for unit in _units(scope) if not unit.docs],
+            2,
+            "deep",
+            None,
+            lambda _, ids: _complement(ids, generation_one),
         )
     reasons = tuple(dict.fromkeys((*(existing.reasons if existing is not None else ()), *depth.reasons)))
     return HuntPlan(reasons=reasons, slots=(*kept, *new, *fresh, *pending))
@@ -409,10 +411,14 @@ def _generation_one(
     weight: Mapping[str, int],
     kept: Sequence[Slot],
     round_number: int,
-) -> tuple[list[Slot], int]:
-    """The new generation 1 bug and simplicity slots for the hunks in `taking`, and how many slices they came from."""
+) -> tuple[list[Slot], int, bool]:
+    """The new generation 1 bug and simplicity slots for the hunks in `taking`.
+
+    Also how many slices they came from and whether the round is a delta round (a later round whose
+    owed hunks are few and quiet, planned as one bug slot).
+    """
     if not taking:
-        return [], 0
+        return [], 0, False
     counter = max((_slot_number(slot.id) for slot in kept if slot.generation == 1), default=0)
     new: list[Slot] = []
 
@@ -463,7 +469,7 @@ def _generation_one(
         lenses = listed(part, SIMPLICITY_LENSES)
         if lenses:
             add("simplicity", owing(part, lenses), lenses)
-    return new, len(parts)
+    return new, len(parts), delta
 
 
 def _with_sweep(
@@ -475,13 +481,22 @@ def _with_sweep(
     weight: Mapping[str, int],
     *,
     carry_sweep: bool,
+    delta: bool,
 ) -> list[Slot]:
-    """`new` with the sweep the plan calls for: whole-diff, once, never on conditional or simplicity slots."""
+    """`new` with the sweep the plan calls for: whole-diff, once, never on conditional or simplicity slots.
+
+    An ordinary sweep (the plan has two bug slots) covers the hunks being taken, may ride on a core slot
+    when there is a single slice, and is left out of a delta round, also when a delta round is raised to
+    deep in place. A sweep slot of its own is never planned over fewer than two hunks. A carried
+    sweep (`carry_sweep`: an earlier round left its sweep unfinished) covers all hunks of the round,
+    code before documentation, and is always a slot of its own: a core slot never grows beyond its
+    slice to carry it. It is required even in a delta round, so that a tiny edit does not erase it.
+    """
     everything = (*kept, *new)
     if any(SWEEP in slot.lenses for slot in everything):
         return new
     bug_slots = sum(slot.kind == "bug" for slot in everything)
-    if not (new and bug_slots >= 2) and not carry_sweep:
+    if not carry_sweep and not (new and bug_slots >= 2 and not delta):
         return new
     if carry_sweep:
         swept = [hunk for hunk in scope if not is_docs_hunk(hunk)] or list(scope)
@@ -501,10 +516,12 @@ def _with_sweep(
         ),
         None,
     )
-    if host is not None and slice_count == 1:
+    if host is not None and slice_count == 1 and not carry_sweep:
         slot = new[host]
         new[host] = replace(slot, lenses=(*slot.lenses, SWEEP), hunks=ids, changed_lines=lines)
         return new
+    if len(ids) < 2:
+        return new  # a sweep slot of its own looks across hunks: one hunk has nothing to look across
     counter = max((_slot_number(slot.id) for slot in everything if slot.generation == 1), default=0)
     new.append(
         Slot(id=f"W1-{counter + 1}", generation=1, kind="sweep", hunks=ids, lenses=(SWEEP,), changed_lines=lines)
@@ -513,6 +530,12 @@ def _with_sweep(
 
 
 # --- later generations ----------------------------------------------------------------------
+#
+# Whatever a hunter was sent to do is stored. A round's stored plan only grows, by `materialize`
+# (the slots someone acts on) and `seal_round` (everything it requires, when the next round is about
+# to open). Only the LATEST round is dynamic: besides its plan it requires the wave slots the findings
+# call for right now, and those may change while nobody has acted on them. A past round requires its
+# stored plan and nothing else, so a finished round is an immutable snapshot.
 
 
 def is_trigger(finding: Finding, hunk_is_docs: bool) -> bool:
@@ -531,18 +554,28 @@ def is_trigger(finding: Finding, hunk_is_docs: bool) -> bool:
 
 
 def _stored_order(ledger: Ledger) -> SlotOrder:
-    """Slot ids by round from the stored plans alone.
-
-    Binding a run to a slot uses the order only to break ties; the dynamic slots, which depend on
-    the binding, sort after the stored ones by id. Using the stored plans keeps the derivation free of
-    recursion.
-    """
+    """Slot ids by round from the stored plans alone."""
 
     def order(number: int) -> Sequence[str]:
         plan = ledger.rounds[number - 1].plan if 1 <= number <= len(ledger.rounds) else None
         return () if plan is None else tuple(slot.id for slot in plan.slots)
 
     return order
+
+
+def _stored_hunks(ledger: Ledger) -> SlotHunks:
+    return _hunks_in({round_.number: round_.plan.slots if round_.plan else () for round_ in ledger.rounds})
+
+
+def _order_with(ledger: Ledger, latest: int, slots: Sequence[Slot]) -> SlotOrder:
+    """Plan order of slot ids: the stored plan of every round, but for round `latest` the `slots` known so far.
+
+    Binding a run to a slot breaks ties by this order, so a wave slot derived for the latest round must
+    be in it, ahead of ids it does not know (never plain sorting of the ids).
+    """
+    stored = _stored_order(ledger)
+    ids = tuple(slot.id for slot in slots)
+    return lambda number: ids if number == latest else stored(number)
 
 
 def _generation_of(finding: Finding, bound: frozenset[str]) -> int:
@@ -564,12 +597,12 @@ def finding_generation(
 ) -> int:
     """The generation of `finding`: that of the slot bound to the run that recorded it, else of its tag.
 
+    The binding uses the plan order of everything the round requires, derived wave slots included.
     `lead` and untagged findings with no bound recorder are generation 1.
     """
     if finding.round != round_.number:
         raise ValueError(f"{finding.id} belongs to round {finding.round}, not round {round_.number}")
-    bound = finding_slots(ledger, finding, runs, _stored_order(ledger))
-    return _generation_of(finding, bound)
+    return _generation_of(finding, finding_slots(ledger, finding, runs, slot_order(ledger)))
 
 
 def _finding_number(finding: Finding) -> int:
@@ -585,70 +618,148 @@ def _open_refs(round_: Round) -> list[HunkRef]:
     return [ref for ref in round_.hunks if not ref.carried]
 
 
-def _own_slots(ledger: Ledger, round_: Round) -> tuple[Slot, ...]:
-    """The stored plan of `round_` plus the wave slots the trigger findings of `round_` call for."""
-    if round_.plan is None:
-        return ()  # a round without a hunt plan keeps the rules of 5.0: no waves
-    stored = round_.plan.slots
-    findings = [item for item in ledger.findings if item.round == round_.number]
-    triggers = [item for item in findings if is_trigger(item, _docs_path(item.path))]
-    open_refs = _open_refs(round_)
-    if not triggers or not open_refs:
-        return stored
-    runs = agent_runs(ledger)
-    order = _stored_order(ledger)
-    table = bound_slots(ledger, runs, order)
-    generation = {
-        item.id: _generation_of(item, finding_slots(ledger, item, runs, order, bound=table))
-        for item in triggers
-    }
-    slots = list(stored)
-    generation_one = [slot for slot in stored if slot.generation == 1]
-    for g in range(1, MAX_GENERATION):
-        wave = sorted((item for item in triggers if generation[item.id] == g), key=_finding_number)
-        if not wave:
-            continue
-        slots.extend(_fresh_for_wave(wave, g, slots, open_refs, generation_one))
-        slots.extend(_variants_for_wave(wave, g, slots, open_refs))
-    return tuple(slots)
-
-
 def required_slots(ledger: Ledger, round_: Round) -> tuple[Slot, ...]:
-    """The slots `round_` requires: its stored plan plus the wave slots the hunt calls for.
+    """The slots `round_` requires.
 
-    A round without a plan requires none. Besides the stored plan there are
-    - the wave slots its own trigger findings call for, over its open hunks (changed lines counted from
-      the hunks' `new_len`, as the ledger holds no diff lines);
-    - for the latest round only, the wave slots that findings of earlier rounds call for and that no
-      later plan stores yet: a finding judged after the next round opened still gets its wave;
-    - every wave slot a hunter already holds (a claim or tagged coverage in this round), even when
-      its finding was re-judged or outranked since: a slot never vanishes under a running hunter.
-    Stored slots are never duplicated.
+    A round without a plan requires none. A past round requires its stored plan and nothing else. The
+    latest round requires its stored plan plus the wave slots that can be derived right now
+    (`_derived_slots`): from its own findings, and from findings of earlier rounds that no stored plan
+    answers yet. Those derived slots are provisional: `materialize` stores the ones someone acts on and
+    `seal_round` stores the rest before the next round opens. Stored slots come first. No id is returned
+    twice, because `_derived_slots` never derives an id the stored plans or the slots derived before hold
+    (`HuntPlan` rejects a duplicate when the slots are stored).
     """
     if round_.plan is None:
         return ()
-    slots = list(_own_slots(ledger, round_))
-    if round_.number == len(ledger.rounds):
-        slots.extend(_inherited_slots(ledger, round_, slots))
-    slots.extend(_held_orphans(ledger, round_, slots))
-    return tuple(slots)
+    if round_.number != len(ledger.rounds):
+        return round_.plan.slots
+    return (*round_.plan.slots, *_derived_slots(ledger, round_))
+
+
+def _verdict_round(ledger: Ledger, finding: Finding) -> int:
+    """The round that was current when `finding` was judged as it is now (its own round if that cannot be told)."""
+    since = verdict_since(finding)
+    if since is None:
+        return finding.round
+    moment = parse_timestamp(since)
+    started = [round_.number for round_ in ledger.rounds if parse_timestamp(round_.prepared_at) <= moment]
+    return max(finding.round, max(started, default=1))
+
+
+def _derived_slots(ledger: Ledger, latest: Round) -> tuple[Slot, ...]:
+    """The wave slots the findings call for from the latest round, beyond its stored plan.
+
+    The wave of generation g+1 is called for by the trigger findings of generation g:
+    - a fresh set `W<g+1>-X<j>`, owed per generation (fresh sets recur under the same ids in many
+      rounds, so an id says nothing): when a trigger finding of generation g exists in any round, no
+      round from the one the finding was judged in onward holds a complete fresh set of that generation,
+      and the latest round stores none. A set for findings of the latest round covers its open hunks,
+      one for findings of earlier rounds (judged late) every hunk of the round;
+    - variant slots `W<g+1>-F<n>`, over the open hunks of the latest round, one per
+      (round, file, lens) cluster of trigger findings that no stored variant answers yet, at most
+      `MAX_VARIANTS_PER_WAVE` per generation counting the ones already stored.
+
+    A finding's generation is that of the slot its recording run is bound to, and the binding breaks
+    ties by plan order, in which the derived slots must appear. So the derivation is repeated, each pass
+    binding with the slots the previous one derived, until it settles (a pass with the same answer).
+    """
+    assert latest.plan is not None
+    triggers = [item for item in ledger.findings if is_trigger(item, _docs_path(item.path))]
+    if not triggers:
+        return ()
+    runs = agent_runs(ledger)
+    stored = [slot for round_ in ledger.rounds if round_.plan for slot in round_.plan.slots]
+    work: dict[tuple[int, str], SlotWork] | None = None
+
+    def fresh_set_complete(finding: Finding, generation: int) -> bool:
+        """Whether a round from the finding's verdict round onward finished a fresh set of `generation`."""
+        nonlocal work
+        for round_ in ledger.rounds[_verdict_round(ledger, finding) - 1 :]:
+            members = [
+                slot
+                for slot in (round_.plan.slots if round_.plan else ())
+                if slot.kind == "fresh" and slot.generation == generation
+            ]
+            if not members or round_.number == latest.number:
+                continue
+            if work is None:
+                work = slot_work(ledger, runs, _stored_order(ledger), slot_hunks=_stored_hunks(ledger))
+            if all(slot_complete(round_, slot, work) for slot in members):
+                return True
+        return False
+
+    derived: tuple[Slot, ...] = ()
+    for _ in range(_MAX_DERIVATION_PASSES):
+        again = _derivation_pass(ledger, latest, triggers, runs, stored, derived, fresh_set_complete)
+        if again == derived:
+            break
+        derived = again
+    return derived
+
+
+def _derivation_pass(
+    ledger: Ledger,
+    latest: Round,
+    triggers: Sequence[Finding],
+    runs: Sequence[AgentRun],
+    stored: Sequence[Slot],
+    previous: Sequence[Slot],
+    complete: Callable[[Finding, int], bool],
+) -> tuple[Slot, ...]:
+    """One derivation of the waves, generation by generation, binding with the slots known so far and `previous`."""
+    assert latest.plan is not None
+    open_refs = _open_refs(latest)
+    slots = list(latest.plan.slots)
+    derived: list[Slot] = []
+    for g in range(1, MAX_GENERATION):
+        known = {slot.id for slot in slots}
+        order = _order_with(ledger, latest.number, [*slots, *(slot for slot in previous if slot.id not in known)])
+        table = bound_slots(ledger, runs, order)
+        wave = sorted(
+            (
+                item
+                for item in triggers
+                if _generation_of(item, finding_slots(ledger, item, runs, order, bound=table)) == g
+            ),
+            key=_finding_number,
+        )
+        if not wave:
+            continue
+        new = [
+            *_fresh_for_wave(latest, wave, g, slots, open_refs, complete),
+            *_variants_for_wave(ledger, wave, g, slots, stored, open_refs),
+        ]
+        slots.extend(new)
+        derived.extend(new)
+    return tuple(derived)
 
 
 def _fresh_for_wave(
+    latest: Round,
     wave: Sequence[Finding],
     g: int,
     slots: Sequence[Slot],
     open_refs: Sequence[HunkRef],
-    generation_one: Sequence[Slot],
+    complete: Callable[[Finding, int], bool],
 ) -> list[Slot]:
-    if any(slot.id.startswith(f"W{g + 1}-X") for slot in slots):
+    assert latest.plan is not None
+    target = g + 1
+    if any(slot.id.startswith(f"W{target}-X") for slot in slots):
         return []
-    units = [unit for unit in _unit_refs(open_refs) if not unit.docs]
+    owing = [item for item in wave if not complete(item, target)]
+    own = [item for item in owing if item.round == latest.number]
+    if own and open_refs:
+        source, refs = own, open_refs
+    else:
+        source, refs = [item for item in owing if item.round != latest.number], list(latest.hunks)
+    if not source:
+        return []
+    generation_one = [slot for slot in latest.plan.slots if slot.generation == 1]
     return _fresh_set(
-        units,
-        g + 1,
-        wave[0].id,
-        _earliest([verdict_since(item) for item in wave]),
+        [unit for unit in _unit_refs(refs) if not unit.docs],
+        target,
+        source[0].id,
+        _earliest([verdict_since(item) for item in source]),
         lambda _, ids: _complement(ids, generation_one),
     )
 
@@ -671,92 +782,105 @@ def _variant_slot(
 
 
 def _variants_for_wave(
-    wave: Sequence[Finding], g: int, slots: Sequence[Slot], open_refs: Sequence[HunkRef]
+    ledger: Ledger,
+    wave: Sequence[Finding],
+    g: int,
+    slots: Sequence[Slot],
+    stored: Sequence[Slot],
+    open_refs: Sequence[HunkRef],
 ) -> list[Slot]:
-    clusters: dict[tuple[str, str], list[Finding]] = defaultdict(list)
-    for item in wave:
-        clusters[(item.path, item.lens)].append(item)
-    ranked = sorted(
-        clusters.values(),
-        key=lambda cluster: (min(SEVERITIES.index(item.severity) for item in cluster), _finding_number(cluster[0])),
-    )[:MAX_VARIANTS_PER_WAVE]
-    known = {slot.id for slot in slots}
-    units = _unit_refs(open_refs)
-    variants: list[Slot] = []
-    for cluster in ranked:
-        first = cluster[0]  # the wave is sorted by finding number
-        slot = _variant_slot(first, g, _earliest([verdict_since(item) for item in cluster]), units)
-        if slot.id not in known:
-            variants.append(slot)
-    return variants
+    """The variant slots of the trigger findings in `wave` (sorted by finding number) that nothing stored answers.
 
-
-def _held_waves(ledger: Ledger, number: int) -> frozenset[str]:
-    """The wave slots (generation 2 and 3) a hunter holds in round `number`: claimed, or covered under their id."""
-    claimed = (claim.slot for claim in ledger.claims if claim.round == number)
-    tagged = (item.hunter for item in ledger.coverage if item.round == number and item.hunter is not None)
-    return frozenset(slot for slot in (*claimed, *tagged) if (slot_generation(slot) or 1) >= 2)
-
-
-def _ever_triggered(findings: Sequence[Finding]) -> tuple[Finding, str] | None:
-    """The first finding that was ever judged proven or probable, with the moment it first was."""
-    for item in sorted(findings, key=_finding_number):
-        moments = [event.at for event in item.verdict_log if event.verdict in ("proven", "probable")]
-        if moments:
-            return item, min(moments, key=parse_timestamp)
-    return None
-
-
-def _held_orphans(ledger: Ledger, round_: Round, slots: Sequence[Slot]) -> list[Slot]:
-    """Held wave slots that the current findings no longer derive, rebuilt so that they stay required.
-
-    A variant is rebuilt from the finding its id names (any bug-lens finding of the ledger), a fresh
-    set whole, from the findings of this round; each keeps a `since` of when its finding was first
-    judged proven or probable.
+    A (round, file, lens) cluster is answered when a stored variant of the same generation names one of
+    its findings as its trigger: the cluster keeps that representative. Variants already in `slots`
+    count toward the cap.
     """
-    known = {slot.id for slot in slots}
-    held = sorted(_held_waves(ledger, round_.number) - known)
-    open_refs = _open_refs(round_)
-    if not held or not open_refs:
+    if not open_refs:
         return []
-    units = _unit_refs(open_refs)
+    target = g + 1
     by_id = {item.id: item for item in ledger.findings}
-    generation_one = [slot for slot in (round_.plan.slots if round_.plan else ()) if slot.generation == 1]
-    orphans: list[Slot] = []
-    fresh_generations: set[int] = set()
-    for slot_id in held:
-        match = SLOT_ID_RE.fullmatch(slot_id)
-        if match is None:
+    known = {slot.id for slot in (*stored, *slots)}
+    answered = {
+        (slot.generation, by_id[slot.trigger].round, by_id[slot.trigger].path, by_id[slot.trigger].lens)
+        for slot in (*stored, *slots)
+        if slot.kind == "variant" and slot.trigger in by_id
+    }
+    room = MAX_VARIANTS_PER_WAVE - sum(slot.kind == "variant" and slot.generation == target for slot in slots)
+    clusters: dict[tuple[int, str, str], list[Finding]] = defaultdict(list)
+    for item in wave:
+        clusters[(item.round, item.path, item.lens)].append(item)
+    ranked = sorted(
+        (cluster for key, cluster in clusters.items() if (target, *key) not in answered),
+        key=lambda cluster: (min(SEVERITIES.index(item.severity) for item in cluster), _finding_number(cluster[0])),
+    )[: max(room, 0)]
+    units = _unit_refs(open_refs)
+    variants = [
+        _variant_slot(cluster[0], g, _earliest([verdict_since(item) for item in cluster]), units)
+        for cluster in ranked
+    ]
+    return [slot for slot in variants if slot.id not in known]
+
+
+def materialize(ledger: Ledger, round_number: int, slot_ids: Sequence[str]) -> Ledger:
+    """Store the named slots in the plan of round `round_number`, as `required_slots` derives them now.
+
+    A hunter that is sent to a slot that is not stored yet (`brief`, `cover --hunter`, `add --hunter`)
+    makes the slot a fact: from then on it is part of the round's plan and never vanishes, whatever
+    later happens to the finding that called for it. Ids already stored are skipped. A fresh slot
+    takes its whole set along, since a fresh set is one unit. Only the latest round derives anything, so
+    an id that `required_slots` does not offer raises `LedgerError`; so does a round without a plan.
+    """
+    if not 1 <= round_number <= len(ledger.rounds):
+        raise LedgerError(f"round {round_number} does not exist")
+    round_ = ledger.rounds[round_number - 1]
+    if round_.plan is None:
+        raise LedgerError(f"round {round_number} has no hunt plan, so it has no slot to store")
+    stored = {slot.id for slot in round_.plan.slots}
+    offered = {slot.id: slot for slot in required_slots(ledger, round_)}
+    wanted: set[str] = set()
+    for slot_id in slot_ids:
+        if slot_id in stored:
             continue
-        g = int(match.group(1)) - 1
-        if match.group(4) is not None:
-            origin = by_id.get(f"F{match.group(4)}")
-            if origin is None or origin.lens not in BUG_LENSES:
-                continue
-            ever = _ever_triggered([origin])
-            orphans.append(_variant_slot(origin, g, ever[1] if ever else verdict_since(origin), units))
-        elif match.group(3) is not None:
-            fresh_generations.add(g + 1)
-    for generation in sorted(fresh_generations):
-        ever = _ever_triggered([item for item in ledger.findings if item.round == round_.number])
-        fresh = _fresh_set(
-            [unit for unit in units if not unit.docs],
-            generation,
-            ever[0].id if ever else "deep",
-            ever[1] if ever else None,
-            lambda _, ids: _complement(ids, generation_one),
-        )
-        if any(slot.id in held for slot in fresh):
-            orphans.extend(fresh)
-    return orphans
+        slot = offered.get(slot_id)
+        if slot is None:
+            raise LedgerError(f"slot {slot_id} is not part of round {round_number}'s plan or derivable for it")
+        wanted.add(slot_id)
+        if slot.kind == "fresh":
+            wanted.update(item.id for item in offered.values() if item.kind == "fresh" and item.generation == slot.generation)
+    adding = tuple(slot for slot in offered.values() if slot.id in wanted and slot.id not in stored)
+    return _with_plan(ledger, round_, adding)
+
+
+def seal_round(ledger: Ledger) -> Ledger:
+    """Store every slot the latest round requires in its plan, so that the round becomes an immutable snapshot.
+
+    Called before a new round opens (and only then: sealing freezes derived slots that a verdict about
+    to be recorded might have withdrawn). A ledger without rounds, or a latest round without a plan,
+    is returned as it is.
+    """
+    if not ledger.rounds or ledger.rounds[-1].plan is None:
+        return ledger
+    latest = ledger.rounds[-1]
+    assert latest.plan is not None
+    stored = {slot.id for slot in latest.plan.slots}
+    return _with_plan(ledger, latest, tuple(slot for slot in required_slots(ledger, latest) if slot.id not in stored))
+
+
+def _with_plan(ledger: Ledger, round_: Round, adding: Sequence[Slot]) -> Ledger:
+    """`ledger` with `adding` appended to the plan of `round_`."""
+    if not adding or round_.plan is None:
+        return ledger
+    plan = HuntPlan(round_.plan.reasons, (*round_.plan.slots, *adding))
+    rounds = tuple(replace(item, plan=plan) if item.number == round_.number else item for item in ledger.rounds)
+    return replace(ledger, rounds=rounds)
 
 
 def slot_complete(round_: Round, slot: Slot, work: Mapping[tuple[int, str], SlotWork]) -> bool:
     """Whether accepted coverage tagged with `slot` covers every hunk of the slot.
 
-    A slot with a `since` (a wave slot) counts only coverage that began at or after it: work that
-    started before the trigger answered something else. This is deliberately strict; a hunter that
-    began early is asked to cover again.
+    A slot with a `since` (a wave slot) counts, per hunk, only coverage recorded at or after it: work
+    that was done before the trigger answered something else. Earlier coverage never blocks: covering
+    the hunks again after the trigger completes the slot.
     """
     done = work.get((round_.number, slot.id))
     if done is None:
@@ -764,9 +888,10 @@ def slot_complete(round_: Round, slot: Slot, work: Mapping[tuple[int, str], Slot
     digests = {ref.digest for ref in round_.hunks if ref.id in slot.hunks}
     if not digests <= done.digests:
         return False
-    return slot.since is None or (
-        done.first_at is not None and done.first_at >= parse_timestamp(slot.since)
-    )
+    if slot.since is None:
+        return True
+    threshold = parse_timestamp(slot.since)
+    return all(done.last_at[digest] >= threshold for digest in digests)
 
 
 def _lenses_of(originals: Sequence[Slot]) -> Callable[[int, frozenset[str]], tuple[str, ...]]:
@@ -851,37 +976,6 @@ def _rebuild_waves(
     return sorted(rebuilt, key=_wave_order)
 
 
-def _inherited_slots(ledger: Ledger, latest: Round, own: Sequence[Slot]) -> list[Slot]:
-    """Wave slots that findings of earlier rounds call for and `latest` does not hold yet.
-
-    A finding judged after the next round was prepared reaches `pending_wave_slots` too late; here it
-    is rebuilt for the latest round (variants over its open hunks, fresh sets over all its hunks).
-    """
-    earlier = ledger.rounds[:-1]
-    if latest.number != len(ledger.rounds) or not earlier:
-        return []
-    owns = {round_.number: _own_slots(ledger, round_) for round_ in earlier}
-    work = slot_work(
-        ledger,
-        agent_runs(ledger),
-        lambda number: [slot.id for slot in owns.get(number, ())],
-        slot_hunks=_hunks_in(owns),
-    )
-    rebuilt = _rebuild_waves(
-        ledger,
-        _unfinished_waves(earlier, owns, work),
-        _unit_refs(_open_refs(latest)),
-        _unit_refs(latest.hunks),
-    )
-    held_ids = {slot.id for slot in own}
-    held_sets = {slot.generation for slot in own if slot.kind == "fresh"}
-    return [
-        slot
-        for slot in rebuilt
-        if slot.id not in held_ids and not (slot.kind == "fresh" and slot.generation in held_sets)
-    ]
-
-
 def _hunks_in(slots_by_round: Mapping[int, Sequence[Slot]]) -> SlotHunks:
     """`attribution`'s lookup of the hunk ids of a slot, from slots already derived per round."""
 
@@ -896,27 +990,29 @@ def pending_wave_slots(
 ) -> tuple[Slot, ...]:
     """The wave slots earlier rounds left unfinished, rebuilt for a round that replaces them.
 
-    A tiny edit and a new `prepare` must not make a pending slot disappear. A variant is judged by the
-    latest earlier round that holds its id; when its coverage is incomplete there, it is stored again
-    in the new round, keeping its id, lens, trigger and `since`, over the new round's open hunks of its
-    finding's file (all open hunks otherwise). A fresh set is judged as a unit by the latest round that
-    holds one of its generation; when unfinished it is stored again whole, over all hunks of the new
-    round that are not documentation, with the original lenses and repartitioned, so its slots are
-    numbered anew. A slot left with no hunks is dropped.
+    Call it after `seal_round`: only stored plans are judged, so the derived slots of a round that is
+    not sealed (and may be re-prepared unchanged) are never frozen by it. A tiny edit and a new
+    `prepare` must not make a pending slot disappear. A variant is judged by the latest earlier round
+    that holds its id; when its coverage is incomplete there, it is stored again in the new round,
+    keeping its id, lens, trigger and `since`, over the new round's open hunks of its finding's file
+    (all open hunks otherwise). A fresh set is judged as a unit by the latest round that holds one of
+    its generation; when unfinished it is stored again whole, over all hunks of the new round that are
+    not documentation, with the original lenses and repartitioned, so its slots are numbered anew. A
+    slot left with no hunks is dropped.
     """
     if not ledger.rounds:
         return ()
-    required = {round_.number: required_slots(ledger, round_) for round_ in ledger.rounds}
+    stored = {round_.number: round_.plan.slots if round_.plan else () for round_ in ledger.rounds}
     work = slot_work(
         ledger,
         agent_runs(ledger),
-        lambda number: [slot.id for slot in required.get(number, ())],
-        slot_hunks=_hunks_in(required),
+        lambda number: [slot.id for slot in stored.get(number, ())],
+        slot_hunks=_hunks_in(stored),
     )
     return tuple(
         _rebuild_waves(
             ledger,
-            _unfinished_waves(ledger.rounds, required, work),
+            _unfinished_waves(ledger.rounds, stored, work),
             _units(open_hunks),
             _units(round_hunks),
         )
@@ -926,68 +1022,95 @@ def pending_wave_slots(
 # --- adapters for attribution ---------------------------------------------------------------
 
 
+class _Required:
+    """The slots every round requires, computed once per round (`required_slots` is not free for the latest)."""
+
+    def __init__(self, ledger: Ledger) -> None:
+        self._ledger = ledger
+        self._cache: dict[int, tuple[Slot, ...]] = {}
+
+    def slots(self, number: int) -> tuple[Slot, ...]:
+        if not 1 <= number <= len(self._ledger.rounds):
+            return ()
+        if number not in self._cache:
+            self._cache[number] = required_slots(self._ledger, self._ledger.rounds[number - 1])
+        return self._cache[number]
+
+    def slot(self, number: int, slot_id: str) -> Slot | None:
+        return next((slot for slot in self.slots(number) if slot.id == slot_id), None)
+
+    def lenses(self, number: int, slot_id: str) -> tuple[str, ...] | None:
+        slot = self.slot(number, slot_id)
+        return None if slot is None else slot.lenses
+
+    def order(self, number: int) -> Sequence[str]:
+        return tuple(slot.id for slot in self.slots(number))
+
+    def hunks(self, number: int, slot_id: str) -> frozenset[str] | None:
+        slot = self.slot(number, slot_id)
+        return None if slot is None else frozenset(slot.hunks)
+
+
 def slot_lenses(ledger: Ledger) -> SlotLenses:
-    """`attribution`'s lookup of a slot's lenses: stored and dynamic slots of every round."""
-    cache: dict[int, dict[str, tuple[str, ...]]] = {}
+    """`attribution`'s lookup of a slot's lenses: stored and derived slots of every round.
 
-    def lookup(number: int, slot_id: str) -> tuple[str, ...] | None:
-        if not 1 <= number <= len(ledger.rounds):
-            return None
-        if number not in cache:
-            cache[number] = {slot.id: slot.lenses for slot in required_slots(ledger, ledger.rounds[number - 1])}
-        return cache[number].get(slot_id)
-
-    return lookup
+    The lenses are the ones the slot lists; whether the sweep among them was really done is a matter
+    of `credited_upto`.
+    """
+    return _Required(ledger).lenses
 
 
 def slot_order(ledger: Ledger) -> SlotOrder:
-    """`attribution`'s plan order of the slot ids of a round: the stored plan, then the dynamic slots."""
-    cache: dict[int, tuple[str, ...]] = {}
-
-    def order(number: int) -> Sequence[str]:
-        if not 1 <= number <= len(ledger.rounds):
-            return ()
-        if number not in cache:
-            cache[number] = tuple(slot.id for slot in required_slots(ledger, ledger.rounds[number - 1]))
-        return cache[number]
-
-    return order
+    """`attribution`'s plan order of the slot ids of a round: the stored plan, then the derived slots."""
+    return _Required(ledger).order
 
 
 def slot_hunks(ledger: Ledger) -> SlotHunks:
-    """`attribution`'s lookup of the hunk ids of a slot: stored and dynamic slots of every round."""
-    cache: dict[int, dict[str, frozenset[str]]] = {}
+    """`attribution`'s lookup of the hunk ids of a slot: stored and derived slots of every round."""
+    return _Required(ledger).hunks
 
-    def lookup(number: int, slot_id: str) -> frozenset[str] | None:
-        if not 1 <= number <= len(ledger.rounds):
+
+def credited_upto(
+    ledger: Ledger, upto: int, *, runs: Sequence[AgentRun] | None = None
+) -> dict[str, frozenset[str]]:
+    """Per hunk digest, the lenses accepted coverage of rounds up to `upto` has examined it with.
+
+    A slot's coverage credits its lenses, except `sweep`: the sweep looks across the hunks of its
+    slot, so it counts only when the slot's coverage spans every hunk it lists (`slot_complete`). A core
+    slot that hosts the sweep and covered some of its hunks credits its core lenses to those and the
+    sweep to none; sweeps of different rounds never add up.
+    """
+    seen = agent_runs(ledger) if runs is None else runs
+    required = _Required(ledger)
+    work = slot_work(ledger, seen, required.order, slot_hunks=required.hunks)
+
+    def lenses(number: int, slot_id: str) -> tuple[str, ...] | None:
+        slot = required.slot(number, slot_id)
+        if slot is None:
             return None
-        if number not in cache:
-            cache[number] = {
-                slot.id: frozenset(slot.hunks) for slot in required_slots(ledger, ledger.rounds[number - 1])
-            }
-        return cache[number].get(slot_id)
+        if SWEEP in slot.lenses and not slot_complete(ledger.rounds[number - 1], slot, work):
+            return tuple(lens for lens in slot.lenses if lens != SWEEP) or None
+        return slot.lenses
 
-    return lookup
+    return credited_lenses(ledger, upto, lenses, required.order, runs=seen, slot_hunks=required.hunks)
 
 
 def credited(ledger: Ledger) -> dict[str, frozenset[str]]:
     """Per hunk digest, the lenses accepted coverage of all rounds so far has examined it with."""
-    return credited_lenses(
-        ledger, len(ledger.rounds), slot_lenses(ledger), slot_order(ledger), slot_hunks=slot_hunks(ledger)
-    )
+    return credited_upto(ledger, len(ledger.rounds))
 
 
 def sweep_pending(ledger: Ledger) -> bool:
     """Whether the latest round that required a sweep left it unfinished.
 
-    The sweep is finished when its lens is credited for the digest of every hunk of the sweep slot, as
-    that round numbered them. A later round that required no sweep neither finishes nor forgives it.
+    The sweep is finished when that round's own sweep slot is complete (`slot_complete`): coverage tagged
+    with it spans every hunk it lists. A later round that required no sweep neither finishes nor
+    forgives it, and partial sweeps of several rounds do not add up.
     """
-    have = credited(ledger)
+    required = _Required(ledger)
+    work = slot_work(ledger, agent_runs(ledger), required.order, slot_hunks=required.hunks)
     for round_ in reversed(ledger.rounds):
         sweep = next((slot for slot in round_.plan.slots if SWEEP in slot.lenses), None) if round_.plan else None
-        if sweep is None:
-            continue
-        digests = {ref.digest for ref in round_.hunks if ref.id in sweep.hunks}
-        return not all(SWEEP in have.get(digest, frozenset()) for digest in digests)
+        if sweep is not None:
+            return not slot_complete(round_, sweep, work)
     return False

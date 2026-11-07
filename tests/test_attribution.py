@@ -451,7 +451,7 @@ class SlotWorkTests(unittest.TestCase):
         self.assertEqual(set(result), {(1, "W1-1")})
         self.assertEqual(
             result[(1, "W1-1")],
-            SlotWork(1, "W1-1", frozenset(["d-f1.py-+x = 1"]), moment(3), ("a",)),
+            SlotWork(1, "W1-1", frozenset(["d-f1.py-+x = 1"]), moment(3), {"d-f1.py-+x = 1": moment(3)}, ("a",)),
         )
 
     def test_the_orchestrators_own_coverage_outside_any_run_is_rejected(self) -> None:
@@ -607,6 +607,19 @@ class SlotWorkTests(unittest.TestCase):
         self.assertEqual(accepted.digests, frozenset({first_hunk}))
         self.assertEqual(accepted.first_at, moment(2))
         self.assertEqual(accepted.runs, ("a",))
+
+    def test_last_at_is_the_latest_accepted_record_per_digest(self) -> None:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = claim(ledger, "W1-1", 1, by="antigravity:a")
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1", "H2"), 3, by="antigravity:a")
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 5, by="antigravity:a")
+        ledger = with_agents(ledger, *run_events("a", 0, 6, platform=AGY))
+        d1, d2 = (ref.digest for ref in ledger.rounds[0].hunks)
+
+        (accepted,) = work(ledger).values()
+
+        self.assertEqual(accepted.first_at, moment(3))
+        self.assertEqual(dict(accepted.last_at), {d1: moment(5), d2: moment(3)})
 
     def test_an_antigravity_record_without_an_identity_is_not_slot_work(self) -> None:
         ledger = hunt_ledger()
@@ -805,6 +818,16 @@ class RelaunchTests(unittest.TestCase):
 
         self.assertEqual(len(self.slot_digests(ledger)), 2)
         self.assertEqual(work(ledger)[(1, "W1-1")].runs, ("first", "second"))
+
+    def test_a_top_up_does_not_refresh_the_time_of_a_digest_the_exact_hunter_covered(self) -> None:
+        ledger = self.half_done()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1", "H2"), 130)  # the relaunch re-lists H1
+        ledger = with_agents(ledger, *run_events("second", 100, 200))
+        d1, d2 = (ref.digest for ref in ledger.rounds[0].hunks)
+
+        accepted = work(ledger)[(1, "W1-1")]
+
+        self.assertEqual(dict(accepted.last_at), {d1: moment(30), d2: moment(130)})
 
     def test_an_orchestrator_record_inside_a_concurrent_unread_run_adds_nothing(self) -> None:
         ledger = self.half_done()

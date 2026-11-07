@@ -28,7 +28,7 @@ from craftsman.gatecheck import (
     verifier_clusters,
 )
 from craftsman.hooks import REVIEW_GUARD_ACTIONS
-from craftsman.huntplan import required_slots
+from craftsman.huntplan import materialize, required_slots
 from craftsman.ledger import (
     add_agent_event,
     add_coverage,
@@ -1144,6 +1144,20 @@ class SlotStatusTests(unittest.TestCase):
 
         self.assertEqual((result.state, result.missing), ("dead", ("H2",)))
 
+    def test_a_sweep_hosted_on_a_core_slot_is_done_only_when_the_slot_covered_all_its_hunks(self) -> None:
+        host = make_slot("W1-1", hunks=("H1", "H2"), lenses=("intent", "sweep"), kind="bug")
+        ledger = planned(hunt("W1-1", count=2), host)
+        ledger = claim(cover(ledger, "W1-1", 12, hunks=("H1",)), "W1-1", 11)
+        ledger = with_agents(ledger, *run_events("h1", 10, 60, records=("B1", "C1")))
+
+        partial = statuses(ledger)["W1-1"]
+
+        self.assertEqual((partial.state, partial.missing), ("dead", ("H2",)))
+
+        ledger = hunted(ledger, "W1-1", "h2", 70, 120)
+
+        self.assertEqual(statuses(ledger, 200)["W1-1"].state, "done")
+
     def test_a_round_without_a_plan_has_no_slots(self) -> None:
         ledger, _ = prepared(hunt_snap())
 
@@ -1284,6 +1298,18 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertEqual(report.issues[0].missing, 2)
         self.assertIn("W2-X1, W2-F1", report.issues[0].message)
         self.assertEqual({item.slot.id: item.state for item in report.slots}["W2-F1"], "unlaunched")
+
+    def test_a_materialized_wave_slot_stays_pending_after_its_finding_is_dismissed(self) -> None:
+        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
+        ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
+        ledger = materialize(ledger, 1, ["W2-F1"])  # what `brief W2-F1` does
+        ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)), VerdictEvent("V2", "dismissed", at(90)))
+
+        report = check(ledger, 300)
+
+        self.assertIn("wave-pending", codes(report))
+        self.assertEqual([item.slot.id for item in report.slots if item.state != "done"], ["W2-F1"])
 
     def test_a_wave_hunter_that_finished_after_the_trigger_clears_the_wave(self) -> None:
         ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))

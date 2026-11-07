@@ -17,7 +17,6 @@ from craftsman.attribution import (
     IDENTITY_PLATFORMS,
     AgentRun,
     agent_runs,
-    credited_lenses,
     distinct_verdict_runs,
     identity,
     slot_work,
@@ -26,10 +25,11 @@ from craftsman.attribution import (
 )
 from craftsman.diffscan import DiffSnapshot
 from craftsman.huntplan import (
+    SWEEP,
+    credited_upto,
     required_slots,
     slot_complete,
     slot_hunks,
-    slot_lenses,
     slot_order,
 )
 from craftsman.ledger import uncovered_hunks
@@ -356,15 +356,16 @@ def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[Age
     A generation 1 slot is done when every one of its (hunk, lens) pairs is credited. The plan lists a
     hunk in a slot only because the hunk owes one of the slot's lenses, and a slot's own coverage credits
     all its lenses, so crediting from any slot (earlier coverage of the same code included) is enough.
-    This holds for a `sweep` slot too, whose lens no hunk requires: it counts only when credited. A later
+    This holds for a `sweep` slot too, whose lens no hunk requires: it counts only when credited, and
+    `huntplan.credited_upto` credits it only to a slot whose own coverage spans every hunk it lists. A later
     generation slot is done when its own vouched coverage, recorded at or after its trigger, covers all
     its hunks.
     """
     slots = required_slots(ledger, round_)
     if not slots:
         return _HuntState(now, ())
-    lenses, order, hunks = slot_lenses(ledger), slot_order(ledger), slot_hunks(ledger)
-    credit = credited_lenses(ledger, round_.number, lenses, order, runs=runs, slot_hunks=hunks)
+    order, hunks = slot_order(ledger), slot_hunks(ledger)
+    credit = credited_upto(ledger, round_.number, runs=runs)
     work = slot_work(ledger, runs, order, slot_hunks=hunks)
     signs = _hunter_signs(ledger, round_, runs, now)
     digest_of = {ref.id: ref.digest for ref in round_.hunks}
@@ -375,6 +376,17 @@ def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[Age
             missing = tuple(
                 hunk_id for hunk_id in slot.hunks if not wanted <= credit.get(digest_of[hunk_id], frozenset())
             )
+            if SWEEP in wanted and missing:
+                # The sweep is credited only to a slot whose coverage spans all its hunks, so every hunk
+                # lacks it until then: name the ones that coverage under this slot has not reached.
+                done = work.get((round_.number, slot.id))
+                reached = done.digests if done is not None else frozenset()
+                core = wanted - {SWEEP}
+                missing = tuple(
+                    hunk_id
+                    for hunk_id in slot.hunks
+                    if digest_of[hunk_id] not in reached or not core <= credit.get(digest_of[hunk_id], frozenset())
+                )
         else:
             # A slot that names no trigger time counts coverage from the moment the round was prepared.
             current = replace(slot, since=slot.since or round_.prepared_at)

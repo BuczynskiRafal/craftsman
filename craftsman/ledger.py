@@ -334,6 +334,40 @@ def _validate_round_continuation(
         raise LedgerError(FIXED_SCOPE_ERROR)
 
 
+def round_unchanged(ledger: Ledger, snap: DiffSnapshot, scope: Sequence[str] | None) -> bool:
+    """Whether `open_round` would hand back the latest round as it is (or raise it in place) for `snap`.
+
+    The same test `open_round` applies: the snapshot has the latest round's fingerprint and the scope
+    is the one that round was prepared with. A pure predicate: it validates nothing, so a base or
+    scope change that `open_round` would refuse reads as "changed" here.
+    """
+    normalized_scope = None if scope is None else tuple(sorted(scope))
+    return bool(ledger.rounds) and (
+        ledger.rounds[-1].fingerprint == snap.fingerprint and ledger.rounds[-1].scope == normalized_scope
+    )
+
+
+def _still_carried(
+    hunks: Sequence[HunkRef],
+    required: Mapping[str, frozenset[str]] | None,
+    credited: Mapping[str, frozenset[str]] | None,
+) -> tuple[HunkRef, ...]:
+    """`hunks` with every carried hunk that lacks a lens of `required` made open again.
+
+    This is the in-place raise of a round to deep: its carried hunks were carried against the lenses
+    required at normal depth. A hunk is never carried again by this, only released. Without `required`
+    and `credited` nothing changes.
+    """
+    if required is None or credited is None:
+        return tuple(hunks)
+    return tuple(
+        replace(ref, carried=False)
+        if ref.carried and not (ref.id in required and required[ref.id] <= credited.get(ref.digest, frozenset()))
+        else ref
+        for ref in hunks
+    )
+
+
 def open_round(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -350,8 +384,9 @@ def open_round(
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op.
 
-    Asking for `deep` on an unchanged diff raises the latest round in place: its hunks and
-    coverage stay, only the lens suggestions grow.
+    Asking for `deep` on an unchanged diff raises the latest round in place: its coverage stays.
+    Given `required` and `credited` (the deep ones), a carried hunk that lacks a deep lens becomes
+    open again, so the raised round owes it; nothing else changes.
 
     Given both `required` (hunk id -> the lenses the hunk must be examined with) and `credited` (hunk
     digest -> the lenses accepted coverage has examined it with), a hunk is carried over only when
@@ -366,10 +401,10 @@ def open_round(
             ledger, snap, normalized_scope, allow_scope_expansion=allow_scope_expansion
         )
         latest = ledger.rounds[-1]
-        if latest.fingerprint == snap.fingerprint and latest.scope == normalized_scope:
+        if round_unchanged(ledger, snap, scope):
             if latest.deep or not deep:
                 return ledger, latest
-            raised = replace(latest, deep=True)
+            raised = replace(latest, deep=True, hunks=_still_carried(latest.hunks, required, credited))
             return replace(ledger, rounds=(*ledger.rounds[:-1], raised)), raised
     unknown = sorted(set(symbols_by_hunk) - {hunk.id for hunk in snap.hunks})
     if unknown:
