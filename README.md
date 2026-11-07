@@ -60,6 +60,8 @@ Depth never goes down during a session. The final report explains what the agent
 
 ## How It Works
 
+![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
+
 ```text
 /craftsman <task>  ->  build freely  ->  review prepare (freeze the diff, risk map)
   ->  hunters (fresh context, parallel)  ->  verifiers try to disprove every finding

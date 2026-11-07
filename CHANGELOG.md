@@ -6,6 +6,12 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **Diagrams are Excalidraw scenes again.** The five Mermaid diagrams (workflow, evidence ledger, finding
+  lifecycle, hooks and guards, stop gate) are redrawn for the 5.0 protocol as editable
+  `docs/diagrams/*.excalidraw` scenes with rendered PNGs, and the README shows the workflow diagram again.
+
 ## [5.0.0] - 2026-11-06
 
 ### Fixed

@@ -10,23 +10,7 @@ source of truth: [`skills/craft-review/SKILL.md`](../skills/craft-review/SKILL.m
 [`skills/craftsman/SKILL.md`](../skills/craftsman/SKILL.md) (the build around it). The README and the
 [usage guide](usage.md) only summarize it.
 
-```mermaid
-flowchart TD
-    task["/craftsman task<br/>records the base commit"] --> build["Build freely<br/>no gate activity, end with /simplify"]
-    build --> prepare["review prepare<br/>freezes the diff into round N<br/>packet and risk map"]
-    prepare --> brief["Intent brief<br/>3-8 claims, each tied to a line"]
-    brief --> hunt["Hunt: craftsman-reviewer hunters<br/>fresh context, in parallel"]
-    hunt --> verify["Verify: craftsman-verifier<br/>proven, probable, question, dismissed"]
-    verify --> more{"New proven<br/>finding?"}
-    more -- "yes: wave k+1, 3 generations at most" --> hunt
-    more -- no --> fix["Fix at the root cause<br/>confirm each fix"]
-    fix --> recheck["review prepare: fix-delta round<br/>one fresh hunter checks for regressions"]
-    recheck --> loop{"Anything new<br/>confirmed?"}
-    loop -- yes --> fix
-    loop -- no --> run["craftsman run --kind test<br/>and e2e when deep"]
-    run --> check["review check passes:<br/>the stop hook lets the agent finish"]
-    check --> report["review report"]
-```
+![Craftsman 5: build freely, review hard](diagrams/harness-overview.png)
 
 ---
 
@@ -142,20 +126,7 @@ A review costs agents times turns times context, so the inputs are kept small.
 Everything goes into `.git/craftsman/ledger.json`, stored separately for each worktree and outside
 commits (schema 3).
 
-```mermaid
-flowchart LR
-    prepare["review prepare<br/>diff, hunks, digests"] --> round["Round N<br/>fingerprint and scope"]
-    round --> carry{"Hunk digest covered<br/>in an earlier round?"}
-    carry -- "no, or it references a changed symbol" --> open["Open hunk<br/>needs a hunter"]
-    carry -- yes --> carried["Carried hunk<br/>no new hunter"]
-    open --> cover["review cover<br/>digests and note"]
-    cover --> gate
-    carried --> gate
-    findings["Findings, verdicts,<br/>resolutions"] --> gate
-    runs["craftsman run<br/>exit code and fingerprint"] --> gate
-    agents["Agent events<br/>from platform hooks"] --> gate
-    gate{"Gate issue list<br/>empty?"}
-```
+![Evidence ledger: what is recorded and when the gate passes](diagrams/evidence-ledger-flow.png)
 
 | Record | Written by | Gate requirement |
 | :--- | :--- | :--- |

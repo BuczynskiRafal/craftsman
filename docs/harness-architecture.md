@@ -6,6 +6,23 @@ The design rule is "build freely, review hard": the build phase has no gate acti
 
 This reference covers the architecture, state machines, data structures, and invariants. The protocol itself, with its flow and ledger diagrams, is explained once, in [how-it-works.md](how-it-works.md); this page does not repeat it.
 
+### Diagrams
+
+The diagrams in `docs/diagrams/` are editable Excalidraw scenes rendered to PNG:
+
+```bash
+npx @excalidraw/cli render docs/diagrams/<name>.excalidraw \
+  --out docs/diagrams/<name>.png --scale 2 --max-width 4096 --max-height 4096
+```
+
+| Diagram | Shows | Source | Image |
+| :--- | :--- | :--- | :--- |
+| **Workflow** | From `/craftsman` to a closed gate: build, freeze, hunt, verify, waves, fix, test | [`harness-overview.excalidraw`](diagrams/harness-overview.excalidraw) | [`harness-overview.png`](diagrams/harness-overview.png) |
+| **Evidence ledger** | What `review prepare` builds, what the ledger records, which hunks the next round re-reviews, when the gate passes | [`evidence-ledger-flow.excalidraw`](diagrams/evidence-ledger-flow.excalidraw) | [`evidence-ledger-flow.png`](diagrams/evidence-ledger-flow.png) |
+| **Hunt and verdicts** | Lenses, hunters, verifiers, saturation, and the evidence each verdict and resolution needs | [`review-protocol-and-verdicts.excalidraw`](diagrams/review-protocol-and-verdicts.excalidraw) | [`review-protocol-and-verdicts.png`](diagrams/review-protocol-and-verdicts.png) |
+| **Install, hooks and guards** | What `craftsman install` writes, what each session hook does, the stop hook's outcomes, the runtime guards | [`lifecycle-hooks-and-guards.excalidraw`](diagrams/lifecycle-hooks-and-guards.excalidraw) | [`lifecycle-hooks-and-guards.png`](diagrams/lifecycle-hooks-and-guards.png) |
+| **Stop gate** | The states of a `/craftsman` session | [`stop-gate.excalidraw`](diagrams/stop-gate.excalidraw) | [`stop-gate.png`](diagrams/stop-gate.png) |
+
 ---
 
 ## 1. Session Lifecycle
@@ -109,22 +126,7 @@ A hunk is covered when a coverage record in this round or an earlier one holds i
 
 ### Verdict and resolution state machine
 
-```mermaid
-stateDiagram-v2
-    [*] --> Created: review add
-    Created --> Proven: verdict proven with a run
-    Created --> Probable: verdict probable with a static chain or no-repro
-    Created --> Question: verdict question with an intent source
-    Created --> Dismissed: verdict dismissed with a run or a guard line
-    Proven --> Fixed: resolve fixed after a code change
-    Probable --> Fixed
-    Proven --> Accepted: resolve accepted, never a blocker
-    Probable --> Accepted
-    Question --> [*]
-    Dismissed --> [*]
-    Fixed --> [*]
-    Accepted --> [*]
-```
+![Hunt, verify, and the life of a finding](diagrams/review-protocol-and-verdicts.png)
 
 Accepting a `major` finding also needs the user's agreement. That is a protocol rule in the prompts (in a gate session the agent asks through `gate --await-user`); the CLI enforces only the blocker ban.
 
@@ -155,17 +157,7 @@ The orchestrator (the main agent) never reviews inline where subagents exist: it
 
 ## 7. Platform Export, Hooks, and Guards
 
-```mermaid
-flowchart LR
-    src["skills/, templates/agents/, rules/<br/>authored once"] --> install["craftsman install / export"]
-    install --> plat["Platform files<br/>skills, agents, rules, hooks"]
-    plat --> prompt["prompt hook<br/>opens or resumes the gate"]
-    plat --> sub["subagent-start / subagent-stop<br/>briefing, agent events, usage"]
-    plat --> pre["pre-tool hook<br/>work-tree and search-scope guards"]
-    plat --> stop["stop hook<br/>evaluates the gate"]
-    stop -- "issues left" --> back["send the agent back<br/>6 times at most"]
-    stop -- "no issues" --> done["agent may finish"]
-```
+![Install, hooks and runtime guards](diagrams/lifecycle-hooks-and-guards.png)
 
 ### Single-source exporter and installer (`craftsman.platforms.*`, `craftsman.export`, `craftsman.install`)
 
