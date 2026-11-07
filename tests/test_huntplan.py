@@ -31,6 +31,7 @@ from craftsman.huntplan import (
     signals_by_hunk,
     slice_hunks,
     slot_complete,
+    slot_hunks,
     slot_lenses,
     slot_order,
     sweep_pending,
@@ -1156,6 +1157,25 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(lenses(2, "W1-1"))
         self.assertEqual(list(order(1)), ["W1-1", "W1-2", "W1-3", "W2-X1", "W2-F1"])
         self.assertEqual(list(order(2)), [])
+
+    def test_the_hunks_of_a_slot_cover_stored_and_dynamic_slots(self) -> None:
+        ledger = record_finding(hunt([code("H1")]))
+        hunks = slot_hunks(ledger)
+
+        self.assertEqual(hunks(1, "W1-1"), frozenset({"H1"}))
+        self.assertEqual(hunks(1, "W2-F1"), frozenset({"H1"}))
+        self.assertIsNone(hunks(1, "W1-9"))
+        self.assertIsNone(hunks(2, "W1-1"))
+
+    def test_a_slot_credits_only_its_own_hunks(self) -> None:
+        first, second = code("H1", count=300), code("H2", "b.py", count=300)
+        ledger = hunt([first, second])
+        slot = ledger.rounds[0].plan.slots[0]  # type: ignore[union-attr]
+        self.assertEqual(slot.hunks, ("H1",))
+        smuggled = run_slot(ledger, slot.id, "a1", 20, only=("H1", "H2"))
+
+        self.assertEqual(slot_hunks(smuggled)(1, slot.id), frozenset({"H1"}))
+        self.assertEqual(set(credited(smuggled)), {first.digest})
 
     def test_credited_lenses_come_from_the_slots_that_ran(self) -> None:
         hunk = code("H1")

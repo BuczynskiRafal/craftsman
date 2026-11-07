@@ -26,6 +26,7 @@ from typing import Literal, TypeVar, cast
 from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
 from craftsman.files import write_text_atomic
 from craftsman.records import (
+    GROUPED_EVIDENCE_PREFIX,
     LEDGER_FILENAME,
     MIN_READABLE_SCHEMA,
     SEVERITIES,
@@ -54,7 +55,6 @@ from craftsman.text import one_line
 from craftsman.triviality import is_trivial_run
 
 LOCK_POLL_S = 0.05
-GROUPED_EVIDENCE_PREFIX = "Grouped into "
 _WORD_RE = re.compile(r"\w+")
 
 T = TypeVar("T")
@@ -642,7 +642,9 @@ def merge_findings(
     """Fold duplicate findings that share a root cause into `target_id` before verification.
 
     Each duplicate is dismissed with a verdict event of its own, so the merge has a token (`V<k>`)
-    that a verifier run can be shown to have printed.
+    that a verifier run can be shown to have printed. Merges do not chain, so a duplicate that already
+    has duplicates folded into it takes them along: they are re-pointed at `target_id`, each with a new
+    event of its own, and returned after the named duplicates.
     """
     target, duplicates = _mergeable(ledger, target_id, duplicate_ids)
     now = _now()
@@ -656,6 +658,12 @@ def merge_findings(
     )
     evidence = f"{GROUPED_EVIDENCE_PREFIX}{target.id} ({target.path}:{target.line}): same root cause."
     first_token = int(next_verdict_token(ledger)[1:])
+    # Duplicates already folded into a duplicate follow it to the new target: merges do not chain.
+    moved = tuple(
+        item
+        for item in ledger.findings
+        if item.merged_into in duplicate_ids and item.id not in duplicate_ids
+    )
     dismissed = tuple(
         replace(
             dup,
@@ -667,9 +675,24 @@ def merge_findings(
         )
         for offset, dup in enumerate(duplicates)
     )
-    by_id = {item.id: item for item in (updated_target, *dismissed)}
+    repointed = tuple(
+        replace(
+            item,
+            verdict_evidence=(
+                evidence if item.verdict_evidence.startswith(GROUPED_EVIDENCE_PREFIX) else item.verdict_evidence
+            ),
+            updated_at=now,
+            verdict_log=(
+                *item.verdict_log,
+                VerdictEvent(f"V{first_token + len(dismissed) + offset}", "dismissed", now, by),
+            ),
+            merged_into=target.id,
+        )
+        for offset, item in enumerate(moved)
+    )
+    by_id = {item.id: item for item in (updated_target, *dismissed, *repointed)}
     findings = tuple(by_id.get(item.id, item) for item in ledger.findings)
-    return replace(ledger, findings=findings), updated_target, dismissed
+    return replace(ledger, findings=findings), updated_target, (*dismissed, *repointed)
 
 
 def _mergeable(
@@ -683,13 +706,25 @@ def _mergeable(
         raise LedgerError(f"duplicate finding ids must not repeat: {', '.join(duplicate_ids)}")
     target = _find(ledger, target_id)
     duplicates = tuple(_find(ledger, dup_id) for dup_id in duplicate_ids)
-    for item in (target, *duplicates):
-        if item.verdict is not None:
-            raise LedgerError(
-                "merge only works on findings without a verdict (before verification); "
-                f"{item.id} already has the verdict {item.verdict}"
-            )
+    if target.merged_into is not None:
+        raise LedgerError(
+            f"{target_id} was merged into {target.merged_into}; merge into {target.merged_into} instead "
+            "(merges do not chain)"
+        )
+    if target.verdict is not None:
+        raise LedgerError(_not_mergeable(target))
+    for dup in duplicates:
+        # Recording a merge again is allowed so that a verifier can vouch for a merge someone else made.
+        if dup.verdict is not None and dup.merged_into != target_id:
+            raise LedgerError(_not_mergeable(dup))
     return target, duplicates
+
+
+def _not_mergeable(item: Finding) -> str:
+    return (
+        "merge only works on findings without a verdict (before verification); "
+        f"{item.id} already has the verdict {item.verdict}"
+    )
 
 
 def _merged_scenario(target: Finding, duplicates: Sequence[Finding]) -> str:
@@ -739,7 +774,9 @@ def set_verdict(
 ) -> tuple[Ledger, Finding]:
     """Record an independent verdict; the latest verdict wins and a non-defect verdict drops any resolution.
 
-    Every call appends a `VerdictEvent`; its token is `finding.verdict_log[-1].token`.
+    Every call appends a `VerdictEvent`; its token is `finding.verdict_log[-1].token`. A merged
+    duplicate stays merged when it is dismissed; any other verdict un-merges it, because whoever
+    judged it found it is not a duplicate.
     """
     flat = one_line(evidence)  # what is stored, so the reservation holds for any spelling of the space
     if flat.startswith(GROUPED_EVIDENCE_PREFIX):
@@ -749,11 +786,6 @@ def set_verdict(
             "`craftsman review merge`",
         )
     finding = _find(ledger, finding_id)
-    if finding.merged_into is not None and verdict != "dismissed":
-        raise LedgerError(
-            f"{finding_id} was merged into {finding.merged_into} and stays dismissed; "
-            f"judge {finding.merged_into} instead"
-        )
     if run_id is not None:
         run = _find_run(ledger, run_id)
         if is_trivial_run(run.argv):
@@ -774,8 +806,23 @@ def set_verdict(
         resolution=finding.resolution if keeps_resolution else None,
         resolution_note=finding.resolution_note if keeps_resolution else "",
         updated_at=now,
+        # A merged duplicate stays merged while it is dismissed; any other verdict says it is not a duplicate.
+        merged_into=finding.merged_into if verdict == "dismissed" else None,
     )
     return _with_finding(ledger, updated)
+
+
+def verdict_streak(finding: Finding) -> tuple[VerdictEvent, ...]:
+    """The trailing events of `finding`'s verdict log that record its current verdict, oldest first.
+
+    Empty without a verdict or without events (a verdict from before events existed).
+    """
+    streak: list[VerdictEvent] = []
+    for event in reversed(finding.verdict_log):
+        if event.verdict != finding.verdict:
+            break
+        streak.append(event)
+    return tuple(reversed(streak))
 
 
 def verdict_since(finding: Finding) -> str | None:
@@ -786,14 +833,8 @@ def verdict_since(finding: Finding) -> str | None:
     """
     if finding.verdict is None:
         return None
-    if not finding.verdict_log:
-        return finding.updated_at
-    since = finding.verdict_log[-1]
-    for event in reversed(finding.verdict_log):
-        if event.verdict != finding.verdict:
-            break
-        since = event
-    return since.at
+    streak = verdict_streak(finding)
+    return streak[0].at if streak else finding.updated_at
 
 
 def resolve(

@@ -18,7 +18,6 @@ from unittest import mock
 
 from craftsman import ledger as ledger_module
 from craftsman.ledger import (
-    GROUPED_EVIDENCE_PREFIX,
     add_claim,
     add_coverage,
     add_finding,
@@ -42,6 +41,7 @@ from craftsman.ledger import (
     waive_run,
 )
 from craftsman.records import (
+    GROUPED_EVIDENCE_PREFIX,
     LEDGER_FILENAME,
     BatchRejected,
     EntryProblem,
@@ -555,6 +555,97 @@ class MergeTests(unittest.TestCase):
                 with self.assertRaisesRegex(LedgerError, f"{judged} already has the verdict probable"):
                     merge_findings(verdict, "F1", ["F2"])
 
+    def test_a_merged_finding_cannot_be_a_target(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        with self.assertRaisesRegex(LedgerError, "F2 was merged into F1; merge into F1 instead"):
+            merge_findings(ledger, "F2", ["F3"])
+
+    def test_a_target_of_merges_can_be_merged_and_takes_its_duplicates_along(self) -> None:
+        ledger = self.finding(self.ledger, "The receipt shows NaN for an empty cart.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger, _, _ = merge_findings(ledger, "F2", ["F3"], by="antigravity:a")
+
+        ledger, target, moved = merge_findings(ledger, "F1", ["F2"], by="antigravity:b")
+
+        by_id = {item.id: item for item in ledger.findings}
+        self.assertEqual([item.id for item in moved], ["F2", "F3"])
+        self.assertEqual((by_id["F2"].merged_into, by_id["F3"].merged_into), ("F1", "F1"))
+        self.assertIsNone(target.merged_into)
+        self.assertIsNone(by_id["F1"].merged_into)
+        self.assertEqual(by_id["F3"].verdict, "dismissed")
+        self.assertEqual(by_id["F3"].verdict_evidence, by_id["F2"].verdict_evidence)
+        self.assertTrue(by_id["F3"].verdict_evidence.startswith("Grouped into F1 "))
+        # F3 keeps the event of its first merge and gets a new one that the second merge's caller owns.
+        self.assertEqual([event.by for event in by_id["F3"].verdict_log], ["antigravity:a", "antigravity:b"])
+        tokens = [event.token for item in ledger.findings for event in item.verdict_log]
+        self.assertEqual(len(tokens), len(set(tokens)))
+        Ledger.from_json(ledger.to_json())  # no chain: the ledger still validates and reloads
+
+    def test_two_groups_of_duplicates_can_be_united(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger = self.finding(ledger, "The cart page crashes when it is empty.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+        ledger, _, _ = merge_findings(ledger, "F3", ["F4"])
+
+        ledger, _, _ = merge_findings(ledger, "F1", ["F3"])
+
+        self.assertEqual(
+            {item.id: item.merged_into for item in ledger.findings},
+            {"F1": None, "F2": "F1", "F3": "F1", "F4": "F1"},
+        )
+        Ledger.from_json(ledger.to_json())
+
+    def test_a_verifier_dismissal_with_its_own_evidence_survives_a_move(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger, _, _ = merge_findings(ledger, "F2", ["F3"])
+        guarded = "guarded by cli.py:19, which rejects an empty list before total() runs"
+        ledger, _ = set_verdict(ledger, "F3", "dismissed", guarded, None)
+
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        moved = next(item for item in ledger.findings if item.id == "F3")
+        self.assertEqual(moved.merged_into, "F1")
+        self.assertEqual(moved.verdict_evidence, guarded)
+        self.assertEqual(len(moved.verdict_log), 3)
+
+    def test_two_findings_cannot_be_merged_into_each_other(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        with self.assertRaisesRegex(LedgerError, "F2 was merged into F1"):
+            merge_findings(ledger, "F2", ["F1"])
+
+    def test_a_duplicate_merged_elsewhere_cannot_move_to_another_target(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        with self.assertRaisesRegex(LedgerError, "F2 already has the verdict dismissed"):
+            merge_findings(ledger, "F3", ["F2"])
+
+    def test_a_merge_can_be_recorded_again_for_a_verifier_to_vouch(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"], by="antigravity:orchestrator")
+
+        again, target, (dup,) = merge_findings(ledger, "F1", ["F2"], by="antigravity:v1")
+
+        self.assertEqual(dup.merged_into, "F1")
+        self.assertEqual([(e.token, e.by) for e in dup.verdict_log], [("V1", "antigravity:orchestrator"), ("V2", "antigravity:v1")])
+        self.assertEqual(target.scenario.count("An empty cart shows an error page."), 1)
+        self.assertEqual(again.findings[1], dup)
+
     def test_invalid_merge_requests_are_rejected(self) -> None:
         ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
         ledger = self.finding(ledger, "An empty cart shows an error page.")
@@ -632,15 +723,41 @@ class VerdictEventTests(unittest.TestCase):
 
         self.assertEqual([(d.id, d.verdict_log[-1].token) for d in duplicates], [("F3", "V1"), ("F2", "V2")])
 
-    def test_a_merged_duplicate_cannot_be_given_another_verdict_than_dismissed(self) -> None:
+    def test_a_merged_duplicate_stays_merged_while_it_is_dismissed(self) -> None:
         merged, _, _ = merge_findings(self.ledger, "F1", ["F2"])
 
-        with self.assertRaises(LedgerError) as caught:
-            set_verdict(merged, "F2", "probable", PROBABLE, None)
-        self.assertNotIsInstance(caught.exception, FieldError)
-        self.assertIn("F2 was merged into F1", str(caught.exception))
-        self.assertIn("judge F1", str(caught.exception))
-        self.assertEqual(merged.findings[1].verdict, "dismissed")
+        again, finding = set_verdict(merged, "F2", "dismissed", DISMISSED, None, by="antigravity:v1")
+
+        self.assertEqual((finding.merged_into, finding.verdict), ("F1", "dismissed"))
+        self.assertEqual([event.token for event in finding.verdict_log], ["V1", "V2"])
+        self.assertEqual(finding.verdict_evidence, DISMISSED)
+        self.assertEqual(again.findings[1], finding)
+
+    def test_any_other_verdict_un_merges_a_duplicate(self) -> None:
+        for verdict, evidence, run_id in (
+            ("probable", PROBABLE, None),
+            ("proven", "Reproduced via tests/test_app.py::test_empty (fails).", "R1"),
+            ("question", "intent: the task asks for retries; app.py:3 retries forever", None),
+        ):
+            with self.subTest(verdict=verdict):
+                merged, _, _ = merge_findings(record_run(self.ledger, kind="repro", exit_code=1), "F1", ["F2"])
+
+                _, finding = set_verdict(merged, "F2", verdict, evidence, run_id, by="antigravity:v1")  # type: ignore[arg-type]
+
+                self.assertEqual((finding.merged_into, finding.verdict), (None, verdict))
+                self.assertEqual([event.verdict for event in finding.verdict_log], ["dismissed", verdict])
+
+    def test_a_verifier_can_prove_what_the_orchestrator_merged_away(self) -> None:
+        """Hiding a real defect by merging it into a trivial finding does not survive the verifier."""
+        ledger = record_run(self.ledger, kind="repro", exit_code=1)
+        merged, _, _ = merge_findings(ledger, "F1", ["F2"], by="antigravity:orchestrator")
+
+        proven, finding = set_verdict(
+            merged, "F2", "proven", "Reproduced via tests/test_app.py::test_empty (fails).", "R1", by="antigravity:v1"
+        )
+
+        self.assertIsNone(finding.merged_into)
+        self.assertEqual(proven.findings[1].verdict, "proven")
 
     def test_verdict_since_is_the_first_event_of_the_current_verdict(self) -> None:
         finding = self.ledger.findings[0]

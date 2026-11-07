@@ -11,7 +11,7 @@ import shlex
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, TypeVar, get_args
@@ -51,6 +51,10 @@ MIN_READABLE_SCHEMA = 3
 LEAD_HUNTER = "lead"
 # W<generation>-<n> (generation 1 slots), W<g>-X<j> (fresh set), W<g>-F<n> (variant of finding F<n>).
 SLOT_ID_RE = re.compile(r"W([1-3])-(?:([1-9]\d*)|X([1-9]\d*)|F([1-9]\d*))")
+# What `craftsman review merge` writes as the verdict evidence of a duplicate; no verdict may start with it.
+GROUPED_EVIDENCE_PREFIX = "Grouped into "
+# Schema-3 ledgers recorded a merge only as this evidence, naming the target right after the prefix.
+_LEGACY_MERGE_RE = re.compile(re.escape(GROUPED_EVIDENCE_PREFIX) + r"(F[1-9]\d*)\b")
 LEDGER_FILENAME = "ledger.json"
 OUTPUT_TAIL_CHARS = 4000
 MIN_TITLE_CHARS = 8
@@ -948,9 +952,18 @@ class Finding:
     @classmethod
     def from_json(cls, raw: Any) -> Finding:
         f = Fields(raw)
+        finding_id = f.text("id")
+        verdict = f.optional_choice("verdict", VERDICTS)
+        verdict_evidence = f.text("verdict_evidence")
+        merged_into = f.optional_text_if_present("merged_into")
+        if "merged_into" not in raw and verdict == "dismissed":
+            # A schema-3 merge: the duplicate holds its target only in the wording of its evidence.
+            legacy = _LEGACY_MERGE_RE.match(verdict_evidence)
+            if legacy is not None and legacy.group(1) != finding_id:
+                merged_into = legacy.group(1)
         return f.done(
             cls(
-                id=f.text("id"),
+                id=finding_id,
                 round=f.integer("round"),
                 lens=f.text("lens"),
                 path=f.text("path"),
@@ -960,8 +973,8 @@ class Finding:
                 scenario=f.text("scenario"),
                 suggestion=f.text("suggestion"),
                 fingerprint=f.text("fingerprint"),
-                verdict=f.optional_choice("verdict", VERDICTS),
-                verdict_evidence=f.text("verdict_evidence"),
+                verdict=verdict,
+                verdict_evidence=verdict_evidence,
                 verdict_run=f.optional_text("verdict_run"),
                 resolution=f.optional_choice("resolution", RESOLUTIONS),
                 resolution_note=f.text("resolution_note"),
@@ -970,7 +983,7 @@ class Finding:
                 hunter=f.optional_text_if_present("hunter"),
                 by=f.optional_text_if_present("by"),
                 verdict_log=f.records_or_empty("verdict_log", VerdictEvent.from_json),
-                merged_into=f.optional_text_if_present("merged_into"),
+                merged_into=merged_into,
             )
         )
 
@@ -1206,6 +1219,28 @@ def scope_contains(superset: tuple[str, ...] | None, subset: tuple[str, ...] | N
     return set(subset).issubset(superset)
 
 
+def _drop_unusable_legacy_merges(findings: tuple[Finding, ...], raw: Sequence[Any]) -> tuple[Finding, ...]:
+    """`findings` without the merge links that `Finding.from_json` derived from schema-3 evidence and that do not hold.
+
+    A derived link (the stored record has no `merged_into`) is dropped when its target is not in the
+    ledger, then when its target is itself merged: legacy data must always load. A stored link is
+    never touched, so the ledger's own validation still rejects a wrong one.
+    """
+    derived = {
+        item.id for item, stored in zip(findings, raw, strict=True) if item.merged_into and "merged_into" not in stored
+    }
+    known = {item.id for item in findings}
+    kept = tuple(
+        replace(item, merged_into=None) if item.id in derived and item.merged_into not in known else item
+        for item in findings
+    )
+    merged = {item.id for item in kept if item.merged_into is not None}
+    return tuple(
+        replace(item, merged_into=None) if item.id in derived and item.merged_into in merged else item
+        for item in kept
+    )
+
+
 @dataclass(frozen=True)
 class Ledger:
     rounds: tuple[Round, ...] = ()
@@ -1267,11 +1302,15 @@ class Ledger:
 
     def _check_finding(self, finding: Finding, where: str) -> None:
         self._round(finding.round, where)
-        _require(
-            finding.merged_into is None or any(item.id == finding.merged_into for item in self.findings),
-            f"{where}.merged_into",
-            f"references an unknown finding {finding.merged_into!r}",
-        )
+        if finding.merged_into is not None:
+            target = next((item for item in self.findings if item.id == finding.merged_into), None)
+            _require(target is not None, f"{where}.merged_into", f"references an unknown finding {finding.merged_into!r}")
+            assert target is not None
+            _require(
+                target.merged_into is None,
+                f"{where}.merged_into",
+                f"{target.id} is itself merged into {target.merged_into}; merges do not chain",
+            )
         _require(
             finding.verdict_run is None or any(run.id == finding.verdict_run for run in self.runs),
             f"{where}.verdict_run",
@@ -1296,11 +1335,14 @@ class Ledger:
                 "schema",
                 f"{schema} is not supported (expected {SCHEMA_VERSION}); upgrade craftsman",
             )
+            rounds = f.records("rounds", Round.from_json)
+            coverage = f.records("coverage", Coverage.from_json)
+            findings = _drop_unusable_legacy_merges(f.records("findings", Finding.from_json), raw["findings"])
             return f.done(
                 cls(
-                    rounds=f.records("rounds", Round.from_json),
-                    coverage=f.records("coverage", Coverage.from_json),
-                    findings=f.records("findings", Finding.from_json),
+                    rounds=rounds,
+                    coverage=coverage,
+                    findings=findings,
                     runs=f.records("runs", Run.from_json),
                     agents=f.records("agents", AgentEvent.from_json),
                     claims=f.records_or_empty("claims", SlotClaim.from_json),

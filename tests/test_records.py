@@ -204,6 +204,105 @@ def schema_3_json() -> dict[str, Any]:
     return raw
 
 
+def legacy_duplicate(finding_id: str, evidence: str) -> dict[str, Any]:
+    """A finding as Craftsman 5.0 stored a merged duplicate: dismissed, its target only in the wording of the evidence."""
+    raw = schema_3_json()["findings"][0]
+    return {
+        **raw,
+        "id": finding_id,
+        "verdict": "dismissed",
+        "verdict_evidence": evidence,
+        "verdict_run": None,
+        "resolution": None,
+        "resolution_note": "",
+    }
+
+
+def grouped(target: str) -> str:
+    return f"Grouped into {target} (requests/models.py:633): same root cause."
+
+
+def schema_3_with_merges() -> dict[str, Any]:
+    """Shaped like the real schema-3 ledgers: judged findings plus duplicates that name a target in their evidence.
+
+    F1 proven; F2 and F3 grouped into F1; F4 dismissed on its own evidence; F5 grouped into F9, which does
+    not exist; F6 grouped into F2, which is itself a duplicate; F7 "grouped" into itself.
+    """
+    raw = schema_3_json()
+    raw["findings"] = [
+        raw["findings"][0],
+        legacy_duplicate("F2", grouped("F1")),
+        legacy_duplicate("F3", grouped("F1")),
+        legacy_duplicate("F4", "guarded by requests/models.py:633, which returns early on an empty body"),
+        legacy_duplicate("F5", grouped("F9")),
+        legacy_duplicate("F6", grouped("F2")),
+        legacy_duplicate("F7", grouped("F7")),
+    ]
+    return raw
+
+
+class LegacyMergeTests(unittest.TestCase):
+    def test_a_schema_3_duplicate_keeps_its_target(self) -> None:
+        loaded = Ledger.from_json(schema_3_with_merges())
+
+        self.assertEqual(
+            {finding.id: finding.merged_into for finding in loaded.findings},
+            {"F1": None, "F2": "F1", "F3": "F1", "F4": None, "F5": None, "F6": None, "F7": None},
+        )
+        self.assertTrue(all(finding.verdict_log == () for finding in loaded.findings))
+
+    def test_a_duplicate_of_a_missing_or_merged_finding_loads_without_a_link(self) -> None:
+        loaded = Ledger.from_json(schema_3_with_merges())
+        by_id = {finding.id: finding for finding in loaded.findings}
+
+        self.assertEqual(by_id["F5"].verdict, "dismissed")  # still dismissed, only the link is dropped
+        self.assertEqual(by_id["F6"].verdict, "dismissed")
+
+    def test_the_derived_links_are_written_and_read_back(self) -> None:
+        loaded = Ledger.from_json(schema_3_with_merges())
+
+        again = Ledger.from_json(json.loads(json.dumps(loaded.to_json())))
+
+        self.assertEqual(again, loaded)
+        self.assertEqual(again.findings[1].merged_into, "F1")
+
+    def test_only_a_dismissed_finding_with_the_wording_at_its_start_is_a_duplicate(self) -> None:
+        raw = schema_3_with_merges()
+        raw["findings"][3]["verdict_evidence"] = "see the note: Grouped into F1 (a.py:1): same root cause."
+        raw["findings"][2]["verdict"] = "probable"
+        raw["findings"][2]["verdict_evidence"] = "no-repro: " + grouped("F1")
+
+        loaded = Ledger.from_json(raw)
+
+        self.assertEqual((loaded.findings[2].merged_into, loaded.findings[3].merged_into), (None, None))
+
+    def test_a_stored_link_is_never_derived_over_or_forgiven(self) -> None:
+        raw = schema_3_with_merges()
+        raw["findings"][1]["merged_into"] = None  # schema 4 stored "not merged"
+        self.assertIsNone(Ledger.from_json(raw).findings[1].merged_into)
+        raw["findings"][2]["merged_into"] = "F9"
+        assert_rejected(self, raw, "findings[2].merged_into references an unknown finding 'F9'")
+
+
+class MergeChainTests(unittest.TestCase):
+    def merged(self, finding_id: str, target: str) -> dict[str, Any]:
+        return {**legacy_duplicate(finding_id, grouped(target)), "merged_into": target}
+
+    def test_a_ledger_rejects_a_merge_into_a_merged_finding(self) -> None:
+        raw = schema_3_json()
+        raw["schema"] = 4
+        raw["findings"] = [raw["findings"][0], self.merged("F2", "F1"), self.merged("F3", "F2")]
+
+        assert_rejected(self, raw, "findings[2].merged_into F2 is itself merged into F1")
+
+    def test_a_ledger_rejects_a_merge_cycle(self) -> None:
+        raw = schema_3_json()
+        raw["schema"] = 4
+        raw["findings"] = [self.merged("F1", "F2"), self.merged("F2", "F1")]
+
+        assert_rejected(self, raw, "merges do not chain")
+
+
 class SchemaTests(unittest.TestCase):
     def test_the_schema_is_four_and_schema_three_is_still_readable(self) -> None:
         self.assertEqual((SCHEMA_VERSION, MIN_READABLE_SCHEMA), (4, 3))

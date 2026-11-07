@@ -25,6 +25,7 @@ from typing import Literal
 
 from craftsman.attribution import (
     AgentRun,
+    SlotHunks,
     SlotLenses,
     SlotOrder,
     SlotWork,
@@ -860,7 +861,12 @@ def _inherited_slots(ledger: Ledger, latest: Round, own: Sequence[Slot]) -> list
     if latest.number != len(ledger.rounds) or not earlier:
         return []
     owns = {round_.number: _own_slots(ledger, round_) for round_ in earlier}
-    work = slot_work(ledger, agent_runs(ledger), lambda number: [slot.id for slot in owns.get(number, ())])
+    work = slot_work(
+        ledger,
+        agent_runs(ledger),
+        lambda number: [slot.id for slot in owns.get(number, ())],
+        slot_hunks=_hunks_in(owns),
+    )
     rebuilt = _rebuild_waves(
         ledger,
         _unfinished_waves(earlier, owns, work),
@@ -874,6 +880,15 @@ def _inherited_slots(ledger: Ledger, latest: Round, own: Sequence[Slot]) -> list
         for slot in rebuilt
         if slot.id not in held_ids and not (slot.kind == "fresh" and slot.generation in held_sets)
     ]
+
+
+def _hunks_in(slots_by_round: Mapping[int, Sequence[Slot]]) -> SlotHunks:
+    """`attribution`'s lookup of the hunk ids of a slot, from slots already derived per round."""
+
+    def lookup(number: int, slot_id: str) -> frozenset[str] | None:
+        return next((frozenset(slot.hunks) for slot in slots_by_round.get(number, ()) if slot.id == slot_id), None)
+
+    return lookup
 
 
 def pending_wave_slots(
@@ -892,7 +907,12 @@ def pending_wave_slots(
     if not ledger.rounds:
         return ()
     required = {round_.number: required_slots(ledger, round_) for round_ in ledger.rounds}
-    work = slot_work(ledger, agent_runs(ledger), lambda number: [slot.id for slot in required.get(number, ())])
+    work = slot_work(
+        ledger,
+        agent_runs(ledger),
+        lambda number: [slot.id for slot in required.get(number, ())],
+        slot_hunks=_hunks_in(required),
+    )
     return tuple(
         _rebuild_waves(
             ledger,
@@ -934,9 +954,27 @@ def slot_order(ledger: Ledger) -> SlotOrder:
     return order
 
 
+def slot_hunks(ledger: Ledger) -> SlotHunks:
+    """`attribution`'s lookup of the hunk ids of a slot: stored and dynamic slots of every round."""
+    cache: dict[int, dict[str, frozenset[str]]] = {}
+
+    def lookup(number: int, slot_id: str) -> frozenset[str] | None:
+        if not 1 <= number <= len(ledger.rounds):
+            return None
+        if number not in cache:
+            cache[number] = {
+                slot.id: frozenset(slot.hunks) for slot in required_slots(ledger, ledger.rounds[number - 1])
+            }
+        return cache[number].get(slot_id)
+
+    return lookup
+
+
 def credited(ledger: Ledger) -> dict[str, frozenset[str]]:
     """Per hunk digest, the lenses accepted coverage of all rounds so far has examined it with."""
-    return credited_lenses(ledger, len(ledger.rounds), slot_lenses(ledger), slot_order(ledger))
+    return credited_lenses(
+        ledger, len(ledger.rounds), slot_lenses(ledger), slot_order(ledger), slot_hunks=slot_hunks(ledger)
+    )
 
 
 def sweep_pending(ledger: Ledger) -> bool:

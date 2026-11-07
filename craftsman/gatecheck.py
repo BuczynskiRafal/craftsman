@@ -6,15 +6,36 @@
 
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
+from craftsman.attribution import (
+    IDENTITY_PLATFORMS,
+    AgentRun,
+    agent_runs,
+    credited_lenses,
+    distinct_verdict_runs,
+    identity,
+    slot_work,
+    verdict_vouched,
+    vouching_runs,
+)
 from craftsman.diffscan import DiffSnapshot
+from craftsman.huntplan import (
+    required_slots,
+    slot_complete,
+    slot_hunks,
+    slot_lenses,
+    slot_order,
+)
 from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
     REVIEWER_AGENT,
+    Finding,
     IsolationEvidence,
     Ledger,
     LedgerError,
@@ -22,6 +43,8 @@ from craftsman.records import (
     Run,
     RunKind,
     SignalKind,
+    Slot,
+    SlotClaim,
     agent_role,
     parse_timestamp,
 )
@@ -32,7 +55,11 @@ IssueCode = Literal[
     "no-round",
     "stale-round",
     "uncovered",
+    "hunt-pending",
     "no-verdict",
+    "unverified",
+    "second-opinion",
+    "wave-pending",
     "unresolved",
     "no-passing-run",
     "no-e2e-run",
@@ -54,6 +81,15 @@ ANOMALY_MIN_FINDINGS = 5
 PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
 _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 
+# A hunter or verifier that started longer ago than this and never reported is taken for dead.
+RUN_STALE_AFTER = timedelta(minutes=30)
+MAX_LISTED_SLOTS = 12
+MAX_LISTED_FINDINGS = 12
+MAX_LISTED_CLUSTERS = 8
+MAX_CLUSTER_FINDINGS = 6
+# What one hunt issue message may take, so that the stop hooks can show several of them in full.
+MAX_HUNT_ISSUE_CHARS = 900
+
 
 # --- gate evaluation ------------------------------------------------------------------------
 
@@ -62,8 +98,32 @@ _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 class GateIssue:
     code: IssueCode
     message: str
-    # Only for `uncovered`: how many hunks are still uncovered.
+    # How many things the issue stands for, where one issue stands for many: hunks still uncovered
+    # (`uncovered`), hunter slots not finished (`hunt-pending`, `wave-pending`), findings still to be
+    # judged (`no-verdict`, `unverified`, `second-opinion`).
     missing: int = 0
+
+
+SlotState = Literal["done", "running", "dead", "unlaunched"]
+
+
+@dataclass(frozen=True)
+class SlotStatus:
+    """Where one slot of the hunt plan stands.
+
+    `missing` lists the hunks of the slot that still owe one of its lenses (empty when done). `since`
+    is when the state began, where that is known: the start of the run that backs a running slot, the
+    moment the hunter of a dead slot stopped (or its claim went stale).
+    """
+
+    slot: Slot
+    state: SlotState
+    missing: tuple[str, ...] = ()
+    since: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if (self.state == "done") != (not self.missing):
+            raise ValueError(f"slot {self.slot.id} is {self.state} but has missing hunks {self.missing!r}")
 
 
 @dataclass(frozen=True)
@@ -74,6 +134,14 @@ class GateReport:
     review_only: bool = False
     self_reviewed: bool = False
     partial: bool = False
+    # The slots of the latest round's hunt plan and where each stands; empty for a round without a plan.
+    slots: tuple[SlotStatus, ...] = ()
+    # Whether the hunt rules judged the round (it is enforced and has a plan) instead of the 5.0 rules.
+    enforced: bool = False
+
+    def __post_init__(self) -> None:
+        if self.enforced and self.self_reviewed:
+            raise ValueError("an enforced round is judged by vouched subagents, so it is never self-reviewed")
 
     @property
     def passed(self) -> bool:
@@ -119,9 +187,19 @@ class GatePolicy:
 
 
 def evaluate(
-    ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy, *, review_only: bool = False
+    ledger: Ledger,
+    snap: DiffSnapshot,
+    policy: GatePolicy,
+    *,
+    review_only: bool = False,
+    now: datetime | None = None,
 ) -> GateReport:
-    """Decide whether the evidence in `ledger` covers the current diff `snap`."""
+    """Decide whether the evidence in `ledger` covers the current diff `snap`.
+
+    An enforced round with a hunt plan is judged by the hunt rules: its slots must be finished by
+    vouched subagents and every finding judged by a verifier. Any other round keeps the 5.0 rules.
+    `now` (default: the current time) only matters for deciding whether a hunter is still running.
+    """
     if snap.is_empty:
         summary = f"Nothing to review: the work tree matches base {snap.base_sha[:12]}."
         issues = () if review_only else tuple(_unresolved_issues(ledger, snap))
@@ -136,6 +214,28 @@ def evaluate(
             *_failing_run_issues(ledger),
         )
     )
+    runs = agent_runs(ledger) if latest is not None and latest.plan is not None else ()
+    state = _hunt_state(ledger, latest, _utc(now), runs) if latest is not None and latest.plan is not None else None
+    slots = state.statuses if state is not None else ()
+    if latest is not None and state is not None and latest.enforced:
+        round_issues = _round_issues(ledger, snap)
+        hunt, waves = _hunt_issues(ledger, latest, state, stale=bool(round_issues))
+        issues = (
+            *round_issues,
+            *hunt,
+            *_verification_issues(ledger, latest, runs, state.now),
+            *waves,
+            *fix_and_test,
+            *_round_cap_issues(ledger),
+        )
+        return GateReport(
+            issues,
+            _warnings(ledger, review_only=review_only),
+            _summary(ledger, snap, slots=slots),
+            review_only=review_only,
+            slots=slots,
+            enforced=True,
+        )
     issues = (
         *_round_issues(ledger, snap),
         *(_coverage_issues(ledger, latest) if latest else ()),
@@ -151,6 +251,7 @@ def evaluate(
         _summary(ledger, snap),
         review_only=review_only,
         self_reviewed=self_reviewed,
+        slots=slots,
     )
 
 
@@ -216,6 +317,478 @@ def _verdict_issues(ledger: Ledger) -> list[GateIssue]:
         for finding in ledger.findings
         if finding.verdict is None
     ]
+
+
+# --- the hunt: slots of an enforced round --------------------------------------------------------
+
+
+def _utc(moment: datetime | None) -> datetime:
+    """`moment` as an aware time: now when absent, UTC when naive (callers may pass either)."""
+    if moment is None:
+        return datetime.now(timezone.utc)
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class _HuntState:
+    """What the ledger shows about a round's hunt at `now`.
+
+    `starting` counts the reviewer runs that began since the round was prepared, are still going and
+    fetched no brief (no claim accounts for them): hunters that were just launched.
+    """
+
+    now: datetime
+    statuses: tuple[SlotStatus, ...]
+    starting: int = 0
+
+
+def slot_statuses(ledger: Ledger, round_: Round, now: datetime) -> tuple[SlotStatus, ...]:
+    """Where every slot `round_` requires stands at `now` (see `SlotStatus`); empty for a round without a plan.
+
+    A naive `now` is taken as UTC.
+    """
+    return _hunt_state(ledger, round_, _utc(now), agent_runs(ledger)).statuses
+
+
+def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[AgentRun]) -> _HuntState:
+    """The statuses of `round_`'s slots, and how many hunters are starting.
+
+    A generation 1 slot is done when every one of its (hunk, lens) pairs is credited. The plan lists a
+    hunk in a slot only because the hunk owes one of the slot's lenses, and a slot's own coverage credits
+    all its lenses, so crediting from any slot (earlier coverage of the same code included) is enough.
+    This holds for a `sweep` slot too, whose lens no hunk requires: it counts only when credited. A later
+    generation slot is done when its own vouched coverage, recorded at or after its trigger, covers all
+    its hunks.
+    """
+    slots = required_slots(ledger, round_)
+    if not slots:
+        return _HuntState(now, ())
+    lenses, order, hunks = slot_lenses(ledger), slot_order(ledger), slot_hunks(ledger)
+    credit = credited_lenses(ledger, round_.number, lenses, order, runs=runs, slot_hunks=hunks)
+    work = slot_work(ledger, runs, order, slot_hunks=hunks)
+    signs = _hunter_signs(ledger, round_, runs, now)
+    digest_of = {ref.id: ref.digest for ref in round_.hunks}
+    statuses: list[SlotStatus] = []
+    for slot in slots:
+        if slot.generation == 1:
+            wanted = frozenset(slot.lenses)
+            missing = tuple(
+                hunk_id for hunk_id in slot.hunks if not wanted <= credit.get(digest_of[hunk_id], frozenset())
+            )
+        else:
+            # A slot that names no trigger time counts coverage from the moment the round was prepared.
+            current = replace(slot, since=slot.since or round_.prepared_at)
+            done = work.get((round_.number, slot.id))
+            covered = done.digests if done is not None else frozenset()
+            missing = (
+                ()
+                if slot_complete(round_, current, work)
+                else tuple(h for h in slot.hunks if digest_of[h] not in covered) or slot.hunks
+            )
+        if not missing:
+            statuses.append(SlotStatus(slot, "done"))
+        elif signs.running.get(slot.id):
+            statuses.append(SlotStatus(slot, "running", missing, min(signs.running[slot.id])))
+        elif signs.ended.get(slot.id):
+            statuses.append(SlotStatus(slot, "dead", missing, max(signs.ended[slot.id])))
+        else:
+            statuses.append(SlotStatus(slot, "unlaunched", missing))
+    return _HuntState(now, tuple(statuses), signs.starting)
+
+
+@dataclass(frozen=True)
+class _HunterSigns:
+    """When hunters were seen working on, and giving up, each slot of a round (see `_hunter_signs`)."""
+
+    running: dict[str, list[datetime]]  # slot id -> start of each open run backing a claim of it
+    ended: dict[str, list[datetime]]  # slot id -> when each hunter that worked on it stopped
+    starting: int
+
+
+def _hunter_signs(ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: datetime) -> _HunterSigns:
+    """What the hooks' runs show about the hunters of `round_`.
+
+    Only a run the hooks recorded can show that someone is working: a claim alone is not enough, since
+    the orchestrator may have fetched the brief itself. A claim that a finished run vouches for by its
+    transcript (or by identity) belongs to that run, which ended. Any other claim is explained by one run
+    of its own: a finished run that vouches for it by time (a hunter whose transcript could not be read),
+    or an open reviewer run that may be its hunter (`_open_backers`). A run explains at most one claim,
+    so a hunter that is going on cannot stand in for one that has stopped, nor an unrelated open run for
+    several claims; finished runs are preferred, which at worst has the slot launched again. Coverage
+    tagged with a slot that a finished run vouches for shows that hunter ended too. An open run counts as
+    going on for `RUN_STALE_AFTER`; after that it is taken for dead, and its slot ended when that time
+    ran out.
+    """
+    prepared = parse_timestamp(round_.prepared_at)
+    running: dict[str, list[datetime]] = defaultdict(list)
+    ended: dict[str, list[datetime]] = defaultdict(list)
+    undecided: list[tuple[SlotClaim, list[int]]] = []
+    for claim in ledger.claims:
+        if claim.round != round_.number:
+            continue
+        finished = vouching_runs(
+            runs, role="reviewer", token=claim.token, recorded_at=parse_timestamp(claim.at), by=claim.by
+        )
+        if any(voucher.exact for voucher in finished):
+            ended[claim.slot].extend(_stopped(voucher.run) for voucher in finished)
+        else:
+            options = [voucher.index for voucher in finished] + _open_backers(runs, claim, prepared)
+            undecided.append((claim, options))
+    explained = _one_each([options for _, options in undecided])
+    for (claim, _), index in zip(undecided, explained, strict=True):
+        if index is None:
+            continue
+        run = runs[index]
+        if run.stopped is not None:
+            ended[claim.slot].append(run.stopped)
+        elif _is_going(run, now):
+            running[claim.slot].append(run.started)
+        else:
+            ended[claim.slot].append(run.started + RUN_STALE_AFTER)
+    for number, record in enumerate(ledger.coverage, 1):
+        if record.round == round_.number and record.hunter is not None:
+            recorded = vouching_runs(
+                runs,
+                role="reviewer",
+                token=f"C{number}",
+                recorded_at=parse_timestamp(record.recorded_at),
+                by=record.by,
+            )
+            ended[record.hunter].extend(_stopped(voucher.run) for voucher in recorded)
+    accounted = {index for index in explained if index is not None}
+    starting = sum(
+        1
+        for index, run in enumerate(runs)
+        if index not in accounted
+        and run.role == "reviewer"
+        and run.platform not in IDENTITY_PLATFORMS
+        and run.started >= prepared
+        and _is_going(run, now)
+    )
+    return _HunterSigns(running, ended, starting)
+
+
+def _is_going(run: AgentRun, now: datetime) -> bool:
+    """Whether `run` has not stopped and began less than `RUN_STALE_AFTER` ago."""
+    return run.stopped is None and now - run.started < RUN_STALE_AFTER
+
+
+def _open_backers(runs: Sequence[AgentRun], claim: SlotClaim, prepared: datetime) -> list[int]:
+    """The indexes of the reviewer runs that have started and not stopped and that may be the hunter of `claim`.
+
+    By identity when the claim names its caller (Antigravity: the run of that conversation). Without
+    one, any open run that started after the round was prepared and before the claim was made: the
+    hunter calls `brief` after it starts. A platform whose honest claims name the caller never matches
+    by time.
+    """
+    caller = identity(claim.by)
+    claimed_at = parse_timestamp(claim.at)
+    backers: list[int] = []
+    for index, run in enumerate(runs):
+        if run.role != "reviewer" or run.stopped is not None:
+            continue
+        if caller is not None:
+            matches = (run.platform, run.agent_id) == caller
+        else:
+            matches = run.platform not in IDENTITY_PLATFORMS and prepared <= run.started <= claimed_at
+        if matches:
+            backers.append(index)
+    return backers
+
+
+def _one_each(options: Sequence[Sequence[int]]) -> list[int | None]:
+    """A maximum matching of items to the runs they may take, one run each: each item's run, None if it got none.
+
+    Items are taken in order. An item takes its first free option; only when all its options are taken
+    does it move an earlier item to another option (an augmenting path). So an earlier item keeps its
+    run unless that is the only way to give a later item one.
+    """
+    owner: dict[int, int] = {}  # run index -> the item holding it
+
+    def take(item: int, tried: set[int]) -> bool:
+        free = next((run for run in options[item] if run not in owner), None)
+        if free is not None:
+            owner[free] = item
+            return True
+        for run in options[item]:
+            if run in tried:
+                continue
+            tried.add(run)
+            if take(owner[run], tried):
+                owner[run] = item
+                return True
+        return False
+
+    for item in range(len(options)):
+        take(item, set())
+    result: list[int | None] = [None] * len(options)
+    for run, item in owner.items():
+        result[item] = run
+    return result
+
+
+def _stopped(run: AgentRun) -> datetime:
+    assert run.stopped is not None  # vouching runs are finished
+    return run.stopped
+
+
+# --- hunt messages ---------------------------------------------------------------------------
+
+_SLOT_ID = re.compile(r"(W\d-[A-Z]?)(\d+)")
+_LAUNCH_HOW = (
+    "For each, start a craftsman-reviewer subagent whose whole prompt is: "
+    "`You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` "
+    "(Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent "
+    "craftsman-reviewer; Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)"
+)
+_VERIFIER_HOW = (
+    "For each cluster, start a craftsman-verifier subagent whose whole prompt is: "
+    "`You are a Craftsman verifier. Run craftsman review brief --verifier <IDS> and follow it exactly.` "
+    "A verdict you record yourself does not count."
+)
+
+
+def _compress(ids: Sequence[str], limit: int) -> str:
+    """`ids` with runs of three or more consecutive slot numbers as `W1-1..W1-3`; at most `limit` ids, then `+N more`."""
+    groups: list[list[str]] = []
+    for item in ids[:limit]:
+        match = _SLOT_ID.fullmatch(item)
+        last = _SLOT_ID.fullmatch(groups[-1][-1]) if groups else None
+        if match and last and match.group(1) == last.group(1) and int(match.group(2)) == int(last.group(2)) + 1:
+            groups[-1].append(item)
+        else:
+            groups.append([item])
+    parts = [f"{group[0]}..{group[-1]}" if len(group) >= 3 else ", ".join(group) for group in groups]
+    if len(ids) > limit:
+        parts.append(f"+{len(ids) - limit} more")
+    return ", ".join(parts)
+
+
+def _slot_ids(statuses: Sequence[SlotStatus]) -> str:
+    return _compress([status.slot.id for status in statuses], MAX_LISTED_SLOTS)
+
+
+def _launch_text(unlaunched: Sequence[SlotStatus], dead: Sequence[SlotStatus]) -> list[str]:
+    """What to tell the caller to launch: the slots nobody has started, and the ones whose hunter died."""
+    parts: list[str] = []
+    if dead:
+        parts.append(f"Stopped without finishing: {_slot_ids(dead)} - launch them again.")
+    if unlaunched:
+        parts.append(f"Launch now, all in one step: {_slot_ids(unlaunched)}. {_LAUNCH_HOW}")
+    elif dead:
+        parts.append(_LAUNCH_HOW)
+    return parts
+
+
+def _starting_text(count: int) -> str:
+    subject = "reviewer subagent has" if count == 1 else "reviewer subagents have"
+    return (
+        f"Starting: {count} {subject} started since the round was prepared and not fetched a brief yet - if you "
+        "launched them just now, do not launch more; end your turn and wait for their reports."
+    )
+
+
+def _pending_message(
+    label: str, round_number: int, pending: Sequence[SlotStatus], *, starting: int = 0, stale: bool = False
+) -> str:
+    """The text of a `hunt-pending` or `wave-pending` issue.
+
+    A non-zero `starting` is the number of hunters that were just launched and have not fetched a brief
+    yet: the caller is told to wait for them instead of launching more. `stale` is a round whose code
+    changed: nothing is launched for it.
+    """
+    running = [status for status in pending if status.state == "running"]
+    dead = [status for status in pending if status.state == "dead"]
+    unlaunched = [status for status in pending if status.state == "unlaunched"]
+    parts = [f"{_counted(len(pending), (f'{label} slot', f'{label} slots'))} of round {round_number} not finished."]
+    if stale:
+        parts.append("The round is out of date, so launch no hunters for it; `craftsman review prepare` opens the next one.")
+        return " ".join(parts)
+    if running:
+        parts.append(
+            f"Running: {_slot_ids(running)} - do not launch these again; end your turn and wait for their reports."
+        )
+    if starting:
+        parts.append(_starting_text(starting))
+    else:
+        parts.extend(_launch_text(unlaunched, dead))
+    return " ".join(parts)
+
+
+def _agent_seen(ledger: Ledger, round_: Round) -> bool:
+    """Whether the hooks recorded any craftsman subagent (hunter or verifier) since the round was prepared."""
+    prepared = parse_timestamp(round_.prepared_at)
+    return any(agent_role(event.agent) is not None and parse_timestamp(event.at) >= prepared for event in ledger.agents)
+
+
+def _hunt_issues(
+    ledger: Ledger, round_: Round, state: _HuntState, *, stale: bool
+) -> tuple[list[GateIssue], list[GateIssue]]:
+    """The issues of the slots: `(hunt-pending or no-isolation, wave-pending)`, which sit at different places in the order.
+
+    A round whose slots are open while no subagent was recorded at all gets `no-isolation` instead of
+    both: the hooks may be missing, and telling the caller to launch hunters again would repeat work.
+    A round whose code changed (`stale`) only counts its open slots: its hunters would be wasted.
+    """
+    pending = [status for status in state.statuses if status.state != "done"]
+    if not pending:
+        return [], []
+    if not stale and not _agent_seen(ledger, round_):
+        message = (
+            f"No Craftsman subagent was recorded for round {round_.number}. If you launched hunters, the "
+            "Craftsman hooks did not see them: run `craftsman doctor` and fix the install; do not "
+            "relaunch hunters that already ran. If you did not launch any, launch them now, all in one "
+            f"step: {_slot_ids(pending)}. {_LAUNCH_HOW}"
+        )
+        return [GateIssue("no-isolation", message)], []
+    first = [status for status in pending if status.slot.generation == 1]
+    later = [status for status in pending if status.slot.generation >= 2]
+    # Hunters that were just launched are waited for when they are enough for every slot nobody works on.
+    idle = sum(status.state in ("unlaunched", "dead") for status in pending)
+    starting = state.starting if idle and state.starting >= idle else 0
+    return (
+        [
+            GateIssue(
+                "hunt-pending",
+                _pending_message("hunter", round_.number, first, starting=starting, stale=stale),
+                missing=len(first),
+            )
+        ]
+        if first
+        else [],
+        [
+            GateIssue(
+                "wave-pending",
+                _pending_message("wave", round_.number, later, starting=starting, stale=stale),
+                missing=len(later),
+            )
+        ]
+        if later
+        else [],
+    )
+
+
+# --- verdicts of an enforced round ---------------------------------------------------------------
+
+
+def _hunk_of(ledger: Ledger, finding: Finding) -> str | None:
+    """The hunk of its round the finding points into, if any."""
+    if not 1 <= finding.round <= len(ledger.rounds):
+        return None
+    for ref in ledger.rounds[finding.round - 1].hunks:
+        if ref.path == finding.path and ref.new_start <= finding.line < ref.new_start + max(ref.new_len, 1):
+            return ref.id
+    return None
+
+
+def _finding_number(finding_id: str) -> int:
+    return int(finding_id[1:])
+
+
+def verifier_clusters(ledger: Ledger, findings: Sequence[Finding]) -> tuple[tuple[str, ...], ...]:
+    """Group `findings` for verifiers: one cluster per file, at most `MAX_CLUSTER_FINDINGS` findings each.
+
+    Findings keep their order. Findings in the same hunk and lens (duplicate candidates) stay in one
+    cluster, unless there are more of them than a cluster holds.
+    """
+    by_path: dict[str, dict[tuple[str, str | None], list[Finding]]] = defaultdict(lambda: defaultdict(list))
+    for finding in findings:
+        by_path[finding.path][(finding.lens, _hunk_of(ledger, finding))].append(finding)
+    clusters: list[tuple[str, ...]] = []
+    for groups in by_path.values():
+        current: list[Finding] = []
+        for group in groups.values():
+            for start in range(0, len(group), MAX_CLUSTER_FINDINGS):
+                chunk = group[start : start + MAX_CLUSTER_FINDINGS]
+                if len(current) + len(chunk) > MAX_CLUSTER_FINDINGS:
+                    clusters.append(_cluster_ids(current))
+                    current = []
+                current.extend(chunk)
+        if current:
+            clusters.append(_cluster_ids(current))
+    return tuple(clusters)
+
+
+def _cluster_ids(findings: Sequence[Finding]) -> tuple[str, ...]:
+    return tuple(sorted((finding.id for finding in findings), key=_finding_number))
+
+
+def _verifier_text(ledger: Ledger, findings: Sequence[Finding], running: int) -> str:
+    """Who to launch for `findings`; with `running` verifiers already going for every cluster, to wait for them."""
+    clusters = verifier_clusters(ledger, findings)
+    if running >= len(clusters):
+        subject = "verifier is" if running == 1 else "verifiers are"
+        return (
+            f"Verifiers running: {running} {subject} still at work - do not launch more; "
+            "end your turn and wait for their reports."
+        )
+    shown = " ".join(f"[{','.join(cluster)}]" for cluster in clusters[:MAX_LISTED_CLUSTERS])
+    more = f" (+{len(clusters) - MAX_LISTED_CLUSTERS} more clusters)" if len(clusters) > MAX_LISTED_CLUSTERS else ""
+    return f"Launch verifiers, one per cluster: {shown}{more}. {_VERIFIER_HOW}"
+
+
+def _finding_ids(findings: Sequence[Finding]) -> str:
+    shown = ", ".join(finding.id for finding in findings[:MAX_LISTED_FINDINGS])
+    extra = len(findings) - MAX_LISTED_FINDINGS
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _verification_issues(ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: datetime) -> list[GateIssue]:
+    """The findings of an enforced round must be judged by verifier subagents, two of them for a dismissed serious one.
+
+    Findings from before verdict events existed (an empty log) are exempt from the vouching rules.
+    Verifiers that started since the round was prepared and are still going are waited for, not launched again.
+    """
+    prepared = parse_timestamp(round_.prepared_at)
+    running = sum(
+        run.role == "verifier" and run.started >= prepared and _is_going(run, now) for run in runs
+    )
+    no_verdict: list[Finding] = []
+    unverified: list[Finding] = []
+    second: list[Finding] = []
+    for finding in ledger.findings:
+        if finding.verdict is None:
+            no_verdict.append(finding)
+        elif not finding.verdict_log:
+            continue
+        elif not verdict_vouched(ledger, finding, finding.verdict_log[-1], runs):
+            unverified.append(finding)
+        elif (
+            finding.severity in ("blocker", "major")
+            and finding.verdict == "dismissed"
+            and finding.verdict_run is None
+            and distinct_verdict_runs(ledger, finding, runs) < 2
+        ):
+            second.append(finding)
+    issues: list[GateIssue] = []
+    if no_verdict:
+        issues.append(
+            GateIssue(
+                "no-verdict",
+                f"{_counted(len(no_verdict), ('finding', 'findings'))} without a verdict: "
+                f"{_finding_ids(no_verdict)}. {_verifier_text(ledger, no_verdict, running)}",
+                missing=len(no_verdict),
+            )
+        )
+    if unverified:
+        issues.append(
+            GateIssue(
+                "unverified",
+                f"{_counted(len(unverified), ('verdict', 'verdicts'))} not recorded by a verifier subagent: "
+                f"{_finding_ids(unverified)}. {_verifier_text(ledger, unverified, running)}",
+                missing=len(unverified),
+            )
+        )
+    if second:
+        issues.append(
+            GateIssue(
+                "second-opinion",
+                f"{_counted(len(second), ('dismissed blocker or major finding', 'dismissed blocker or major findings'))} "
+                f"still need a second, independent verifier: {_finding_ids(second)}. {_verifier_text(ledger, second, running)}",
+                missing=len(second),
+            )
+        )
+    return issues
 
 
 def _unresolved_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
@@ -577,7 +1150,8 @@ def _large_diff_warnings(ledger: Ledger) -> list[str]:
     return [warning] if warning else []
 
 
-def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
+def _summary(ledger: Ledger, snap: DiffSnapshot, *, slots: Sequence[SlotStatus] | None = None) -> str:
+    """The summary lines; `slots` (an enforced round's) replace the hunk coverage, which that round does not judge by."""
     if not ledger.rounds:
         round_line = "Round: none prepared yet."
         coverage_line = "Coverage: n/a."
@@ -588,7 +1162,7 @@ def _summary(ledger: Ledger, snap: DiffSnapshot) -> str:
             f"Round {latest.number} ({'deep, ' if latest.deep else ''}{freshness}): "
             f"{len(latest.hunks)} hunks in {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines."
         )
-        coverage_line = _coverage_summary(ledger, latest)
+        coverage_line = _coverage_summary(ledger, latest) if slots is None else _slot_summary(latest, slots)
     return "\n".join((round_line, coverage_line, _findings_summary(ledger), _runs_summary(ledger, snap)))
 
 
@@ -597,6 +1171,13 @@ def _coverage_summary(ledger: Ledger, latest: Round) -> str:
     done = total - len(uncovered_hunks(ledger, latest))
     carried = len(latest.hunks) - total
     return f"Coverage: {done}/{total} hunks; {carried} hunk(s) carried from earlier rounds."
+
+
+def _slot_summary(latest: Round, slots: Sequence[SlotStatus]) -> str:
+    """Progress of an enforced round: the finished slots; coverage the orchestrator recorded itself shows nowhere."""
+    done = sum(status.state == "done" for status in slots)
+    carried = len(latest.hunks) - len(latest.open_hunk_ids)
+    return f"Coverage: {done}/{len(slots)} slots done; {carried} hunk(s) carried from earlier rounds."
 
 
 def _findings_summary(ledger: Ledger) -> str:
@@ -640,12 +1221,27 @@ def render_next_actions(issues: Sequence[GateIssue], *, max_items: int = MAX_NEX
     return lines
 
 
+def hunt_line(slots: Sequence[SlotStatus]) -> str:
+    """`Hunt: 5 slots - 3 done, 1 running (W1-4), 1 pending (W2-X1)`; stopped hunters are listed too."""
+    parts: list[str] = []
+    done = sum(status.state == "done" for status in slots)
+    if done:
+        parts.append(f"{done} done")
+    for state, label in (("running", "running"), ("dead", "stopped"), ("unlaunched", "pending")):
+        members = [status for status in slots if status.state == state]
+        if members:
+            parts.append(f"{len(members)} {label} ({_slot_ids(members)})")
+    return f"Hunt: {_counted(len(slots), ('slot', 'slots'))} - {', '.join(parts)}"
+
+
 def render_report(report: GateReport) -> str:
     """Render a gate report as a compact Markdown block with numbered next actions."""
     lines = [f"**Craftsman {report.subject}: {report.status_label}**"]
     if report.self_reviewed:
         lines.append(f"**{SELF_REVIEWED_BANNER}**")
     lines += ["", report.summary]
+    if report.slots:
+        lines.append(hunt_line(report.slots))
     if report.issues:
         lines += ["", "**Next actions**", *render_next_actions(report.issues)]
     if report.warnings:
@@ -660,7 +1256,11 @@ _ROUND_CLAUSES: dict[IssueCode, str] = {
     "round-cap": "maximum review rounds reached",
 }
 _COUNTED_CLAUSES: dict[IssueCode, tuple[str, str]] = {
+    "hunt-pending": ("hunter slot pending", "hunter slots pending"),
     "no-verdict": ("finding without a verdict", "findings without a verdict"),
+    "unverified": ("verdict not made by a verifier", "verdicts not made by a verifier"),
+    "second-opinion": ("dismissal needing a second verifier", "dismissals needing a second verifier"),
+    "wave-pending": ("wave slot pending", "wave slots pending"),
     "unresolved": ("unresolved finding", "unresolved findings"),
 }
 _RUN_CLAUSES: dict[IssueCode, str] = {
@@ -686,7 +1286,11 @@ def format_blocker_summary(report: GateReport) -> str:
     codes = [issue.code for issue in report.issues]
     clauses = [clause for code, clause in _ROUND_CLAUSES.items() if code in codes]
     clauses += _coverage_clauses(report.issues)
-    clauses += [_counted(codes.count(code), forms) for code, forms in _COUNTED_CLAUSES.items() if code in codes]
+    clauses += [
+        _counted(sum(issue.missing or 1 for issue in report.issues if issue.code == code), forms)
+        for code, forms in _COUNTED_CLAUSES.items()
+        if code in codes
+    ]
     clauses += [clause for code, clause in _RUN_CLAUSES.items() if code in codes]
     if "failing-run" in codes:
         clauses.append(_counted(codes.count("failing-run"), ("failing run", "failing runs")))

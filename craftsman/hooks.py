@@ -58,7 +58,6 @@ from craftsman.gatecheck import (
     render_next_actions,
 )
 from craftsman.ledger import (
-    GROUPED_EVIDENCE_PREFIX,
     add_agent_event,
     ledger_path_for,
     load,
@@ -66,6 +65,7 @@ from craftsman.ledger import (
     uncovered_hunks,
 )
 from craftsman.records import (
+    GROUPED_EVIDENCE_PREFIX,
     AgentEvent,
     AgentEventKind,
     AgentRole,

@@ -30,6 +30,7 @@ from craftsman.records import (
     HunkRef,
     Ledger,
     SlotClaim,
+    Verdict,
     VerdictEvent,
     parse_timestamp,
 )
@@ -53,7 +54,16 @@ VERIFIER = "craftsman-verifier"
 AGY = "antigravity"
 
 EVIDENCE = "guarded by cli.py:19, which rejects an empty list before total() runs"
+EVIDENCE_OF = {
+    "dismissed": EVIDENCE,
+    "probable": "no-repro: needs a live database; cli.py:19 fails on an empty list",
+    "question": "intent: the task asks for retries; cli.py:19 retries forever",
+    "proven": "Reproduced via tests/test_app.py::test_empty (fails).",
+}
 SLOT_LENSES = {"W1-1": ("intent",), "W1-2": ("contracts",), "W1-3": ("failure",), "W1-4": ("ripple", "tests")}
+
+
+FOREVER = 9_999_999_999  # seconds after T0: a run that is still open whenever the test records something
 
 
 def moment(seconds: float) -> datetime:
@@ -145,17 +155,147 @@ class AgentRunTests(unittest.TestCase):
             ],
         )
 
-    def test_a_stop_pairs_with_the_latest_start_of_its_id(self) -> None:
+    def test_a_stop_pairs_with_the_earliest_unpaired_start_of_its_id(self) -> None:
         ledger = with_agents(
             hunt_ledger(),
             agent_event("start", REVIEWER, "r1", 1),
             agent_event("start", REVIEWER, "r1", 10),
             agent_event("stop", REVIEWER, "r1", 12),
+            agent_event("stop", REVIEWER, "r1", 20),
         )
 
         runs = agent_runs(ledger)
 
-        self.assertEqual([(r.started, r.stopped) for r in runs], [(moment(1), None), (moment(10), moment(12))])
+        self.assertEqual([(r.started, r.stopped) for r in runs], [(moment(1), moment(12)), (moment(10), moment(20))])
+
+    def test_a_repeated_stop_extends_the_run_of_the_latest_start_of_its_id(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "a", 0),
+            agent_event("start", REVIEWER, "a", 1),
+            agent_event("stop", REVIEWER, "a", 2),
+            agent_event("stop", REVIEWER, "a", 3),
+            agent_event("stop", REVIEWER, "a", 4),
+        )
+
+        self.assertEqual(
+            [(r.started, r.stopped) for r in agent_runs(ledger)], [(moment(0), moment(2)), (moment(1), moment(4))]
+        )
+
+    def test_a_repeated_stop_prefers_its_id_over_an_untaken_start_without_one(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "a", 0),
+            agent_event("start", REVIEWER, "", 1),
+            agent_event("stop", REVIEWER, "a", 5),
+            agent_event("stop", REVIEWER, "a", 6),
+        )
+
+        self.assertEqual(
+            [(r.agent_id, r.started, r.stopped) for r in agent_runs(ledger)],
+            [("a", moment(0), moment(6)), ("", moment(1), None)],
+        )
+
+    def test_two_starts_and_two_stops_of_one_id_leave_no_run_unstopped(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "a", 1),
+            agent_event("start", REVIEWER, "a", 2),
+            agent_event("stop", REVIEWER, "a", 5),
+            agent_event("stop", REVIEWER, "a", 8),
+        )
+
+        self.assertEqual([r.stopped for r in agent_runs(ledger)], [moment(5), moment(8)])
+
+    def test_a_stop_of_another_id_never_takes_a_running_start(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "a", 1, platform="claude"),
+            agent_event("stop", REVIEWER, "b", 5, platform="claude", records=("C1",)),
+        )
+
+        runs = agent_runs(ledger)
+
+        self.assertEqual(
+            [(r.agent_id, r.started, r.stopped, r.records) for r in runs],
+            [("b", moment(0), moment(5), ("C1",)), ("a", moment(1), None, None)],
+        )
+
+    def test_a_stop_with_an_id_pairs_with_a_start_that_has_none(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "", 1, platform="copilot"),
+            agent_event("stop", REVIEWER, "x", 5, platform="copilot"),
+        )
+
+        (run,) = agent_runs(ledger)
+
+        self.assertEqual((run.agent_id, run.started, run.stopped), ("x", moment(1), moment(5)))
+
+    def test_roles_never_pair_across(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "x", 1),
+            agent_event("stop", VERIFIER, "x", 5),
+        )
+
+        runs = agent_runs(ledger)
+
+        self.assertEqual(
+            [(r.role, r.started, r.stopped) for r in runs],
+            [("verifier", moment(0), moment(5)), ("reviewer", moment(1), None)],
+        )
+
+    def test_a_second_stop_of_a_started_id_extends_its_run_instead_of_making_another(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "a", 1),
+            agent_event("stop", REVIEWER, "a", 5, records=("B1", "C1")),
+            agent_event("stop", REVIEWER, "a", 9, records=("C2",)),
+        )
+
+        (run,) = agent_runs(ledger)
+
+        self.assertEqual((run.started, run.stopped, run.records), (moment(1), moment(9), ("B1", "C1", "C2")))
+
+    def test_an_extended_run_has_unknown_records_when_either_stop_has_none(self) -> None:
+        for first, second in ((("C1",), None), (None, ("C2",)), (None, None)):
+            with self.subTest(first=first, second=second):
+                ledger = with_agents(
+                    hunt_ledger(),
+                    agent_event("start", REVIEWER, "a", 1),
+                    agent_event("stop", REVIEWER, "a", 5, records=first),
+                    agent_event("stop", REVIEWER, "a", 9, records=second),
+                )
+
+                (run,) = agent_runs(ledger)
+
+                self.assertEqual((run.stopped, run.records), (moment(9), None))
+
+    def test_a_stop_that_comes_out_of_order_keeps_the_later_stop_time(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "a", 1),
+            agent_event("stop", REVIEWER, "a", 9),
+            agent_event("stop", REVIEWER, "a", 5),
+        )
+
+        (run,) = agent_runs(ledger)
+
+        self.assertEqual(run.stopped, moment(9))
+
+    def test_one_start_and_two_stops_without_ids_make_two_runs_today(self) -> None:
+        """Documents the pairing Phase F relies on: it stops recording the second stop of a subagent."""
+        ledger = with_agents(
+            hunt_ledger(),
+            agent_event("start", REVIEWER, "", 1, platform="copilot"),
+            agent_event("stop", REVIEWER, "", 5, platform="copilot"),
+            agent_event("stop", REVIEWER, "", 9, platform="copilot"),
+        )
+
+        runs = agent_runs(ledger)
+
+        self.assertEqual([(r.started, r.stopped) for r in runs], [(moment(0), moment(9)), (moment(1), moment(5))])
 
     def test_stops_without_an_id_pair_first_in_first_out_by_name(self) -> None:
         ledger = with_agents(
@@ -277,6 +417,18 @@ class VouchingTests(unittest.TestCase):
 
         self.assertEqual(vouching_runs([verifier], role="reviewer", token="C1", recorded_at=moment(5), by=None), ())
         self.assertEqual(len(vouching_runs([verifier], role="verifier", token="V1", recorded_at=moment(5), by=None)), 1)
+
+    def test_an_antigravity_run_never_vouches_by_window_for_a_record_without_an_identity(self) -> None:
+        run = make_run("a", 0, 10, platform=AGY)
+
+        self.assertEqual(vouching_runs([run], role="reviewer", token="C1", recorded_at=moment(5), by=None), ())
+
+    def test_an_antigravity_run_whose_transcript_shows_the_token_still_vouches(self) -> None:
+        run = make_run("a", 0, 10, platform=AGY, records=("C1",))
+
+        (voucher,) = vouching_runs([run], role="reviewer", token="C1", recorded_at=moment(5), by=None)
+
+        self.assertTrue(voucher.exact)
 
     def test_a_voucher_remembers_the_position_of_its_run(self) -> None:
         first = make_run("a", 0, 10)
@@ -456,6 +608,145 @@ class SlotWorkTests(unittest.TestCase):
         self.assertEqual(accepted.first_at, moment(2))
         self.assertEqual(accepted.runs, ("a",))
 
+    def test_an_antigravity_record_without_an_identity_is_not_slot_work(self) -> None:
+        ledger = hunt_ledger()
+        ledger, _ = cover(ledger, "W1-2", 3, by=None)  # `env -u ANTIGRAVITY_CONVERSATION_ID craftsman review cover`
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        self.assertEqual(accepted_slots(ledger), set())
+
+    def test_a_bound_agent_does_not_vouch_a_second_slot_by_window(self) -> None:
+        ledger = hunt_ledger()
+        ledger, b1 = claim(ledger, "W1-1", 1)
+        ledger, c1 = cover(ledger, "W1-1", 2)
+        ledger, _ = cover(ledger, "W1-2", 12)
+        ledger = with_agents(
+            ledger,
+            *run_events("a", 0, 5, records=(b1, c1)),
+            *run_events("a", 10, 15),  # the same agent resumed, its transcript unreadable this time
+        )
+
+        self.assertEqual(accepted_slots(ledger), {"W1-1"})
+
+    def test_a_window_run_that_spans_two_slots_does_not_hide_the_slot_of_another_run(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2", "W1-3"))
+        for slot, seconds in (("W1-1", 1), ("W1-2", 2), ("W1-3", 12)):
+            ledger, _ = cover(ledger, slot, seconds)
+        ledger = with_agents(
+            ledger, *run_events("w1", 0, 5, platform="copilot"), *run_events("w2", 10, 15, platform="copilot")
+        )
+
+        self.assertEqual(accepted_slots(ledger), {"W1-1", "W1-3"})
+
+    def test_a_run_that_only_repeats_a_slot_does_not_unlock_the_slots_of_another(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2", "W1-3"))
+        for slot, seconds in (("W1-1", 1), ("W1-2", 2), ("W1-3", 3), ("W1-1", 12)):
+            ledger, _ = cover(ledger, slot, seconds)
+        ledger = with_agents(
+            ledger, *run_events("w1", 0, 5, platform="copilot"), *run_events("w2", 10, 15, platform="copilot")
+        )
+
+        self.assertEqual(accepted_slots(ledger), {"W1-1", "W1-2"})
+
+    def test_window_slots_are_matched_to_runs_by_plan_order(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2", "W1-3"))
+        for slot, seconds in (("W1-3", 1), ("W1-2", 2)):
+            ledger, _ = cover(ledger, slot, seconds)
+        ledger = with_agents(ledger, *run_events("w1", 0, 5, platform="copilot"))
+
+        self.assertEqual(accepted_slots(ledger), {"W1-2"})
+
+    def test_plan_order_is_not_slot_id_order(self) -> None:
+        ledger = hunt_ledger(("W1-2", "W1-1"))
+        for slot, seconds in (("W1-1", 1), ("W1-2", 2)):
+            ledger, _ = cover(ledger, slot, seconds)
+        ledger = with_agents(ledger, *run_events("w1", 0, 5, platform="copilot"))
+
+        self.assertEqual(accepted_slots(ledger), {"W1-2"})
+
+    def test_a_nudged_copilot_reviewer_is_one_run_with_one_slot_once_its_stops_pair(self) -> None:
+        ledger = hunt_ledger()
+        ledger, _ = cover(ledger, "W1-1", 3)
+        ledger, _ = cover(ledger, "W1-2", 7)
+        ledger = with_agents(
+            ledger,
+            agent_event("start", REVIEWER, "x", 1, platform="copilot"),
+            agent_event("stop", REVIEWER, "x", 5, platform="copilot"),
+            agent_event("stop", REVIEWER, "x", 9, platform="copilot"),
+        )
+
+        self.assertEqual(accepted_slots(ledger), {"W1-1"})
+
+    def test_work_outside_the_slots_hunks_earns_nothing(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2"))
+        both = tuple(h.digest for h in ledger.rounds[0].hunks)
+        record = Coverage(1, both, coverage_note(["H1", "H2"]), at(2), hunter="W1-1", by="antigravity:a")
+        ledger = replace(ledger, coverage=(record,))
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        unfiltered = slot_work(ledger, agent_runs(ledger), order_of(ledger))
+        owned = slot_work(
+            ledger, agent_runs(ledger), order_of(ledger), slot_hunks=lambda n, s: frozenset({"H1"})
+        )
+
+        self.assertEqual(unfiltered[(1, "W1-1")].digests, frozenset(both))
+        self.assertEqual(owned[(1, "W1-1")].digests, frozenset({ledger.rounds[0].hunks[0].digest}))
+
+    def test_a_record_left_with_no_hunk_of_its_slot_adds_nothing(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2"))
+        other = ledger.rounds[0].hunks[1].digest
+        ledger = replace(
+            ledger,
+            coverage=(Coverage(1, (other,), coverage_note(["H2"]), at(2), hunter="W1-1", by="antigravity:a"),),
+        )
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        filtered = slot_work(
+            ledger, agent_runs(ledger), order_of(ledger), slot_hunks=lambda n, s: frozenset({"H1"})
+        )
+
+        self.assertEqual(filtered, {})
+
+    def test_a_slot_the_lookup_does_not_know_is_not_cut(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2"))
+        both = tuple(h.digest for h in ledger.rounds[0].hunks)
+        ledger = replace(
+            ledger,
+            coverage=(Coverage(1, both, coverage_note(["H1", "H2"]), at(2), hunter="W1-1", by="antigravity:a"),),
+        )
+        ledger = with_agents(ledger, *run_events("a", 0, 5, platform=AGY))
+
+        result = slot_work(ledger, agent_runs(ledger), order_of(ledger), slot_hunks=lambda n, s: None)
+
+        self.assertEqual(result[(1, "W1-1")].digests, frozenset(both))
+
+    def test_a_record_cut_to_nothing_does_not_spend_a_window_run(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2"))
+        stray = Coverage(
+            1, (ledger.rounds[0].hunks[1].digest,), coverage_note(["H2"]), at(1), hunter="W1-1"
+        )
+        proper = Coverage(
+            1, (ledger.rounds[0].hunks[1].digest,), coverage_note(["H2"]), at(2), hunter="W1-2"
+        )
+        ledger = replace(ledger, coverage=(stray, proper))
+        ledger = with_agents(ledger, *run_events("w", 0, 5, platform="copilot"))
+
+        result = slot_work(
+            ledger,
+            agent_runs(ledger),
+            order_of(ledger),
+            slot_hunks=lambda n, s: frozenset({"H1" if s == "W1-1" else "H2"}),
+        )
+
+        self.assertEqual(set(result), {(1, "W1-2")})
+
+    def test_the_runs_of_a_slot_are_never_empty_for_a_platform_without_agent_ids(self) -> None:
+        ledger = hunt_ledger(("W1-1",))
+        ledger, _ = cover(ledger, "W1-1", 2)
+        ledger = with_agents(ledger, *run_events("", 1, 5, platform="copilot"))
+
+        self.assertEqual(work(ledger)[(1, "W1-1")].runs, ("run:0",))
+
     def test_work_of_a_later_round_is_kept_apart(self) -> None:
         first = hunt_ledger()
         second_round = replace(first.rounds[0], number=2, prepared_at=at(20))
@@ -465,6 +756,120 @@ class SlotWorkTests(unittest.TestCase):
         ledger = with_agents(ledger, *run_events("a", 20, 25, records=(b, c)))
 
         self.assertEqual(set(work(ledger)), {(2, "W1-1")})
+
+
+def two_hunk_slot_ledger() -> Ledger:
+    """One slot, W1-1, over H1 and H2."""
+    snap = make_snap(make_hunk("H1", "f1.py"), make_hunk("H2", "f2.py"))
+    ledger, _ = prepared(snap)
+    ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0),))
+    return planned(ledger, make_slot("W1-1", hunks=("H1", "H2"), lenses=("intent",)))
+
+
+def cover_hunks(ledger: Ledger, slot: str, hunk_ids: Sequence[str], seconds: float, *, by: str | None = None) -> tuple[Ledger, str]:
+    """Coverage of just `hunk_ids`, tagged with `slot`; returns the new coverage token."""
+    digests = tuple(h.digest for h in ledger.rounds[0].hunks if h.id in hunk_ids)
+    record = Coverage(1, digests, coverage_note(hunk_ids), at(seconds), hunter=slot, by=by)
+    return replace(ledger, coverage=(*ledger.coverage, record)), f"C{len(ledger.coverage) + 1}"
+
+
+class RelaunchTests(unittest.TestCase):
+    """A hunter that died with its slot half done can be replaced by one whose transcript is unreadable."""
+
+    def half_done(self) -> Ledger:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = claim(ledger, "W1-1", 20)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 30)
+        return with_agents(ledger, *run_events("first", 10, 60, records=("B1", "C1")))
+
+    def slot_digests(self, ledger: Ledger) -> frozenset[str]:
+        return work(ledger)[(1, "W1-1")].digests
+
+    def test_the_dead_hunter_alone_leaves_the_slot_half_done(self) -> None:
+        ledger = self.half_done()
+
+        self.assertEqual(len(self.slot_digests(ledger)), 1)
+
+    def test_a_readable_relaunch_completes_the_slot(self) -> None:
+        ledger = self.half_done()
+        ledger, _ = claim(ledger, "W1-1", 120)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 130)
+        ledger = with_agents(ledger, *run_events("second", 100, 200, records=("B2", "C2")))
+
+        self.assertEqual(len(self.slot_digests(ledger)), 2)
+
+    def test_an_unreadable_relaunch_that_started_later_completes_the_slot(self) -> None:
+        ledger = self.half_done()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 130)
+        ledger = with_agents(ledger, *run_events("second", 100, 200))
+
+        self.assertEqual(len(self.slot_digests(ledger)), 2)
+        self.assertEqual(work(ledger)[(1, "W1-1")].runs, ("first", "second"))
+
+    def test_an_orchestrator_record_inside_a_concurrent_unread_run_adds_nothing(self) -> None:
+        ledger = self.half_done()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 130)  # the orchestrator's, in nobody's name
+        ledger = with_agents(ledger, *run_events("other", 40, 300))  # started before the first hunter stopped
+
+        self.assertEqual(len(self.slot_digests(ledger)), 1)
+
+    def test_an_unreadable_run_that_started_exactly_when_the_hunter_stopped_adds_nothing(self) -> None:
+        ledger = self.half_done()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 130)
+        ledger = with_agents(ledger, *run_events("other", 60, 300))
+
+        self.assertEqual(len(self.slot_digests(ledger)), 1)
+
+    def two_exact_holders(self) -> Ledger:
+        """Two readable hunters of W1-1, both covering H1: the first ran 10..60, the second 50..100."""
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = claim(ledger, "W1-1", 20)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 30)
+        ledger, _ = claim(ledger, "W1-1", 55)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 70)
+        ledger = with_agents(
+            ledger, *run_events("first", 10, 60, records=("B1", "C1")), *run_events("second", 50, 100, records=("B2", "C2"))
+        )
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 330)  # the orchestrator's, in nobody's name
+        return ledger
+
+    def test_an_unreadable_run_waits_for_every_exact_holder_to_stop(self) -> None:
+        concurrent = with_agents(self.two_exact_holders(), *run_events("unread", 80, 400))  # the second still worked
+        later = with_agents(self.two_exact_holders(), *run_events("unread", 110, 400))
+
+        self.assertEqual(len(self.slot_digests(concurrent)), 1)
+        self.assertEqual(len(self.slot_digests(later)), 2)
+
+    def test_a_window_record_repeating_what_the_exact_hunter_covered_adds_nothing(self) -> None:
+        ledger = self.half_done()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 130)
+        ledger = with_agents(ledger, *run_events("second", 100, 200))
+
+        self.assertEqual(work(ledger)[(1, "W1-1")].runs, ("first",))
+
+    def test_one_unreadable_run_cannot_finish_two_slots(self) -> None:
+        snap = make_snap(make_hunk("H1", "f1.py"), make_hunk("H2", "f2.py"), make_hunk("H3", "f3.py"), make_hunk("H4", "f4.py"))
+        ledger, _ = prepared(snap)
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0),))
+        ledger = planned(
+            ledger,
+            make_slot("W1-1", hunks=("H1", "H2"), lenses=("intent",)),
+            make_slot("W1-2", hunks=("H3", "H4"), lenses=("contracts",)),
+        )
+        ledger, _ = claim(ledger, "W1-1", 20)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 30)
+        ledger, _ = claim(ledger, "W1-2", 25)
+        ledger, _ = cover_hunks(ledger, "W1-2", ("H3",), 35)
+        ledger = with_agents(
+            ledger, *run_events("one", 10, 60, records=("B1", "C1")), *run_events("two", 11, 61, records=("B2", "C2"))
+        )
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 130)
+        ledger, _ = cover_hunks(ledger, "W1-2", ("H4",), 131)
+        ledger = with_agents(ledger, *run_events("late", 100, 200))
+
+        result = work(ledger)
+
+        self.assertEqual(sum(len(item.digests) for item in result.values()), 3)
 
 
 class CreditedLensesTests(unittest.TestCase):
@@ -584,6 +989,23 @@ class CreditedLensesTests(unittest.TestCase):
         )
 
         self.assertEqual(self.credited(ledger, upto=2), {})
+
+
+class SlotHunkCreditTests(unittest.TestCase):
+    def test_a_hunk_outside_the_slot_gets_no_lenses_from_it(self) -> None:
+        ledger = hunt_ledger(("W1-1", "W1-2"))
+        digests = {h.id: h.digest for h in ledger.rounds[0].hunks}
+        record = Coverage(1, tuple(digests.values()), coverage_note(["H1", "H2"]), at(2), hunter="W1-1", by="antigravity:a")
+        ledger = with_agents(replace(ledger, coverage=(record,)), *run_events("a", 0, 5, platform=AGY))
+
+        def lenses(number: int, slot: str) -> tuple[str, ...] | None:
+            return SLOT_LENSES.get(slot)
+
+        smuggled = credited_lenses(ledger, 1, lenses, order_of(ledger))
+        honest = credited_lenses(ledger, 1, lenses, order_of(ledger), slot_hunks=lambda n, s: frozenset({"H1"}))
+
+        self.assertEqual(set(smuggled), {digests["H1"], digests["H2"]})
+        self.assertEqual(honest, {digests["H1"]: frozenset({"intent"})})
 
 
 def with_verdicts(ledger: Ledger, finding_id: str, *events: VerdictEvent) -> Ledger:
@@ -730,6 +1152,58 @@ class DistinctVerdictRunsTests(unittest.TestCase):
 
         self.assertEqual(self.count(ledger), 2)
 
+    def verifiers(self, ledger: Ledger, *ids: str) -> Ledger:
+        for agent_id in ids:
+            ledger = with_agents(ledger, *run_events(agent_id, 0, 50, agent=VERIFIER, platform=AGY))
+        return ledger
+
+    def test_a_verifier_who_judged_otherwise_is_not_agreement(self) -> None:
+        ledger = with_verdicts(
+            finding_ledger(),
+            "F1",
+            VerdictEvent("V1", "probable", at(2), "antigravity:v1"),
+            VerdictEvent("V2", "dismissed", at(8), "antigravity:v2"),
+        )
+        ledger = self.verifiers(ledger, "v1", "v2")
+
+        self.assertEqual(self.count(ledger), 1)
+
+    def test_an_orchestrator_flip_after_two_confirming_verifiers_counts_nothing(self) -> None:
+        ledger = with_verdicts(
+            finding_ledger(),
+            "F1",
+            VerdictEvent("V1", "probable", at(2), "antigravity:v1"),
+            VerdictEvent("V2", "probable", at(3), "antigravity:v2"),
+            VerdictEvent("V3", "dismissed", at(60), "antigravity:orchestrator"),
+        )
+        ledger = self.verifiers(ledger, "v1", "v2")
+
+        self.assertEqual(self.count(ledger), 0)
+
+    def test_an_overturned_dismissal_is_not_reused_by_its_author(self) -> None:
+        ledger = with_verdicts(
+            finding_ledger(),
+            "F1",
+            VerdictEvent("V1", "dismissed", at(2), "antigravity:v1"),
+            VerdictEvent("V2", "proven", at(3), "antigravity:v2"),
+            VerdictEvent("V3", "dismissed", at(4), "antigravity:v1"),
+        )
+        ledger = self.verifiers(ledger, "v1", "v2")
+
+        self.assertEqual(self.count(ledger), 1)
+
+    def test_two_verifiers_agreeing_after_an_earlier_disagreement_count_twice(self) -> None:
+        ledger = with_verdicts(
+            finding_ledger(),
+            "F1",
+            VerdictEvent("V1", "probable", at(2), "antigravity:v1"),
+            VerdictEvent("V2", "dismissed", at(3), "antigravity:v2"),
+            VerdictEvent("V3", "dismissed", at(4), "antigravity:v3"),
+        )
+        ledger = self.verifiers(ledger, "v1", "v2", "v3")
+
+        self.assertEqual(self.count(ledger), 2)
+
     def test_unvouched_events_count_nothing(self) -> None:
         ledger = with_verdicts(finding_ledger(), "F1", VerdictEvent("V1", "dismissed", at(30)))
         ledger = with_agents(ledger, *run_events("a", 0, 5, agent=VERIFIER))
@@ -750,6 +1224,18 @@ class EvidenceCounterTests(unittest.TestCase):
     def counter(self, ledger: Ledger) -> int:
         return evidence_counter(ledger, agent_runs(ledger))
 
+    def verified(self, *ids: str) -> Ledger:
+        """A ledger with open verifier runs `ids` on Antigravity, so their verdicts (by identity) are vouched."""
+        ledger = finding_ledger()
+        for agent_id in ids:
+            ledger = with_agents(ledger, *run_events(agent_id, 0, FOREVER, agent=VERIFIER, platform=AGY))
+        return ledger
+
+    def judge(self, ledger: Ledger, agent_id: str, verdict: Verdict = "dismissed") -> Ledger:
+        run_id = "R1" if verdict == "proven" else None
+        ledger, _ = set_verdict(ledger, "F1", verdict, EVIDENCE_OF[verdict], run_id, by=f"antigravity:{agent_id}")
+        return ledger
+
     def test_a_fresh_round_counts_itself(self) -> None:
         self.assertEqual(self.counter(hunt_ledger()), 1)
 
@@ -761,31 +1247,111 @@ class EvidenceCounterTests(unittest.TestCase):
 
         self.assertEqual(self.counter(ledger), 2)
 
-    def test_repeating_a_verdict_is_not_progress(self) -> None:
+    def test_an_orchestrator_cycling_verdicts_and_resolving_is_not_progress(self) -> None:
         ledger = finding_ledger()
-        ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
-        once = self.counter(ledger)
-        for _ in range(10):
-            ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
+        base = self.counter(ledger)
+        for verdict in ("dismissed", "probable", "question", "proven"):
+            ledger = self.judge(ledger, "orchestrator", verdict)
+        ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list.", fingerprint="fp2")
+        ledger = self.judge(ledger, "orchestrator", "proven")
 
-        self.assertEqual(self.counter(ledger), once)
+        self.assertEqual(self.counter(ledger), base)
+
+    def test_an_orchestrator_is_not_progress_even_beside_a_live_verifier(self) -> None:
+        ledger = self.verified("v1")
+        base = self.counter(ledger)
+        ledger = self.judge(ledger, "orchestrator", "proven")
+
+        self.assertEqual(self.counter(ledger), base)
+
+    def test_a_verifier_repeating_one_verdict_counts_once(self) -> None:
+        ledger = self.verified("v1")
+        base = self.counter(ledger)
+        for _ in range(5):
+            ledger = self.judge(ledger, "v1")
+
+        self.assertEqual(self.counter(ledger), base + 1)
+
+    def test_a_second_verifier_agreeing_counts(self) -> None:
+        ledger = self.verified("v1", "v2")
+        base = self.counter(ledger)
+        ledger = self.judge(ledger, "v1")
+        ledger = self.judge(ledger, "v2")
+        ledger = self.judge(ledger, "v2")
+
+        self.assertEqual(self.counter(ledger), base + 2)
+
+    def test_two_overlapping_window_verifiers_agreeing_count_twice(self) -> None:
+        ledger = with_agents(
+            finding_ledger(),
+            *run_events("a", 0, 50, agent=VERIFIER, platform="copilot"),
+            *run_events("b", 0, 50, agent=VERIFIER, platform="copilot"),
+        )
+        base = self.counter(ledger)
+        ledger = with_verdicts(
+            ledger, "F1", VerdictEvent("V1", "dismissed", at(3)), VerdictEvent("V2", "dismissed", at(4))
+        )
+
+        self.assertEqual(self.counter(ledger), base + 2)
+        self.assertEqual(distinct_verdict_runs(ledger, ledger.findings[0], agent_runs(ledger)), 2)
+
+    def test_one_window_verifier_judging_twice_counts_once(self) -> None:
+        ledger = with_agents(finding_ledger(), *run_events("a", 0, 50, agent=VERIFIER, platform="copilot"))
+        base = self.counter(ledger)
+        ledger = with_verdicts(
+            ledger, "F1", VerdictEvent("V1", "dismissed", at(3)), VerdictEvent("V2", "dismissed", at(4))
+        )
+
+        self.assertEqual(self.counter(ledger), base + 1)
+
+    def test_an_identityless_verdict_beside_a_live_antigravity_verifier_is_not_progress(self) -> None:
+        """`env -u ANTIGRAVITY_CONVERSATION_ID craftsman review verdict ...` cannot borrow the run."""
+        ledger = self.verified("v1")
+        base = self.counter(ledger)
+        ledger, _ = set_verdict(ledger, "F1", "dismissed", EVIDENCE_OF["dismissed"], None, by=None)
+        finding = ledger.findings[0]
+        runs = agent_runs(ledger)
+
+        self.assertFalse(verdict_vouched(ledger, finding, finding.verdict_log[0], runs))
+        self.assertEqual(distinct_verdict_runs(ledger, finding, runs), 0)
+        self.assertEqual(self.counter(ledger), base)
 
     def test_changing_a_verdict_is_progress(self) -> None:
-        ledger = finding_ledger()
-        ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
+        ledger = self.verified("v1")
+        ledger = self.judge(ledger, "v1", "proven")
         once = self.counter(ledger)
-        ledger, _ = set_verdict(ledger, "F1", "dismissed", EVIDENCE, None)
+        ledger = self.judge(ledger, "v1", "dismissed")
 
         self.assertEqual(self.counter(ledger), once + 1)
 
-    def test_a_verifier_vouching_for_verdicts_is_progress(self) -> None:
+    def test_a_verifier_transcript_showing_two_verdicts_counts_both(self) -> None:
         ledger = with_verdicts(
-            finding_ledger(), "F1", VerdictEvent("V1", "proven", at(3)), VerdictEvent("V2", "proven", at(4))
+            finding_ledger(), "F1", VerdictEvent("V1", "proven", at(3)), VerdictEvent("V2", "dismissed", at(4))
         )
         before = self.counter(ledger)
         ledger = with_agents(ledger, *run_events("v", 0, 5, agent=VERIFIER, records=("V1", "V2")))
 
         self.assertEqual(self.counter(ledger), before + 2)
+
+    def test_a_resolution_counts_only_after_a_vouched_verdict(self) -> None:
+        ledger = self.verified("v1")
+        ledger = self.judge(ledger, "orchestrator", "proven")
+        ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list.", fingerprint="fp2")
+        unvouched = self.counter(ledger)
+        ledger = self.judge(ledger, "v1", "proven")
+        vouched_verdict = self.counter(ledger)
+
+        self.assertEqual(vouched_verdict, unvouched + 2)  # the verdict, and the resolution it now backs
+
+    def test_a_legacy_verdict_and_its_resolution_count(self) -> None:
+        ledger = finding_ledger()
+        base = self.counter(ledger)
+        legacy = replace(ledger.findings[0], verdict="proven", verdict_evidence=EVIDENCE, verdict_run="R1")
+        ledger = replace(ledger, findings=(legacy,))
+        self.assertEqual(self.counter(ledger), base + 1)
+        ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list.", fingerprint="fp2")
+
+        self.assertEqual(self.counter(ledger), base + 2)
 
     def test_stop_events_and_claims_are_not_progress(self) -> None:
         before = hunt_ledger()
@@ -794,44 +1360,30 @@ class EvidenceCounterTests(unittest.TestCase):
 
         self.assertEqual(self.counter(after), self.counter(before))
 
-    def test_verdict_events_resolutions_and_passing_runs_count(self) -> None:
-        ledger = finding_ledger()
-        base = self.counter(ledger)
-        ledger, _ = set_verdict(ledger, "F1", "proven", EVIDENCE, "R1")
-        self.assertEqual(self.counter(ledger), base + 1)
-        ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list.", fingerprint="fp2")
-        self.assertEqual(self.counter(ledger), base + 2)
-        ledger = record_run(ledger)
-        self.assertEqual(self.counter(ledger), base + 3)
-
-    def test_a_trivial_or_failing_run_does_not_count(self) -> None:
+    def test_passing_runs_count_and_trivial_or_failing_ones_do_not(self) -> None:
         ledger = finding_ledger()
         base = self.counter(ledger)
 
+        self.assertEqual(self.counter(record_run(ledger)), base + 1)
         self.assertEqual(self.counter(record_run(ledger, ("true",))), base)
         self.assertEqual(self.counter(record_run(ledger, exit_code=1)), base)
 
-    def test_a_verdict_from_before_events_counts_once(self) -> None:
-        ledger = finding_ledger()
-        base = self.counter(ledger)
-        legacy = replace(ledger.findings[0], verdict="proven", verdict_evidence=EVIDENCE, verdict_run="R1")
-        ledger = replace(ledger, findings=(legacy,))
-
-        self.assertEqual(self.counter(ledger), base + 1)
-
-    def test_it_grows_with_every_kind_of_recorded_work(self) -> None:
+    def test_a_new_round_counts(self) -> None:
         ledger = hunt_ledger()
-        seen = [self.counter(ledger)]
-        ledger, c1 = cover(ledger, "W1-1", 2)
-        ledger = with_agents(ledger, *run_events("a", 0, 5, records=(c1,)))
-        seen.append(self.counter(ledger))
-        ledger, _ = add_finding(ledger, **{**FINDING, "severity": "major"})
-        ledger, _ = set_verdict(ledger, "F1", "dismissed", EVIDENCE, None)
-        seen.append(self.counter(ledger))
-        ledger = replace(ledger, rounds=(*ledger.rounds, replace(ledger.rounds[0], number=2, prepared_at=at(40))))
-        seen.append(self.counter(ledger))
+        later = replace(ledger, rounds=(*ledger.rounds, replace(ledger.rounds[0], number=2, prepared_at=at(40))))
 
-        self.assertEqual(seen, sorted(set(seen)))
+        self.assertEqual(self.counter(later), self.counter(ledger) + 1)
+
+    def test_it_can_drop_when_a_vouched_resolution_is_overturned(self) -> None:
+        """The value is not monotone, and the docstring says so."""
+        ledger = self.verified("v1")
+        ledger = self.judge(ledger, "v1", "dismissed")
+        ledger = self.judge(ledger, "v1", "proven")
+        ledger, _ = resolve(ledger, "F1", "fixed", "Guarded the empty list.", fingerprint="fp2")
+        resolved = self.counter(ledger)
+        ledger = self.judge(ledger, "v1", "dismissed")  # nothing new to count; the resolution goes
+
+        self.assertEqual(self.counter(ledger), resolved - 1)
 
 
 class FindingSlotsTests(unittest.TestCase):
