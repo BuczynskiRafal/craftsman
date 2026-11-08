@@ -733,6 +733,29 @@ class LayoutTests(unittest.TestCase):
         self.assertIn("````diff\n@@ -1,1 +1,2 @@ def f():\n x = 1\n+y = ```\n````", text)
 
 
+class OtherHunksIndexTests(unittest.TestCase):
+    def index_of(self, ctx: PacketContext) -> str:
+        view = render_packet_view(ctx, assigned_hunks=("H1",))
+        return view.split("### Other hunks (index)")[1]
+
+    def test_a_carried_hunk_inside_a_scope_keeps_both_its_scope_and_the_carried_label(self) -> None:
+        scope = Scope("pkg/b.py", "moved", "function", 1, 9, "def moved():\n    return 1")
+        ctx = build_context(H1, H2, scopes={"H2": scope}, carried_from={"H2": 1})
+
+        self.assertIn("- H2 · pkg/b.py · moved · carried (round 1)", self.index_of(ctx))
+
+    def test_a_carried_hunk_without_a_scope_is_labeled_carried(self) -> None:
+        ctx = build_context(H1, H2, carried_from={"H2": 1})
+
+        self.assertIn("- H2 · pkg/b.py · carried (round 1)", self.index_of(ctx))
+
+    def test_an_open_hunk_keeps_its_scope_or_status(self) -> None:
+        scope = Scope("pkg/b.py", "moved", "function", 1, 9, "def moved():\n    return 1")
+
+        self.assertIn("- H2 · pkg/b.py · moved\n", self.index_of(build_context(H1, H2, scopes={"H2": scope})) + "\n")
+        self.assertIn("- H2 · pkg/b.py · modified", self.index_of(build_context(H1, H2)))
+
+
 class LeanPacketTests(unittest.TestCase):
     """A small diff costs a hunter its code context and little else."""
 

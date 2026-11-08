@@ -975,17 +975,30 @@ class CarryOverTests(unittest.TestCase):
 
         self.assertEqual(owed["H1"], frozenset({"state", "trust", "platform", "model"}))
 
-    def test_legacy_coverage_keeps_the_five_oh_behavior(self) -> None:
-        hunks = self.two()
-        snap = make_snap(*hunks)
-        legacy, _ = prepared(snap)
+    def legacy(self, hunks: Sequence[Hunk], *, vouched: bool) -> Ledger:
+        legacy, _ = prepared(make_snap(*hunks))
         legacy = replace(legacy, coverage=(Coverage(1, tuple(h.digest for h in hunks), coverage_note(["H1", "H2"]), at(1)),))
+        if vouched:
+            legacy = add_agent_event(legacy, agent_event("start", REVIEWER, "legacy", 0))  # no transcript: by time
+            legacy = add_agent_event(legacy, agent_event("stop", REVIEWER, "legacy", 2))
+        return legacy
+
+    def test_vouched_legacy_coverage_carries_at_normal_depth_and_owes_the_conditional_lenses_when_deep(self) -> None:
+        hunks = self.two()
+        legacy = self.legacy(hunks, vouched=True)
 
         _, normal = advance(legacy, [*hunks, code("H3", "c.py")])
         _, deep = advance(legacy, [*hunks, code("H3", "c.py")], deep=True)
 
         self.assertEqual(normal.open_hunk_ids, ("H3",))
-        self.assertEqual(deep.open_hunk_ids, ("H3",))
+        self.assertEqual(deep.open_hunk_ids, ("H1", "H2", "H3"))
+
+    def test_unvouched_legacy_coverage_does_not_carry_into_an_enforced_round(self) -> None:
+        hunks = self.two()
+
+        _, normal = advance(self.legacy(hunks, vouched=False), [*hunks, code("H3", "c.py")])
+
+        self.assertEqual(normal.open_hunk_ids, ("H1", "H2", "H3"))
 
 
 class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
@@ -1033,7 +1046,7 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
         ledger = run_all(hunt(hunks), skip=("W1-2",))
         edited = [hunks[0], code("H3", "c.py")]
         ledger, _ = advance(ledger, edited)
-        ledger = run_all(ledger, number=2)
+        ledger = run_all(ledger, number=2, start=6100)  # round 2 was prepared at 6000
 
         self.assertFalse(sweep_pending(ledger))
 
@@ -2149,6 +2162,14 @@ class ReviewOfB2Probes(unittest.TestCase):
         self.assertEqual((statuses[sweep.id].state, statuses[sweep.id].missing), ("unlaunched", sweep.hunks))
         for digest in credited(ledger).values():
             self.assertNotIn("sweep", digest)
+
+    def test_a_sweep_in_a_round_that_adds_a_hunk_names_every_hunk_as_missing(self) -> None:
+        h1, h2, h3 = code("H1", "a.py", 25), code("H2", "b.py", 25), code("H3", "c.py", 25)
+        ledger, round_ = advance(run_all(hunt([h1, h2])), [h1, h2, h3], deep=True, first_deep=True)
+        sweep = next(slot for slot in round_.plan.slots if "sweep" in slot.lenses)  # type: ignore[union-attr]
+
+        self.assertEqual(slots_missing(ledger, round_)[sweep.id], sweep.hunks)
+        self.assertGreater(len(sweep.hunks), 1)
 
     # finding 4: variants cut by the cap leak into later rounds
     def test_triggers_the_cap_left_out_do_not_come_back_in_a_later_round(self) -> None:

@@ -139,22 +139,29 @@ class PartialReportCliTests(_RepoTestCase):
         assert_cli_error(self, bad_flag, 2, "unrecognized arguments: --partial")
 
     def test_empty_ledger_does_not_crash_report(self) -> None:
-        clean_partial = self.review("report", "--review-only", "--partial")
-        self.assertEqual(clean_partial.returncode, 0)
-        self.assertIn("- Review: COMPLETE (review-only)", clean_partial.stdout)
+        clean_report = self.review("report", "--review-only")
+        self.assertEqual(clean_report.returncode, 0)
+        self.assertIn("- Review: COMPLETE (review-only)", clean_report.stdout)
 
         self.repo.write("cart.py", BUGGY_CART)
         dirty_report = self.review("report")
-        dirty_partial = self.review("report", "--review-only", "--partial")
-        dirty_json = self.json_of("report", "--review-only", "--partial")
 
         self.assertEqual(dirty_report.returncode, 0)
-        self.assertEqual(dirty_partial.returncode, 0)
-        self.assertIn("- Review: PARTIAL (review-only, 1 open items)", dirty_partial.stdout)
-        self.assertIn("## Not covered", dirty_partial.stdout)
-        self.assertTrue(dirty_json["partial"])
-        self.assertEqual(dirty_json["rounds"], 0)
-        self.assertEqual(dirty_json["not_covered"], [])
+
+    def test_a_partial_report_without_any_round_is_refused(self) -> None:
+        for dirty in (False, True):
+            with self.subTest(dirty=dirty):
+                if dirty:
+                    self.repo.write("cart.py", BUGGY_CART)
+
+                proc = self.review("report", "--review-only", "--partial", check=False)
+
+                assert_cli_error(
+                    self,
+                    proc,
+                    2,
+                    "No review round yet: run `craftsman review prepare` and launch the hunters it lists.",
+                )
 
 
 class ShowHunksTests(_RepoTestCase):
@@ -246,7 +253,7 @@ class ShowHunksTests(_RepoTestCase):
         self.assertEqual(
             stale_lines,
             [
-                "H3  cart.py:1-3  [open]",
+                "H3  cart.py:1-3  [round 2]",
                 "H2  notes.py:1-1  [carried]",
                 "stale: run `craftsman review prepare`",
             ],

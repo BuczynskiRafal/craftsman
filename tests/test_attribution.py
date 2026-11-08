@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from craftsman.attribution import (
+    LEGACY_CREDIT_LENSES,
     AgentRun,
     SlotWork,
     agent_runs,
@@ -21,6 +22,7 @@ from craftsman.attribution import (
     verdict_vouched,
     vouching_runs,
 )
+from craftsman.huntplan import CORE_LENSES, SIMPLICITY_LENSES
 from craftsman.ledger import add_agent_event, add_finding, next_claim_token, resolve, set_verdict
 from craftsman.lenses import LENS_IDS
 from craftsman.records import (
@@ -899,6 +901,90 @@ class RelaunchTests(unittest.TestCase):
         self.assertEqual(sum(len(item.digests) for item in result.values()), 3)
 
 
+class RelaunchOrderTests(unittest.TestCase):
+    """A relaunch does not erase earlier work, whichever of the unreadable and the readable hunter ran first."""
+
+    def three_hunk_slot_ledger(self) -> Ledger:
+        snap = make_snap(make_hunk("H1", "f1.py"), make_hunk("H2", "f2.py"), make_hunk("H3", "f3.py"))
+        ledger, _ = prepared(snap)
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0),))
+        return planned(ledger, make_slot("W1-1", hunks=("H1", "H2", "H3"), lenses=("intent",)))
+
+    def digests(self, ledger: Ledger) -> frozenset[str]:
+        return work(ledger)[(1, "W1-1")].digests
+
+    def test_an_unread_hunter_that_died_first_keeps_its_work_when_a_readable_one_finishes_the_slot(self) -> None:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 30)  # C1, by the unread hunter (10..60)
+        ledger, _ = claim(ledger, "W1-1", 110)  # B1
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 150)  # C2, by the readable relaunch (100..200)
+        ledger = with_agents(ledger, *run_events("unread", 10, 60), *run_events("exact", 100, 200, records=("B1", "C2")))
+
+        self.assertEqual(len(self.digests(ledger)), 2)
+        self.assertEqual(work(ledger)[(1, "W1-1")].runs, ("exact", "unread"))
+
+    def test_exact_then_unread_then_exact_keeps_all_three(self) -> None:
+        ledger = self.three_hunk_slot_ledger()
+        ledger, _ = claim(ledger, "W1-1", 11)  # B1
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 30)  # C1: exact (10..60)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 130)  # C2: unread (100..150)
+        ledger, _ = claim(ledger, "W1-1", 205)  # B2
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H3",), 230)  # C3: exact (200..250)
+        ledger = with_agents(
+            ledger,
+            *run_events("first", 10, 60, records=("B1", "C1")),
+            *run_events("unread", 100, 150),
+            *run_events("last", 200, 250, records=("B2", "C3")),
+        )
+
+        self.assertEqual(len(self.digests(ledger)), 3)
+
+    def test_an_unread_run_that_overlaps_a_later_exact_holder_still_adds_nothing(self) -> None:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 130)  # C1: the orchestrator's, inside the unread window
+        ledger, _ = claim(ledger, "W1-1", 110)  # B1
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 150)  # C2, exact (100..200)
+        ledger = with_agents(ledger, *run_events("exact", 100, 200, records=("B1", "C2")), *run_events("unread", 50, 150))
+
+        self.assertEqual(len(self.digests(ledger)), 1)
+
+    def test_an_unread_run_that_stopped_exactly_when_a_later_exact_holder_started_adds_nothing(self) -> None:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 60)
+        ledger, _ = claim(ledger, "W1-1", 110)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H2",), 150)
+        ledger = with_agents(ledger, *run_events("unread", 10, 100), *run_events("exact", 100, 200, records=("B1", "C2")))
+
+        self.assertEqual(len(self.digests(ledger)), 1)
+
+    def test_earlier_exact_coverage_before_the_since_of_a_slot_does_not_hide_a_later_relaunch(self) -> None:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = claim(ledger, "W1-1", 11)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1", "H2"), 30)  # exact, before the trigger
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1", "H2"), 130)  # an unread relaunch after it
+        ledger = with_agents(ledger, *run_events("first", 10, 60, records=("B1", "C1")), *run_events("second", 100, 200))
+        d1, d2 = (ref.digest for ref in ledger.rounds[0].hunks)
+
+        plain = slot_work(ledger, agent_runs(ledger), order_of(ledger))[(1, "W1-1")]
+        triggered = slot_work(ledger, agent_runs(ledger), order_of(ledger), slot_since=lambda number, slot: moment(100))[
+            (1, "W1-1")
+        ]
+
+        self.assertEqual(dict(plain.last_at), {d1: moment(30), d2: moment(30)})
+        self.assertEqual(dict(triggered.last_at), {d1: moment(130), d2: moment(130)})
+        self.assertEqual(triggered.runs, ("first", "second"))
+
+    def test_exact_coverage_after_the_since_still_hides_a_window_repeat(self) -> None:
+        ledger = two_hunk_slot_ledger()
+        ledger, _ = claim(ledger, "W1-1", 11)
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1", "H2"), 130)  # exact, after the trigger
+        ledger, _ = cover_hunks(ledger, "W1-1", ("H1",), 230)  # an unread relaunch repeating it
+        ledger = with_agents(ledger, *run_events("first", 10, 200, records=("B1", "C1")), *run_events("second", 210, 300))
+
+        accepted = slot_work(ledger, agent_runs(ledger), order_of(ledger), slot_since=lambda number, slot: moment(100))
+        self.assertEqual(accepted[(1, "W1-1")].runs, ("first",))
+
+
 class CreditedLensesTests(unittest.TestCase):
     def credited(self, ledger: Ledger, upto: int = 1) -> dict[str, frozenset[str]]:
         plans = {n: ledger.rounds[n - 1].plan for n in range(1, len(ledger.rounds) + 1)}
@@ -1026,13 +1112,85 @@ class CreditedLensesTests(unittest.TestCase):
                 credited_lenses(covered, 1, lambda number, slot: None, order_of(covered), enforced=True), {}
             )
 
-    def test_judging_for_an_enforced_round_still_credits_coverage_of_a_round_without_a_plan(self) -> None:
+    def legacy_ledger(self) -> tuple[Ledger, str]:
         snap = make_snap(make_hunk("H1", "f1.py"))
         ledger, _ = prepared(snap)
         digest = ledger.rounds[0].hunks[0].digest
-        ledger = replace(ledger, coverage=(Coverage(1, (digest,), coverage_note(["H1"]), at(1)),))
+        return replace(ledger, coverage=(Coverage(1, (digest,), coverage_note(["H1"]), at(1)),)), digest
 
-        credit = credited_lenses(ledger, 1, lambda number, slot: None, order_of(ledger), enforced=True)
+    def judged_for_enforced(self, ledger: Ledger) -> dict[str, frozenset[str]]:
+        return credited_lenses(ledger, 1, lambda number, slot: None, order_of(ledger), enforced=True)
+
+    def test_judging_for_an_enforced_round_ignores_unvouched_coverage_of_a_round_without_a_plan(self) -> None:
+        ledger, _ = self.legacy_ledger()
+
+        self.assertEqual(self.judged_for_enforced(ledger), {})
+
+    def test_judging_for_an_enforced_round_credits_vouched_legacy_coverage_with_the_normal_depth_lenses_only(self) -> None:
+        ledger, digest = self.legacy_ledger()
+        ledger = with_agents(ledger, *run_events("r", 0, 5))  # no transcript: the window vouches
+
+        credit = self.judged_for_enforced(ledger)
+
+        self.assertEqual(credit, {digest: frozenset(["intent", "contracts", "failure", "ripple", "tests", "craft", "design"])})
+        self.assertFalse({"sweep", "state", "trust", "platform", "model"} & credit[digest])
+
+    def test_a_transcript_that_shows_the_token_vouches_legacy_coverage_too(self) -> None:
+        ledger, digest = self.legacy_ledger()
+        ledger = with_agents(ledger, *run_events("r", 0, 5, records=("C1",)))
+
+        self.assertIn(digest, self.judged_for_enforced(ledger))
+
+    def test_a_verifier_run_does_not_vouch_legacy_coverage(self) -> None:
+        ledger, _ = self.legacy_ledger()
+        ledger = with_agents(ledger, *run_events("v", 0, 5, agent=VERIFIER))
+
+        self.assertEqual(self.judged_for_enforced(ledger), {})
+
+    def test_legacy_coverage_outside_every_run_does_not_carry_into_an_enforced_round(self) -> None:
+        ledger, _ = self.legacy_ledger()
+        ledger = with_agents(ledger, *run_events("r", 10, 15))  # the orchestrator covered at 1, before the run
+
+        self.assertEqual(self.judged_for_enforced(ledger), {})
+
+    def test_vouched_untagged_coverage_of_an_advisory_round_credits_the_normal_depth_lenses_for_an_enforced_one(self) -> None:
+        ledger = hunt_ledger(("W1-1",), enforced=False)
+        ledger, _ = cover(ledger, None, 1)
+        ledger = with_agents(ledger, *run_events("r", 0, 5))
+        digest = ledger.rounds[0].hunks[0].digest
+
+        credit = self.judged_for_enforced(ledger)
+
+        self.assertEqual(credit, {digest: LEGACY_CREDIT_LENSES})
+
+    def test_tagged_coverage_a_run_vouches_for_credits_through_its_slot_only_when_judged_for_an_enforced_round(self) -> None:
+        # One reviewer run claims W1-1 and covers both slots; binding rejects its record of W1-2. The advisory
+        # round credits every lens to vouched tagged coverage, but an enforced round must not be paid by it.
+        ledger = hunt_ledger(("W1-1", "W1-2"), enforced=False)
+        ledger, b1 = claim(ledger, "W1-1", 5)
+        ledger, c1 = cover(ledger, "W1-1", 10)
+        ledger, c2 = cover(ledger, "W1-2", 11)
+        ledger = with_agents(ledger, *run_events("r", 1, 20, records=(b1, c1, c2)))
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+
+        def lenses(number: int, slot: str) -> tuple[str, ...] | None:
+            found = plan.slot(slot)
+            return found.lenses if found else None
+
+        credit = credited_lenses(ledger, 1, lenses, order_of(ledger), enforced=True)
+
+        first, second = (ref.digest for ref in ledger.rounds[0].hunks)
+        self.assertEqual(credit, {first: frozenset(SLOT_LENSES["W1-1"])})
+        self.assertNotIn(second, credit)
+
+    def test_the_legacy_lenses_are_the_core_and_simplicity_lenses_of_the_planner(self) -> None:
+        self.assertEqual(LEGACY_CREDIT_LENSES, frozenset((*CORE_LENSES, *SIMPLICITY_LENSES)))
+
+    def test_judging_without_enforcement_still_credits_every_lens_to_unvouched_legacy_coverage(self) -> None:
+        ledger, digest = self.legacy_ledger()
+
+        credit = credited_lenses(ledger, 1, lambda number, slot: None, order_of(ledger))
 
         self.assertEqual(credit, {digest: frozenset(LENS_IDS)})
 

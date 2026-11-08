@@ -537,13 +537,9 @@ def _conventions_section(ctx: PacketContext) -> str:
 
 def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
     scope = ctx.scopes.get(hunk.id)
-    if scope is not None:
-        label = scope.name
-    elif hunk.id in ctx.carried_from:
-        label = f"carried (round {ctx.carried_from[hunk.id]})"
-    else:
-        label = hunk.status
-    return f"- {hunk.id} · {hunk.path} · {label}"
+    carried = f"carried (round {ctx.carried_from[hunk.id]})" if hunk.id in ctx.carried_from else None
+    label = " · ".join(part for part in (scope.name if scope is not None else None, carried) if part)
+    return f"- {hunk.id} · {hunk.path} · {label or hunk.status}"
 
 
 def _hunk_section(ctx: PacketContext, hunk: Hunk, owners: _Owners, detail: _Detail) -> str:

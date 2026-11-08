@@ -1199,7 +1199,8 @@ class WaveSlotTests(unittest.TestCase):
         ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=at(100)),))
         early = hunted(ledger, "W2-X1", "h2", 10, 60)
 
-        self.assertEqual(statuses(early, 200)["W2-X1"].state, "dead")
+        # Not done, and not even the work of a hunter of this round: the run began before the round was prepared.
+        self.assertEqual(statuses(early, 200)["W2-X1"].state, "unlaunched")
 
 
 class HuntSlotsTests(unittest.TestCase):
@@ -1358,10 +1359,11 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertEqual([item.slot.id for item in check(ledger).slots], ["W1-1"])  # F1 has no verdict: the barrier holds
         self.assertNotIn("wave-pending", codes(check(ledger)))
 
-    def test_an_advisory_round_plans_no_wave_in_the_gate(self) -> None:
+    def test_an_advisory_round_plans_no_wave_and_reports_no_slots_in_the_gate(self) -> None:
         ledger = replace(self.due_wave_ledger(), rounds=(replace(self.due_wave_ledger().rounds[0], enforced=False),))
 
-        self.assertEqual([item.slot.id for item in check(ledger).slots], ["W1-1"])
+        self.assertEqual(check(ledger).slots, ())
+        self.assertEqual(len(required_slots(ledger, ledger.rounds[0])), 1)
 
     def test_planned_variants_and_fresh_sets_are_wave_slots_with_their_own_issue(self) -> None:
         ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
@@ -1456,7 +1458,7 @@ class EnforcedIssueTests(unittest.TestCase):
 
         self.assertTrue(report.passed)
         self.assertTrue(report.self_reviewed)
-        self.assertEqual(len(report.slots), 1)
+        self.assertEqual(report.slots, ())
 
 
 def second_round(ledger: Ledger, *slots: Slot) -> Ledger:
@@ -1743,6 +1745,247 @@ class StartingHuntersTests(unittest.TestCase):
 
         self.assertIn("Starting: 1 reviewer subagent has started", issue.message)
         self.assertNotIn("launch them again", issue.message)
+
+
+class ClaimMatchingTests(unittest.TestCase):
+    """Which open run stands for a claim (agy review of Phase D, finding 4): live over stale, one per slot, none for done slots."""
+
+    def test_a_run_that_was_stale_when_the_claim_was_made_does_not_steal_it_from_the_relaunch(self) -> None:
+        ledger = with_agents(
+            claim(hunt("W1-1", "W1-2"), "W1-1", 1905),
+            *run_events("stale", 10, None),
+            *run_events("live", 1900, None),
+        )
+
+        result = statuses(ledger, 1910)
+
+        self.assertEqual((result["W1-1"].state, result["W1-1"].since), ("running", moment(1900)))
+        self.assertEqual(result["W1-2"].state, "unlaunched")
+
+    def test_a_run_that_was_stale_when_the_claim_was_made_is_not_the_hunter_of_it(self) -> None:
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", 1905), *run_events("stale", 10, None))
+
+        self.assertEqual(statuses(ledger, 1910)["W1-1"].state, "unlaunched")
+
+    def test_a_run_that_is_going_is_preferred_to_one_that_has_gone_stale_since_the_claim(self) -> None:
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", 1000), *run_events("old", 0, None), *run_events("new", 900, None))
+
+        self.assertEqual(statuses(ledger, 2000)["W1-1"].state, "running")
+
+    def test_a_hunter_that_fetched_the_brief_twice_does_not_use_up_a_second_run(self) -> None:
+        ledger = claim(claim(claim(hunt("W1-1", "W1-2"), "W1-1", 15), "W1-1", 16), "W1-2", 20)
+        ledger = with_agents(ledger, *run_events("a1", 10, None), *run_events("a2", 12, None))
+
+        result = statuses(ledger, 25)
+
+        self.assertEqual((result["W1-1"].state, result["W1-2"].state), ("running", "running"))
+
+    def test_a_slot_with_several_claims_is_backed_by_the_run_of_the_one_a_run_can_back(self) -> None:
+        # The first claim was made before any run existed (the orchestrator itself); the second is the hunter's.
+        ledger = claim(claim(hunt("W1-1"), "W1-1", 5), "W1-1", 20)
+        ledger = with_agents(ledger, *run_events("a1", 10, None))
+
+        self.assertEqual(statuses(ledger, 25)["W1-1"].state, "running")
+
+    def test_a_claim_of_a_slot_that_is_done_takes_no_run_from_the_hunters_still_starting(self) -> None:
+        ledger = claim(claim(hunt("W1-1", "W1-2", count=2), "W1-1", 15), "W1-1", 16)
+        ledger = cover(ledger, "W1-1", 17)
+        ledger = with_agents(
+            ledger, *run_events("a1", 10, 18, records=("B2", "C1")), *run_events("a2", 12, None)
+        )
+
+        (issue,) = check(ledger, 25, snap=hunt_snap(2)).issues
+
+        self.assertEqual(issue.code, "hunt-pending")
+        self.assertIn("Starting: 1 reviewer subagent has started", issue.message)
+        self.assertNotIn("Launch now", issue.message)
+
+    def test_a_run_that_began_before_the_round_does_not_back_a_claim_of_it(self) -> None:
+        ledger = hunt("W1-1")
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=at(20)),))
+        ledger = with_agents(claim(ledger, "W1-1", 25), *run_events("early", 10, None))
+
+        self.assertEqual(statuses(ledger, 30)["W1-1"].state, "unlaunched")
+
+    def test_an_antigravity_run_from_before_the_round_does_not_back_its_claim_either(self) -> None:
+        ledger = hunt("W1-1", count=1)
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=at(20)),))
+        ledger = with_agents(claim(ledger, "W1-1", 25, by=f"{AGY}:a1"), *run_events("a1", 10, None, platform=AGY))
+
+        report = check(ledger, 30, snap=hunt_snap(1))
+
+        self.assertEqual({item.slot.id: item.state for item in report.slots}, {"W1-1": "unlaunched"})
+        self.assertEqual(codes(report), ["no-isolation"])  # and the report no longer says it runs
+
+    def test_a_finished_run_from_before_the_round_does_not_end_a_claim_of_it(self) -> None:
+        ledger = hunt("W1-1")
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=at(20)),))
+        ledger = with_agents(claim(ledger, "W1-1", 25), *run_events("early", 10, 60, records=("B1",)))
+
+        self.assertEqual(statuses(ledger, 70)["W1-1"].state, "unlaunched")
+
+
+    def test_a_late_brief_of_an_antigravity_conversation_still_makes_its_slot_dead(self) -> None:
+        # Identity proves who made the claim, so the run being 30 minutes old when it asked for a brief does not
+        # make the claim someone else's: the slot is dead (relaunch), not unlaunched-with-a-hunter-nobody-sees.
+        late = 10 + RUN_STALE_AFTER.total_seconds() + 100
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", late, by=f"{AGY}:a1"), *run_events("a1", 10, None, platform=AGY))
+
+        self.assertEqual(statuses(ledger, late + 5)["W1-1"].state, "dead")
+
+    def test_a_late_claim_without_an_identity_is_not_backed_by_a_stale_run(self) -> None:
+        late = 10 + RUN_STALE_AFTER.total_seconds() + 100
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", late), *run_events("h1", 10, None))
+
+        self.assertEqual(statuses(ledger, late + 5)["W1-1"].state, "unlaunched")
+
+    def test_a_hunter_still_going_on_a_slot_done_by_credit_is_not_a_starting_one(self) -> None:
+        # W1-1 and W1-2 both own H1 with the intent lens: hunter a finished W1-1, which credits W1-2 as well.
+        # Hunter b claimed W1-2 and is still going; W1-3 is the only slot nobody works on.
+        ledger, _ = prepared(hunt_snap())
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0, enforced=True),))
+        ledger = planned(
+            ledger, make_slot("W1-1", hunks=("H1",)), make_slot("W1-2", hunks=("H1",)), make_slot("W1-3", hunks=("H3",))
+        )
+        ledger = hunted(ledger, "W1-1", "a", 10, 20)
+        ledger = with_agents(claim(ledger, "W1-2", 13), *run_events("b", 12, None))
+
+        result = statuses(ledger, 25)
+        (issue,) = check(ledger, 25).issues
+
+        self.assertEqual({slot: item.state for slot, item in result.items()}, {"W1-1": "done", "W1-2": "done", "W1-3": "unlaunched"})
+        self.assertIn("Launch now, all in one step: W1-3.", issue.message)
+        self.assertNotIn("Starting:", issue.message)
+
+    def test_a_window_run_from_before_the_round_does_not_vouch_for_the_coverage_of_a_slot(self) -> None:
+        # A hunter of an earlier round was still going when this one was prepared (at 20); the coverage the
+        # orchestrator tagged with W1-1 at 30 falls in its window, but the run is nobody's hunter of this round.
+        ledger = hunt("W1-1", count=1)
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=at(20)),))
+        ledger = cover(claim(ledger, "W1-1", 25), "W1-1", 30)
+        ledger = with_agents(ledger, *run_events("early", 10, 60))
+
+        result = statuses(ledger, 70)["W1-1"]
+
+        self.assertEqual((result.state, result.missing), ("unlaunched", ("H1",)))
+
+
+class PendingMessageScopeTests(unittest.TestCase):
+    def test_starting_hunters_are_not_mentioned_where_nothing_is_left_to_launch(self) -> None:
+        ledger = hunt("W1-1", "W2-X1", count=2)
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+        ledger = planned(ledger, *(replace(slot, since=at(20)) if slot.generation == 2 else slot for slot in plan.slots))
+        ledger = with_agents(claim(ledger, "W1-1", 15), *run_events("a1", 10, None), *run_events("a2", 30, None))
+
+        by_code = {issue.code: issue.message for issue in check(ledger, 40, snap=hunt_snap(2)).issues}
+
+        self.assertIn("Running: W1-1", by_code["hunt-pending"])
+        self.assertNotIn("Starting", by_code["hunt-pending"])
+        self.assertIn("Starting: 1 reviewer subagent has started", by_code["wave-pending"])
+
+
+class WaveMissingSinceTests(unittest.TestCase):
+    """`missing` of a wave slot counts only coverage at or after its `since` (agy review of Phase D, finding 5)."""
+
+    def ledger(self) -> Ledger:
+        ledger = hunt("W2-X1", count=2)
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+        return planned(ledger, *(replace(slot, since=at(100)) for slot in plan.slots))
+
+    def attempt(self, ledger: Ledger, agent_id: str, start: float, covered: str, recorded: float, stop: float) -> Ledger:
+        token = len(ledger.claims) + 1
+        ledger = claim(ledger, "W2-X1", start + 2)
+        ledger = cover(ledger, "W2-X1", recorded, hunks=(covered,))
+        return with_agents(ledger, *run_events(agent_id, start, stop, records=(f"B{token}", f"C{len(ledger.coverage)}")))
+
+    def test_coverage_from_before_the_since_is_still_missing(self) -> None:
+        ledger = self.attempt(self.ledger(), "a1", 10, "H1", 20, 30)
+
+        result = statuses(ledger, 120)["W2-X1"]
+
+        self.assertEqual((result.state, result.missing), ("dead", ("H1", "H2")))
+
+    def test_what_the_hunter_covered_after_the_since_is_no_longer_missing(self) -> None:
+        ledger = self.attempt(self.ledger(), "a1", 10, "H1", 20, 30)
+        ledger = self.attempt(ledger, "a2", 125, "H2", 130, 140)
+
+        result = statuses(ledger, 150)["W2-X1"]
+
+        self.assertEqual((result.state, result.missing), ("dead", ("H1",)))
+
+    def test_covering_all_after_the_since_finishes_it(self) -> None:
+        ledger = self.attempt(self.ledger(), "a1", 10, "H1", 20, 30)
+        ledger = self.attempt(ledger, "a2", 125, "H1", 130, 140)
+        ledger = self.attempt(ledger, "a3", 145, "H2", 150, 160)
+
+        self.assertEqual(statuses(ledger, 170)["W2-X1"].missing, ())
+
+    def test_an_unread_relaunch_after_the_since_completes_a_slot_the_readable_hunter_covered_early(self) -> None:
+        ledger = claim(self.ledger(), "W2-X1", 12)
+        ledger = cover(ledger, "W2-X1", 20)
+        ledger = with_agents(ledger, *run_events("first", 10, 30, records=("B1", "C1")))
+        ledger = with_agents(cover(ledger, "W2-X1", 130), *run_events("second", 110, 160))  # unreadable
+
+        result = statuses(ledger, 170)["W2-X1"]
+
+        self.assertEqual((result.state, result.missing), ("done", ()))
+
+
+class LegacyCoverageTests(unittest.TestCase):
+    """What an earlier round without a plan lends an enforced round (agy review of Phase D, finding 3)."""
+
+    def two_rounds(self, *, vouched: bool) -> Ledger:
+        first = make_snap(make_hunk("H1", "f1.py"))
+        ledger, _ = prepared(first)
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0),))
+        ledger = replace(ledger, coverage=(Coverage(1, (ledger.rounds[0].hunks[0].digest,), coverage_note(["H1"]), at(5)),))
+        if vouched:
+            ledger = with_agents(ledger, *run_events("r", 1, 8))  # no transcript: vouched by the time window
+        second = make_snap(make_hunk("H1", "f1.py"), make_hunk("H2", "f2.py"), fingerprint="fp2")
+        ledger, _ = prepared(second, ledger=ledger)
+        latest = replace(ledger.rounds[-1], prepared_at=at(20), enforced=True)
+        ledger = replace(ledger, rounds=(*ledger.rounds[:-1], latest))
+        return planned(
+            ledger,
+            make_slot("W1-1", hunks=("H1",), lenses=("intent",)),
+            make_slot("W1-2", hunks=("H2",), lenses=("intent",)),
+        )
+
+    def test_an_orchestrators_self_review_of_a_planless_round_does_not_finish_an_enforced_slot(self) -> None:
+        ledger = self.two_rounds(vouched=False)
+        self.assertTrue(ledger.rounds[-1].hunks[0].carried)  # 5.0 carried it; the hunt does not take its word
+
+        result = {item.slot.id: item.state for item in slot_statuses(ledger, ledger.rounds[-1], moment(40))}
+
+        self.assertEqual(result, {"W1-1": "unlaunched", "W1-2": "unlaunched"})
+
+    def test_a_review_that_a_reviewer_run_vouched_for_still_counts(self) -> None:
+        ledger = self.two_rounds(vouched=True)
+
+        result = {item.slot.id: item.state for item in slot_statuses(ledger, ledger.rounds[-1], moment(40))}
+
+        self.assertEqual(result, {"W1-1": "done", "W1-2": "unlaunched"})
+
+    def test_it_never_credits_a_conditional_lens(self) -> None:
+        ledger = self.two_rounds(vouched=True)
+        plan = ledger.rounds[-1].plan
+        assert plan is not None
+        ledger = planned(ledger, make_slot("W1-1", hunks=("H1",), lenses=("intent", "state")), *plan.slots[1:])
+
+        self.assertEqual(statuses(ledger, 40)["W1-1"].missing, ("H1",))
+
+
+class AdvisoryRoundTests(unittest.TestCase):
+    def test_an_advisory_round_reports_no_slots_and_no_slot_issue(self) -> None:
+        ledger = cover_open_hunks(hunt("W1-1", "W1-2", enforced=False))
+
+        report = check(ledger)
+
+        self.assertEqual(report.slots, ())
+        self.assertTrue(report.passed)
+        self.assertNotIn("Hunt:", render_report(report))
 
 
 class RunningMessageTests(unittest.TestCase):

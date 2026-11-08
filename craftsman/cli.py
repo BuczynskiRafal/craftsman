@@ -22,6 +22,7 @@ from craftsman.gate import main as gate_main
 from craftsman.gatecheck import hunt_slots
 from craftsman.generated import ExportError
 from craftsman.hooks import main as hook_main
+from craftsman.huntview import STALE_NOTE
 from craftsman.install import install_main
 from craftsman.ledger import ledger_path_for, load, uncovered_hunks
 from craftsman.manifest import InstallError
@@ -81,9 +82,11 @@ class LedgerOverview:
     resolved: int
     latest_runs: tuple[RunSummary, ...]
     agent_usage: dict[str, dict[str, Any]] = field(default_factory=dict)  # per role, when recorded
+    stale: bool = False  # the latest round no longer matches the diff: its progress describes code that changed
 
     @classmethod
-    def of(cls, ledger: Ledger) -> LedgerOverview:
+    def of(cls, ledger: Ledger, snap: DiffSnapshot | None = None) -> LedgerOverview:
+        """The overview of `ledger`; with the current diff `snap` it also says whether the latest round is stale."""
         latest = ledger.rounds[-1] if ledger.rounds else None
         coverage, hunt = None, None
         slots = hunt_slots(ledger)
@@ -108,6 +111,7 @@ class LedgerOverview:
                 for run in ledger.runs[-LATEST_RUNS_SHOWN:]
             ),
             agent_usage=usage_json(ledger),
+            stale=latest is not None and snap is not None and not snap.is_empty and latest.fingerprint != snap.fingerprint,
         )
 
     def __post_init__(self) -> None:
@@ -121,6 +125,9 @@ class LedgerOverview:
         assert self.coverage is not None  # guaranteed by __post_init__
         return f"coverage {self.coverage.covered}/{self.coverage.total} hunks"
 
+    def _freshness(self) -> str:
+        return f" ({STALE_NOTE})" if self.stale else ""
+
     def describe(self) -> str:
         if self.rounds == 0:
             return "no review round yet (`craftsman review prepare`)"
@@ -130,7 +137,7 @@ class LedgerOverview:
         )
         runs = ", ".join(f"{run.id} {run.kind} exit {run.exit_code}" for run in self.latest_runs)
         return (
-            f"{self.rounds} round(s){', deep' if self.deep else ''}, {self._progress()}; findings {self.findings} ({verdicts}, "
+            f"{self.rounds} round(s){', deep' if self.deep else ''}, {self._progress()}{self._freshness()}; findings {self.findings} ({verdicts}, "
             f"resolved {self.resolved}); latest runs: {runs or 'none'}{usage_summary(self.agent_usage)}"
         )
 
@@ -164,7 +171,7 @@ class StatusReport:
         cls, state_path: Path, state: GateState | None, root: Path, snap: DiffSnapshot
     ) -> StatusReport:
         try:
-            overview: LedgerOverview | None = LedgerOverview.of(load(ledger_path_for(root)))
+            overview: LedgerOverview | None = LedgerOverview.of(load(ledger_path_for(root)), snap)
             ledger_error = None
         except LedgerError as exc:
             overview, ledger_error = None, str(exc)

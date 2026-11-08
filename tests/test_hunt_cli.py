@@ -20,8 +20,8 @@ from unittest import mock
 from craftsman import review
 from craftsman.gate import GateOwner
 from craftsman.huntplan import credited
-from craftsman.ledger import add_agent_event, load, mutate
-from craftsman.records import AgentEvent, Ledger, Round, format_timestamp
+from craftsman.ledger import add_agent_event, load, mutate, set_verdict
+from craftsman.records import AgentEvent, Ledger, Round, format_timestamp, parse_timestamp
 from craftsman.usage import _COVERAGE_TOKEN_RE, _FINDING_TOKEN_RE
 from craftsman.workspace import HOOKS_MARKER, ReviewMarker, read_marker, write_marker
 
@@ -125,7 +125,10 @@ class HuntTestCase(unittest.TestCase):
 
         `briefed=False` skips the brief (which plans the waves that are due, as every judging command does).
         """
-        started = format_timestamp(datetime.now(timezone.utc) - timedelta(seconds=1))
+        # A hunter starts after its round was prepared (a run from before it is no hunter of it), so the start
+        # is a second ago at the earliest, but never before the round.
+        prepared = parse_timestamp(self.latest().prepared_at)
+        started = format_timestamp(max(datetime.now(timezone.utc) - timedelta(seconds=1), prepared))
         claim = None
         if briefed:
             claim = re.search(r"Brief issued \((B\d+)\)", self.review("brief", slot).stdout)
@@ -153,6 +156,22 @@ class HuntTestCase(unittest.TestCase):
         for slot in plan.slots:
             if slot.generation == 1:
                 self.finish_hunter(slot.id, briefed=briefed)
+
+    def drop_planned_waves(self) -> None:
+        """The latest round as a writer that does not plan waves leaves it: a wave may be due, none is stored.
+
+        Every recording command stores the waves that are due, so the last `cover` of a hunt already does.
+        """
+
+        def drop(current: Ledger) -> tuple[Ledger, None]:
+            latest = current.rounds[-1]
+            assert latest.plan is not None
+            plan = replace(
+                latest.plan, slots=tuple(s for s in latest.plan.slots if s.generation == 1), waves=()
+            )
+            return replace(current, rounds=(*current.rounds[:-1], replace(latest, plan=plan))), None
+
+        mutate(self.ledger_path, drop)
 
     def add_events(self, *events: AgentEvent) -> None:
         def record(current: Ledger) -> tuple[Ledger, None]:
@@ -630,7 +649,8 @@ class BriefTests(HuntTestCase):
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
         self.finish_generation_one(briefed=False)
-        self.assertNotIn("W2-F1", self.slot_ids())  # finishing a hunt plans nothing by itself
+        self.drop_planned_waves()  # a writer that does not plan: the wave is due but not stored
+        self.assertNotIn("W2-F1", self.slot_ids())
 
         out = self.review("brief", "W2-F1", env=CLAUDE).stdout
 
@@ -917,20 +937,20 @@ class CoverHunterTests(HuntTestCase):
         self.assertIn("Coverage recorded (C2) for W1-1: H2 in round 1", tagged)
         self.assert_error(unknown, 1, "unknown slot W1-9")
 
-    def test_a_wave_slot_can_be_covered_only_once_it_is_planned(self) -> None:
+    def test_a_wave_slot_that_is_due_can_be_covered_at_once_and_one_that_is_not_is_unknown(self) -> None:
         self.review("prepare")
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
         self.finish_generation_one(briefed=False)
+        self.drop_planned_waves()  # due, but a writer that does not plan left it unstored
         self.assertNotIn("W2-F1", self.slot_ids())
 
-        refused = self.cover("--hunter", "W2-F1", "--hunks", "H1", check=False)
-        self.review("check", "--review-only", check=False)  # plans the wave that is due
         planned = self.cover("--hunter", "W2-F1", "--hunks", "H1").stdout
+        unknown = self.cover("--hunter", "W3-F1", "--hunks", "H1", check=False)
 
-        self.assert_error(refused, 1, "unknown slot W2-F1 in round 1")
         self.assertIn("for W2-F1: H1 in round 1", planned)
         self.assertIn("W2-F1", self.slot_ids())
+        self.assert_error(unknown, 1, "unknown slot W3-F1 in round 1")
 
     def test_the_caller_identity_is_stored(self) -> None:
         self.review("prepare")
@@ -1106,6 +1126,13 @@ class PartialReportTests(HuntTestCase):
         assert marker is not None
         self.assertTrue(marker.guarding)
 
+    def test_no_round_at_all_refuses_a_partial_report(self) -> None:
+        proc = self.review("report", "--review-only", "--partial", check=False)
+
+        self.assert_error(
+            proc, 2, "No review round yet: run `craftsman review prepare` and launch the hunters it lists."
+        )
+
     def test_a_fetched_brief_counts_as_a_launched_hunter_but_leaves_the_guard_armed(self) -> None:
         self.arm()
         self.review("prepare")
@@ -1218,13 +1245,13 @@ class CheckAndReportTests(HuntTestCase):
         self.assertEqual((payload["enforced"], payload["platform"]), (True, "claude"))
         self.assertEqual(len(payload["slots"]), 3)
 
-    def test_an_advisory_review_reports_no_enforcement_but_still_lists_its_slots(self) -> None:
+    def test_an_advisory_review_reports_no_enforcement_and_lists_no_slot(self) -> None:
         self.review("prepare")
 
         payload = json.loads(self.review("check", "--review-only", "--json", check=False).stdout)
 
         self.assertEqual((payload["enforced"], payload["platform"]), (False, "cli"))
-        self.assertEqual(len(payload["slots"]), 3)
+        self.assertEqual(payload["slots"], [])
 
     def test_check_text_shows_the_slot_table(self) -> None:
         self.arm()
@@ -1358,6 +1385,7 @@ class StoredWaveTests(HuntTestCase):
         self.review("prepare")
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
         self.finish_generation_one(briefed=False)
+        self.drop_planned_waves()
         self.assertEqual(self.latest().number, 2)
         self.assertEqual(self.wave_ids(), [])
 
@@ -1366,6 +1394,172 @@ class StoredWaveTests(HuntTestCase):
         self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
         self.assertIn("New slots since the last prepare: W2-X1, W2-F1", out)
         self.assertEqual(self.ledger().rounds[0].plan.waves, ())  # type: ignore[union-attr]
+
+
+class RecordingStoresWavesTests(HuntTestCase):
+    """`cover`, `add` and `verdict` store the waves that are due, so the slots the displays list can be named at once."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_cart()
+        self.arm()
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.finish_generation_one(briefed=False)
+
+    def wave_ids(self) -> list[str]:
+        return [slot_id for slot_id in self.slot_ids() if slot_id.startswith(("W2", "W3"))]
+
+    def judge_without_planning(self) -> None:
+        """A verdict as an older craftsman (or any writer that does not plan) left it: the wave is due, not stored."""
+
+        def record(current: Ledger) -> tuple[Ledger, None]:
+            return set_verdict(current, "F1", "probable", STATIC, None)[0], None
+
+        mutate(self.ledger_path, record)
+        self.drop_planned_waves()
+        self.assertEqual(self.wave_ids(), [])
+
+    def test_a_verdict_stores_the_wave_it_calls_for(self) -> None:
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_a_wave_slot_can_be_covered_right_after_the_verdict(self) -> None:
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+
+        proc = self.review("cover", "--hunter", "W2-X1", "--hunks", "H1", "--note", coverage_note(["H1"]))
+
+        self.assertIn("Coverage recorded", proc.stdout)
+
+    def test_the_cover_that_lets_the_first_generation_pass_stores_the_wave(self) -> None:
+        self.review("reset")
+        self.arm()
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        self.assertEqual(self.wave_ids(), [])
+
+        self.finish_generation_one(briefed=False)  # no check, no brief: only recording commands ran
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_a_cover_that_finishes_the_last_bug_slot_stores_the_wave_it_made_due(self) -> None:
+        self.review("reset")
+        self.arm()
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+        plan = self.latest().plan
+        assert plan is not None
+        last = next(slot for slot in reversed(plan.slots) if slot.kind != "simplicity")
+        for slot in plan.slots:
+            if slot.id != last.id:
+                self.finish_hunter(slot.id, briefed=False)
+        self.assertEqual(self.wave_ids(), [])
+        # A hunter whose run is still open for the record to fall in (a window the stop event already closes).
+        now = datetime.now(timezone.utc)
+        self.add_events(
+            AgentEvent("claude", "start", "craftsman-reviewer", "late", self.latest().prepared_at),
+            AgentEvent("claude", "stop", "craftsman-reviewer", "late", format_timestamp(now + timedelta(seconds=300))),
+        )
+
+        self.review("cover", "--hunter", last.id, "--hunks", ",".join(last.hunks), "--note", coverage_note(list(last.hunks)))
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_a_batch_of_verdicts_stores_the_wave_too(self) -> None:
+        entries = json.dumps([{"id": "F1", "as": "probable", "evidence": STATIC}])
+
+        self.review("verdict", "--from-json", "-", stdin=entries)
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_cover_stores_a_wave_the_displays_already_list(self) -> None:
+        self.judge_without_planning()
+        shown = json.loads(self.review("show", "--json", check=False).stdout)
+        self.assertIn("W2-X1", [slot["id"] for slot in shown["slots"]])
+
+        proc = self.review("cover", "--hunter", "W2-X1", "--hunks", "H1", "--note", coverage_note(["H1"]))
+
+        self.assertIn("Coverage recorded", proc.stdout)
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_add_stores_a_wave_the_displays_already_list(self) -> None:
+        self.judge_without_planning()
+
+        self.review("add", "--hunter", "W2-X1", *FINDING_FLAGS)
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_a_batch_of_coverage_names_a_wave_slot_the_displays_list(self) -> None:
+        self.judge_without_planning()
+        entries = json.dumps([{"hunks": ["H1"], "note": coverage_note(["H1"]), "hunter": "W2-X1"}])
+
+        self.review("cover", "--from-json", "-", stdin=entries)
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+
+    def test_a_check_run_stores_nothing(self) -> None:
+        self.judge_without_planning()
+        before = self.ledger_path.read_bytes()
+
+        self.review("cover", "--check", "--hunter", "W2-X1", "--hunks", "H1", "--note", coverage_note(["H1"]))
+
+        self.assertEqual(self.ledger_path.read_bytes(), before)
+
+    def test_an_advisory_round_stores_its_waves_but_lists_no_slot(self) -> None:
+        self.review("reset")
+        (self.ledger_path.parent / HOOKS_MARKER).unlink(missing_ok=True)
+        self.review("prepare")  # no marker: an advisory round
+        self.review("add", "--hunter", "lead", *FINDING_FLAGS)
+        self.finish_generation_one(briefed=False)
+        self.assertFalse(self.latest().enforced)
+
+        self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        payload = json.loads(self.review("check", "--review-only", "--json", check=False).stdout)
+        self.assertEqual(payload["slots"], [])
+
+
+class AdvisoryDisplaysTests(HuntTestCase):
+    """An advisory round is complete when every hunk is covered: no command lists slot states for it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_cart_and_reader()
+        self.review("prepare")
+        self.review("cover", "--hunks", "H1,H2", "--note", NOTE)
+
+    def test_check_and_report_list_no_slots_and_no_hunt_line(self) -> None:
+        for command in (("check", "--review-only"), ("report", "--review-only")):
+            with self.subTest(command=command[0]):
+                text = self.review(*command, check=False).stdout
+                payload = json.loads(self.review(*command, "--json", check=False).stdout)
+
+                self.assertNotIn("Hunt:", text)
+                self.assertNotIn("not launched", text)
+                self.assertEqual(payload["slots"], [])
+                self.assertTrue(payload["passed"])
+                self.assertFalse(payload["enforced"])
+
+    def test_preparing_again_does_not_ask_for_hunters_the_review_no_longer_needs(self) -> None:
+        out = self.review("prepare").stdout
+
+        self.assertIn("This plan is a suggestion: an advisory review is complete when every hunk is covered.", out)
+        self.assertIn("Every hunk is covered. Run `craftsman review check --review-only`.", out)
+        self.assertNotIn("Launch", out)
+        self.assertNotIn("[not launched]", out)
+
+    def test_preparing_again_with_hunks_left_still_launches_the_plan(self) -> None:
+        self.review("reset")
+        self.review("prepare")
+        self.review("cover", "--hunks", "H1", "--note", NOTE)
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Launch", out)
 
 
 OWNER = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "s1"}
@@ -1441,6 +1635,60 @@ class SliceViewCarriedTests(HuntTestCase):
 
         self.assertTrue(out.rstrip().endswith("stale: run `craftsman review prepare`"), out)
         self.assertNotIn("slot(s) left to cover", out)
+
+    def test_show_hunks_json_lists_a_carried_hunk_a_slot_still_misses(self) -> None:
+        self.own_both_with_a_sweep()
+
+        payload = json.loads(self.review("show", "--hunks", "--json", check=False).stdout)
+
+        hunks = {hunk["id"]: hunk for hunk in payload["hunks"]}
+        self.assertEqual(sorted(hunks), sorted((self.open, self.carried)))
+        self.assertEqual((hunks[self.carried]["carried"], hunks[self.carried]["covered"]), (True, False))
+        self.assertFalse(hunks[self.open]["carried"])
+        (sweep,) = (slot for slot in payload["slots"] if slot["id"] == "W1-9")
+        self.assertEqual(sorted(sweep["missing"]), sorted(hunks))
+
+    def test_plain_show_json_lists_the_carried_hunk_a_slot_still_misses_too(self) -> None:
+        self.own_both_with_a_sweep()
+
+        payload = json.loads(self.review("show", "--json", check=False).stdout)
+
+        hunks = {hunk["id"]: hunk for hunk in payload["hunks"]}
+        self.assertEqual(sorted(hunks), sorted((self.open, self.carried)))
+        self.assertEqual((hunks[self.carried]["carried"], hunks[self.carried]["covered"]), (True, False))
+        (sweep,) = (slot for slot in payload["slots"] if slot["id"] == "W1-9")
+        self.assertEqual(sorted(sweep["missing"]), sorted(hunks))
+
+    def test_show_hunks_json_leaves_out_carried_hunks_no_slot_misses(self) -> None:
+        payload = json.loads(self.review("show", "--hunks", "--json", check=False).stdout)
+
+        self.assertNotIn(self.carried, [hunk["id"] for hunk in payload["hunks"]])
+
+    def test_stale_displays_say_so(self) -> None:
+        self.own_both_with_a_sweep()
+        self.repo.write("cart.py", CART_EDITED + "\n# edited again\n")
+
+        status = self.repo.cli("status").stdout
+        status_json = json.loads(self.repo.cli("status", "--json").stdout)["ledger"]
+        report = self.review("report", "--review-only", check=False).stdout
+        hunks = self.review("show", "--hunks", check=False).stdout
+        check = self.review("check", "--review-only", check=False).stdout
+
+        self.assertIn("(stale: run `craftsman review prepare`)", status)
+        self.assertTrue(status_json["stale"])
+        self.assertIn("## Hunt\nHunt:", report)
+        self.assertIn("stale: run `craftsman review prepare`", report.split("## Hunt")[1].split("```")[0])
+        self.assertNotIn("[open]", hunks)
+        self.assertRegex(hunks, r"\[round 2\]")
+        round_line = next(line for line in check.splitlines() if line.startswith("Round 2 (stale)"))
+        self.assertIn("hunks in 2 files as prepared; the diff now has", round_line)
+
+    def test_a_current_round_is_not_called_stale(self) -> None:
+        status = self.repo.cli("status").stdout
+        status_json = json.loads(self.repo.cli("status", "--json").stdout)["ledger"]
+
+        self.assertNotIn("stale", status)
+        self.assertFalse(status_json["stale"])
 
     def test_a_view_that_does_not_ask_for_the_carried_hunk_still_stubs_it(self) -> None:
         self.own_both_with_a_sweep()
@@ -1729,6 +1977,7 @@ class DisplaysAgreeWithTheGateTests(HuntTestCase):
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
         self.finish_generation_one(briefed=False)
+        self.drop_planned_waves()
         stored = [slot.id for slot in self.latest().plan.slots]  # type: ignore[union-attr]
         self.assertNotIn("W2-F1", stored)
 

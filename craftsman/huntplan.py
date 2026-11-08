@@ -33,6 +33,7 @@ from craftsman.attribution import (
     SlotHunks,
     SlotLenses,
     SlotOrder,
+    SlotSince,
     SlotWork,
     agent_runs,
     bound_slots,
@@ -608,6 +609,10 @@ class _Stored:
         slot = self.slot(number, slot_id)
         return None if slot is None else slot.lenses
 
+    def since(self, number: int, slot_id: str) -> datetime | None:
+        slot = self.slot(number, slot_id)
+        return None if slot is None or slot.since is None else parse_timestamp(slot.since)
+
 
 def required_slots(ledger: Ledger, round_: Round) -> tuple[Slot, ...]:
     """The slots `round_` requires: its stored plan, always, and none for a round without a plan.
@@ -695,7 +700,7 @@ def slots_missing(
         return {}
     seen = agent_runs(ledger) if runs is None else runs
     stored = _Stored(ledger)
-    work = slot_work(ledger, seen, stored.order, slot_hunks=stored.hunks)
+    work = slot_work(ledger, seen, stored.order, slot_hunks=stored.hunks, slot_since=stored.since)
     credit = credited_upto(ledger, round_.number, runs=seen, enforced=round_.enforced)
     digest_of = {ref.id: ref.digest for ref in round_.hunks}
     return {slot.id: _missing_hunks(round_, slot, credit, work, digest_of) for slot in round_.plan.slots}
@@ -711,14 +716,20 @@ def _missing_hunks(
     done = work.get((round_.number, slot.id))
     covered = done.digests if done is not None else frozenset()
     if slot.generation == 1:
+        # A slot's hunks are checked with ALL of its lenses, not only those each hunk requires: the stored slot
+        # does not record per hunk which lens put the hunk in it. That can only demand redundant work (a mixed
+        # slot whose hunk never required one of its lenses), never pass a slot wrongly.
         wanted = frozenset(slot.lenses) - {SWEEP}
         lacking = {hunk_id for hunk_id in slot.hunks if not wanted <= credit.get(digest_of[hunk_id], frozenset())}
         if SWEEP in slot.lenses:
             lacking.update(hunk_id for hunk_id in slot.hunks if digest_of[hunk_id] not in covered)
         return tuple(hunk_id for hunk_id in slot.hunks if hunk_id in lacking)
-    if slot_complete(round_, replace(slot, since=slot.since or round_.prepared_at), work):
+    since = slot.since or round_.prepared_at
+    if slot_complete(round_, replace(slot, since=since), work):
         return ()
-    return tuple(hunk_id for hunk_id in slot.hunks if digest_of[hunk_id] not in covered) or slot.hunks
+    threshold = parse_timestamp(since)
+    fresh = {digest for digest, moment in (done.last_at if done is not None else {}).items() if moment >= threshold}
+    return tuple(hunk_id for hunk_id in slot.hunks if digest_of[hunk_id] not in fresh) or slot.hunks
 
 
 # --- planning the waves ---------------------------------------------------------------------
@@ -1075,6 +1086,11 @@ def slot_hunks(ledger: Ledger) -> SlotHunks:
     return _Stored(ledger).hunks
 
 
+def slot_since(ledger: Ledger) -> SlotSince:
+    """`attribution`'s lookup of the `since` of a slot: the stored slots of every round."""
+    return _Stored(ledger).since
+
+
 def credited_upto(
     ledger: Ledger, upto: int, *, runs: Sequence[AgentRun] | None = None, enforced: bool = False
 ) -> dict[str, frozenset[str]]:
@@ -1098,6 +1114,7 @@ def credited_upto(
         stored.order,
         runs=agent_runs(ledger) if runs is None else runs,
         slot_hunks=stored.hunks,
+        slot_since=stored.since,
         enforced=enforced,
     )
 
@@ -1115,7 +1132,7 @@ def sweep_pending(ledger: Ledger) -> bool:
     forgives it, and partial sweeps of several rounds do not add up.
     """
     stored = _Stored(ledger)
-    work = slot_work(ledger, agent_runs(ledger), stored.order, slot_hunks=stored.hunks)
+    work = slot_work(ledger, agent_runs(ledger), stored.order, slot_hunks=stored.hunks, slot_since=stored.since)
     for round_ in reversed(ledger.rounds):
         sweep = next((slot for slot in round_.plan.slots if SWEEP in slot.lenses), None) if round_.plan else None
         if sweep is not None:

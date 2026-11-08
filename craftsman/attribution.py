@@ -27,7 +27,6 @@ from craftsman.records import (
     Coverage,
     Finding,
     Ledger,
-    Round,
     VerdictEvent,
     agent_role,
     craftsman_agent_name,
@@ -192,6 +191,7 @@ def vouching_runs(
 SlotLenses = Callable[[int, str], tuple[str, ...] | None]  # (round number, slot id) -> lenses, None if unknown
 SlotOrder = Callable[[int], Sequence[str]]  # round number -> the slot ids of its plan, in plan order
 SlotHunks = Callable[[int, str], frozenset[str] | None]  # (round number, slot id) -> hunk ids, None if unknown
+SlotSince = Callable[[int, str], datetime | None]  # (round number, slot id) -> the slot's `since`, None if it has none
 
 
 @dataclass(frozen=True)
@@ -215,14 +215,23 @@ class _Tagged:
 
 
 def _tagged_records(ledger: Ledger, runs: Sequence[AgentRun]) -> dict[int, list[_Tagged]]:
-    """The coverage records that name a slot and that a reviewer run vouches for, by round."""
+    """The coverage records that name a slot and that a reviewer run vouches for, by round.
+
+    Only a run that started since the round was prepared can vouch: an earlier one is a hunter of an earlier
+    round, still going when this one was prepared, and not the hunter of any slot of it.
+    """
     by_round: dict[int, list[_Tagged]] = defaultdict(list)
     for index, record in enumerate(ledger.coverage, 1):
         if record.hunter is None:
             continue
         token = f"C{index}"
         at = parse_timestamp(record.recorded_at)
-        vouchers = vouching_runs(runs, role="reviewer", token=token, recorded_at=at, by=record.by)
+        prepared = parse_timestamp(ledger.rounds[record.round - 1].prepared_at)
+        vouchers = tuple(
+            voucher
+            for voucher in vouching_runs(runs, role="reviewer", token=token, recorded_at=at, by=record.by)
+            if voucher.run.started >= prepared
+        )
         if vouchers:
             by_round[record.round].append(_Tagged(token, record, at, vouchers))
     return by_round
@@ -302,35 +311,43 @@ def _window_slots_kept(rank_order: Sequence[str], vouched_by: Mapping[str, set[s
 def _window_candidates(
     windowed: Sequence[tuple[_Tagged, tuple[Voucher, ...]]],
     exact: Sequence[tuple[_Tagged, tuple[Voucher, ...]]],
+    exact_covered: Mapping[str, frozenset[str]],
     digests_of: Mapping[str, frozenset[str]],
 ) -> list[tuple[_Tagged, tuple[Voucher, ...]]]:
     """The window-vouched records that may add to their slot: all for a slot no exact record holds, and for
-    a slot an exact hunter holds only those from a run that started after every exact holder stopped and
-    that cover a digest no exact record of the slot covers (the relaunch rule of `slot_work`)."""
-    released: dict[str, datetime] = {}
-    covered: dict[str, frozenset[str]] = {}
+    a slot an exact hunter holds only those from a run that is disjoint in time from every exact holder
+    (it ran before them or after them, never alongside) and that cover a digest `exact_covered` does not
+    (the relaunch rule of `slot_work`)."""
+    holders: dict[str, list[AgentRun]] = defaultdict(list)
     for item, vouchers in exact:
-        slot = item.record.hunter
-        assert slot is not None
-        covered[slot] = covered.get(slot, frozenset()) | digests_of[item.token]
-        for voucher in vouchers:
-            assert voucher.run.stopped is not None  # vouchers are finished runs
-            released[slot] = max(released.get(slot, voucher.run.stopped), voucher.run.stopped)
+        assert item.record.hunter is not None
+        holders[item.record.hunter].extend(voucher.run for voucher in vouchers)
     candidates: list[tuple[_Tagged, tuple[Voucher, ...]]] = []
     for item, vouchers in windowed:
         slot = item.record.hunter
         assert slot is not None
-        if slot not in released:
+        if slot not in holders:
             candidates.append((item, vouchers))
             continue
-        later = tuple(v for v in vouchers if v.run.started > released[slot])
-        if later and digests_of[item.token] - covered[slot]:
-            candidates.append((item, later))
+        apart = tuple(v for v in vouchers if all(_apart(v.run, holder) for holder in holders[slot]))
+        if apart and digests_of[item.token] - exact_covered.get(slot, frozenset()):
+            candidates.append((item, apart))
     return candidates
 
 
+def _apart(run: AgentRun, other: AgentRun) -> bool:
+    """Whether two finished runs did not overlap: one stopped strictly before the other started."""
+    assert run.stopped is not None and other.stopped is not None  # vouchers are finished runs
+    return other.stopped < run.started or run.stopped < other.started
+
+
 def slot_work(
-    ledger: Ledger, runs: Sequence[AgentRun], slot_order: SlotOrder, *, slot_hunks: SlotHunks | None = None
+    ledger: Ledger,
+    runs: Sequence[AgentRun],
+    slot_order: SlotOrder,
+    *,
+    slot_hunks: SlotHunks | None = None,
+    slot_since: SlotSince | None = None,
 ) -> dict[tuple[int, str], SlotWork]:
     """The acceptable work per (round, slot).
 
@@ -347,10 +364,12 @@ def slot_work(
       are credited with their exact records, plus one exception for a relaunch: when the exact hunter
       died with the slot half done, a replacement whose transcript cannot be read must still be able
       to finish it. A window record tagged with such a slot therefore adds the digests no exact record
-      of the slot covers, but only when the window run started after every exact holder of the slot
-      stopped. A record inside the window of a run that was going on concurrently with the exact
-      holder comes from an agent nobody can name and adds nothing. These top-ups take part in the
-      one-to-one matching to window runs like any other window slot.
+      of the slot covers, but only when the window run is apart in time from every exact holder of the
+      slot (it ran before or after them, in whatever order the relaunches came; a run that overlaps one
+      comes from an agent nobody can name and adds nothing). For a slot with a `since` (`slot_since`),
+      exact coverage recorded before it does not count as covered, so a relaunch that covers the digest
+      again after the trigger still completes the slot. These top-ups take part in the one-to-one
+      matching to window runs like any other window slot.
 
     With `slot_hunks`, a record counts only for the hunks that belong to its slot: its digests are
     cut to those of the slot's hunks, and a record left with none adds nothing. A slot `slot_hunks`
@@ -389,8 +408,10 @@ def slot_work(
         exact_covered: dict[str, frozenset[str]] = {}
         for item, _ in accepted:
             assert item.record.hunter is not None
-            exact_covered[item.record.hunter] = exact_covered.get(item.record.hunter, frozenset()) | digests_of[item.token]
-        window_candidates = _window_candidates(windowed, accepted, digests_of)
+            since = None if slot_since is None else slot_since(number, item.record.hunter)
+            if since is None or item.at >= since:
+                exact_covered[item.record.hunter] = exact_covered.get(item.record.hunter, frozenset()) | digests_of[item.token]
+        window_candidates = _window_candidates(windowed, accepted, exact_covered, digests_of)
         vouched_by: dict[str, set[str]] = defaultdict(set)
         for item, vouchers in window_candidates:
             assert item.record.hunter is not None
@@ -468,6 +489,12 @@ def finding_slots(
     return frozenset(slot for slot in slots if slot is not None)
 
 
+# What untagged coverage of a round without a hunt plan (or of an advisory one) can credit an enforced round
+# with when a reviewer run vouches for it: the normal-depth lenses (`huntplan.CORE_LENSES` and
+# `SIMPLICITY_LENSES`, which `tests/test_attribution.py` keeps equal), never a conditional lens or the sweep.
+LEGACY_CREDIT_LENSES = frozenset(("intent", "contracts", "failure", "ripple", "tests", "craft", "design"))
+
+
 def credited_lenses(
     ledger: Ledger,
     upto: int,
@@ -476,46 +503,55 @@ def credited_lenses(
     *,
     runs: Sequence[AgentRun] | None = None,
     slot_hunks: SlotHunks | None = None,
+    slot_since: SlotSince | None = None,
     enforced: bool = False,
 ) -> dict[str, frozenset[str]]:
     """Per hunk digest, the lenses that acceptable coverage of rounds up to `upto` has examined it with.
 
     A slot's coverage credits that slot's lenses (`slot_lenses` returns None for a slot it does not
     know, which credits nothing). Coverage from before the latest round that reopened a digest does
-    not count for it, as in `ledger.covered_digests`. Coverage of a round without a hunt plan (5.0) and
-    unvouched coverage of an advisory round credit every lens, tagged with a slot or not: nothing vouches
-    for a hunter there, so the 5.0 rules apply. When the work is judged for an `enforced` round, or the
-    covered round was itself enforced, unvouched coverage of a planned round credits nothing: only a
-    slot's hunter may credit there, so neither an orchestrator that covers hunks itself nor a
-    self-review of an earlier advisory round pays for the hunt an enforced round owes. With `slot_hunks`,
-    a slot credits only the hunks it owns (see `slot_work`).
+    not count for it, as in `ledger.covered_digests`. Coverage of a round that is not held to a hunt (no plan,
+    or advisory), tagged or not, credits by the 5.0 rules: every lens, vouched or not, as nothing there
+    asks for a hunter. Judged for an `enforced` round that is too generous: a self-review of an earlier
+    advisory or legacy round must not pay for a hunt the enforced round owes. So then
+    - untagged coverage credits only when a finished reviewer run vouches for it (by any means), and then
+      only `LEGACY_CREDIT_LENSES`;
+    - tagged coverage credits through its slot only (`slot_work`).
+    Coverage of a round that is itself enforced and planned credits through its slots only, always.
+    With `slot_hunks`, a slot credits only the hunks it owns; with `slot_since`, see `slot_work`.
     """
     reopened = reopened_in(ledger, upto)
     credit: dict[str, set[str]] = defaultdict(set)
     seen_runs = agent_runs(ledger) if runs is None else runs
-    for (number, slot), work in slot_work(ledger, seen_runs, slot_order, slot_hunks=slot_hunks).items():
+    work = slot_work(ledger, seen_runs, slot_order, slot_hunks=slot_hunks, slot_since=slot_since)
+    for (number, slot), done in work.items():
         lenses = slot_lenses(number, slot)
         if number > upto or lenses is None:
             continue
-        for digest in work.digests:
+        for digest in done.digests:
             if number >= reopened.get(digest, 1):
                 credit[digest].update(lenses)
-    for record in ledger.coverage:
-        if record.round > upto or _unvouched_counts_for_nothing(ledger.rounds[record.round - 1], enforced):
+    for index, record in enumerate(ledger.coverage, 1):
+        if record.round > upto:
             continue
+        covered = ledger.rounds[record.round - 1]
+        if covered.plan is not None and covered.enforced:
+            continue  # the hooks hold this round to its hunters: only `slot_work` credits there
+        credits: frozenset[str] = LENS_IDS
+        if enforced:
+            if record.hunter is not None or not vouching_runs(
+                seen_runs,
+                role="reviewer",
+                token=f"C{index}",
+                recorded_at=parse_timestamp(record.recorded_at),
+                by=record.by,
+            ):
+                continue
+            credits = LEGACY_CREDIT_LENSES
         for digest in record.digests:
             if record.round >= reopened.get(digest, 1):
-                credit[digest].update(LENS_IDS)
+                credit[digest].update(credits)
     return {digest: frozenset(lenses) for digest, lenses in credit.items()}
-
-
-def _unvouched_counts_for_nothing(covered: Round, enforced: bool) -> bool:
-    """Whether coverage of `covered` that no hunter run vouches for credits nothing.
-
-    True for a round with a hunt plan that the hooks hold to it (`Round.enforced`), and for any round with
-    a plan when the credit is wanted for an enforced round. A round without a plan is a 5.0 round.
-    """
-    return covered.plan is not None and (covered.enforced or enforced)
 
 
 # --- verdicts -------------------------------------------------------------------------------

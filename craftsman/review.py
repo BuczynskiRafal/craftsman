@@ -771,7 +771,11 @@ def _print_prepare_summary(
 
 
 def _print_hunt_plan(result: _Prepared, now: datetime, *, check: str) -> None:
-    """The plan table and what to do next. A re-prepared round shows where each slot stands."""
+    """The plan table and what to do next. A re-prepared round shows where each slot stands.
+
+    An advisory round is judged by its hunk coverage, so its plan is a suggestion: once every hunk is covered
+    nothing is left to launch, whatever state its slots are in.
+    """
     round_ = result.round
     statuses = slot_statuses(result.ledger, round_, now)
     print(f"Hunt plan, round {round_.number}:")
@@ -779,10 +783,16 @@ def _print_hunt_plan(result: _Prepared, now: datetime, *, check: str) -> None:
         print("  (no slot: every hunk is carried over from earlier rounds)")
         print(f"Nothing is owed. Run `{check}`.")
         return
-    for line in huntview.plan_lines(statuses, with_state=not result.created):
+    covered = not round_.enforced and not result.created and not uncovered_hunks(result.ledger, round_)
+    for line in huntview.plan_lines(statuses, with_state=not result.created and not covered):
         print(line)
+    if not round_.enforced:
+        print("This plan is a suggestion: an advisory review is complete when every hunk is covered.")
     if result.added_slots:
         print(f"New slots since the last prepare: {', '.join(result.added_slots)}")
+    if covered:
+        print(f"Every hunk is covered. Run `{check}`.")
+        return
     todo = [status.slot.id for status in statuses if status.state in ("unlaunched", "dead")]
     running = [status.slot.id for status in statuses if status.state == "running"]
     if running:
@@ -1180,11 +1190,13 @@ def _cover_one(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, str]:
         round_ = require_current_round(current, snap)
+        current = _store_due_waves(current)  # a wave slot of the displays can be named at once
         raw = args.files if args.files is not None else args.hunks
         targets = _cover_targets(round_, target_kind, raw, files_of(round_))
-        return _record_coverage(
+        updated, message = _record_coverage(
             current, round_, targets, args.note, target_kind=target_kind, hunter=args.hunter, by=by
         )
+        return _store_due_waves(updated), message
 
     return _run_single(ws, bool(args.check), record, print)
 
@@ -1292,10 +1304,10 @@ def _cover_from_json(args: argparse.Namespace) -> int:
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[str]]:
         round_ = require_current_round(current, snap)
-        return _record_entries(
+        updated, messages = _record_entries(
             "cover",
             raw_entries,
-            current,
+            _store_due_waves(current),
             lambda _index, raw: _cover_entry_label(raw),
             lambda _index, state, raw: _cover_one_from_json(
                 state,
@@ -1305,6 +1317,7 @@ def _cover_from_json(args: argparse.Namespace) -> int:
                 by,
             ),
         )
+        return _store_due_waves(updated), messages
 
     return _run_batch(ws, args, record_batch, print)
 
@@ -1458,8 +1471,9 @@ def _add_one(args: argparse.Namespace) -> int:
 
     def record(current: Ledger) -> tuple[Ledger, Finding]:
         round_ = require_current_round(current, snap)
+        current = _store_due_waves(current)  # a wave slot of the displays can be named at once
         hunter = _finding_hunter(current, round_, args.hunter)
-        return add_finding(
+        updated, finding = add_finding(
             current,
             lens=args.lens,
             path=path,
@@ -1471,6 +1485,7 @@ def _add_one(args: argparse.Namespace) -> int:
             hunter=hunter,
             by=by,
         )
+        return _store_due_waves(updated), finding
 
     return _run_single(ws, bool(args.check), record, lambda finding: _print_recorded(finding, lines))
 
@@ -1489,13 +1504,14 @@ def _add_from_json(args: argparse.Namespace) -> int:
     def record_batch(current: Ledger) -> tuple[Ledger, list[tuple[Finding, list[str] | None]]]:
         require_current_round(current, snap)
         base_number = int(next_finding_id(current)[1:])
-        return _record_entries(
+        updated, recorded = _record_entries(
             "add",
             raw_entries,
-            current,
+            _store_due_waves(current),
             lambda index, _raw: f"F{base_number + index - 1}",
             lambda _index, state, raw: _add_one_from_json(ws, cwd, snap, state, raw, by),
         )
+        return _store_due_waves(updated), recorded
 
     return _run_batch(ws, args, record_batch, lambda pair: _print_recorded(pair[0], pair[1]))
 
@@ -1668,12 +1684,12 @@ def _verdict_one(args: argparse.Namespace) -> int:
     _require_flags(args, {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence})
     ws = open_workspace(args.cwd)
     by = caller_identity(os.environ)
-    return _run_single(
-        ws,
-        bool(args.check),
-        lambda current: set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run, by=by),
-        _print_verdict,
-    )
+
+    def record(current: Ledger) -> tuple[Ledger, Finding]:
+        updated, finding = set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run, by=by)
+        return _store_due_waves(updated), finding  # the verdict may be the one that calls for a wave
+
+    return _run_single(ws, bool(args.check), record, _print_verdict)
 
 
 def _verdict_one_from_json(state: Ledger, raw: Any, by: str | None) -> tuple[Ledger, Finding]:
@@ -1701,13 +1717,14 @@ def _verdict_from_json(args: argparse.Namespace) -> int:
     by = caller_identity(os.environ)
 
     def record_batch(current: Ledger) -> tuple[Ledger, list[Finding]]:
-        return _record_entries(
+        updated, findings = _record_entries(
             "verdict",
             raw_entries,
             current,
             lambda _index, raw: _entry_label(raw, "id"),
             lambda _index, state, raw: _verdict_one_from_json(state, raw, by),
         )
+        return _store_due_waves(updated), findings
 
     return _run_batch(ws, args, record_batch, _print_verdict)
 
@@ -1761,7 +1778,7 @@ def _show(args: argparse.Namespace) -> int:
         payload = {
             "round": _round_json(latest, snap) if latest else None,
             "coverage": _coverage_json(ledger, latest, slots) if latest else {},
-            "hunks": _hunks_json(ws.root, latest, snap) if latest else [],
+            "hunks": _hunks_json(ws.root, latest, snap, _not_covered(ledger, slots)) if latest else [],
             **({} if slots is None else {"slots": _slots_json(slots)}),
             "findings": [finding.to_json() for finding in ledger.findings],
             "runs": [run.to_json() for run in ledger.runs[-SHOW_RECENT_RUNS:]],
@@ -1822,7 +1839,10 @@ def _hunk_span(new_start: int, new_len: int, old_start: int = 0, old_len: int = 
 def _hunks_json(
     root: Path, round_: Round, snap: DiffSnapshot, missing: Sequence[str] | None = None
 ) -> list[dict[str, Any]]:
-    """The round's hunks; for a current round each says whether it is `covered` (when `missing` is given)."""
+    """The round's hunks; for a current round each says whether it is `covered` (when `missing` is given).
+
+    A current round lists its open hunks, and with `missing` also the carried hunks that are in it (`"carried": true`).
+    """
     if round_.fingerprint != snap.fingerprint:
         return [
             {
@@ -1839,7 +1859,9 @@ def _hunks_json(
     by_id = {hunk.id: hunk for hunk in snap.hunks}
     items: list[dict[str, Any]] = []
     for ref in round_.hunks:
-        if ref.carried or (hunk := by_id.get(ref.id)) is None:
+        # A carried hunk is listed only when a slot still misses it (a carried sweep or wave slot lists it), so
+        # that `hunks` and `slots` never disagree about what is left.
+        if (ref.carried and (missing is None or ref.id not in missing)) or (hunk := by_id.get(ref.id)) is None:
             continue
         scope = index.hunk_scope(hunk)
         start, end = _hunk_span(hunk.new_start, hunk.new_len, hunk.old_start, hunk.old_len)
@@ -1851,7 +1873,7 @@ def _hunks_json(
                 "new_len": ref.new_len,
                 "start_line": start,
                 "end_line": end,
-                "carried": False,
+                "carried": ref.carried,
                 "status": hunk.status,
                 "scope": scope.name if scope is not None and scope.kind != "block" else None,
                 **({} if missing is None else {"covered": ref.id not in missing}),
@@ -1876,18 +1898,19 @@ def _hunk_map_lines(
     """
     entries = _hunks_json(root, round_, snap)
     if round_.fingerprint != snap.fingerprint:
+        # What the stale round recorded, not what is covered now: nothing here says "open".
         lines = [
             f"{e['id']}  {_format_span(e['path'], e['new_start'], e['end_line'], e['new_len'] > 0)}  "
-            f"[{'carried' if e['carried'] else 'open'}]"
+            f"[{'carried' if e['carried'] else f'round {round_.number}'}]"
             for e in entries
         ]
-        lines.append("stale: run `craftsman review prepare`")
+        lines.append(huntview.STALE_NOTE)
         return lines
     by_id = {e["id"]: e for e in entries}
 
     def hunk_line(hunk_id: str) -> str:
         entry = by_id.get(hunk_id)
-        if entry is None:  # a carried hunk that a slot lists: the round keeps no scope for it
+        if entry is None or entry["carried"]:  # a carried hunk that a slot lists: shown as the round recorded it
             ref = next(ref for ref in round_.hunks if ref.id == hunk_id)
             end = ref.new_start + ref.new_len - 1 if ref.new_len > 0 else ref.new_start
             return f"{hunk_id}  {_format_span(ref.path, ref.new_start, end, ref.new_len > 0)}  [carried]"
@@ -2054,15 +2077,22 @@ def _evaluate(
     return ledger, snap, deep, evaluate(ledger, snap, policy, review_only=review_only)
 
 
+def _store_due_waves(ledger: Ledger, now: datetime | None = None) -> Ledger:
+    """`ledger` with the waves that are due stored in the plan of its latest round; the same object when none is."""
+    if not ledger.rounds or ledger.rounds[-1].plan is None:
+        return ledger
+    return huntplan.plan_due_waves(ledger, datetime.now(timezone.utc) if now is None else now)
+
+
 def _with_due_waves(ws: Workspace) -> Ledger:
     """The ledger with the waves that are due stored in the plan of its latest round (under the lock, only if any are)."""
     now = datetime.now(timezone.utc)
     ledger = load(ws.ledger_path)
-    if huntplan.plan_due_waves(ledger, now) is ledger:
+    if _store_due_waves(ledger, now) is ledger:
         return ledger  # the usual case: take no lock
 
     def plan(current: Ledger) -> tuple[Ledger, Ledger]:
-        planned = huntplan.plan_due_waves(current, now)
+        planned = _store_due_waves(current, now)
         return planned, planned
 
     return mutate(ws.ledger_path, plan)
@@ -2194,15 +2224,20 @@ def _end_guard_of_caller(ws: Workspace, env: Mapping[str, str]) -> None:
 
 
 def _require_hunters_launched(ws: Workspace, ledger: Ledger) -> None:
-    """A partial report of an enforced round needs at least one hunter launched in it (a claim or a start/stop).
+    """A partial report needs a round, and one that is enforced needs at least one hunter launched in it (a claim or a start/stop).
 
-    Otherwise nothing was reviewed independently and `--partial` would only be a way out of the review.
+    Without a round nothing was prepared, let alone reviewed. Otherwise nothing was reviewed independently and
+    `--partial` would only be a way out of the review.
 
     A bare claim counts although the orchestrator could fetch a brief itself: a session whose hooks recorded
     no start event must not be trapped, and the Phase F PreToolUse hook denies `brief` to the main session.
     """
     latest = ledger.rounds[-1] if ledger.rounds else None
-    if latest is None or not latest.enforced or latest.plan is None:
+    if latest is None:
+        raise CommandRefused(
+            "No review round yet: run `craftsman review prepare` and launch the hunters it lists."
+        )
+    if not latest.enforced or latest.plan is None:
         return
     prepared = parse_timestamp(latest.prepared_at)
     if any(claim.round == latest.number for claim in ledger.claims) or any(
@@ -2293,7 +2328,16 @@ def _not_covered_lines(
 def _hunt_report_lines(report: GateReport) -> list[str]:
     if not report.slots:
         return []
-    return ["", "## Hunt", hunt_line(report.slots), "```", *huntview.plan_lines(report.slots, with_state=True), "```"]
+    stale = [huntview.STALE_NOTE] if any(issue.code == "stale-round" for issue in report.issues) else []
+    return [
+        "",
+        "## Hunt",
+        hunt_line(report.slots),
+        *stale,
+        "```",
+        *huntview.plan_lines(report.slots, with_state=True),
+        "```",
+    ]
 
 
 def _report_finding_lines(ledger: Ledger, groups: dict[str, list[Finding]]) -> list[str]:

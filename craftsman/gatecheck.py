@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -214,7 +215,7 @@ def evaluate(
     moment = _utc(now)
     latest, runs, state = _judged_hunt(ledger, moment)
     slots = state.statuses if state is not None else ()
-    if latest is not None and state is not None and latest.enforced:
+    if latest is not None and state is not None:
         round_issues = _round_issues(ledger, snap)
         hunt, waves = _hunt_issues(ledger, latest, state, stale=bool(round_issues))
         issues = (
@@ -259,12 +260,13 @@ def _judged_hunt(
 
     The one place that decides which slots a round has: for an enforced round with a plan the waves that are
     due are planned in memory (`evaluate` never writes), so the slots of a wave that is not stored yet count.
-    The state is None for a round without a plan.
+    The state is None for a round that is not judged by slots: one without a plan, and an advisory one, whose
+    completion is its hunk coverage (its plan is a suggestion, so no display may list slot states for it).
     """
     latest = ledger.rounds[-1] if ledger.rounds else None
-    if latest is None or latest.plan is None:
+    if latest is None or latest.plan is None or not latest.enforced:
         return latest, (), None
-    planned = plan_due_waves(ledger, moment) if latest.enforced else ledger
+    planned = plan_due_waves(ledger, moment)
     latest = planned.rounds[-1]
     runs = agent_runs(ledger)
     return latest, runs, _hunt_state(planned, latest, moment, runs)
@@ -282,7 +284,7 @@ def hunt_slots(ledger: Ledger, now: datetime | None = None) -> tuple[SlotStatus,
     if latest is None or latest.plan is None or not latest.enforced:
         return None
     state = _judged_hunt(ledger, _utc(now))[2]
-    assert state is not None  # the round has a plan
+    assert state is not None  # the round is enforced and has a plan
     return state.statuses
 
 
@@ -392,7 +394,7 @@ def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[Age
     if not slots:
         return _HuntState(now, ())
     missing = slots_missing(ledger, round_, runs=runs)
-    signs = _hunter_signs(ledger, round_, runs, now)
+    signs = _hunter_signs(ledger, round_, runs, now, done={slot_id for slot_id, lacking in missing.items() if not lacking})
     statuses: list[SlotStatus] = []
     for slot in slots:
         lacking = missing[slot.id]
@@ -416,46 +418,72 @@ class _HunterSigns:
     starting: int
 
 
-def _hunter_signs(ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: datetime) -> _HunterSigns:
+def _hunter_signs(
+    ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: datetime, *, done: AbstractSet[str] = frozenset()
+) -> _HunterSigns:
     """What the hooks' runs show about the hunters of `round_`.
 
     Only a run the hooks recorded can show that someone is working: a claim alone is not enough, since
-    the orchestrator may have fetched the brief itself. A claim that a finished run vouches for by its
-    transcript (or by identity) belongs to that run, which ended. Any other claim is explained by one run
+    the orchestrator may have fetched the brief itself. A run that started before the round was prepared
+    belongs to an earlier round and backs no claim of this one. A claim that a finished run vouches for by
+    its transcript (or by identity) belongs to that run, which ended. Any other claim is explained by a run
     of its own: a finished run that vouches for it by time (a hunter whose transcript could not be read),
-    or an open reviewer run that may be its hunter (`_open_backers`). A run explains at most one claim,
-    so a hunter that is going on cannot stand in for one that has stopped, nor an unrelated open run for
-    several claims; finished runs are preferred, which at worst has the slot launched again. Coverage
-    tagged with a slot that a finished run vouches for shows that hunter ended too. An open run counts as
-    going on for `RUN_STALE_AFTER`; after that it is taken for dead, and its slot ended when that time
-    ran out.
+    or, per slot, ONE open reviewer run that may be its hunter (`_open_backers`); a hunter that fetched its
+    brief twice is still one hunter. A run explains at most one claim or slot, so a hunter that is going on
+    cannot stand in for one that has stopped, nor an unrelated open run for several; finished runs are
+    preferred, which at worst has the slot launched again, and open runs that are still going are preferred
+    to ones that are not. Claims of slots in `done` take no run from the slots still waiting: they are no
+    longer waiting for a hunter. Only after those are matched does an open run that may be the hunter of
+    a done slot nobody finished (one slot, one run) stop counting as starting. Coverage tagged with a slot that a finished run vouches for shows that hunter
+    ended too. An open run counts as going on for `RUN_STALE_AFTER`; after that it is taken for dead, and
+    its slot ended when that time ran out.
     """
     prepared = parse_timestamp(round_.prepared_at)
     running: dict[str, list[datetime]] = defaultdict(list)
     ended: dict[str, list[datetime]] = defaultdict(list)
     undecided: list[tuple[SlotClaim, list[int]]] = []
+    done_claims: dict[str, list[SlotClaim]] = defaultdict(list)  # slot in `done` -> its claims no finished run explains
+    finished_done: set[str] = set()  # slots in `done` whose hunter a finished run accounts for
     for claim in ledger.claims:
         if claim.round != round_.number:
             continue
-        finished = vouching_runs(
-            runs, role="reviewer", token=claim.token, recorded_at=parse_timestamp(claim.at), by=claim.by
+        finished = tuple(
+            voucher
+            for voucher in vouching_runs(
+                runs, role="reviewer", token=claim.token, recorded_at=parse_timestamp(claim.at), by=claim.by
+            )
+            if voucher.run.started >= prepared
         )
+        if claim.slot in done:
+            if finished:
+                finished_done.add(claim.slot)
+            else:
+                done_claims[claim.slot].append(claim)
+            continue
         if any(voucher.exact for voucher in finished):
             ended[claim.slot].extend(_stopped(voucher.run) for voucher in finished)
         else:
-            options = [voucher.index for voucher in finished] + _open_backers(runs, claim, prepared)
-            undecided.append((claim, options))
+            undecided.append((claim, [voucher.index for voucher in finished]))
     explained = _one_each([options for _, options in undecided])
+    accounted: set[int] = set()
+    waiting: dict[str, list[SlotClaim]] = defaultdict(list)  # slot -> its claims no finished run explains
     for (claim, _), index in zip(undecided, explained, strict=True):
         if index is None:
+            waiting[claim.slot].append(claim)
             continue
+        accounted.add(index)
+        ended[claim.slot].append(_stopped(runs[index]))
+    slot_ids = list(waiting)
+    backed = _one_each([_open_backers(runs, waiting[slot_id], prepared, now) for slot_id in slot_ids])
+    for slot_id, index in zip(slot_ids, backed, strict=True):
+        if index is None:
+            continue
+        accounted.add(index)
         run = runs[index]
-        if run.stopped is not None:
-            ended[claim.slot].append(run.stopped)
-        elif _is_going(run, now):
-            running[claim.slot].append(run.started)
+        if _is_going(run, now):
+            running[slot_id].append(run.started)
         else:
-            ended[claim.slot].append(run.started + RUN_STALE_AFTER)
+            ended[slot_id].append(run.started + RUN_STALE_AFTER)
     for number, record in enumerate(ledger.coverage, 1):
         if record.round == round_.number and record.hunter is not None:
             recorded = vouching_runs(
@@ -465,12 +493,20 @@ def _hunter_signs(ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: 
                 recorded_at=parse_timestamp(record.recorded_at),
                 by=record.by,
             )
-            ended[record.hunter].extend(_stopped(voucher.run) for voucher in recorded)
-    accounted = {index for index in explained if index is not None}
+            ended[record.hunter].extend(_stopped(voucher.run) for voucher in recorded if voucher.run.started >= prepared)
+    # A slot can be done (credited from another slot's coverage) while its own hunter is still going on: that
+    # open run is the hunter of the slot, not one that is still starting.
+    done_slots = [slot_id for slot_id in done_claims if slot_id not in finished_done]
+    free = [
+        [index for index in _open_backers(runs, done_claims[slot_id], prepared, now) if index not in accounted]
+        for slot_id in done_slots
+    ]
+    done_backers = {index for index in _one_each(free) if index is not None}
     starting = sum(
         1
         for index, run in enumerate(runs)
         if index not in accounted
+        and index not in done_backers
         and run.role == "reviewer"
         and run.platform not in IDENTITY_PLATFORMS
         and run.started >= prepared
@@ -484,27 +520,37 @@ def _is_going(run: AgentRun, now: datetime) -> bool:
     return run.stopped is None and now - run.started < RUN_STALE_AFTER
 
 
-def _open_backers(runs: Sequence[AgentRun], claim: SlotClaim, prepared: datetime) -> list[int]:
-    """The indexes of the reviewer runs that have started and not stopped and that may be the hunter of `claim`.
+def _open_backers(
+    runs: Sequence[AgentRun], claims: Sequence[SlotClaim], prepared: datetime, now: datetime
+) -> list[int]:
+    """The indexes of the open reviewer runs that may be the hunter of one of `claims` (all of one slot), best first.
 
-    By identity when the claim names its caller (Antigravity: the run of that conversation). Without
-    one, any open run that started after the round was prepared and before the claim was made: the
-    hunter calls `brief` after it starts. A platform whose honest claims name the caller never matches
-    by time.
+    Only a run that started since the round was prepared can be: an earlier one belongs to an earlier round.
+    By identity when a claim names its caller (Antigravity: the run of that conversation). Without one,
+    any open run that started before the claim was made (the hunter calls `brief` after it starts) and was
+    not stale by then: a run that had gone `RUN_STALE_AFTER` without a brief was taken for dead already,
+    so it cannot be the hunter that a later relaunch stands for. A platform whose honest claims name
+    the caller never matches by time. Runs that are still going come before the ones that are not, the
+    older start first.
     """
-    caller = identity(claim.by)
-    claimed_at = parse_timestamp(claim.at)
-    backers: list[int] = []
-    for index, run in enumerate(runs):
-        if run.role != "reviewer" or run.stopped is not None:
-            continue
-        if caller is not None:
-            matches = (run.platform, run.agent_id) == caller
-        else:
-            matches = run.platform not in IDENTITY_PLATFORMS and prepared <= run.started <= claimed_at
-        if matches:
-            backers.append(index)
-    return backers
+    backers: set[int] = set()
+    for claim in claims:
+        caller = identity(claim.by)
+        claimed_at = parse_timestamp(claim.at)
+        for index, run in enumerate(runs):
+            if run.role != "reviewer" or run.stopped is not None or run.started < prepared:
+                continue
+            if caller is not None:
+                matches = (run.platform, run.agent_id) == caller
+            else:
+                matches = (
+                    run.platform not in IDENTITY_PLATFORMS
+                    and run.started <= claimed_at
+                    and claimed_at - run.started < RUN_STALE_AFTER
+                )
+            if matches:
+                backers.add(index)
+    return sorted(backers, key=lambda index: (not _is_going(runs[index], now), runs[index].started, index))
 
 
 def _one_each(options: Sequence[Sequence[int]]) -> list[int | None]:
@@ -605,7 +651,7 @@ def _pending_message(
     """The text of a `hunt-pending` or `wave-pending` issue.
 
     A non-zero `starting` is the number of hunters that were just launched and have not fetched a brief
-    yet: the caller is told to wait for them instead of launching more. `stale` is a round whose code
+    yet: for slots nobody works on the caller is told to wait for them instead of launching more. `stale` is a round whose code
     changed: nothing is launched for it.
     """
     running = [status for status in pending if status.state == "running"]
@@ -619,10 +665,12 @@ def _pending_message(
         parts.append(
             f"Running: {_slot_ids(running)} - do not launch these again; end your turn and wait for their reports."
         )
-    if starting:
-        parts.append(_starting_text(starting))
-    else:
-        parts.extend(_launch_text(unlaunched, dead))
+    if unlaunched or dead:
+        # Hunters just launched may be the ones these slots wait for; say so only where there is something to launch.
+        if starting:
+            parts.append(_starting_text(starting))
+        else:
+            parts.extend(_launch_text(unlaunched, dead))
     return " ".join(parts)
 
 
@@ -1168,11 +1216,19 @@ def _summary(ledger: Ledger, snap: DiffSnapshot, *, slots: Sequence[SlotStatus] 
         coverage_line = "Coverage: n/a."
     else:
         latest = ledger.rounds[-1]
-        freshness = "current" if latest.fingerprint == snap.fingerprint else "stale"
-        round_line = (
-            f"Round {latest.number} ({'deep, ' if latest.deep else ''}{freshness}): "
-            f"{len(latest.hunks)} hunks in {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines."
-        )
+        current = latest.fingerprint == snap.fingerprint
+        kind = f"{'deep, ' if latest.deep else ''}{'current' if current else 'stale'}"
+        if current:
+            round_line = (
+                f"Round {latest.number} ({kind}): "
+                f"{len(latest.hunks)} hunks in {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines."
+            )
+        else:  # the hunks are the round's own, so the files must be too; the diff now is another snapshot
+            round_files = len({ref.path for ref in latest.hunks})
+            round_line = (
+                f"Round {latest.number} ({kind}): {len(latest.hunks)} hunks in {round_files} files as prepared; "
+                f"the diff now has {len(snap.files)} files, +{snap.added}/-{snap.deleted} lines."
+            )
         coverage_line = _coverage_summary(ledger, latest) if slots is None else _slot_summary(latest, slots)
     return "\n".join((round_line, coverage_line, _findings_summary(ledger), _runs_summary(ledger, snap)))
 

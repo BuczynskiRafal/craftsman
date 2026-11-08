@@ -18,6 +18,7 @@ LAUNCH_MECHANICS = (
     "Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.",
 )
 CHECK_COMMAND = "craftsman review check"
+STALE_NOTE = "stale: run `craftsman review prepare`"  # the latest round no longer matches the diff
 REVIEW_ONLY_CHECK_COMMAND = "craftsman review check --review-only"
 PLATFORM_LABELS = {
     "claude": "Claude Code",
