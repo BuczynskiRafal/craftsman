@@ -310,9 +310,18 @@ def slice_hunks(hunks: Sequence[Hunk], *, reverse: bool = False) -> tuple[tuple[
 # --- building the plan ----------------------------------------------------------------------
 
 
-def _complement(hunk_ids: frozenset[str], generation_one: Sequence[Slot]) -> tuple[str, ...]:
-    """The bug lenses that no generation 1 slot over `hunk_ids` used, else the default fresh lenses."""
+def _complement(
+    hunk_ids: frozenset[str], generation_one: Sequence[Slot], examined: Mapping[str, frozenset[str]]
+) -> tuple[str, ...]:
+    """The bug lenses nothing has used on `hunk_ids` yet, else the default fresh lenses.
+
+    Used, for every hunk of the set: the lenses of the generation 1 slots of the round that list it, and
+    the lenses accepted coverage has credited to it (`examined`, hunk id -> lenses; earlier rounds
+    included, so a carried hunk is not looked at with the lenses it already got). The sweep is not a
+    bug lens, so it is never in the way.
+    """
     used = {lens for slot in generation_one if hunk_ids & set(slot.hunks) for lens in slot.lenses}
+    used.update(lens for hunk_id in hunk_ids for lens in examined.get(hunk_id, ()))
     missing = tuple(lens for lens in BUG_LENSES if lens not in used)[:MAX_FRESH_LENSES]
     return missing or FRESH_DEFAULT_LENSES
 
@@ -323,14 +332,17 @@ def _fresh_set(
     trigger: str,
     since: str | None,
     lenses_for: Callable[[int, frozenset[str]], tuple[str, ...]],
+    *,
+    first: int = 1,
 ) -> list[Slot]:
     """The fresh slots `W<generation>-X<j>`: the same packing as the plan, walked from the other end.
 
     With a single slice the partition equals the original one; the value is a hunter without the
-    first hunters' anchoring. `lenses_for(j, hunk ids)` names the lenses of slot j.
+    first hunters' anchoring. `lenses_for(j, hunk ids)` names the lenses of slot j; numbering starts at
+    `first` (a top-up continues after the slots a set already has).
     """
     slots: list[Slot] = []
-    for j, part in enumerate(_slices(units, reverse=True), 1):
+    for j, part in enumerate(_slices(units, reverse=True), first):
         ids = tuple(unit.id for unit in part)
         slots.append(
             Slot(
@@ -364,6 +376,7 @@ def build_plan(
     pending_wave_slots: Sequence[Slot] = (),
     round_hunks: Sequence[Hunk] | None = None,
     carry_sweep: bool = False,
+    credited: Mapping[str, frozenset[str]] | None = None,
 ) -> HuntPlan:
     """The hunt plan of a round, or `existing` extended with what is newly owed (append-only).
 
@@ -372,7 +385,11 @@ def build_plan(
     again; new generation 1 slots continue the numbering. `pending_wave_slots` are wave slots an earlier
     round left unfinished (see `pending_wave_slots`). `round_hunks` are all hunks of the round, carried
     ones included (default: `open_hunks`), and `carry_sweep` demands a sweep over all of them because an
-    earlier round left its sweep unfinished.
+    earlier round left its sweep unfinished. `credited` (hunk digest -> lenses, as `credited(ledger)`)
+    lets the static fresh set complement what each hunk has been examined with already.
+
+    Everything `existing` holds is kept, its `Wave` records included: a plan never forgets a wave
+    decision, so re-preparing a round never re-plans a finding a wave considered.
     """
     kept = existing.slots if existing is not None else ()
     assigned: dict[str, set[str]] = defaultdict(set)
@@ -396,15 +413,17 @@ def build_plan(
     holds_fresh = any(slot.id.startswith("W2-X") for slot in (*kept, *pending))
     if depth.deep and first_deep_round and not holds_fresh:
         generation_one = [slot for slot in (*kept, *new) if slot.generation == 1]
+        examined = {hunk.id: (credited or {}).get(hunk.digest, frozenset()) for hunk in scope}
         fresh = _fresh_set(
             [unit for unit in _units(scope) if not unit.docs],
             2,
             "deep",
             None,
-            lambda _, ids: _complement(ids, generation_one),
+            lambda _, ids: _complement(ids, generation_one, examined),
         )
     reasons = tuple(dict.fromkeys((*(existing.reasons if existing is not None else ()), *depth.reasons)))
-    return HuntPlan(reasons=reasons, slots=(*kept, *new, *fresh, *pending))
+    waves = existing.waves if existing is not None else ()
+    return HuntPlan(reasons=reasons, slots=(*kept, *new, *fresh, *pending), waves=waves)
 
 
 def _generation_one(
@@ -754,6 +773,14 @@ class _WaveState:
             item for item in ledger.findings if item.id not in answered and is_trigger(item, _docs_path(item.path))
         ]
         self._missing: dict[str, tuple[str, ...]] | None = None
+        self._examined: dict[str, frozenset[str]] | None = None
+
+    def examined(self) -> dict[str, frozenset[str]]:
+        """Per hunk id of the latest round, the lenses accepted coverage (all rounds so far) has examined it with."""
+        if self._examined is None:
+            credit = credited_upto(self.ledger, self.latest.number, runs=self.runs, enforced=self.latest.enforced)
+            self._examined = {ref.id: credit.get(ref.digest, frozenset()) for ref in self.latest.hunks}
+        return self._examined
 
     def generation(self, item: Finding) -> int:
         bound = finding_slots(self.ledger, item, self.runs, self._stored.order, bound=self._table)
@@ -800,12 +827,13 @@ def _plan_next_wave(ledger: Ledger, planned_at: str) -> Ledger:
         by_generation[state.generation(item)].append(item)
     for g in sorted(by_generation):
         if state.barrier_passed(g):
-            return _store_wave(ledger, state.latest, g, by_generation[g], planned_at)
+            return _store_wave(ledger, state, g, by_generation[g], planned_at)
     return ledger
 
 
-def _store_wave(ledger: Ledger, latest: Round, g: int, triggers: Sequence[Finding], planned_at: str) -> Ledger:
+def _store_wave(ledger: Ledger, state: _WaveState, g: int, triggers: Sequence[Finding], planned_at: str) -> Ledger:
     """`ledger` with the wave that answers `triggers` (findings of generation `g`) stored in the latest round."""
+    latest = state.latest
     assert latest.plan is not None
     plan = latest.plan
     considered = tuple(item.id for item in sorted(triggers, key=_finding_number))
@@ -815,18 +843,48 @@ def _store_wave(ledger: Ledger, latest: Round, g: int, triggers: Sequence[Findin
     units = [unit for unit in _unit_refs(latest.hunks) if not unit.docs]
     open_ids = {ref.id for ref in _open_refs(latest)}
     open_units = [unit for unit in units if unit.id in open_ids]
-    adding: list[Slot] = []
-    if not any(slot.kind == "fresh" and slot.generation == target for slot in plan.slots):
-        scope = open_units if open_units and all(item.round == latest.number for item in triggers) else units
-        if scope:
-            generation_one = [slot for slot in plan.slots if slot.generation == 1]
-            adding.extend(
-                _fresh_set(
-                    scope, target, considered[0], planned_at, lambda _, ids: _complement(ids, generation_one)
-                )
-            )
+    adding = _fresh_slots(state, plan, target, considered[0], triggers, units, open_units, planned_at)
     adding.extend(_variant_slots(ledger, plan, target, triggers, units, open_units, planned_at, {slot.id for slot in adding}))
     return _with_wave(ledger, latest, Wave(target, planned_at, considered, tuple(slot.id for slot in adding)), adding)
+
+
+def _fresh_slots(
+    state: _WaveState,
+    plan: HuntPlan,
+    target: int,
+    trigger: str,
+    triggers: Sequence[Finding],
+    units: Sequence[_Unit],
+    open_units: Sequence[_Unit],
+    planned_at: str,
+) -> list[Slot]:
+    """The fresh slots `W<target>-X<j>` a wave adds: the whole set, or the top-up a late trigger needs.
+
+    The round stores no fresh set of this generation yet: one over the open hunks when every trigger comes
+    from the latest round (else over all of its hunks). The round stores one already (the first trigger
+    came from the latest round, the static deep set was narrower): a trigger of an EARLIER round gets
+    fresh eyes over the whole round too, whatever order the verdicts came in, so the hunks no stored
+    fresh slot of this generation lists are partitioned into more slots that continue the numbering.
+    """
+    stored = [slot for slot in plan.slots if slot.kind == "fresh" and slot.generation == target]
+    from_earlier_round = any(item.round < state.latest.number for item in triggers)
+    if stored:
+        listed = {hunk_id for slot in stored for hunk_id in slot.hunks}
+        scope = [unit for unit in units if unit.id not in listed] if from_earlier_round else []
+    else:
+        scope = list(open_units if open_units and not from_earlier_round else units)
+    if not scope:
+        return []
+    generation_one = [slot for slot in plan.slots if slot.generation == 1]
+    examined = state.examined()
+    return _fresh_set(
+        scope,
+        target,
+        trigger,
+        planned_at,
+        lambda _, ids: _complement(ids, generation_one, examined),
+        first=max((_slot_number(slot.id) for slot in stored), default=0) + 1,
+    )
 
 
 def _variant_slots(
@@ -839,23 +897,29 @@ def _variant_slots(
     planned_at: str,
     taken: set[str],
 ) -> list[Slot]:
-    """The variant slots `W<target>-F<n>` for `triggers`: one per (file, lens) cluster, capped, best first."""
+    """The variant slots `W<target>-F<n>` for `triggers`: one per (file, lens) cluster, best first.
+
+    `MAX_VARIANTS_PER_WAVE` is the budget of a whole generation of a round: the variants of this
+    generation the plan stores already (carried ones included) are subtracted. A cluster that cannot get
+    a slot (its id is taken, no hunk to read) does not use the budget; the clusters left over are
+    considered all the same, since the wave names every trigger.
+    """
     by_id = {item.id: item for item in ledger.findings}
-    held = {
-        (by_id[slot.trigger].path, by_id[slot.trigger].lens)
-        for slot in plan.slots
-        if slot.kind == "variant" and slot.generation == target and slot.trigger in by_id
-    }
+    stored = [slot for slot in plan.slots if slot.kind == "variant" and slot.generation == target]
+    held = {(by_id[slot.trigger].path, by_id[slot.trigger].lens) for slot in stored if slot.trigger in by_id}
+    budget = MAX_VARIANTS_PER_WAVE - len(stored)
     clusters: dict[tuple[str, str], list[Finding]] = defaultdict(list)
     for item in sorted(triggers, key=_finding_number):
         clusters[(item.path, item.lens)].append(item)
     ranked = sorted(
         (cluster for key, cluster in clusters.items() if key not in held),
         key=lambda cluster: (min(SEVERITIES.index(item.severity) for item in cluster), _finding_number(cluster[0])),
-    )[:MAX_VARIANTS_PER_WAVE]
+    )
     taken = taken | {slot.id for slot in plan.slots}
     variants: list[Slot] = []
     for cluster in ranked:
+        if len(variants) >= budget:
+            break
         first = cluster[0]
         here = [unit for unit in open_units if unit.path == first.path] or list(units)
         slot_id = f"W{target}-F{_finding_number(first)}"

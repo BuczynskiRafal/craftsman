@@ -370,10 +370,12 @@ def _plan_round(
     The steps follow the planner's contract: the lenses each hunk requires and has been credited are
     computed on the ledger; `open_round` carries over the hunks that owe nothing; the plan is built for
     what the open hunks still owe, appending to the plan the round already has (so re-preparing an
-    unchanged diff never changes an existing slot); finally the waves that are due are stored in it.
+    unchanged diff never changes an existing slot or forgets a wave); finally the waves that are due are
+    stored in it. A wave that is already due is stored BEFORE anything else, so that a verdict recorded
+    since the last `check` is carried into the next round's first plan instead of being lost to it.
     """
     snap = ctx.snap
-    base = current
+    base = huntplan.plan_due_waves(current, ctx.now)
     required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep)
     enforced, platform = review_enforcement(ctx.ws, current, ctx.env, ctx.now)
     have = huntplan.credited(base, enforced=enforced)
@@ -400,10 +402,12 @@ def _plan_round(
         pending_wave_slots=pending,
         round_hunks=snap.hunks,
         carry_sweep=carry_sweep,
+        credited=have,
     )
     if round_.enforced:  # sticky: the round keeps the platform that first held it
         enforced, platform = True, round_.platform
-    known = {slot.id for slot in round_.plan.slots} if round_.plan is not None and not created else set()
+    stored_before = current.rounds[-1].plan if current.rounds else None
+    known = {slot.id for slot in stored_before.slots} if stored_before is not None and not created else set()
     task = _round_task(ctx, base, round_, created=created)
     prepared = replace(
         round_,
