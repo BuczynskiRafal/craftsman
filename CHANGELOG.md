@@ -80,6 +80,11 @@ All notable changes to Craftsman are recorded here. The format follows
   as "no launch". The cited source line of `review add` and `review move` is printed defanged, and an `echo` or `printf`
   that could build the phrase of a record next to a recording call makes its output foreign. A hunter that covered
   parts of several slots without a brief is dead for one slot only. `FOO=1 true` is as trivial as `true`.
+- **Long Antigravity requests and stdin filters.** A `/craft-review` request or continuation prompt that Antigravity
+  cut in `transcript.jsonl` is read whole from `transcript_full.jsonl` (one reader, `transcript.read_conversation`); one
+  that cannot be restored changes nothing and is reported, and so is a stop allowed only because a cut response could not
+  be read. `cat`, `head` and `tail` next to a recording call are foreign output unless they filter a pipe and have no
+  input of their own, so they can no longer forge a record token.
 - **Antigravity reviews are read back correctly.** Parallel `invoke_subagent` calls, whose acknowledgements carry no
   id, are paired with their calls in call order and attributed to the right subagent; verifier runs are recorded like
   hunter runs; `gate --init` records the Antigravity conversation as the gate owner.

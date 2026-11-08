@@ -213,33 +213,63 @@ def latest_user_input(entries: Sequence[Entry]) -> tuple[int, str] | None:
     return None
 
 
-def _latest_response(entries: Sequence[Entry]) -> Entry | None:
-    """The latest PLANNER_RESPONSE that no USER_INPUT follows, None when the user spoke last (or nothing was said)."""
-    for entry in reversed(entries):
+def _latest_response(entries: Sequence[Entry]) -> tuple[int, Entry] | None:
+    """The step and entry of the latest PLANNER_RESPONSE that no USER_INPUT follows, None when the user spoke last
+    (or nothing was said)."""
+    for position in range(len(entries), 0, -1):
+        entry = entries[position - 1]
         if entry.get("type") == "USER_INPUT":
             return None
         if entry.get("type") == "PLANNER_RESPONSE":
-            return entry
+            return step_of(entry, position), entry
     return None
 
 
-def has_cut_tool_calls(entries: Sequence[Entry]) -> bool:
-    """Whether the agent's latest response lost its `tool_calls` to the compact transcript's cut, so only the full
-    transcript can say whether it asked a question (`read_transcript_entries(..., restore=True)`)."""
+def cut_tool_calls_step(entries: Sequence[Entry]) -> int | None:
+    """The step of the agent's latest response when it lost its `tool_calls` to the compact transcript's cut, so only
+    the full transcript can say whether it asked a question (`read_conversation`); None when it did not."""
     latest = _latest_response(entries)
-    return latest is not None and not isinstance(latest.get("tool_calls"), list) and "tool_calls" in _truncated(latest)
+    if latest is None:
+        return None
+    step, entry = latest
+    return step if not isinstance(entry.get("tool_calls"), list) and "tool_calls" in _truncated(entry) else None
+
+
+def has_cut_tool_calls(entries: Sequence[Entry]) -> bool:
+    """Whether `cut_tool_calls_step` finds a step."""
+    return cut_tool_calls_step(entries) is not None
+
+
+def has_cut_user_input(entries: Sequence[Entry]) -> bool:
+    """Whether the latest USER_INPUT lost its `content` to the compact transcript's cut (head, `<truncated N bytes>`,
+    tail): the request it holds may be missing its end, or show an earlier `<USER_REQUEST>` block instead of the last."""
+    for entry in reversed(entries):
+        if entry.get("type") == "USER_INPUT":
+            return "content" in _truncated(entry)
+    return False
+
+
+def read_conversation(transcript_path: Path | None) -> list[Entry]:
+    """The entries of a conversation's transcript as the hooks read them: the compact file, and the full one
+    (`read_transcript_entries(..., restore=True)`) when the compact file cut what they decide on, which is the
+    `tool_calls` of the agent's latest response and the `content` of the user's latest input. An entry that
+    cannot be restored keeps its `truncated_fields`; `has_cut_tool_calls` and `has_cut_user_input` tell."""
+    entries = read_transcript_entries(transcript_path)
+    if has_cut_tool_calls(entries) or has_cut_user_input(entries):
+        return read_transcript_entries(transcript_path, restore=True)
+    return entries
 
 
 def is_waiting_on_question(entries: Sequence[Entry]) -> bool:
     """True when the agent's latest action was a question to the user that is still unanswered.
 
-    Calls that were cut from the entry and could not be restored are read as a question: the user is never
-    trapped behind a guard because a long call hid what the agent did.
+    Calls that were cut from the entry and could not be restored are read as a question (`has_cut_tool_calls` tells
+    them apart): the user is never trapped behind a guard because a long call hid what the agent did.
     """
     latest = _latest_response(entries)
     if latest is None:
         return False
-    calls = latest.get("tool_calls")
+    calls = latest[1].get("tool_calls")
     if not isinstance(calls, list):
         return has_cut_tool_calls(entries)
     return any(isinstance(call, dict) and call.get("name") in QUESTION_TOOLS for call in calls)

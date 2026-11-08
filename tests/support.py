@@ -332,6 +332,22 @@ def user_input(step: int, content: str, at: float | None = None) -> dict[str, An
     return entry
 
 
+def long_user_input(step: int, request: str, at: float | None = None) -> dict[str, Any]:
+    """A `USER_INPUT` as `transcript_full.jsonl` has a long request: wrapped in `<USER_REQUEST>`, followed by metadata
+    Antigravity appends (so the request's closing tag is not at the end of the text, where the cut keeps the tail)."""
+    metadata = "<ADDITIONAL_METADATA>\n" + "The user has 3 active documents.\n" * 120 + "</ADDITIONAL_METADATA>"
+    return user_input(step, f"<USER_REQUEST>\n{request}\n</USER_REQUEST>\n{metadata}", at)
+
+
+def cut_user_input(entry: dict[str, Any], *, head: int = 1500, tail: int = 2000) -> dict[str, Any]:
+    """`entry` as the compact `transcript.jsonl` keeps a long `content`: the head, `<truncated N bytes>`, the tail."""
+    content = str(entry["content"])
+    omitted = len(content.encode("utf-8")) - head - tail
+    assert omitted > 0, "the content must be longer than head + tail to be cut"
+    cut = f"{content[:head]}\n<truncated {omitted} bytes>\n{content[-tail:]}"
+    return {**entry, "content": cut, "truncated_fields": ["content"]}
+
+
 def agy_call(name: str, *, encoded: bool = True, **args: Any) -> dict[str, Any]:
     """One tool call of a `PLANNER_RESPONSE`; `transcript.jsonl` JSON-encodes the values of `args`, `transcript_full.jsonl` does not."""
     return {"name": name, "args": {key: json.dumps(value) if encoded else value for key, value in args.items()}}

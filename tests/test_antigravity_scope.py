@@ -29,7 +29,17 @@ from craftsman.scope import evaluate_antigravity_payload
 from craftsman.scope import main as scope_guard_main
 from craftsman.workspace import ReviewMarker, live_marker, read_marker
 
-from tests.support import AGY_EPOCH, REPO_ROOT, AgyApp, EvidenceRepo, open_gate, planner, user_input
+from tests.support import (
+    AGY_EPOCH,
+    REPO_ROOT,
+    AgyApp,
+    EvidenceRepo,
+    cut_user_input,
+    long_user_input,
+    open_gate,
+    planner,
+    user_input,
+)
 
 MAIN = "main-1"
 SUB = "sub-1"
@@ -331,6 +341,36 @@ class ArmingTests(AntigravityPreToolTestCase):
         live = live_marker(self.ledger_path, clock(11))
         assert live is not None
         self.assertEqual((live.deep, live.task), (True, "check the totals change"))
+
+    LONG_TASK = "check the totals " + "and the rest of the cart " * 200  # over 4 KB: the compact transcript cuts it
+
+    def test_a_long_craft_review_request_cut_in_the_compact_transcript_gives_prepare_its_depth_and_task(self) -> None:
+        full = long_user_input(0, f"/craft-review --deep {self.LONG_TASK}", 2)
+        self.app.write_transcript(MAIN, cut_user_input(full))
+        self.app.write_transcript(MAIN, full, full=True)
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.shell(MAIN, "craftsman review prepare", now=clock(10))
+
+        marker = self.marker()
+        assert marker is not None
+        self.assertEqual((marker.deep, marker.task, marker.at), (True, " ".join(self.LONG_TASK.split())[:300], "2026-01-01T00:00:02.000Z"))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_cut_request_nobody_can_restore_is_not_read_and_is_reported(self) -> None:
+        full = long_user_input(0, f"/craft-review --deep {self.LONG_TASK}", 2)
+        self.app.write_transcript(MAIN, cut_user_input(full))  # no transcript_full.jsonl
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            result = self.shell(MAIN, "craftsman review prepare", now=clock(10))
+
+        self.assertEqual(result, ("allow", None))
+        self.assertIn("was cut from the compact transcript", err.getvalue())
+        marker = self.marker()
+        assert marker is not None  # the command still arms the guard, as it does without any request
+        self.assertEqual((marker.deep, marker.task, marker.at), (False, "", "2026-01-01T00:00:10.000Z"))
 
     def test_the_same_request_never_arms_twice(self) -> None:
         self.app.write_transcript(MAIN, user_input(0, "/craft-review check", 2))

@@ -7,18 +7,22 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest import mock
 
 from craftsman.records import format_timestamp
 from craftsman.transcript import (
     SubagentLaunch,
     TranscriptError,
+    cut_tool_calls_step,
     decode_arg,
     has_cut_tool_calls,
+    has_cut_user_input,
     is_waiting_on_question,
     latest_user_input,
     latest_user_input_text,
     launch_role,
     parent_conversation,
+    read_conversation,
     read_transcript_entries,
     request_body,
     review_request,
@@ -33,9 +37,11 @@ from tests.support import (
     agy_call,
     agy_time,
     ask_question,
+    cut_user_input,
     generic,
     invoke_call,
     launch_reviewers,
+    long_user_input,
     parent_message,
     planner,
     subagent_ack,
@@ -315,6 +321,49 @@ class CutFieldsTests(unittest.TestCase):
         self.assertFalse(is_waiting_on_question([cut, user_input(1, "answer", 4)]))  # the user spoke last
         self.assertFalse(has_cut_tool_calls([self.cut(command, "content"), user_input(1, "answer", 4)]))
         self.assertFalse(is_waiting_on_question([user_input(0, "go", 0), self.cut(command, "content")]))  # another field was cut
+
+    def test_the_step_of_a_cut_response_is_named(self) -> None:
+        cut = self.cut(ask_question(7), "tool_calls")
+
+        self.assertEqual(cut_tool_calls_step([user_input(0, "go", 0), cut]), 7)
+        self.assertIsNone(cut_tool_calls_step([user_input(0, "go", 0), ask_question(7)]))
+        self.assertIsNone(cut_tool_calls_step([]))
+
+    def test_only_the_latest_user_input_decides_whether_a_user_input_is_cut(self) -> None:
+        long = cut_user_input(long_user_input(1, "/craft-review " + "x " * 3000, 1))
+        short = user_input(4, "thanks", 9)
+
+        self.assertTrue(has_cut_user_input([long]))
+        self.assertTrue(has_cut_user_input([short, ask_question(5), long]))
+        self.assertFalse(has_cut_user_input([long, ask_question(2), short]))  # an older cut input does not matter
+        self.assertFalse(has_cut_user_input([self.cut(user_input(1, "x"), "other")]))
+        self.assertFalse(has_cut_user_input([ask_question(1)]))
+
+    def test_read_conversation_restores_a_cut_user_input_and_a_cut_response(self) -> None:
+        full_input = long_user_input(1, "/craft-review " + "x " * 3000, 1)
+        question = ask_question(2)
+        path = self.app.write_transcript("c", cut_user_input(full_input), self.cut(question, "tool_calls"))
+        self.app.write_transcript("c", full_input, question, full=True)
+
+        self.assertEqual(read_conversation(path), [full_input, question])
+
+        self.app.write_transcript("c", cut_user_input(full_input), question)
+        self.assertEqual(read_conversation(path), [full_input, question])  # only the input was cut
+
+    def test_read_conversation_without_a_full_file_keeps_what_was_cut(self) -> None:
+        full_input = long_user_input(1, "/craft-review " + "x " * 3000, 1)
+        path = self.app.write_transcript("c", cut_user_input(full_input))
+
+        entries = read_conversation(path)
+
+        self.assertTrue(has_cut_user_input(entries))
+        self.assertEqual(read_conversation(None), [])
+
+    def test_read_conversation_leaves_an_uncut_transcript_alone(self) -> None:
+        path = self.app.write_transcript("c", user_input(0, "go", 0), ask_question(1))
+        with mock.patch("craftsman.transcript._restored") as restored:
+            self.assertEqual(read_conversation(path), [user_input(0, "go", 0), ask_question(1)])
+        restored.assert_not_called()
 
     def test_restore_follows_line_numbers_across_blank_lines(self) -> None:
         full = planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)

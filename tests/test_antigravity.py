@@ -32,7 +32,9 @@ from tests.support import (
     agy_call,
     ask_question,
     coverage_note,
+    cut_user_input,
     launch_reviewers,
+    long_user_input,
     open_gate,
     planner,
     user_input,
@@ -531,6 +533,190 @@ class MarkerSyncTests(AntigravityTestCase):
     def test_a_review_request_in_a_subagent_message_is_not_a_request(self) -> None:
         self.sync(support.parent_message(0, OTHER, 7))
         self.assertIsNone(self.marker())
+
+
+class CutUserInputTests(AntigravityTestCase):
+    """Antigravity's compact transcript cuts a long `USER_INPUT` (head, `<truncated N bytes>`, tail); the full one has it all."""
+
+    TASK = "check the totals " + "and the rest of the cart " * 200  # over 4 KB, cut away from the compact file
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.ledger_path = ledger_path_for(self.repo.root)
+
+    def write_cut(self, full_entry: dict[str, Any], *, restorable: bool = True, before: tuple[dict[str, Any], ...] = ()) -> None:
+        self.write_transcript(*before, cut_user_input(full_entry))
+        if restorable:
+            self.app.write_transcript(MAIN, *before, full_entry, full=True)
+
+    def sync(self, now: float = 100) -> str:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            antigravity.sync_marker_from_user_input(self.repo.root, self.app.root, MAIN, self.caller, clock(now))
+        return err.getvalue()
+
+    def test_a_long_review_request_cut_in_the_compact_transcript_arms_the_guard(self) -> None:
+        self.write_cut(long_user_input(1, f"/craft-review --deep {self.TASK}", 7))
+
+        self.assertEqual(self.sync(), "")
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertEqual(
+            (marker.at, marker.deep, marker.task, marker.forced),
+            ("2026-01-01T00:00:07.000Z", True, " ".join(self.TASK.split())[:300], 0),
+        )
+
+    def test_a_long_review_request_arms_the_guard_on_the_stop_path(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.write_cut(long_user_input(1, f"/craft-review --deep {self.TASK}", 7))
+
+        answer, err = self.stop(now=clock(10))
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertEqual((answer["decision"], marker.deep, marker.guarding), ("continue", True, True))
+        self.assertIn(REVIEW_NOT_STARTED, answer["reason"])
+        self.assertNotIn("cut", err)
+        self.assertEqual(hook_errors.read(self.repo.ledger_dir), ())
+
+    def test_a_request_cut_and_not_restorable_arms_nothing_and_says_so(self) -> None:
+        self.write_cut(long_user_input(1, f"/craft-review --deep {self.TASK}", 7), restorable=False)
+
+        err = self.sync()
+
+        self.assertIsNone(read_marker(self.ledger_path))
+        self.assertIn("(step 1) was cut from the compact transcript", err)
+        self.assertIn("the review guard is unchanged", err)
+
+    def test_the_stop_hook_logs_a_cut_request_it_cannot_restore(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.write_cut(long_user_input(1, f"/craft-review --deep {self.TASK}", 7), restorable=False)
+
+        answer, err = self.stop(now=clock(10))
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertIsNone(read_marker(self.ledger_path))
+        self.assertIn("was cut from the compact transcript", err)
+        logged = hook_errors.read(self.repo.ledger_dir)
+        self.assertEqual([(entry.kind, entry.source) for entry in logged], [("transcript", "antigravity-stop")])
+        self.assertIn("transcript_full.jsonl does not restore it", logged[0].message)
+
+    def test_a_full_transcript_of_another_entry_restores_nothing(self) -> None:
+        full = long_user_input(1, f"/craft-review {self.TASK}", 7)
+        self.write_transcript(cut_user_input(full))
+        self.app.write_transcript(MAIN, {**full, "step_index": 9}, full=True)  # not the same entry
+
+        err = self.sync()
+
+        self.assertIsNone(read_marker(self.ledger_path))
+        self.assertIn("was cut", err)
+
+    def test_a_guard_is_not_ended_by_a_cut_input_nobody_can_read(self) -> None:
+        arm_marker(self.ledger_path, self.caller, clock(10), fresh=False)
+        self.write_cut(long_user_input(4, "please explain the whole diff. " + self.TASK, 90), restorable=False)
+
+        err = self.sync()
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertTrue(marker.guarding)
+        self.assertIn("was cut", err)
+
+    def test_a_long_message_that_is_no_request_ends_the_guard_once_it_is_read(self) -> None:
+        arm_marker(self.ledger_path, self.caller, clock(10), fresh=False)
+        self.write_cut(long_user_input(4, "please explain the whole diff. " + self.TASK, 90))
+
+        self.assertEqual(self.sync(), "")
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertFalse(marker.guarding)
+
+    def test_a_long_continuation_prompt_cut_in_the_compact_file_is_no_user_moving_on(self) -> None:
+        request = user_input(1, "/craft-review check", 7)
+        arm_marker(self.ledger_path, self.caller, clock(7), fresh=True, deep=False, task="check")
+        continuation = long_user_input(4, "[CRAFTSMAN REVIEW 2/6] review incomplete. " + self.TASK, 90)
+        self.write_cut(continuation, before=(request,))
+
+        self.assertEqual(self.sync(), "")
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertTrue(marker.guarding)
+
+
+class CutQuestionTests(AntigravityTestCase):
+    """`is_waiting_on_question` reads a response whose calls were cut and cannot be restored as a question (fail open).
+
+    In a running hook `sync_from_stop` raises on such a response first (the stop is then allowed with the error
+    `The quality gate was not checked`, pinned below); the tests that reach the question check itself switch that
+    sync off, so the second line of defence is proven on its own.
+    """
+
+    def cut_call(self, call: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in call.items() if key != "tool_calls"} | {"truncated_fields": ["tool_calls"]}
+
+    def stop_without_sync(self) -> tuple[dict[str, str], str]:
+        with mock.patch("craftsman.antigravity.sync_from_stop"):
+            return self.stop()
+
+    def test_a_cut_response_nothing_restores_lets_the_agent_stop_and_says_the_gate_was_not_checked(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "go", 0), self.cut_call(ask_question(2)))
+
+        answer, err = self.stop_without_sync()
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertEqual(err.count("were cut from the compact transcript"), 1)
+        self.assertIn("the quality gate and the review guard were not checked", err)
+        logged = hook_errors.read(self.repo.ledger_dir)
+        self.assertEqual([(entry.kind, entry.source) for entry in logged], [("transcript", "antigravity-stop")])
+        self.assertIn("tool calls of step 2", logged[0].message)
+
+    def test_a_cut_response_nothing_restores_is_reported_on_the_review_guard_path_too(self) -> None:
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "/craft-review check", 0), self.cut_call(ask_question(2)))
+
+        answer, err = self.stop_without_sync()
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertEqual(err.count("were cut from the compact transcript"), 1)
+        self.assertEqual([entry.kind for entry in hook_errors.read(self.repo.ledger_dir)], ["transcript"])
+
+    def test_a_cut_response_nothing_restores_is_an_error_of_the_stop_even_with_the_sync(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "go", 0), self.cut_call(ask_question(2)))
+
+        answer, err = self.stop()
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertIn("The quality gate was not checked", err)
+        self.assertEqual([entry.kind for entry in hook_errors.read(self.repo.ledger_dir)], ["transcript"])
+
+    def test_a_cut_response_the_full_transcript_restores_is_not_reported(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "go", 0), self.cut_call(ask_question(2)))
+        self.app.write_transcript(MAIN, user_input(1, "go", 0), ask_question(2), full=True)
+
+        answer, err = self.stop()
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertNotIn("cut", err)
+        self.assertEqual(hook_errors.read(self.repo.ledger_dir), ())
+
+    def test_an_answered_question_is_not_reported(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "go", 0), ask_question(2), user_input(3, "yes", 5))
+
+        _, err = self.stop()
+
+        self.assertNotIn("cut", err)
+        self.assertEqual(hook_errors.read(self.repo.ledger_dir), ())
 
 
 class ReviewGuardTests(HuntTestCase):

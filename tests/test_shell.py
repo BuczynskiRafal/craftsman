@@ -161,6 +161,30 @@ class HeredocAndPathExpansionTests(unittest.TestCase):
         self.assertEqual(ps_events[0], "'x; y'")
         self.assertEqual(ps_events[1], "Set-Content out.txt")
 
+    def test_a_segment_after_an_unquoted_pipe_is_piped(self) -> None:
+        for command, piped in (
+            ("a | b", [False, True]),
+            ("a |& b", [False, True]),
+            ("a | b | c", [False, True, True]),
+            ("a |\n b", [False, True]),
+            ("a | b && c", [False, True, False]),
+            ("a | b; c", [False, True, False]),
+            ("a || b", [False, False]),
+            ("a & b", [False, False]),
+            ("a && b", [False, False]),
+            ("a >| out; b", [False, False]),
+            ("a >| out | b", [False, True]),
+            ("echo 'a | b'", [False]),
+            ("echo a\\| b", [False]),
+            ("a | (b)", [False, True]),
+            ("a | cat <<EOF\nx\nEOF\nb", [False, True, False]),
+        ):
+            with self.subTest(command=command):
+                self.assertEqual([item.piped for item in iter_simple_commands(command)], piped)
+
+    def test_a_nested_shell_reads_its_own_pipes(self) -> None:
+        self.assertEqual([(item.tokens[0], item.piped) for item in iter_simple_commands("bash -c 'a | b'")], [("bash", False), ("a", False), ("b", True)])
+
     def test_windows_backslash_paths_stay_intact(self) -> None:
         with mock.patch.dict(
             os.environ,

@@ -22,7 +22,7 @@ from typing import Any
 from craftsman.command_policy import BRIEF_OPTIONS, has_option, invocations
 from craftsman.jsonl import MAX_TRANSCRIPT_BYTES, JsonlReader, StopReason
 from craftsman.records import AgentRole, AgentUsage, Ledger, agent_role, parse_timestamp
-from craftsman.shell import SimpleCommand, iter_simple_commands
+from craftsman.shell import SimpleCommand, is_env_assignment, iter_simple_commands
 
 # A longer pause between two transcript entries is the agent being idle (a resumed agent waits for
 # its parent between runs), not working.
@@ -38,7 +38,8 @@ _TOKEN_RES = (_COVERAGE_TOKEN_RE, _FINDING_TOKEN_RE, _CLAIM_TOKEN_RE, _VERDICT_T
 # The `craftsman review` subcommands whose output is the proof of a record.
 _RECORDING_SUBCOMMANDS = frozenset({"cover", "add", "brief", "verdict", "merge"})
 # Commands that print nothing a transcript reader could take for a record: they may share a command line with a
-# recording call (`cd repo && craftsman review cover ...`), and so may `tail` / `head` / `cat` filtering its output.
+# recording call (`cd repo && craftsman review cover ...`), and so may `tail` / `head` / `cat` filtering its output
+# through a pipe (`_filters_a_pipe`).
 _SILENT_COMMANDS = frozenset({"cd", "pushd", "popd", "export", "set", "unset", "true", "false", ":", "test", "[", "exit"})
 _ECHOES = frozenset({"echo", "printf"})
 _ECHO_SPECIAL_CHARS = frozenset("\\$`{}*?[")
@@ -287,8 +288,23 @@ def _prints_text(item: SimpleCommand) -> bool:
     if name in _ECHOES:
         return not _echoes_plain_words(name, item.tokens[1:])
     if name in _STDIN_FILTERS:
-        return any(not word.startswith("-") and not word.isdigit() for word in item.tokens[1:])  # a file to read
+        return not _filters_a_pipe(item)
     return True
+
+
+def _filters_a_pipe(item: SimpleCommand) -> bool:
+    """Whether a `tail` / `head` / `cat` only passes on what the command before it printed (`... | tail -3`).
+
+    Any other input is text the agent chose: a file word, a `<`, `<<`, `<<<`, `<&` or `N<` redirection (a quoted
+    `<` counts too, which only errs towards foreign), a heredoc, or the agent's own stdin (`... && cat`, no pipe).
+    A wrapper that is more than a variable assignment (`xargs cat` prints the files its stdin names) is no filter.
+    """
+    return (
+        item.piped
+        and "<" not in item.segment
+        and all(is_env_assignment(word) for word in item.prefix)
+        and all(word.startswith("-") or word.isdigit() for word in item.tokens[1:])
+    )
 
 
 def _echoes_plain_words(name: str, words: list[str]) -> bool:

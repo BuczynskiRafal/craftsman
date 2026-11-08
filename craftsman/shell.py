@@ -167,16 +167,43 @@ def _is_redirection_ampersand(command_line: str, idx: int) -> bool:
     )
 
 
-def _flush_segment(current: list[str], events: list[str]) -> list[str]:
-    seg = "".join(current).strip()
-    if seg:
-        events.append(seg)
-    return []
+class ShellEvent(NamedTuple):
+    """A command segment, or a subshell boundary (`(` or `)`), of a command line."""
+
+    text: str
+    piped: bool  # a segment after an unquoted `|` (or `|&`, not `||` and not `>|`): its stdin is the previous command's output
+
+
+class _Events:
+    """The events of a command line being split; a pipe makes the next SEGMENT `piped` (boundaries and empty
+    flushes, such as the `&` of `|&` or a newline after the pipe, keep it pending)."""
+
+    def __init__(self) -> None:
+        self.items: list[ShellEvent] = []
+        self._pipe_pending = False
+
+    def boundary(self, text: str) -> None:
+        self.items.append(ShellEvent(text, False))
+
+    def pipe(self) -> None:
+        self._pipe_pending = True
+
+    def flush(self, current: list[str]) -> list[str]:
+        seg = "".join(current).strip()
+        if seg:
+            self.items.append(ShellEvent(seg, self._pipe_pending))
+            self._pipe_pending = False
+        return []
 
 
 def split_shell_events(command_line: str) -> list[str]:
     """Split a shell command line into command segments and subshell boundary tokens `(` and `)`."""
-    events: list[str] = []
+    return [event.text for event in scan_shell_events(command_line)]
+
+
+def scan_shell_events(command_line: str) -> list[ShellEvent]:
+    """`split_shell_events`, with the fact whether a segment reads the output of the one before it through a pipe."""
+    events = _Events()
     current: list[str] = []
     quote: str | None = None
     escaped = False
@@ -199,27 +226,30 @@ def split_shell_events(command_line: str) -> list[str]:
             delim = hd.group(1) or hd.group(2) or hd.group(3)
             body, i = _consume_heredoc_body(command_line, i + 1, delim)
             current.extend(("\n", body))
-            current = _flush_segment(current, events)
+            current = events.flush(current)
         elif ch in ("(", ")"):
-            current = _flush_segment(current, events)
-            events.append(ch)
+            current = events.flush(current)
+            events.boundary(ch)
             i += 1
         elif ch in (";", "\n", "`") or _is_standalone_brace(command_line, i):
-            current = _flush_segment(current, events)
+            current = events.flush(current)
             i += 1
         elif ch == "|" and i == after_redirect:
             current.append(ch)
             i += 1
         elif ch in ("|", "&") and not _is_redirection_ampersand(command_line, i):
-            i += 2 if (i + 1 < n and command_line[i + 1] == ch) else 1
-            current = _flush_segment(current, events)
+            doubled = i + 1 < n and command_line[i + 1] == ch
+            i += 2 if doubled else 1
+            current = events.flush(current)
+            if ch == "|" and not doubled:
+                events.pipe()
         else:
             if ch == ">":
                 after_redirect = i + 1
             current.append(ch)
             i += 1
-    _flush_segment(current, events)
-    return events
+    events.flush(current)
+    return events.items
 
 
 def is_env_assignment(token: str) -> bool:
@@ -585,6 +615,8 @@ class SimpleCommand:
     cwd: str | None
     # The wrapper words that were stripped (`env`, `VAR=x`, `-u VAR`, the words of an `env -S` string, ...).
     prefix: tuple[str, ...] = ()
+    # Its stdin is the output of the command before it (`scan_shell_events`): it follows an unquoted `|`.
+    piped: bool = False
 
 
 def expand_shell_path_token(raw: str) -> str:
@@ -776,7 +808,8 @@ def iter_simple_commands(
     dir_stack: list[str | None] = []
     subshell_stack: list[tuple[str | None, list[str | None]]] = []
 
-    for ev in split_shell_events(command_line):
+    for event in scan_shell_events(command_line):
+        ev = event.text
         if ev == "(":
             subshell_stack.append((cur_cwd, list(dir_stack)))
             continue
@@ -787,7 +820,7 @@ def iter_simple_commands(
         raw_tokens = _tokenize_raw_segment(ev)
         prefix, tokens = _split_wrappers(raw_tokens)
         cmd_cwd = _extract_wrapper_chdir(prefix, cur_cwd)
-        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd, prefix=tuple(prefix)))
+        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd, prefix=tuple(prefix), piped=event.piped))
         commands.extend(_expand_nested_commands(tokens, ev, cmd_cwd, max_depth))
         if tokens:
             cmd_low = tokens[0].lower()

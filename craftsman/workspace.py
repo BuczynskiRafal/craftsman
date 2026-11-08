@@ -198,10 +198,11 @@ def caller_identity(env: Mapping[str, str]) -> str | None:
     hunter from the orchestrator: that identity comes from the subagent's own transcript instead.
 
     The variable is the caller's own word, so it is only as good as the guard that keeps one agent from
-    setting it for another: the Antigravity scope guard and the Claude and Copilot PreToolUse hooks (a later
-    phase) must deny any command that assigns `ANTIGRAVITY_CONVERSATION_ID` (an inline `VAR=...` prefix,
-    `env`, `export`), found with `shell.iter_simple_commands`. Until then an orchestrator that learned a
-    subagent's conversation id could record as that subagent.
+    setting it for another. That guard is the command policy every platform's PreToolUse hook applies
+    (`command_policy._sets_identity`, found with `shell.iter_simple_commands`): it denies a command line that
+    runs `craftsman` and sets or unsets an identity variable (an inline `VAR=...` prefix, `env`, `export`,
+    `unset`, ...), so an orchestrator that learned a subagent's conversation id cannot record as that subagent
+    through the hooks. A call that bypasses the hooks (a person at a terminal, a platform without them) is not stopped.
     """
     conversation = env.get("ANTIGRAVITY_CONVERSATION_ID", "").strip()
     return f"antigravity:{conversation}" if conversation else None

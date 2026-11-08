@@ -60,15 +60,17 @@ from craftsman.review_guard import gate_stop_inputs, serve_review_stop
 from craftsman.streams import configure_std_streams
 from craftsman.subagent_stop import REVIEWER_STOP_REASON, records_since, verifier_debt
 from craftsman.transcript import (
+    FULL_TRANSCRIPT,
     Entry,
     TranscriptError,
     conversation_transcript,
-    has_cut_tool_calls,
+    cut_tool_calls_step,
+    has_cut_user_input,
     is_waiting_on_question,
     latest_user_input,
     latest_user_input_text,
     parent_conversation,
-    read_transcript_entries,
+    read_conversation,
     request_body,
     review_request,
     step_of,
@@ -146,11 +148,8 @@ class StopPayload:
         return GateOwner(PLATFORM, self.conversation_id)
 
     def entries(self) -> list[Entry]:
-        """The transcript of this conversation (none yet is no entries). The full transcript is read as well when
-        the compact one cut the calls of the agent's latest response: they may be a question to the user."""
-        path = self.transcript or conversation_transcript(self.app_dir, self.conversation_id)
-        entries = read_transcript_entries(path)
-        return read_transcript_entries(path, restore=True) if has_cut_tool_calls(entries) else entries
+        """The transcript of this conversation (none yet is no entries), as `read_conversation` reads it."""
+        return read_conversation(self.transcript or conversation_transcript(self.app_dir, self.conversation_id))
 
 
 def is_final_stop(payload: Mapping[str, Any]) -> bool:
@@ -190,7 +189,7 @@ def on_stop(stop: StopPayload, now: datetime | None = None) -> str | None:
 def _serve_gate(
     state: GateState, root: Path, entries: Sequence[Entry], stop: StopPayload, now: datetime
 ) -> tuple[GateState, str | None]:
-    if is_waiting_on_question(entries):
+    if _waiting_on_question(entries):
         return state, None
     ledger_path = ledger_path_for(root)
     inputs = None if state.awaiting_user else gate_stop_inputs(ledger_path, now)
@@ -207,9 +206,34 @@ def _serve_gate(
     return decision.state, decision.block_reason
 
 
+def _waiting_on_question(entries: Sequence[Entry]) -> bool:
+    """`is_waiting_on_question`, saying so when a stop is allowed only because the agent's latest response was cut.
+
+    That fail-open is kept (the user is never trapped behind a guard), but it must not be silent: the gate and the
+    review guard were not checked, and nobody would see it.
+    """
+    if not is_waiting_on_question(entries):
+        return False
+    step = cut_tool_calls_step(entries)
+    if step is not None:
+        _surface(
+            "transcript",
+            f"the tool calls of step {step} were cut from the compact transcript and {FULL_TRANSCRIPT} does not "
+            "restore them, so the stop was allowed as if the agent had asked the user a question: the quality gate "
+            "and the review guard were not checked. Run `craftsman review check` yourself.",
+        )
+    return True
+
+
+def _surface(kind: hook_errors.ErrorKind, message: str) -> None:
+    """A problem the hook survives, made visible: in the hook error log and on stderr."""
+    hook_errors.report(kind, message)
+    sys.stderr.write(f"craftsman hook: {message}\n")
+
+
 def _serve_review_guard(root: Path, entries: Sequence[Entry], stop: StopPayload, now: datetime) -> str | None:
     """The review guard for a conversation that holds no gate: a `/craft-review` request arms it, `serve_review_stop` decides."""
-    if is_waiting_on_question(entries):
+    if _waiting_on_question(entries):
         return None
     sync_marker_from_user_input(root, stop.app_dir, stop.conversation_id, stop.caller, now, entries=entries)
     decision = serve_review_stop(root, ledger_path_for(root), stop.caller, now)
@@ -236,13 +260,22 @@ def sync_marker_from_user_input(
       (whole seconds on both sides), and its `deep` flag and task;
     - any other input that is newer than the marker's `at` and its last touch, while the marker guards this
       conversation: the user moved on, so the guard ends (a continuation prompt is no such input);
-    - otherwise nothing. A later `craftsman review` command re-arms like on Claude (`review_guard.arm_for_review_command`).
+    - otherwise nothing; a latest input that the compact transcript cut and the full one does not restore changes
+      nothing either (and is reported). A later `craftsman review` command re-arms like on Claude (`review_guard.arm_for_review_command`).
     """
     ledger_path = ledger_path_for(root)
     if entries is None:
-        entries = read_transcript_entries(transcript or conversation_transcript(app_dir, conversation_id))
+        entries = read_conversation(transcript or conversation_transcript(app_dir, conversation_id))
     latest = latest_user_input_text(entries)
     if latest is None:
+        return
+    if has_cut_user_input(entries):  # the full transcript did not give it back: a cut text is no ground to arm or disarm
+        _surface(
+            "transcript",
+            f"the latest user input (step {latest[0]}) was cut from the compact transcript and {FULL_TRANSCRIPT} does "
+            "not restore it, so it was not read as a review request or as the user moving on: the review guard is "
+            "unchanged.",
+        )
         return
     _, stamp, text = latest
     if stamp is None:
