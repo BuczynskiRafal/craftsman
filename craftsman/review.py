@@ -371,15 +371,21 @@ def _plan_round(
     computed on the ledger; `open_round` carries over the hunks that owe nothing; the plan is built for
     what the open hunks still owe, appending to the plan the round already has (so re-preparing an
     unchanged diff never changes an existing slot or forgets a wave); finally the waves that are due are
-    stored in it. A wave that is already due is stored BEFORE anything else, so that a verdict recorded
-    since the last `check` is carried into the next round's first plan instead of being lost to it.
+    stored in it. When this opens a NEW round, a wave that is already due is stored BEFORE anything else,
+    in the round being replaced, so that a verdict recorded since the last `check` is carried into the new
+    round's first plan instead of being lost to it. When the round is only refreshed (an unchanged
+    diff, or an in-place raise to deep), no wave is planned until its plan is rebuilt: the barrier of a wave
+    must see the generation 1 slots the refresh adds, and the hunks it releases. Carry-over is decided on
+    the credit before the round opens; the plan is built on the credit as the round being planned sees it
+    (hunks the new round reopened have none).
     """
     snap = ctx.snap
-    base = huntplan.plan_due_waves(current, ctx.now)
+    changing = not round_unchanged(current, snap, ctx.scope)
+    base = huntplan.plan_due_waves(current, ctx.now) if changing else current
     required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep)
     enforced, platform = review_enforcement(ctx.ws, current, ctx.env, ctx.now)
     have = huntplan.credited(base, enforced=enforced)
-    carry_sweep = not round_unchanged(current, snap, ctx.scope) and huntplan.sweep_pending(base)
+    carry_sweep = changing and huntplan.sweep_pending(base)
     packet = packet_path(ctx.ws.ledger_path, len(base.rounds) + 1)
     opened, round_ = open_round(
         base, snap, ctx.depth.deep, str(packet), ctx.symbols,
@@ -402,7 +408,7 @@ def _plan_round(
         pending_wave_slots=pending,
         round_hunks=snap.hunks,
         carry_sweep=carry_sweep,
-        credited=have,
+        credited=huntplan.credited(opened, enforced=enforced),
     )
     if round_.enforced:  # sticky: the round keeps the platform that first held it
         enforced, platform = True, round_.platform

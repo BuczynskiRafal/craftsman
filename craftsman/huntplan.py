@@ -383,11 +383,15 @@ def build_plan(
 
     `open_hunks` are the hunks the round has to review, `owed` what each still owes. Existing slots stay
     exactly as they are and come first; a (hunk, lens) pair one of them already assigns is not assigned
-    again; new generation 1 slots continue the numbering. `pending_wave_slots` are wave slots an earlier
-    round left unfinished (see `pending_wave_slots`). `round_hunks` are all hunks of the round, carried
-    ones included (default: `open_hunks`), and `carry_sweep` demands a sweep over all of them because an
-    earlier round left its sweep unfinished. `credited` (hunk digest -> lenses, as `credited(ledger)`)
-    lets the static fresh set complement what each hunk has been examined with already.
+    again; new generation 1 slots continue the numbering. Only the generation 1 slots of `existing` count as
+    lenses a hunk is assigned: a wave slot has examined nothing until its coverage is credited, which
+    `owed` already accounts for. `pending_wave_slots` are wave slots an earlier round left unfinished (see
+    `pending_wave_slots`). `round_hunks` are all hunks of the round, carried ones included (default:
+    `open_hunks`), and `carry_sweep` demands a sweep over all of them because an earlier round left its
+    sweep unfinished. `credited` (hunk digest -> lenses, as `credited(ledger)` sees the round being planned)
+    lets the fresh slots, the static set of the first deep round and the carried sets alike, take the lenses
+    that neither this round's generation 1 nor the credit has used on their hunks. The static set is topped
+    up over the hunks of the scope that no stored or carried generation 2 fresh slot lists.
 
     Everything `existing` holds is kept, its `Wave` records included: a plan never forgets a wave
     decision, so re-preparing a round never re-plans a finding a wave considered.
@@ -395,8 +399,9 @@ def build_plan(
     kept = existing.slots if existing is not None else ()
     assigned: dict[str, set[str]] = defaultdict(set)
     for slot in kept:
-        for hunk_id in slot.hunks:
-            assigned[hunk_id].update(slot.lenses)
+        if slot.generation == 1:  # a wave slot has not examined anything until its coverage is credited
+            for hunk_id in slot.hunks:
+                assigned[hunk_id].update(slot.lenses)
     needs = {
         hunk.id: owed.get(hunk.id, frozenset()) - assigned.get(hunk.id, set()) for hunk in open_hunks
     }
@@ -410,18 +415,26 @@ def build_plan(
 
     taken_ids = {slot.id for slot in (*kept, *new)}
     pending = [slot for slot in pending_wave_slots if slot.id not in taken_ids]
+    generation_one = [slot for slot in (*kept, *new) if slot.generation == 1]
+    examined = {hunk.id: (credited or {}).get(hunk.digest, frozenset()) for hunk in scope}
+
+    def complement(ids: frozenset[str]) -> tuple[str, ...]:
+        return _complement(ids, generation_one, examined)
+
+    # A carried fresh set was repartitioned for this round: it takes the lenses this round's generation 1
+    # and the credit have not used on its new hunks, never those of the old partition.
+    pending = [
+        replace(slot, lenses=complement(frozenset(slot.hunks))) if slot.kind == "fresh" else slot
+        for slot in pending
+    ]
     fresh: list[Slot] = []
-    holds_fresh = any(slot.id.startswith("W2-X") for slot in (*kept, *pending))
-    if depth.deep and first_deep_round and not holds_fresh:
-        generation_one = [slot for slot in (*kept, *new) if slot.generation == 1]
-        examined = {hunk.id: (credited or {}).get(hunk.digest, frozenset()) for hunk in scope}
-        fresh = _fresh_set(
-            [unit for unit in _units(scope) if not unit.docs],
-            2,
-            "deep",
-            None,
-            lambda _, ids: _complement(ids, generation_one, examined),
-        )
+    if depth.deep and first_deep_round:
+        held = [slot for slot in (*kept, *pending) if slot.kind == "fresh" and slot.generation == 2]
+        listed = {hunk_id for slot in held for hunk_id in slot.hunks}
+        uncovered = [unit for unit in _units(scope) if not unit.docs and unit.id not in listed]
+        if uncovered:  # the static set spans the whole scope, whatever a wave stored before it
+            first = max((_slot_number(slot.id) for slot in held), default=0) + 1
+            fresh = _fresh_set(uncovered, 2, "deep", None, lambda _, ids: complement(ids), first=first)
     reasons = tuple(dict.fromkeys((*(existing.reasons if existing is not None else ()), *depth.reasons)))
     waves = existing.waves if existing is not None else ()
     return HuntPlan(reasons=reasons, slots=(*kept, *new, *fresh, *pending), waves=waves)
@@ -749,8 +762,10 @@ def plan_due_waves(ledger: Ledger, now: datetime) -> Ledger:
     - variant slots `W<g+1>-F<n>`, one per (file, lens) cluster of those findings that the round does not
       hold a variant for already, best severity first, at most `MAX_VARIANTS_PER_WAVE`, over the open
       non-documentation hunks of the file in the latest round (else all non-documentation hunks of the round);
-    - a fresh set `W<g+1>-X<j>` unless the round stores one of that generation, over the open
-      non-documentation hunks when every finding comes from the latest round (else all of the round).
+    - fresh slots `W<g+1>-X<j>` so that the round's fresh set of that generation lists every hunk of the
+      wave's scope: the open non-documentation hunks when every finding comes from the latest round and
+      some hunk is open, else all non-documentation hunks of the round. The hunks the stored set (if any)
+      does not list get new slots that continue its numbering.
     Findings of the last generation spawn nothing and are only marked as decided. A planned slot stays
     required even if its trigger is dismissed later: once planned, it runs. Repeats until nothing is due.
     """
@@ -869,21 +884,20 @@ def _fresh_slots(
     open_units: Sequence[_Unit],
     planned_at: str,
 ) -> list[Slot]:
-    """The fresh slots `W<target>-X<j>` a wave adds: the whole set, or the top-up a late trigger needs.
+    """The fresh slots `W<target>-X<j>` a wave adds, so that the round's set of this generation spans its scope.
 
-    The round stores no fresh set of this generation yet: one over the open hunks when every trigger comes
-    from the latest round (else over all of its hunks). The round stores one already (the first trigger
-    came from the latest round, the static deep set was narrower): a trigger of an EARLIER round gets
-    fresh eyes over the whole round too, whatever order the verdicts came in, so the hunks no stored
-    fresh slot of this generation lists are partitioned into more slots that continue the numbering.
+    The scope: the open hunks when every trigger comes from the latest round and some hunk is open, else all
+    hunks of the round (documentation never counts). The hunks no stored fresh slot of this generation lists
+    yet get slots that continue the numbering: the whole set when the round stores none, otherwise a top-up
+    (the static deep set was narrower, an earlier trigger planned the set before these hunks were open, or a
+    trigger of an earlier round needs fresh eyes over the whole round). A wave decision stays a decision at
+    its moment: a set is not extended later by an in-place deep raise, only by another wave.
     """
     stored = [slot for slot in plan.slots if slot.kind == "fresh" and slot.generation == target]
     from_earlier_round = any(item.round < state.latest.number for item in triggers)
-    if stored:
-        listed = {hunk_id for slot in stored for hunk_id in slot.hunks}
-        scope = [unit for unit in units if unit.id not in listed] if from_earlier_round else []
-    else:
-        scope = list(open_units if open_units and not from_earlier_round else units)
+    wanted = open_units if open_units and not from_earlier_round else units
+    listed = {hunk_id for slot in stored for hunk_id in slot.hunks}
+    scope = [unit for unit in wanted if unit.id not in listed]
     if not scope:
         return []
     generation_one = [slot for slot in plan.slots if slot.generation == 1]
@@ -962,13 +976,9 @@ def _with_wave(ledger: Ledger, round_: Round, wave: Wave, adding: Sequence[Slot]
 # --- waves an earlier round left unfinished -------------------------------------------------
 
 
-def _lenses_of(originals: Sequence[Slot]) -> Callable[[int, frozenset[str]], tuple[str, ...]]:
-    """The lenses of slot j of a rebuilt fresh set: those of original slot j (the last one if there are fewer)."""
-
-    def lenses_for(j: int, _: frozenset[str]) -> tuple[str, ...]:
-        return originals[min(j, len(originals)) - 1].lenses
-
-    return lenses_for
+def _latest_since(slots: Sequence[Slot]) -> str | None:
+    """The latest `since` among `slots` (a static slot has none); None when none has one."""
+    return max((slot.since for slot in slots if slot.since is not None), key=parse_timestamp, default=None)
 
 
 def _wave_order(slot: Slot) -> tuple[int, int, int]:
@@ -1014,7 +1024,9 @@ def _rebuild_waves(
 
     A variant is rebuilt over the open hunks of its file, else over all hunks of the round (the rule
     `_store_wave` plans a variant by); it is dropped only when the round has no hunk that is not
-    documentation. A fresh set is repartitioned over the hunks of the round.
+    documentation. A fresh set is repartitioned over the hunks of the round; all its slots carry the
+    trigger of the first original slot (`deep` for a static one) and the latest `since` among the
+    originals, and placeholder lenses that `build_plan` replaces.
     """
     code_round = [unit for unit in round_units if not unit.docs]
     code_open = [unit for unit in open_units if not unit.docs]
@@ -1032,8 +1044,8 @@ def _rebuild_waves(
                 code_round,
                 generation,
                 originals[0].trigger or "deep",
-                originals[0].since,
-                _lenses_of(originals),
+                _latest_since(originals),
+                lambda _, __: FRESH_DEFAULT_LENSES,  # a placeholder: `build_plan` complements the new round's lenses
             )
         )
     return sorted(rebuilt, key=_wave_order)
@@ -1049,8 +1061,9 @@ def pending_wave_slots(
     `since`, over the new round's open hunks of its finding's file that are not documentation (all
     non-documentation hunks of the round otherwise); it is dropped only when the round has nothing but
     documentation. A fresh set is judged as a unit: when any of its slots is not done it is
-    stored again whole, over all hunks of the new round that are not documentation, with the original
-    lenses and repartitioned, so its slots are numbered anew.
+    stored again whole, over all hunks of the new round that are not documentation, repartitioned, so
+    its slots are numbered anew. The lenses of such a slot are `FRESH_DEFAULT_LENSES` here: the lenses
+    that fit the new round are known only once its generation 1 exists, and `build_plan` chooses them.
     """
     if not ledger.rounds or ledger.rounds[-1].plan is None:
         return ()

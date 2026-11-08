@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 import unittest
 from collections import Counter, defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ from craftsman.huntplan import (
     BUG_LENSES,
     DEEP_MIN_PRODUCTION_LINES,
     DELTA_MAX_CHANGED_LINES,
+    FRESH_DEFAULT_LENSES,
     MAX_VARIANTS_PER_WAVE,
     SLICE_MAX_CHANGED_LINES,
     Depth,
@@ -64,6 +65,7 @@ from craftsman.records import (
     VerdictEvent,
     Wave,
     parse_timestamp,
+    slot_generation,
 )
 from craftsman.review import _plan_round, _PrepareContext, _Prepared
 from craftsman.workspace import Workspace
@@ -701,8 +703,8 @@ def advance(
     waves that are due (`waves=False` leaves the last step out).
 
     A shortcut for tests that need a new round only. It does not store the waves that are due BEFORE
-    opening the round and does not hand `build_plan` the credit; `prepare_round` runs `review._plan_round`
-    itself and is what to use for anything that depends on those steps."""
+    opening the round; `prepare_round` runs `review._plan_round` itself and is what to use for anything
+    that depends on that step."""
     snap = stable_hunk_ids(ledger, make_snap(*hunks, fingerprint=f"fp{len(ledger.rounds) + 2}"))
     required = required_by_hunk(snap.hunks, deep=deep)
     have = credited(ledger, enforced=True)
@@ -722,6 +724,7 @@ def advance(
         pending_wave_slots=pending,
         round_hunks=snap.hunks,
         carry_sweep=carry_sweep,
+        credited=credited(opened, enforced=True),
     )
     round_ = replace(round_, plan=plan)
     opened = replace(opened, rounds=(*opened.rounds[:-1], round_))
@@ -738,6 +741,7 @@ def prepare_round(
     deep: bool = False,
     same: bool = False,
     task: str = "",
+    symbols: Mapping[str, tuple[str, ...]] | None = None,
 ) -> _Prepared:
     """`craftsman review prepare` on `ledger` for `hunks` at `seconds` after T0: `review._plan_round` itself.
 
@@ -755,7 +759,7 @@ def prepare_round(
         allow_scope_expansion=False,
         out_of_scope=(),
         depth=Depth(deep, ("requested with --deep",) if deep else ()),
-        symbols={},
+        symbols=symbols or {},
         explicit_task=task,
         marker_task="",
         now=parse_timestamp(at(seconds + 1)),
@@ -1465,18 +1469,6 @@ class FreshSetIsAUnitTests(unittest.TestCase):
 
         assert third.plan is not None
         self.assertEqual([s.id for s in third.plan.slots if s.kind == "fresh"], [])
-
-    def test_the_rebuilt_lenses_come_from_the_latest_set_only(self) -> None:
-        hunks = [code("H1", "a.py", 300), code("H2", "b.py", 300)]
-        ledger = run_all(hunt(hunks, deep=True, first_deep=True), skip=("W2-X1", "W2-X2"))
-        ledger, _ = advance(ledger, [hunks[0], code("H3", "c.py", 5)], deep=True)
-        assert ledger.rounds[1].plan is not None
-        only = ledger.rounds[1].plan.slot("W2-X1")
-        assert only is not None
-
-        pending = pending_wave_slots(ledger, open_hunks=[code("H3", "c.py", 5)], round_hunks=[code("H3", "c.py", 5)])
-
-        self.assertEqual([(s.id, s.lenses) for s in pending], [("W2-X1", only.lenses)])
 
 
 class AgyPlannerFindingTests(unittest.TestCase):
@@ -2664,6 +2656,311 @@ class ComplementTests(unittest.TestCase):
         self.assertEqual(fresh[("H2",)], ("state", "trust", "platform"))  # the carried hunk had the core five
 
 
+def generation_one_lenses(plan: HuntPlan, hunk_id: str) -> frozenset[str]:
+    return frozenset(lens for slot in plan.slots if slot.generation == 1 and hunk_id in slot.hunks for lens in slot.lenses)
+
+
+def missing_deep_lenses(ledger: Ledger, round_: Round, hunks: Sequence[Hunk]) -> dict[str, frozenset[str]]:
+    """Per open hunk of the deep `round_`, the deep lenses neither its generation 1 slots nor its credit hold.
+
+    The credit is `credited` of the whole ledger, none for a reopened hunk (as `owed_lenses` treats it), so a
+    lens that only a not-yet-run wave slot lists is missing. `hunks` are the diff's hunks, by digest.
+    """
+    assert round_.plan is not None
+    required = required_by_hunk(hunks, deep=True)
+    by_digest = {hunk.digest: hunk.id for hunk in hunks}
+    credit = credited(ledger, enforced=round_.enforced)
+    missing: dict[str, frozenset[str]] = {}
+    for ref in round_.hunks:
+        if ref.carried:
+            continue
+        have = generation_one_lenses(round_.plan, ref.id) | (
+            frozenset() if ref.reopened else credit.get(ref.digest, frozenset())
+        )
+        lacking = required[by_digest[ref.digest]] - have
+        if lacking:
+            missing[ref.id] = lacking
+    return missing
+
+
+class UnrunWaveSlotsAreNotGenerationOneTests(unittest.TestCase):
+    """B5 item 1 (REVIEW-B4 F1): a wave slot that has not run never stands in for generation 1."""
+
+    def waiting_round_two(self) -> tuple[Ledger, Hunk]:
+        h1, h2 = code("H1", "a.py", 50), code("H2", "a.py", 50)
+        ledger = run_all(hunt([h1]), start=100)
+        ledger = record_finding(ledger, path="a.py", lens="contracts", severity="major", verdict="proven", seconds=200)
+        ledger = prepare_round(plan_waves(ledger, 300), [h2], seconds=1000).ledger
+        plan = ledger.rounds[1].plan
+        assert plan is not None
+        self.assertEqual([(s.id, s.lenses) for s in plan.slots if s.generation == 2],
+                         [("W2-X1", ("state", "trust", "platform")), ("W2-F1", ("contracts",))])  # fmt: skip
+        return ledger, h2
+
+    def test_the_wave_slots_have_not_run_so_generation_one_gets_every_deep_lens(self) -> None:
+        ledger, h2 = self.waiting_round_two()
+
+        raised = prepare_round(ledger, [h2], seconds=1100, deep=True, same=True)
+
+        plan = raised.ledger.rounds[1].plan
+        assert plan is not None
+        self.assertEqual(generation_one_lenses(plan, "H2") - {"sweep"}, required_by_hunk([h2], deep=True)["H2"])
+        self.assertEqual({lens for slot in plan.slots if slot.generation == 1 for lens in slot.lenses} - {"sweep"},
+                         set(BUG_LENSES) | set(SIMPLICITY))  # fmt: skip
+        self.assertEqual(missing_deep_lenses(raised.ledger, raised.round, [h2]), {})
+
+    def test_a_wave_slot_that_has_run_is_credit_so_generation_one_adds_the_rest(self) -> None:
+        ledger, h2 = self.waiting_round_two()
+        ledger = run_slot(ledger, "W2-X1", "w2x1", 1050, number=2)  # state, trust, platform examined H2
+
+        raised = prepare_round(ledger, [h2], seconds=1100, deep=True, same=True)
+
+        plan = raised.ledger.rounds[1].plan
+        assert plan is not None
+        added = [slot for slot in plan.slots if slot.generation == 1 and slot.id not in {"W1-1", "W1-2", "W1-3"}]
+        self.assertEqual([slot.lenses for slot in added], [("model",)])
+        self.assertEqual(missing_deep_lenses(raised.ledger, raised.round, [h2]), {})
+
+    def test_only_generation_one_slots_count_as_assigned_lenses(self) -> None:
+        hunk = code("H1", "a.py")
+        existing = HuntPlan((), (make_slot("W1-1", lenses=("intent",)), make_slot("W2-X1", lenses=("state",))))
+        owed = {"H1": frozenset({"intent", "state", "trust"})}
+
+        plan = build_plan(
+            [hunk], owed, depth=Depth(True, ()), round_number=1, first_deep_round=False, existing=existing
+        )
+
+        self.assertEqual([(slot.id, slot.lenses) for slot in plan.slots[2:]], [("W1-2", ("state",)), ("W1-3", ("trust",))])
+
+
+class NoWaveAgainstARoundBeingRefreshedTests(unittest.TestCase):
+    """B5 items 2 and 3 (REVIEW-B4 F2.1 and F2.2): waves wait for the rebuilt plan; the first deep set spans the round."""
+
+    def normal_round_two(self) -> tuple[Ledger, list[Hunk]]:
+        h1, h2 = code("H1", "a.py", 200), code("H2", "b.py", 40)
+        ledger = run_all(hunt([h1, h2]), start=100)
+        hunks = [h1, code("H3", "b.py", 40)]
+        ledger = run_all(prepare_round(ledger, hunks, seconds=1000).ledger, number=2, start=1100)
+        self.assertEqual(ledger.rounds[1].open_hunk_ids, ("H3",))
+        return record_finding(ledger, path="b.py", lens="failure", verdict="proven", seconds=1200), hunks
+
+    def test_an_in_place_deep_raise_plans_no_wave_before_the_new_generation_one_has_run(self) -> None:
+        ledger, hunks = self.normal_round_two()  # the verdict is recorded; no check has stored its wave
+
+        raised = prepare_round(ledger, hunks, seconds=1300, deep=True, same=True)
+
+        plan = raised.ledger.rounds[1].plan
+        assert plan is not None
+        self.assertEqual(raised.round.open_hunk_ids, ("H1", "H3"))  # the carried hunk lacks deep lenses
+        self.assertEqual(plan.waves, ())  # the barrier of generation 1 sees the slots the raise added
+        before = {slot.id for slot in ledger.rounds[1].plan.slots}  # type: ignore[union-attr]
+        self.assertEqual(raised.added_slots, tuple(s.id for s in plan.slots if s.id not in before))
+        self.assertTrue(any(s.generation == 1 for s in plan.slots if s.id in raised.added_slots))
+        self.assertEqual(sorted(h for s in plan.slots if s.kind == "fresh" for h in s.hunks), ["H1", "H3"])
+
+        done = plan_waves(run_all(raised.ledger, number=2, start=1500), 2000)
+        later = done.rounds[1].plan
+        assert later is not None
+        self.assertEqual([wave.considered for wave in later.waves], [("F1",)])
+        self.assertEqual([s.id for s in later.slots if s.kind == "fresh"], [s.id for s in plan.slots if s.kind == "fresh"])
+        self.assertEqual(missing_deep_lenses(done, done.rounds[1], hunks), {})
+
+    def test_an_unchanged_prepare_stores_the_wave_that_became_due_and_reports_its_slots(self) -> None:
+        ledger, hunks = self.normal_round_two()
+        self.assertEqual(wave_ids(ledger, 2), [])
+
+        again = prepare_round(ledger, hunks, seconds=1300, same=True)
+
+        self.assertEqual(again.added_slots, ("W2-X1", "W2-F1"))  # stored after the plan was rebuilt, still stored
+        stored_is_required(self, again.ledger)
+
+    def test_a_wave_stored_by_a_check_before_the_raise_is_topped_up_by_the_static_set(self) -> None:
+        ledger, hunks = self.normal_round_two()
+        ledger = plan_waves(ledger, 1250)  # `check` stored the wave on the round as it was: fresh eyes over H3 only
+        plan = ledger.rounds[1].plan
+        assert plan is not None
+        self.assertEqual([(s.id, s.hunks) for s in plan.slots if s.kind == "fresh"], [("W2-X1", ("H3",))])
+
+        raised = prepare_round(ledger, hunks, seconds=1300, deep=True, same=True)
+
+        after = raised.ledger.rounds[1].plan
+        assert after is not None
+        top_up = after.slot("W2-X2")
+        assert top_up is not None
+        self.assertEqual((top_up.hunks, top_up.trigger, top_up.since), (("H1",), "deep", None))
+        self.assertEqual(top_up.lenses, FRESH_DEFAULT_LENSES)  # the raise gave H1 every other bug lens
+        self.assertEqual(after.waves, plan.waves)  # the wave decision is untouched
+        self.assertNotIn("W2-X2", after.waves[0].slots)
+
+    def test_the_top_up_numbers_after_the_stored_and_the_carried_fresh_slots_and_never_adds_an_empty_one(self) -> None:
+        h1, h2, h3 = code("H1", "a.py"), code("H2", "b.py"), code("H3", "c.py")
+        stored = make_slot("W2-X2", hunks=("H1",), lenses=("state",))
+        carried = make_slot("W2-X5", hunks=("H2",), lenses=("state",))
+
+        def fresh_ids(*, kept: tuple[Slot, ...], pending: tuple[Slot, ...], scope: Sequence[Hunk]) -> list[str]:
+            plan = build_plan(
+                scope, {}, depth=Depth(True, ()), round_number=1, first_deep_round=True,
+                existing=HuntPlan((), kept) if kept else None, pending_wave_slots=pending,
+            )  # fmt: skip
+            return sorted(slot.id for slot in plan.slots if slot.kind == "fresh")
+
+        self.assertEqual(fresh_ids(kept=(stored,), pending=(carried,), scope=[h1, h2, h3]), ["W2-X2", "W2-X5", "W2-X6"])
+        self.assertEqual(fresh_ids(kept=(stored,), pending=(), scope=[h1, h2]), ["W2-X2", "W2-X3"])
+        self.assertEqual(fresh_ids(kept=(stored, carried), pending=(), scope=[h1, h2]), ["W2-X2", "W2-X5"])
+        readme = make_hunk("H9", "README.md", ("+text",))
+        self.assertEqual(fresh_ids(kept=(stored,), pending=(), scope=[h1, readme]), ["W2-X2"])  # documentation is no scope
+
+
+    def test_only_generation_two_fresh_slots_count_as_listing_hunks_of_the_static_set(self) -> None:
+        h1, h2 = code("H1", "a.py"), code("H2", "b.py")
+        gen2 = make_slot("W2-X1", hunks=("H2",), lenses=("state",))
+        gen3 = make_slot("W3-X5", hunks=("H1", "H2"), lenses=("state",))
+
+        def top_up(*, kept: tuple[Slot, ...], pending: tuple[Slot, ...]) -> list[tuple[str, tuple[str, ...], str | None]]:
+            plan = build_plan(
+                [h1, h2], {}, depth=Depth(True, ()), round_number=1, first_deep_round=True,
+                existing=HuntPlan((), kept), pending_wave_slots=pending,
+            )  # fmt: skip
+            return [(s.id, s.hunks, s.trigger) for s in plan.slots if s.kind == "fresh" and s.generation == 2]
+
+        expected = [("W2-X1", ("H2",), "deep"), ("W2-X2", ("H1",), "deep")]  # numbering ignores the generation 3 X5
+        self.assertEqual(sorted(top_up(kept=(gen2, gen3), pending=())), expected)
+        self.assertEqual(sorted(top_up(kept=(gen2,), pending=(gen3,))), expected)
+        only_gen3 = make_slot("W3-X1", hunks=("H1",), lenses=("state",))
+        self.assertEqual(
+            sorted(top_up(kept=(only_gen3, gen2), pending=())), expected
+        )  # a generation 3 set over H1 gives H1 no generation 2 eyes
+
+
+class OneFreshCoverageRuleTests(unittest.TestCase):
+    """B5 item 4 (REVIEW-B4 F2.3): every wave that adds slots leaves its generation's fresh set over its whole scope."""
+
+    def raised_round(self) -> tuple[Ledger, list[Hunk]]:
+        """Round 2 (H1 carried, H3 open) planned waves 2 and 3 over H3 only, then was raised to deep in place."""
+        h1, h2 = code("H1", "a.py", 200), code("H2", "b.py", 40)
+        ledger = run_all(hunt([h1, h2]), start=100)
+        hunks = [h1, code("H3", "b.py", 40)]
+        ledger = run_all(prepare_round(ledger, hunks, seconds=1000).ledger, number=2, start=1100)
+        ledger = record_finding(ledger, path="b.py", lens="failure", verdict="proven", seconds=1200)
+        ledger = run_waves(plan_waves(ledger, 1250), number=2, start=1300)
+        ledger = record_finding(ledger, path="b.py", lens="contracts", verdict="proven", seconds=1400, hunter="W2-X1")
+        ledger = plan_waves(ledger, 1450)
+        self.assertEqual(wave_ids(ledger, 2, generation=3)[:1], ["W3-X1"])
+        raised = prepare_round(ledger, hunks, seconds=1500, deep=True, same=True)
+        return raised.ledger, hunks
+
+    def fresh(self, ledger: Ledger, generation: int) -> list[tuple[str, tuple[str, ...]]]:
+        plan = ledger.rounds[1].plan
+        assert plan is not None
+        return [(s.id, s.hunks) for s in plan.slots if s.kind == "fresh" and s.generation == generation]
+
+    def test_a_set_planned_before_an_in_place_raise_stays_a_decision_of_its_moment(self) -> None:
+        ledger, _ = self.raised_round()
+
+        self.assertEqual(self.fresh(ledger, 3), [("W3-X1", ("H3",))])  # the raise does not top generation 3 up
+        self.assertEqual(self.fresh(ledger, 2), [("W2-X1", ("H3",)), ("W2-X2", ("H1",))])  # generation 2 is, by item 3
+
+    def test_a_later_wave_of_the_generation_tops_the_set_up_over_the_hunks_the_raise_opened(self) -> None:
+        ledger, _ = self.raised_round()
+        ledger = run_all(ledger, number=2, start=2000)
+        ledger = record_finding(ledger, path="a.py", lens="state", verdict="proven", seconds=2500, hunter="W2-X2")
+
+        ledger = plan_waves(ledger, 2600)
+
+        plan = ledger.rounds[1].plan
+        assert plan is not None
+        self.assertEqual(self.fresh(ledger, 3), [("W3-X1", ("H3",)), ("W3-X2", ("H1",))])
+        top_up = plan.slot("W3-X2")
+        assert top_up is not None
+        self.assertEqual((top_up.trigger, top_up.since), ("F3", at(2600)))
+        self.assertIn("W3-X2", plan.waves[-1].slots)
+        stored_is_required(self, ledger)
+
+
+class CarriedFreshSetTests(unittest.TestCase):
+    """B5 items 5 and 6 (REVIEW-B4 F3 and F4): a carried fresh set is rebuilt with fresh lenses, on the credit the round sees."""
+
+    def topped_up_round_two(self) -> Ledger:
+        # 210 production lines (normal depth) + 210 test lines (> 400 in all: two slices)
+        h1_a, h2_b = code("H1", "a.py", 210, (FS_LINE,)), code("H2", "tests/test_b.py", 210)
+        ledger = run_all(hunt([h1_a, h2_b]), start=100)
+        ledger = record_finding(ledger, path="a.py", lens="failure", severity="major", verdict=None, seconds=200)
+        ledger = prepare_round(ledger, [code("H3", "a.py", 210, (FS_LINE,)), h2_b], seconds=1000).ledger
+        ledger = run_all(ledger, number=2, start=1100)
+        ledger = record_finding(ledger, path="a.py", lens="contracts", severity="major", verdict="proven", seconds=1200)
+        ledger = plan_waves(ledger, 1300)  # W2-X1 over the open a.py
+        return plan_waves(judge(ledger, "F1", "proven", 2000), 2100)  # the late round 1 trigger tops it up over tests/test_b.py
+
+    def test_a_carried_set_takes_its_lenses_from_the_new_round_not_from_its_old_slots(self) -> None:
+        ledger = self.topped_up_round_two()
+        plan = ledger.rounds[1].plan
+        assert plan is not None
+        self.assertEqual([(s.id, s.hunks, s.lenses) for s in plan.slots if s.kind == "fresh"],
+                         [("W2-X1", ("H3",), ("model",)), ("W2-X2", ("H2",), ("state", "trust", "platform"))])  # fmt: skip
+
+        third = prepare_round(ledger, [code("H4", "a.py", 210, (FS_LINE,)), code("H2", "tests/test_b.py", 210)], seconds=3000)
+
+        plan = third.round.plan
+        assert plan is not None
+        fresh = {slot.hunks: slot.lenses for slot in plan.slots if slot.kind == "fresh"}
+        self.assertEqual(fresh[("H4",)], ("model",))  # its generation 1 already holds the other eight
+        self.assertEqual(fresh[("H2",)], ("state", "trust", "platform"))  # the carried test hunk had the core five
+
+    def test_the_rebuilt_slots_take_the_trigger_of_the_first_original_and_the_latest_since(self) -> None:
+        ledger = self.topped_up_round_two()
+
+        third = prepare_round(ledger, [code("H4", "a.py", 210, (FS_LINE,)), code("H2", "tests/test_b.py", 210)], seconds=3000)
+
+        plan = third.round.plan
+        assert plan is not None
+        self.assertEqual([(s.id, s.trigger, s.since) for s in plan.slots if s.kind == "fresh"],
+                         [("W2-X1", "F2", at(2100)), ("W2-X2", "F2", at(2100))])  # fmt: skip
+
+    def test_a_set_that_mixes_a_static_slot_and_a_topped_up_one_is_rebuilt_without_error(self) -> None:
+        hunks = [code("H1", "a.py", 300), code("H2", "b.py", 300)]
+        ledger = run_all(hunt(hunks, deep=True, first_deep=True), skip=("W2-X1", "W2-X2"))
+        round_ = ledger.rounds[0]
+        assert round_.plan is not None
+        mixed = tuple(
+            replace(slot, trigger="F1", since=at(500)) if slot.id == "W2-X2" else slot for slot in round_.plan.slots
+        )
+        self.assertEqual([(s.trigger, s.since) for s in mixed if s.kind == "fresh"], [("deep", None), ("F1", at(500))])
+        ledger = replace(ledger, rounds=(replace(round_, plan=replace(round_.plan, slots=mixed)),))
+
+        out = prepare_round(ledger, [code("H3", "a.py", 300), code("H4", "b.py", 300)], seconds=1000, deep=True)
+
+        plan = out.round.plan
+        assert plan is not None
+        self.assertEqual([(s.id, s.trigger, s.since) for s in plan.slots if s.kind == "fresh"],
+                         [("W2-X1", "deep", at(500)), ("W2-X2", "deep", at(500))])  # fmt: skip
+
+    def test_the_set_of_a_single_static_slot_keeps_no_since(self) -> None:
+        ledger = hunt([code("H1", "a.py")], deep=True, first_deep=True)
+
+        out = prepare_round(ledger, [code("H2", "a.py")], seconds=1000, deep=True)
+
+        plan = out.round.plan
+        assert plan is not None
+        self.assertEqual([(s.id, s.trigger, s.since) for s in plan.slots if s.kind == "fresh"], [("W2-X1", "deep", None)])
+
+    def test_complements_use_the_credit_of_the_round_being_planned_so_a_reopened_hunk_has_none(self) -> None:
+        h1 = code("H1", "a.py", 50, ("+def foo(): return 1",))
+        h2 = code("H2", "tests/test_a.py", 300, ("+assert foo() == 1",))
+        ledger = run_all(hunt([h1, h2]), start=100)
+        ledger = record_finding(ledger, path="a.py", lens="contracts", severity="major", verdict="proven", seconds=200)
+        ledger = run_waves(plan_waves(ledger, 300), number=1, start=400)  # W2-X1 examined H2 with state, trust, platform
+
+        # round 2 is deep and edits foo, which reopens the test hunk H2: round 1's credit of it is void
+        h3 = code("H3", "a.py", 300, ("+def foo(): return 2",))
+        out = prepare_round(ledger, [h3, h2], seconds=1000, deep=True, symbols={"H3": ("foo",), "H2": ("foo",)})
+
+        self.assertEqual([(ref.id, ref.carried, ref.reopened) for ref in out.round.hunks], [("H3", False, False), ("H2", False, True)])
+        plan = out.round.plan
+        assert plan is not None
+        fresh = {slot.hunks: slot.lenses for slot in plan.slots if slot.kind == "fresh"}
+        self.assertEqual(fresh[("H2",)], ("state", "trust", "platform"))
+
+
 class RandomSequenceTests(unittest.TestCase):
     """Whatever order prepare, hunters, verdicts and edits come in, the stored plan is the whole truth."""
 
@@ -2690,7 +2987,7 @@ class RandomSequenceTests(unittest.TestCase):
             action = rng.choice(
                 ("finish", "finish", "finding", "finding", "tagged", "judge", "claim", "merge", "edit", "deep", "late",
                  "waves", "waves", "wave finding", "wave finding", "last wave finding", "last wave finding",
-                 "reprepare", "reprepare", "new task", "raise in place")
+                 "reprepare", "reprepare", "new task", "raise in place", "raise after waves", "raise after waves")
             )  # fmt: skip
             before = ledger
             latest = ledger.rounds[-1]
@@ -2747,10 +3044,21 @@ class RandomSequenceTests(unittest.TestCase):
                 if rng.random() < 0.7 or action == "deep":
                     hunks.append(new_hunk(rng.choice(self.PATHS)))
                 deep = action == "deep" or any(r.deep for r in ledger.rounds)
-                ledger = prepare_round(ledger, hunks, seconds=clock + 300, deep=deep).ledger
-            elif action in ("reprepare", "new task", "raise in place"):
+                result = prepare_round(ledger, hunks, seconds=clock + 300, deep=deep)
+                self.check_prepared(result, hunks, latest)
+                ledger = result.ledger
+            elif action in ("reprepare", "new task", "raise in place", "raise after waves"):
                 # the same diff again, through the code `prepare` runs: nothing may be forgotten
-                deep = action == "raise in place" or any(r.deep for r in ledger.rounds)
+                if action == "raise after waves":  # the wave slots ran, then the round turns deep in place
+                    if not any(s.generation >= 2 for s in plan.slots):  # make a wave due first
+                        for index, slot in enumerate(plan.slots):
+                            ledger = run_slot(ledger, slot.id, f"r{seed}-{step}-{index}", clock + 2 * index, number=latest.number)
+                        ledger = record_finding(
+                            ledger, lens=rng.choice(self.LENSES), path=rng.choice(self.PATHS), seconds=clock + 60
+                        )
+                        ledger = plan_waves(ledger, clock + 100)
+                    ledger = run_waves(ledger, number=latest.number, start=clock + 101)
+                deep = action in ("raise in place", "raise after waves") or any(r.deep for r in ledger.rounds)
                 task = f"task {step}" if action == "new task" else ""
                 result = prepare_round(ledger, hunks, seconds=clock + 300, deep=deep, same=True, task=task)
                 self.reached[action].add(self.seed)
@@ -2760,11 +3068,61 @@ class RandomSequenceTests(unittest.TestCase):
                     self.reached["raised in place"].add(self.seed)
                 if result.added_slots:
                     self.reached["in-place slots added"].add(self.seed)
+                self.check_prepared(result, hunks, latest)
                 ledger = result.ledger
             ledger = plan_waves(ledger, clock + 400)
             self.check(before, ledger, seen)
 
+    def check_prepared(self, result: _Prepared, hunks: Sequence[Hunk], latest: Round) -> None:
+        """What every prepare of a deep round leaves behind (B5 invariants (a) and the second half of (b))."""
+        round_, plan = result.round, result.round.plan
+        assert plan is not None
+        if result.created and any(s.kind == "fresh" for s in latest.plan.slots) and any(s.kind == "fresh" for s in plan.slots):  # type: ignore[union-attr]
+            self.reached["fresh set carried"].add(self.seed)
+        if not round_.deep:
+            return
+        self.reached["deep prepared"].add(self.seed)
+        self.assertEqual(missing_deep_lenses(result.ledger, round_, hunks), {}, f"seed {self.seed}")  # (a)
+        if not result.created and not latest.deep and any(
+            c.round == latest.number and c.hunter is not None and (slot_generation(c.hunter) or 1) >= 2
+            for c in result.ledger.coverage
+        ):
+            self.reached["raised after a wave ran"].add(self.seed)
+        if not any(r.deep for r in result.ledger.rounds[:-1]):  # the first deep round: its static set spans the round
+            listed = {hunk for s in plan.slots if s.kind == "fresh" and s.generation == 2 for hunk in s.hunks}
+            self.assertLessEqual({ref.id for ref in round_.hunks}, listed, f"seed {self.seed}")  # (b)
+            self.reached["first deep round"].add(self.seed)
+
+    def check_fresh_sets(self, before: Ledger, ledger: Ledger) -> None:
+        """B5 invariants (b), per wave this action recorded, and (c), for every fresh slot."""
+        for round_ in ledger.rounds:
+            assert round_.plan is not None
+            old = before.rounds[round_.number - 1].plan if round_.number <= len(before.rounds) else None
+            for wave in round_.plan.waves[len(old.waves) if old is not None else 0 :]:
+                if not wave.slots:
+                    continue
+                from_earlier = any(f.round < round_.number for f in ledger.findings if f.id in wave.considered)
+                open_ids = {ref.id for ref in round_.hunks if not ref.carried}
+                everything = {ref.id for ref in round_.hunks}  # the sequences use .py paths only
+                scope = open_ids if open_ids and not from_earlier else everything
+                listed = {
+                    hunk
+                    for slot in round_.plan.slots
+                    if slot.kind == "fresh" and slot.generation == wave.generation
+                    for hunk in slot.hunks
+                }
+                self.assertLessEqual(scope, listed, f"seed {self.seed}: wave {wave.considered} of round {round_.number}")  # (b)
+                self.reached["wave scope checked"].add(self.seed)
+            for index, slot in enumerate(round_.plan.slots):
+                if slot.kind != "fresh" or slot.lenses == FRESH_DEFAULT_LENSES:
+                    continue
+                for earlier in round_.plan.slots[:index]:
+                    if earlier.generation == 1 and set(earlier.hunks) & set(slot.hunks):
+                        self.assertFalse(set(earlier.lenses) & set(slot.lenses), f"seed {self.seed}: {slot.id} repeats {earlier.id}")  # (c)
+                self.reached["fresh complement checked"].add(self.seed)
+
     def check(self, before: Ledger, ledger: Ledger, seen: dict[int, tuple[str, ...]]) -> None:
+        self.check_fresh_sets(before, ledger)
         stored_is_required(self, ledger)
         self.assertIs(plan_waves(ledger, 99999), ledger)  # planning twice is planning once
         answered = {fid for r in before.rounds if r.plan is not None for w in r.plan.waves for fid in w.considered}
@@ -2825,6 +3183,9 @@ class RandomSequenceTests(unittest.TestCase):
         self.assertGreater(len(self.reached["raised in place"]), 30)
         self.assertGreater(len(self.reached["late trigger"]), 5)
         self.assertGreater(len(self.reached["in-place slots added"]), 30)
+        for name in ("deep prepared", "first deep round", "raised after a wave ran", "fresh set carried",
+                     "wave scope checked", "fresh complement checked"):  # fmt: skip
+            self.assertGreater(len(self.reached[name]), 20, name)
 
 
 if __name__ == "__main__":
