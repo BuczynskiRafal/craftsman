@@ -311,6 +311,8 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Run.output_tail",
         "Run.fingerprint_after",
         "Run.waiver",
+        "Run.tests_ran",
+        "Run.min_tests",
         # AgentEvent
         "AgentEvent.platform",
         "AgentEvent.event",

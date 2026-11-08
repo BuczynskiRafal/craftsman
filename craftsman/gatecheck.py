@@ -29,6 +29,7 @@ from craftsman.diffscan import DiffSnapshot
 from craftsman.huntplan import plan_due_waves, required_slots, slots_missing, window_slots
 from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
+    MIN_TESTS_HINT,
     REVIEWER_AGENT,
     Finding,
     IsolationEvidence,
@@ -44,7 +45,12 @@ from craftsman.records import (
     parse_timestamp,
 )
 from craftsman.text import defang_tokens, inline_md
-from craftsman.triviality import command_without_env, is_trivial_run
+from craftsman.triviality import (
+    PASSING_KINDS,
+    command_without_env,
+    counts_as_verification,
+    is_trivial_run,
+)
 
 IssueCode = Literal[
     "no-round",
@@ -73,7 +79,6 @@ SUMMARY_RECENT_RUNS = 3
 MAX_ROUNDS = 5
 # Process anomalies: patterns typical of a review that was recorded rather than performed.
 ANOMALY_MIN_FINDINGS = 5
-PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
 _VERIFYING_KINDS: tuple[RunKind, ...] = ("test", "e2e", "lint", "build")
 
 MAX_LISTED_SLOTS = 12
@@ -1017,37 +1022,50 @@ def _unresolved_issues(ledger: Ledger, snap: DiffSnapshot) -> list[GateIssue]:
 
 
 def _counting_runs(ledger: Ledger, kinds: Sequence[RunKind]) -> list[Run]:
-    return [run for run in ledger.runs if run.kind in kinds and not is_trivial_run(run.argv)]
+    return [run for run in ledger.runs if run.kind in kinds and not is_trivial_run(run.argv, run.kind)]
 
 
 def passing_runs(ledger: Ledger, fingerprint: str) -> list[Run]:
     """The non-trivial test and e2e runs that passed at `fingerprint`: what the gate counts."""
     return [
-        run
-        for run in _counting_runs(ledger, PASSING_KINDS)
-        if run.counts_as_passing and run.fingerprint == fingerprint
+        run for run in ledger.runs if run.fingerprint == fingerprint and counts_as_verification(run)
     ]
+
+
+def _too_few_tests_note(ledger: Ledger, snap: DiffSnapshot) -> str:
+    """" (R3 ran 0 tests (minimum 1))": the test runs at this code that exited 0 but ran too few tests."""
+    short = [
+        run.tests_shortfall
+        for run in ledger.runs
+        if run.fingerprint == snap.fingerprint
+        and run.too_few_tests
+        and not is_trivial_run(run.argv, run.kind)
+    ]
+    return f" ({'; '.join(short)})" if short else ""
+
+
+def _with_min_tests_hint(message: str, note: str) -> str:
+    """`message`, and when `note` names a run with too few tests, how to proceed if that count is right."""
+    return f"{message} {MIN_TESTS_HINT}" if note else message
 
 
 def _passing_run_issues(ledger: Ledger, snap: DiffSnapshot, policy: GatePolicy) -> list[GateIssue]:
     passing = passing_runs(ledger, snap.fingerprint)
     issues: list[GateIssue] = []
     if not passing:
-        issues.append(
-            GateIssue(
-                "no-passing-run",
-                "No passing test or e2e run at the current code; "
-                "run `craftsman run --kind test -- <your test command>`.",
-            )
+        note = _too_few_tests_note(ledger, snap)
+        message = (
+            f"No passing test or e2e run at the current code{note}; "
+            "run `craftsman run --kind test -- <your test command>`."
         )
+        issues.append(GateIssue("no-passing-run", _with_min_tests_hint(message, note)))
     elif policy.deep and not any(run.kind == "test" for run in passing):
-        issues.append(
-            GateIssue(
-                "no-passing-run",
-                "A deep gate needs a passing test run as well as the e2e run at the current "
-                "code; run `craftsman run --kind test -- <your test command>`.",
-            )
+        note = _too_few_tests_note(ledger, snap)
+        message = (
+            "A deep gate needs a passing test run as well as the e2e run at the current "
+            f"code{note}; run `craftsman run --kind test -- <your test command>`."
         )
+        issues.append(GateIssue("no-passing-run", _with_min_tests_hint(message, note)))
     if policy.deep and not any(run.kind == "e2e" for run in passing):
         issues.append(
             GateIssue(
@@ -1332,7 +1350,17 @@ def _warnings(ledger: Ledger, *, review_only: bool = False) -> tuple[str, ...]:
     warnings.extend(
         f"{run.id} (`{run.command}`) is trivial and does not count as verification."
         for run in ledger.runs
-        if is_trivial_run(run.argv)
+        if is_trivial_run(run.argv, run.kind)
+    )
+    warnings.extend(
+        f"{run.tests_shortfall}; it does not count as a passing run."
+        for run in ledger.runs
+        if run.too_few_tests
+    )
+    warnings.extend(
+        f"{run.id} reported 0 tests and passes only because it ran with --min-tests 0; tell the user."
+        for run in ledger.runs
+        if run.switched_off_test_minimum and run.counts_as_passing
     )
     warnings.extend(_process_anomaly_warnings(ledger))
     return tuple(warnings)
@@ -1413,7 +1441,7 @@ def _runs_summary(ledger: Ledger, snap: DiffSnapshot) -> str:
     if not ledger.runs:
         return "Runs: none recorded."
     recent = ", ".join(
-        f"{run.id} {run.kind} `{run.short_command}` exit {run.exit_code} "
+        f"{run.id} {run.kind} `{run.short_command}` {run.exit_text} "
         f"({'current' if run.fingerprint == snap.fingerprint else 'stale'})"
         for run in ledger.runs[-SUMMARY_RECENT_RUNS:]
     )

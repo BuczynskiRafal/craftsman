@@ -24,7 +24,7 @@ from craftsman.generated import ExportError
 from craftsman.hooks import main as hook_main
 from craftsman.huntview import STALE_NOTE
 from craftsman.install import install_main
-from craftsman.ledger import ledger_path_for, load, uncovered_hunks
+from craftsman.ledger import backups_of, ledger_path_for, load, uncovered_hunks
 from craftsman.manifest import InstallError
 from craftsman.paths import default_repo_dir
 from craftsman.playbooks import (
@@ -33,7 +33,7 @@ from craftsman.playbooks import (
     expand_playbook_lenses,
     lens_playbooks,
 )
-from craftsman.records import VERDICTS, Ledger, LedgerError
+from craftsman.records import VERDICTS, Ledger, LedgerError, NewerSchemaError, OlderSchemaError
 from craftsman.review import main as review_main
 from craftsman.runner import main as run_main
 from craftsman.scope import main as scope_guard_main
@@ -53,6 +53,7 @@ class RunSummary:
     kind: str
     command: str
     exit_code: int
+    exit_text: str  # "exit 0", or "exit 0, 0 tests - not counted" for a run that ran too few tests
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,7 @@ class LedgerOverview:
             verdicts=verdicts,
             resolved=sum(finding.resolution is not None for finding in ledger.findings),
             latest_runs=tuple(
-                RunSummary(run.id, run.kind, run.command, run.exit_code)
+                RunSummary(run.id, run.kind, run.command, run.exit_code, run.exit_text)
                 for run in ledger.runs[-LATEST_RUNS_SHOWN:]
             ),
             agent_usage=usage_json(ledger),
@@ -135,7 +136,7 @@ class LedgerOverview:
             f"{'no verdict' if name == 'none' else name} {count}"
             for name, count in self.verdicts.items()
         )
-        runs = ", ".join(f"{run.id} {run.kind} exit {run.exit_code}" for run in self.latest_runs)
+        runs = ", ".join(f"{run.id} {run.kind} {run.exit_text}" for run in self.latest_runs)
         return (
             f"{self.rounds} round(s){', deep' if self.deep else ''}, {self._progress()}{self._freshness()}; findings {self.findings} ({verdicts}, "
             f"resolved {self.resolved}); latest runs: {runs or 'none'}{usage_summary(self.agent_usage)}"
@@ -165,16 +166,35 @@ class StatusReport:
     diff: DiffSummary
     ledger: LedgerOverview | None
     ledger_error: str | None
+    ledger_path: str
+    # Why the evidence cannot be shown: "newer-schema", "older-schema" or "invalid"; None when it can.
+    ledger_problem: str | None
+    ledger_backups: tuple[str, ...]  # ledgers set aside by an upgrade, next to the ledger
+
+    @property
+    def ledger_broken(self) -> bool:
+        """The ledger exists but cannot be used by this craftsman (an older one is merely set aside later)."""
+        return self.ledger_problem in ("newer-schema", "invalid")
 
     @classmethod
     def of(
         cls, state_path: Path, state: GateState | None, root: Path, snap: DiffSnapshot
     ) -> StatusReport:
-        try:
-            overview: LedgerOverview | None = LedgerOverview.of(load(ledger_path_for(root)), snap)
-            ledger_error = None
+        ledger_path = ledger_path_for(root)
+        overview: LedgerOverview | None = None
+        ledger_error, problem = None, None
+        try:  # status only looks: it never sets an older ledger aside
+            overview = LedgerOverview.of(load(ledger_path, set_aside=False), snap)
+        except NewerSchemaError as exc:
+            ledger_error, problem = str(exc), "newer-schema"
+        except OlderSchemaError as exc:
+            ledger_error = (
+                f"{ledger_path} was written by an older craftsman (schema {exc.schema}); "
+                "the next review command that writes sets it aside and starts a new review"
+            )
+            problem = "older-schema"
         except LedgerError as exc:
-            overview, ledger_error = None, str(exc)
+            ledger_error, problem = _named_by_path(ledger_path, str(exc)), "invalid"
         deep = bool(state is not None and state.deep) or bool(overview is not None and overview.deep)
         return cls(
             state_file=str(state_path),
@@ -190,7 +210,17 @@ class StatusReport:
             diff=DiffSummary(len(snap.files), snap.added, snap.deleted, snap.added + snap.deleted),
             ledger=overview,
             ledger_error=ledger_error,
+            ledger_path=str(ledger_path),
+            ledger_problem=problem,
+            ledger_backups=tuple(str(backup) for backup in backups_of(ledger_path)),
         )
+
+
+def _named_by_path(path: Path, message: str) -> str:
+    """`message` led by `path` once: loader errors already carry the path or only the file name."""
+    if str(path) in message:
+        return message
+    return f"{path}: {message.removeprefix(f'{path.name}: ')}"
 
 
 def _status_base_and_scope(
@@ -199,7 +229,7 @@ def _status_base_and_scope(
     if state is not None and state.active:
         return state.base_sha, None
     try:
-        ledger = load(ledger_path_for(root))
+        ledger = load(ledger_path_for(root), set_aside=False)
     except LedgerError:
         ledger = Ledger()
     if ledger.rounds:
@@ -221,11 +251,11 @@ def run_status(cwd: str | None, *, as_json: bool) -> int:
     report = StatusReport.of(state_path, state, root, snap)
     if as_json:
         sys.stdout.write(json.dumps(asdict(report), indent=2, ensure_ascii=False) + "\n")
-        return 0
+        return 1 if report.ledger_broken else 0
     if report.ledger is not None:
         evidence = report.ledger.describe()
     else:
-        evidence = f"unavailable ({report.ledger_error})"
+        evidence = f"UNAVAILABLE - {report.ledger_error}"
     print(f"Craftsman Status (v{__version__})")
     print(f"  Active         : {report.active}")
     print(f"  Owner          : {state.owner.describe() if state is not None else 'none'}")
@@ -237,7 +267,11 @@ def run_status(cwd: str | None, *, as_json: bool) -> int:
         f"  Cumulative Diff: {diff.changed_files} files, +{diff.added_lines}/-{diff.deleted_lines} lines"
     )
     print(f"  Evidence       : {evidence}")
-    return 0
+    for backup in report.ledger_backups:
+        print(f"  Set-aside ledger: {backup}")
+    if report.ledger_broken:
+        sys.stderr.write(f"craftsman status: error: the review ledger is unusable: {report.ledger_error}\n")
+    return 1 if report.ledger_broken else 0
 
 
 # --- skills ---------------------------------------------------------------------------------

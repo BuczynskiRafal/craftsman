@@ -21,6 +21,8 @@ from craftsman.records import (
     LedgerError,
     QualitySignal,
     Round,
+    Run,
+    RunKind,
     SignalKind,
     Slot,
     SlotClaim,
@@ -116,7 +118,7 @@ class SerializationTests(unittest.TestCase):
                 {**ledger_json(), "schema": 2},
                 "schema 2 is from an older craftsman; run `craftsman review reset` to archive it",
             ),
-            ({**ledger_json(), "schema": 5}, "schema 5 is not supported (expected 4)"),
+            ({**ledger_json(), "schema": 5}, "this ledger was written by a newer Craftsman (schema 5); upgrade craftsman"),
             ([], "ledger.json: must be a JSON object"),
         ]
         for raw, message in cases:
@@ -187,6 +189,77 @@ class RunRecordTests(unittest.TestCase):
 
         self.assertEqual(self.recorded.short_command, "pytest -q")
         self.assertEqual(long_run.short_command, "python3 -c " + "x" * 48 + "…")
+
+    def test_a_test_run_must_report_at_least_its_minimum_of_tests(self) -> None:
+        cases: list[tuple[RunKind, int | None, int, bool, str]] = [
+            # kind, tests_ran, min_tests, counts, shortfall
+            ("test", None, 1, True, ""),
+            ("test", 1, 1, True, ""),
+            ("test", 40, 5, True, ""),
+            ("test", 0, 1, False, "R1 ran 0 tests (minimum 1)"),
+            ("test", 1, 2, False, "R1 ran 1 test (minimum 2)"),
+            ("test", 0, 0, True, ""),
+            ("e2e", 0, 1, True, ""),
+            ("other", 0, 1, True, ""),
+        ]
+        for kind, ran, minimum, counts, shortfall in cases:
+            with self.subTest(kind=kind, ran=ran, minimum=minimum):
+                run = replace(self.recorded, kind=kind, tests_ran=ran, min_tests=minimum)
+                self.assertEqual(run.counts_as_passing, counts)
+                self.assertEqual(run.too_few_tests, not counts)
+                self.assertEqual(run.tests_shortfall, shortfall)
+
+    def test_a_run_that_ran_too_few_tests_says_so_next_to_its_exit_code(self) -> None:
+        self.assertEqual(self.recorded.exit_text, "exit 0")
+        self.assertEqual(replace(self.recorded, tests_ran=0).exit_text, "exit 0, 0 tests - not counted")
+        self.assertEqual(
+            replace(self.recorded, tests_ran=1, min_tests=2).exit_text, "exit 0, 1 test - not counted"
+        )
+        self.assertEqual(replace(self.recorded, tests_ran=0, min_tests=0).exit_text, "exit 0")
+        self.assertEqual(replace(self.recorded, exit_code=1, tests_ran=0).exit_text, "exit 1")
+        self.assertTrue(replace(self.recorded, tests_ran=0, min_tests=0).switched_off_test_minimum)
+        self.assertFalse(replace(self.recorded, tests_ran=3, min_tests=0).switched_off_test_minimum)
+
+    def test_a_failing_or_tree_changing_run_is_not_too_few_tests(self) -> None:
+        failing = replace(self.recorded, exit_code=1, tests_ran=0)
+        changed = replace(self.recorded, tests_ran=0, fingerprint_after="fp2")
+
+        self.assertFalse(failing.counts_as_passing)
+        self.assertFalse(failing.too_few_tests)
+        self.assertFalse(changed.counts_as_passing)
+        self.assertFalse(changed.too_few_tests)
+
+    def test_test_counts_must_not_be_negative(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "tests_ran must be >= 0 or null"):
+            replace(self.recorded, tests_ran=-1)
+        with self.assertRaisesRegex(LedgerError, "min_tests must be >= 0"):
+            replace(self.recorded, min_tests=-1)
+
+    def test_test_counts_round_trip_and_are_optional_on_read(self) -> None:
+        counted = replace(self.recorded, tests_ran=0, min_tests=3)
+        raw = counted.to_json()
+        older = {key: value for key, value in self.recorded.to_json().items() if key not in ("tests_ran", "min_tests")}
+
+        self.assertEqual((raw["tests_ran"], raw["min_tests"]), (0, 3))
+        self.assertEqual(Run.from_json(json.loads(json.dumps(raw))), counted)
+        loaded = Run.from_json(older)
+        self.assertEqual((loaded.tests_ran, loaded.min_tests), (None, 1))
+        self.assertEqual(loaded, self.recorded)
+        with self.assertRaisesRegex(LedgerError, "tests_ran must be an integer or null"):
+            Run.from_json({**raw, "tests_ran": "many"})
+        with self.assertRaisesRegex(LedgerError, "min_tests must be an integer"):
+            Run.from_json({**raw, "min_tests": None})
+
+    def test_a_ledger_without_the_new_run_fields_loads_and_stays_schema_4(self) -> None:
+        raw = ledger_json()
+        for run in raw["runs"]:
+            run.pop("tests_ran")
+            run.pop("min_tests")
+
+        loaded = Ledger.from_json(raw)
+
+        self.assertEqual({run.tests_ran for run in loaded.runs}, {None})
+        self.assertEqual(loaded.to_json()["schema"], 4)
 
 
 def schema_3_json() -> dict[str, Any]:
@@ -327,7 +400,7 @@ class SchemaTests(unittest.TestCase):
         for schema, message in (
             (2, "schema 2 is from an older craftsman; run `craftsman review reset` to archive it"),
             (1, "schema 1 is from an older craftsman"),
-            (5, "schema 5 is not supported (expected 4); upgrade craftsman"),
+            (5, "this ledger was written by a newer Craftsman (schema 5); upgrade craftsman"),
         ):
             with self.subTest(schema=schema):
                 assert_rejected(self, {**ledger_json(), "schema": schema}, message)
@@ -337,6 +410,19 @@ class SchemaTests(unittest.TestCase):
         raw["findings"][0]["surprise"] = 1
 
         assert_rejected(self, raw, "findings[0].surprise is not a known field")
+
+    def test_unknown_fields_are_all_named_and_blamed_on_a_newer_craftsman(self) -> None:
+        raw = ledger_json()
+        raw["findings"][0]["surprise"] = 1
+        assert_rejected(self, raw, "a newer Craftsman may have written it")
+
+        top = {**ledger_json(), "zeta": 1, "alpha": 2}
+        assert_rejected(self, top, "alpha is not a known field (also unknown: zeta)")
+        assert_rejected(self, top, "a newer Craftsman may have written them")
+
+        nested = ledger_json()
+        nested["runs"][0].update({"b_field": 1, "a_field": 2})
+        assert_rejected(self, nested, "runs[0].a_field is not a known field (also unknown: b_field)")
 
     def test_stop_event_records_may_be_claims_coverage_findings_or_verdicts(self) -> None:
         stop = AgentEvent("claude", "stop", "craftsman-reviewer", "a", at(1), records=("B1", "C3", "F2", "V4"))

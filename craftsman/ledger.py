@@ -10,6 +10,7 @@ through an agent-facing CLI command: subagent isolation evidence has to come fro
 from __future__ import annotations
 
 import errno
+import glob
 import json
 import os
 import re
@@ -26,9 +27,11 @@ from typing import Literal, TypeVar, cast
 from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
 from craftsman.files import write_text_atomic
 from craftsman.records import (
+    DEFAULT_MIN_TESTS,
     GROUPED_EVIDENCE_PREFIX,
     LEDGER_FILENAME,
     MIN_READABLE_SCHEMA,
+    SCHEMA_VERSION,
     SEVERITIES,
     AgentEvent,
     Coverage,
@@ -37,6 +40,8 @@ from craftsman.records import (
     HunkRef,
     Ledger,
     LedgerError,
+    NewerSchemaError,
+    OlderSchemaError,
     QualitySignal,
     Resolution,
     Round,
@@ -169,8 +174,13 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def load(path: Path) -> Ledger:
-    """Read the ledger at `path`; a missing file is an empty ledger."""
+def load(path: Path, *, set_aside: bool = True) -> Ledger:
+    """Read the ledger at `path`; a missing file is an empty ledger.
+
+    A ledger of an older craftsman is set aside under a unique name and read as empty; with
+    `set_aside=False` (read-only callers) it raises `OlderSchemaError` and nothing moves. A ledger of
+    a NEWER craftsman always raises `NewerSchemaError`: it is never read as empty, set aside or rewritten.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -183,18 +193,42 @@ def load(path: Path) -> Ledger:
         raise LedgerError(
             f"{path} is not valid JSON ({exc}); restore it or archive it with `craftsman review reset`"
         ) from exc
-    if _unreadable_schema(raw) is not None:
+    schema = _schema_of(raw)
+    if schema is not None and schema > SCHEMA_VERSION:
+        raise NewerSchemaError(schema, path)
+    older = _unreadable_schema(raw)
+    if older is not None:
+        if not set_aside:
+            raise OlderSchemaError(older)
         _set_aside_older_ledger(path)
         return load(path)  # the old ledger is gone: empty, or a new one written meanwhile
     return Ledger.from_json(raw)
 
 
+def refuse_newer_schema(path: Path) -> None:
+    """Raise `NewerSchemaError` when the file at `path` is a ledger of a newer craftsman; else do nothing.
+
+    For callers that move the file without loading it (`craftsman review reset`): a ledger this
+    craftsman cannot read must stay where the newer craftsman expects it. An unreadable or corrupt
+    file is no concern of this check.
+    """
+    try:
+        schema = _schema_of(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return
+    if schema is not None and schema > SCHEMA_VERSION:
+        raise NewerSchemaError(schema, path)
+
+
+def _schema_of(raw: object) -> int | None:
+    schema = raw.get("schema") if isinstance(raw, dict) else None
+    return schema if isinstance(schema, int) and not isinstance(schema, bool) else None
+
+
 def _unreadable_schema(raw: object) -> int | None:
     """The schema of a ledger this craftsman cannot read because it is too old; None otherwise."""
-    schema = raw.get("schema") if isinstance(raw, dict) else None
-    if isinstance(schema, int) and not isinstance(schema, bool) and schema < MIN_READABLE_SCHEMA:
-        return schema
-    return None
+    schema = _schema_of(raw)
+    return schema if schema is not None and schema < MIN_READABLE_SCHEMA else None
 
 
 def _set_aside_older_ledger(path: Path) -> None:
@@ -211,7 +245,7 @@ def _set_aside_older_ledger(path: Path) -> None:
         schema = _unreadable_schema(current)
         if schema is None:
             return
-        backup = path.with_name(f"{path.stem}.v{schema}.bak{path.suffix}")
+        backup = _free_backup_path(path, schema)
         try:
             os.replace(path, backup)
         except FileNotFoundError:
@@ -222,6 +256,43 @@ def _set_aside_older_ledger(path: Path) -> None:
         f"[craftsman] Archived the review ledger of an older craftsman to {backup.name}; "
         "starting a new review.\n"
     )
+
+
+_BACKUP_NAME_RE = re.compile(r"\.v(?P<schema>\d+)(?:\.(?P<stamp>\d{8}T\d{6}Z))?(?:\.(?P<counter>\d+))?\.bak(?:\..*)?")
+
+
+def _free_backup_path(path: Path, schema: int) -> Path:
+    """`ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json`, with a counter before `.bak` when it exists.
+
+    Always a name no file has: an earlier backup is never overwritten. The caller holds the ledger lock.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{path.stem}.v{schema}.{stamp}"
+    candidate = path.with_name(f"{base}.bak{path.suffix}")
+    counter = 1
+    while candidate.exists():
+        counter += 1
+        candidate = path.with_name(f"{base}.{counter}.bak{path.suffix}")
+    return candidate
+
+
+def backups_of(path: Path) -> tuple[Path, ...]:
+    """The ledgers set aside next to `path` (`ledger.v<schema>[.<stamp>][.<counter>].bak.json`), oldest first.
+
+    Ordered by schema number, then stamp (the old unstamped name first), then counter (no counter first).
+    """
+    try:
+        found = path.parent.glob(f"{glob.escape(path.stem)}.v[0-9]*.bak{path.suffix}")
+        return tuple(sorted(found, key=lambda backup: _backup_order(path, backup)))
+    except OSError:
+        return ()
+
+
+def _backup_order(ledger: Path, backup: Path) -> tuple[int, str, int, str]:
+    match = _BACKUP_NAME_RE.fullmatch(backup.name.removeprefix(ledger.stem))
+    if match is None:  # the glob is looser than the naming scheme: keep such a name last, in name order
+        return (sys.maxsize, "", 0, backup.name)
+    return (int(match["schema"]), match["stamp"] or "", int(match["counter"] or 1), backup.name)
 
 
 def save(path: Path, ledger: Ledger) -> None:
@@ -835,7 +906,7 @@ def set_verdict(
     finding = _find(ledger, finding_id)
     if run_id is not None:
         run = _find_run(ledger, run_id)
-        if is_trivial_run(run.argv):
+        if is_trivial_run(run.argv, run.kind):
             raise FieldError(
                 "verdict_run",
                 f"{run_id} (`{run.command}`) is trivial and proves nothing; record the command that "
@@ -939,6 +1010,8 @@ def add_run(
     started_at: str,
     output_tail: str,
     fingerprint_after: str | None,
+    tests_ran: int | None = None,
+    min_tests: int = DEFAULT_MIN_TESTS,
 ) -> tuple[Ledger, Run]:
     """Append a verification run under the next free run id."""
     run = Run(
@@ -952,6 +1025,8 @@ def add_run(
         started_at=started_at,
         output_tail=output_tail,
         fingerprint_after=fingerprint_after,
+        tests_ran=tests_ran,
+        min_tests=min_tests,
     )
     return replace(ledger, runs=(*ledger.runs, run)), run
 

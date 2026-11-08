@@ -12,6 +12,7 @@ import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -21,6 +22,7 @@ from craftsman.ledger import (
     add_claim,
     add_coverage,
     add_finding,
+    backups_of,
     covered_digests,
     ledger_path_for,
     load,
@@ -49,6 +51,8 @@ from craftsman.records import (
     FieldError,
     Ledger,
     LedgerError,
+    NewerSchemaError,
+    OlderSchemaError,
     QualitySignal,
     SignalKind,
     VerdictEvent,
@@ -927,7 +931,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(load(self.path), Ledger())
 
         self.assertEqual(taken, [True])
-        self.assertTrue(self.path.with_name("ledger.v2.bak.json").is_file())
+        self.assertEqual(len(backups_of(self.path)), 1)
 
     def test_a_ledger_written_while_the_old_one_was_set_aside_is_left_alone(self) -> None:
         self.path.parent.mkdir(parents=True)
@@ -944,7 +948,7 @@ class PersistenceTests(unittest.TestCase):
 
         self.assertEqual(loaded, newer)
         self.assertEqual(load(self.path), newer)
-        self.assertFalse(self.path.with_name("ledger.v2.bak.json").exists())
+        self.assertEqual(backups_of(self.path), ())
 
     def test_setting_an_older_ledger_aside_inside_mutate_does_not_deadlock(self) -> None:
         self.path.parent.mkdir(parents=True)
@@ -964,9 +968,10 @@ class PersistenceTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()) as err:
                     self.assertEqual(load(self.path), Ledger())
 
-                self.assertTrue(self.path.with_name(f"ledger.v{schema}.bak.json").is_file())
+                (backup,) = (path for path in backups_of(self.path) if f".v{schema}." in path.name)
+                self.assertRegex(backup.name, rf"^ledger\.v{schema}\.\d{{8}}T\d{{6}}Z\.bak\.json$")
                 self.assertFalse(self.path.exists())
-                self.assertIn(f"ledger.v{schema}.bak.json", err.getvalue())
+                self.assertIn(backup.name, err.getvalue())
 
     def test_a_schema_3_ledger_is_kept_and_written_as_schema_4_on_the_next_save(self) -> None:
         ledger = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))))
@@ -986,9 +991,122 @@ class PersistenceTests(unittest.TestCase):
         self.path.parent.mkdir(parents=True)
         self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 5}), encoding="utf-8")
 
-        with self.assertRaisesRegex(LedgerError, r"schema 5 is not supported \(expected 4\)"):
+        with self.assertRaisesRegex(LedgerError, r"newer Craftsman \(schema 5\); upgrade craftsman"):
             load(self.path)
         self.assertTrue(self.path.is_file())
+
+    def write_schema(self, schema: int) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": schema}), encoding="utf-8")
+
+    def test_a_newer_schema_is_refused_by_load_and_by_every_writing_command(self) -> None:
+        self.write_schema(5)
+        before = self.path.read_text(encoding="utf-8")
+
+        with self.assertRaises(NewerSchemaError) as caught:
+            load(self.path)
+        with self.assertRaises(NewerSchemaError):
+            mutate(self.path, lambda current: (record_run(current), None))
+        with self.assertRaises(NewerSchemaError):
+            load(self.path, set_aside=False)
+
+        self.assertEqual(caught.exception.schema, 5)
+        self.assertEqual(
+            str(caught.exception),
+            f"{self.path}: this ledger was written by a newer Craftsman (schema 5); upgrade craftsman",
+        )
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(backups_of(self.path), ())
+
+    def test_a_newer_schema_is_refused_even_when_its_records_would_not_parse(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"schema": 9, "rounds": "from the future"}), encoding="utf-8")
+
+        with self.assertRaises(NewerSchemaError):
+            load(self.path)
+
+    def test_a_read_only_load_leaves_an_older_ledger_where_it_is(self) -> None:
+        self.write_schema(2)
+
+        with self.assertRaises(OlderSchemaError) as caught:
+            load(self.path, set_aside=False)
+
+        self.assertEqual(caught.exception.schema, 2)
+        self.assertTrue(self.path.is_file())
+        self.assertEqual(backups_of(self.path), ())
+
+    def test_two_upgrades_in_the_same_second_keep_both_backups(self) -> None:
+        moment = datetime(2026, 11, 8, 10, 30, 5, tzinfo=timezone.utc)
+        first_text = json.dumps({**Ledger().to_json(), "schema": 2, "marker": "first"})
+        second_text = json.dumps({**Ledger().to_json(), "schema": 2, "marker": "second"})
+        self.path.parent.mkdir(parents=True)
+
+        with mock.patch.object(ledger_module, "datetime", wraps=datetime) as clock, redirect_stderr(io.StringIO()):
+            clock.now.return_value = moment
+            self.path.write_text(first_text, encoding="utf-8")
+            load(self.path)
+            self.path.write_text(second_text, encoding="utf-8")
+            load(self.path)
+
+        names = [backup.name for backup in backups_of(self.path)]
+        self.assertEqual(
+            names, ["ledger.v2.20261108T103005Z.bak.json", "ledger.v2.20261108T103005Z.2.bak.json"]
+        )
+        by_name = {backup.name: backup.read_text(encoding="utf-8") for backup in backups_of(self.path)}
+        self.assertEqual(by_name["ledger.v2.20261108T103005Z.bak.json"], first_text)
+        self.assertEqual(by_name["ledger.v2.20261108T103005Z.2.bak.json"], second_text)
+
+    def test_backups_are_listed_oldest_first_by_schema_stamp_and_counter(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        names = [
+            "ledger.v2.20261108T103005Z.bak.json",
+            "ledger.v2.20261108T103005Z.2.bak.json",
+            "ledger.v2.20261108T103005Z.10.bak.json",
+            "ledger.v2.20261108T103006Z.bak.json",
+            "ledger.v10.20260101T000000Z.bak.json",
+        ]
+        for name in ("ledger.v2.bak.json", *reversed(names)):
+            self.path.with_name(name).write_text("{}", encoding="utf-8")
+
+        self.assertEqual([b.name for b in backups_of(self.path)], ["ledger.v2.bak.json", *names])
+
+    def test_a_third_upgrade_does_not_overwrite_either_earlier_backup(self) -> None:
+        moment = datetime(2026, 11, 8, 10, 30, 5, tzinfo=timezone.utc)
+        self.path.parent.mkdir(parents=True)
+        with mock.patch.object(ledger_module, "datetime", wraps=datetime) as clock, redirect_stderr(io.StringIO()):
+            clock.now.return_value = moment
+            for marker in ("a", "b", "c"):
+                self.path.write_text(
+                    json.dumps({**Ledger().to_json(), "schema": 2, "marker": marker}), encoding="utf-8"
+                )
+                load(self.path)
+
+        markers = sorted(json.loads(b.read_text(encoding="utf-8"))["marker"] for b in backups_of(self.path))
+        self.assertEqual(markers, ["a", "b", "c"])
+
+    def test_backups_of_lists_only_set_aside_ledgers_of_that_ledger(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        legacy = self.path.with_name("ledger.v2.bak.json")
+        stamped = self.path.with_name("ledger.v2.20260101T000000Z.bak.json")
+        for name in (legacy, stamped, self.path.with_name("ledger.json.tmp"), self.path.with_name("notes.bak.json")):
+            name.write_text("{}", encoding="utf-8")
+
+        self.assertEqual(backups_of(self.path), (legacy, stamped))
+        self.assertEqual(backups_of(self.path.parent / "missing" / LEDGER_FILENAME), ())
+
+    def test_unknown_fields_of_a_same_schema_ledger_are_named_and_blamed_on_a_newer_craftsman(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        raw = Ledger().to_json()
+        self.path.write_text(json.dumps({**raw, "zeta": 1, "alpha": 2}), encoding="utf-8")
+
+        with self.assertRaises(LedgerError) as caught:
+            load(self.path)
+
+        message = str(caught.exception)
+        self.assertIn("alpha is not a known field (also unknown: zeta)", message)
+        self.assertIn("a newer Craftsman may have written them", message)
+        self.assertTrue(self.path.is_file())
+        self.assertEqual(backups_of(self.path), ())
 
     def test_corrupt_json_raises(self) -> None:
         self.path.parent.mkdir(parents=True)

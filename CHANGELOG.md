@@ -20,6 +20,30 @@ All notable changes to Craftsman are recorded here. The format follows
   version writes no longer carry the retired `previous_hooks_path` and `hooks_dir` keys, so Craftsman 5.0 cannot read
   them back: reinstall with 5.0 after a downgrade.
 
+### Fixed
+
+- **A test run must have run tests.** `craftsman run --kind test` reads the whole output of the command for the
+  summaries of pytest, unittest, `go test`, `cargo test`, jest, vitest and mocha, adds them up and stores the count
+  (`tests_ran`, with `min_tests`). A run that exited 0 but reported fewer tests than `--min-tests` (default 1;
+  `0` turns the check off) is still recorded, but is no passing evidence anywhere: the gate says "R3 ran 0 tests
+  (minimum 1)" and the progress counter ignores it. Output no runner claims keeps the exit code as the only
+  judge. A run refused for too few tests says how to proceed (`--min-tests 0`), and a run that passes only
+  because of `--min-tests 0` is a gate warning. The run summaries show "exit 0, 0 tests - not counted". `pytest
+  --collect-only` and an all-skipped `go test -v` count as 0 tests. An inline Python program (`python -c`, or a
+  heredoc fed to `python -`) that checks nothing (no `assert`, `raise`, test framework, `subprocess.check_call`,
+  `subprocess.run(check=True)`, `runpy` call or computed exit status) is now trivial as a `test` run; `e2e` runs
+  keep the old rule. A newline in an inline shell script now separates commands, as `;` does.
+- **`craftsman status` never hides a broken ledger.** A corrupted ledger, a ledger of a newer schema and the
+  ledgers an upgrade set aside are reported with their path (text and `--json`: `ledger_path`, `ledger_problem`,
+  `ledger_backups`); a corrupted or newer ledger makes `status` exit 1. `status` only looks: it no longer sets an
+  older ledger aside.
+- **A ledger written by a newer Craftsman is never moved or rewritten.** Every command, `review reset` included,
+  stops with "this ledger was written by a newer Craftsman (schema N); upgrade craftsman". Unknown fields in a
+  same-schema ledger are named in the error, which says a newer Craftsman may have written them.
+- **Set-aside ledgers are never overwritten.** An older ledger now moves to
+  `ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json` (with a counter before `.bak` if that name exists), so two
+  upgrades keep both backups.
+
 ### Changed
 
 - **The `audit-*` skills load their review lens instead of repeating its probes** (`craftsman skill show craft-review

@@ -14,6 +14,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Literal, TypeVar, get_args
 
 from craftsman.diffscan import is_relative_posix_path
@@ -59,6 +60,12 @@ GROUPED_EVIDENCE_PREFIX = "Grouped into "
 _LEGACY_MERGE_RE = re.compile(re.escape(GROUPED_EVIDENCE_PREFIX) + r"(F[1-9]\d*)\b")
 LEDGER_FILENAME = "ledger.json"
 OUTPUT_TAIL_CHARS = 4000
+DEFAULT_MIN_TESTS = 1
+# Said wherever a run is refused for too few tests: the count can be a runner format that is read wrongly.
+MIN_TESTS_HINT = (
+    "If the command really runs that few tests, re-run it with "
+    "`craftsman run --kind test --min-tests 0 -- <command>` (or the number of tests it runs)."
+)
 MIN_TITLE_CHARS = 8
 MAX_TITLE_CHARS = 160
 MIN_SCENARIO_CHARS = 20
@@ -117,6 +124,43 @@ class FieldError(LedgerError):
 
     def within(self, parent: str) -> FieldError:
         return FieldError(f"{parent}.{self.field}" if self.field else parent, self.problem)
+
+
+class UnknownFieldsError(FieldError):
+    """Fields nothing reads: a newer Craftsman of the same schema may have written them."""
+
+    def __init__(self, fields: Sequence[str], *, parent: str = "") -> None:
+        self.names = tuple(fields)
+        self.parent = parent
+        first = f"{parent}.{self.names[0]}" if parent else self.names[0]
+        problem = "is not a known field"
+        if len(self.names) > 1:
+            problem += f" (also unknown: {', '.join(self.names[1:])})"
+        super().__init__(first, problem)
+
+    def within(self, parent: str) -> UnknownFieldsError:
+        return UnknownFieldsError(self.names, parent=f"{parent}.{self.parent}" if self.parent else parent)
+
+
+class NewerSchemaError(LedgerError):
+    """The ledger was written by a newer Craftsman; it must not be read as empty, set aside or rewritten."""
+
+    def __init__(self, schema: int, path: Path | None = None) -> None:
+        where = f"{path}: " if path is not None else ""
+        super().__init__(
+            f"{where}this ledger was written by a newer Craftsman (schema {schema}); upgrade craftsman"
+        )
+        self.schema = schema
+
+
+class OlderSchemaError(LedgerError):
+    """The ledger is from a Craftsman too old to read; the next write sets it aside."""
+
+    def __init__(self, schema: int) -> None:
+        super().__init__(
+            f"schema {schema} is from an older craftsman; run `craftsman review reset` to archive it"
+        )
+        self.schema = schema
 
 
 @dataclass(frozen=True)
@@ -337,6 +381,14 @@ class Fields:
         value: int | None = self._value(key, (int, type(None)), "an integer or null")
         return value
 
+    def optional_integer_if_present(self, key: str) -> int | None:
+        """An integer or null field; None when it is left out (older ledgers do not have it)."""
+        return None if self._absent(key) else self.optional_integer(key)
+
+    def integer_or(self, key: str, default: int) -> int:
+        """An integer field; `default` when it is left out (older ledgers do not have it)."""
+        return default if self._absent(key) else self.integer(key)
+
     def number(self, key: str) -> float:
         return float(self._value(key, (int, float), "a number"))
 
@@ -432,7 +484,7 @@ class Fields:
         """Fail on any field of the JSON object that was never read."""
         unknown = self.unknown_fields()
         if unknown:
-            raise FieldError(unknown[0], "is not a known field")
+            raise UnknownFieldsError(unknown)
 
     def done(self, record: T) -> T:
         """Return `record` once every field of the JSON object has been consumed."""
@@ -1083,6 +1135,10 @@ class Run:
     output_tail: str
     fingerprint_after: str | None = None  # set when the command changed the work tree
     waiver: RunWaiver | None = None
+    # How many tests the output of a test run reported; None when its runner is not recognized.
+    tests_ran: int | None = None
+    # A test run that reported fewer tests than this does not count as passing (0 turns the check off).
+    min_tests: int = DEFAULT_MIN_TESTS
 
     def __post_init__(self) -> None:
         _require_id(self.id, "R", "id")
@@ -1106,11 +1162,43 @@ class Run:
         _require(
             self.waiver is None or self.exit_code != 0, "waiver", "is only allowed for failing runs"
         )
+        _require(self.tests_ran is None or self.tests_ran >= 0, "tests_ran", "must be >= 0 or null")
+        _require(self.min_tests >= 0, "min_tests", "must be >= 0")
+
+    @property
+    def ran_enough_tests(self) -> bool:
+        """A test run reported at least `min_tests` tests; unrecognized output and other kinds pass."""
+        return self.kind != "test" or self.tests_ran is None or self.tests_ran >= self.min_tests
 
     @property
     def counts_as_passing(self) -> bool:
-        """Exited 0 without changing the work tree, so it verified the code it ran against."""
-        return self.exit_code == 0 and self.fingerprint_after is None
+        """Exited 0 without changing the work tree and (for a test run) ran tests: it verified the code."""
+        return self.exit_code == 0 and self.fingerprint_after is None and self.ran_enough_tests
+
+    @property
+    def tests_shortfall(self) -> str:
+        """"R3 ran 0 tests (minimum 1)": why a run that exited 0 does not count (empty when it ran enough)."""
+        if self.ran_enough_tests or self.tests_ran is None:
+            return ""
+        noun = "test" if self.tests_ran == 1 else "tests"
+        return f"{self.id} ran {self.tests_ran} {noun} (minimum {self.min_tests})"
+
+    @property
+    def exit_text(self) -> str:
+        """"exit 0", or "exit 0, 0 tests - not counted" for a run that exited 0 but ran too few tests."""
+        if not self.too_few_tests:
+            return f"exit {self.exit_code}"
+        return f"exit {self.exit_code}, {self.tests_ran} {'test' if self.tests_ran == 1 else 'tests'} - not counted"
+
+    @property
+    def switched_off_test_minimum(self) -> bool:
+        """A test run that reported no tests and was run with `--min-tests 0`, so that it still passes."""
+        return self.kind == "test" and self.tests_ran == 0 and self.min_tests == 0
+
+    @property
+    def too_few_tests(self) -> bool:
+        """Exited 0 and left the work tree alone, but ran fewer tests than it must have."""
+        return self.exit_code == 0 and self.fingerprint_after is None and not self.ran_enough_tests
 
     @property
     def command(self) -> str:
@@ -1143,6 +1231,8 @@ class Run:
                 output_tail=f.text("output_tail"),
                 fingerprint_after=f.optional_text("fingerprint_after"),
                 waiver=f.optional_record("waiver", RunWaiver.from_json),
+                tests_ran=f.optional_integer_if_present("tests_ran"),
+                min_tests=f.integer_or("min_tests", DEFAULT_MIN_TESTS),
             )
         )
 
@@ -1397,15 +1487,9 @@ class Ledger:
             f = Fields(raw)
             schema = f.integer("schema")
             if schema < MIN_READABLE_SCHEMA:
-                raise FieldError(
-                    "schema",
-                    f"{schema} is from an older craftsman; run `craftsman review reset` to archive it",
-                )
-            _require(
-                schema <= SCHEMA_VERSION,
-                "schema",
-                f"{schema} is not supported (expected {SCHEMA_VERSION}); upgrade craftsman",
-            )
+                raise OlderSchemaError(schema)
+            if schema > SCHEMA_VERSION:
+                raise NewerSchemaError(schema)
             rounds = f.records("rounds", Round.from_json)
             coverage = f.records("coverage", Coverage.from_json)
             findings = _drop_unusable_legacy_merges(f.records("findings", Finding.from_json), raw["findings"])
@@ -1419,5 +1503,10 @@ class Ledger:
                     claims=f.records_or_empty("claims", SlotClaim.from_json),
                 )
             )
+        except UnknownFieldsError as exc:
+            noun = "it" if len(exc.names) == 1 else "them"
+            raise LedgerError(
+                f"{LEDGER_FILENAME}: {exc}; a newer Craftsman may have written {noun}, upgrade craftsman"
+            ) from None
         except FieldError as exc:
             raise LedgerError(f"{LEDGER_FILENAME}: {exc}") from None

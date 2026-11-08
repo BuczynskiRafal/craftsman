@@ -467,7 +467,7 @@ class EvidenceRepo(GitRepo):
         """Everything the gate needs at the current code: a round, coverage and runs."""
         self.cli("review", "prepare", *(["--deep"] if deep else []))
         self.cover_all()
-        self.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('tests ok')")
+        self.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('tests ok')")
         if deep:
             self.cli("run", "--kind", "e2e", "--", sys.executable, "-c", "print('e2e ok')")
 

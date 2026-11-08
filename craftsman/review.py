@@ -2066,7 +2066,7 @@ def _run_lines(runs: Sequence[Run], snap: DiffSnapshot) -> list[str]:
     for run in runs:
         freshness = "current" if run.fingerprint == snap.fingerprint else "stale"
         lines.append(
-            f"- {run.id} {run.kind} exit {run.exit_code} · {run.duration_s:.1f}s · {freshness} · "
+            f"- {run.id} {run.kind} {run.exit_text} · {run.duration_s:.1f}s · {freshness} · "
             f"`{run.short_command}`"
         )
     return lines

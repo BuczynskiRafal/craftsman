@@ -1,7 +1,12 @@
 """Recognize commands that prove nothing, such as `true`, `echo ok` or `sh -c 'exit 0'`.
 
 A recorded run only counts as verification when its command exercises code; these checks see
-through `env` prefixes, interpreter flags and inline shell or Python scripts.
+through `env` prefixes, interpreter flags and inline shell or Python scripts. For a run of kind
+`test` an inline Python program (`python -c`, or a heredoc fed to `python -`) is also trivial when it
+checks nothing: no `assert`, no `raise`, no test framework and no exit status computed from the code.
+
+`counts_as_verification` is the one rule for "this run is passing evidence" that the gate, the
+attribution counters and the ledger share.
 """
 
 from __future__ import annotations
@@ -11,10 +16,23 @@ import re
 import shlex
 from collections.abc import Sequence
 
+from craftsman.records import Run, RunKind
+
+# Test and end-to-end runs are what counts as verification.
+PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
+_TEST_FRAMEWORKS = frozenset({"unittest", "pytest", "doctest"})
+_EXIT_CALLS = frozenset({"exit", "quit", "_exit"})
+# Calls that raise when what they run fails: `subprocess.check_call([...])`, `subprocess.run([...], check=True)`.
+_RAISING_SUBPROCESS_CALLS = frozenset({"check_call", "check_output"})
+_RUNPY_CALLS = frozenset({"run_path", "run_module"})
+_HEREDOC_RE = re.compile(r"(?<!<)<<(-?)\s*([\"']?)([A-Za-z_]\w*)\2")
+_HEREDOC_WORD = "@@heredoc{}@@"
+_HEREDOC_WORD_RE = re.compile(r"@@heredoc(\d+)@@")
 _TRIVIAL_PROGRAMS = frozenset({"true", ":", "exit", "echo", "printf"})
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
 _POWERSHELLS = frozenset({"powershell", "pwsh"})
-_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "|", "&", "(", ")"})
+_SHELL_PUNCTUATION = "();<>|&\n"
+_SEPARATOR_CHARS = frozenset("();|&\n")
 _PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?|py")
 _PYTHON_EXITS = frozenset({"exit", "quit"})
 # `env` options that consume a value: -u NAME, -C DIR, -S STRING and their long forms.
@@ -22,8 +40,22 @@ _ENV_SHORT_VALUE_OPTIONS = frozenset("uCS")
 _ENV_LONG_VALUE_OPTIONS = {"--unset": "u", "--chdir": "C", "--split-string": "S"}
 
 
-def is_trivial_run(argv: Sequence[str]) -> bool:
-    """True for commands that prove nothing, such as `true`, `echo ok` or `sh -c 'exit 0'`."""
+def is_trivial_run(argv: Sequence[str], kind: str | None = None) -> bool:
+    """True for commands that prove nothing, such as `true`, `echo ok` or `sh -c 'exit 0'`.
+
+    `kind` is the run kind; `test` also rejects an inline Python program that checks nothing.
+    """
+    return _is_trivial(argv, kind)
+
+
+def counts_as_verification(run: Run) -> bool:
+    """A test or e2e run that exited 0, left the work tree alone, ran tests (if a test run) and proves something."""
+    return (
+        run.kind in PASSING_KINDS and run.counts_as_passing and not is_trivial_run(run.argv, run.kind)
+    )
+
+
+def _is_trivial(argv: Sequence[str], kind: str | None) -> bool:
     tokens = command_without_env(argv)
     if not tokens:
         return True
@@ -32,9 +64,11 @@ def is_trivial_run(argv: Sequence[str]) -> bool:
         return True
     if _PYTHON_RE.fullmatch(program):
         code = _python_inline_code(tokens[1:])
-        return code is not None and _is_trivial_python(code)
+        if code is None:
+            return False
+        return _is_trivial_python(code) or (kind == "test" and _checks_nothing(code))
     script = _shell_script(program, tokens[1:])
-    return script is not None and _is_trivial_script(script)
+    return script is not None and _is_trivial_script(script, kind)
 
 
 def _program_name(token: str) -> str:
@@ -140,6 +174,55 @@ def _is_trivial_statement(statement: ast.stmt) -> bool:
     return exits and all(isinstance(arg, ast.Constant) for arg in value.args)
 
 
+def _checks_nothing(code: str) -> bool:
+    """Python that can neither fail a check nor fail on a computed exit status."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return False  # Python would reject it, so it is not a trivial pass
+    return not any(_checks(node) for node in ast.walk(tree))
+
+
+def _checks(node: ast.AST) -> bool:
+    if isinstance(node, (ast.Assert, ast.Raise)):
+        return True
+    if isinstance(node, ast.Import):
+        return any(alias.name.split(".")[0] in _TEST_FRAMEWORKS for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        return (node.module or "").split(".")[0] in _TEST_FRAMEWORKS
+    if isinstance(node, ast.Call):
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else ""
+        if name in ("__import__", "import_module"):  # __import__("pytest").main([...])
+            first = node.args[0] if node.args else None
+            return (
+                isinstance(first, ast.Constant)
+                and isinstance(first.value, str)
+                and first.value.split(".")[0] in _TEST_FRAMEWORKS
+            )
+        if name in _RAISING_SUBPROCESS_CALLS or _is_checked_run(node, name):
+            return True
+        # sys.exit(0 if ok() else 1): an exit status computed from the code is the check
+        return name in _EXIT_CALLS and not all(isinstance(arg, ast.Constant) for arg in node.args)
+    return False
+
+
+def _is_checked_run(call: ast.Call, name: str) -> bool:
+    """`subprocess.run(..., check=True)` and `runpy.run_path(...)`: both raise when the code they run fails."""
+    if name == "run":
+        return any(
+            keyword.arg == "check" and not (isinstance(keyword.value, ast.Constant) and not keyword.value.value)
+            for keyword in call.keywords
+        )
+    func = call.func
+    return (
+        name in _RUNPY_CALLS
+        and isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "runpy"
+    )
+
+
 def _shell_script(program: str, args: Sequence[str]) -> str | None:
     """The inline script of a shell invocation such as `bash -lc '...'` or `cmd /d /c ...`."""
     if program in _SHELLS:
@@ -177,8 +260,13 @@ def _posix_shell_script(args: Sequence[str]) -> str | None:
     return remaining[0] if inline and remaining else None
 
 
-def _is_trivial_script(script: str) -> bool:
-    lexer = shlex.shlex(script, posix=True, punctuation_chars=True)
+def _is_trivial_script(script: str, kind: str | None) -> bool:
+    heredocs: list[str] = []
+    if kind == "test":
+        script, heredocs = _extract_heredocs(script)
+    # A newline ends a command like `;` does: it is a punctuation character here, not whitespace.
+    lexer = shlex.shlex(script, posix=True, punctuation_chars=_SHELL_PUNCTUATION)
+    lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
@@ -186,8 +274,59 @@ def _is_trivial_script(script: str) -> bool:
         return False  # unbalanced quotes: the shell would reject it, so it is not a trivial pass
     segments: list[list[str]] = [[]]
     for token in tokens:
-        if token in _SHELL_SEPARATORS:
+        if _is_separator(token):
             segments.append([])
         else:
             segments[-1].append(token)
-    return all(is_trivial_run(segment) for segment in segments if segment)
+    return all(_is_trivial_segment(segment, kind, heredocs) for segment in segments if segment)
+
+
+def _is_separator(token: str) -> bool:
+    """`&&`, `||`, `;`, `|`, `&`, parentheses and newlines, alone or run together (`;\n`)."""
+    return bool(token) and all(char in _SEPARATOR_CHARS for char in token)
+
+
+def _is_trivial_segment(segment: list[str], kind: str | None, heredocs: Sequence[str]) -> bool:
+    fed = [int(m[1]) for token in segment if (m := _HEREDOC_WORD_RE.fullmatch(token))]
+    words = [token for token in segment if not _HEREDOC_WORD_RE.fullmatch(token)]
+    if fed and words:
+        tokens = command_without_env(words)
+        stdin_python = (
+            tokens
+            and _PYTHON_RE.fullmatch(_program_name(tokens[0]))
+            and (len(tokens) == 1 or tokens[1] == "-")
+        )
+        if stdin_python:
+            return _checks_nothing(heredocs[fed[-1]])
+    return _is_trivial(words, kind) if words else True
+
+
+def _heredoc_in(line: str) -> re.Match[str] | None:
+    """The first `<<WORD` of `line` that starts a heredoc, not a shift inside `$(( ... ))` or `(( ... ))`."""
+    for match in _HEREDOC_RE.finditer(line):
+        before = line[: match.start()]
+        if before.count("((") <= before.count("))"):
+            return match
+    return None
+
+
+def _extract_heredocs(script: str) -> tuple[str, list[str]]:
+    """The script without its heredoc bodies, each `<<WORD` replaced by a marker, and the bodies in order."""
+    kept: list[str] = []
+    bodies: list[str] = []
+    lines = iter(script.split("\n"))
+    for line in lines:
+        match = _heredoc_in(line)
+        if match is None:
+            kept.append(line)
+            continue
+        marker = _HEREDOC_WORD.format(len(bodies))
+        # The body ends the command, so the next line starts a new one: end this line with a separator.
+        kept.append(f"{line[: match.start()]} {marker} {line[match.end() :]} ;")
+        body: list[str] = []
+        for body_line in lines:
+            if body_line.strip() == match[3]:
+                break
+            body.append(body_line.lstrip("\t") if match[1] else body_line)
+        bodies.append("\n".join(body))
+    return "\n".join(kept), bodies

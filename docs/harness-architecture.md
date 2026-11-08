@@ -82,7 +82,7 @@ Every ledger check compares the recorded state with a live `DiffSnapshot` from `
 
 ## 4. Ledger (`craftsman.records`, `craftsman.ledger`)
 
-All state is in `.git/craftsman/ledger.json` (`SCHEMA_VERSION = 3`). A schema 2 ledger is archived automatically to `ledger.v2.bak.json` the first time it is read and a fresh ledger starts; no command is needed. A newer schema asks to upgrade Craftsman. Writes from parallel subagents are serialized by `ledger.mutate(path, fn)` with an exclusive OS lock and an atomic `tempfile.mkstemp` + `os.replace()`.
+All state is in `.git/craftsman/ledger.json` (`SCHEMA_VERSION = 4`, readable back to `MIN_READABLE_SCHEMA = 3`). An older ledger is set aside automatically the first time a command that writes reads it, under a name no file has (`ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json`, with a counter before `.bak` if that name exists: `...Z.2.bak.json`), and a fresh ledger starts; no command is needed. `craftsman status` lists the set-aside ledgers and never moves one. A ledger of a newer schema is never set aside, rewritten or read as empty: every command (also `review reset`) refuses it with "written by a newer Craftsman; upgrade craftsman", and `status` exits 1. Writes from parallel subagents are serialized by `ledger.mutate(path, fn)` with an exclusive OS lock and an atomic `tempfile.mkstemp` + `os.replace()`.
 
 The ledger holds immutable tuples:
 
@@ -114,7 +114,7 @@ A hunk is covered when a coverage record in this round or an earlier one holds i
 | `uncovered` | Open hunks without coverage | spawn a hunter, `craftsman review cover ...` |
 | `no-verdict` | A finding has no verdict | spawn a `craftsman-verifier`, `craftsman review verdict ...` |
 | `unresolved` | A `proven` or `probable` finding has no resolution, or is `fixed` without a changed fingerprint | fix, `craftsman review resolve F# ...`, `review prepare` |
-| `no-passing-run` | No non-trivial passing `test` or `e2e` run at the snapshot fingerprint | `craftsman run --kind test -- <cmd>` |
+| `no-passing-run` | No non-trivial passing `test` or `e2e` run at the snapshot fingerprint (a `test` run that reported fewer than `--min-tests` tests, default 1, does not pass; the message names it) | `craftsman run --kind test -- <cmd>` |
 | `no-e2e-run` | The gate is deep and no passing `e2e` run exists at the fingerprint | `craftsman run --kind e2e -- <cmd>` |
 | `failing-run` | The latest run of a command in the same `cwd` failed and was not waived | fix and re-run, or `craftsman review waive-run R# --reason '...'` |
 | `no-isolation` | Isolation evidence exists for the platform, but no `craftsman-reviewer` finished after the latest round was prepared, or hunks were covered outside any reviewer run | delegate the hunt to `craftsman-reviewer`; it records its own coverage |
@@ -204,6 +204,7 @@ Both run through `craftsman hook pre-tool` (Claude Code, VS Code Copilot, Copilo
 | [`craftsman/quality.py`](../craftsman/quality.py) | Mechanical quality hint detectors (`S#`) |
 | [`craftsman/review.py`](../craftsman/review.py) | `review` subcommands: `prepare`, `view`, `scout`, `cover`, `add`, `move`, `merge`, `verdict`, `resolve`, `waive-run`, `show`, `check`, `report`, `reset`, `inbox`, `scratch` |
 | [`craftsman/runner.py`](../craftsman/runner.py) | `craftsman run` with scope-consistent before/after fingerprinting |
+| [`craftsman/testcount.py`](../craftsman/testcount.py) | Counts the tests a test runner's output reports (pytest, unittest, go, cargo, jest, vitest, mocha), so a run that ran none is no evidence |
 | [`craftsman/trigger.py`](../craftsman/trigger.py) | `/craftsman` and `ultracraft` prompt trigger detector |
 | [`craftsman/hooks.py`](../craftsman/hooks.py) | Multi-platform hook adapter (`prompt`, `stop`, `subagent-start`, `subagent-stop`, `pre-tool`) |
 | [`craftsman/shell.py`](../craftsman/shell.py) | Shell command parser and `git` invocation analyzer |

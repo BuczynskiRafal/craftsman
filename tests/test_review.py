@@ -97,7 +97,7 @@ class RepoTestCase(unittest.TestCase):
         )
 
     def run_tests(
-        self, code: str = "print('ok')", *, check: bool = True
+        self, code: str = "assert True; print('ok')", *, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         return self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", code, check=check)
 
@@ -993,6 +993,15 @@ class InspectionTests(RepoTestCase):
         self.assertIn("0/1 hunks (missing H1)", shown)
         self.assertIn("Findings: none recorded.", shown)
 
+    def test_show_marks_a_run_that_ran_no_tests_as_not_counted(self) -> None:
+        self.prepare_bug()
+        code = "assert True; print('Ran 0 tests in 0.0s')"
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", code)
+
+        shown = self.review("show").stdout
+
+        self.assertIn("R1 test exit 0, 0 tests - not counted", shown)
+
     def test_show_prints_the_packet_path(self) -> None:
         self.prepare_bug()
 
@@ -1125,7 +1134,7 @@ class QualityHintTests(RepoTestCase):
         self.repo.write("long_mod.py", LONG_FUNCTION)
         self.review("prepare")
         self.repo.cover_all()
-        self.run_tests("import long_mod")
+        self.run_tests("import long_mod; assert long_mod")
 
     def prepare_oversized(self) -> None:
         lines = "".join(f"CONST_{i} = {i}\n" for i in range(300))

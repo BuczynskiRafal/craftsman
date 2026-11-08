@@ -23,7 +23,7 @@ from typing import Any, Literal, get_args
 from craftsman.diffscan import DiffSnapshot
 from craftsman.files import replace_with_retry
 from craftsman.gatecheck import GatePolicy, GateReport, evaluate
-from craftsman.ledger import ledger_path_for, load, locked
+from craftsman.ledger import ledger_path_for, load, locked, refuse_newer_schema
 from craftsman.records import IsolationEvidence, Ledger, LedgerError
 
 PACKET_GLOB = "packet-*.md"
@@ -384,8 +384,12 @@ def _should_prune_packet(entry: Path, round_number: int) -> bool:
 
 
 def archive_ledger(ledger_path: Path) -> tuple[Path, ...]:
-    """Move the ledger and its review packets aside so the next review starts clean."""
+    """Move the ledger and its review packets aside so the next review starts clean.
+
+    A ledger of a newer craftsman is refused: it is never moved.
+    """
     with locked(ledger_path):
+        refuse_newer_schema(ledger_path)
         return _archive(ledger_path)
 
 

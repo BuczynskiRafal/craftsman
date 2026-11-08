@@ -261,6 +261,107 @@ class RunTests(unittest.TestCase):
 
         self.assertEqual([run.id for run in passing_runs(ledger, "fp1")], ["R2"])
 
+    def reported(self, ledger: Ledger, ran: int | None, minimum: int = 1) -> Ledger:
+        """`ledger` with its latest run reporting `ran` tests."""
+        *earlier, last = ledger.runs
+        return replace(ledger, runs=(*earlier, replace(last, tests_ran=ran, min_tests=minimum)))
+
+    def test_a_test_run_that_ran_no_tests_is_not_a_passing_run(self) -> None:
+        ledger = self.reported(record_run(self.covered), 0)
+
+        report = evaluate(ledger, two_hunks(), POLICY)
+
+        self.assertEqual(passing_runs(ledger, "fp1"), [])
+        self.assertEqual(codes(report), ["no-passing-run"])
+        self.assertIn("(R1 ran 0 tests (minimum 1))", report.issues[0].message)
+        self.assertIn("craftsman run --kind test --", report.issues[0].message)
+        self.assertIn("--min-tests 0", report.issues[0].message)
+        self.assertIn("R1 ran 0 tests (minimum 1); it does not count as a passing run.", report.warnings)
+
+    def test_a_test_run_below_its_own_minimum_is_not_a_passing_run(self) -> None:
+        ledger = self.reported(record_run(self.covered), 3, minimum=5)
+
+        report = evaluate(ledger, two_hunks(), POLICY)
+
+        self.assertEqual(codes(report), ["no-passing-run"])
+        self.assertIn("R1 ran 3 tests (minimum 5)", report.issues[0].message)
+
+    def test_runs_that_ran_enough_or_did_not_say_pass(self) -> None:
+        for ran, minimum in ((None, 1), (1, 1), (12, 5), (0, 0)):
+            with self.subTest(ran=ran, minimum=minimum):
+                ledger = self.reported(record_run(self.covered), ran, minimum)
+                self.assertTrue(evaluate(ledger, two_hunks(), POLICY).passed)
+
+    def test_the_run_summary_does_not_show_a_green_exit_for_a_run_that_ran_no_tests(self) -> None:
+        ledger = self.reported(record_run(self.covered), 0)
+
+        report = evaluate(ledger, two_hunks(), POLICY)
+
+        self.assertIn("R1 test `pytest -q` exit 0, 0 tests - not counted (current)", report.summary)
+
+    def test_a_run_that_switched_the_minimum_off_passes_with_a_warning(self) -> None:
+        ledger = self.reported(record_run(self.covered), 0, minimum=0)
+
+        report = evaluate(ledger, two_hunks(), POLICY)
+
+        self.assertTrue(report.passed)
+        self.assertIn(
+            "R1 reported 0 tests and passes only because it ran with --min-tests 0; tell the user.",
+            report.warnings,
+        )
+
+    def test_a_run_that_reported_tests_under_a_zero_minimum_has_no_warning(self) -> None:
+        ledger = self.reported(record_run(self.covered), 4, minimum=0)
+
+        report = evaluate(ledger, two_hunks(), POLICY)
+
+        self.assertFalse([warning for warning in report.warnings if "min-tests" in warning])
+
+    def test_a_later_run_that_ran_tests_makes_the_gate_pass(self) -> None:
+        ledger = self.reported(record_run(self.covered), 0)
+        ledger = self.reported(record_run(ledger, ("pytest",)), 4)
+
+        self.assertEqual([run.id for run in passing_runs(ledger, "fp1")], ["R2"])
+        self.assertTrue(evaluate(ledger, two_hunks(), POLICY).passed)
+
+    def test_an_empty_test_run_does_not_clear_an_earlier_failure_of_the_same_command(self) -> None:
+        ledger = record_run(self.covered, exit_code=1)
+        ledger = self.reported(record_run(ledger), 0)
+
+        self.assertIn("failing-run", codes(evaluate(ledger, two_hunks(), POLICY)))
+
+    def test_the_count_does_not_apply_to_an_e2e_run(self) -> None:
+        ledger = record_run(self.covered, ("python3", "smoke.py"), kind="e2e")
+        ledger = self.reported(ledger, 0)
+
+        self.assertTrue(evaluate(ledger, two_hunks(), POLICY).passed)
+
+    def test_a_deep_gate_names_the_empty_test_run(self) -> None:
+        ledger, _ = prepared(two_hunks(), deep=True)
+        ledger = record_run(cover_open_hunks(ledger), ("python3", "smoke.py"), kind="e2e")
+        ledger = self.reported(record_run(ledger, kind="test"), 0)
+
+        report = evaluate(ledger, two_hunks(), DEEP)
+
+        self.assertEqual(codes(report), ["no-passing-run"])
+        self.assertIn("R2 ran 0 tests (minimum 1)", report.issues[0].message)
+
+    def test_an_inline_test_program_without_a_check_is_trivial(self) -> None:
+        ledger = record_run(self.covered, ("python3", "-c", "import app; app.main()"), kind="test")
+
+        report = evaluate(ledger, two_hunks(), POLICY)
+
+        self.assertEqual(codes(report), ["no-passing-run"])
+        self.assertIn(
+            "R1 (`python3 -c 'import app; app.main()'`) is trivial and does not count as verification.",
+            report.warnings,
+        )
+
+    def test_the_same_inline_program_still_counts_as_an_e2e_run(self) -> None:
+        ledger = record_run(self.covered, ("python3", "-c", "import app; app.main()"), kind="e2e")
+
+        self.assertTrue(evaluate(ledger, two_hunks(), POLICY).passed)
+
     def test_deep_gate_requires_an_e2e_run(self) -> None:
         ledger = fully_reviewed(two_hunks(), deep=True)
         deep = DEEP

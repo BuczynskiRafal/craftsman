@@ -235,7 +235,7 @@ def _last_runs(ledger: Ledger, snap: DiffSnapshot) -> tuple[str, ...]:
         if run is not None:
             freshness = "current" if run.fingerprint == snap.fingerprint else "stale"
             lines.append(
-                f"{run.id} `{run.short_command}` ({run.kind}) exit {run.exit_code} ({freshness})"
+                f"{run.id} `{run.short_command}` ({run.kind}) {run.exit_text} ({freshness})"
             )
     return tuple(lines)
 

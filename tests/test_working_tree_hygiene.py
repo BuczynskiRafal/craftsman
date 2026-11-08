@@ -244,7 +244,7 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
         self.repo.cover_all()
 
         # Run verification
-        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('tests pass')")
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('tests pass')")
 
         # Check passes
         self.repo.cli("review", "check")

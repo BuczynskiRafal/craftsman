@@ -60,7 +60,7 @@ source of truth: [`skills/craft-review/SKILL.md`](../skills/craft-review/SKILL.m
      the hunks that reference a changed symbol. One fresh, unanchored hunter checks it (never the
      finder or its verifier, who are anchored), with a verifier if it records findings. The round cap
      bounds this loop.
-9. **Test.** `craftsman run --kind test -- <cmd>` on the final code; deep also `--kind e2e`.
+9. **Test.** `craftsman run --kind test -- <cmd>` on the final code; deep also `--kind e2e`. A test run counts only when its runner reported at least `--min-tests` tests (default 1); a command that matched no tests is recorded but is no evidence.
 10. **Close.** `craftsman review check`, then `craftsman gate --complete`, then `craftsman review
     report`.
 
@@ -190,7 +190,7 @@ The gate reports an issue list. It passes when the list is empty:
 ### Upgrading from Craftsman 4.x
 
 Nothing to run. The first command that reads a pre-5.0 gate state or a schema 2 ledger archives it
-(`craftsman_state.json.v4.bak`, `ledger.v2.bak.json`) and starts fresh, so neither `gate --init
+(`craftsman_state.json.v4.bak`, `ledger.v2.<UTC stamp>.bak.json`) and starts fresh, so neither `gate --init
 --takeover` nor `review reset` is needed. Re-run `craftsman install` to refresh the skills and agents.
 
 ---

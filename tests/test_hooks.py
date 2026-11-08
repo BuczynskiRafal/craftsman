@@ -706,7 +706,7 @@ class StopTests(HookTestCase):
         self.open_unsatisfied_gate()
         self.repo.cli("review", "prepare")
         self.repo.cover_all()
-        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('ok')")
 
     def test_hooked_gate_blocks_a_review_without_a_reviewer(self) -> None:
         self.prepare_unisolated_review()
@@ -738,7 +738,7 @@ class StopTests(HookTestCase):
         """A hooked gate with a test run and a reviewer that started, before anything is covered."""
         self.open_unsatisfied_gate()
         self.repo.cli("review", "prepare")
-        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('ok')")
         reviewer = {"agent_id": "a1", "agent_type": "craftsman-reviewer"}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         return reviewer
@@ -1848,7 +1848,7 @@ class GateWaitingTests(HookTestCase):
 
     def test_a_satisfied_gate_stops_even_with_a_hunter_running(self) -> None:
         self.hunt()
-        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('ok')")
         self.start("late-1")
 
         self.assertEqual(self.stop(), {})

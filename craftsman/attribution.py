@@ -33,7 +33,7 @@ from craftsman.records import (
     craftsman_agent_name,
     parse_timestamp,
 )
-from craftsman.triviality import is_trivial_run
+from craftsman.triviality import counts_as_verification
 
 # Platforms where every honest record names its caller (`by`): a record without `by` is vouched by no run of
 # these, not even by the time window, so withholding the identity cannot borrow a run.
@@ -42,9 +42,6 @@ IDENTITY_PLATFORMS = ("antigravity",)
 # A hunter or verifier that started longer ago than this and never reported is taken for dead.
 RUN_STALE_AFTER = timedelta(minutes=30)
 
-# Test and end-to-end runs are what counts as verification (the same kinds as `gatecheck.PASSING_KINDS`,
-# which cannot be imported here: the gate imports this module).
-_PASSING_KINDS = ("test", "e2e")
 
 
 @dataclass(frozen=True)
@@ -802,8 +799,5 @@ def evidence_counter(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
             continue
         resolutions += not events or bool(events[-1][1])
     legacy = sum(finding.verdict is not None and not finding.verdict_log for finding in ledger.findings)
-    passing = sum(
-        run.kind in _PASSING_KINDS and run.counts_as_passing and not is_trivial_run(run.argv)
-        for run in ledger.runs
-    )
+    passing = sum(counts_as_verification(run) for run in ledger.runs)
     return vouched + judged + legacy + resolutions + passing + len(ledger.rounds)

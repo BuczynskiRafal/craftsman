@@ -1620,6 +1620,28 @@ class EvidenceCounterTests(unittest.TestCase):
         self.assertEqual(self.counter(record_run(ledger, ("true",))), base)
         self.assertEqual(self.counter(record_run(ledger, exit_code=1)), base)
 
+    def test_a_test_run_that_ran_too_few_tests_is_not_progress(self) -> None:
+        ledger = finding_ledger()
+        base = self.counter(ledger)
+
+        def reported(ran: int | None, minimum: int = 1, argv: tuple[str, ...] = ("pytest", "-q")) -> Ledger:
+            recorded = record_run(ledger, argv)
+            return replace(recorded, runs=(replace(recorded.runs[-1], tests_ran=ran, min_tests=minimum),))
+
+        self.assertEqual(self.counter(reported(0)), base)
+        self.assertEqual(self.counter(reported(2, minimum=3)), base)
+        self.assertEqual(self.counter(reported(1)), base + 1)
+        self.assertEqual(self.counter(reported(None)), base + 1)
+        self.assertEqual(self.counter(reported(0, minimum=0)), base + 1)
+
+    def test_an_inline_test_program_without_a_check_is_not_progress(self) -> None:
+        ledger = finding_ledger()
+        base = self.counter(ledger)
+
+        self.assertEqual(self.counter(record_run(ledger, ("python3", "-c", "import app"))), base)
+        self.assertEqual(self.counter(record_run(ledger, ("python3", "-c", "import app"), kind="e2e")), base + 1)
+        self.assertEqual(self.counter(record_run(ledger, ("python3", "-c", "assert 1 + 1 == 2"))), base + 1)
+
     def test_a_new_round_counts(self) -> None:
         ledger = hunt_ledger()
         later = replace(ledger, rounds=(*ledger.rounds, replace(ledger.rounds[0], number=2, prepared_at=at(40))))

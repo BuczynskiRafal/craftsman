@@ -264,6 +264,17 @@ class CollectContextTests(unittest.TestCase):
         self.assertEqual(text.count("line_150 = "), 2, "the hunk is not printed twice")
 
 
+class LastRunsTests(unittest.TestCase):
+    def test_a_run_that_ran_no_tests_does_not_look_green(self) -> None:
+        snap = DiffSnapshot("b" * 40, "fp1", (), (), 0, 0)
+        ledger = record_run(Ledger())
+        ledger = replace(ledger, runs=(replace(ledger.runs[0], tests_ran=0),))
+
+        (line,) = packet._last_runs(ledger, snap)
+
+        self.assertEqual(line, "R1 `pytest -q` (test) exit 0, 0 tests - not counted (current)")
+
+
 class RenderTests(unittest.TestCase):
     def test_a_scope_whose_omission_saves_nothing_is_kept(self) -> None:
         path = "pkg/" + "deeply/nested/" * 6 + "a.py"
