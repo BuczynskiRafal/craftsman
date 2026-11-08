@@ -15,14 +15,28 @@ from craftsman.assets import iter_skills
 from craftsman.doctor import detect_antigravity_drift, scan_copilot_duplicates
 from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import CRAFTSMAN_BEGIN_MARKER
-from craftsman.install import check_ephemeral_uv_interpreter, parse_install_args
-from craftsman.manifest import MANIFEST_FILENAME, InstallError, TargetKind, load_manifest
+from craftsman.install import check_ephemeral_uv_interpreter, install_main, parse_install_args
+from craftsman.manifest import (
+    BEFORE_4_0_MANIFEST_MESSAGE,
+    MANIFEST_FILENAME,
+    InstallError,
+    TargetKind,
+    load_manifest,
+)
 from craftsman.paths import default_vscode_prompts_dir
 from craftsman.platforms.antigravity import is_agy_plugin_active
 from craftsman.platforms.claude import is_craftsman_hook_command
 from craftsman.staging import InstallMode
 
-from tests.support import REPO_ROOT, IsolatedHomeTestCase, snapshot_tree
+from tests.support import (
+    REMOVED_SKILLS,
+    REPO_ROOT,
+    IsolatedHomeTestCase,
+    repo_with_removed_skills,
+    run_main,
+    snapshot_tree,
+    write_pre_4_0_install,
+)
 
 SKILL_NAMES = [skill.name for skill in iter_skills(REPO_ROOT)]
 
@@ -417,149 +431,221 @@ class CopilotTests(InstallTestCase):
         self.assert_ok(self.install("--copilot-workspace", str(workspace), "--allow-duplicate-scopes"))
 
 
-class LegacyGitHooksUpgradeTests(InstallTestCase):
-    def test_upgrade_retires_craftsman_hooks_path_with_its_files(self) -> None:
-        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=None)
+class ManifestBefore4UpgradeTests(InstallTestCase):
+    def test_a_manifest_of_craftsman_before_4_0_stops_the_install_with_a_reinstall_message(self) -> None:
+        manifest = write_pre_4_0_install(self.claude_dir)
+        before = snapshot_tree(self.home)
 
         result = self.install("--claude")
 
-        self.assert_ok(result)
-        self.assertIn("removed the global git hooks of Craftsman 3.x", result.out)
+        self.assertEqual(result.code, 1)
+        self.assertIn(BEFORE_4_0_MANIFEST_MESSAGE.format(path=manifest), result.err)
+        self.assertEqual(snapshot_tree(self.home), before)
+
+    def test_the_check_comes_before_the_first_write_of_any_target(self) -> None:
+        manifest = write_pre_4_0_install(self.claude_dir)
+        before = snapshot_tree(self.home)
+
+        for dry_run in ((), ("--dry-run",)):
+            with self.subTest(dry_run=bool(dry_run)):
+                result = self.install("--antigravity", "--claude", *dry_run)
+
+                self.assertEqual(result.code, 1)
+                self.assertIn(BEFORE_4_0_MANIFEST_MESSAGE.format(path=manifest), result.err)
+                self.assertEqual(snapshot_tree(self.home), before)
+
+    def test_a_manifest_in_a_workspace_stops_the_install_before_the_user_targets(self) -> None:
+        workspace = self.tmp / "project"
+        workspace.mkdir()
+        write_pre_4_0_install(workspace)
+        before = snapshot_tree(self.home)
+
+        result = self.install("--claude", "--agents-workspace", str(workspace))
+
+        self.assertEqual(result.code, 1)
+        self.assertEqual(snapshot_tree(self.home), before)
+
+    def test_deleting_that_manifest_lets_the_install_proceed(self) -> None:
+        write_pre_4_0_install(self.claude_dir).unlink()
+
+        self.assert_ok(self.install("--claude"))
+
+        self.assertTrue((self.claude_dir / "commands" / "craftsman.md").is_file())
+
+    def test_the_git_hooks_of_craftsman_before_4_0_are_not_looked_for_in_the_craftsman_home(self) -> None:
+        write_pre_4_0_install(self.home / ".craftsman")
+        before = snapshot_tree(self.home / ".craftsman")
+
+        self.assert_ok(self.install("--claude"))
+
+        self.assertEqual(snapshot_tree(self.home / ".craftsman"), before)
         self.assertIsNone(self.hooks_path())
-        self.assertFalse(hooks_dir.exists())
-        self.assertIsNone(load_manifest(self.home / ".craftsman"))
 
-    def test_upgrade_restores_previous_hooks_path(self) -> None:
-        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path="~/my-hooks")
+    def test_a_manifest_written_by_craftsman_5_0_is_still_read(self) -> None:
+        self.assert_ok(self.install("--claude"))
+        path = self.claude_dir / MANIFEST_FILENAME
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["targets"]["claude"].update(previous_hooks_path=None, hooks_dir=None)
+        path.write_text(json.dumps(data), encoding="utf-8")
 
-        result = self.install("--copilot")
+        self.assert_ok(self.install("--claude"))
 
-        self.assert_ok(result)
-        self.assertEqual(self.hooks_path(), "~/my-hooks")
-        self.assertFalse(hooks_dir.exists())
+        written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("hooks_dir", written["targets"]["claude"])
 
-    def test_upgrade_leaves_user_changed_hooks_path_untouched(self) -> None:
-        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=None)
-        self.git_global("core.hooksPath", "/opt/husky")
 
-        result = self.install("--claude")
+class RemovedSkillsUpgradeTests(InstallTestCase):
+    """The skills Craftsman stopped shipping leave an existing install on the next `craftsman install`."""
 
-        self.assert_ok(result)
-        self.assertEqual(self.hooks_path(), "/opt/husky")
-        self.assertIn("leaving git config --global core.hooksPath (/opt/husky) untouched", result.err)
-        self.assertFalse(hooks_dir.exists())
+    def setUp(self) -> None:
+        super().setUp()
+        self.old_release = repo_with_removed_skills(self.tmp)
 
-    def test_upgrade_keeps_shared_runtime_needed_by_antigravity(self) -> None:
-        self.assert_ok(self.install("--antigravity"))
-        hooks_dir = self.write_legacy_git_hooks(self.config_dir)
+    def install_old(self, *args: str) -> None:
+        self.assert_ok(run_main(install_main, "--repo-dir", str(self.old_release), *args))
 
-        result = self.install("--claude")
+    def locations(self, base: Path, template: str) -> list[Path]:
+        return [base / template.format(name=name) for name in REMOVED_SKILLS]
 
-        self.assert_ok(result)
-        self.assertIsNone(self.hooks_path())
-        self.assertFalse(hooks_dir.exists())
-        self.assertTrue((self.config_dir / "scripts" / "craftsman-stop-gate.py").is_file())
-        manifest = load_manifest(self.config_dir)
+    def assert_gone(self, paths: list[Path]) -> None:
+        for path in paths:
+            self.assertFalse(path.exists() or path.is_symlink(), f"{path} is still installed")
+
+    def assert_present(self, paths: list[Path]) -> None:
+        for path in paths:
+            self.assertTrue(path.exists(), f"{path} is missing")
+
+    def test_the_old_release_installs_them(self) -> None:
+        self.install_old("--claude")
+
+        self.assert_present(self.locations(self.claude_dir, "commands/{name}.md"))
+
+    def test_claude_commands_are_removed(self) -> None:
+        self.install_old("--claude")
+
+        self.assert_ok(self.install("--claude"))
+
+        self.assert_gone(self.locations(self.claude_dir, "commands/{name}.md"))
+        self.assertTrue((self.claude_dir / "commands" / "craftsman.md").is_file())
+        manifest = load_manifest(self.claude_dir)
         assert manifest is not None
-        self.assertNotIn(TargetKind.GIT_HOOKS, manifest.targets)
-        self.assertIn(TargetKind.ANTIGRAVITY, manifest.targets)
+        self.assertFalse(any(name in path for path in manifest.created_paths for name in REMOVED_SKILLS))
 
-    def test_dry_run_upgrade_leaves_legacy_git_hooks_untouched(self) -> None:
-        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path="~/prev")
+    def test_antigravity_copies_are_removed(self) -> None:
+        self.install_old("--antigravity")
+
+        result = self.install("--antigravity")
+
+        self.assert_ok(result)
+        self.assert_gone(self.locations(self.config_dir, "skills/{name}"))
+        self.assertIn(f"- {self.config_dir / 'skills' / REMOVED_SKILLS[0]}", result.out)
+        self.assertEqual(detect_antigravity_drift(REPO_ROOT, self.config_dir), [])
+
+    def test_antigravity_symlinks_are_removed_and_the_old_checkout_stays(self) -> None:
+        self.install_old("--antigravity", "--symlink")
+        links = self.locations(self.config_dir, "skills/{name}")
+        self.assertTrue(all(link.is_symlink() for link in links))
+
+        self.assert_ok(self.install("--antigravity", "--symlink"))
+
+        self.assert_gone(links)
+        self.assert_present(self.locations(self.old_release, "skills/{name}/SKILL.md"))
+
+    def test_the_antigravity_plugin_is_replaced_without_them(self) -> None:
+        self.install_old("--antigravity", "--plugin")
+        old = self.config_dir / "plugins" / "craftsman" / "skills"
+        self.assert_present([old / name for name in REMOVED_SKILLS])
+
+        self.assert_ok(self.install("--antigravity", "--plugin"))
+
+        self.assert_gone([old / name for name in REMOVED_SKILLS])
+
+    def test_copilot_user_skills_are_removed(self) -> None:
+        self.install_old("--copilot")
+
+        self.assert_ok(self.install("--copilot"))
+
+        self.assert_gone(self.locations(self.home / ".copilot", "skills/{name}"))
+
+    def test_copilot_workspace_skills_are_removed(self) -> None:
+        workspace = self.tmp / "project"
+        workspace.mkdir()
+        self.install_old("--copilot-workspace", str(workspace))
+
+        self.assert_ok(self.install("--copilot-workspace", str(workspace)))
+
+        self.assert_gone(self.locations(workspace, ".github/skills/{name}"))
+
+    def test_the_agents_workspace_list_drops_them(self) -> None:
+        workspace = self.tmp / "project"
+        workspace.mkdir()
+        self.install_old("--agents-workspace", str(workspace))
+        agents = (workspace / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertTrue(all(f"`/{name}`" in agents for name in REMOVED_SKILLS))
+
+        self.assert_ok(self.install("--agents-workspace", str(workspace)))
+
+        agents = (workspace / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertFalse(any(f"`/{name}`" in agents for name in REMOVED_SKILLS))
+        self.assertIn("`/craftsman`", agents)
+
+    def test_a_skill_of_the_same_name_that_craftsman_did_not_create_stays(self) -> None:
+        mine = self.claude_dir / "commands" / "code-quality.md"
+        mine.parent.mkdir(parents=True)
+        mine.write_text("my own command\n", encoding="utf-8")
+        self.assert_ok(self.install("--claude"))
+
+        self.assertEqual(mine.read_text(encoding="utf-8"), "my own command\n")
+
+    def test_a_same_named_command_of_the_user_that_the_old_install_moved_aside_stays_in_the_backup(
+        self,
+    ) -> None:
+        mine = self.claude_dir / "commands" / "code-quality.md"
+        mine.parent.mkdir(parents=True)
+        mine.write_text("my own command\n", encoding="utf-8")
+        self.install_old("--claude")
+
+        self.assert_ok(self.install("--claude"))
+
+        self.assertFalse(mine.exists())
+        backups = list((self.claude_dir / "commands" / BACKUP_DIR_NAME).iterdir())
+        self.assertEqual([p.read_text(encoding="utf-8") for p in backups], ["my own command\n"])
+
+    def test_files_the_user_added_beside_them_stay(self) -> None:
+        self.install_old("--antigravity")
+        note = self.config_dir / "skills" / "my-skill" / "SKILL.md"
+        note.parent.mkdir()
+        note.write_text("mine\n", encoding="utf-8")
+
+        self.assert_ok(self.install("--antigravity"))
+
+        self.assertEqual(note.read_text(encoding="utf-8"), "mine\n")
+
+    def test_one_target_does_not_remove_the_skills_of_another_base_folder(self) -> None:
+        self.install_old("--claude", "--antigravity")
+
+        self.assert_ok(self.install("--claude"))
+
+        self.assert_gone(self.locations(self.claude_dir, "commands/{name}.md"))
+        self.assert_present(self.locations(self.config_dir, "skills/{name}"))
+
+    def test_a_dry_run_changes_nothing(self) -> None:
+        self.install_old("--claude")
         before = snapshot_tree(self.home)
 
         result = self.install("--claude", "--dry-run")
 
         self.assert_ok(result)
+        self.assertIn(f"- {self.claude_dir / 'commands' / 'code-quality.md'}", result.out)
         self.assertEqual(snapshot_tree(self.home), before)
-        self.assertEqual(self.hooks_path(), str(hooks_dir))
 
-    def test_corrupt_git_hooks_manifest_does_not_block_other_targets(self) -> None:
-        (self.home / ".craftsman").mkdir()
-        (self.home / ".craftsman" / MANIFEST_FILENAME).write_text("{", encoding="utf-8")
+    def test_uninstall_after_the_upgrade_leaves_nothing(self) -> None:
+        self.install_old("--claude", "--antigravity", "--copilot")
+        self.assert_ok(self.install("--claude", "--antigravity", "--copilot"))
 
-        self.assert_ok(self.install("--claude"))
+        self.assert_ok(self.uninstall("--all"))
 
-    def test_upgrade_from_v1_manifest_unsets_hooks_path_and_removes_files(self) -> None:
-        hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path=None)
-
-        result = self.install("--claude")
-
-        self.assert_ok(result)
-        self.assertIn("removed the global git hooks of Craftsman 3.x", result.out)
-        self.assertIsNone(self.hooks_path())
-        self.assertFalse(hooks_dir.exists())
-        self.assertFalse((self.home / ".craftsman").exists())
-
-    def test_upgrade_from_v1_manifest_restores_previous_hooks_path(self) -> None:
-        hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path="~/my-hooks")
-
-        result = self.install("--copilot")
-
-        self.assert_ok(result)
-        self.assertEqual(self.hooks_path(), "~/my-hooks")
-        self.assertFalse(hooks_dir.exists())
-        self.assertIsNone(load_manifest(self.home / ".craftsman"))
-
-    def test_upgrade_from_v1_manifest_leaves_user_changed_hooks_path_untouched(self) -> None:
-        hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path=None)
-        self.git_global("core.hooksPath", "/opt/husky")
-
-        result = self.install("--claude")
-
-        self.assert_ok(result)
-        self.assertEqual(self.hooks_path(), "/opt/husky")
-        self.assertIn("leaving git config --global core.hooksPath (/opt/husky) untouched", result.err)
-        self.assertFalse(hooks_dir.exists())
-
-    def test_upgrade_from_v1_antigravity_and_git_hooks_manifest(self) -> None:
-        self.config_dir.mkdir(parents=True)
-        (self.config_dir / "scripts").mkdir()
-        legacy_guard = self.config_dir / "scripts" / "git-guard.py"
-        legacy_guard.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-        hooks_json = self.config_dir / "hooks.json"
-        hooks_json.write_text(
-            json.dumps(
-                {
-                    "craftsman-git-guard": {"enabled": True, "PreToolUse": []},
-                    "craftsman-stop-gate": {"enabled": False, "Stop": []},
-                    "my-hook": {"enabled": True, "Stop": []},
-                }
-            ),
-            encoding="utf-8",
-        )
-        hooks_dir = self.write_legacy_v1_git_hooks(
-            self.config_dir,
-            previous_hooks_path="~/before-craftsman",
-            created_dirs=(),
-            extra_targets={
-                "antigravity": {
-                    "target": "antigravity",
-                    "mode": "copy",
-                    "version": "3.0.0",
-                    "created_paths": [str(legacy_guard)],
-                    "created_dirs": [],
-                    "modified_files": {str(hooks_json): "hooks_json"},
-                }
-            },
-        )
-
-        result = self.install("--antigravity")
-
-        self.assert_ok(result)
-        self.assertEqual(self.hooks_path(), "~/before-craftsman")
-        self.assertFalse(hooks_dir.exists())
-        self.assertFalse(legacy_guard.exists())
-        self.assertTrue((self.config_dir / "scripts" / "craftsman-scope-guard.py").is_file())
-        self.assertTrue((self.config_dir / "scripts" / "craftsman-stop-gate.py").is_file())
-        merged = json.loads(hooks_json.read_text(encoding="utf-8"))
-        self.assertNotIn("craftsman-git-guard", merged)
-        self.assertIn("craftsman-scope-guard", merged)
-        self.assertIs(merged["craftsman-stop-gate"]["enabled"], False)
-        self.assertIn("my-hook", merged)
-        manifest = load_manifest(self.config_dir)
-        assert manifest is not None
-        self.assertEqual(set(manifest.targets), {TargetKind.ANTIGRAVITY})
+        self.assertEqual(list(self.home.iterdir()), [])
 
 
 class WorkspaceTests(InstallTestCase):

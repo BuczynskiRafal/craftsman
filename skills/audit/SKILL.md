@@ -2,12 +2,12 @@
 name: audit
 description: >-
   Focused deep audits of a diff, module or directory, one concern at a time:
-  errors, tests, types, comments, security, plus optional quality and perf.
-  Each audit is an in-depth run of the matching review lens with its own
-  inventory table. Use when /audit [aspects] [target] is invoked.
+  errors, tests, types, comments, security. Each audit is an in-depth run of
+  the matching review lens with its own inventory table. Use when /audit
+  [aspects] [target] is invoked.
 ---
 
-# Audit (`/audit [errors,tests,types,comments,security,quality,perf | all] [target] [--fix]`)
+# Audit (`/audit [errors,tests,types,comments,security | all] [target] [--fix]`)
 
 A review looks at a change through many lenses at once; an audit takes **one** concern and goes
 through the target exhaustively, building an inventory instead of sampling. Use it for code that
@@ -31,8 +31,6 @@ contract).
 | `types` | `/audit-types` | `model` | adds or changes classes, records, enums, schemas |
 | `comments` | `/audit-comments` | `craft` (probe 4) | adds or changes comments or docstrings |
 | `security` | `/audit-security` | `trust` | touches paths, processes, SQL, deserialization, auth, network |
-| `quality` | `/code-quality` | `craft` | on request |
-| `perf` | `/extreme-optimizer` | — | on request |
 
 ## How to run
 

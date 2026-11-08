@@ -16,12 +16,10 @@ from unittest import mock
 
 from craftsman import cli
 from craftsman.doctor import (
-    LEFTOVER_GIT_HOOKS_PROBLEM,
     build_report,
     command_executables,
     detect_antigravity_drift,
     inspect_legacy_distribution,
-    inspect_legacy_git_hooks,
     loads_jsonc_dict,
     plugin_skill_names,
     scan_copilot_duplicates,
@@ -29,7 +27,7 @@ from craftsman.doctor import (
 )
 from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.hook_command import absolute_hook_prefixes
-from craftsman.manifest import MANIFEST_FILENAME
+from craftsman.manifest import BEFORE_4_0_MANIFEST_MESSAGE, MANIFEST_FILENAME
 from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
 from craftsman.platforms.claude import export_to_claude_user, merge_claude_hooks
 from craftsman.platforms.copilot import (
@@ -40,7 +38,7 @@ from craftsman.platforms.copilot import (
     write_copilot_hooks,
 )
 
-from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main
+from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main, write_pre_4_0_install
 
 VERIFY_SKILL = "---\nname: verify\n---\nClaude skill\n"
 
@@ -237,15 +235,15 @@ class SkillManifestTests(DoctorTestCase):
     def test_plugin_manifest_must_list_the_skill_folders(self) -> None:
         repo = self.copy_repo()
         names = json.loads((repo / "plugin.json").read_text(encoding="utf-8"))
-        names["skills"] = [n.replace("code-quality", "code_quality") for n in names["skills"]]
+        names["skills"] = [n.replace("simplify", "simple_fy") for n in names["skills"]]
         (repo / "plugin.json").write_text(json.dumps(names), encoding="utf-8")
 
         report = build_report(repo, None, self.tmp)
 
         self.assertIn(
-            "plugin.json lists skill 'code_quality' that skills/ does not have", report.skill_errors
+            "plugin.json lists skill 'simple_fy' that skills/ does not have", report.skill_errors
         )
-        self.assertIn("skills/code-quality is not listed in plugin.json", report.skill_errors)
+        self.assertIn("skills/simplify is not listed in plugin.json", report.skill_errors)
 
     def test_unreadable_plugin_manifest_is_an_error(self) -> None:
         repo = self.copy_repo()
@@ -479,52 +477,81 @@ class LegacyDistributionTests(unittest.TestCase):
         self.assertEqual(self.inspect("craftsman"), [])
 
 
-class LegacyGitHooksInspectionTests(IsolatedHomeTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        self.hooks_dir = self.home / ".craftsman" / "git-hooks"
-
-    def test_leftover_git_hooks_manifest_warns(self) -> None:
-        self.write_legacy_git_hooks(set_hooks_path=False)
-
-        self.assertEqual(
-            inspect_legacy_git_hooks(None, self.home), [LEFTOVER_GIT_HOOKS_PROBLEM]
-        )
-
-    def test_craftsman_hooks_path_without_manifest_warns(self) -> None:
-        self.assertEqual(
-            inspect_legacy_git_hooks(str(self.hooks_dir), self.home), [LEFTOVER_GIT_HOOKS_PROBLEM]
-        )
-
-    def test_uninstall_clears_leftover_git_hooks_warning(self) -> None:
-        self.write_legacy_git_hooks()
-
-        self.assert_ok(self.uninstall())
-
+class HomeInspectionTests(IsolatedHomeTestCase):
+    def doctor(self) -> tuple[int, dict[str, Any]]:
         result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
-        self.assertEqual(result.code, 0, result.err)
-        self.assertEqual(json.loads(result.out)["problems"], [])
+        return result.code, json.loads(result.out)
 
-    def test_hooks_of_another_tool_are_not_flagged(self) -> None:
-        (self.tmp / "husky").mkdir()
+    def test_a_clean_home_is_healthy(self) -> None:
+        code, report = self.doctor()
 
-        self.assertEqual(inspect_legacy_git_hooks(str(self.tmp / "husky"), self.home), [])
+        self.assertEqual((code, report["problems"]), (0, []))
+
+    def test_a_manifest_of_craftsman_before_4_0_is_a_problem_that_asks_for_a_reinstall(self) -> None:
+        manifest = write_pre_4_0_install(self.home / ".claude")
+
+        code, report = self.doctor()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(report["problems"], [BEFORE_4_0_MANIFEST_MESSAGE.format(path=manifest)])
+
+    def test_a_manifest_of_craftsman_before_4_0_in_the_craftsman_home_is_not_read(self) -> None:
+        write_pre_4_0_install(self.home / ".craftsman")
+
+        code, report = self.doctor()
+
+        self.assertEqual((code, report["problems"]), (0, []))
+
+    def test_uninstall_does_not_clear_the_problem_but_deleting_the_manifest_does(self) -> None:
+        manifest = write_pre_4_0_install(self.home / ".gemini" / "config")
+
+        self.assertEqual(self.uninstall("--all").code, 1)
+        self.assertEqual(self.doctor()[0], 1)
+        manifest.unlink()
+
+        self.assertEqual(self.doctor()[0], 0)
+
+    def test_a_hooks_path_in_a_git_hooks_folder_of_craftsman_before_4_0_is_a_problem(self) -> None:
+        for value in (
+            str(self.home / ".craftsman" / "git-hooks"),
+            str(self.home / ".gemini" / "config" / "git-hooks"),
+            "~/.craftsman/git-hooks",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(self.git_global("core.hooksPath", value).returncode, 0)
+
+                code, report = self.doctor()
+
+                self.assertEqual(code, 1)
+                (problem,) = report["problems"]
+                self.assertIn("git config --global --unset core.hooksPath", problem)
+
+    def test_other_hooks_paths_are_no_problem(self) -> None:
+        for value in ("/opt/husky", ".husky", str(self.home / ".craftsman" / "other")):
+            with self.subTest(value=value):
+                self.assertEqual(self.git_global("core.hooksPath", value).returncode, 0)
+
+                code, report = self.doctor()
+
+                self.assertEqual((code, report["problems"]), (0, []))
 
     def test_unreadable_git_config_is_a_problem(self) -> None:
         self.git_config.write_text("[core\n", encoding="utf-8")
 
-        result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
+        code, report = self.doctor()
 
-        self.assertEqual(result.code, 1)
-        problems = json.loads(result.out)["problems"]
-        self.assertTrue(any("git config --global --get user.name failed" in p for p in problems))
+        self.assertEqual(code, 1)
+        self.assertTrue(any("git config --global --get user.name failed" in p for p in report["problems"]))
 
     def test_corrupt_manifest_is_a_problem(self) -> None:
-        self.hooks_dir.parent.mkdir(parents=True)
-        (self.hooks_dir.parent / MANIFEST_FILENAME).write_text("{", encoding="utf-8")
+        claude_dir = self.home / ".claude"
+        claude_dir.mkdir()
+        (claude_dir / MANIFEST_FILENAME).write_text("{", encoding="utf-8")
 
-        (problem,) = inspect_legacy_git_hooks(None, self.home)
+        code, report = self.doctor()
 
+        self.assertEqual(code, 1)
+        (problem,) = report["problems"]
         self.assertIn("cannot read install manifest", problem)
 
     def test_duplicate_claude_hooks_flagged(self) -> None:

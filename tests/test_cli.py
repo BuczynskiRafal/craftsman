@@ -86,9 +86,9 @@ class StatusTests(unittest.TestCase):
 class SkillCommandTests(unittest.TestCase):
     def test_skill_is_found_by_its_name(self) -> None:
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            code = skill_main(["path", "code-quality", "--repo-dir", str(REPO_ROOT)])
+            code = skill_main(["path", "simplify", "--repo-dir", str(REPO_ROOT)])
 
-        self.assertEqual((code, out.getvalue().strip()), (0, str(REPO_ROOT / "skills" / "code-quality")))
+        self.assertEqual((code, out.getvalue().strip()), (0, str(REPO_ROOT / "skills" / "simplify")))
 
     def skill(self, *args: str) -> CliResult:
         return run_main(skill_main, *args, "--repo-dir", str(REPO_ROOT))

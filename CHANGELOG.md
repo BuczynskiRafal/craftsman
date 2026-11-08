@@ -6,7 +6,24 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Removed
+
+- **Four skills unrelated to the review loop:** `leetcode-style-code-reviewer`, `code-quality`,
+  `high-level-commit-message` and `extreme-optimizer`. `craftsman install` removes the copies, links and
+  commands that an earlier install recorded in its manifest (and nothing it did not create); `/audit` no longer
+  lists the `quality` and `perf` aspects, and `/craftsman` proposes the commit message itself.
+- **The migration of Craftsman < 4.0 installs** (`legacy_githooks.py`, `TargetKind.GIT_HOOKS`, the `schema_version: 1`
+  manifest reader and the restore of `core.hooksPath`). A manifest of that age now stops `install`, `uninstall` and
+  `doctor` with a message to delete it and run `craftsman install` again.
+  `craftsman install` reads the manifest of every selected target before it writes anything. `craftsman doctor`
+  still reports a global `core.hooksPath` that points to the git hooks folder of those releases. The manifests this
+  version writes no longer carry the retired `previous_hooks_path` and `hooks_dir` keys, so Craftsman 5.0 cannot read
+  them back: reinstall with 5.0 after a downgrade.
+
 ### Changed
+
+- **The `audit-*` skills load their review lens instead of repeating its probes** (`craftsman skill show craft-review
+  --lenses <id>`) and keep only their own inventory table and method.
 
 - **Diagrams are Excalidraw scenes again.** The five Mermaid diagrams (workflow, evidence ledger, finding
   lifecycle, hooks and guards, stop gate) are redrawn for the 5.0 protocol as editable

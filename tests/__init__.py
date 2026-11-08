@@ -23,5 +23,5 @@ os.environ.update(
 )
 # The platform markers hooks read to tell which agent runs them (the shared list, so that a test run started
 # from inside an agent session sees none of them); tests set the ones they need.
-for _variable in (*sorted(AMBIENT_PLATFORM_ENV_VARS), "XDG_CONFIG_HOME", "APPDATA", "CRAFTSMAN_HOME"):
+for _variable in (*sorted(AMBIENT_PLATFORM_ENV_VARS), "XDG_CONFIG_HOME", "APPDATA"):
     os.environ.pop(_variable, None)

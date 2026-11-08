@@ -215,7 +215,6 @@ Both run through `craftsman hook pre-tool` (Claude Code, VS Code Copilot, Copilo
 | [`craftsman/hook_command.py`](../craftsman/hook_command.py) | Absolute Python + CLI hook command builder |
 | [`craftsman/platforms/`](../craftsman/platforms/__init__.py) | Per-platform exporters and installers (`copilot.py`, `claude.py`, `antigravity.py`, `agents_md.py`) |
 | [`craftsman/export.py`](../craftsman/export.py) | `craftsman export` entrypoint |
-| [`craftsman/install.py`](../craftsman/install.py) | Installer orchestration (`craftsman install`) and 3.x git-hook cleanup |
+| [`craftsman/install.py`](../craftsman/install.py) | Installer orchestration (`craftsman install`) |
 | [`craftsman/uninstall.py`](../craftsman/uninstall.py) | Manifest-driven uninstaller |
-| [`craftsman/legacy_githooks.py`](../craftsman/legacy_githooks.py) | Removal of global git hooks installed by Craftsman 3.x |
 | [`craftsman/doctor.py`](../craftsman/doctor.py) | Repository asset validator and installation health checker |

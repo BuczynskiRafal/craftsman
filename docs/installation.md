@@ -127,3 +127,7 @@ craftsman uninstall --dry-run                      # preview changes without rem
 ```
 
 Uninstall cleans only paths registered in `.craftsman-install.json` and restores original configuration files.
+
+Running `craftsman install` again also removes what an earlier install created and this version no longer ships (for example the `code-quality`, `extreme-optimizer`, `high-level-commit-message` and `leetcode-style-code-reviewer` skills, which 5.0 still shipped). Only paths the manifest records are removed; a skill or command of the same name that you wrote yourself stays. A folder Craftsman created is Craftsman's with everything in it: every install replaces it and an upgrade that drops it deletes it, so keep your own skills beside it, not inside it.
+
+A manifest written by Craftsman before 4.0 (it records global git hooks) is no longer migrated: `install`, `uninstall` and `doctor` stop with a message that asks you to delete that file and run `craftsman install` again. If `git config --global core.hooksPath` still points to a Craftsman `git-hooks` folder, unset it with `git config --global --unset core.hooksPath`; `craftsman doctor` reports that setting when it points to `~/.craftsman/git-hooks` or `~/.gemini/config/git-hooks`.

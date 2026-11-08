@@ -81,10 +81,10 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
 Run `craftsman review report` and give the user a short summary: what was built (files, one line
 each); your decisions in plain language (the depth and why; the hunters and their lenses; the waves; how
 findings were verified); findings fixed, accepted (with reasons) and dismissed
-(count); the verification commands and results; a proposed commit message from
-`/high-level-commit-message`. Write it as rendered Markdown with real line breaks, never `\n`
-escapes, and do not wrap it in quotes, JSON or a code block. Never commit, push or open a pull
-request unless the user asked.
+(count); the verification commands and results; a proposed commit message (Conventional Commits,
+American English, one line stating the intent). Write it as rendered Markdown with real line breaks,
+never `\n` escapes, and do not wrap it in quotes, JSON or a code block. Never commit, push or open a
+pull request unless the user asked.
 
 ## Autonomy
 
