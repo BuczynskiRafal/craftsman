@@ -227,6 +227,33 @@ class PrepareEnforcementTests(HuntTestCase):
         self.assertIn("Advisory:", out)
         self.assertFalse(self.latest().enforced)
 
+    def test_a_stale_marker_leaks_neither_its_depth_nor_its_task_into_any_round(self) -> None:
+        self.write_cart()
+        self.arm(seconds_ago=300, deep=True, task="OLD TASK")
+
+        seen = []
+        for command in (("prepare",), ("prepare", "--task", "X"), ("reset",), ("prepare",)):
+            self.review(*command)
+            if command[0] == "prepare":
+                seen.append(self.latest())
+
+        self.assertEqual(len(seen), 3)
+        for round_ in seen:
+            self.assertEqual((round_.enforced, round_.deep), (False, False))
+            self.assertNotEqual(round_.task, "OLD TASK")
+        self.assertEqual(seen[-1].task, "")
+
+    def test_a_marker_the_hooks_just_touched_lends_its_depth_and_its_task_to_the_round(self) -> None:
+        self.write_cart()
+        self.arm(seconds_ago=0, deep=True, task="the cart totals")
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Depth: deep", out)
+        self.assertEqual(
+            (self.latest().enforced, self.latest().deep, self.latest().task), (True, True, "the cart totals")
+        )
+
     def test_a_gate_whose_platform_proved_isolation_enforces_the_round(self) -> None:
         open_gate(
             self.repo.root,

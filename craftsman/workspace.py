@@ -19,16 +19,19 @@ HOOKS_MARKER = "review_hooks.json"
 # A marker touched within this long ago was touched by the very command that is running now: the
 # PreToolUse hook arms or touches it just before the shell call.
 MARKER_FRESH_FOR = timedelta(seconds=120)
+# A guarding marker of another session that was touched more recently than this is not taken over.
+MARKER_STEAL_AFTER = timedelta(hours=2)
 HOOKED_PLATFORMS = ("claude", "copilot", "antigravity")
 
 
 @dataclass(frozen=True)
 class ReviewMarker:
-    """What the prompt hook noted about a session that invoked the review command.
+    """What the hooks noted about a session that invoked the review command.
 
     A review-only run has no gate state to say that hooks serve its session; this file does. While
-    `guarding`, the Stop hook keeps the session working until the review-only outcome exists;
-    `forced` and `best` count those reminders like the gate's continuations.
+    `guarding`, the Stop hook keeps the session working until the review-only outcome exists; `forced`
+    counts those reminders, `evidence_seen` is the evidence counter at the last one (the progress rule is
+    `gate.advance_streak`). Only the hooks write `touched_at`: no `craftsman` command does.
     """
 
     platform: str
@@ -36,7 +39,6 @@ class ReviewMarker:
     at: str
     guarding: bool = True
     forced: int = 0
-    best: int | None = None
     touched_at: str | None = None  # when the hooks last saw this session run a review command
     deep: bool = False  # the request that started the review asked for the deep review
     task: str = ""  # what the request said the change is for
@@ -46,11 +48,22 @@ class ReviewMarker:
     def is_of(self, caller: GateOwner) -> bool:
         return self.platform == caller.platform and self.session_id == caller.session_id
 
+    def last_seen(self) -> datetime:
+        """When the hooks last saw this session do anything for the review: the touch, else the start."""
+        return parse_timestamp(self.touched_at or self.at)
+
+    def ended(self) -> ReviewMarker:
+        """This marker once its review is over (finished, or the user moved on): no longer guarding."""
+        return replace(self, guarding=False, forced=0, evidence_seen=None)
+
+    def abandoned(self, now: datetime) -> ReviewMarker:
+        """This marker once the guard gave up on an incomplete review at `now`."""
+        return replace(self.ended(), abandoned_at=format_timestamp(now))
+
 
 def read_marker(ledger_path: Path) -> ReviewMarker | None:
     try:
         raw = json.loads((ledger_path.parent / HOOKS_MARKER).read_text(encoding="utf-8"))
-        best = raw.get("best")
         seen = raw.get("evidence_seen")
         task = raw.get("task")
         return ReviewMarker(
@@ -59,7 +72,6 @@ def read_marker(ledger_path: Path) -> ReviewMarker | None:
             str(raw["at"]),
             guarding=raw.get("guarding") is True,
             forced=int(raw.get("forced", 0)),
-            best=best if isinstance(best, int) else None,
             touched_at=str(raw["touched_at"]) if raw.get("touched_at") else None,
             deep=raw.get("deep") is True,
             task=task if isinstance(task, str) else "",
@@ -78,37 +90,105 @@ def write_marker(ledger_path: Path, marker: ReviewMarker) -> None:
         pass  # without the marker a review-only run is only advisory about isolation
 
 
-def mark_hooks_active(ledger_path: Path, caller: GateOwner) -> None:
-    """Note that the prompt hook saw `caller`'s session invoke the review command."""
+def arm_marker(
+    ledger_path: Path,
+    caller: GateOwner,
+    now: datetime,
+    *,
+    fresh: bool,
+    deep: bool | None = None,
+    task: str | None = None,
+) -> bool:
+    """Note that the hooks saw `caller`'s session ask for or run a review; False when it was left alone.
+
+    A guarding marker of ANOTHER session that was seen less than `MARKER_STEAL_AFTER` ago is kept (the
+    single marker file serves one review per checkout; parallel reviews need worktrees).
+
+    `fresh` is a new review request (the `/craft-review` prompt): a NEW marker for `caller` with `at` =
+    `now`, no touch (a prompt is not a review command), the counters at zero and `deep`/`task` from the
+    request. Without it (a `craftsman review` command seen by PreToolUse) a marker of `caller` that is still
+    guarding keeps its `at`, counters, `deep` and `task` unless new ones are given, and is touched `now`.
+    A marker that no longer guards (its review passed, the user moved on, the guard gave up) belongs to a
+    finished review: a command then begins a new one, so the marker is new, touched `now`, with `deep` and
+    `task` only as given (the request of the old review must not leak into it); only `abandoned_at` is
+    carried over, since the banner of an abandoned review stays until the next round replaces it.
+    """
     if caller.session_id is None:
-        return
-    now = format_timestamp(datetime.now(timezone.utc))
-    write_marker(ledger_path, ReviewMarker(caller.platform, caller.session_id, now))
+        return False
+    stamp = format_timestamp(now)
+    current = read_marker(ledger_path)
+    if current is not None and current.guarding and not current.is_of(caller) and now - _seen(current) < MARKER_STEAL_AFTER:
+        return False
+    if current is not None and current.guarding and current.is_of(caller) and not fresh:
+        marker = replace(
+            current,
+            touched_at=stamp,
+            deep=current.deep if deep is None else deep,
+            task=current.task if task is None else task,
+        )
+    else:
+        kept = current.abandoned_at if current is not None and current.is_of(caller) and not fresh else None
+        marker = ReviewMarker(
+            caller.platform,
+            caller.session_id,
+            stamp,
+            touched_at=None if fresh else stamp,
+            deep=bool(deep),
+            task=task or "",
+            abandoned_at=kept,
+        )
+    write_marker(ledger_path, marker)
+    return True
+
+
+def _seen(marker: ReviewMarker) -> datetime:
+    try:
+        return marker.last_seen()
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)  # a stamp that cannot be read proves nothing
+
+
+def touch_marker(ledger_path: Path, caller: GateOwner, now: datetime) -> None:
+    """Note that the hooks saw `caller`'s guarding session run a review command (`report` among them)."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding and marker.is_of(caller):
+        write_marker(ledger_path, replace(marker, touched_at=format_timestamp(now)))
+
+
+def end_review_guard(ledger_path: Path, caller: GateOwner | None = None) -> None:
+    """Stop holding the session (of `caller`, if given) to a finished review or one the user moved on from."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding and (caller is None or marker.is_of(caller)):
+        write_marker(ledger_path, marker.ended())
+
+
+def abandon_review_guard(ledger_path: Path, caller: GateOwner, now: datetime) -> None:
+    """Stop holding `caller`'s session to a review it left incomplete, and say so (`abandoned_at`)."""
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding and marker.is_of(caller):
+        write_marker(ledger_path, marker.abandoned(now))
+
+
+def live_marker(ledger_path: Path, now: datetime) -> ReviewMarker | None:
+    """The marker, when it counts for the command that runs at `now`: guarding, of a hooked platform, and
+    touched by the hooks within `MARKER_FRESH_FOR` (the PreToolUse of this very command).
+
+    The one decision of `review_enforcement` and of `prepare` (the marker's `deep` and `task` apply only
+    through here, so a stale marker of an earlier review leaks nothing into a new round).
+    """
+    marker = read_marker(ledger_path)
+    if marker is not None and marker.guarding and marker.platform in HOOKED_PLATFORMS and _just_touched(marker, now):
+        return marker
+    return None
 
 
 def cli_visible(caller: GateOwner) -> GateOwner:
     """`caller` as a `craftsman` command run by that session sees it.
 
-    Only Claude Code exports its session id to the commands it runs; on other platforms a command
-    cannot tell which session it serves.
+    Claude Code exports its session id to the commands it runs and an Antigravity conversation exports its
+    own id; on other platforms a command cannot tell which session it serves.
     """
-    return caller if caller.platform == "claude" else GateOwner(caller.platform, None)
-
-
-def touch_review(ledger_path: Path) -> None:
-    """Note that `review prepare` ran for the guarded review: re-preparing an unchanged diff, or
-    raising its depth, leaves the round as it was but is still the agent doing its part."""
-    marker = read_marker(ledger_path)
-    if marker is not None and marker.guarding:
-        now = format_timestamp(datetime.now(timezone.utc))
-        write_marker(ledger_path, replace(marker, touched_at=now))
-
-
-def end_review_guard(ledger_path: Path, caller: GateOwner | None = None) -> None:
-    """Stop holding the session (of `caller`, if given) to a finished or abandoned review."""
-    marker = read_marker(ledger_path)
-    if marker is not None and marker.guarding and (caller is None or marker.is_of(caller)):
-        write_marker(ledger_path, replace(marker, guarding=False, forced=0, best=None))
+    return caller if caller.platform in ("claude", "antigravity") else GateOwner(caller.platform, None)
 
 
 def caller_identity(env: Mapping[str, str]) -> str | None:
@@ -221,8 +301,8 @@ def review_enforcement(
     """
     if ws.state is not None and ws.state.required_isolation != "none":
         return True, ws.state.owner.platform
-    marker = read_marker(ws.ledger_path)
-    if marker is not None and marker.guarding and marker.platform in HOOKED_PLATFORMS and _just_touched(marker, now):
+    marker = live_marker(ws.ledger_path, now)
+    if marker is not None:
         return True, marker.platform
     if ledger.rounds and ledger.rounds[-1].enforced:
         return True, ledger.rounds[-1].platform

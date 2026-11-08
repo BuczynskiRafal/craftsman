@@ -23,7 +23,7 @@ Severity = Literal["blocker", "major", "minor", "nit"]
 Verdict = Literal["proven", "probable", "question", "dismissed"]
 Resolution = Literal["fixed", "accepted"]
 RunKind = Literal["test", "e2e", "repro", "lint", "build", "other"]
-AgentEventKind = Literal["start", "stop"]
+AgentEventKind = Literal["start", "stop", "nudge"]
 AgentRole = Literal["reviewer", "verifier"]
 IsolationEvidence = Literal["hooks", "transcript", "none"]
 SlotKind = Literal["bug", "simplicity", "sweep", "fresh", "variant"]
@@ -1199,6 +1199,12 @@ RECORD_TOKEN_RE = re.compile(r"[BCFV]\d+")
 
 @dataclass(frozen=True)
 class AgentEvent:
+    """One lifecycle fact of a subagent: it started, stopped, or was sent back once (`nudge`).
+
+    A `nudge` is written by the SubagentStop hook when it sends an agent back instead of letting it stop. It
+    opens and closes no run: it only remembers that this run was sent back, so it is sent back at most once.
+    """
+
     platform: str
     event: AgentEventKind
     agent: str

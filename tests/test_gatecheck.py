@@ -9,6 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
+from craftsman import gatecheck
 from craftsman.attribution import RUN_STALE_AFTER
 from craftsman.diffscan import DiffSnapshot, snapshot
 from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, continuation_reason
@@ -23,12 +24,10 @@ from craftsman.gatecheck import (
     format_blocker_summary,
     hunt_slots,
     passing_runs,
-    render_next_actions,
     render_report,
     slot_statuses,
     verifier_clusters,
 )
-from craftsman.hooks import REVIEW_GUARD_ACTIONS
 from craftsman.huntplan import plan_due_waves, required_slots
 from craftsman.ledger import (
     add_agent_event,
@@ -400,6 +399,30 @@ class IsolationTests(unittest.TestCase):
         report = evaluate(self.ledger, two_hunks(), POLICY)
 
         self.assertIn("SELF-REVIEWED", render_report(report))
+
+
+class NudgeTests(unittest.TestCase):
+    """A `nudge` (the SubagentStop hook sent an agent back) is not a stop: the 5.0 run builder opens a run on a start only."""
+
+    def test_start_nudge_stop_is_one_run_closed_at_the_stop(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        events = [
+            AgentEvent("copilot", "start", "craftsman-reviewer", "", shifted(T0, 1)),
+            AgentEvent("copilot", "nudge", "craftsman-reviewer", "", shifted(T0, 3)),
+            AgentEvent("copilot", "stop", "craftsman-reviewer", "", shifted(T0, 7)),
+        ]
+        for event in events:
+            ledger = add_agent_event(ledger, event)
+
+        (run,) = gatecheck._reviewer_runs(ledger)
+
+        self.assertEqual((run.started, run.stopped), (parse_timestamp(shifted(T0, 1)), parse_timestamp(shifted(T0, 7))))
+
+    def test_a_nudge_alone_is_no_finished_run(self) -> None:
+        ledger, _ = prepared(two_hunks())
+        ledger = add_agent_event(ledger, AgentEvent("copilot", "nudge", "craftsman-reviewer", "", shifted(T0, 3)))
+
+        self.assertEqual(gatecheck._reviewer_runs(ledger), [])
 
 
 class RoundIsolationTests(unittest.TestCase):
@@ -1069,6 +1092,17 @@ class SlotStatusTests(unittest.TestCase):
         result = statuses(ledger)
 
         self.assertEqual((result["W1-1"].state, result["W1-2"].state), ("done", "dead"))
+
+    def test_a_hunter_that_crashed_after_its_brief_leaves_its_slot_dead(self) -> None:
+        # Its transcript shows the `B` token the brief printed, so the claim is vouched by it: the hunter ended.
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", 11), *run_events("h1", 10, 60, records=("B1",)))
+
+        self.assertEqual(statuses(ledger)["W1-1"].state, "dead")
+
+    def test_a_crashed_hunter_that_showed_no_brief_backs_no_claim(self) -> None:
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", 11), *run_events("h1", 10, 60, records=()))
+
+        self.assertEqual(statuses(ledger)["W1-1"].state, "unlaunched")
 
     def test_a_claim_backed_by_an_open_run_is_running(self) -> None:
         ledger = with_agents(claim(hunt("W1-1"), "W1-1", 20), *run_events("h1", 10, None))
@@ -2342,11 +2376,12 @@ class BudgetTests(unittest.TestCase):
         ledger, snap = self.nineteen()
         report = check(ledger, 100, snap=snap)
 
-        actions = render_next_actions(report.issues, max_items=REVIEW_GUARD_ACTIONS)
-        block = f"{format_blocker_summary(report)}.\n" + "\n".join(actions)
+        block = continuation_reason(
+            "[CRAFTSMAN REVIEW 1/6]", report, None, consequence="", closing="Finish with `x` passing.", check="x"
+        )
 
-        self.assertLess(len(block), 1500)  # 1.1k today; the two issues of this plan are shown in full
-        self.assertIn(report.issues[0].message, block)
+        self.assertLessEqual(len(block), MAX_CONTINUATION_REASON_CHARS)
+        self.assertIn(report.issues[0].message, block)  # the first issue of this plan is shown in full
 
     def test_every_state_at_once_with_scattered_slots_and_many_findings_stays_in_budget(self) -> None:
         count = 40

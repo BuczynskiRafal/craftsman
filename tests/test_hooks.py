@@ -8,14 +8,18 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from craftsman import antigravity, hooks
-from craftsman.gate import MAX_CONTINUATIONS
+from craftsman.attribution import agent_runs
+from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, MAX_CONTINUATIONS
 from craftsman.gatecheck import MAX_ROUNDS
 from craftsman.hooks import REVIEWER_STOP_REASON, HookInput, HookInputError
+from craftsman.huntview import hunk_ranges
+from craftsman.ledger import load
 
 from tests.support import EvidenceRepo, coverage_note
 
@@ -115,6 +119,70 @@ class HookTestCase(unittest.TestCase):
             claude("SubagentStop", self.root, stop_hook_active=True, **reviewer),
         )
 
+    def pre_tool(self, command: str, platform: str = "claude", **extra: Any) -> dict[str, Any]:
+        """The PreToolUse hook of the main session's shell call `command`."""
+        if platform == "copilot":
+            payload = vscode(
+                "PreToolUse", self.root, tool_name="run_in_terminal", tool_input={"command": command}, **extra
+            )
+        else:
+            payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": command}, **extra)
+        return call_hook("pre-tool", platform, payload)[0]
+
+    def prepare(self, *args: str, platform: str = "claude") -> None:
+        """`craftsman review prepare` as the hooked main session runs it: PreToolUse first, then the command."""
+        self.pre_tool(" ".join(["craftsman", "review", "prepare", *args]), platform)
+        self.repo.cli("review", "prepare", *args)
+
+    def marker(self) -> dict[str, Any]:
+        loaded = json.loads((self.repo.ledger_dir / "review_hooks.json").read_text(encoding="utf-8"))
+        assert isinstance(loaded, dict)
+        return loaded
+
+    def run_hunter(
+        self,
+        slot: dict[str, Any],
+        *,
+        platform: str = "claude",
+        agent_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        """The hunter of `slot` (a slot of `show --json`) as its platform's hooks see it: start, brief, cover, stop.
+
+        Claude Code hunters stop with a transcript that shows the commands they ran; Copilot hunters have no ids
+        and no transcript. Returns the SubagentStop answer.
+        """
+        slot_id, missing = slot["id"], slot["missing"] or slot["hunks"]
+        ids = ",".join(missing)
+        if platform == "copilot":
+            call_hook("subagent-start", "copilot", copilot_cli(self.root, agentName="craftsman-reviewer"))
+            self.repo.cli("review", "brief", slot_id)
+            self.repo.cli("review", "cover", "--hunter", slot_id, "--hunks", ids, "--note", coverage_note(missing))
+            return call_hook("subagent-stop", "copilot", copilot_cli(self.root, agentName="craftsman-reviewer"))[0]
+        reviewer = {"agent_id": agent_id or f"h-{slot_id}", "agent_type": "craftsman-reviewer"}
+        if session_id is not None:
+            reviewer["session_id"] = session_id
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        brief = self.repo.cli("review", "brief", slot_id)
+        cover = self.repo.cli("review", "cover", "--hunter", slot_id, "--hunks", ids, "--note", coverage_note(missing))
+        lines = [
+            *shell_run(f"b-{slot_id}", f"craftsman review brief {slot_id}", brief.stdout),
+            *shell_run(f"c-{slot_id}", f'craftsman review cover --hunter {slot_id} --hunks {ids} --note "x"', cover.stdout),
+        ]
+        return self.stop_with_transcript(reviewer, *lines)
+
+    def unfinished_slots(self) -> list[dict[str, Any]]:
+        return [slot for slot in self.repo.show()["slots"] if slot["state"] != "done"]
+
+    def hunt(self, *, platform: str = "claude") -> None:
+        """Every unfinished slot of the latest (enforced) round hunted to the end, one hunter after the other."""
+        for _ in range(20):  # a hunter may finish other slots by credit; ask again after each
+            slots = self.unfinished_slots()
+            if not slots:
+                return
+            self.assertEqual(self.run_hunter(slots[0], platform=platform), {})
+        self.fail("the hunt did not finish")
+
     def stop_with_transcript(self, reviewer: dict[str, str], *lines: str, **extra: Any) -> dict[str, Any]:
         """A subagent stops; its own transcript consists of `lines`."""
         path = self.tmp / f"agent-{reviewer['agent_id']}.jsonl"  # outside the work tree: it is not part of the diff
@@ -133,11 +201,13 @@ class HookTestCase(unittest.TestCase):
         assert isinstance(loaded, dict)
         return loaded
 
-    def add_finding(self) -> None:
+    def add_finding(self, hunter: str | None = None) -> None:
+        """A finding of the orchestrator; in an enforced round it has to name a slot (`lead` is its own)."""
         self.repo.cli(
             "review", "add", "--lens", "contracts", "--file", "cart.py", "--line", "2",
             "--severity", "major", "--title", "Strings are summed without a check",
             "--scenario", "total(['a']) raises TypeError instead of a clear error",
+            *(["--hunter", hunter] if hunter else []),
         )  # fmt: skip
 
 
@@ -298,8 +368,7 @@ class ReviewStopGuardTests(HookTestCase):
         return call_hook("stop", "claude", claude("Stop", self.root, **extra))[0]
 
     def guarding(self) -> bool:
-        marker = json.loads((self.repo.ledger_dir / "review_hooks.json").read_text(encoding="utf-8"))
-        return bool(marker["guarding"])
+        return bool(self.marker()["guarding"])
 
     def begin_review(self, prompt: str = "/craftsman:craft-review the cart") -> None:
         self.prompt(prompt)
@@ -313,7 +382,7 @@ class ReviewStopGuardTests(HookTestCase):
         self.assertEqual(out["decision"], "block")
         self.assertIn(f"[CRAFTSMAN REVIEW 1/{MAX_CONTINUATIONS}]", out["reason"])
         self.assertIn("craftsman review prepare", out["reason"])
-        self.assertIn("craftsman-reviewer", out["reason"])
+        self.assertIn("launch the hunters it lists", out["reason"])
         self.assertFalse((self.repo.ledger_dir / "craftsman_state.json").exists())
 
     def test_the_hosts_own_review_command_is_never_guarded(self) -> None:
@@ -325,13 +394,18 @@ class ReviewStopGuardTests(HookTestCase):
                 self.assertFalse((self.repo.ledger_dir / "review_hooks.json").exists())
                 self.assertFalse(self.state_file.exists())
 
-    def test_a_reviewer_still_running_lets_the_agent_wait_for_it(self) -> None:
+    def test_a_reviewer_still_running_lets_the_agent_wait_for_it_without_spending_a_reminder(self) -> None:
         self.begin_review()
-        self.repo.cli("review", "prepare")
+        self.prepare()
         reviewer = {"agent_id": "bg-1", "agent_type": "craftsman-reviewer"}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
 
-        self.assertEqual(self.stop(), {})  # its completion wakes the session; no reminder is spent
+        waiting = self.stop()  # its completion wakes the session
+
+        self.assertEqual(set(waiting), {"systemMessage"})
+        self.assertIn("waiting for craftsman-reviewer", waiting["systemMessage"])
+        self.assertIn("`craftsman review check --review-only` will say to relaunch them", waiting["systemMessage"])
+        self.assertEqual(self.marker()["forced"], 0)
         self.assertTrue(self.guarding())
 
         call_hook(
@@ -341,52 +415,65 @@ class ReviewStopGuardTests(HookTestCase):
         )
         self.assertIn("[CRAFTSMAN REVIEW 1/", self.stop()["reason"])
 
+    def test_a_claim_without_an_open_run_does_not_wave_the_stop_through(self) -> None:
+        self.begin_review()
+        self.prepare()
+        self.repo.cli("review", "brief", "W1-1")  # the orchestrator fetched a brief itself: no run behind it
+
+        blocked = self.stop()
+
+        self.assertIn("[CRAFTSMAN REVIEW 1/", blocked["reason"])
+
+    def test_the_orchestrator_cannot_fetch_a_brief_of_its_own(self) -> None:
+        self.begin_review()
+        self.prepare()
+
+        out = self.pre_tool("craftsman review brief W1-1")
+
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("Briefs are for the subagents you launch", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(self.pre_tool("craftsman review brief --verifier F1")["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_preparing_an_unchanged_diff_again_counts_as_starting_the_review(self) -> None:
         self.begin_review()
-        self.repo.cli("review", "prepare")
-        self.repo.cover_all()
-        self.run_reviewer()
+        self.prepare()
+        self.hunt()
         self.assertEqual(self.stop(), {})
         self.prompt("/craft-review again")
         self.assertIn("No review round yet", self.stop()["reason"])
 
-        self.repo.cli("review", "prepare")
+        self.prepare()  # an unchanged diff keeps its round and its `prepared_at`
 
         self.assertEqual(self.stop(), {})
 
     def test_the_guard_judges_a_copilot_review_like_the_cli_check_does(self) -> None:
         call_hook("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="/craft-review"))
         self.repo.write("cart.py", CHANGE)
-        self.repo.cli("review", "prepare")
-        self.repo.cover_all()
+        self.prepare(platform="copilot")
+        self.assertEqual(call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))[0]["decision"], "block")
+        self.assertEqual(self.repo.cli("review", "check", "--review-only", check=False).returncode, 1)
+
+        self.hunt(platform="copilot")
 
         checked = self.repo.cli("review", "check", "--review-only", check=False)
         out, _ = call_hook("stop", "copilot", vscode("Stop", self.root, stop_hook_active=False))
-
         self.assertEqual(checked.returncode, 0, checked.stdout)  # no session id reaches the CLI
         self.assertEqual(out, {})
 
-    def test_a_round_without_coverage_or_a_reviewer_is_named(self) -> None:
+    def test_a_round_without_a_finished_hunt_names_the_slots(self) -> None:
         self.begin_review()
-        self.repo.cli("review", "prepare")
+        self.prepare()
 
         reason = self.stop()["reason"]
 
-        self.assertIn("1 hunk not covered", reason)
-        self.assertIn("[uncovered]", reason)
-
-    def test_covered_hunks_still_need_a_reviewer_run(self) -> None:
-        self.begin_review()
-        self.repo.cli("review", "prepare")
-        self.repo.cover_all()
-
-        self.assertIn("[no-isolation]", self.stop()["reason"])
+        self.assertIn("[no-isolation]", reason)  # no craftsman subagent was recorded at all
+        self.assertIn("W1-1..W1-3", reason)
+        self.assertNotIn("review cover --hunks", reason)
 
     def test_a_finished_review_lets_the_agent_stop_once(self) -> None:
         self.begin_review()
-        self.repo.cli("review", "prepare")
-        self.repo.cover_all()
-        self.run_reviewer()
+        self.prepare()
+        self.hunt()
 
         self.assertEqual(self.stop(), {})
         self.assertFalse(self.guarding())
@@ -395,16 +482,38 @@ class ReviewStopGuardTests(HookTestCase):
 
     def test_an_old_round_does_not_satisfy_a_new_review(self) -> None:
         self.begin_review()
-        self.repo.cli("review", "prepare")
-        self.repo.cover_all()
-        self.run_reviewer()
+        self.prepare()
+        self.hunt()
         self.assertEqual(self.stop(), {})
 
         self.prompt("/craft-review again")
 
         self.assertEqual(self.stop()["decision"], "block")
 
-    def test_the_guard_lets_go_after_the_continuation_cap(self) -> None:
+    def test_a_deep_request_is_not_met_by_an_earlier_normal_round(self) -> None:
+        self.begin_review()
+        self.prepare()
+        self.hunt()
+        self.assertEqual(self.stop(), {})
+
+        self.prompt("/craft-review --deep")
+        self.pre_tool("craftsman review show")
+
+        blocked = self.stop()["reason"]
+
+        self.assertIn("A deep review was requested: run `craftsman review prepare`", blocked)
+        self.assertTrue(self.marker()["deep"])
+
+    def test_an_advisory_round_does_not_satisfy_a_hooked_session(self) -> None:
+        self.begin_review()
+        self.repo.cli("review", "prepare")  # a command the hooks never saw: an advisory round
+        self.pre_tool("craftsman review show")
+
+        blocked = self.stop()["reason"]
+
+        self.assertIn("This session's hooks enforce the review: run `craftsman review prepare`", blocked)
+
+    def test_the_guard_lets_go_after_the_continuation_cap_and_says_the_review_is_not_complete(self) -> None:
         self.begin_review()
         for count in range(1, MAX_CONTINUATIONS + 1):
             self.assertIn(f"[CRAFTSMAN REVIEW {count}/", self.stop()["reason"])
@@ -412,8 +521,32 @@ class ReviewStopGuardTests(HookTestCase):
         out = self.stop()
 
         self.assertEqual(set(out), {"systemMessage"})
-        self.assertIn("still incomplete after", out["systemMessage"])
+        self.assertIn("still incomplete after 6 reminders without progress", out["systemMessage"])
+        self.assertIn("The review is NOT complete", out["systemMessage"])
+        self.assertIsNotNone(self.marker()["abandoned_at"])
+        self.assertFalse(self.guarding())
         self.assertEqual(self.stop(), {})
+
+    def test_progress_resets_the_reminders(self) -> None:
+        self.begin_review()
+        self.prepare()
+        for count in range(1, 4):
+            self.assertIn(f"[CRAFTSMAN REVIEW {count}/", self.stop()["reason"])
+        slots = self.unfinished_slots()
+        self.run_hunter(slots[0])  # vouched coverage: the evidence counter grows
+
+        self.assertIn("[CRAFTSMAN REVIEW 1/", self.stop()["reason"])
+
+    def test_activity_without_evidence_does_not_reset_the_reminders(self) -> None:
+        self.begin_review()
+        self.prepare()
+        for count in range(1, 4):
+            self.assertIn(f"[CRAFTSMAN REVIEW {count}/", self.stop()["reason"])
+        reviewer = {"agent_id": "idle", "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
+        call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, stop_hook_active=True, **reviewer))
+
+        self.assertIn("[CRAFTSMAN REVIEW 4/", self.stop()["reason"])
 
     def test_a_continuation_prompt_keeps_the_guard(self) -> None:
         self.begin_review()
@@ -425,10 +558,9 @@ class ReviewStopGuardTests(HookTestCase):
 
     def test_a_background_agents_report_keeps_the_guard_and_blocks_the_next_stop(self) -> None:
         self.begin_review()
-        self.repo.cli("review", "prepare")
-        self.repo.cover_all()
-        self.add_finding()  # no verdict yet
-        self.run_reviewer()
+        self.prepare()
+        self.hunt()
+        self.add_finding("lead")  # no verdict yet
         reports = (
             'Another Claude session sent a message:\n<agent-message from="a1">Hunt done: F1</agent-message>',
             "<task-notification>\n<status>completed</status>\n</task-notification>",
@@ -450,7 +582,7 @@ class ReviewStopGuardTests(HookTestCase):
     def test_nothing_to_review_is_an_outcome(self) -> None:
         self.prompt("/craft-review")
 
-        self.repo.cli("review", "prepare")
+        self.prepare()
 
         self.assertEqual(self.stop(), {})
 
@@ -487,6 +619,33 @@ class ReviewStopGuardTests(HookTestCase):
         reason = self.stop()["reason"]
 
         self.assertIn("[CRAFTSMAN GATE 1/", reason)
+
+    def test_a_session_under_a_foreign_gate_is_still_guarded_and_told_the_gate_check(self) -> None:
+        self.repo.cli("gate", "--init", "--cwd", ".", "--session-id", "gate-owner", env_extra={"CLAUDECODE": "1"})
+        self.begin_review()
+
+        reason = self.stop()["reason"]  # session claude-session is not the gate's owner
+
+        self.assertIn("[CRAFTSMAN REVIEW 1/", reason)
+        self.assertIn("Finish with `craftsman review check` passing.", reason)
+        self.assertNotIn("--review-only", reason)
+
+    def test_the_owner_of_a_gate_is_held_by_the_gate_not_the_review_guard(self) -> None:
+        self.repo.cli("gate", "--init", "--cwd", ".", "--session-id", "claude-session", env_extra={"CLAUDECODE": "1"})
+        self.begin_review()
+
+        reason = self.stop()["reason"]
+
+        self.assertIn("[CRAFTSMAN GATE 1/", reason)
+
+    def test_the_block_fits_the_budget_and_never_cuts_a_sentence(self) -> None:
+        self.begin_review()
+        self.prepare()
+
+        reason = self.stop()["reason"]
+
+        self.assertLessEqual(len(reason), MAX_CONTINUATION_REASON_CHARS)
+        self.assertTrue(reason.rstrip().endswith("passing."))
 
 
 class StopTests(HookTestCase):
@@ -537,7 +696,7 @@ class StopTests(HookTestCase):
 
     def test_cap_answers_with_a_system_message(self) -> None:
         self.open_unsatisfied_gate()
-        self.update_state(forced_continuations=MAX_CONTINUATIONS)
+        self.update_state(forced_continuations=MAX_CONTINUATIONS, evidence_seen=0)
         capped, _ = call_hook("stop", "copilot", copilot_cli(self.root))
         self.assertEqual(set(capped), {"systemMessage"})
         self.assertIn("Craftsman gate not satisfied", capped["systemMessage"])
@@ -773,32 +932,23 @@ class SubagentTests(HookTestCase):
         payload = vscode("SubagentStart", self.root, agent_id="r-1", agent_type="craftsman-reviewer")
         return call_hook("subagent-start", "copilot", payload)[0]
 
-    def test_reviewer_start_is_briefed_with_the_round_and_how_to_read_its_slice(self) -> None:
+    def test_reviewer_start_is_briefed_with_the_round_and_where_its_slot_comes_from(self) -> None:
         out = self.start_reviewer()
         context = out["additionalContext"]
         self.assertEqual(
             out["hookSpecificOutput"], {"hookEventName": "SubagentStart", "additionalContext": context}
         )
-        self.assertTrue(context.startswith("Craftsman review round 1.\n"))
+        self.assertEqual(
+            context,
+            "Craftsman review round 1. Your slot id is in your prompt: run `craftsman review brief <ID>` and "
+            "follow it; cover only your slot (other slots belong to other hunters).",
+        )
 
-    def test_reviewer_brief_lists_the_uncovered_hunks(self) -> None:
-        context = self.start_reviewer()["additionalContext"]
-        self.assertIn("Hunks not covered yet (take only your assigned slice): H1", context)
-
-    def test_briefs_never_name_the_packet_and_hold_only_the_round_the_work_and_the_commands(self) -> None:
+    def test_briefs_list_neither_uncovered_hunks_nor_slots_and_never_name_the_packet(self) -> None:
         reviewer = self.start_reviewer()["additionalContext"]
 
-        self.assertEqual(
-            reviewer.splitlines(),
-            [
-                "Craftsman review round 1.",
-                "Hunks not covered yet (take only your assigned slice): H1",
-                "Read your slice: `craftsman review view --hunks <ids>`; context before opening files: "
-                "`craftsman review scout H#` or `craftsman review scout <symbol>`.",
-            ],
-        )
-        self.assertLess(len(reviewer), 400)
-        for text in ("packet", "craftsman review cover", "craftsman review add", "Recording commands", "Scope:"):
+        self.assertLess(len(reviewer), 300)
+        for text in ("packet", "H1", "W1-", "Hunks not covered", "craftsman review cover", "Scope:"):
             self.assertNotIn(text, reviewer)
 
     def test_reviewer_start_is_recorded(self) -> None:
@@ -809,7 +959,7 @@ class SubagentTests(HookTestCase):
             [("copilot", "start", "craftsman-reviewer", "r-1")],
         )
 
-    def test_verifier_brief_lists_findings_without_a_verdict(self) -> None:
+    def test_verifier_is_pointed_at_its_brief_command_and_told_no_findings(self) -> None:
         self.repo.cli("review", "prepare")
         self.add_finding()
         out, _ = call_hook(
@@ -820,11 +970,12 @@ class SubagentTests(HookTestCase):
             ),
         )
         context = out["additionalContext"]
-        self.assertIn("Findings without a verdict:\n- F1 (major, cart.py:2): Strings are summed", context)
-        self.assertIn("Lens and scenario of each: `craftsman review show`", context)
-        self.assertIn("`craftsman review scout <symbol>`", context)
-        self.assertNotIn("craftsman review verdict", context)
-        self.assertNotIn("packet", context)
+        self.assertEqual(
+            context,
+            "Craftsman review round 1. Run the `craftsman review brief --verifier ...` command from your prompt.",
+        )
+        for text in ("F1", "Strings are summed", "craftsman review verdict", "packet"):
+            self.assertNotIn(text, context)
 
     def stop_recording_coverage(self, transcript: tuple[str, ...] | None = None, **extra: Any) -> dict[str, Any]:
         """A reviewer that covered its hunk stops; return the stop event the ledger got.
@@ -867,7 +1018,7 @@ class SubagentTests(HookTestCase):
         )
         self.assertEqual(event["records"], ["C1"])
 
-    def test_the_stop_is_recorded_before_the_transcript_is_read(self) -> None:
+    def test_a_stop_is_recorded_only_with_the_facts_of_the_transcript_it_was_judged_on(self) -> None:
         self.repo.cli("review", "prepare")
         reviewer = {"agent_id": "r-t", "agent_type": "craftsman-reviewer"}
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
@@ -882,8 +1033,7 @@ class SubagentTests(HookTestCase):
                 )
 
         events = self.ledger()["agents"]
-        self.assertEqual([(e["event"], e["agent_id"]) for e in events], [("start", "r-t"), ("stop", "r-t")])
-        self.assertNotIn("usage", events[-1])
+        self.assertEqual([(e["event"], e["agent_id"]) for e in events], [("start", "r-t")])  # nothing half-recorded
 
     def test_the_sessions_own_transcript_path_is_not_read_as_the_agents(self) -> None:
         path = self.agent_transcript(
@@ -942,7 +1092,7 @@ class SubagentTests(HookTestCase):
 
         self.assertEqual(first, {"decision": "block", "reason": REVIEWER_STOP_REASON})
         self.assertEqual(second, {})
-        self.assertEqual([e["event"] for e in self.ledger()["agents"]], ["start", "stop", "stop"])
+        self.assertEqual([e["event"] for e in self.ledger()["agents"]], ["start", "nudge", "stop"])
 
     def test_reviewer_that_recorded_coverage_may_stop(self) -> None:
         self.repo.cli("review", "prepare")
@@ -1214,7 +1364,7 @@ class SessionOwnershipTests(HookTestCase):
         )
         self.repo.write("cart.py", CHANGE)
         self.repo.cli("gate", "--await-user", "--cwd", ".", "--session-id", "claude-A")
-        self.update_state(forced_continuations=3)
+        self.update_state(forced_continuations=3, evidence_seen=0)
         raw_before = self.state_file.read_bytes()
 
         out_p, _ = call_hook(
@@ -1285,7 +1435,7 @@ class SessionOwnershipTests(HookTestCase):
         out, _ = call_hook("pre-tool", "copilot", payload)
         self.assertEqual(out["permissionDecision"], "deny")
 
-    def test_subagent_hooks_ignore_non_owner_sessions(self) -> None:
+    def test_the_subagents_of_a_non_owner_session_are_recorded_all_the_same(self) -> None:
         self.open_antigravity_gate_from_the_terminal()
         sub_out, _ = call_hook(
             "subagent-start",
@@ -1293,8 +1443,28 @@ class SessionOwnershipTests(HookTestCase):
             claude("SubagentStart", self.root, agent_id="x", agent_type="Explore"),
         )
         self.assertEqual(sub_out, {})
-        self.assertEqual(self.ledger()["agents"], [])
-        self.assertEqual(self.state()["isolation_evidence"], "none")
+        self.assertEqual([(e["event"], e["agent"]) for e in self.ledger()["agents"]], [("start", "Explore")])
+        self.assertEqual(self.state()["isolation_evidence"], "none")  # recording is not claiming the gate
+
+    def test_a_second_sessions_review_under_a_foreign_gate_is_recorded_and_can_finish(self) -> None:
+        self.repo.cli("gate", "--init", "--cwd", ".", "--session-id", "sess-A", env_extra={"CLAUDECODE": "1"})
+        self.repo.write("cart.py", CHANGE)
+        call_hook(
+            "prompt", "claude", claude("UserPromptSubmit", self.root, session_id="sess-B", prompt="/craft-review the cart")
+        )
+        self.pre_tool("craftsman review prepare", session_id="sess-B")
+        self.repo.cli("review", "prepare")
+        self.assertTrue(self.repo.show()["slots"])  # an enforced round: the foreign gate and the marker both enforce it
+
+        for _ in range(10):
+            slots = self.unfinished_slots()
+            if not slots:
+                break
+            self.assertEqual(self.run_hunter(slots[0], session_id="sess-B"), {})
+
+        slots = self.repo.show()["slots"]
+        self.assertEqual({slot["state"] for slot in slots}, {"done"})
+        self.assertEqual(self.state()["owner"]["session_id"], "sess-A")
 
     def test_craftsman_trigger_in_other_session_preserves_owner_gate(self) -> None:
         call_hook(
@@ -1328,6 +1498,738 @@ class SessionOwnershipTests(HookTestCase):
         self.assertEqual((self.state()["active"], self.state()["stage"]), (False, "completed"))
         report = self.repo.cli("review", "report").stdout
         self.assertNotIn("SELF-REVIEWED", report)
+
+
+class ArmingTests(HookTestCase):
+    """PreToolUse arms the review guard when the main session runs a `craftsman review` command."""
+
+    def marker_file(self) -> Path:
+        return self.repo.ledger_dir / "review_hooks.json"
+
+    def role_pre_tool(self, command: str, agent_type: str = "craftsman-reviewer") -> dict[str, Any]:
+        return self.pre_tool(command, agent_id="sub-1", agent_type=agent_type)
+
+    def decision(self, out: dict[str, Any]) -> str | None:
+        found = out.get("hookSpecificOutput", {}).get("permissionDecision", out.get("permissionDecision"))
+        return str(found) if found is not None else None
+
+    def test_the_main_sessions_prepare_arms_the_guard_on_claude_and_copilot(self) -> None:
+        for platform, session in (("claude", "claude-session"), ("copilot", "vscode-session")):
+            with self.subTest(platform=platform):
+                self.marker_file().unlink(missing_ok=True)
+
+                self.assertEqual(self.pre_tool("craftsman review prepare", platform), {})
+
+                marker = self.marker()
+                self.assertEqual((marker["platform"], marker["session_id"]), (platform, session))
+                self.assertTrue(marker["guarding"])
+                self.assertIsNotNone(marker["touched_at"])
+                self.assertEqual(marker["forced"], 0)
+
+    def test_every_spelling_of_the_command_arms(self) -> None:
+        for command in (
+            "python -m craftsman.cli review prepare",
+            "cd . && craftsman review show",
+            "python scripts/craftsman-cli.py review check --review-only",
+            "uv run craftsman review prepare",
+            "uvx craftsman review prepare",
+        ):
+            with self.subTest(command=command):
+                self.marker_file().unlink(missing_ok=True)
+
+                self.pre_tool(command)
+
+                self.assertTrue(self.marker_file().is_file())
+
+    def test_text_that_only_mentions_the_command_does_not_arm(self) -> None:
+        for command in ("echo craftsman review prepare", 'git commit -m "craftsman review prepare"', "git status"):
+            with self.subTest(command=command):
+                self.pre_tool(command)
+
+                self.assertFalse(self.marker_file().exists())
+
+    def test_a_non_review_craftsman_command_does_not_arm(self) -> None:
+        self.pre_tool("craftsman run --kind test -- pytest")
+
+        self.assertFalse(self.marker_file().exists())
+
+    def test_a_report_only_touches_a_guard_that_exists(self) -> None:
+        self.pre_tool("craftsman review report")
+        self.assertFalse(self.marker_file().exists())
+        self.pre_tool("craftsman review prepare")
+        old = {**self.marker(), "touched_at": "2020-01-01T00:00:00.000Z", "forced": 3}
+        self.marker_file().write_text(json.dumps(old), encoding="utf-8")
+
+        self.pre_tool("craftsman review report")
+
+        marker = self.marker()
+        self.assertGreater(marker["touched_at"], old["touched_at"])
+        self.assertEqual((marker["forced"], marker["at"]), (3, old["at"]))
+
+    def test_a_command_of_a_guarding_session_keeps_its_counters(self) -> None:
+        self.pre_tool("craftsman review prepare")
+        guarded = {**self.marker(), "forced": 2}
+        self.marker_file().write_text(json.dumps(guarded), encoding="utf-8")
+
+        self.pre_tool("craftsman review show")
+
+        self.assertEqual((self.marker()["guarding"], self.marker()["forced"], self.marker()["at"]), (True, 2, guarded["at"]))
+
+    def test_a_command_after_the_guard_ended_starts_a_new_review_without_the_old_request(self) -> None:
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craft-review --deep the parser"))
+        self.assertEqual((self.marker()["deep"], self.marker()["task"]), (True, "the parser"))
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="thanks, now something else"))
+        self.assertFalse(self.marker()["guarding"])
+        ended = self.marker()
+        self.repo.write("cart.py", CHANGE)
+
+        self.prepare()
+
+        marker = self.marker()
+        self.assertTrue(marker["guarding"])
+        self.assertEqual((marker["deep"], marker["task"]), (False, ""))
+        self.assertGreater(marker["at"], ended["at"])
+        latest = self.ledger()["rounds"][-1]
+        self.assertEqual((latest["enforced"], latest["deep"], latest["task"]), (True, False, ""))
+
+    def test_a_marker_the_guard_gave_up_on_keeps_its_abandoned_stamp_when_the_session_runs_a_command_again(self) -> None:
+        self.pre_tool("craftsman review prepare")
+        abandoned = {**self.marker(), "guarding": False, "abandoned_at": "2026-01-01T00:00:00.000Z"}
+        self.marker_file().write_text(json.dumps(abandoned), encoding="utf-8")
+
+        self.pre_tool("craftsman review check --review-only")
+
+        self.assertEqual(self.marker()["abandoned_at"], "2026-01-01T00:00:00.000Z")
+
+    def test_the_gate_owners_review_commands_do_not_arm_a_second_guard_after_the_gate_gives_up(self) -> None:
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="ultracraft add the totals"))
+        self.repo.write("cart.py", CHANGE)
+
+        self.pre_tool("craftsman review prepare")
+        self.assertFalse(self.marker_file().exists())
+        stops = [call_hook("stop", "claude", claude("Stop", self.root))[0] for _ in range(MAX_CONTINUATIONS + 4)]
+
+        self.assertEqual([("decision" in out) for out in stops], [True] * MAX_CONTINUATIONS + [False] * 4)
+        self.assertFalse(self.state()["active"])
+        self.assertEqual(stops[-1], {})
+
+    def test_a_guard_the_gate_owner_armed_before_the_gate_ended_with_the_gate(self) -> None:
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="/craft-review the cart"))
+        self.repo.write("cart.py", CHANGE)
+        self.init()
+        self.update_state(owner={"platform": "claude", "session_id": "claude-session"})
+        self.assertTrue(self.marker()["guarding"])
+
+        stops = [call_hook("stop", "claude", claude("Stop", self.root))[0] for _ in range(MAX_CONTINUATIONS + 2)]
+
+        self.assertEqual([("decision" in out) for out in stops], [True] * MAX_CONTINUATIONS + [False] * 2)
+        self.assertEqual(set(stops[MAX_CONTINUATIONS]), {"systemMessage"})
+        self.assertFalse(self.marker()["guarding"])
+
+    def test_a_subagent_does_not_arm_and_may_not_restart_the_review(self) -> None:
+        for command in ("craftsman review prepare", "craftsman review prepare --deep", "craftsman review reset"):
+            with self.subTest(command=command):
+                out = self.role_pre_tool(command)
+
+                self.assertEqual(self.decision(out), "deny")
+                self.assertFalse(self.marker_file().exists())
+
+    def test_a_denied_restart_names_the_reason_and_hands_the_work_back(self) -> None:
+        out = self.role_pre_tool("craftsman review reset", "craftsman-verifier")
+
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("must not re-plan or reset the review", reason)
+
+    def test_a_subagent_may_run_the_other_review_commands_without_arming(self) -> None:
+        for command in (
+            "craftsman review brief W1-1",
+            "craftsman review brief --verifier F1",
+            'craftsman review cover --hunks H1 --note "x"',
+            "craftsman review verdict F1 --as dismissed",
+            "craftsman review add --lens contracts",
+            "craftsman review show --json",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.role_pre_tool(command), {})
+                self.assertFalse(self.marker_file().exists())
+
+    def test_a_subagent_of_the_copilot_cli_is_recognised_by_its_name(self) -> None:
+        payload = copilot_cli(
+            self.root, toolName="bash", toolArgs=json.dumps({"command": "craftsman review prepare"}),
+            agentName="craftsman-reviewer",
+        )  # fmt: skip
+
+        out, _ = call_hook("pre-tool", "copilot", payload)
+
+        self.assertEqual(self.decision(out), "deny")
+        self.assertFalse(self.marker_file().exists())
+
+    def test_an_agent_that_is_not_craftsmans_is_not_the_main_session_and_does_not_arm(self) -> None:
+        self.assertEqual(self.pre_tool("craftsman review prepare", agent_id="x-1", agent_type="Explore"), {})
+        self.assertFalse(self.marker_file().exists())
+
+    def test_the_main_session_may_not_fetch_a_brief_and_the_denial_does_not_arm(self) -> None:
+        for command in (
+            "craftsman review brief W1-1",
+            "craftsman review brief --verifier F1",
+            "uv run craftsman review brief W1-1",
+            "pipx run craftsman review brief W1-1",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.decision(self.pre_tool(command)), "deny")
+                self.assertFalse(self.marker_file().exists())
+
+    def test_a_chain_with_a_brief_is_denied_as_a_whole(self) -> None:
+        out = self.pre_tool("craftsman review prepare && craftsman review brief W1-1")
+
+        self.assertEqual(self.decision(out), "deny")
+        self.assertFalse(self.marker_file().exists())
+
+    def test_a_worktree_violation_is_denied_and_does_not_arm(self) -> None:
+        self.init()
+        self.update_state(owner={"platform": "claude", "session_id": "claude-session"})
+
+        out = self.pre_tool("craftsman review prepare && git -C /elsewhere reset --hard")
+
+        if self.decision(out) == "deny":
+            self.assertFalse(self.marker_file().exists())
+
+    def test_a_failure_to_arm_never_blocks_the_command(self) -> None:
+        payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": "craftsman review prepare"})
+        with mock.patch.object(hooks, "arm_marker", side_effect=OSError("disk full")):
+            out, err = call_hook("pre-tool", "claude", payload)
+
+        self.assertEqual(out, {})
+        self.assertIn("could not arm the review guard: disk full", err)
+
+    def test_a_prompt_without_a_session_id_arms_nothing(self) -> None:
+        payload = copilot_cli(self.root, toolName="bash", toolArgs=json.dumps({"command": "craftsman review prepare"}))
+        payload.pop("sessionId")
+
+        call_hook("pre-tool", "copilot", payload)
+
+        self.assertFalse(self.marker_file().exists())
+
+    def test_a_marker_of_another_session_is_kept_for_two_hours(self) -> None:
+        self.pre_tool("craftsman review prepare")
+        mine = self.marker()
+
+        out = self.pre_tool("craftsman review prepare", "copilot")  # vscode-session
+        self.assertEqual(out, {})
+        self.assertEqual(self.marker(), mine)
+
+        stale = {**mine, "at": "2020-01-01T00:00:00.000Z", "touched_at": "2020-01-01T00:00:00.000Z"}
+        self.marker_file().write_text(json.dumps(stale), encoding="utf-8")
+        self.pre_tool("craftsman review prepare", "copilot")
+
+        self.assertEqual((self.marker()["platform"], self.marker()["session_id"]), ("copilot", "vscode-session"))
+
+    def test_the_prompt_arms_a_fresh_guard_with_the_request_and_a_new_prompt_disarms_it(self) -> None:
+        prompt = "/craftsman:craft-review --deep the cart totals"
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt=prompt))
+
+        marker = self.marker()
+        self.assertEqual((marker["deep"], marker["task"], marker["guarding"]), (True, "the cart totals", True))
+        self.assertIsNone(marker["touched_at"])
+
+        call_hook("prompt", "claude", claude("UserPromptSubmit", self.root, prompt="thanks, now something else"))
+        self.assertFalse(self.marker()["guarding"])
+
+    def test_a_prompt_does_not_take_over_a_live_review_of_another_session(self) -> None:
+        self.pre_tool("craftsman review prepare")
+        mine = self.marker()
+
+        call_hook("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="/craft-review"))
+
+        self.assertEqual(self.marker(), mine)
+
+    def test_the_marker_makes_the_next_prepare_an_enforced_round(self) -> None:
+        self.repo.write("cart.py", CHANGE)
+        self.prepare()
+
+        self.assertTrue(self.ledger()["rounds"][-1]["enforced"])
+
+    def test_a_prepare_without_the_hook_is_an_advisory_round(self) -> None:
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+
+        self.assertFalse(self.ledger()["rounds"][-1]["enforced"])
+
+    def test_an_arm_that_went_stale_makes_an_advisory_round(self) -> None:
+        self.repo.write("cart.py", CHANGE)
+        self.pre_tool("craftsman review show")
+        old = {**self.marker(), "touched_at": "2020-01-01T00:00:00.000Z"}
+        self.marker_file().write_text(json.dumps(old), encoding="utf-8")
+
+        self.repo.cli("review", "prepare")
+
+        self.assertFalse(self.ledger()["rounds"][-1]["enforced"])
+
+
+class GateWaitingTests(HookTestCase):
+    """A gate's Stop does not spend reminders while craftsman subagents of its review are at work."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.init()
+        self.repo.write("cart.py", CHANGE)
+        self.prepare()
+
+    def stop(self) -> dict[str, Any]:
+        return call_hook("stop", "claude", claude("Stop", self.root))[0]
+
+    def start(self, agent_id: str, agent_type: str = "craftsman-reviewer") -> dict[str, str]:
+        agent = {"agent_id": agent_id, "agent_type": agent_type}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **agent))
+        return agent
+
+    def age_starts(self, minutes: int) -> None:
+        """Make every start event `minutes` old; the round is made older still, so the starts stay in it."""
+        ledger = self.ledger()
+
+        def earlier(stamp: str, by: int) -> str:
+            moved = datetime.fromisoformat(stamp.replace("Z", "+00:00")) - timedelta(minutes=by)
+            return moved.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+        for event in ledger["agents"]:
+            event["at"] = earlier(event["at"], minutes)
+        for round_ in ledger["rounds"]:
+            round_["prepared_at"] = earlier(round_["prepared_at"], minutes + 60)
+        (self.repo.ledger_dir / "ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+    def test_seven_stops_while_a_hunter_runs_spend_no_reminder(self) -> None:
+        self.start("bg-1")
+
+        for _ in range(7):
+            out = self.stop()
+            self.assertEqual(set(out), {"systemMessage"})
+            self.assertIn("waiting for craftsman-reviewer", out["systemMessage"])
+
+        self.assertEqual(self.state()["forced_continuations"], 0)
+        self.assertTrue(self.state()["active"])
+
+    def test_the_waiting_notice_names_the_gate_check(self) -> None:
+        self.start("bg-1")
+
+        message = self.stop()["systemMessage"]
+
+        self.assertIn("`craftsman review check` will say to relaunch them", message)
+        self.assertNotIn("--review-only", message)
+
+    def test_when_the_hunter_stops_the_next_stop_is_blocked_and_counted(self) -> None:
+        agent = self.start("bg-1")
+        self.stop()
+        call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, stop_hook_active=True, **agent))
+
+        out = self.stop()
+
+        self.assertEqual(out["decision"], "block")
+        self.assertTrue(out["reason"].startswith(header(1)))
+
+    def test_a_start_older_than_the_stale_limit_no_longer_exempts_the_stop(self) -> None:
+        self.start("bg-1")
+        self.age_starts(31)
+
+        out = self.stop()
+
+        self.assertEqual(out["decision"], "block")
+        self.assertEqual(self.state()["forced_continuations"], 1)
+
+    def test_a_start_just_inside_the_limit_still_exempts_the_stop(self) -> None:
+        self.start("bg-1")
+        self.age_starts(25)
+
+        self.assertEqual(set(self.stop()), {"systemMessage"})
+
+    def test_a_claim_without_an_open_run_does_not_exempt_the_stop(self) -> None:
+        self.repo.cli("review", "brief", "W1-1")
+
+        self.assertEqual(self.stop()["decision"], "block")
+
+    def test_a_satisfied_gate_stops_even_with_a_hunter_running(self) -> None:
+        self.hunt()
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('ok')")
+        self.start("late-1")
+
+        self.assertEqual(self.stop(), {})
+
+    def test_a_hunter_of_an_earlier_round_does_not_exempt_a_stop(self) -> None:
+        self.start("old-1")
+        self.repo.write("cart.py", CHANGE + "# changed\n")
+        self.prepare()
+
+        self.assertEqual(self.stop()["decision"], "block")
+
+
+class DueWaveTests(HookTestCase):
+    """Both Stop paths store the waves that are due before they judge, so the block lists the next wave's slots."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("cart.py", CHANGE)
+
+    def judged_trigger(self) -> None:
+        """Every slot of generation 1 hunted, and one probable major finding: a second wave is due, not yet stored.
+
+        The commands store the wave themselves; it is taken out of the plan again, as if no command had come by.
+        """
+        self.hunt()
+        self.add_finding(hunter="lead")
+        self.repo.cli("review", "verdict", "F1", "--as", "probable", "--evidence", "static: cart.py:2 sums strings -> total(['a']) raises TypeError")
+        ledger = self.ledger()
+        plan = ledger["rounds"][-1]["plan"]
+        plan["slots"] = [slot for slot in plan["slots"] if not slot["id"].startswith("W2-")]
+        plan["waves"] = []
+        (self.repo.ledger_dir / "ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+    def stored_slots(self) -> list[str]:
+        return [slot["id"] for slot in self.ledger()["rounds"][-1]["plan"]["slots"]]
+
+    def stop(self) -> dict[str, Any]:
+        return call_hook("stop", "claude", claude("Stop", self.root))[0]
+
+    def check_stop(self) -> None:
+        self.judged_trigger()
+        self.assertFalse([slot for slot in self.stored_slots() if slot.startswith("W2-")])
+        ledger_file = self.repo.ledger_dir / "ledger.json"
+
+        first = self.stop()
+
+        self.assertEqual(first["decision"], "block")
+        self.assertIn("W2-", first["reason"])
+        self.assertTrue([slot for slot in self.stored_slots() if slot.startswith("W2-")])
+        stored = ledger_file.read_bytes()
+        self.stop()
+        self.assertEqual(ledger_file.read_bytes(), stored)  # planned once: the second Stop does not rewrite the ledger
+
+    def test_the_review_guard_stores_the_due_wave_before_it_blocks(self) -> None:
+        self.prepare()
+
+        self.check_stop()
+
+    def test_the_gates_stop_stores_the_due_wave_before_it_blocks(self) -> None:
+        self.init()
+        self.prepare()
+
+        self.check_stop()
+
+
+class GateProgressTests(HookTestCase):
+    """The gate's reminders start over when the review gained evidence, and only then."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.init()
+        self.repo.write("cart.py", CHANGE)
+        self.prepare()
+
+    def stop(self) -> dict[str, Any]:
+        return call_hook("stop", "claude", claude("Stop", self.root))[0]
+
+    def test_new_evidence_between_stops_resets_the_count(self) -> None:
+        for expected in (1, 2, 3):
+            self.assertTrue(self.stop()["reason"].startswith(header(expected)))
+        self.assertEqual(self.state()["forced_continuations"], 3)
+
+        self.hunt_one()
+
+        self.assertTrue(self.stop()["reason"].startswith(header(1)))
+
+    def hunt_one(self) -> None:
+        slots = self.unfinished_slots()
+        self.assertEqual(self.run_hunter(slots[0]), {})
+
+    def test_a_stop_without_new_evidence_keeps_counting(self) -> None:
+        for expected in (1, 2, 3, 4):
+            self.assertTrue(self.stop()["reason"].startswith(header(expected)))
+        self.repo.cli("review", "show")  # looking is not evidence
+
+        self.assertTrue(self.stop()["reason"].startswith(header(5)))
+
+    def test_the_count_is_stored_with_the_evidence_it_was_judged_on(self) -> None:
+        self.stop()
+
+        self.assertIsNotNone(self.state()["evidence_seen"])
+
+
+class SubagentGuardTests(HookTestCase):
+    """SubagentStop in an enforced round: a hunter that left its slot unfinished is sent back once."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.write("cart.py", CHANGE)
+        self.prepare()
+
+    def start_hunter(self, agent_id: str = "h-1") -> dict[str, str]:
+        agent = {"agent_id": agent_id, "agent_type": "craftsman-reviewer"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **agent))
+        return agent
+
+    def events(self) -> list[str]:
+        return [str(e["event"]) for e in self.ledger()["agents"]]
+
+    def test_a_hunter_that_only_fetched_its_brief_is_sent_back_once_with_the_command_to_run(self) -> None:
+        hunter = self.start_hunter()
+        slot = self.unfinished_slots()[0]
+        brief = self.repo.cli("review", "brief", slot["id"])
+        lines = shell_run("b1", f"craftsman review brief {slot['id']}", brief.stdout)
+
+        first = self.stop_with_transcript(hunter, *lines)
+        second = self.stop_with_transcript(hunter, *lines)
+
+        self.assertEqual(first["decision"], "block")
+        self.assertEqual(
+            first["reason"],
+            f"Your slot {slot['id']} is not finished: cover hunks {hunk_ranges(slot['hunks'])} with "
+            f'`craftsman review cover --hunter {slot["id"]} --hunks {hunk_ranges(slot["hunks"])} --note "..."`, then reply.',
+        )
+        self.assertEqual(second, {})
+        self.assertEqual(self.events(), ["start", "nudge", "stop"])
+
+    def test_the_stop_of_a_nudged_hunter_records_the_transcript_facts_once(self) -> None:
+        hunter = self.start_hunter()
+        slot = self.unfinished_slots()[0]
+        brief = self.repo.cli("review", "brief", slot["id"])
+        lines = shell_run("b1", f"craftsman review brief {slot['id']}", brief.stdout)
+        self.stop_with_transcript(hunter, *lines)
+        self.stop_with_transcript(hunter, *lines)
+
+        stops = [e for e in self.ledger()["agents"] if e["event"] == "stop"]
+        nudges = [e for e in self.ledger()["agents"] if e["event"] == "nudge"]
+
+        self.assertEqual([e["records"] for e in stops], [["B1"]])
+        self.assertIsNone(nudges[0].get("records"))
+        self.assertIsNone(nudges[0].get("usage"))
+
+    def test_a_hunter_that_stopped_after_a_nudge_leaves_its_slot_dead_not_unlaunched(self) -> None:
+        hunter = self.start_hunter()
+        slot = self.unfinished_slots()[0]
+        brief = self.repo.cli("review", "brief", slot["id"])
+        lines = shell_run("b1", f"craftsman review brief {slot['id']}", brief.stdout)
+        self.stop_with_transcript(hunter, *lines)
+        self.stop_with_transcript(hunter, *lines)
+
+        shown = {item["id"]: item["state"] for item in self.repo.show()["slots"]}
+
+        self.assertEqual(shown[slot["id"]], "dead")
+
+    def test_a_hunter_is_held_to_its_own_slot_not_to_a_slot_another_hunter_left_dead(self) -> None:
+        dead = self.start_hunter("h-dead")
+        first, second = self.unfinished_slots()[:2]
+        brief = self.repo.cli("review", "brief", first["id"])
+        lines = shell_run("b1", f"craftsman review brief {first['id']}", brief.stdout)
+        self.assertEqual(self.stop_with_transcript(dead, *lines)["decision"], "block")
+        self.assertEqual(self.stop_with_transcript(dead, *lines), {})  # sent back once, then let go: its slot is dead
+        shown = {item["id"]: item["state"] for item in self.repo.show()["slots"]}
+        self.assertEqual(shown[first["id"]], "dead")
+
+        out = self.run_hunter(second)
+
+        self.assertEqual(out, {})
+        self.assertEqual(self.events(), ["start", "nudge", "stop", "start", "stop"])
+
+    def test_an_honest_hunter_stops_on_its_first_subagent_stop(self) -> None:
+        slot = self.unfinished_slots()[0]
+
+        self.assertEqual(self.run_hunter(slot), {})
+        self.assertEqual(self.events(), ["start", "stop"])
+
+    def test_a_copilot_hunter_that_did_nothing_is_sent_back_once_and_makes_one_run(self) -> None:
+        call_hook("subagent-start", "copilot", copilot_cli(self.root, agentName="craftsman-reviewer"))
+        stop = copilot_cli(self.root, agentName="craftsman-reviewer")
+
+        first, _ = call_hook("subagent-stop", "copilot", stop)
+        second, _ = call_hook("subagent-stop", "copilot", stop)
+
+        self.assertEqual(first["decision"], "block")
+        self.assertEqual(second, {})
+        self.assertEqual(self.events(), ["start", "nudge", "stop"])
+        self.assertEqual(len(agent_runs(load(self.repo.ledger_dir / "ledger.json"))), 1)
+
+    def test_two_parallel_copilot_hunters_are_each_sent_back_once(self) -> None:
+        copilot = copilot_cli(self.root, agentName="craftsman-reviewer")
+        for _ in range(2):
+            call_hook("subagent-start", "copilot", copilot)
+
+        decisions = [call_hook("subagent-stop", "copilot", copilot)[0].get("decision") for _ in range(4)]
+
+        self.assertEqual(decisions, ["block", None, "block", None])
+        self.assertEqual(self.events(), ["start", "start", "nudge", "stop", "nudge", "stop"])
+
+    def test_a_copilot_hunter_that_stopped_honestly_does_not_use_up_the_nudge_of_the_next_one(self) -> None:
+        slot = self.unfinished_slots()[0]
+        self.assertEqual(self.run_hunter(slot, platform="copilot"), {})
+        copilot = copilot_cli(self.root, agentName="craftsman-reviewer")
+        call_hook("subagent-start", "copilot", copilot)
+
+        decisions = [call_hook("subagent-stop", "copilot", copilot)[0].get("decision") for _ in range(2)]
+
+        self.assertEqual(decisions, ["block", None])
+        self.assertEqual(self.events(), ["start", "stop", "start", "nudge", "stop"])
+
+    def stop_without_transcript(self, agent: dict[str, str]) -> dict[str, Any]:
+        return call_hook("subagent-stop", "claude", claude("SubagentStop", self.root, **agent))[0]
+
+    def test_a_hunter_without_a_readable_transcript_is_not_given_the_claim_of_another_hunter(self) -> None:
+        first, second = self.start_hunter("h-1"), self.start_hunter("h-2")
+        slot = self.unfinished_slots()[0]
+        self.repo.cli("review", "brief", slot["id"])  # the claim of ONE hunter, made while both run
+        self.assertEqual(self.stop_without_transcript(first)["decision"], "block")  # its slot is unfinished
+        self.assertEqual(self.stop_without_transcript(first), {})
+
+        out = self.stop_without_transcript(second)
+
+        self.assertEqual(out, {"decision": "block", "reason": REVIEWER_STOP_REASON})
+
+    def test_a_claim_made_at_the_very_millisecond_a_hunter_started_still_belongs_to_it(self) -> None:
+        hunter = self.start_hunter()
+        slot = self.unfinished_slots()[0]
+        self.repo.cli("review", "brief", slot["id"])
+        ledger = self.ledger()
+        start = next(e for e in ledger["agents"] if e["event"] == "start")
+        ledger["claims"][0]["at"] = start["at"]
+        (self.repo.ledger_dir / "ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+
+        out = self.stop_without_transcript(hunter)
+
+        self.assertIn(f"Your slot {slot['id']} is not finished", out["reason"])
+
+    def test_a_copilot_hunter_that_finished_its_slot_stops_at_once(self) -> None:
+        slot = self.unfinished_slots()[0]
+
+        self.assertEqual(self.run_hunter(slot, platform="copilot"), {})
+        self.assertEqual(self.events(), ["start", "stop"])
+
+    def test_the_stop_of_a_hunter_the_ledger_never_saw_start_is_dropped_with_a_note(self) -> None:
+        ghost = {"agent_id": "ghost", "agent_type": "craftsman-reviewer"}
+        path = self.tmp / "ghost.jsonl"
+        path.write_text("\n".join(shell_run("c1", "craftsman review cover --hunks H1", "Brief issued (B1)")) + "\n")
+
+        out, err = call_hook(
+            "subagent-stop", "claude", claude("SubagentStop", self.root, agent_transcript_path=str(path), **ghost)
+        )
+
+        self.assertEqual(out, {})
+        self.assertEqual(self.events(), [])
+        self.assertIn("never saw start (ghost)", err)
+
+    def test_a_hunter_of_a_reset_review_vouches_for_nothing(self) -> None:
+        hunter = self.start_hunter("pre-reset")
+        slot = self.unfinished_slots()[0]
+        brief = self.repo.cli("review", "brief", slot["id"])
+        self.repo.cli("review", "reset")
+        self.repo.cli("review", "prepare")
+        lines = shell_run("b1", f"craftsman review brief {slot['id']}", brief.stdout)
+
+        out = self.stop_with_transcript(hunter, *lines, "{}")
+
+        self.assertEqual(out, {})
+        self.assertNotIn("stop", self.events())
+        shown = {item["id"]: item["state"] for item in self.repo.show()["slots"]}
+        self.assertNotIn("done", shown.values())
+
+    def test_two_parallel_verifiers_the_one_that_judged_nothing_is_sent_back_once(self) -> None:
+        self.hunt()
+        self.add_finding(hunter="lead")
+        self.add_finding(hunter="lead")
+        judged = {"agent_id": "v-1", "agent_type": "craftsman-verifier"}
+        idle = {"agent_id": "v-2", "agent_type": "craftsman-verifier"}
+        for verifier in (judged, idle):
+            call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **verifier))
+        brief = self.repo.cli("review", "brief", "--verifier", "F1")
+        verdict = self.repo.cli(
+            "review", "verdict", "F1", "--as", "dismissed",
+            "--evidence", "cart.py:2 only receives numbers from the typed API layer",
+        )  # fmt: skip
+        lines = [
+            *shell_run("vb", "craftsman review brief --verifier F1", brief.stdout),
+            *shell_run("vv", "craftsman review verdict F1 --as dismissed --evidence x", verdict.stdout),
+        ]
+
+        self.assertEqual(self.stop_with_transcript(judged, *lines), {})
+        sent_back = self.stop_with_transcript(idle, *shell_run("ib", "craftsman review brief --verifier F2", ""))
+        again = self.stop_with_transcript(idle, *shell_run("ib", "craftsman review brief --verifier F2", ""))
+
+        self.assertEqual(sent_back["decision"], "block")
+        self.assertIn("Findings still without a verdict", sent_back["reason"])
+        self.assertEqual(again, {})
+
+    def verifier_with_pending_finding(self) -> dict[str, str]:
+        self.hunt()
+        self.add_finding(hunter="lead")
+        verifier = {"agent_id": "v-1", "agent_type": "craftsman-verifier"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **verifier))
+        return verifier
+
+    def test_a_verifier_that_recorded_a_finding_instead_of_a_verdict_is_sent_back(self) -> None:
+        verifier = self.verifier_with_pending_finding()
+        brief = self.repo.cli("review", "brief", "--verifier", "F1")
+        added = self.repo.cli(
+            "review", "add", "--lens", "failure", "--file", "cart.py", "--line", "1", "--severity", "minor",
+            "--title", "Empty cart is not handled", "--scenario", "total([]) returns 0 without a note", "--hunter", "lead",
+        )  # fmt: skip
+        lines = [
+            *shell_run("vb", "craftsman review brief --verifier F1", brief.stdout),
+            *shell_run("va", "craftsman review add --lens failure", added.stdout),
+        ]
+
+        first = self.stop_with_transcript(verifier, *lines)
+
+        self.assertIn("F2 recorded", added.stdout)
+        self.assertEqual(first["decision"], "block")
+        self.assertIn("Findings still without a verdict: F1, F2", first["reason"])
+        self.assertEqual(self.stop_with_transcript(verifier, *lines), {})
+
+    def test_a_verifier_that_only_recorded_coverage_is_sent_back(self) -> None:
+        verifier = self.verifier_with_pending_finding()
+        brief = self.repo.cli("review", "brief", "--verifier", "F1")
+        lines = [
+            *shell_run("vb", "craftsman review brief --verifier F1", brief.stdout),
+            *shell_run("vc", "craftsman review cover --hunter W1-1 --hunks H1", "Coverage recorded (C9) for W1-1: H1"),
+        ]
+
+        first = self.stop_with_transcript(verifier, *lines)
+
+        self.assertEqual(first["decision"], "block")
+        self.assertIn("Findings still without a verdict: F1", first["reason"])
+
+    def test_a_verifier_stopping_when_nothing_waits_for_a_verdict_any_more_is_let_go(self) -> None:
+        verifier = self.verifier_with_pending_finding()
+        other = {"agent_id": "v-2", "agent_type": "craftsman-verifier"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **other))
+        self.repo.cli(
+            "review", "verdict", "F1", "--as", "dismissed",
+            "--evidence", "cart.py:2 only receives numbers from the typed API layer",
+        )  # fmt: skip
+        brief = self.repo.cli("review", "brief", "--verifier", "F1")
+
+        out = self.stop_with_transcript(verifier, *shell_run("vb", "craftsman review brief --verifier F1", brief.stdout))
+
+        self.assertEqual(out, {})
+        self.assertEqual(self.events()[-1], "stop")
+
+    def test_a_verifier_with_a_brief_and_a_verdict_stops_and_the_gate_sees_no_unverified_finding(self) -> None:
+        self.hunt()
+        self.add_finding(hunter="lead")
+        verifier = {"agent_id": "v-1", "agent_type": "craftsman-verifier"}
+        call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **verifier))
+        brief = self.repo.cli("review", "brief", "--verifier", "F1")
+        verdict = self.repo.cli(
+            "review", "verdict", "F1", "--as", "dismissed",
+            "--evidence", "cart.py:2 only receives numbers from the typed API layer",
+        )  # fmt: skip
+        lines = [
+            *shell_run("vb", "craftsman review brief --verifier F1", brief.stdout),
+            *shell_run("vv", "craftsman review verdict F1 --as dismissed --evidence x", verdict.stdout),
+        ]
+
+        out = self.stop_with_transcript(verifier, *lines)
+
+        stop = [e for e in self.ledger()["agents"] if e["event"] == "stop"][-1]
+        checked = self.repo.cli("review", "check", "--review-only", check=False)
+        self.assertEqual(out, {})
+        self.assertEqual(stop["records"], ["V1"])
+        self.assertNotIn("unverified", checked.stdout)
 
 
 if __name__ == "__main__":

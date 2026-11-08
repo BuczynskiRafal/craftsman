@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import unittest
 
-from craftsman.trigger import MAX_TASK_CHARS, detect_trigger, is_review_prompt, task_from_prompt
+from craftsman.trigger import (
+    MAX_TASK_CHARS,
+    detect_trigger,
+    is_review_prompt,
+    review_request,
+    task_from_prompt,
+)
 
 
 class DetectTriggerTests(unittest.TestCase):
@@ -212,6 +218,42 @@ class TaskFromPromptTests(unittest.TestCase):
 
     def test_task_is_capped(self) -> None:
         self.assertEqual(len(task_from_prompt("ultracraft " + "x" * 500)), MAX_TASK_CHARS)
+
+
+class ReviewRequestTests(unittest.TestCase):
+    def test_a_plain_request_is_normal_depth_and_its_text_is_the_task(self) -> None:
+        for prompt in ("/craft-review the cart", "/craftsman:craft-review the cart", "/clear /craft-review the cart"):
+            with self.subTest(prompt=prompt):
+                self.assertEqual(review_request(prompt), (False, "the cart"))
+
+    def test_ultracraft_or_the_deep_flag_asks_for_a_deep_review(self) -> None:
+        cases = {
+            "/craft-review ultracraft the cart": "the cart",
+            "/craft-review --deep the cart": "the cart",
+            "/craftsman:craft-review the cart --deep": "the cart",
+            "/craft-review review the cart with ultracraft": "review the cart with",
+        }
+        for prompt, task in cases.items():
+            with self.subTest(prompt=prompt):
+                self.assertEqual(review_request(prompt), (True, task))
+
+    def test_quoted_mentions_do_not_ask_for_depth(self) -> None:
+        for prompt in ("/craft-review explain `--deep` in the docs", '/craft-review the "ultracraft" flag'):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(review_request(prompt)[0])
+
+    def test_a_claude_command_tag_carries_its_arguments(self) -> None:
+        tagged = "<command-name>/craftsman:craft-review</command-name><command-args>--deep tidy up</command-args>"
+        self.assertEqual(review_request(tagged), (True, "tidy up"))
+        bare = "<command-name>/craftsman:craft-review</command-name>"
+        self.assertEqual(review_request(bare), (False, ""))
+
+    def test_the_task_is_one_capped_line(self) -> None:
+        self.assertEqual(review_request("/craft-review fix\n the  bug"), (False, "fix the bug"))
+        self.assertEqual(len(review_request("/craft-review " + "x" * 500)[1]), MAX_TASK_CHARS)
+
+    def test_a_flag_that_only_looks_like_the_deep_flag_is_no_flag(self) -> None:
+        self.assertFalse(review_request("/craft-review --deeper --deep-dive the cart")[0])
 
 
 if __name__ == "__main__":

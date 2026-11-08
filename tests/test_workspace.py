@@ -13,12 +13,19 @@ from craftsman.gate import GateOwner
 from craftsman.records import Ledger, format_timestamp
 from craftsman.workspace import (
     HOOKS_MARKER,
+    MARKER_STEAL_AFTER,
     ReviewMarker,
+    abandon_review_guard,
+    arm_marker,
     brief_platform,
     caller_identity,
+    cli_visible,
+    end_review_guard,
+    live_marker,
     open_workspace,
     read_marker,
     review_enforcement,
+    touch_marker,
     write_marker,
 )
 
@@ -115,13 +122,13 @@ class MarkerFileTests(WorkspaceTestCase):
         (self.repo.ledger_dir / HOOKS_MARKER).write_text(json.dumps({**base, **fields}), encoding="utf-8")
 
     def test_a_marker_from_before_the_new_fields_still_reads(self) -> None:
-        self.write_raw(guarding=True, forced=2, best=3, touched_at="2026-01-01T00:00:05.000Z")
+        self.write_raw(guarding=True, forced=2, best=3, touched_at="2026-01-01T00:00:05.000Z")  # `best` is gone
 
         marker = read_marker(self.ledger_path)
 
         self.assertEqual(
             marker,
-            ReviewMarker("claude", "s1", "2026-01-01T00:00:00.000Z", True, 2, 3, "2026-01-01T00:00:05.000Z"),
+            ReviewMarker("claude", "s1", "2026-01-01T00:00:00.000Z", True, 2, "2026-01-01T00:00:05.000Z"),
         )
         assert marker is not None
         self.assertEqual((marker.deep, marker.task, marker.evidence_seen, marker.abandoned_at), (False, "", None, None))
@@ -143,6 +150,203 @@ class MarkerFileTests(WorkspaceTestCase):
 
         assert marker is not None
         self.assertEqual((marker.deep, marker.task, marker.evidence_seen, marker.abandoned_at), (False, "", None, None))
+
+
+NOW = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+A = GateOwner("claude", "sess-A")
+B = GateOwner("claude", "sess-B")
+
+
+class ArmingTests(WorkspaceTestCase):
+    """`arm_marker`, `touch_marker` and the rest of the marker's life; only the hooks call them."""
+
+    @property
+    def ledger_path(self) -> Path:
+        return self.repo.ledger_dir / "ledger.json"
+
+    def marker(self) -> ReviewMarker:
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        return marker
+
+    def put(self, owner: GateOwner, **fields: object) -> ReviewMarker:
+        marker = replace(
+            ReviewMarker(owner.platform, owner.session_id or "", format_timestamp(NOW - timedelta(hours=1))),
+            **fields,  # type: ignore[arg-type]
+        )
+        write_marker(self.ledger_path, marker)
+        return marker
+
+    def test_a_fresh_request_writes_a_new_untouched_marker(self) -> None:
+        self.assertTrue(arm_marker(self.ledger_path, A, NOW, fresh=True, deep=True, task="the cart"))
+
+        self.assertEqual(
+            self.marker(),
+            ReviewMarker("claude", "sess-A", format_timestamp(NOW), deep=True, task="the cart"),
+        )  # a prompt is not a review command: no touch
+
+    def test_a_fresh_request_of_the_same_session_starts_over(self) -> None:
+        self.put(A, forced=4, evidence_seen=9, deep=True, task="old", abandoned_at=format_timestamp(NOW), touched_at=format_timestamp(NOW))
+
+        arm_marker(self.ledger_path, A, NOW, fresh=True)
+
+        self.assertEqual(self.marker(), ReviewMarker("claude", "sess-A", format_timestamp(NOW)))
+
+    def test_a_review_command_keeps_the_counters_and_what_the_request_said(self) -> None:
+        before = self.put(A, forced=4, evidence_seen=9, deep=True, task="the cart")
+
+        arm_marker(self.ledger_path, A, NOW, fresh=False)
+
+        self.assertEqual(self.marker(), replace(before, touched_at=format_timestamp(NOW)))
+
+    def test_a_review_command_after_the_review_ended_begins_a_new_one_without_the_old_request(self) -> None:
+        self.put(A, forced=0, deep=True, task="the cart", guarding=False)
+
+        arm_marker(self.ledger_path, A, NOW, fresh=False)
+
+        self.assertEqual(
+            self.marker(),
+            ReviewMarker("claude", "sess-A", format_timestamp(NOW), touched_at=format_timestamp(NOW)),
+        )
+
+    def test_a_review_command_after_the_review_ended_may_bring_new_values(self) -> None:
+        self.put(A, deep=True, task="old", guarding=False)
+
+        arm_marker(self.ledger_path, A, NOW, fresh=False, deep=True, task="new")
+
+        self.assertEqual((self.marker().deep, self.marker().task, self.marker().guarding), (True, "new", True))
+
+    def test_a_review_command_after_the_guard_gave_up_keeps_the_abandoned_stamp(self) -> None:
+        stamp = format_timestamp(NOW - timedelta(minutes=5))
+        self.put(A, guarding=False, deep=True, task="old", abandoned_at=stamp)
+
+        arm_marker(self.ledger_path, A, NOW, fresh=False)
+
+        self.assertEqual((self.marker().abandoned_at, self.marker().deep, self.marker().task), (stamp, False, ""))
+
+    def test_a_review_command_never_carries_the_abandoned_stamp_of_another_session(self) -> None:
+        stale = NOW - timedelta(hours=3)
+        self.put(B, guarding=False, abandoned_at=format_timestamp(stale))
+
+        arm_marker(self.ledger_path, A, NOW, fresh=False)
+
+        self.assertIsNone(self.marker().abandoned_at)
+
+    def test_a_review_command_may_bring_new_values(self) -> None:
+        self.put(A, deep=True, task="old")
+
+        arm_marker(self.ledger_path, A, NOW, fresh=False, deep=False, task="new")
+
+        self.assertEqual((self.marker().deep, self.marker().task), (False, "new"))
+
+    def test_a_review_command_without_a_marker_of_the_caller_makes_one_that_is_touched(self) -> None:
+        arm_marker(self.ledger_path, A, NOW, fresh=False)
+
+        self.assertEqual(
+            self.marker(),
+            ReviewMarker("claude", "sess-A", format_timestamp(NOW), touched_at=format_timestamp(NOW)),
+        )
+
+    def test_a_guarding_marker_of_another_session_seen_recently_is_kept(self) -> None:
+        kept = self.put(A, touched_at=format_timestamp(NOW - MARKER_STEAL_AFTER + timedelta(seconds=1)))
+
+        for fresh in (True, False):
+            with self.subTest(fresh=fresh):
+                self.assertFalse(arm_marker(self.ledger_path, B, NOW, fresh=fresh))
+                self.assertEqual(self.marker(), kept)
+
+    def test_an_untouched_marker_is_judged_by_the_time_it_began(self) -> None:
+        kept = replace(
+            ReviewMarker("claude", "sess-A", format_timestamp(NOW - timedelta(minutes=5))), guarding=True
+        )
+        write_marker(self.ledger_path, kept)
+
+        self.assertFalse(arm_marker(self.ledger_path, B, NOW, fresh=True))
+
+    def test_a_marker_of_another_session_that_went_quiet_is_replaced(self) -> None:
+        self.put(A, touched_at=format_timestamp(NOW - MARKER_STEAL_AFTER))
+
+        self.assertTrue(arm_marker(self.ledger_path, B, NOW, fresh=True, task="mine"))
+
+        self.assertEqual((self.marker().session_id, self.marker().task), ("sess-B", "mine"))
+
+    def test_a_marker_of_another_session_that_is_not_guarding_is_replaced(self) -> None:
+        self.put(A, guarding=False, touched_at=format_timestamp(NOW))
+
+        self.assertTrue(arm_marker(self.ledger_path, B, NOW, fresh=False))
+
+        self.assertEqual(self.marker().session_id, "sess-B")
+
+    def test_a_session_without_an_id_arms_nothing(self) -> None:
+        self.assertFalse(arm_marker(self.ledger_path, GateOwner("copilot"), NOW, fresh=True))
+        self.assertIsNone(read_marker(self.ledger_path))
+
+    def test_a_marker_whose_times_cannot_be_read_does_not_hold_the_file(self) -> None:
+        self.put(A, touched_at="yesterday")
+
+        self.assertTrue(arm_marker(self.ledger_path, B, NOW, fresh=True))
+
+    def test_touching_sets_the_time_of_the_callers_guarding_marker_only(self) -> None:
+        before = self.put(A)
+        touch_marker(self.ledger_path, B, NOW)
+        self.assertEqual(self.marker(), before)
+
+        touch_marker(self.ledger_path, A, NOW)
+        self.assertEqual(self.marker(), replace(before, touched_at=format_timestamp(NOW)))
+
+        end_review_guard(self.ledger_path, A)
+        ended = self.marker()
+        touch_marker(self.ledger_path, A, NOW + timedelta(seconds=9))
+        self.assertEqual(self.marker(), ended)  # a finished review is not touched back to life
+
+    def test_ending_the_guard_clears_the_counters_and_keeps_what_was_asked(self) -> None:
+        self.put(A, forced=3, evidence_seen=5, deep=True, task="the cart")
+
+        end_review_guard(self.ledger_path, B)  # not its session
+        self.assertTrue(self.marker().guarding)
+        end_review_guard(self.ledger_path)
+
+        self.assertEqual(
+            self.marker(),
+            ReviewMarker("claude", "sess-A", format_timestamp(NOW - timedelta(hours=1)), False, deep=True, task="the cart"),
+        )
+
+    def test_abandoning_ends_the_guard_and_says_so(self) -> None:
+        self.put(A, forced=6, evidence_seen=5)
+
+        abandon_review_guard(self.ledger_path, B, NOW)
+        self.assertIsNone(self.marker().abandoned_at)
+        abandon_review_guard(self.ledger_path, A, NOW)
+
+        marker = self.marker()
+        self.assertEqual((marker.guarding, marker.forced, marker.evidence_seen), (False, 0, None))
+        self.assertEqual(marker.abandoned_at, format_timestamp(NOW))
+
+    def test_a_live_marker_is_guarding_hooked_and_touched_within_the_window(self) -> None:
+        self.put(A, touched_at=format_timestamp(NOW - timedelta(seconds=5)))
+        self.assertEqual(live_marker(self.ledger_path, NOW), self.marker())
+
+        cases: dict[str, dict[str, str | bool | None]] = {
+            "stale": {"touched_at": format_timestamp(NOW - timedelta(minutes=5))},
+            "never touched": {"touched_at": None},
+            "not guarding": {"guarding": False},
+        }
+        for name, fields in cases.items():
+            with self.subTest(name):
+                self.put(A, **{"touched_at": format_timestamp(NOW), **fields})
+                self.assertIsNone(live_marker(self.ledger_path, NOW))
+
+    def test_only_a_command_the_hooks_saw_makes_the_marker_live(self) -> None:
+        arm_marker(self.ledger_path, A, NOW, fresh=True)
+        self.assertIsNone(live_marker(self.ledger_path, NOW))  # the prompt alone enforces nothing
+
+        arm_marker(self.ledger_path, A, NOW + timedelta(seconds=1), fresh=False)
+        self.assertIsNotNone(live_marker(self.ledger_path, NOW + timedelta(seconds=2)))
+
+    def test_commands_see_the_session_of_claude_and_antigravity_only(self) -> None:
+        self.assertEqual(cli_visible(GateOwner("claude", "s")), GateOwner("claude", "s"))
+        self.assertEqual(cli_visible(GateOwner("antigravity", "c")), GateOwner("antigravity", "c"))
+        self.assertEqual(cli_visible(GateOwner("copilot", "s")), GateOwner("copilot"))
 
 
 class EnforcementTests(WorkspaceTestCase):

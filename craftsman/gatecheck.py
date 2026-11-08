@@ -383,6 +383,17 @@ def slot_statuses(ledger: Ledger, round_: Round, now: datetime) -> tuple[SlotSta
     return _hunt_state(ledger, round_, _utc(now), agent_runs(ledger)).statuses
 
 
+def claim_holders(ledger: Ledger, round_: Round, now: datetime) -> frozenset[int]:
+    """Which finished reviewer runs hold a brief of `round_`, as indices into `attribution.agent_runs(ledger)`.
+
+    The one-to-one matching of claims to runs that `slot_statuses` uses (a run whose transcript shows its
+    `B` token, or the run a time window and the slots' evidence assign the claim to): a claim made while
+    several hunters ran belongs to ONE of them.
+    """
+    runs = agent_runs(ledger)
+    return _hunter_signs(ledger, round_, runs, _utc(now), done=frozenset()).holders
+
+
 def _hunt_state(ledger: Ledger, round_: Round, now: datetime, runs: Sequence[AgentRun]) -> _HuntState:
     """The statuses of `round_`'s stored slots, and how many hunters are starting.
 
@@ -416,6 +427,7 @@ class _HunterSigns:
     running: dict[str, list[datetime]]  # slot id -> start of each open run backing a claim of it
     ended: dict[str, list[datetime]]  # slot id -> when each hunter that worked on it stopped
     starting: int
+    holders: frozenset[int]  # indices into `runs` of the finished runs that account for a claim of the round
 
 
 def _hunter_signs(
@@ -451,6 +463,7 @@ def _hunter_signs(
     ended: dict[str, list[datetime]] = defaultdict(list)
     window_claims: dict[str, list[tuple[SlotClaim, list[int]]]] = defaultdict(list)  # slot -> its claims no exact voucher settles
     finished_done: set[str] = set()  # slots in `done` whose hunter a finished run accounts for
+    holders: set[int] = set()  # the finished runs that account for any claim
     for claim in ledger.claims:
         if claim.round != number:
             continue
@@ -458,6 +471,7 @@ def _hunter_signs(
             ledger, runs, number, role="reviewer", token=claim.token, recorded_at=parse_timestamp(claim.at), by=claim.by
         )
         if any(voucher.exact for voucher in finished):
+            holders.update(voucher.index for voucher in finished)
             if claim.slot in done:
                 finished_done.add(claim.slot)
             else:
@@ -481,6 +495,7 @@ def _hunter_signs(
         if slot_id not in done:
             ended[slot_id].extend(_stopped(runs[index]) for index in taken)
         accounted.update(taken)
+        holders.update(taken)
     slot_ids = list(waiting)
     options = {slot_id: _open_backers(runs, waiting[slot_id], prepared, now) for slot_id in slot_ids}
     live = _one_each([[index for index in options[slot_id] if _is_going(runs[index], now)] for slot_id in slot_ids])
@@ -521,10 +536,9 @@ def _hunter_signs(
         and index not in done_backers
         and run.role == "reviewer"
         and run.platform not in IDENTITY_PLATFORMS
-        and run.started >= prepared
-        and _is_going(run, now)
+        and is_open_run(run, prepared, now)
     )
-    return _HunterSigns(running, ended, starting)
+    return _HunterSigns(running, ended, starting, frozenset(holders))
 
 
 def _window_evidence(ledger: Ledger, round_: Round, runs: Sequence[AgentRun]) -> dict[int, str]:
@@ -618,6 +632,25 @@ def _covering_runs(candidates: Sequence[Sequence[int]], preferred: AbstractSet[i
 def _is_going(run: AgentRun, now: datetime) -> bool:
     """Whether `run` has not stopped and began less than `RUN_STALE_AFTER` ago."""
     return run.stopped is None and now - run.started < RUN_STALE_AFTER
+
+
+def is_open_run(run: AgentRun, prepared: datetime, now: datetime) -> bool:
+    """Whether `run` belongs to the round prepared at `prepared` (it started since) and is still going.
+
+    The one rule for "a craftsman subagent is working on this round": the count of hunters that are
+    starting and the Stop hooks' waiting exemption (`review_guard.running_work`) both ask it.
+    """
+    return run.started >= prepared and _is_going(run, now)
+
+
+def hunters_at_work(ledger: Ledger, round_: Round, now: datetime) -> tuple[tuple[str, ...], int]:
+    """The slots of `round_` whose hunter is running, and how many reviewer runs are starting (no brief fetched yet).
+
+    Exactly the states `slot_statuses` and the `hunt-pending` message are built from; `((), 0)` for a round
+    without a plan. A naive `now` is taken as UTC.
+    """
+    state = _hunt_state(ledger, round_, _utc(now), agent_runs(ledger))
+    return tuple(status.slot.id for status in state.statuses if status.state == "running"), state.starting
 
 
 def _open_backers(
@@ -1087,7 +1120,7 @@ def _reviewer_runs(ledger: Ledger) -> list[_ReviewerRun]:
     for event in ledger.agents:
         if event.event == "start":
             starts.append((event.agent, event.agent_id, parse_timestamp(event.at)))
-        elif agent_role(event.agent) == "reviewer":
+        elif event.event == "stop" and agent_role(event.agent) == "reviewer":
             stopped = parse_timestamp(event.at)
             by_id = [i for i, (_, agent_id, _) in enumerate(starts) if event.agent_id and agent_id == event.agent_id]
             by_name = [i for i, (name, _, _) in enumerate(starts) if name == event.agent and i not in taken]

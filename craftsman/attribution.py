@@ -134,6 +134,8 @@ def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
         if event.event == "start":
             starts.append(_Start(event, role, at))
             continue
+        if event.event != "stop":
+            continue  # a nudge opens and closes nothing
         same_id = [
             i
             for i, item in enumerate(starts)

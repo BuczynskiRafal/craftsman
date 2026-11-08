@@ -118,3 +118,27 @@ def task_from_prompt(prompt: str) -> str:
     command_args = CLAUDE_COMMAND_ARGS_RE.search(prompt)
     text = f"/craftsman {command_args.group(1)}" if command_args else prompt
     return " ".join(TRIGGER_TOKEN_RE.sub(" ", text).split())[:MAX_TASK_CHARS]
+
+
+# `--deep` as a flag of its own in a review request.
+REVIEW_DEEP_FLAG_RE = re.compile(r"(?<![\w-])--deep(?![\w-])")
+
+
+def review_request(prompt: str) -> tuple[bool, str]:
+    """What a `/craft-review` prompt asks for: `(deep, task)`.
+
+    Deep when the request carries `ultracraft` or `--deep` outside quotes and backticks (the way a
+    `/craftsman` request does). The task is the request without the command and those words, as one line.
+    """
+    command_args = CLAUDE_COMMAND_ARGS_RE.search(prompt)
+    if command_args:
+        text = command_args.group(1)
+    elif CLAUDE_REVIEW_COMMAND_RE.search(prompt):
+        text = ""  # the command tag without arguments
+    else:
+        requests = USER_REQUEST_BLOCK_RE.findall(prompt)
+        text = REVIEW_COMMAND_RE.sub(" ", (requests[-1] if requests else prompt).strip(), count=1)
+    unquoted = QUOTED_SPAN_RE.sub(" ", text)
+    deep = ULTRACRAFT_WORD_RE.search(unquoted) is not None or REVIEW_DEEP_FLAG_RE.search(unquoted) is not None
+    task = " ".join(ULTRACRAFT_WORD_RE.sub(" ", REVIEW_DEEP_FLAG_RE.sub(" ", text)).split())
+    return deep, task[:MAX_TASK_CHARS]

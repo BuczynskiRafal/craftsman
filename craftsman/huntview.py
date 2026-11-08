@@ -60,6 +60,18 @@ def check_command(*, gate_active: bool) -> str:
     return CHECK_COMMAND if gate_active else REVIEW_ONLY_CHECK_COMMAND
 
 
+def waiting_notice(running: Sequence[str], *, gate_active: bool) -> str:
+    """What a Stop hook tells the user when it lets the agent stop because craftsman subagents are still running.
+
+    One text for the gate and the review guard: their reports wake the session; if they died, the check
+    command (`check_command`) says which to launch again.
+    """
+    return (
+        f"Craftsman: waiting for {', '.join(running)}. Their reports will wake you; "
+        f"if they died, `{check_command(gate_active=gate_active)}` will say to relaunch them."
+    )
+
+
 def wait_and_check(check: str) -> tuple[str, ...]:
     """The last lines of the launch block: end the turn, then run `check` and do what it lists."""
     return (

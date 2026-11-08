@@ -19,8 +19,10 @@ from craftsman.gate import (
     GateState,
     GateStateError,
     Stage,
+    advance_streak,
     cli_caller,
     decide_stop,
+    detect_cli_platform,
     is_continuation_prompt,
     load_state,
     save_state,
@@ -116,6 +118,14 @@ class GateStateJsonTests(unittest.TestCase):
     def test_state_round_trips_through_json(self) -> None:
         raw = json.loads(json.dumps(self.state.to_json()))
         self.assertEqual(GateState.from_json(raw), self.state)
+
+    def test_the_evidence_seen_round_trips_and_an_older_state_without_it_loads(self) -> None:
+        seen = replace(self.state, evidence_seen=7)
+        self.assertEqual(GateState.from_json(json.loads(json.dumps(seen.to_json()))).evidence_seen, 7)
+
+        older = self.state.to_json()
+        del older["evidence_seen"]
+        self.assertIsNone(GateState.from_json(older).evidence_seen)
 
     def test_missing_field_is_an_error(self) -> None:
         raw = self.state.to_json()
@@ -283,6 +293,63 @@ class DecideStopTests(RepoTestCase):
         self.assertEqual(
             (decision.state.active, decision.state.stage), (False, Stage.COMPLETE_UNISOLATED)
         )
+
+    def test_running_craftsman_agents_let_the_agent_wait_without_a_continuation(self) -> None:
+        state = self.state
+        for _ in range(MAX_CONTINUATIONS + 3):
+            decision = decide_stop(state, self.repo.root, running=("W1-1", "craftsman-verifier"), evidence=0)
+            self.assertIsNone(decision.block_reason)
+            assert decision.notice is not None
+            self.assertIn("waiting for W1-1, craftsman-verifier", decision.notice)
+            self.assertIn("`craftsman review check` will say to relaunch them", decision.notice)
+            self.assertNotIn("--review-only", decision.notice)
+            state = decision.state
+        self.assertEqual(state, self.state)  # nothing counted, nothing stored
+
+    def test_waiting_does_not_hold_a_satisfied_gate(self) -> None:
+        self.repo.record_full_evidence()
+
+        decision = decide_stop(self.state, self.repo.root, running=("W1-1",), evidence=5)
+
+        self.assertIsNone(decision.notice)
+        self.assertFalse(decision.state.active)
+
+    def test_evidence_that_grew_starts_a_new_streak(self) -> None:
+        stuck = replace(self.state, forced_continuations=MAX_CONTINUATIONS - 1, evidence_seen=3)
+
+        decision = decide_stop(stuck, self.repo.root, evidence=4)
+
+        self.assertIsNotNone(decision.block_reason)
+        self.assertEqual((decision.state.forced_continuations, decision.state.evidence_seen), (1, 4))
+
+    def test_the_same_evidence_does_not_reset_the_streak_and_the_cap_aborts(self) -> None:
+        capped = replace(self.state, forced_continuations=MAX_CONTINUATIONS, evidence_seen=3)
+
+        decision = decide_stop(capped, self.repo.root, evidence=3)
+
+        self.assertIsNone(decision.block_reason)
+        self.assertEqual((decision.state.active, decision.state.stage), (False, Stage.ABORTED))
+        self.assertEqual(decision.state.evidence_seen, 3)
+
+    def test_the_first_block_remembers_the_evidence(self) -> None:
+        decision = decide_stop(self.state, self.repo.root, evidence=2)
+
+        self.assertEqual((decision.state.forced_continuations, decision.state.evidence_seen), (1, 2))
+        self.assertIsNone(decision.state.best_issue_count)  # the issue-count rule is only for callers without evidence
+
+    def test_a_caller_without_evidence_keeps_the_issue_count_rule(self) -> None:
+        decision = decide_stop(self.state, self.repo.root)
+
+        self.assertIsNotNone(decision.state.best_issue_count)
+        self.assertIsNone(decision.state.evidence_seen)
+
+
+class AdvanceStreakTests(unittest.TestCase):
+    def test_the_streak_restarts_only_when_the_evidence_grew(self) -> None:
+        self.assertEqual(advance_streak(4, None, 0), 0)  # before the first block there is no streak
+        self.assertEqual(advance_streak(4, 2, 3), 0)
+        self.assertEqual(advance_streak(4, 2, 2), 4)
+        self.assertEqual(advance_streak(4, 2, 1), 4)  # the counter is not monotone: lower is no progress
 
 
 OLD_STATE = {
@@ -495,6 +562,30 @@ class CallerTests(unittest.TestCase):
 
     def test_plain_terminal_is_the_cli_platform(self) -> None:
         self.assertEqual(cli_caller(None, {}), GateOwner("cli"))
+
+    def test_an_antigravity_conversation_id_makes_the_platform_and_the_session(self) -> None:
+        env = {"ANTIGRAVITY_CONVERSATION_ID": "conv-1"}
+        self.assertEqual(detect_cli_platform(env), "antigravity")
+        self.assertEqual(cli_caller(None, env), GateOwner("antigravity", "conv-1"))
+
+    def test_the_session_flag_wins_over_the_conversation_id(self) -> None:
+        self.assertEqual(
+            cli_caller("s9", {"ANTIGRAVITY_CONVERSATION_ID": "conv-1"}), GateOwner("antigravity", "s9")
+        )
+
+    def test_a_blank_conversation_id_is_no_conversation(self) -> None:
+        env = {"ANTIGRAVITY_CONVERSATION_ID": "  "}
+        self.assertEqual(detect_cli_platform(env), "cli")
+        self.assertEqual(cli_caller(None, env), GateOwner("cli"))
+
+    def test_antigravity_without_a_conversation_id_has_no_session(self) -> None:
+        self.assertEqual(cli_caller(None, {"ANTIGRAVITY_AGENT": "1"}), GateOwner("antigravity"))
+
+    def test_a_subagent_conversation_is_not_the_owner_of_its_parents_gate(self) -> None:
+        owner = cli_caller(None, {"ANTIGRAVITY_CONVERSATION_ID": "parent"})
+        subagent = cli_caller(None, {"ANTIGRAVITY_CONVERSATION_ID": "child"})
+        self.assertTrue(owner.admits(owner))
+        self.assertFalse(owner.admits(subagent))
 
 
 class UpdateTests(RepoTestCase):

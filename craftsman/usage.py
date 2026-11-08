@@ -3,8 +3,8 @@
 `read_transcript` makes one pass over a subagent's JSONL transcript: it sums the token usage
 (Claude Code writes one assistant entry per content block, all repeating the usage of their message,
 so each message counts once) and lists the record tokens (`C3`, `F2`) that the agent's successful
-`craftsman review cover` and `review add` calls printed, which is how the gate knows what a
-reviewer recorded. `read_usage` is its usage half. `role_totals` adds up what the ledger recorded
+`craftsman review cover` and `review add` calls printed, plus the `B` token of a `review brief` and the `V`
+token of a `review verdict` or `merge`, which is how the gate knows what a hunter or a verifier recorded. `read_usage` is its usage half. `role_totals` adds up what the ledger recorded
 per role for `review report` and `craftsman status`. None of them ever raises: telemetry must not
 fail a hook or a report.
 """
@@ -26,12 +26,18 @@ MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024
 # its parent between runs), not working.
 IDLE_GAP_S = 300.0
 ROLE_LABELS: Mapping[AgentRole, str] = {"reviewer": "hunters", "verifier": "verifiers"}
-# What a successful recording call prints; see `review._record_coverage` and `review._add_one`.
+# What a successful recording call prints; see `review._record_coverage`, `review._add_one`, `review._brief`
+# (`Brief issued (B1)`) and `review._print_verdict` (`F3 verdict recorded (V7)`, also printed by `merge`).
 _COVERAGE_TOKEN_RE = re.compile(r"Coverage recorded \((C\d+)\)")
 _FINDING_TOKEN_RE = re.compile(r"\b(F\d+) recorded \(")
-# A `craftsman review cover|add` invocation, however it is spelled: `craftsman`, `craftsman.exe`,
-# `python3 -m craftsman.cli`, `scripts/craftsman-cli.py`, with any spacing.
-_RECORDING_CALL_RE = re.compile(r"craftsman\S*\s+review\s+(?:cover|add)\b")
+_CLAIM_TOKEN_RE = re.compile(r"Brief issued \((B\d+)\)")
+_VERDICT_TOKEN_RE = re.compile(r"verdict recorded \((V\d+)\)")
+_TOKEN_RES = (_COVERAGE_TOKEN_RE, _FINDING_TOKEN_RE, _CLAIM_TOKEN_RE, _VERDICT_TOKEN_RE)
+# A `craftsman review cover|add|brief|verdict|merge` invocation, however it is spelled: `craftsman`,
+# `craftsman.exe`, `python3 -m craftsman.cli`, `scripts/craftsman-cli.py`, with any spacing.
+_RECORDING_CALL_RE = re.compile(r"craftsman\S*\s+review\s+(?:cover|add|brief|verdict|merge)\b")
+# `review brief --verifier F1,F2` records nothing and prints no token: a recording call that is clear without one.
+_VERIFIER_BRIEF_RE = re.compile(r"craftsman\S*\s+review\s+brief\b[^|;&\n]*--verifier\b")
 # Output of a recording call that recorded nothing, which is not a failure to read it.
 _NOTHING_RECORDED = ("Nothing to record", "Check passed")
 _TOKEN_KEYS = (
@@ -109,14 +115,14 @@ def _read_transcript(path: Path) -> TranscriptFacts:
     anonymous: list[dict[str, int]] = []
     previous: datetime | None = None
     active_s = 0.0
-    calls: set[str] = set()  # recording calls still waiting for their result
+    calls: dict[str, bool] = {}  # recording calls still waiting for their result: may it print no token?
     tokens: list[str] = []
     mentioned: set[str] = set()  # every token the raw text shows, from any kind of entry
     vouched = True
     with path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            mentioned.update(_COVERAGE_TOKEN_RE.findall(line))
-            mentioned.update(_FINDING_TOKEN_RE.findall(line))
+            for pattern in _TOKEN_RES:
+                mentioned.update(pattern.findall(line))
             entry = _entry(line)
             if entry is None:
                 vouched = vouched and not line.strip()
@@ -158,8 +164,8 @@ def _read_transcript(path: Path) -> TranscriptFacts:
     return TranscriptFacts(usage_total, records)
 
 
-def _follow_recording_calls(content: Any, calls: set[str], tokens: list[str]) -> bool:
-    """Track the `review cover` / `review add` calls in a message's content blocks.
+def _follow_recording_calls(content: Any, calls: dict[str, bool], tokens: list[str]) -> bool:
+    """Track the recording calls (`review cover|add|brief|verdict|merge`) in a message's content blocks.
 
     A call joins `calls` until its result arrives; the tokens of a successful one join `tokens`.
     False when a call cannot be paired or its output cannot be read.
@@ -173,24 +179,31 @@ def _follow_recording_calls(content: Any, calls: set[str], tokens: list[str]) ->
         if block.get("type") == "tool_use" and _is_recording_call(block.get("input")):
             call_id = block.get("id")
             if isinstance(call_id, str) and call_id:
-                calls.add(call_id)
+                calls[call_id] = _prints_no_token(block.get("input"))
             else:
                 clear = False
         elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
-            calls.discard(block["tool_use_id"])
+            tokenless = calls.pop(block["tool_use_id"])
             output = _result_text(block.get("content"))
             # A token is printed only after the record is written, so it counts even when a later
             # part of the command failed (`craftsman review cover ... && false`).
-            found = _COVERAGE_TOKEN_RE.findall(output) + _FINDING_TOKEN_RE.findall(output)
+            found = [token for pattern in _TOKEN_RES for token in pattern.findall(output)]
             tokens.extend(found)
             if block.get("is_error") is not True:
-                clear = clear and (bool(found) or any(mark in output for mark in _NOTHING_RECORDED))
+                clear = clear and (
+                    bool(found) or tokenless or any(mark in output for mark in _NOTHING_RECORDED)
+                )
     return clear
 
 
 def _is_recording_call(tool_input: Any) -> bool:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     return isinstance(command, str) and _RECORDING_CALL_RE.search(command) is not None
+
+
+def _prints_no_token(tool_input: Any) -> bool:
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    return isinstance(command, str) and _VERIFIER_BRIEF_RE.search(command) is not None
 
 
 def _result_text(content: Any) -> str:

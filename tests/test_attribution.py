@@ -167,6 +167,32 @@ class AgentRunTests(unittest.TestCase):
             ],
         )
 
+    def test_a_nudge_opens_and_closes_no_run(self) -> None:
+        for name, agent_id in (("claude", "r1"), ("copilot", "")):
+            with self.subTest(platform=name):
+                ledger = with_agents(
+                    hunt_ledger(),
+                    agent_event("start", REVIEWER, agent_id, 1, platform=name),
+                    agent_event("nudge", REVIEWER, agent_id, 3, platform=name),
+                    agent_event("stop", REVIEWER, agent_id, 5, platform=name, records=("C1",)),
+                )
+
+                (run,) = agent_runs(ledger)
+
+                self.assertEqual((run.started, run.stopped, run.records), (moment(1), moment(5), ("C1",)))
+
+    def test_a_run_that_was_only_sent_back_has_not_stopped(self) -> None:
+        ledger = with_agents(
+            hunt_ledger(), agent_event("start", REVIEWER, "r1", 1), agent_event("nudge", REVIEWER, "r1", 3)
+        )
+
+        (run,) = agent_runs(ledger)
+
+        self.assertEqual((run.started, run.stopped), (moment(1), None))
+
+    def test_a_nudge_without_a_start_is_no_run(self) -> None:
+        self.assertEqual(agent_runs(with_agents(hunt_ledger(), agent_event("nudge", REVIEWER, "r1", 3))), ())
+
     def test_a_stop_pairs_with_the_earliest_unpaired_start_of_its_id(self) -> None:
         ledger = with_agents(
             hunt_ledger(),

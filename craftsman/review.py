@@ -122,10 +122,10 @@ from craftsman.workspace import (
     brief_platform,
     caller_identity,
     end_review_guard,
+    live_marker,
     open_workspace,
     read_marker,
     review_enforcement,
-    touch_review,
 )
 
 PROG = "craftsman review"
@@ -302,11 +302,8 @@ def _prepare(args: argparse.Namespace) -> int:
             "Note: --deep ignored: the active gate belongs to another session, "
             "which alone can raise it."
         )
-    marker = read_marker(ws.ledger_path)
-    marker_live = marker is not None and marker.guarding
-    floor, floor_reason = _depth_floor(
-        args, ws, ledger, marker is not None and marker_live and marker.deep, owned=owned
-    )
+    marker = live_marker(ws.ledger_path, now)  # a stale marker's depth and task belong to an older review
+    floor, floor_reason = _depth_floor(args, ws, ledger, marker is not None and marker.deep, owned=owned)
     depth = huntplan.decide_depth(snap, floor=floor, floor_reason=floor_reason)
     if ws.state is not None and owned and depth.deep and not ws.state.deep:
         update_state(state_path_for(ws.root), lambda current: (_raised_to_deep(current), None))
@@ -323,7 +320,7 @@ def _prepare(args: argparse.Namespace) -> int:
         depth=depth,
         symbols=symbols,
         explicit_task=explicit_task,
-        marker_task=marker.task.strip() if marker is not None and marker_live else "",
+        marker_task=marker.task.strip() if marker is not None else "",
         now=now,
     )
 
@@ -346,7 +343,6 @@ def _prepare(args: argparse.Namespace) -> int:
 
     result = mutate(ws.ledger_path, open_next)
     ledger, round_ = result.ledger, result.round
-    touch_review(ws.ledger_path)
     packet = Path(round_.packet_path)
     if result.created or result.raised or result.refreshed or result.task_changed or not packet.is_file():
         pctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task)

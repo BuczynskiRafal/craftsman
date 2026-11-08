@@ -133,6 +133,58 @@ class ReadRecordsTests(TranscriptCase):
 
         self.assertEqual(records, ("C1", "F2"))
 
+    def test_a_brief_and_a_verdict_print_the_tokens_that_vouch_for_a_hunter_and_a_verifier(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review brief W1-2"),
+            tool_result("t1", "Brief issued (B3) for W1-2, round 1.\n\nYou are hunter W1-2 ..."),
+            shell_call("t2", 'craftsman review verdict F1 --as dismissed --evidence "x"'),
+            tool_result("t2", "F1 verdict recorded (V4): dismissed"),
+            shell_call("t3", "craftsman review merge F2 F3"),
+            tool_result("t3", "F3 verdict recorded (V5): dismissed (merged into F2)\nF4 verdict recorded (V6): dismissed (merged into F2)"),
+        )
+
+        self.assertEqual(records, ("B3", "V4", "V5", "V6"))
+
+    def test_a_verdict_line_is_no_finding_token(self) -> None:
+        # `F3 verdict recorded (V7)` must not also read as the finding F3 being added.
+        records = self.records(
+            shell_call("t1", "craftsman review verdict F3 --as proven"),
+            tool_result("t1", "F3 verdict recorded (V7): proven (R2)"),
+        )
+
+        self.assertEqual(records, ("V7",))
+
+    def test_a_verifier_brief_prints_no_token_and_is_still_readable(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review brief --verifier F1,F2"),
+            tool_result("t1", "You are a Craftsman verifier for round 1 ...\nF1: ...\nF2: ..."),
+            shell_call("t2", 'cd /repo && craftsman review brief --verifier F3 && echo ok'),
+            tool_result("t2", "You are a Craftsman verifier ...\nok"),
+        )
+
+        self.assertEqual(records, ())
+
+    def test_a_hunter_brief_that_printed_nothing_recognizable_makes_the_transcript_unreadable(self) -> None:
+        self.assertIsNone(
+            self.records(shell_call("t1", "craftsman review brief W1-1"), tool_result("t1", "something else"))
+        )
+
+    def test_a_brief_that_was_refused_records_nothing(self) -> None:
+        records = self.records(
+            shell_call("t1", "craftsman review brief W1-1"),
+            tool_result("t1", "Slot W1-1 is no longer required in round 1.", error=True),
+        )
+
+        self.assertEqual(records, ())
+
+    def test_tokens_of_the_new_kinds_that_no_call_printed_fail_safe(self) -> None:
+        for text in ("Brief issued (B1) for W1-1", "F1 verdict recorded (V2): proven"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.records(shell_call("t1", "ls"), tool_result("t1", text)))
+
+    def test_the_brief_of_another_program_is_not_a_recording_call(self) -> None:
+        self.assertEqual(self.records(shell_call("t1", "git brief"), tool_result("t1", "x")), ())
+
     def test_a_transcript_without_recording_calls_shows_none(self) -> None:
         self.assertEqual(self.records(shell_call("t1", "ls"), tool_result("t1", "a.py")), ())
 
@@ -320,6 +372,18 @@ class RoleTotalsTests(unittest.TestCase):
         self.assertEqual(role_totals(ledger)["reviewer"].output_tokens, 40)
         self.assertEqual(role_totals(ledger)["reviewer"].agents, 1)
 
+    def test_a_nudge_between_a_start_and_a_stop_changes_nothing(self) -> None:
+        ledger = Ledger(
+            agents=(
+                AgentEvent("claude", "start", "craftsman-reviewer", "r1", AT),
+                AgentEvent("claude", "nudge", "craftsman-reviewer", "r1", AT),
+                stop("craftsman-reviewer", "r1", used(5)),
+            )
+        )
+
+        self.assertEqual(role_totals(ledger)["reviewer"].agents, 1)
+        self.assertEqual(role_totals(ledger)["reviewer"].output_tokens, 5)
+
     def test_lines_and_json_name_hunters_and_verifiers(self) -> None:
         ledger = self.ledger(stop("craftsman-reviewer", "r1", used(45_600, 852)), stop("craftsman-verifier", "v1", used(900, 60)))
 
@@ -348,6 +412,15 @@ class AgentEventRecordTests(unittest.TestCase):
         self.assertIsNone(event.usage)
         self.assertEqual(event.to_json(), self.BASE)
         self.assertEqual(AgentEvent.from_json({**self.BASE, "usage": None}), event)
+
+    def test_a_nudge_event_round_trips_and_carries_no_facts(self) -> None:
+        nudge = AgentEvent("claude", "nudge", "craftsman-reviewer", "r1", AT)
+
+        self.assertEqual(AgentEvent.from_json(nudge.to_json()), nudge)
+        with self.assertRaisesRegex(FieldError, "usage is only allowed on a stop event"):
+            AgentEvent("claude", "nudge", "craftsman-reviewer", "r1", AT, used(5))
+        with self.assertRaisesRegex(FieldError, "records is only allowed on a stop event"):
+            AgentEvent("claude", "nudge", "craftsman-reviewer", "r1", AT, records=("C1",))
 
     def test_usage_is_only_allowed_on_a_stop_event(self) -> None:
         with self.assertRaisesRegex(FieldError, "usage is only allowed on a stop event"):
