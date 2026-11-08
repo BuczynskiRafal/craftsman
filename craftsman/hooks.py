@@ -12,9 +12,10 @@ Events:
 - `subagent-start` / `subagent-stop`: record subagent runs in the ledger (the evidence of reviewer
   isolation) of ANY session of the checkout, brief Craftsman hunters and verifiers, and send them back
   once when they finish without doing their part.
-- `pre-tool`: guards shell commands against work-tree violations, enforces search scope, arms the review
-  guard when the main session runs a `craftsman review` command, and keeps hunters and verifiers from
-  re-planning the review.
+- `pre-tool`: applies the command policy (`craftsman.command_policy`: no forged hooks, no direct ledger
+  or transcript writes, no forged identity, lead-only records for the main session, no re-planning by hunters
+  and verifiers, the work-tree guard), enforces search scope, and arms the review guard when the main session
+  runs a `craftsman review` command.
 
 The first event of the owning session claims an active gate for the hooks: from then on the gate
 requires an isolated reviewer for every round with hunks to review. Another session's prompt and Stop
@@ -23,23 +24,39 @@ one ledger serves the checkout.
 
 A hook never crashes the session it serves. When an event cannot be handled, `pre-tool` asks the
 user to confirm the tool call (Copilot denies it), and every other event lets the agent go on with
-a `systemMessage` that says the gate was not checked.
+a `systemMessage` that says the gate was not checked. Nothing a hook survives is silent: a crash, a transcript
+it could not read, a git call that ran out of the hook's budget, a ledger it could not load or had to set
+aside, all go to the hook error log (`craftsman.hook_errors`), which `review check` shows.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, NoReturn, get_args
 
+from craftsman import hook_errors
 from craftsman.attribution import agent_runs, pair_unnamed_stop
-from craftsman.diffscan import DiffScanError, resolve_base_sha, snapshot, worktree_root
+from craftsman.command_policy import (
+    PolicyContext,
+    arming_action,
+    decide,
+    is_main_session,
+    tool_call,
+)
+from craftsman.diffscan import (
+    DiffScanError,
+    resolve_base_sha,
+    snapshot,
+    worktree_root,
+)
 from craftsman.evidence import archive_ledger
 from craftsman.gate import (
     GateOwner,
@@ -62,9 +79,9 @@ from craftsman.ledger import (
     mutate,
     uncovered_hunks,
 )
+from craftsman.paths import user_home
 from craftsman.records import (
     GROUPED_EVIDENCE_PREFIX,
-    ORCHESTRATOR_AGENT,
     AgentEvent,
     AgentEventKind,
     AgentRole,
@@ -72,11 +89,10 @@ from craftsman.records import (
     LedgerError,
     Round,
     agent_role,
-    craftsman_agent_name,
     format_timestamp,
     parse_timestamp,
 )
-from craftsman.review_guard import gate_stop_inputs, review_commands, serve_review_stop
+from craftsman.review_guard import gate_stop_inputs, serve_review_stop
 from craftsman.scope import (
     evaluate_scope,
     is_craftsman_agent,
@@ -86,7 +102,6 @@ from craftsman.scope import (
 from craftsman.trigger import detect_trigger, is_review_prompt, review_request, task_from_prompt
 from craftsman.usage import TranscriptFacts, read_transcript
 from craftsman.workspace import arm_marker, end_review_guard, touch_marker
-from craftsman.worktree_guard import find_worktree_mutation
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
@@ -101,9 +116,6 @@ HOOK_EVENT_NAMES: dict[Event, str] = {
     "subagent-stop": "SubagentStop",
     "pre-tool": "PreToolUse",
 }
-SHELL_TOOLS = frozenset(
-    {"run_in_terminal", "runinterminal", "terminal", "bash", "powershell", "pwsh", "shell"}
-)
 # Characters that a shell or PowerShell would interpret inside a double-quoted argument.
 SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
 REVIEWER_STOP_REASON = (
@@ -111,14 +123,6 @@ REVIEWER_STOP_REASON = (
     "examined, and a finding (`craftsman review add ...`) for every defect you found. If your prompt "
     "names a slot <ID>, run `craftsman review brief <ID>` first and add `--hunter <ID>` to both commands."
 )
-NO_RESTART = (
-    "Craftsman hunters and verifiers must not re-plan or reset the review; record with `--hunter` and "
-    "report back."
-)
-BRIEFS_ARE_FOR_SUBAGENTS = (
-    "Briefs are for the subagents you launch: give each the one-line prompt that `prepare` / `check` printed."
-)
-RESTARTING_COMMANDS = frozenset({"prepare", "reset"})
 
 
 class UsageError(Exception):
@@ -148,6 +152,7 @@ class HookInput:
     transcript_path: str
     session_id: str | None = None
     agent_transcript_path: str = ""  # a subagent's own transcript (Claude Code SubagentStop)
+    last_message: str = ""  # the agent's last message (Claude Code Stop), when the platform sends it
 
     @classmethod
     def parse(cls, payload: dict[str, Any]) -> HookInput:
@@ -164,6 +169,7 @@ class HookInput:
             transcript_path=_text(payload, "transcript_path", "transcriptPath"),
             session_id=_text(payload, "session_id", "sessionId").strip() or None,
             agent_transcript_path=_text(payload, "agent_transcript_path", "agentTranscriptPath"),
+            last_message=_text(payload, "last_assistant_message", "lastAssistantMessage"),
         )
 
 
@@ -281,6 +287,11 @@ class Session:
     def ledger_path(self) -> Path:
         return ledger_path_for(self.root)
 
+    @property
+    def craftsman_dir(self) -> Path:
+        """`<git-dir>/craftsman`, found without running git when it can be (the hook error log must work after a git timeout)."""
+        return hook_errors.craftsman_dir_for(self.root) or self.ledger_path.parent
+
 
 def open_session(cwd: str) -> Session | None:
     """The session for the work tree containing `cwd`, or None outside a git work tree."""
@@ -354,7 +365,7 @@ def serve(
     if event == "stop":
         if foreign:
             return state, review_stop_guard(session, reply, caller)
-        return on_stop(session, state, reply, caller)
+        return on_stop(session, state, reply, caller, hook)
     active = state is not None and state.active
     if event == "subagent-start":
         return state, on_subagent_start(session, active, hook, reply)
@@ -379,7 +390,9 @@ def on_non_owner_prompt(session: Session, state: GateState, hook: HookInput, rep
 def after_user_prompt(state: GateState, prompt: str, deep: bool | None) -> GateState:
     """An active gate after its user wrote `prompt`: a new streak, and the gate can become deep."""
     if not is_continuation_prompt(prompt):
-        state = replace(state, awaiting_user=False, forced_continuations=0, best_issue_count=None)
+        state = replace(
+            state, awaiting_user=False, awaiting_since=None, question=None, forced_continuations=0, best_issue_count=None
+        )
     if deep and state.stage is not Stage.NEEDS_HUMAN:
         state = replace(state, deep=True)
     return state
@@ -431,11 +444,17 @@ def _shell_safe(text: str) -> str:
 
 
 def on_stop(
-    session: Session, state: GateState | None, reply: Reply, caller: GateOwner | None = None
+    session: Session,
+    state: GateState | None,
+    reply: Reply,
+    caller: GateOwner | None = None,
+    hook: HookInput | None = None,
 ) -> tuple[GateState | None, Output]:
     if state is None or not state.active:
         guard = review_stop_guard(session, reply, caller) if caller is not None else reply.allow()
         return state, guard
+    if state.awaiting_user and hook is not None:
+        _check_await_user(session, state, hook)
     inputs = gate_stop_inputs(session.ledger_path, _now()) if not state.awaiting_user else None
     decision = decide_stop(
         state,
@@ -450,6 +469,75 @@ def on_stop(
     if decision.notice is not None:
         return decision.state, notice(reply, decision.notice)
     return decision.state, reply.allow()
+
+
+MAX_TRANSCRIPT_TAIL_BYTES = 1024 * 1024
+
+
+def _check_await_user(session: Session, state: GateState, hook: HookInput) -> None:
+    """The Stop hook lets an agent stop because it awaits the user: log it when its last message asks nothing.
+
+    The stop itself is never blocked (the user sees the message), but an agent that parks the gate with
+    `--await-user` and stops without a question is leaving the user to guess; `review check` shows the log entry.
+    A message that cannot be found is not judged.
+    """
+    message = hook.last_message or _last_assistant_message(session, hook)
+    if message is not None and not asks_a_question(message, state.question):
+        report_error("await-user", "await-user without a question: the last message does not end with a question", session)
+
+
+def asks_a_question(message: str, question: str | None) -> bool:
+    """Whether `message` asks the user something: a `?` in its last paragraph, or the stored question text in it."""
+    paragraphs = [part for part in re.split(r"\n\s*\n", message.strip()) if part.strip()]
+    if paragraphs and "?" in paragraphs[-1]:
+        return True
+    wanted = " ".join((question or "").split()).casefold()
+    return bool(wanted) and wanted in " ".join(message.split()).casefold()
+
+
+def _last_assistant_message(session: Session, hook: HookInput) -> str | None:
+    """The text of the last assistant message of the session transcript, None when it holds none or is not readable."""
+    if not hook.transcript_path:
+        return None
+    path = Path(hook.transcript_path)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - MAX_TRANSCRIPT_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        report_error("transcript", f"cannot read the session transcript {path} to check the await-user question: {exc}", session)
+        return None
+    for line in reversed(tail.splitlines()):
+        text = _assistant_text(line)
+        if text is not None:
+            return text
+    return None
+
+
+def _assistant_text(line: str) -> str | None:
+    """The text of one transcript line when it is an assistant message (Claude Code and Copilot CLI shapes), else None."""
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    message = entry.get("message") if isinstance(entry.get("message"), dict) else entry.get("data")
+    holder: dict[str, Any] = message if isinstance(message, dict) else entry
+    role = holder.get("role") or entry.get("role")
+    if entry.get("type") not in ("assistant", "assistant.message") and role != "assistant":
+        return None
+    content = holder.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = [
+            block["text"] for block in content if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str)
+        ]
+        return "\n".join(texts) if texts else None
+    return None
 
 
 def review_stop_guard(session: Session, reply: Reply, caller: GateOwner) -> Output:
@@ -556,7 +644,7 @@ def on_subagent_stop(session: Session, active: bool, hook: HookInput, reply: Rep
     if role is not None and not _saw_start(load(session.ledger_path), hook, role, _now()):
         _drop_unseen_stop(hook)
         return reply.allow()
-    facts = _agent_transcript(hook)  # slow: read outside the ledger lock
+    facts = _agent_transcript(session, hook, reply.platform)  # slow: read outside the ledger lock
 
     def judge(ledger: Ledger) -> tuple[Ledger, Output]:
         now = _now()
@@ -779,17 +867,55 @@ def _judged_since(ledger: Ledger, since: datetime) -> bool:
     return False
 
 
-def _agent_transcript(hook: HookInput) -> TranscriptFacts:
+def transcript_roots(platform: Platform, hook: HookInput, env: Mapping[str, str] | None = None) -> tuple[Path, ...]:
+    """Where the transcript of a subagent of this session may be: next to the session's own transcript, or under
+    the platform's transcript root (Claude Code: `$CLAUDE_CONFIG_DIR/projects` and `~/.claude/projects`; Copilot:
+    `~/.copilot/session-state`)."""
+    values = os.environ if env is None else env
+    home = user_home()
+    roots: list[Path] = []
+    if hook.transcript_path:
+        roots.append(Path(hook.transcript_path).parent)
+    if platform == "claude":
+        if values.get("CLAUDE_CONFIG_DIR", "").strip():
+            roots.append(Path(values["CLAUDE_CONFIG_DIR"]).expanduser() / "projects")
+        roots.append(home / ".claude" / "projects")
+    else:
+        roots.append(home / ".copilot" / "session-state")
+    return tuple(roots)
+
+
+def _has_provenance(path: Path, roots: Sequence[Path]) -> bool:
+    resolved = Path(os.path.realpath(path))
+    return any(resolved == base or base in resolved.parents for base in (Path(os.path.realpath(root)) for root in roots))
+
+
+def _agent_transcript(session: Session, hook: HookInput, platform: Platform) -> TranscriptFacts:
     """The agent's usage and records from its own transcript, if the payload names one; never raises.
 
-    The payload's plain `transcript_path` is the parent session's, so it is not read here.
+    The payload's plain `transcript_path` is the parent session's, so it is not read here. A transcript that is
+    not under the platform's transcript root for this session (`transcript_roots`) is not read: the stop is
+    recorded with `records=None` (the hunter is judged by the time window) and the hook error log says so. A
+    transcript that cannot be read is logged too.
     """
     if not hook.agent_transcript_path:
         return TranscriptFacts()
-    try:
-        return read_transcript(Path(hook.agent_transcript_path))
-    except Exception:  # noqa: BLE001 - telemetry must never fail the hook
+    path = Path(hook.agent_transcript_path)
+    if not _has_provenance(path, transcript_roots(platform, hook)):
+        report_error(
+            "provenance",
+            f"the agent transcript {path} is not under the {platform} transcript root for this session; not read",
+            session,
+        )
         return TranscriptFacts()
+    try:
+        facts = read_transcript(path)
+    except Exception as exc:  # noqa: BLE001 - telemetry must never fail the hook
+        report_error("transcript", f"cannot read the agent transcript {path}: {type(exc).__name__}: {exc}", session)
+        return TranscriptFacts()
+    if facts.problem is not None:
+        report_error("transcript", facts.problem, session)
+    return facts
 
 
 def _with_started_agent_name(session: Session, hook: HookInput) -> HookInput:
@@ -811,7 +937,11 @@ REVIEW_IN_PROGRESS_MAX_AGE = timedelta(hours=12)
 
 
 def _review_in_progress(session: Session) -> int | None:
-    """The latest round number when an open review-only round ran within 12 hours, else None."""
+    """The latest round number when an open review-only round ran within 12 hours, else None.
+
+    A ledger or gate state that cannot be read is not "no review": the error goes to the hook error log and the
+    work-tree guard stays quiet.
+    """
     try:
         if not session.ledger_path.is_file():
             return None
@@ -821,6 +951,7 @@ def _review_in_progress(session: Session) -> int | None:
         ledger = load(session.ledger_path)
     except (DiffScanError, GateStateError, LedgerError) as exc:
         sys.stderr.write(f"craftsman hook error: {exc}\n")
+        report_error(hook_errors.kind_of(exc), f"the work-tree guard could not read the review: {exc}", session)
         return None
     if not ledger.rounds:
         return None
@@ -833,85 +964,38 @@ def _review_in_progress(session: Session) -> int | None:
     return latest.number if has_open else None
 
 
-def _shell_command(hook: HookInput) -> tuple[str, str] | None:
-    """The shell command line a tool call runs, with the directory it runs in; None for any other tool call."""
-    if hook.tool_name.lower() not in SHELL_TOOLS:
-        return None
-    command = hook.tool_input.get("command") or hook.tool_input.get("CommandLine")
-    if not isinstance(command, str):
-        return None
-    tool_cwd = hook.tool_input.get("cwd") or hook.tool_input.get("Cwd")
-    cwd = str(Path(hook.cwd, tool_cwd)) if isinstance(tool_cwd, str) and tool_cwd else hook.cwd
-    return command, cwd
+def _policy_context(hook: HookInput, session: Session | None, caller: GateOwner) -> PolicyContext:
+    """What the command policy may ask of this work tree, each asked only if a rule needs it."""
 
-
-def _check_worktree_guard(hook: HookInput, reply: Reply, session: Session | None) -> Output | None:
-    shell = _shell_command(hook)
-    if shell is None:
-        return None
-    command, cwd = shell
-    if agent_role(hook.agent) is not None:
-        mutation = find_worktree_mutation(command, cwd, subagent=True)
-        if mutation is None:
+    def ledger_dir() -> Path | None:
+        try:
+            return session.ledger_path.parent if session is not None else ledger_path_for(hook.cwd).parent
+        except LedgerError:
             return None
-        return reply.deny(
-            "Craftsman reviewers and verifiers must not change the work tree or the index "
-            f"({mutation}). Read an old version with `git show <base>:<path>`; put reproductions "
-            "in a temp directory."
-        )
-    if session is None:
-        return None
-    mutation = find_worktree_mutation(command, cwd, subagent=False)
-    if mutation is None:
-        return None
-    round_number = _review_in_progress(session)
-    if round_number is None:
-        return None
-    return reply.ask(
-        f"A Craftsman review is in progress (round {round_number}); {mutation} would change the "
-        "files under review. Approve only if you mean it."
-    )
+
+    def owns_gate() -> bool:
+        return session is not None and owns_active_gate(load_state(session.state_path), caller)
+
+    def review_in_progress() -> int | None:
+        return _review_in_progress(session) if session is not None else None
+
+    return PolicyContext(ledger_dir, owns_gate, review_in_progress)
 
 
-def _is_main_session(hook: HookInput) -> bool:
-    """Whether the tool call is the main session's: no subagent role, no agent id, and no agent name other than
-    Craftsman's own orchestrator (a session started with `--agent craftsman` is still the main session)."""
-    if agent_role(hook.agent) is not None or hook.agent_id:
-        return False
-    return not hook.agent.strip() or craftsman_agent_name(hook.agent) == ORCHESTRATOR_AGENT
-
-
-def _check_review_commands(hook: HookInput, reply: Reply) -> Output | None:
-    """Deny the `craftsman review` commands the caller must not run: a hunter or verifier re-planning or
-    resetting the review, and the main session fetching a brief that belongs to a subagent."""
-    shell = _shell_command(hook)
-    if shell is None:
-        return None
-    subs = review_commands(*shell)
-    if not subs:
-        return None
-    if agent_role(hook.agent) is not None:
-        return reply.deny(NO_RESTART) if RESTARTING_COMMANDS.intersection(subs) else None
-    if _is_main_session(hook) and "brief" in subs:
-        return reply.deny(BRIEFS_ARE_FOR_SUBAGENTS)
-    return None
-
-
-def _arm_for_review_command(hook: HookInput, session: Session, caller: GateOwner) -> None:
+def _arm_for_review_command(hook: HookInput, review: tuple[str, ...], session: Session, caller: GateOwner) -> None:
     """The main session runs a `craftsman review` command: arm the review guard for it (a `report` only touches).
 
     Never blocks the tool call: a failure is reported on stderr and the command goes on.
     """
-    shell = _shell_command(hook)
-    if shell is None or caller.session_id is None or not _is_main_session(hook):
+    action = arming_action(review)
+    if action is None or caller.session_id is None or not is_main_session(hook.agent, hook.agent_id):
         return
     try:
         if owns_active_gate(load_state(session.state_path), caller):
             return  # the gate holds its owner; a second guard would outlive the gate's own cap
-        subs = review_commands(*shell)
-        if any(sub != "report" for sub in subs):
+        if action == "arm":
             arm_marker(session.ledger_path, caller, _now(), fresh=False)
-        elif subs:
+        else:
             touch_marker(session.ledger_path, caller, _now())
     except (OSError, ValueError, GateStateError) as exc:
         sys.stderr.write(f"craftsman hook error: could not arm the review guard: {exc}\n")
@@ -924,21 +1008,32 @@ def _is_refusal(out: Output) -> bool:
 
 
 def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
-    """Guard shell commands against work-tree violations and misplaced review commands, enforce search
-    scope, and arm the review guard for a `craftsman review` command that was allowed to run."""
-    out = _guard_tool_call(hook, reply, session, caller)
+    """Apply the command policy to the tool call, enforce search scope, and arm the review guard for a
+    `craftsman review` command that was allowed to run.
+
+    The policy (`command_policy.decide`) answers first for every tool: the write protection of the ledger and the
+    transcripts must reach tools outside `SCOPE_CHECKED_TOOLS` (Write, Edit, Copilot's edit tools) too.
+    """
+    call = tool_call(
+        hook.tool_name,
+        hook.tool_input,
+        hook.cwd,
+        role=agent_role(hook.agent),
+        main_session=is_main_session(hook.agent, hook.agent_id),
+        session_id=hook.session_id,
+    )
+    decision = decide(call, _policy_context(hook, session, caller))
+    if decision.action == "deny":
+        return reply.deny(decision.reason)
+    if decision.action == "ask":
+        return reply.ask(decision.reason)
+    out = _enforce_scope(hook, reply, session, caller)
     if session is not None and not _is_refusal(out):
-        _arm_for_review_command(hook, session, caller)
+        _arm_for_review_command(hook, decision.review, session, caller)
     return out
 
 
-def _guard_tool_call(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
-    worktree_reply = _check_worktree_guard(hook, reply, session)
-    if worktree_reply is not None:
-        return worktree_reply
-    review_reply = _check_review_commands(hook, reply)
-    if review_reply is not None:
-        return review_reply
+def _enforce_scope(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
     if session is None or not is_scope_checked_tool(hook.tool_name):
         return reply.allow()
     if not _serves_owned_gate(session, caller) and not is_craftsman_agent(hook.agent):
@@ -966,6 +1061,20 @@ def _serves_owned_gate(session: Session, caller: GateOwner) -> bool:
     if claim(state, caller) != state:
         update_state(session.state_path, lambda current: (claim(current, caller), None))
     return True
+
+
+# --- the hook error log -----------------------------------------------------------------------
+
+
+def report_error(kind: hook_errors.ErrorKind, message: str, session: Session | None = None) -> None:
+    """Log a problem the hook survives (`hook_errors.report`), in `session`'s checkout when no hook run is active."""
+    directory: Path | None = None
+    if session is not None:
+        try:
+            directory = session.craftsman_dir
+        except (DiffScanError, LedgerError):
+            directory = None
+    hook_errors.report(kind, message, directory)
 
 
 # --- entry point ----------------------------------------------------------------------------
@@ -1008,22 +1117,36 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload = json.loads(_read_stdin().strip() or "{}")
     except (OSError, ValueError) as exc:
-        _emit(failure(reply, f"unreadable hook input: {exc}"))
+        with hook_errors.hook_run(args.event, None) as log:
+            _emit(failure(reply, f"unreadable hook input: {exc}", log))
         return 0
     if not isinstance(payload, dict):
-        _emit(failure(reply, "the hook input is not a JSON object"))
+        with hook_errors.hook_run(args.event, None) as log:
+            _emit(failure(reply, "the hook input is not a JSON object", log))
         return 0
-    try:
-        out = handle(args.event, args.platform, payload)
-    except Exception as exc:  # the platform treats a crashed hook as "allow"; `failure` decides
-        out = failure(reply, f"{type(exc).__name__}: {exc}")
+    cwd = payload.get("cwd")
+    with hook_errors.hook_run(args.event, cwd if isinstance(cwd, str) and cwd else None) as log:
+        try:
+            out = handle(args.event, args.platform, payload)
+        except Exception as exc:  # the platform treats a crashed hook as "allow"; `failure` decides
+            out = failure(reply, f"{type(exc).__name__}: {exc}", log, hook_errors.kind_of(exc))
     _emit(out)
     return 0
 
 
-def failure(reply: Reply, problem: str) -> Output:
-    """The answer when an event cannot be handled: confirm a tool call, else go on with a warning."""
+def failure(
+    reply: Reply, problem: str, log: hook_errors.HookLog | None = None, kind: hook_errors.ErrorKind = "crash"
+) -> Output:
+    """The answer when an event cannot be handled: confirm a tool call, else go on with a warning.
+
+    The problem goes to the hook error log (`log`), so `review check` can say a hook failed.
+    """
     sys.stderr.write(f"craftsman hook error: {problem}\n")
+    if log is not None:
+        if kind == "git-timeout":
+            log.git_timeout(problem)  # the budget may have logged this run's timeout already
+        else:
+            log.record(kind, problem)
     if reply.event == "pre-tool":
         return reply.ask(
             f"The Craftsman guard could not check this tool call ({problem}); confirm it only if "

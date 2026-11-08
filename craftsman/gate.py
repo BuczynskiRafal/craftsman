@@ -28,6 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, TypeVar, get_args
 
+from craftsman import hook_errors
 from craftsman.diffscan import (
     DiffScanError,
     git_dir,
@@ -71,6 +72,7 @@ MAX_ERROR_CHARS = 400
 CONTINUATION_HEADER = "[CRAFTSMAN GATE"
 REVIEW_CONTINUATION_HEADER = "[CRAFTSMAN REVIEW"
 TAKEOVER_HINT = "start a new gate with `craftsman gate --init --takeover`"
+TAKEOVER_NOTE = "If that session is gone, take its gate over with `craftsman gate --init --takeover`."
 NO_ACTIVE_GATE = "no active gate in this work tree; open one with `craftsman gate --init`"
 ROUND_CAP_NOTICE = (
     "Craftsman gate: the review reached its round cap. The remaining issues need your decision; "
@@ -177,6 +179,9 @@ class GateState:
     request_step: int | None = None
     # The evidence counter (`attribution.evidence_counter`) when the gate last blocked a stop; None until it did.
     evidence_seen: int | None = None
+    # While `awaiting_user`: when `--await-user` was run and the question it was tied to, if it named one.
+    awaiting_since: str | None = None
+    question: str | None = None
 
     def __post_init__(self) -> None:
         if not self.base_sha:
@@ -216,6 +221,10 @@ class GateState:
             evidence_seen=fields.optional_integer("evidence_seen")
             if isinstance(raw, dict) and "evidence_seen" in raw
             else None,
+            awaiting_since=fields.optional_text("awaiting_since")
+            if isinstance(raw, dict) and "awaiting_since" in raw
+            else None,
+            question=fields.optional_text("question") if isinstance(raw, dict) and "question" in raw else None,
         )
         return fields.done(state)
 
@@ -234,7 +243,7 @@ class GateState:
         user up. A deep gate still needed its end-to-end run to get here.
         """
         stage = Stage.COMPLETE_UNISOLATED if report.self_reviewed else Stage.COMPLETED
-        return replace(self, active=False, awaiting_user=False, stage=stage)
+        return replace(self, active=False, awaiting_user=False, awaiting_since=None, question=None, stage=stage)
 
     @property
     def required_isolation(self) -> IsolationEvidence:
@@ -589,6 +598,10 @@ def _build_parser() -> argparse.ArgumentParser:
     action.add_argument(
         "--resume", action="store_true", help="Enforce the gate again after --await-user."
     )
+    parser.add_argument(
+        "--question",
+        help="With --await-user: the question you ask the user (the Stop hook looks for it in your last message).",
+    )
     parser.add_argument("--cwd", help="A directory inside the work tree (default: the current one).")
     parser.add_argument(
         "--deep",
@@ -621,6 +634,8 @@ def _check_combinations(parser: argparse.ArgumentParser, args: argparse.Namespac
     ]
     if init_only and not args.init:
         parser.error(f"{', '.join(init_only)}: only valid with --init")
+    if args.question is not None and not args.await_user:
+        parser.error("--question: only valid with --await-user")
     if (args.complete or args.await_user or args.resume) and (args.deep or args.task):
         parser.error("--deep and --task apply with --init or on their own")
     if not (args.init or args.complete or args.await_user or args.resume or args.deep or args.task):
@@ -667,8 +682,9 @@ def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -
         elif previous is not None and previous.active:
             if not args.takeover:
                 raise ForeignGateError(foreign_gate_refusal(root, previous, "initialize"))
-            # Taking a gate over never makes it shallower.
-            takeover_from, deep = previous.owner, previous.deep or deep
+            # Taking a gate over never weakens it: not shallower, and not less proven. Resetting the isolation
+            # evidence would make the next round advisory and close the gate SELF-REVIEWED.
+            takeover_from, deep, isolation = previous.owner, previous.deep or deep, previous.isolation_evidence
         state = GateState.open(
             owner,
             base_sha,
@@ -693,8 +709,16 @@ def _replaceable_state(path: Path, *, takeover: bool) -> GateState | None:
 
 
 def _updated(state: GateState, args: argparse.Namespace) -> GateState:
-    if args.await_user or args.resume:
-        return replace(state, awaiting_user=bool(args.await_user))
+    if args.await_user:
+        question = " ".join((args.question or "").split())
+        return replace(
+            state,
+            awaiting_user=True,
+            awaiting_since=format_timestamp(datetime.now(timezone.utc)),
+            question=question or None,
+        )
+    if args.resume:
+        return replace(state, awaiting_user=False, awaiting_since=None, question=None)
     return replace(
         state,
         deep=state.deep or bool(args.deep),
@@ -722,6 +746,9 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
         path, lambda current: _close_gate(current, root=root, caller=caller)
     )
     (sys.stdout if code == 0 else sys.stderr).write(message)
+    line = hook_errors.summary_of(path.parent)
+    if line is not None:
+        (sys.stdout if code == 0 else sys.stderr).write(line + "\n")
     if code == 0:
         prune_all_temp_dirs(path.parent)
     return code

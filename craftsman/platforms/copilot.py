@@ -34,6 +34,7 @@ from craftsman.generated import (
     write_generated,
     write_marked,
 )
+from craftsman.hook_budget import HOOK_TIMEOUTS_S
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.manifest import TargetKind
 from craftsman.paths import (
@@ -172,11 +173,11 @@ COPILOT_SUBAGENT_NOTE = (
 )
 # Copilot CLI event name -> `craftsman hook` event, with the timeout in seconds.
 COPILOT_HOOK_EVENTS: dict[str, tuple[str, int]] = {
-    "userPromptSubmitted": ("prompt", 30),
-    "agentStop": ("stop", 60),
-    "subagentStart": ("subagent-start", 30),
-    "subagentStop": ("subagent-stop", 30),
-    "preToolUse": ("pre-tool", 30),
+    "userPromptSubmitted": ("prompt", HOOK_TIMEOUTS_S["prompt"]),
+    "agentStop": ("stop", HOOK_TIMEOUTS_S["stop"]),
+    "subagentStart": ("subagent-start", HOOK_TIMEOUTS_S["subagent-start"]),
+    "subagentStop": ("subagent-stop", HOOK_TIMEOUTS_S["subagent-stop"]),
+    "preToolUse": ("pre-tool", HOOK_TIMEOUTS_S["pre-tool"]),
 }
 HOOKS_FILENAME = "craftsman.json"
 _COPILOT_HOOK_RE = re.compile(r" hook [a-z-]+ --platform copilot$")

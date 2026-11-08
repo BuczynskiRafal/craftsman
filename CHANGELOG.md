@@ -6,8 +6,31 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Hooks cannot be forged and the evidence cannot be edited from the session.** One entry point,
+  `craftsman/command_policy.py`, decides every PreToolUse call for every platform: `craftsman hook ...` (and
+  `import craftsman` in an inline program) is denied, as is any write into `<git-dir>/craftsman/` (ledger, state,
+  hook log; `inbox/` and `scratch/` stay open) or into the transcript folders of the platforms, by a shell command or
+  by a file-writing tool. The Claude Code matcher now covers `Write|Edit|MultiEdit|NotebookEdit`, and the write check
+  runs before the scope filter. Identity variables (`CLAUDE_CODE_SESSION_ID`, `CRAFTSMAN_*`, ...) cannot be set for a
+  craftsman command, the main session records only as `lead`, the gate owner cannot `--takeover` its own gate, and a
+  made-up `--session-id` is denied. A subagent's transcript is read only from under the platform's transcript folders.
+- **Taking a gate over keeps what the hooks proved.** `gate --init --takeover` keeps `isolation_evidence`, so the next
+  round is still enforced.
+
+### Added
+
+- **A hook error log.** Whatever a hook survives (a crash, an unreadable transcript, a git call out of budget, a ledger
+  it cannot load or had to set aside, a transcript without provenance) is appended to
+  `<git-dir>/craftsman/hook-errors.log`; `review check`, `review report`, `gate --complete` and `status` print
+  `Hook errors since round N was prepared: K (see <path>)`. Every git call of a hook shares the budget of its event.
+- **`gate --await-user --question "..."`** stores the time and the question; the Stop hook logs an `await-user` entry
+  when the last message of an agent that parked the gate asks nothing.
+
 ### Removed
 
+- **The `mentioned` rule of the usage reader:** a command counts as run only when a recognized recording call printed it.
 - **Four skills unrelated to the review loop:** `leetcode-style-code-reviewer`, `code-quality`,
   `high-level-commit-message` and `extreme-optimizer`. `craftsman install` removes the copies, links and
   commands that an earlier install recorded in its manifest (and nothing it did not create); `/audit` no longer

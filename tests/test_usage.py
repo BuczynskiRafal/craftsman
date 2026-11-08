@@ -11,7 +11,6 @@ from unittest import mock
 
 from craftsman.records import AgentEvent, AgentUsage, FieldError, Ledger
 from craftsman.usage import (
-    TranscriptFacts,
     read_transcript,
     read_usage,
     role_totals,
@@ -100,26 +99,131 @@ class ReadRecordsTests(TranscriptCase):
         )
         mentioning = self.records(shell_call("t1", 'grep "review cover" notes.txt'), tool_result("t1", "none"))
 
-        self.assertIsNone(searching)  # looks like a recording call with an unreadable outcome
+        self.assertEqual(searching, ())  # F11: the command only names a recording call, it does not run one
         self.assertEqual(mentioning, ())  # not one, and no token anywhere
 
-    def test_a_token_that_only_an_unrecognized_call_printed_makes_the_transcript_unreadable(self) -> None:
-        for command in ("craftsman review show --json", "craftsman review cvr --hunks H1 --note x"):
+    def test_a_token_printed_by_a_call_that_is_no_recording_call_is_not_the_agents_record(self) -> None:
+        # F11: only the tokens that a recognized recording call printed count; text the agent merely saw does not.
+        for command in ("craftsman review show --json", "craftsman review cvr --hunks H1 --note x", "ls"):
             with self.subTest(command=command):
                 records = self.records(shell_call("t1", command), tool_result("t1", "Coverage recorded (C9): H1"))
 
-                self.assertIsNone(records)
-        self.assertIsNone(self.records(shell_call("t1", "ls"), tool_result("t1", "F4 recorded (major, intent, a.py:1)")))
+                self.assertEqual(records, ())
+        self.assertEqual(self.records(shell_call("t1", "ls"), tool_result("t1", "F4 recorded (major, intent, a.py:1)")), ())
 
-    def test_a_renamed_command_key_or_tool_use_type_fails_safe(self) -> None:
+    def test_documents_that_print_every_token_phrase_are_no_records_of_the_agent(self) -> None:
+        phrases = (
+            "Coverage recorded (C3): H1\nF4 recorded (major, intent, a.py:1)\n"
+            "Brief issued (B5) for W1-1\nF2 verdict recorded (V6): proven\n"
+        )
+        read = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "docs/how-it-works.md"}}]}}  # fmt: skip
+        records = self.records(
+            read,
+            tool_result("r1", phrases),
+            shell_call("t1", "cat tests/test_usage.py"),
+            tool_result("t1", phrases),
+            shell_call("t2", "grep -rn 'recorded (' docs tests"),
+            tool_result("t2", phrases),
+            shell_call("t3", "craftsman review show --json"),
+            tool_result("t3", '{"findings": [{"id": "F3", "title": "Coverage recorded (C9) is printed twice"}]}'),
+            shell_call("t4", "craftsman review cover --hunks H1 --note x"),
+            tool_result("t4", "Coverage recorded (C2): H1 in round 1"),
+        )
+
+        self.assertEqual(records, ("C2",))
+
+    def test_a_recognized_cover_call_that_shows_no_token_and_no_nothing_recorded_mark_is_unclear(self) -> None:
+        self.assertIsNone(
+            self.records(shell_call("t1", "craftsman review cover --hunks H1 --note x"), tool_result("t1", "done"))
+        )
+
+    def test_a_recording_call_that_a_wrapper_hides_is_not_vouched(self) -> None:
+        records = self.records(
+            shell_call("t1", "./scripts/record.sh H1"), tool_result("t1", "Coverage recorded (C4): H1 in round 1")
+        )
+
+        self.assertEqual(records, ())  # the reader does not know the wrapper: it vouches for nothing
+
+    def test_a_renamed_command_key_or_tool_use_type_is_not_vouched(self) -> None:
         output = tool_result("t1", "Coverage recorded (C1): H1 in round 1")
         renamed_key = shell_call("t1", "craftsman review cover --hunks H1 --note x")
         renamed_key["message"]["content"][0]["input"] = {"cmd": "craftsman review cover --hunks H1 --note x"}
         renamed_type = shell_call("t1", "craftsman review cover --hunks H1 --note x")
         renamed_type["message"]["content"][0]["type"] = "server_tool_use"
 
-        self.assertIsNone(self.records(renamed_key, output))
-        self.assertIsNone(self.records(renamed_type, output))
+        self.assertEqual(self.records(renamed_key, output), ())
+        self.assertEqual(self.records(renamed_type, output), ())
+
+    def test_copilot_cli_events_are_read_like_claude_transcripts(self) -> None:
+        def start(call_id: str, command: str) -> dict[str, Any]:
+            return {"type": "tool.execution_start", "data": {"toolCallId": call_id, "toolName": "bash", "arguments": {"command": command}}}
+
+        def complete(call_id: str, output: str, *, success: bool = True) -> dict[str, Any]:
+            return {"type": "tool.execution_complete", "data": {"toolCallId": call_id, "success": success, "result": {"content": output}}}
+
+        phrases = "Coverage recorded (C3): H1\nBrief issued (B5) for W1-1"
+        self.assertEqual(
+            self.records(
+                start("c1", "cat docs/how-it-works.md"), complete("c1", phrases),
+                start("c2", "craftsman review cover --hunter W1-1 --hunks H1 --note x"), complete("c2", "Coverage recorded (C7): H1"),
+            ),
+            ("C7",),
+        )  # fmt: skip
+        self.assertIsNone(self.records(start("c3", "craftsman review cover --hunks H1 --note x")))  # no result
+        self.assertIsNone(
+            self.records(start("c4", "craftsman review cover --hunks H1 --note x"), complete("c4", "done"))
+        )  # no token, no mark
+
+    def test_a_command_that_only_names_a_recording_call_is_no_recording_call(self) -> None:
+        # F11 when the reviewed repository is Craftsman: a hunter greps the docs for the command, and the matches
+        # print the phrase a real call prints.
+        output = "docs/a.md:3: Coverage recorded (C1)\ntests/b.py:9: F2 recorded (major, intent, a.py:1)"
+        for command in (
+            'grep -rn "craftsman review cover" docs/',
+            "grep -rn 'craftsman review add' tests/ | head -5",
+            "rg 'craftsman review verdict' docs",
+            "echo craftsman review cover",
+            "git log --grep='craftsman review cover'",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.records(shell_call("t1", command), tool_result("t1", output)), ())
+
+    def test_a_token_that_another_command_of_the_line_printed_is_not_vouched(self) -> None:
+        for command in (
+            'craftsman review cover --hunks H1 --note x; echo "Coverage recorded (C7): H1"',
+            "craftsman review cover --hunks H1 --note x && cat README.md",
+            "craftsman review cover --hunks H1 --note x && grep -rn recorded docs/",
+            "craftsman review cover --hunks H1 --note x && craftsman review show --json",
+        ):
+            with self.subTest(command=command):
+                records = self.records(shell_call("t1", command), tool_result("t1", "Coverage recorded (C7): H1\nCoverage recorded (C9): H2"))
+
+                self.assertIsNone(records)  # unclear, so the gate attributes by time window instead
+
+    def test_commands_that_print_nothing_of_their_own_may_share_the_line(self) -> None:
+        for command, expected in (
+            ("cd /repo && craftsman review cover --hunks H1 --note x 2>&1 | tail -3", ("C7",)),
+            ("export X=1; craftsman review cover --hunks H1 --note x | head -n 5", ("C7",)),
+            ("craftsman review cover --hunks H1 --note x && echo ok", ("C7",)),
+            ("bash -c 'craftsman review cover --hunks H1 --note x'", ("C7",)),
+            ("craftsman review cover --hunks H1 --note x | cat", ("C7",)),
+        ):
+            with self.subTest(command=command):
+                records = self.records(shell_call("t1", command), tool_result("t1", "Coverage recorded (C7): H1"))
+
+                self.assertEqual(records, expected)
+
+    def test_the_same_holds_for_copilot_events(self) -> None:
+        def start(call_id: str, command: str) -> dict[str, Any]:
+            return {"type": "tool.execution_start", "data": {"toolCallId": call_id, "toolName": "bash", "arguments": {"command": command}}}
+
+        def complete(call_id: str, output: str) -> dict[str, Any]:
+            return {"type": "tool.execution_complete", "data": {"toolCallId": call_id, "success": True, "result": {"content": output}}}
+
+        output = "docs/a.md:3: Coverage recorded (C1)"
+        self.assertEqual(self.records(start("c1", 'grep -rn "craftsman review cover" docs/'), complete("c1", output)), ())
+        self.assertIsNone(self.records(start("c2", 'craftsman review cover --hunks H1 --note x; echo "Coverage recorded (C7)"'), complete("c2", "Coverage recorded (C7)")))
 
     def test_tokens_the_reviewer_quotes_in_its_final_message_are_already_recognized(self) -> None:
         final = {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Done: C1 and F2 recorded (see Coverage recorded (C1))."}]}}
@@ -177,10 +281,10 @@ class ReadRecordsTests(TranscriptCase):
 
         self.assertEqual(records, ())
 
-    def test_tokens_of_the_new_kinds_that_no_call_printed_fail_safe(self) -> None:
+    def test_tokens_of_the_new_kinds_that_no_call_printed_are_no_records(self) -> None:
         for text in ("Brief issued (B1) for W1-1", "F1 verdict recorded (V2): proven"):
             with self.subTest(text=text):
-                self.assertIsNone(self.records(shell_call("t1", "ls"), tool_result("t1", text)))
+                self.assertEqual(self.records(shell_call("t1", "ls"), tool_result("t1", text)), ())
 
     def test_the_brief_of_another_program_is_not_a_recording_call(self) -> None:
         self.assertEqual(self.records(shell_call("t1", "git brief"), tool_result("t1", "x")), ())
@@ -236,9 +340,18 @@ class ReadRecordsTests(TranscriptCase):
             oversized = read_transcript(path)
 
         self.assertEqual(read_transcript(path).records, ())
+        self.assertIsNone(read_transcript(path).problem)
         for facts in (read_transcript(self.dir / "absent.jsonl"), read_transcript(self.dir), oversized):
-            self.assertEqual(facts, TranscriptFacts(None, None))
+            self.assertEqual((facts.usage, facts.records), (None, None))
+            self.assertIsNotNone(facts.problem)  # the reason is for the hook error log
+        self.assertIn("larger than", oversized.problem or "")
         self.assertIsNone(read_transcript(binary).records)
+
+    def test_a_line_that_is_not_json_is_a_problem_the_hooks_log(self) -> None:
+        facts = read_transcript(self.transcript(shell_call("t1", "ls"), "not json"))
+
+        self.assertIsNone(facts.records)
+        self.assertIn("not JSON", facts.problem or "")
 
     def test_one_pass_reads_usage_and_records(self) -> None:
         path = self.transcript(

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypeVar
 
-from craftsman import huntplan, huntview
+from craftsman import hook_errors, huntplan, huntview
 from craftsman.agy_sync import sync_antigravity_runs
 from craftsman.assets import TemplateRole, load_agent_templates
 from craftsman.attribution import agent_runs
@@ -40,8 +40,15 @@ from craftsman.evidence import (
     prune_inbox_files,
     prune_round_files,
 )
-from craftsman.files import write_text_atomic
-from craftsman.gate import GateState, GateStateError, cli_caller, state_path_for, update_state
+from craftsman.files import decode_json_bytes, write_text_atomic
+from craftsman.gate import (
+    TAKEOVER_NOTE,
+    GateState,
+    GateStateError,
+    cli_caller,
+    state_path_for,
+    update_state,
+)
 from craftsman.gatecheck import (
     SELF_REVIEWED_BANNER,
     GatePolicy,
@@ -485,7 +492,8 @@ def _gate_label(state: GateState) -> str:
 def _foreign_gate_note(state: GateState) -> str:
     return (
         f"This checkout has an active /craftsman gate ({_gate_label(state)}); this round follows it. "
-        "For a separate review use its own worktree: git worktree add <path>."
+        "For a separate review use its own worktree: git worktree add <path>. "
+        f"{TAKEOVER_NOTE}"
     )
 
 
@@ -928,9 +936,8 @@ def _reject_flags_with_from_json(flags: Mapping[str, object]) -> None:
 
 
 def _decode_json_bytes(data: bytes, label: str) -> str:
-    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
     try:
-        return data.decode(encoding)
+        return decode_json_bytes(data)
     except UnicodeDecodeError as exc:
         raise LedgerError(f"cannot read {label}: {exc}; {UTF8_SAVE_HINT}") from exc
 
@@ -2135,7 +2142,9 @@ def _check(args: argparse.Namespace) -> int:
     ledger, _, _, report = _evaluate(ws, review_only=args.review_only)
     abandoned = _abandoned(ws, ledger, report)
     if args.json:
-        print(json.dumps(_report_json(report, ledger, abandoned=abandoned), indent=2, ensure_ascii=False))
+        payload = _report_json(report, ledger, abandoned=abandoned)
+        _add_hook_errors(payload, ws, ledger)
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         if abandoned:
             print(f"**{ABANDONED_BANNER}**: {ABANDONED_NOTE}.\n")
@@ -2143,9 +2152,23 @@ def _check(args: argparse.Namespace) -> int:
         if report.slots:
             print("\n**Hunt slots**")
             print("\n".join(huntview.plan_lines(report.slots, with_state=True)))
+        _print_hook_errors(ws, ledger)
         if args.review_only:
             _warn_new_out_of_scope(ws, ledger)
     return 0 if report.passed else 1
+
+
+def _print_hook_errors(ws: Workspace, ledger: Ledger) -> None:
+    """The line that says the platform hooks failed since the latest round was prepared (nothing when none did)."""
+    line = hook_errors.summary_for(ws.ledger_path, ledger)
+    if line is not None:
+        print(f"\n{line}")
+
+
+def _add_hook_errors(payload: dict[str, Any], ws: Workspace, ledger: Ledger) -> None:
+    summary = hook_errors.summary_json(ws.ledger_path, ledger)
+    if summary is not None:
+        payload["hook_errors"] = summary
 
 
 def _slots_json(slots: Sequence[SlotStatus]) -> list[dict[str, Any]]:
@@ -2210,9 +2233,11 @@ def _report(args: argparse.Namespace) -> int:
             "waived_runs": [run.to_json() for run in ledger.runs if run.waiver is not None],
             "agent_usage": usage_json(ledger),
         }
+        _add_hook_errors(payload, ws, ledger)
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         print("\n".join(_report_lines(ledger, snap, deep, report, groups, runs, slots, abandoned=abandoned)))
+        _print_hook_errors(ws, ledger)
         _warn_new_out_of_scope(ws, ledger)
     if args.review_only and report.passed:
         # Only a review that passed is over. A report of an unfinished one ends nothing: pruning would delete the

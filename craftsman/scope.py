@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 from craftsman.antigravity import session_id
-from craftsman.diffscan import DiffScanError, worktree_root
+from craftsman.diffscan import DiffScanError, git_time_left, note_git_timeout, worktree_root
 from craftsman.gate import GateOwner, GateStateError, load_state, state_path_for
 from craftsman.paths import user_home
 from craftsman.records import CRAFTSMAN_AGENTS, craftsman_agent_name
@@ -81,6 +81,7 @@ ENV_VAR_RE = re.compile(
 )
 GLOB_META_RE = re.compile(r"[*?\[\{]")
 WIN_DRIVE_RE = re.compile(r"^([A-Za-z]):([/\\].*|$)")
+GIT_CONFIG_TIMEOUT_S = 5.0
 SCOPE_ALLOW_SPLIT_RE = re.compile(r";|(?<![A-Za-z]):|(?<=[A-Za-z]{2}):")
 
 
@@ -122,6 +123,10 @@ def _deny(target_desc: str, detail: str = "is outside the repository work tree")
 
 
 def _git_config_lines(cwd: Path, *args: str) -> list[str]:
+    timeout = git_time_left(GIT_CONFIG_TIMEOUT_S)
+    if timeout <= 0:
+        note_git_timeout(f"`git config` was not run in {cwd}: the hook's git budget is spent")
+        return []
     try:
         proc = subprocess.run(
             ["git", "config", *args],
@@ -129,9 +134,12 @@ def _git_config_lines(cwd: Path, *args: str) -> list[str]:
             capture_output=True,
             encoding="utf-8",  # git config files are UTF-8; the locale may not be
             errors="replace",
-            timeout=5,
+            timeout=timeout,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        note_git_timeout(f"`git config` timed out after {timeout:g}s in {cwd}; the search scope policy was not read")
+        return []
     except (OSError, subprocess.SubprocessError):
         return []
     return (

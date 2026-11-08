@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from craftsman import antigravity, hooks
+from craftsman import antigravity, command_policy, hooks
 from craftsman.attribution import agent_runs
 from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, MAX_CONTINUATIONS
 from craftsman.gatecheck import MAX_ROUNDS
@@ -92,6 +93,13 @@ class HookTestCase(unittest.TestCase):
         self.tmp = Path(tmp.name).resolve()
         self.repo = EvidenceRepo(self.tmp / "repo")
         self.root = self.repo.root
+        # Where Claude Code keeps transcripts; a subagent's transcript is read only from under it (F7.3).
+        self.config_dir = self.tmp / "claude-config"
+        self.transcripts = self.config_dir / "projects" / "repo"
+        self.transcripts.mkdir(parents=True)
+        env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config_dir)})
+        env.start()
+        self.addCleanup(env.stop)
 
     @property
     def state_file(self) -> Path:
@@ -185,7 +193,7 @@ class HookTestCase(unittest.TestCase):
 
     def stop_with_transcript(self, reviewer: dict[str, str], *lines: str, **extra: Any) -> dict[str, Any]:
         """A subagent stops; its own transcript consists of `lines`."""
-        path = self.tmp / f"agent-{reviewer['agent_id']}.jsonl"  # outside the work tree: it is not part of the diff
+        path = self.transcripts / f"agent-{reviewer['agent_id']}.jsonl"  # outside the work tree: it is not part of the diff
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         payload = claude("SubagentStop", self.root, agent_transcript_path=str(path), **reviewer, **extra)
         return call_hook("subagent-stop", "claude", payload)[0]
@@ -1264,7 +1272,7 @@ class PreToolTests(HookTestCase):
 
     def test_guard_failure_asks_the_user(self) -> None:
         payload = claude("PreToolUse", self.root, tool_name="Bash", tool_input={"command": "git status"})
-        with mock.patch.object(hooks, "find_worktree_mutation", side_effect=RuntimeError("boom")):
+        with mock.patch.object(command_policy, "find_worktree_mutation", side_effect=RuntimeError("boom")):
             out, _ = call_hook("pre-tool", "claude", payload)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "ask")
 
@@ -1272,7 +1280,7 @@ class PreToolTests(HookTestCase):
         payload = vscode(
             "PreToolUse", self.root, tool_name="run_in_terminal", tool_input={"command": "ls"}
         )
-        with mock.patch.object(hooks, "find_worktree_mutation", side_effect=RuntimeError("boom")):
+        with mock.patch.object(command_policy, "find_worktree_mutation", side_effect=RuntimeError("boom")):
             out, _ = call_hook("pre-tool", "copilot", payload)
         self.assertEqual(out["permissionDecision"], "deny")
 

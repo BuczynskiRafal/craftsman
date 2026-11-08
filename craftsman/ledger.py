@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -174,6 +175,23 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+_SET_ASIDE_LISTENER: ContextVar[Callable[[Path], None] | None] = ContextVar("craftsman_set_aside_listener", default=None)
+
+
+@contextmanager
+def watch_set_asides(listener: Callable[[Path], None]) -> Iterator[None]:
+    """Tell `listener` the backup path whenever `load` in this block sets an older ledger aside.
+
+    A hook may move an older ledger aside as a side effect of reading it; its entry point uses this to log the
+    move (`hook_errors`) so that it never goes unnoticed.
+    """
+    token = _SET_ASIDE_LISTENER.set(listener)
+    try:
+        yield
+    finally:
+        _SET_ASIDE_LISTENER.reset(token)
+
+
 def load(path: Path, *, set_aside: bool = True) -> Ledger:
     """Read the ledger at `path`; a missing file is an empty ledger.
 
@@ -256,6 +274,9 @@ def _set_aside_older_ledger(path: Path) -> None:
         f"[craftsman] Archived the review ledger of an older craftsman to {backup.name}; "
         "starting a new review.\n"
     )
+    listener = _SET_ASIDE_LISTENER.get()
+    if listener is not None:
+        listener(backup)
 
 
 _BACKUP_NAME_RE = re.compile(r"\.v(?P<schema>\d+)(?:\.(?P<stamp>\d{8}T\d{6}Z))?(?:\.(?P<counter>\d+))?\.bak(?:\..*)?")

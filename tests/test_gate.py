@@ -532,6 +532,32 @@ class InitTests(RepoTestCase):
         state = self.stored()
         self.assertEqual((state.owner.session_id, state.deep), ("s2", True))
 
+    def test_takeover_keeps_the_isolation_evidence_of_the_gate_it_takes(self) -> None:
+        open_gate(
+            self.repo.root,
+            self.repo.base_sha,
+            owner=GateOwner("claude", "s1"),
+            isolation_evidence="hooks",
+        )
+
+        code, _, err = self.run_gate(
+            "--init", "--takeover", env={**CLAUDE_ENV, "CLAUDE_CODE_SESSION_ID": "s2"}
+        )
+
+        self.assertEqual(code, 0, err)
+        state = self.stored()
+        self.assertEqual(
+            (state.owner.session_id, state.isolation_evidence, state.takeover_from),
+            ("s2", "hooks", GateOwner("claude", "s1")),
+        )
+
+    def test_a_takeover_never_proves_more_than_the_gate_had(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))
+
+        self.run_gate("--init", "--takeover", env={**CLAUDE_ENV, "CLAUDE_CODE_SESSION_ID": "s2"})
+
+        self.assertEqual(self.stored().isolation_evidence, "none")
+
     def test_init_over_the_state_and_ledger_of_craftsman_4_needs_no_takeover(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(OLD_STATE), encoding="utf-8")
@@ -615,6 +641,23 @@ class UpdateTests(RepoTestCase):
         self.run_gate("--resume")
         self.assertFalse(self.stored().awaiting_user)
 
+    def test_await_user_keeps_when_and_what_it_asked_and_resume_forgets_both(self) -> None:
+        self.run_gate("--await-user", "--question", "Which database?")
+        parked = self.stored()
+        self.assertEqual((parked.awaiting_user, parked.question), (True, "Which database?"))
+        self.assertIsNotNone(parked.awaiting_since)
+
+        self.run_gate("--resume")
+
+        resumed = self.stored()
+        self.assertEqual((resumed.awaiting_user, resumed.awaiting_since, resumed.question), (False, None, None))
+
+    def test_await_user_without_a_question_keeps_the_time_only(self) -> None:
+        self.run_gate("--await-user")
+
+        self.assertEqual(self.stored().question, None)
+        self.assertIsNotNone(self.stored().awaiting_since)
+
     def test_update_of_another_sessions_gate_is_refused(self) -> None:
         open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))
         env = {**CLAUDE_ENV, "CLAUDE_CODE_SESSION_ID": "s2"}
@@ -689,6 +732,11 @@ class ArgumentTests(RepoTestCase):
 
     def test_deep_cannot_change_while_completing(self) -> None:
         self.assert_usage_error("--complete", "--deep")
+
+    def test_a_question_needs_await_user(self) -> None:
+        for action in ("--resume", "--complete", "--task=x"):
+            with self.subTest(action=action):
+                self.assert_usage_error(action, "--question", "x")
 
     def test_actions_are_mutually_exclusive(self) -> None:
         self.assert_usage_error("--await-user", "--resume")

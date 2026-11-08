@@ -13,13 +13,13 @@ abandoned, never complete). The same progress rule and waiting notice serve the 
 
 from __future__ import annotations
 
-import os
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from craftsman import hook_errors
 from craftsman.attribution import agent_runs, evidence_counter
+from craftsman.command_policy import review_commands as review_commands
 from craftsman.diffscan import DiffScanError
 from craftsman.evidence import effective_deep
 from craftsman.gate import (
@@ -37,7 +37,6 @@ from craftsman.huntplan import plan_due_waves
 from craftsman.huntview import check_command, waiting_notice
 from craftsman.ledger import load, mutate
 from craftsman.records import AgentRole, Ledger, LedgerError, Round, parse_timestamp
-from craftsman.shell import iter_simple_commands
 from craftsman.workspace import (
     ReviewMarker,
     Workspace,
@@ -56,82 +55,6 @@ ABANDONED_NOTICE = (
     f"Craftsman review guard: still incomplete after {MAX_CONTINUATIONS} reminders without progress; "
     "letting the agent stop. The review is NOT complete: `{check}` lists what is missing."
 )
-_CRAFTSMAN_EXECUTABLES = frozenset({"craftsman", "craftsman.exe"})
-_CRAFTSMAN_MODULES = frozenset({"craftsman.cli", "craftsman"})
-_CRAFTSMAN_SCRIPT = "craftsman-cli.py"
-# Programs that run another program: the words that follow the launcher's name before the command it runs.
-_LAUNCHERS: dict[str, tuple[str, ...]] = {"uv": ("run",), "uvx": (), "pipx": ("run",), "poetry": ("run",), "npx": ()}
-
-
-# --- reading a command ------------------------------------------------------------------------------
-
-
-def review_commands(command: str, cwd: str | None = None) -> tuple[str, ...]:
-    """The subcommand of every `craftsman review <sub>` the shell command line runs, in order.
-
-    Found with the same parser the other PreToolUse guards use (`shell.iter_simple_commands`): the executable
-    has to be `craftsman`, `craftsman.exe`, `python -m craftsman.cli` or a `craftsman-cli.py` script, alone or
-    run by a launcher (`uv run`, `uvx`, `pipx run`, `poetry run`, `npx`), so text that merely mentions the
-    command (`echo craftsman review prepare`) names none. Deliberately not read: a program named by command
-    substitution (`$(which craftsman) review ...`), a command line inside `powershell -Command "..."`, and a
-    launcher option that takes its value as a separate word (`uv run --project dir craftsman ...`); a main
-    session that goes to such lengths gets an advisory review, which `prepare` says so.
-    """
-    found: list[str] = []
-    for item in iter_simple_commands(command, cwd):
-        sub = _review_subcommand(item.tokens)
-        if sub:
-            found.append(sub)
-    return tuple(found)
-
-
-def _review_subcommand(tokens: Sequence[str]) -> str | None:
-    arguments = _arguments_after_craftsman(tokens)
-    if arguments is None or len(arguments) < 2 or arguments[0] != "review" or arguments[1].startswith("-"):
-        return None
-    return arguments[1]
-
-
-def _arguments_after_craftsman(tokens: Sequence[str]) -> Sequence[str] | None:
-    """What follows the Craftsman CLI in a simple command, None when the command is another program."""
-    if not tokens:
-        return None
-    executable = os.path.basename(tokens[0]).lower()
-    if executable in _CRAFTSMAN_EXECUTABLES or executable == _CRAFTSMAN_SCRIPT:
-        return tokens[1:]
-    if executable in _LAUNCHERS:
-        return _arguments_after_craftsman(_launched(executable, tokens[1:]))
-    if not (executable.startswith("python") or executable in ("py", "py.exe")):
-        return None
-    for index in range(1, len(tokens)):
-        token = tokens[index]
-        if token == "-m":
-            module = tokens[index + 1] if index + 1 < len(tokens) else ""
-            if module in _LAUNCHERS:
-                return _arguments_after_craftsman(_launched(module, tokens[index + 2 :]))
-            return tokens[index + 2 :] if module in _CRAFTSMAN_MODULES else None
-        if not token.startswith("-"):
-            return tokens[index + 1 :] if os.path.basename(token).lower() == _CRAFTSMAN_SCRIPT else None
-    return None
-
-
-def _launched(launcher: str, tokens: Sequence[str]) -> Sequence[str]:
-    """The command `launcher` runs, given the words after its name: its own options and subcommand are skipped;
-    empty when the launcher is not asked to run anything (`uv sync`)."""
-    words = _after_options(tokens)
-    for word in _LAUNCHERS[launcher]:
-        if not words or words[0] != word:
-            return ()
-        words = _after_options(words[1:])
-    return words
-
-
-def _after_options(tokens: Sequence[str]) -> Sequence[str]:
-    """`tokens` without the options (words that start with `-`) in front of the first plain word."""
-    index = 0
-    while index < len(tokens) and tokens[index].startswith("-"):
-        index += 1
-    return tokens[index:]
 
 
 # --- what is running --------------------------------------------------------------------------------
@@ -190,7 +113,10 @@ def gate_stop_inputs(ledger_path: Path, now: datetime) -> StopInputs:
     try:
         store_due_waves(ledger_path, now)
         ledger = load(ledger_path)
-    except LedgerError:
+    except LedgerError as exc:
+        # Not "nothing running": the ledger could not be read (a newer craftsman's, a corrupt file). The hook error
+        # log keeps the reason; the caller falls back to the rule that needs no evidence counter.
+        hook_errors.report("ledger", f"the stop guard could not read the review ledger: {exc}", ledger_path.parent)
         return StopInputs()
     running = running_work(ledger, ledger.rounds[-1], now) if ledger.rounds else ()
     return StopInputs(running, evidence_counter(ledger, agent_runs(ledger)))
@@ -270,6 +196,7 @@ def decide_review_stop(
         ledger = load(ledger_path)
         gate_active = _gate_active(root)
     except (DiffScanError, LedgerError, GateStateError) as exc:
+        hook_errors.report(hook_errors.kind_of(exc), f"the review guard could not check the review: {exc}", ledger_path.parent)
         return GuardDecision(marker.ended(), notice=f"Craftsman review guard could not check the review ({exc}); not enforced.")
     check = check_command(gate_active=gate_active)
     if not issues:

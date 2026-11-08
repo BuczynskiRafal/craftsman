@@ -42,8 +42,8 @@ UNQUOTED_REDIR_RE = re.compile(
         | (?:\d+)?                                  # optional source file descriptor
           (?:
               &>>?                                  # bash combined stdout/stderr redirect (`&>`, `&>>`)
+              | >\|                                 # noclobber override (`>|`); before `>` so the `|` is not left behind
               | >>?                                 # stdout write or append (`>`, `>>`)
-              | >\|                                 # noclobber override (`>|`)
               | < (?! << | \( )                     # stdin redirect `<` (excluding `<<<` and `<(...)`)
           )
     """
@@ -178,6 +178,7 @@ def split_shell_events(command_line: str) -> list[str]:
     current: list[str] = []
     quote: str | None = None
     escaped = False
+    after_redirect = -1  # the index right after the last unquoted `>`: a `|` there is `>|`, not a pipe
     i, n = 0, len(command_line)
     while i < n:
         ch = command_line[i]
@@ -204,10 +205,15 @@ def split_shell_events(command_line: str) -> list[str]:
         elif ch in (";", "\n", "`") or _is_standalone_brace(command_line, i):
             current = _flush_segment(current, events)
             i += 1
+        elif ch == "|" and i == after_redirect:
+            current.append(ch)
+            i += 1
         elif ch in ("|", "&") and not _is_redirection_ampersand(command_line, i):
             i += 2 if (i + 1 < n and command_line[i + 1] == ch) else 1
             current = _flush_segment(current, events)
         else:
+            if ch == ">":
+                after_redirect = i + 1
             current.append(ch)
             i += 1
     _flush_segment(current, events)
@@ -385,10 +391,65 @@ def _preserve_unquoted_windows_backslashes(cmd_header: str) -> str:
     return "".join(out)
 
 
+def redirection_targets(segment: str) -> list[str]:
+    """The files the unquoted `>`, `>>`, `>|`, `&>` and `&>>` redirections of a simple command write to.
+
+    Only the command's first line is read (a heredoc body follows it), with each heredoc operator and its delimiter
+    blanked so that a redirection on either side of `<<EOF` is found; quoted text is never a redirection.
+    Descriptor duplications (`2>&1`) and input redirections write nothing and are left out.
+    """
+    header = _blank_heredoc_openers(segment.split("\n", 1)[0])
+    targets: list[str] = []
+    quote: str | None = None
+    escaped = False
+    i, n = 0, len(header)
+    while i < n:
+        ch = header[i]
+        if escaped:
+            escaped = False
+        elif ch == "\\":
+            escaped = quote != "'"
+        elif quote:
+            quote = None if ch == quote else quote
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "<>&" or ch.isdigit():
+            match = UNQUOTED_REDIR_RE.match(header, i)
+            starts_word = i == 0 or header[i - 1].isspace() or header[i - 1] in ";|&("
+            if match and (not ch.isdigit() or starts_word):
+                target = _write_target(match.group(0))
+                if target:
+                    targets.append(target)
+                i = match.end()
+                continue
+        i += 1
+    return targets
+
+
+def _blank_heredoc_openers(line: str) -> str:
+    """`line` with every heredoc operator and its delimiter word (`<<'EOF'`, `<<-EOF`) replaced by spaces."""
+    return HEREDOC_OPEN_RE.sub(lambda match: " " * len(match.group(0)), line)
+
+
+def _write_target(redirection: str) -> str | None:
+    """The file a matched redirection writes to, None when it is not a file write."""
+    text = redirection.lstrip("0123456789")
+    for operator in ("&>>", "&>", ">>", ">|", ">"):
+        if text.startswith(operator):
+            rest = text[len(operator) :].strip()
+            break
+    else:
+        return None
+    if rest.startswith("&") and operator in (">>", ">|", ">"):
+        return None  # `>&2`, `>&-`: a descriptor, not a file
+    if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "'\"":
+        rest = rest[1:-1]
+    return rest or None
+
+
 def _tokenize_raw_segment(segment: str) -> list[str]:
     first_line = segment.split("\n", 1)[0]
-    hd_match = HEREDOC_OPEN_RE.search(first_line)
-    cmd_header = first_line[: hd_match.start()] if hd_match else segment
+    cmd_header = _blank_heredoc_openers(first_line) if HEREDOC_OPEN_RE.search(first_line) else segment
     cmd_header = _separate_unquoted_redirections(cmd_header)
     cmd_header = _preserve_unquoted_windows_backslashes(cmd_header)
     try:
@@ -436,6 +497,8 @@ class SimpleCommand:
     segment: str
     tokens: list[str]
     cwd: str | None
+    # The words as written, before env assignments, `env -u X` and other wrappers were stripped from `tokens`.
+    raw_tokens: tuple[str, ...] = ()
 
 
 def expand_shell_path_token(raw: str) -> str:
@@ -594,7 +657,7 @@ def _expand_nested_commands(
         out.extend(iter_simple_commands(nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
     for sub_tokens in _extract_find_or_fd_exec_commands(tokens):
         sub_seg = " ".join(sub_tokens)
-        out.append(SimpleCommand(segment=sub_seg, tokens=sub_tokens, cwd=cmd_cwd))
+        out.append(SimpleCommand(segment=sub_seg, tokens=sub_tokens, cwd=cmd_cwd, raw_tokens=tuple(sub_tokens)))
         sub_nested = _extract_nested_shell_command(sub_tokens, sub_seg)
         if sub_nested:
             out.extend(iter_simple_commands(sub_nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
@@ -621,7 +684,7 @@ def iter_simple_commands(
         raw_tokens = _tokenize_raw_segment(ev)
         cmd_cwd = _extract_wrapper_chdir(raw_tokens, cur_cwd)
         tokens = _strip_wrappers_from_tokens(raw_tokens)
-        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd))
+        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd, raw_tokens=tuple(raw_tokens)))
         commands.extend(_expand_nested_commands(tokens, ev, cmd_cwd, max_depth))
         if tokens:
             cmd_low = tokens[0].lower()

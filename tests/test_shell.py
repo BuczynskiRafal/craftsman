@@ -11,6 +11,7 @@ from craftsman.shell import (
     expand_shell_path_token,
     iter_simple_commands,
     parse_git_invocation,
+    redirection_targets,
     split_shell_events,
 )
 
@@ -29,6 +30,42 @@ class RedirectionTokenizationTests(unittest.TestCase):
 
         cmds_plain = iter_simple_commands("git push origin main>/dev/null")
         self.assertEqual(cmds_plain[0].tokens, ["git", "push", "origin", "main"])
+
+
+class RedirectionTargetTests(unittest.TestCase):
+    def targets(self, command: str) -> list[list[str]]:
+        return [redirection_targets(item.segment) for item in iter_simple_commands(command)]
+
+    def test_a_redirection_on_either_side_of_a_heredoc_operator_is_found(self) -> None:
+        for command in (
+            "cat > out.txt <<EOF\nx\nEOF",
+            "cat <<EOF > out.txt\nx\nEOF",
+            "cat <<'EOF' >out.txt\nx\nEOF",
+            "cat <<-EOF >>out.txt\n\tx\n\tEOF",
+            'cat <<"EOF" > "out.txt"\nx\nEOF',
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.targets(command), [["out.txt"]])
+        self.assertEqual(self.targets("cat <<A <<B > out.txt\nx\nA\ny\nB")[0], ["out.txt"])
+
+    def test_the_heredoc_body_is_not_scanned(self) -> None:
+        self.assertEqual(self.targets("cat <<EOF\necho x > no.txt\nEOF"), [[]])
+
+    def test_the_arguments_after_a_heredoc_operator_stay_in_the_command(self) -> None:
+        self.assertEqual(iter_simple_commands("tee <<EOF out.txt\nx\nEOF")[0].tokens, ["tee", "out.txt"])
+        self.assertEqual(iter_simple_commands("cat <<EOF > out.txt\nx\nEOF")[0].tokens, ["cat"])
+
+    def test_the_clobber_redirection_is_one_redirection_not_a_pipe(self) -> None:
+        for command in ("echo x >| out.txt", "echo x >|out.txt", "echo x 2>| out.txt"):
+            with self.subTest(command=command):
+                self.assertEqual(self.targets(command), [["out.txt"]])
+        self.assertEqual(split_shell_events("echo x >| out.txt | cat"), ["echo x >| out.txt", "cat"])
+        self.assertEqual(split_shell_events("echo a | cat"), ["echo a", "cat"])
+        self.assertEqual(split_shell_events("echo \\>|cat"), ["echo \\>", "cat"])  # an escaped `>` is no redirection
+
+    def test_descriptor_duplications_and_input_redirections_write_nothing(self) -> None:
+        self.assertEqual(self.targets("cmd 2>&1 < in.txt >&2"), [[]])
+        self.assertEqual(self.targets("echo '> no.txt' \"> no.txt\""), [[]])
 
 
 class WorkingDirectoryTrackingTests(unittest.TestCase):

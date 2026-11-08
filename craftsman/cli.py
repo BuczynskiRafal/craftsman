@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from craftsman import __version__
+from craftsman import __version__, hook_errors
 from craftsman.assets import Skill, iter_skills
 from craftsman.diffscan import DiffScanError, DiffSnapshot, resolve_base_sha, snapshot, worktree_root
 from craftsman.doctor import run_doctor
@@ -170,6 +170,10 @@ class StatusReport:
     # Why the evidence cannot be shown: "newer-schema", "older-schema" or "invalid"; None when it can.
     ledger_problem: str | None
     ledger_backups: tuple[str, ...]  # ledgers set aside by an upgrade, next to the ledger
+    awaiting_user: bool = False  # `gate --await-user` parked the gate: the Stop hook lets the agent stop
+    awaiting_since: str | None = None
+    question: str | None = None
+    hook_errors: dict[str, object] | None = None  # entries of the hook error log since the latest round, if any
 
     @property
     def ledger_broken(self) -> bool:
@@ -182,9 +186,11 @@ class StatusReport:
     ) -> StatusReport:
         ledger_path = ledger_path_for(root)
         overview: LedgerOverview | None = None
+        ledger: Ledger | None = None
         ledger_error, problem = None, None
         try:  # status only looks: it never sets an older ledger aside
-            overview = LedgerOverview.of(load(ledger_path, set_aside=False), snap)
+            ledger = load(ledger_path, set_aside=False)
+            overview = LedgerOverview.of(ledger, snap)
         except NewerSchemaError as exc:
             ledger_error, problem = str(exc), "newer-schema"
         except OlderSchemaError as exc:
@@ -213,6 +219,10 @@ class StatusReport:
             ledger_path=str(ledger_path),
             ledger_problem=problem,
             ledger_backups=tuple(str(backup) for backup in backups_of(ledger_path)),
+            awaiting_user=state is not None and state.awaiting_user,
+            awaiting_since=state.awaiting_since if state is not None else None,
+            question=state.question if state is not None else None,
+            hook_errors=hook_errors.summary_json(ledger_path, ledger) if ledger is not None else None,
         )
 
 
@@ -269,6 +279,13 @@ def run_status(cwd: str | None, *, as_json: bool) -> int:
     print(f"  Evidence       : {evidence}")
     for backup in report.ledger_backups:
         print(f"  Set-aside ledger: {backup}")
+    if report.awaiting_user:
+        print(f"  Awaiting user  : since {report.awaiting_since or 'unknown'}")
+        if report.question:
+            print(f"  Question       : {report.question}")
+    if report.hook_errors is not None:
+        info = report.hook_errors
+        print(f"  Hook errors    : {info['count']} since round {info['since_round']} was prepared (see {info['path']})")
     if report.ledger_broken:
         sys.stderr.write(f"craftsman status: error: the review ledger is unusable: {report.ledger_error}\n")
     return 1 if report.ledger_broken else 0

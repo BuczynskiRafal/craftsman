@@ -16,7 +16,10 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Collection, Iterator, Sequence
+import time
+from collections.abc import Callable, Collection, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -207,6 +210,62 @@ class DiffScanError(RuntimeError):
     """Raised when the repository or a file in it cannot be inspected."""
 
 
+class GitTimeoutError(DiffScanError):
+    """A git call ran out of time: its own limit (`GIT_TIMEOUT_S`) or the budget of the hook it ran in."""
+
+
+@dataclass(frozen=True)
+class _GitBudget:
+    seconds: float
+    deadline: float  # `time.monotonic()` value
+    on_timeout: Callable[[str], None] | None
+
+
+_GIT_BUDGET: ContextVar[_GitBudget | None] = ContextVar("craftsman_git_budget", default=None)
+
+
+@contextmanager
+def git_budget(seconds: float, on_timeout: Callable[[str], None] | None = None) -> Iterator[None]:
+    """Everything that runs git inside this block shares `seconds` of time (a hook must answer within its platform's timeout).
+
+    Each git call gets what is left of the budget, at most `GIT_TIMEOUT_S`; a call that finds it spent, or runs out
+    of it, raises `GitTimeoutError`. `on_timeout` receives the message of every timeout before it is raised, so a
+    caller that catches the error somewhere in the middle still leaves a trace (the hooks log it through
+    `hook_errors`). Nested blocks cannot extend the budget they sit in.
+    """
+    outer = _GIT_BUDGET.get()
+    deadline = time.monotonic() + seconds
+    if outer is not None:
+        deadline = min(deadline, outer.deadline)
+    token = _GIT_BUDGET.set(_GitBudget(seconds, deadline, on_timeout))
+    try:
+        yield
+    finally:
+        _GIT_BUDGET.reset(token)
+
+
+def git_time_left(limit: float | None = None) -> float:
+    """The seconds the next git call may take: `limit`, or less when a `git_budget` is nearly spent; 0 when it is spent."""
+    limit = GIT_TIMEOUT_S if limit is None else limit
+    budget = _GIT_BUDGET.get()
+    if budget is None:
+        return limit
+    return max(0.0, min(limit, budget.deadline - time.monotonic()))
+
+
+def note_git_timeout(message: str) -> None:
+    """Tell the `on_timeout` of the surrounding `git_budget`, if any, that a git call ran out of time."""
+    budget = _GIT_BUDGET.get()
+    if budget is not None and budget.on_timeout is not None:
+        budget.on_timeout(message)
+
+
+def git_timed_out(message: str) -> GitTimeoutError:
+    """The error for a git call that ran out of time, after `note_git_timeout`."""
+    note_git_timeout(message)
+    return GitTimeoutError(message)
+
+
 @dataclass(frozen=True)
 class Hunk:
     id: str
@@ -342,6 +401,9 @@ def _existing_dir(cwd: str | Path) -> Path:
 def _git_bytes(cwd: Path, *args: str) -> tuple[int, bytes, str]:
     """Run git with stable, unlocalized output; return (returncode, raw stdout, decoded stderr)."""
     argv = ["git", "-c", "core.quotepath=off", "-c", "color.ui=never", *args]
+    timeout = git_time_left()
+    if timeout <= 0:
+        raise git_timed_out(f"`git {args[0]}` was not run in {cwd}: the hook's git budget is spent")
     try:
         proc = subprocess.run(
             argv,
@@ -351,12 +413,12 @@ def _git_bytes(cwd: Path, *args: str) -> tuple[int, bytes, str]:
             capture_output=True,
             text=False,
             check=False,
-            timeout=GIT_TIMEOUT_S,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise DiffScanError("git executable not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
-        raise DiffScanError(f"`git {args[0]}` timed out after {GIT_TIMEOUT_S:.0f}s in {cwd}") from exc
+        raise git_timed_out(f"`git {args[0]}` timed out after {timeout:g}s in {cwd}") from exc
     except OSError as exc:
         raise DiffScanError(f"cannot run git in {cwd}: {exc}") from exc
     return proc.returncode, proc.stdout, _decode(proc.stderr)
