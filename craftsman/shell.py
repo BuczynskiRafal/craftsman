@@ -13,6 +13,7 @@ import re
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from craftsman.paths import user_home
 
@@ -221,9 +222,88 @@ def split_shell_events(command_line: str) -> list[str]:
     return events
 
 
-def _is_env_assignment(token: str) -> bool:
+def is_env_assignment(token: str) -> bool:
     """A leading `NAME=value` that sets a variable for the command, e.g. `CI=1 pytest`."""
     return "=" in token and not token.startswith("-") and token.split("=", 1)[0].isidentifier()
+
+
+# `env` options that consume a value: -u NAME, -C DIR, -S STRING, -a ARGV0 (BSD: -P PATH) and their long
+# forms. GNU `env` accepts any unique prefix of a long option, and the first letter of these four is unique
+# among its long options (`--debug`, `--default-signal`, `--ignore-*`, `--block-signal`, `--list-signal-handling`,
+# `--null`, `--help`, `--version` do not start with a, c, s or u), so `--s`, `--sp` and `--split` are
+# `--split-string` too. The shortest accepted spelling is the two dashes and one letter.
+ENV_SHORT_VALUE_OPTIONS = frozenset("uCSaP")
+_ENV_LONG_VALUE_OPTIONS = (("--unset", "u"), ("--chdir", "C"), ("--split-string", "S"), ("--argv0", "a"))
+_ENV_LONG_MIN_LENGTH = 3
+
+
+def split_env_string(value: str) -> list[str]:
+    """The words of an `env -S` string: shell-split, or the raw value when its quotes do not balance. `\\_`
+    separates words in `env -S` (shlex would glue it into one), so it is read as a space: splitting more
+    than `env` does only shows more of the command."""
+    try:
+        return shlex.split(value.replace("\\_", " "))
+    except ValueError:  # env rejects it too, so keep it as one opaque program
+        return [value]
+
+
+def _env_long_option(name: str) -> str | None:
+    if len(name) < _ENV_LONG_MIN_LENGTH:
+        return None
+    for full, letter in _ENV_LONG_VALUE_OPTIONS:
+        if full.startswith(name):
+            return letter
+    return None
+
+
+class EnvOption(NamedTuple):
+    """One option word of `env` that takes a value."""
+
+    letter: str  # "u", "C", "S", "a" or "P"; "" when the word is another option
+    taken: int  # how many of the following words the value is (0: attached to the option)
+    words: list[str]  # for `-S`: the words its value stands for, else []
+
+
+def read_env_option(token: str, following: Sequence[str]) -> EnvOption:
+    """Read the `env` option word `token` (it starts with `-`); `following` is the word after it."""
+    if token.startswith("--"):
+        name, equals, value = token.partition("=")
+        has_value = bool(equals)
+        letter = _env_long_option(name)
+        if letter is None:
+            return EnvOption("", 0, [])
+    else:
+        flags = token[1:]
+        index = next((i for i, flag in enumerate(flags) if flag in ENV_SHORT_VALUE_OPTIONS), None)
+        if index is None:
+            return EnvOption("", 0, [])
+        letter, value = flags[index], flags[index + 1 :]
+        has_value = bool(value)
+    taken = 0
+    if not has_value:
+        taken = 1 if following else 0
+        value = following[0] if following else ""
+    return EnvOption(letter, taken, split_env_string(value) if letter == "S" else [])
+
+
+def _skip_env_options(tokens: list[str], idx: int) -> int:
+    """The index after the options and assignments of an `env` whose name sits before `idx`. The words of a
+    `-S` string replace the option in `tokens`, so the caller reads them as the rest of the command line."""
+    while idx < len(tokens):
+        word = tokens[idx]
+        if word == "--":
+            return idx + 1
+        if is_env_assignment(word):
+            idx += 1
+        elif word.startswith("-"):
+            option = read_env_option(word, tokens[idx + 1 : idx + 2])
+            if option.letter == "S":
+                tokens[idx : idx + 1 + option.taken] = option.words
+            else:
+                idx += 1 + option.taken
+        else:
+            break
+    return idx
 
 
 def _skip_options(tokens: list[str], idx: int, opts_with_value: frozenset[str]) -> int:
@@ -233,11 +313,13 @@ def _skip_options(tokens: list[str], idx: int, opts_with_value: frozenset[str]) 
     return idx
 
 
-def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
-    """Strip leading env assignments, shell control keywords, and command wrappers (`env`, `nice`, `sudo`, `timeout`, `xargs`, etc.)."""
+def _split_wrappers(words: list[str]) -> tuple[list[str], list[str]]:
+    """The wrapper words in front of a command, and the command. The words of an `env -S` string stand in
+    the place of the option, so they are part of the prefix (assignments) or of the command (the program)."""
+    tokens = list(words)
     idx = 0
-    n = len(tokens)
-    while idx < n:
+    while idx < len(tokens):
+        n = len(tokens)
         tok = tokens[idx]
         if tok in SHELL_CONTROL_KEYWORDS:
             idx += 1
@@ -247,10 +329,13 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
             while idx < n and tokens[idx] != "do":
                 idx += 1
             continue
-        if _is_env_assignment(tok):
+        if is_env_assignment(tok):
             idx += 1
             continue
         exe = os.path.basename(tok)
+        if exe == "env":
+            idx = _skip_env_options(tokens, idx + 1)
+            continue
         if exe in SIMPLE_WRAPPERS:
             opts_with_val = WRAPPER_OPTS_WITH_VALUE.get(exe, frozenset())
             idx += 1
@@ -259,7 +344,7 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
                 if cur_tok == "--":
                     idx += 1
                     break
-                if _is_env_assignment(cur_tok):
+                if is_env_assignment(cur_tok):
                     idx += 1
                     continue
                 if cur_tok in opts_with_val:
@@ -282,7 +367,7 @@ def _strip_wrappers_from_tokens(tokens: list[str]) -> list[str]:
         break
 
     # Remove shell here-string operator '<<<' so `xargs git push origin <<< main` preserves 'main'
-    return [t for t in tokens[idx:] if t != "<<<"]
+    return tokens[:idx], [t for t in tokens[idx:] if t != "<<<"]
 
 
 def _separate_unquoted_redirections(cmd_header: str) -> str:
@@ -498,8 +583,8 @@ class SimpleCommand:
     segment: str
     tokens: list[str]
     cwd: str | None
-    # The words as written, before env assignments, `env -u X` and other wrappers were stripped from `tokens`.
-    raw_tokens: tuple[str, ...] = ()
+    # The wrapper words that were stripped (`env`, `VAR=x`, `-u VAR`, the words of an `env -S` string, ...).
+    prefix: tuple[str, ...] = ()
 
 
 def expand_shell_path_token(raw: str) -> str:
@@ -527,6 +612,15 @@ def _join_and_normpath(target: str, current_cwd: str | None) -> str:
     return os.path.normpath(expanded)
 
 
+def _attached_env_value(token: str) -> str:
+    """The value written into the option word itself: `-C.git`, `-iC.git`, `--chdir=.git`."""
+    if token.startswith("--"):
+        return token.partition("=")[2]
+    flags = token[1:]
+    index = next(i for i, flag in enumerate(flags) if flag in ENV_SHORT_VALUE_OPTIONS)
+    return flags[index + 1 :]
+
+
 def _consume_wrapper_chdir_options(
     exe: str, raw_tokens: list[str], idx: int, eff_cwd: str | None
 ) -> tuple[int, str | None]:
@@ -536,15 +630,18 @@ def _consume_wrapper_chdir_options(
         cur_tok = raw_tokens[idx]
         if cur_tok == "--":
             return idx + 1, eff_cwd
-        if _is_env_assignment(cur_tok):
+        if is_env_assignment(cur_tok):
             idx += 1
-        elif (
-            (exe == "env" and cur_tok in ("-C", "--chdir"))
-            or (exe == "sudo" and cur_tok in ("-D", "--chdir"))
-        ) and idx + 1 < n:
+        elif exe == "env" and cur_tok.startswith("-"):
+            option = read_env_option(cur_tok, raw_tokens[idx + 1 : idx + 2])
+            if option.letter == "C":
+                value = raw_tokens[idx + 1] if option.taken else _attached_env_value(cur_tok)
+                eff_cwd = _join_and_normpath(value, eff_cwd)
+            idx += 1 + option.taken
+        elif (exe == "sudo" and cur_tok in ("-D", "--chdir")) and idx + 1 < n:
             eff_cwd = _join_and_normpath(raw_tokens[idx + 1], eff_cwd)
             idx += 2
-        elif exe in ("env", "sudo") and cur_tok.startswith("--chdir="):
+        elif exe == "sudo" and cur_tok.startswith("--chdir="):
             eff_cwd = _join_and_normpath(cur_tok.split("=", 1)[1], eff_cwd)
             idx += 1
         elif cur_tok in opts_with_val:
@@ -557,7 +654,8 @@ def _consume_wrapper_chdir_options(
 
 
 def _extract_wrapper_chdir(raw_tokens: list[str], current_cwd: str | None) -> str | None:
-    """Inspect leading `env`/`sudo` wrappers for `-C`, `-D`, or `--chdir` and return the effective cwd."""
+    """Inspect the leading wrapper words (the prefix of a command) for `env -C`, `sudo -D` or `--chdir` and
+    return the effective cwd."""
     eff_cwd = current_cwd
     idx, n = 0, len(raw_tokens)
     while idx < n:
@@ -568,10 +666,14 @@ def _extract_wrapper_chdir(raw_tokens: list[str], current_cwd: str | None) -> st
             idx += 3
             while idx < n and raw_tokens[idx] != "do":
                 idx += 1
-        elif _is_env_assignment(tok):
+        elif is_env_assignment(tok):
             idx += 1
         elif (exe := os.path.basename(tok)) in SIMPLE_WRAPPERS:
             idx, eff_cwd = _consume_wrapper_chdir_options(exe, raw_tokens, idx + 1, eff_cwd)
+        elif exe == "timeout":  # the options, then the duration: `timeout 5 env -C .git rm x`
+            idx = _skip_options(raw_tokens, idx + 1, TIMEOUT_OPTS_WITH_VALUE) + 1
+        elif exe == "xargs":
+            idx = _skip_options(raw_tokens, idx + 1, XARGS_OPTS_WITH_VALUE)
         else:
             break
     return eff_cwd
@@ -622,15 +724,15 @@ _EXEC_OPTIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
 }
 
 
-def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[list[str]]:
-    """Extract subcommands passed to `find ... -exec/-execdir/-ok/-okdir` or `fd ... -x/--exec/-X/--exec-batch`."""
+def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[tuple[list[str], list[str]]]:
+    """Extract (wrapper words, command) of the subcommands passed to `find ... -exec/-execdir/-ok/-okdir` or `fd ... -x/--exec/-X/--exec-batch`."""
     if not tokens:
         return []
     exec_options = _EXEC_OPTIONS.get(os.path.basename(tokens[0]).lower())
     if exec_options is None:
         return []
     starters, terminators = exec_options
-    subcommands: list[list[str]] = []
+    subcommands: list[tuple[list[str], list[str]]] = []
     idx = 1
     n = len(tokens)
     while idx < n:
@@ -640,9 +742,9 @@ def _extract_find_or_fd_exec_commands(tokens: list[str]) -> list[list[str]]:
             while idx < n and tokens[idx] not in terminators:
                 sub.append(tokens[idx])
                 idx += 1
-            cleaned = _strip_wrappers_from_tokens(sub)
+            prefix, cleaned = _split_wrappers(sub)
             if cleaned:
-                subcommands.append(cleaned)
+                subcommands.append((prefix, cleaned))
         idx += 1
     return subcommands
 
@@ -656,9 +758,9 @@ def _expand_nested_commands(
     nested = _extract_nested_shell_command(tokens, seg)
     if nested:
         out.extend(iter_simple_commands(nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
-    for sub_tokens in _extract_find_or_fd_exec_commands(tokens):
+    for sub_prefix, sub_tokens in _extract_find_or_fd_exec_commands(tokens):
         sub_seg = " ".join(sub_tokens)
-        out.append(SimpleCommand(segment=sub_seg, tokens=sub_tokens, cwd=cmd_cwd, raw_tokens=tuple(sub_tokens)))
+        out.append(SimpleCommand(segment=sub_seg, tokens=sub_tokens, cwd=cmd_cwd, prefix=tuple(sub_prefix)))
         sub_nested = _extract_nested_shell_command(sub_tokens, sub_seg)
         if sub_nested:
             out.extend(iter_simple_commands(sub_nested, cwd_str=cmd_cwd, max_depth=max_depth - 1))
@@ -683,9 +785,9 @@ def iter_simple_commands(
                 cur_cwd, dir_stack = subshell_stack.pop()
             continue
         raw_tokens = _tokenize_raw_segment(ev)
-        cmd_cwd = _extract_wrapper_chdir(raw_tokens, cur_cwd)
-        tokens = _strip_wrappers_from_tokens(raw_tokens)
-        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd, raw_tokens=tuple(raw_tokens)))
+        prefix, tokens = _split_wrappers(raw_tokens)
+        cmd_cwd = _extract_wrapper_chdir(prefix, cur_cwd)
+        commands.append(SimpleCommand(segment=ev, tokens=tokens, cwd=cmd_cwd, prefix=tuple(prefix)))
         commands.extend(_expand_nested_commands(tokens, ev, cmd_cwd, max_depth))
         if tokens:
             cmd_low = tokens[0].lower()

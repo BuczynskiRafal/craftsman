@@ -434,6 +434,37 @@ class ScopeEnforcementTests(unittest.TestCase):
                 "deny",
             ),
             (
+                "read_file with the Antigravity Path argument on a sibling repository is denied",
+                "read_file",
+                {"Path": str(self.other_repo / "secret.py")},
+                "deny",
+            ),
+            (
+                "read_file with the Antigravity Path argument on the own repository is allowed",
+                "read_file",
+                {"Path": str(self.repo / "src" / "app.py")},
+                "allow",
+            ),
+            (
+                "read_file with the Antigravity Path argument on a session store is denied",
+                "read_file",
+                {"Path": str(self.home / ".claude" / "projects" / "slug" / "session.jsonl")},
+                "deny",
+            ),
+            (
+                "env -S hides nothing: a recursive grep in a sibling repository is denied",
+                "Bash",
+                {"command": f"env -S 'grep -r foo {self.other_repo}'"},
+                "deny",
+            ),
+            (
+                "env --split-string hides nothing: a read of a sibling repository file is denied",
+                "Bash",
+                {"command": 'env --split-string="cat ../other-repo/secret.py"'},
+                "deny",
+            ),
+            ("env -S of a search inside the repository is allowed", "Bash", {"command": "env -S 'rg foo src'"}, "allow"),
+            (
                 "grep_search with includePattern outside repo is denied",
                 "grep_search",
                 {"query": "foo", "includePattern": "../other-repo/**"},
@@ -457,6 +488,28 @@ class ScopeEnforcementTests(unittest.TestCase):
                 if expected == "deny":
                     self.assertIn("[CRAFTSMAN SCOPE-GUARD]", res.reason)
                     self.assertIn("git config craftsman.scopeAllow", res.reason)
+
+    def test_the_transcript_roots_of_the_environment_are_protected_for_reads(self) -> None:
+        # A custom CLAUDE_CONFIG_DIR / ANTIGRAVITY_APP_DATA_DIR is protected like the default stores (one source of
+        # truth with the command policy: `default_transcript_roots`).
+        claude_dir = self.tmp / "config" / "claude"
+        app_dir = self.tmp / "config" / "antigravity"
+        claude_file = claude_dir / "projects" / "slug" / "session.jsonl"
+        app_file = app_dir / "brain" / "conv-9" / ".system_generated" / "logs" / "transcript.jsonl"
+        for path in (claude_file, app_file):
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+        for tool, key in (("Read", "file_path"), ("read_file", "Path"), ("view_file", "AbsolutePath")):
+            for path in (claude_file, app_file):
+                with self.subTest(tool=tool, path=path.name, configured=False):
+                    self.assertEqual(evaluate_scope(tool, {key: str(path)}, self.repo, self.repo, self.policy).decision, "allow")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(claude_dir), "ANTIGRAVITY_APP_DATA_DIR": str(app_dir)}):
+            for tool, key in (("Read", "file_path"), ("read_file", "Path"), ("view_file", "AbsolutePath")):
+                for path in (claude_file, app_file):
+                    with self.subTest(tool=tool, path=path.name, configured=True):
+                        res = evaluate_scope(tool, {key: str(path)}, self.repo, self.repo, self.policy)
+                        self.assertEqual(res.decision, "deny")
+                        self.assertIn("protected session store", res.reason)
 
     def test_scope_allow_config_unlocks_external_directories(self) -> None:
         extra_dir = self.tmp / "shared-contracts"

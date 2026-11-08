@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,12 +28,17 @@ from craftsman.command_policy import (
     craftsman_arguments,
     decide,
     default_transcript_roots,
+    invocations,
     is_main_session,
     review_commands,
     tool_call,
     tool_kind,
 )
 from craftsman.diffscan import DiffScanError
+from craftsman.shell import iter_simple_commands
+from craftsman.worktree_guard import find_worktree_mutation
+
+from tests.support import REPO_ROOT
 
 
 class PolicyCase(unittest.TestCase):
@@ -668,6 +674,167 @@ class LeadOnlyTests(PolicyCase):
         batch.write_text(json.dumps([{"hunks": "H1", "hunter": "W1-1"}]) + " " * (5 * 1024 * 1024))
 
         self.assertAllowed(self.shell(f"craftsman review cover --from-json {batch}"))
+
+
+class EnvSplitStringTests(PolicyCase):
+    """`env -S "<command line>"` runs the command line: every rule judges it exactly like the plain spelling."""
+
+    def both(self, plain: str, *, role: str | None = None, main: bool = True) -> list[tuple[str, Decision]]:
+        spellings = [
+            plain,
+            f"env -S '{plain}'",
+            f'env -S "{plain}"',
+            f"env -S'{plain}'",
+            f"env --split-string='{plain}'",
+            f"env --split-string '{plain}'",
+            f"env -i -S '{plain}'",
+            f"/usr/bin/env -S '{plain}'",
+            f"/usr/bin/env --split-string='{plain}'",
+            f"./env -S '{plain}'",
+            f"env --s '{plain}'",  # GNU env takes the shortest unique prefix of a long option
+            f"env --sp '{plain}'",
+            f"env -a x -S '{plain}'",
+        ]
+        return [(spelling, self.shell(spelling, role=role, main=main)) for spelling in spellings]
+
+    def assertSame(self, plain: str, message: str, *, role: str | None = None, main: bool = True) -> None:
+        for spelling, decision in self.both(plain, role=role, main=main):
+            with self.subTest(command=spelling):
+                self.assertDenied(decision, message)
+
+    def test_a_hook_command_is_denied(self) -> None:
+        self.assertSame("craftsman hook stop --platform claude", HOOKS_ARE_THE_PLATFORMS)
+
+    def test_a_ledger_write_is_denied(self) -> None:
+        self.assertSame("rm -f .git/craftsman/ledger.json", LEDGER_IS_WRITTEN_BY_THE_CLI)
+
+    def test_a_restarting_command_is_denied_to_a_role(self) -> None:
+        self.assertSame("craftsman review prepare", NO_RESTART, role="reviewer")
+
+    def test_a_work_tree_change_is_denied_to_a_subagent(self) -> None:
+        for spelling, decision in self.both("git reset --hard", role="reviewer", main=False):
+            with self.subTest(command=spelling):
+                self.assertEqual(decision.action, "deny")
+                self.assertIn("`git reset`", decision.reason)
+                self.assertEqual(find_worktree_mutation(spelling, str(self.repo), subagent=True), "`git reset`")
+
+    def test_an_identity_variable_inside_the_string_is_denied(self) -> None:
+        for command in (
+            'env -S "CLAUDE_CODE_SESSION_ID=other craftsman review check"',
+            "env -S 'FOO=1 CLAUDE_CODE_SESSION_ID=other craftsman review check'",
+            'env --split-string="ANTIGRAVITY_CONVERSATION_ID=x craftsman review check"',
+            'env -S "env -S \'CRAFTSMAN_X=1 craftsman gate --complete\'"',
+        ):
+            with self.subTest(command=command):
+                self.assertDenied(self.shell(command), IDENTITY_IS_THE_PLATFORMS)
+
+    def test_an_harmless_string_is_allowed(self) -> None:
+        for command in ("env -S 'FOO=1 craftsman review check'", 'env -S "git status"', "env -S 'echo hi'"):
+            with self.subTest(command=command):
+                self.assertAllowed(self.shell(command))
+
+    def test_the_main_session_cannot_tag_a_slot_through_the_string(self) -> None:
+        self.assertSame("craftsman review cover --hunter W1-1 --hunks H1 --note x", LEAD_ONLY)
+
+
+def _runs_a_program(source: str) -> bool:
+    """The module ends in a `__main__` block that does work (not the one that only says it is no program)."""
+    block = source.partition('if __name__ == "__main__":')[2]
+    return bool(block) and "is not a program" not in block
+
+
+class EnvOptionSpellingTests(PolicyCase):
+    """Every spelling of an `env` option that takes a value hides nothing: the policy judges the command behind it."""
+
+    LEDGER = "craftsman/ledger.json"  # inside `.git`
+
+    def assertLedgerDenied(self, *commands: str) -> None:
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertDenied(self.shell(command), LEDGER_IS_WRITTEN_BY_THE_CLI)
+
+    def test_the_directory_of_env_decides_where_a_relative_path_points(self) -> None:
+        self.assertLedgerDenied(
+            f"env -C .git rm {self.LEDGER}",
+            f"env -S '-C .git rm {self.LEDGER}'",
+            f"env -S '-C.git rm {self.LEDGER}'",
+            f"env -S '--chdir=.git rm {self.LEDGER}'",
+            f"env -C.git rm {self.LEDGER}",
+            f"env -iC .git rm {self.LEDGER}",
+            f"env --chd .git rm {self.LEDGER}",
+            f"env --chdir=.git rm {self.LEDGER}",
+            f"timeout 5 env -C .git rm {self.LEDGER}",
+            f"/usr/bin/env -S '-C .git rm {self.LEDGER}'",
+        )
+
+    def test_the_value_of_the_argv0_option_is_not_the_program(self) -> None:
+        self.assertLedgerDenied(
+            "env -a x rm -f .git/craftsman/ledger.json",
+            "env -ax rm -f .git/craftsman/ledger.json",
+            "env --argv0 x rm -f .git/craftsman/ledger.json",
+            "env --argv0=x rm -f .git/craftsman/ledger.json",
+            "env --a x rm -f .git/craftsman/ledger.json",
+            "env -a x -S 'rm -f .git/craftsman/ledger.json'",
+            "env -P /bin rm -f .git/craftsman/ledger.json",  # the BSD option for the search path
+        )
+        self.assertDenied(self.shell("env -a x craftsman hook stop --platform claude"), HOOKS_ARE_THE_PLATFORMS)
+        self.assertDenied(self.shell("env --argv0 x craftsman hook stop --platform claude"), HOOKS_ARE_THE_PLATFORMS)
+
+    def test_an_escaped_underscore_separates_the_words_of_the_string(self) -> None:
+        self.assertLedgerDenied(
+            "env -S 'rm\\_-f\\_.git/craftsman/ledger.json'",
+            "env -S 'FOO=1\\_rm\\_-f\\_.git/craftsman/ledger.json'",
+        )
+
+    def test_the_unique_prefixes_of_the_long_options_are_the_options(self) -> None:
+        for option in ("--s", "--sp", "--split", "--split-string"):
+            self.assertLedgerDenied(f"env {option} 'rm -f .git/craftsman/ledger.json'")
+        self.assertLedgerDenied("env --u HOME rm -f .git/craftsman/ledger.json", "env --un=HOME rm -f .git/craftsman/ledger.json")
+
+
+class EntryModuleTests(PolicyCase):
+    """Every module the package can run as a program is a command the policy reads (REVIEW-FSE 3)."""
+
+    def test_every_module_with_a_main_block_is_a_recognized_entry_point(self) -> None:
+        modules = sorted(
+            path
+            for path in (REPO_ROOT / "craftsman").glob("*.py")
+            if _runs_a_program(path.read_text(encoding="utf-8"))
+        )
+        self.assertGreaterEqual({path.stem for path in modules}, {"cli", "hooks", "antigravity", "scope"})
+
+        for path in modules:
+            for command in (
+                f"python3 -m craftsman.{path.stem} --init --takeover",
+                f"python3 {path} --init --takeover",
+                f"python3 craftsman/{path.name}",
+            ):
+                with self.subTest(command=command):
+                    self.assertTrue(
+                        invocations(iter_simple_commands(command)),
+                        f"`{command}` runs craftsman/{path.name}, which the command policy does not read: "
+                        "teach `command_policy` the module or drop its `__main__` block",
+                    )
+
+    def test_the_cli_module_run_as_a_script_is_the_cli(self) -> None:
+        self.owns = True
+
+        for command in ("python3 craftsman/cli.py gate --init --takeover", f"python3 {REPO_ROOT}/craftsman/cli.py gate --init --takeover"):
+            with self.subTest(command=command):
+                self.assertDenied(self.shell(command), OWNER_CANNOT_TAKE_OVER)
+
+    def test_the_gate_and_export_modules_are_no_programs_and_say_so(self) -> None:
+        # `craftsman/gate.py` used to end in a `__main__` block that ran the gate CLI around the command policy;
+        # the policy reads one CLI (`craftsman gate ...`), so running the module fails loud and does nothing.
+        for name in ("gate", "export"):
+            for argv in (["-m", f"craftsman.{name}", "--init", "--takeover"], [str(REPO_ROOT / "craftsman" / f"{name}.py"), "--init"]):
+                with self.subTest(argv=argv):
+                    done = subprocess.run(
+                        [sys.executable, *argv], cwd=self.repo, capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+                    )
+                    self.assertEqual((done.returncode, done.stdout), (2, ""))
+                    self.assertIn(f"craftsman.{name} is not a program: run `craftsman {name} ...`", done.stderr)
+                    self.assertFalse((self.ledger / "craftsman_state.json").exists())
 
 
 class WorktreeGuardTests(PolicyCase):

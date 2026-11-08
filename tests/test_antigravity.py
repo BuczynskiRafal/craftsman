@@ -21,6 +21,7 @@ from craftsman.ledger import ledger_path_for, load
 from craftsman.records import Ledger, format_timestamp, parse_timestamp
 from craftsman.review_guard import REVIEW_NOT_STARTED
 from craftsman.scope import evaluate_antigravity_payload
+from craftsman.subagent_stop import REVIEWER_STOP_REASON
 from craftsman.workspace import ReviewMarker, arm_marker, read_marker
 
 from tests import support
@@ -152,6 +153,20 @@ class NoGateTests(AntigravityTestCase):
         self.assertEqual(answer, {"decision": "allow"})
         self.assertIn("The quality gate was not checked", err)
         self.assertIn("is larger than", err)
+        entries = hook_errors.read(self.repo.ledger_dir)
+        self.assertEqual([(entry.kind, entry.source) for entry in entries], [("transcript", "antigravity-stop")])
+
+    def test_a_launch_cut_from_the_compact_transcript_allows_with_an_error(self) -> None:
+        # REVIEW-FSE 8: a step Antigravity cut and the full file cannot give back is a visible problem, not "no launch".
+        response = planner(2, agy_call("invoke_subagent", encoded=False, TypeName="self", Role="craftsman-reviewer", Prompt="p"), at=5)
+        cut = {key: value for key, value in response.items() if key != "tool_calls"} | {"truncated_fields": ["tool_calls"]}
+        self.write_transcript(user_input(1, "go", 0), cut, *launch_reviewers(3, SUB, at=5)[1:])
+
+        answer, err = self.stop()
+
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertIn("The quality gate was not checked", err)
+        self.assertIn("was cut from the compact transcript", err)
         entries = hook_errors.read(self.repo.ledger_dir)
         self.assertEqual([(entry.kind, entry.source) for entry in entries], [("transcript", "antigravity-stop")])
 
@@ -294,6 +309,43 @@ class OwnershipTests(AntigravityTestCase):
         self.repo.write_lines("app.py", 5)
         self.assertEqual(self.stop()[0], {"decision": "allow"})
 
+    def cut_question(self) -> dict[str, Any]:
+        """A question to the user as the compact transcript has it when the call was too long: `tool_calls` cut."""
+        question = ask_question(2)
+        return {key: value for key, value in question.items() if key != "tool_calls"} | {"truncated_fields": ["tool_calls"]}
+
+    def test_a_question_cut_from_the_compact_transcript_is_found_in_the_full_one(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "go", 0), self.cut_question())
+        self.app.write_transcript(MAIN, user_input(1, "go", 0), ask_question(2), full=True)
+
+        self.assertEqual(self.stop()[0], {"decision": "allow"})
+        stored = self.stored()
+        assert stored is not None
+        self.assertTrue(stored.active)  # waiting on the user is no stop: the gate is untouched
+
+    def test_a_cut_call_the_full_transcript_shows_is_no_question(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        call = planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)
+        cut = {key: value for key, value in call.items() if key != "tool_calls"} | {"truncated_fields": ["tool_calls"]}
+        self.write_transcript(user_input(1, "go", 0), cut)
+        self.app.write_transcript(MAIN, user_input(1, "go", 0), call, full=True)
+
+        self.assertEqual(self.stop()[0]["decision"], "continue")  # the gate is served: no question was asked
+
+    def test_a_cut_call_nothing_can_restore_is_read_as_a_question(self) -> None:
+        # No full file: the user is never trapped behind the gate because a long call hid what the agent did.
+        open_gate(self.repo.root, self.repo.base_sha)
+        self.repo.write_lines("app.py", 5)
+        self.write_transcript(user_input(1, "go", 0), self.cut_question())
+
+        self.assertEqual(self.stop()[0], {"decision": "allow"})
+        stored = self.stored()
+        assert stored is not None
+        self.assertTrue(stored.active)
+
     def test_a_subagent_is_not_served_by_the_gate_of_its_parent(self) -> None:
         open_gate(self.repo.root, self.repo.base_sha, owner=self.caller, request_step=1)
         self.repo.write_lines("app.py", 5)
@@ -361,6 +413,12 @@ class HuntTestCase(AntigravityTestCase):
     def cover(self, sub_id: str, slot: dict[str, Any]) -> None:
         missing = slot["missing"] or slot["hunks"]
         self.cli(sub_id, "review", "cover", "--hunter", slot["id"], "--hunks", ",".join(missing), "--note", coverage_note(missing))
+
+    def add_finding(self, sub_id: str, slot: str, *, severity: str = "minor") -> None:
+        self.cli(
+            sub_id, "review", "add", "--hunter", slot, "--file", "app.py", "--line", "1", "--lens", "intent",
+            "--severity", severity, "--title", "Totals ignore empty carts", "--scenario", "total([]) divides by zero",
+        )  # fmt: skip
 
     def events(self, event: str | None = None) -> list[tuple[str, str, str]]:
         return [(e.event, e.agent_id, e.at) for e in self.ledger().agents if event in (None, e.event)]
@@ -676,22 +734,90 @@ class SubagentStopTests(HuntTestCase):
         self.assertEqual(answer, {"decision": "allow"})
         self.assertEqual([event for event, _, _ in self.events()], ["start", "stop"])
 
-    def test_a_hunter_that_claimed_no_slot_is_let_go(self) -> None:
-        self.launch("sub-2")
+    def test_a_hunter_that_claimed_no_slot_and_recorded_nothing_is_sent_back_once(self) -> None:
+        # On Claude Code this is `REVIEWER_STOP_REASON` (REVIEW-FSE 4b); here it also says how to report.
+        self.launch(SUB, "sub-2")
         self.working("sub-2")
         self.done("sub-2", at=60)
 
-        self.assertEqual(self.stop("sub-2", now=clock(61))[0], {"decision": "allow"})
+        first, _ = self.stop("sub-2", now=clock(61))
 
-    def test_a_verifier_is_let_go(self) -> None:
-        self.app.write_subagent(MAIN, "ver-1", planner(1, at=60), role="craftsman-verifier")
-        self.write_transcript(
-            user_input(0, "/craft-review check the totals", -5),
-            *launch_reviewers(1, SUB, at=0),
-            *launch_reviewers(4, "ver-1", at=1, role="craftsman-verifier"),
-        )
+        self.assertEqual(first["decision"], "continue")
+        self.assertTrue(first["reason"].startswith(REVIEWER_STOP_REASON))
+        self.assertIn("send your 2-3 line summary to your parent with send_message", first["reason"])
+        self.assertEqual([event for event, who, _ in self.events() if who == "sub-2"], ["nudge"])
 
-        self.assertEqual(self.stop("ver-1", now=clock(61))[0], {"decision": "allow"})
+        self.done("sub-2", at=90, resumed_at=70)
+        second, _ = self.stop("sub-2", now=clock(91))
+
+        self.assertEqual(second, {"decision": "allow"})
+        self.assertEqual([event for event, who, _ in self.events() if who == "sub-2"], ["nudge", "start", "stop"])
+
+    def test_a_hunter_that_claimed_no_slot_but_recorded_a_finding_or_coverage_is_let_go(self) -> None:
+        for what in ("finding", "coverage"):
+            with self.subTest(what=what):
+                sub = f"sub-{what}"
+                self.launch(SUB, sub)
+                self.working(sub)
+                if what == "finding":
+                    self.add_finding(sub, self.slot["id"])
+                else:
+                    self.cover(sub, self.slot)
+                self.done(sub, at=60)
+
+                self.assertEqual(self.stop(sub, now=clock(61))[0], {"decision": "allow"})
+
+    def test_what_another_conversation_recorded_does_not_excuse_an_idle_hunter(self) -> None:
+        self.launch(SUB, "sub-2")
+        self.working("sub-2")
+        self.cover(SUB, self.slot)  # SUB, not sub-2
+        self.done("sub-2", at=60)
+
+        self.assertEqual(self.stop("sub-2", now=clock(61))[0]["decision"], "continue")
+
+    def test_a_finding_of_another_conversation_does_not_excuse_an_idle_hunter(self) -> None:
+        self.launch(SUB, "sub-2")
+        self.working("sub-2")
+        self.add_finding(SUB, self.slot["id"])  # SUB, not sub-2
+        self.done("sub-2", at=60)
+
+        first, _ = self.stop("sub-2", now=clock(61))
+
+        self.assertEqual(first["decision"], "continue")
+        self.assertEqual([event for event, who, _ in self.events() if who == "sub-2"], ["nudge"])
+
+    def test_a_record_dated_before_the_start_of_the_run_does_not_excuse_it(self) -> None:
+        # The run is acknowledged at second 30 of the review's clock; sub-2's coverage is dated at the start of the
+        # test (the real clock): it is older than the run, so it is not this run's work.
+        self.launch(SUB, "sub-2", at=30)
+        self.working("sub-2", at=35)
+        self.cover("sub-2", self.slot)
+        self.done("sub-2", at=60)
+
+        first, _ = self.stop("sub-2", now=clock(61))
+
+        self.assertEqual(first["decision"], "continue")
+        self.assertTrue(first["reason"].startswith(REVIEWER_STOP_REASON))
+        self.assertEqual([event for event, who, _ in self.events() if who == "sub-2"], ["nudge"])
+
+    def test_a_finding_dated_before_the_start_of_the_run_does_not_excuse_it(self) -> None:
+        self.launch(SUB, "sub-2", at=30)
+        self.working("sub-2", at=35)
+        self.add_finding("sub-2", self.slot["id"])
+        self.done("sub-2", at=60)
+
+        self.assertEqual(self.stop("sub-2", now=clock(61))[0]["decision"], "continue")
+
+    def test_a_hunter_that_holds_a_finished_slot_owes_no_record_dated_inside_its_run(self) -> None:
+        # The claim is what a hunter owes: its slot is done (covered, with a record dated before the run's start),
+        # so it is let go, unlike a hunter that never claimed a slot (`test_a_record_dated_before...`).
+        self.launched.clear()
+        self.launch(SUB, at=30)
+        self.working(SUB, at=35)
+        self.cover(SUB, self.slot)
+        self.done(SUB, at=60)
+
+        self.assertEqual(self.stop(SUB, now=clock(61))[0], {"decision": "allow"})
 
     def test_a_subagent_the_parent_does_not_know_is_let_go(self) -> None:
         self.app.write_subagent(MAIN, "stray", planner(1, at=60))
@@ -751,6 +877,103 @@ class SubagentStopTests(HuntTestCase):
         self.done(SUB, at=60)
         self.stop(SUB, now=clock(61))
         self.assertEqual(read_marker(ledger_path_for(self.repo.root)), before)
+
+
+class VerifierStopTests(HuntTestCase):
+    """The verification debt of the gate is owed by a verifier that stops, as on Claude Code (REVIEW-FSE 4a)."""
+
+    VERIFIER = "ver-1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.slot = self.slots()[0]
+        self.launch(SUB)
+        self.working(SUB)
+        self.brief(SUB, self.slot["id"])
+        self.add_finding(SUB, self.slot["id"], severity="minor")  # F1, no verdict
+        self.cover(SUB, self.slot)
+        self.done(SUB, at=30)
+        self.launched_verifiers: list[str] = []
+
+    def launch_verifier(self, *ids: str) -> None:
+        self.launched_verifiers.extend(ids)
+        self.write_transcript(
+            user_input(0, "/craft-review check the totals", -5),
+            *launch_reviewers(1, SUB, at=0),
+            *launch_reviewers(4, *self.launched_verifiers, at=0, role="craftsman-verifier"),  # the second of `prepare`: starts then
+        )
+
+    def idle_verifier(self, sub_id: str = VERIFIER) -> None:
+        self.launch_verifier(sub_id)
+        self.app.write_subagent(MAIN, sub_id, planner(1, at=60), role="craftsman-verifier")
+
+    def test_an_idle_verifier_is_sent_back_once_while_a_finding_has_no_verdict(self) -> None:
+        self.idle_verifier()
+
+        first, _ = self.stop(self.VERIFIER, now=clock(61))
+
+        self.assertEqual(first["decision"], "continue")
+        self.assertTrue(first["reason"].startswith("Findings still without a verdict: F1."), first["reason"])
+        self.assertIn("craftsman review verdict <id> --as proven|probable|question|dismissed", first["reason"])
+        self.assertIn("send_message", first["reason"])
+        self.assertEqual([event for event, who, _ in self.events() if who == self.VERIFIER], ["nudge"])
+
+        self.app.write_subagent(MAIN, self.VERIFIER, planner(1, at=60), planner(2, at=61), role="craftsman-verifier")
+        second, _ = self.stop(self.VERIFIER, now=clock(62))
+
+        self.assertEqual(second, {"decision": "allow"})
+        self.assertEqual([event for event, who, _ in self.events() if who == self.VERIFIER], ["nudge", "start", "stop"])
+
+    def test_a_verifier_that_judged_the_finding_is_let_go(self) -> None:
+        self.idle_verifier()
+        self.cli(self.VERIFIER, "review", "verdict", "F1", "--as", "probable", "--evidence", "static: app.py:1 divides by zero")
+
+        self.assertEqual(self.stop(self.VERIFIER, now=clock(61))[0], {"decision": "allow"})
+
+    def test_one_own_verdict_excuses_the_verifier_while_other_findings_still_wait(self) -> None:
+        # The same rule as on Claude Code (hooks `_verifier_debt`): the verifier owes A verdict of its own, not one
+        # per finding it was handed (REVIEW-FSE 6 is a documented limit of both platforms, see DONE.md).
+        self.add_finding(SUB, self.slot["id"])  # F2
+        self.idle_verifier()
+        self.cli(self.VERIFIER, "review", "verdict", "F1", "--as", "probable", "--evidence", "static: app.py:1 divides by zero")
+
+        self.assertEqual(self.stop(self.VERIFIER, now=clock(61))[0], {"decision": "allow"})
+
+    def test_a_verdict_of_another_conversation_does_not_excuse_it(self) -> None:
+        self.idle_verifier()
+        self.cli(MAIN, "review", "verdict", "F1", "--as", "probable", "--evidence", "static: app.py:1 divides by zero")
+
+        first, _ = self.stop(self.VERIFIER, now=clock(61))  # the main conversation's own verdict is unverified
+
+        self.assertEqual(first["decision"], "continue")
+        self.assertTrue(first["reason"].startswith("Findings that still need your independent verdict: F1."), first["reason"])
+
+    def test_a_verifier_is_let_go_when_nothing_waits_for_a_verdict(self) -> None:
+        self.launch_verifier("ver-0", self.VERIFIER)
+        # ver-0 worked while it recorded its verdict, which carries the real time of this test run
+        self.app.write_subagent(MAIN, "ver-0", planner(1, at=3600), role="craftsman-verifier")
+        self.cli("ver-0", "review", "verdict", "F1", "--as", "probable", "--evidence", "static: app.py:1 divides by zero")
+        self.app.write_subagent(MAIN, self.VERIFIER, planner(1, at=60), role="craftsman-verifier")
+
+        self.assertEqual(self.stop(self.VERIFIER, now=clock(61))[0], {"decision": "allow"})
+
+    def test_a_merge_is_no_verdict(self) -> None:
+        self.add_finding(SUB, self.slot["id"])  # F2, the same defect again
+        self.idle_verifier()
+        self.cli(self.VERIFIER, "review", "merge", "F1", "F2")
+
+        first, _ = self.stop(self.VERIFIER, now=clock(61))
+
+        self.assertEqual(first["decision"], "continue")  # F1 itself still has no verdict
+        self.assertIn("F1", first["reason"])
+
+
+class SubagentStopUnknownTests(HuntTestCase):
+    def test_a_conversation_the_parent_never_launched_is_not_judged(self) -> None:
+        self.app.write_subagent(MAIN, "stray", planner(1, at=60), role="craftsman-verifier")
+
+        self.assertEqual(self.stop("stray", now=clock(61))[0], {"decision": "allow"})
+        self.assertEqual(self.events(), [])
 
 
 class RunRecordTests(AntigravityTestCase):

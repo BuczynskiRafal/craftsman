@@ -41,6 +41,7 @@ _RECORDING_SUBCOMMANDS = frozenset({"cover", "add", "brief", "verdict", "merge"}
 # recording call (`cd repo && craftsman review cover ...`), and so may `tail` / `head` / `cat` filtering its output.
 _SILENT_COMMANDS = frozenset({"cd", "pushd", "popd", "export", "set", "unset", "true", "false", ":", "test", "[", "exit"})
 _ECHOES = frozenset({"echo", "printf"})
+_ECHO_SPECIAL_CHARS = frozenset("\\$`{}*?[")
 _STDIN_FILTERS = frozenset({"tail", "head", "cat"})
 # Shells that only run the commands inside them, which are read on their own.
 _SHELL_RUNNERS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "eval"})
@@ -283,11 +284,26 @@ def _prints_text(item: SimpleCommand) -> bool:
     name = os.path.basename(item.tokens[0]).lower()
     if name in _SILENT_COMMANDS or name in _SHELL_RUNNERS:
         return False  # a shell runner's inner commands are listed (and judged) on their own
-    if name in _ECHOES:  # a literal can say "ok", but not forge the phrase a recording call prints
-        return any(pattern.search(" ".join(item.tokens[1:])) for pattern in _TOKEN_RES)
+    if name in _ECHOES:
+        return not _echoes_plain_words(name, item.tokens[1:])
     if name in _STDIN_FILTERS:
         return any(not word.startswith("-") and not word.isdigit() for word in item.tokens[1:])  # a file to read
     return True
+
+
+def _echoes_plain_words(name: str, words: list[str]) -> bool:
+    """Whether an `echo` / `printf` provably prints just the words it is given (`echo ok`), which cannot pass for a record.
+
+    That holds for an `echo` with no option (`-n` would join its output with the next command's, `-e` reads
+    escapes), no character the shell or `echo` expands (`\\`, `$`, a backtick, braces, a glob) and words that,
+    joined, do not read as a record. `printf` never qualifies: a format, an escape (`\\x28`) or its lack of a
+    newline lets two harmless arguments or commands make up the phrase.
+    """
+    if name != "echo":
+        return False
+    if any(word.startswith("-") or any(char in word for char in _ECHO_SPECIAL_CHARS) for word in words):
+        return False
+    return not any(pattern.search(" ".join(words)) for pattern in _TOKEN_RES)
 
 
 def _result_text(content: Any) -> str:

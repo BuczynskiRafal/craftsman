@@ -32,7 +32,9 @@ Entry = dict[str, Any]
 
 SUBAGENT_ACK_MARKER = "Created the following subagent:"
 LOG_DIR = Path(".system_generated") / "logs"
-TRANSCRIPT_NAMES = ("transcript.jsonl", "transcript_full.jsonl")
+COMPACT_TRANSCRIPT = "transcript.jsonl"
+FULL_TRANSCRIPT = "transcript_full.jsonl"
+TRANSCRIPT_NAMES = (COMPACT_TRANSCRIPT, FULL_TRANSCRIPT)
 KILLED_STATE = "SUBAGENT_STATE_KILLED"
 EARLY_ENTRIES = 5  # a subagent's transcript opens with the message of its parent
 SENDER_RE = re.compile(r"\bsender=(\S+)")
@@ -44,14 +46,34 @@ class TranscriptError(Exception):
     """A transcript exists but cannot be read."""
 
 
-def read_transcript_entries(transcript_path: Path | None) -> list[Entry]:
+def read_transcript_entries(transcript_path: Path | None, *, restore: bool = False) -> list[Entry]:
     """The entries of a JSONL transcript.
 
     No path or a missing file yields no entries: the session has not written one yet. A last line
     without its newline is one the agent is still writing and is left out; any other line that is
     not a JSON object, or a file that cannot be read, raises `TranscriptError`, since a skipped
     entry could hide what the stop hook must see.
+
+    Antigravity's compact `transcript.jsonl` cuts long fields (`truncated_fields` on the entry). With `restore`,
+    each such entry is replaced by the same line of `transcript_full.jsonl` (see `_restored`); one that cannot be
+    restored keeps its `truncated_fields`, and the reader that needs the cut field (`subagent_launches`) says so.
     """
+    numbered = _read_numbered(transcript_path)
+    if restore and transcript_path is not None:
+        cut = {number for number, entry in numbered if _truncated(entry)}
+        restored = _restored(transcript_path, cut) if cut else {}
+        numbered = [(number, _with_full(entry, restored.get(number))) for number, entry in numbered]
+    return [entry for _, entry in numbered]
+
+
+def _with_full(compact: Entry, full: Entry | None) -> Entry:
+    """`full` in place of `compact` when it is the same entry (same type and step), else `compact`."""
+    same = full is not None and full.get("type") == compact.get("type") and full.get("step_index") == compact.get("step_index")
+    return full if full is not None and same else compact
+
+
+def _read_numbered(transcript_path: Path | None) -> list[tuple[int, Entry]]:
+    """`read_transcript_entries` without restoring: each entry with the number of its line."""
     if transcript_path is None:
         return []
     reader = JsonlReader(transcript_path, max_bytes=MAX_TRANSCRIPT_BYTES)
@@ -62,16 +84,55 @@ def read_transcript_entries(transcript_path: Path | None) -> list[Entry]:
     except (OSError, UnicodeDecodeError) as exc:
         raise TranscriptError(f"cannot read the transcript {transcript_path}: {exc}") from exc
     if reader.stopped is StopReason.TOO_LARGE:
-        raise TranscriptError(
-            f"the transcript {transcript_path} is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB; not read"
-        )
+        raise TranscriptError(_too_large(transcript_path))
     entries = [
-        _normalize(_json_object(line, transcript_path), line.number) for line in lines if not line.blank and line.complete
+        (line.number, _normalize(_json_object(line, transcript_path), line.number))
+        for line in lines
+        if not line.blank and line.complete
     ]
     last = lines[-1] if lines and not lines[-1].complete else None
     if last is not None and isinstance(last.value, dict):  # a finished entry without its newline
-        entries.append(_normalize(last.value, last.number))
+        entries.append((last.number, _normalize(last.value, last.number)))
     return entries
+
+
+def _too_large(path: Path) -> str:
+    return f"the transcript {path} is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB; not read"
+
+
+def _truncated(entry: Entry) -> list[str]:
+    """The fields Antigravity cut from an entry of its compact transcript (`truncated_fields`), `[]` when none."""
+    fields = entry.get("truncated_fields")
+    return [field for field in fields if isinstance(field, str)] if isinstance(fields, list) else []
+
+
+def _restored(compact: Path, numbers: set[int]) -> dict[int, Entry]:
+    """The entries of lines `numbers` of `transcript.jsonl`, as `transcript_full.jsonl` has them (the two files are
+    line-aligned and the full one keeps what the compact one cuts).
+
+    The compact file stays the authority on which lines exist: a line the full file does not have (yet), a line
+    that is not the same entry (another `type` or `step_index`), or a missing full file restores nothing. A
+    full file past the byte cap or one that cannot be read raises `TranscriptError`: the cut fields stay
+    unknown, and saying so beats reading them as empty.
+    """
+    full = compact.with_name(FULL_TRANSCRIPT) if compact.name == COMPACT_TRANSCRIPT else None
+    if full is None:
+        return {}
+    reader = JsonlReader(full, max_bytes=MAX_TRANSCRIPT_BYTES)
+    found: dict[int, Entry] = {}
+    try:
+        for line in reader:
+            if line.number in numbers and line.complete and isinstance(line.value, dict):
+                found[line.number] = _normalize(line.value, line.number)
+            if line.number >= max(numbers):
+                break
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise TranscriptError(f"cannot read the transcript {full}: {exc}") from exc
+    if reader.stopped is StopReason.TOO_LARGE:
+        raise TranscriptError(_too_large(full))
+    return found
 
 
 def _json_object(line: JsonlLine, path: Path) -> Entry:
@@ -152,17 +213,36 @@ def latest_user_input(entries: Sequence[Entry]) -> tuple[int, str] | None:
     return None
 
 
-def is_waiting_on_question(entries: Sequence[Entry]) -> bool:
-    """True when the agent's latest action was a question to the user that is still unanswered."""
+def _latest_response(entries: Sequence[Entry]) -> Entry | None:
+    """The latest PLANNER_RESPONSE that no USER_INPUT follows, None when the user spoke last (or nothing was said)."""
     for entry in reversed(entries):
         if entry.get("type") == "USER_INPUT":
-            return False
+            return None
         if entry.get("type") == "PLANNER_RESPONSE":
-            calls = entry.get("tool_calls")
-            if not isinstance(calls, list):
-                return False
-            return any(isinstance(call, dict) and call.get("name") in QUESTION_TOOLS for call in calls)
-    return False
+            return entry
+    return None
+
+
+def has_cut_tool_calls(entries: Sequence[Entry]) -> bool:
+    """Whether the agent's latest response lost its `tool_calls` to the compact transcript's cut, so only the full
+    transcript can say whether it asked a question (`read_transcript_entries(..., restore=True)`)."""
+    latest = _latest_response(entries)
+    return latest is not None and not isinstance(latest.get("tool_calls"), list) and "tool_calls" in _truncated(latest)
+
+
+def is_waiting_on_question(entries: Sequence[Entry]) -> bool:
+    """True when the agent's latest action was a question to the user that is still unanswered.
+
+    Calls that were cut from the entry and could not be restored are read as a question: the user is never
+    trapped behind a guard because a long call hid what the agent did.
+    """
+    latest = _latest_response(entries)
+    if latest is None:
+        return False
+    calls = latest.get("tool_calls")
+    if not isinstance(calls, list):
+        return has_cut_tool_calls(entries)
+    return any(isinstance(call, dict) and call.get("name") in QUESTION_TOOLS for call in calls)
 
 
 def decode_arg(value: Any) -> str:
@@ -227,10 +307,14 @@ def subagent_launches(entries: Sequence[Entry]) -> tuple[SubagentLaunch, ...]:
     other tools interleave: the k-th result belongs to the k-th call, whatever the tool). An `invoke_subagent`
     call is paired with the k-th `GENERIC` entry after its response; its text names the new conversation. A
     call whose acknowledgement is missing (still running), unreadable or without a time, or whose role is not a
-    Craftsman role, is skipped.
+    Craftsman role, is skipped. An entry whose `tool_calls` (or an acknowledgement whose `content`) Antigravity cut
+    from its compact transcript (`truncated_fields`) and that was not restored (`read_transcript_entries(...,
+    restore=True)`) raises `TranscriptError`: a launch hidden in it must never read as "no launch".
     """
     launches: list[SubagentLaunch] = []
     for position, entry in enumerate(entries):
+        if entry.get("type") == "PLANNER_RESPONSE" and "tool_calls" in _truncated(entry):
+            raise TranscriptError(_cut_text(entry, position, "tool_calls"))
         calls = entry.get("tool_calls") if entry.get("type") == "PLANNER_RESPONSE" else None
         if not isinstance(calls, list) or entry.get("status") == "ERROR":
             continue
@@ -238,6 +322,8 @@ def subagent_launches(entries: Sequence[Entry]) -> tuple[SubagentLaunch, ...]:
         for index, call in enumerate(calls):
             if not isinstance(call, dict) or call.get("name") != "invoke_subagent" or index >= len(results):
                 continue
+            if "content" in _truncated(results[index]):
+                raise TranscriptError(_cut_text(results[index], position, "content"))
             raw_args = call.get("args")
             args: Entry = raw_args if isinstance(raw_args, dict) else {}
             role = launch_role(args.get("Role"), args.get("TypeName"))
@@ -246,6 +332,13 @@ def subagent_launches(entries: Sequence[Entry]) -> tuple[SubagentLaunch, ...]:
                 continue
             launches.append(SubagentLaunch(created[0], role, created[1], created[2]))
     return tuple(launches)
+
+
+def _cut_text(entry: Entry, position: int, field: str) -> str:
+    return (
+        f"the {field} of step {step_of(entry, position + 1)} was cut from the compact transcript and "
+        f"{FULL_TRANSCRIPT} does not restore it, so the subagents it launched cannot be told"
+    )
 
 
 def _results_after(entries: Sequence[Entry], position: int) -> list[Entry]:
@@ -328,12 +421,15 @@ def subagent_finish(app_dir: Path, conversation_id: str, parent_id: str) -> Suba
     killed_at = _killed_at(_registry_file(app_dir, parent_id, conversation_id))
     path = conversation_transcript(app_dir, conversation_id)
     try:
-        entries = read_transcript_entries(path)
+        numbered = _read_numbered(path)
+        if numbered and _truncated(numbered[-1][1]) and path is not None:  # the last step decides: restore only it
+            number, last = numbered[-1]
+            numbered[-1] = (number, _with_full(last, _restored(path, {number}).get(number)))
     except TranscriptError:
-        entries = []
+        numbered = []
         path = None
-    finished = _finished_at(entries[-1]) if entries else None
-    last_step = step_of(entries[-1], len(entries)) if entries else None
+    finished = _finished_at(numbered[-1][1]) if numbered else None
+    last_step = step_of(numbered[-1][1], len(numbered)) if numbered else None
     if killed_at is not None:
         return SubagentState(killed_at, True, path is not None, last_step)
     return SubagentState(finished, False, path is not None, last_step)
@@ -353,6 +449,8 @@ def _finished_at(entry: Entry) -> str | None:
     """When the turn that `entry` (the last of a transcript) ends was over, None when it does not end one."""
     created = entry.get("created_at")
     calls = entry.get("tool_calls")
+    if "tool_calls" in _truncated(entry):
+        return None  # its tool calls were cut, so it may be a response that calls tools: not the end of a turn
     if (
         entry.get("type") == "PLANNER_RESPONSE"
         and entry.get("status") == "DONE"
@@ -402,10 +500,11 @@ def subagent_role(app_dir: Path, conversation_id: str, parent_id: str) -> AgentR
     except (OSError, ValueError):
         pass
     try:
-        entries = read_transcript_entries(conversation_transcript(app_dir, parent_id))
+        entries = read_transcript_entries(conversation_transcript(app_dir, parent_id), restore=True)
+        launches = subagent_launches(entries)
     except TranscriptError:
         return None
-    return next((item.role for item in subagent_launches(entries) if item.conversation_id == conversation_id), None)
+    return next((item.role for item in launches if item.conversation_id == conversation_id), None)
 
 
 def latest_user_input_text(entries: Sequence[Entry]) -> tuple[int, str | None, str] | None:

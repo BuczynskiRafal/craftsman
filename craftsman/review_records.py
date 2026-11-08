@@ -62,7 +62,7 @@ from craftsman.review_ingest import (
     run_single,
 )
 from craftsman.review_scope import finding_path, normalize_round_files
-from craftsman.text import one_line
+from craftsman.text import defang_tokens, one_line
 from craftsman.workspace import (
     Workspace,
     caller_identity,
@@ -491,13 +491,17 @@ def handle_merge(args: argparse.Namespace) -> int:
 
 
 def cited_line(finding: Finding, lines: Sequence[str] | None) -> str:
-    """Echo the cited source line so a wrong `--line` is noticed while the finding is fresh."""
+    """Echo the cited source line so a wrong `--line` is noticed while the finding is fresh.
+
+    The line is repository text, so a comment or a test fixture on it may spell a record
+    (`Brief issued (B9)`): it is printed defanged, like every other prose echoed by a recording command.
+    """
     if lines is None:
         return (
             f"  ({finding.path} is deleted in the diff; line {finding.line} refers to the base version)"
         )
     text = lines[finding.line - 1].strip()
-    return f"  L{finding.line}: {text[:CITED_LINE_CHARS]}{'…' if len(text) > CITED_LINE_CHARS else ''}"
+    return f"  L{finding.line}: {defang_tokens(text[:CITED_LINE_CHARS])}{'…' if len(text) > CITED_LINE_CHARS else ''}"
 
 
 def _git_lines(path: Path) -> list[str]:

@@ -84,6 +84,57 @@ class TrivialRunTests(unittest.TestCase):
     def test_env_without_a_command_is_trivial(self) -> None:
         self.assertTrue(is_trivial_run(["env", "-u", "FOO"]))
 
+    def test_every_spelling_of_env_split_string_is_read(self) -> None:
+        for argv in (
+            ["env", "-S", "A=1 pytest -q"],
+            ["env", "-SA=1 pytest -q"],
+            ["env", "--split-string", "A=1 pytest -q"],
+            ["env", "--split-string=A=1 pytest -q"],
+            ["env", "-iS", "A=1 pytest -q"],
+            ["env", "-u", "FOO", "-S", "A=1 pytest -q"],
+            ["A=1", "env", "-S", "pytest -q"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(command_without_env(argv), ["pytest", "-q"])
+
+
+class LeadingAssignmentTests(unittest.TestCase):
+    """`NAME=VALUE command` is the command: an assignment in front changes nothing about what it proves (REVIEW-FSE 10)."""
+
+    HEREDOC = "{prefix}python3 -u <<'EOF'\nprint('ok')\nEOF"
+
+    def test_leading_assignments_are_stripped_without_an_explicit_env(self) -> None:
+        self.assertEqual(command_without_env(["FOO=1", "pytest", "-q"]), ["pytest", "-q"])
+        self.assertEqual(command_without_env(["FOO=1", "BAR=", "env", "X=2", "pytest"]), ["pytest"])
+        self.assertEqual(command_without_env(["FOO=1"]), [])
+        self.assertEqual(command_without_env(["pytest", "FOO=1"]), ["pytest", "FOO=1"])  # an argument is not an assignment
+
+    def test_agys_probe_trivial_commands_stay_trivial_behind_an_assignment(self) -> None:
+        plain = {
+            "true": ["true"],
+            "inline": ["python3", "-c", "print('ok')"],
+        }
+        for label, argv in plain.items():
+            with self.subTest(label=label, prefix=False):
+                self.assertTrue(is_trivial_run(argv, kind="test"))
+            with self.subTest(label=label, prefix=True):
+                self.assertTrue(is_trivial_run(["FOO=1", *argv], kind="test"))
+        for prefix in ("", "FOO=1 "):
+            with self.subTest(heredoc=prefix):
+                self.assertTrue(is_trivial_run(["bash", "-c", self.HEREDOC.format(prefix=prefix)], kind="test"))
+        self.assertTrue(is_trivial_run(["bash", "-c", "FOO=1 true"], kind="test"))
+        self.assertTrue(is_trivial_run(["bash", "-c", "FOO=1 python3 -c \"print('ok')\""], kind="test"))
+
+    def test_real_commands_stay_real_behind_an_assignment(self) -> None:
+        for argv in (
+            ["FOO=1", "pytest", "-q"],
+            ["FOO=1", "python3", "-c", "assert 1 + 1 == 2"],
+            ["bash", "-c", "FOO=1 pytest -q"],
+            ["bash", "-c", "FOO=1 python3 -u <<'EOF'\nassert 1\nEOF"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(is_trivial_run(argv, kind="test"))
+
 
 # Inline programs that exercise code without checking anything: trivial as a `test` run only.
 UNCHECKED_PROGRAMS = (

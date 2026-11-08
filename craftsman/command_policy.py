@@ -55,7 +55,7 @@ from craftsman.shell import (
     python_program,
     redirection_targets,
 )
-from craftsman.tool_names import READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
+from craftsman.tool_names import READ_PATH_KEYS, READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
 from craftsman.worktree_guard import find_worktree_mutation
 
 # --- the messages -----------------------------------------------------------------------------------
@@ -85,6 +85,7 @@ RESTARTING_COMMANDS = frozenset({"prepare", "reset"})
 _CRAFTSMAN_EXECUTABLES = frozenset({"craftsman", "craftsman.exe"})
 _CLI_MODULES = frozenset({"craftsman.cli", "craftsman"})
 _CLI_SCRIPT = "craftsman-cli.py"
+_CLI_FILE = "craftsman/cli.py"
 # Entry points that only a platform runs: the hook dispatcher, the Antigravity guards and their scripts.
 _ENTRY_MODULES = frozenset({"craftsman.hooks", "craftsman.antigravity", "craftsman.scope"})
 _ENTRY_SCRIPTS = frozenset({"craftsman-stop-gate.py", "craftsman-scope-guard.py"})
@@ -140,7 +141,7 @@ def _python_invocation(tokens: Sequence[str]) -> tuple[CallKind, tuple[str, ...]
         return ("entry", tuple(rest)) if value in _ENTRY_MODULES else None
     if kind == "script":
         script = value.replace("\\", "/").lower()
-        if os.path.basename(script) == _CLI_SCRIPT:
+        if os.path.basename(script) == _CLI_SCRIPT or script.endswith(_CLI_FILE):
             return "cli", tuple(rest)
         if os.path.basename(script) in _ENTRY_SCRIPTS or script.endswith(_ENTRY_FILES):
             return "entry", tuple(rest)
@@ -285,11 +286,8 @@ READ_ONLY_TOOL_NAMES = READ_TOOL_NAMES | SEARCH_TOOL_NAMES | frozenset(
     }
 )  # fmt: skip
 _READ_ONLY_PREFIXES = ("read", "view", "get_", "list", "search", "find", "grep", "glob", "fetch")
-_PATH_KEYS = frozenset(
-    {
-        "file_path", "filepath", "notebook_path", "notebookpath", "path", "targetfile", "target_file", "absolutepath",
-        "filename", "file", "files", "paths", "destination", "dest", "newpath", "oldpath",
-    }
+_PATH_KEYS = frozenset(key.lower() for key in READ_PATH_KEYS) | frozenset(
+    {"notebookpath", "target_file", "filename", "file", "files", "paths", "destination", "dest", "newpath", "oldpath"}
 )  # fmt: skip
 _PATCH_KEYS = frozenset({"input", "patch", "diff"})
 _PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$", re.MULTILINE)
@@ -717,10 +715,7 @@ def _sets_identity(commands: Sequence[SimpleCommand], calls: Sequence[Invocation
     for call in calls:
         if call.kind not in ("cli", "entry"):
             continue
-        item = call.command
-        raw = item.raw_tokens
-        prefix = raw[: len(raw) - len(item.tokens)] if tuple(raw[len(raw) - len(item.tokens) :]) == tuple(item.tokens) else raw
-        if any(_names_identity(word) for word in prefix):
+        if any(_names_identity(word) for word in call.command.prefix):
             return True
     if not any(call.kind in ("cli", "entry") for call in calls):
         return False

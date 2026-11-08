@@ -18,9 +18,10 @@ from craftsman import antigravity, command_policy, hooks, review_guard
 from craftsman.attribution import agent_runs
 from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, MAX_CONTINUATIONS
 from craftsman.gatecheck import MAX_ROUNDS
-from craftsman.hooks import REVIEWER_STOP_REASON, HookInput, HookInputError
+from craftsman.hooks import HookInput, HookInputError
 from craftsman.huntview import hunk_ranges
 from craftsman.ledger import load
+from craftsman.subagent_stop import REVIEWER_STOP_REASON
 
 from tests.support import EvidenceRepo, coverage_note
 

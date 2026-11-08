@@ -73,6 +73,16 @@
         ]
       },
       {
+        "matcher": "read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
         "matcher": "grep_search",
         "hooks": [
           {

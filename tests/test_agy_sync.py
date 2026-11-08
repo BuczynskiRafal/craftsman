@@ -10,6 +10,7 @@ from contextlib import redirect_stderr
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from craftsman import agy_sync
 from craftsman.agy_sync import (
@@ -24,6 +25,7 @@ from craftsman.agy_sync import (
 from craftsman.attribution import agent_runs
 from craftsman.ledger import ledger_path_for, load, save
 from craftsman.records import AgentEvent, Ledger, parse_timestamp
+from craftsman.transcript import TranscriptError
 from craftsman.workspace import Workspace
 
 from tests.support import (
@@ -37,6 +39,7 @@ from tests.support import (
     launch_reviewers,
     parent_message,
     planner,
+    subagent_ack,
     user_input,
 )
 from tests.test_attribution import hunt_ledger, with_agents
@@ -329,6 +332,121 @@ class WholeSecondTests(SyncTestCase):
         events = run_events(self.sync(ledger))
 
         self.assertEqual(events, [("start", "craftsman-reviewer", at(20.9)), ("stop", "craftsman-reviewer", at(20.9))])
+
+
+def compact(entry: dict[str, Any], **cut: Any) -> dict[str, Any]:
+    """The entry as Antigravity's compact `transcript.jsonl` writes it when it cuts fields: each field of `cut` is
+    dropped (value None) or replaced, and listed in `truncated_fields`."""
+    kept = {key: value for key, value in entry.items() if key not in cut}
+    kept.update({key: value for key, value in cut.items() if value is not None})
+    return {**kept, "truncated_fields": sorted(cut)}
+
+
+class CompactTranscriptTests(SyncTestCase):
+    """The compact transcript cuts long fields; launches and acknowledgements are read from the full one (REVIEW-FSE 8)."""
+
+    def write(self, compact_entries: list[dict[str, Any]], full_entries: list[dict[str, Any]] | None) -> None:
+        self.app.write_transcript(MAIN, *compact_entries)
+        if full_entries is not None:
+            self.app.write_transcript(MAIN, *full_entries, full=True)
+
+    def launch_steps(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The launch response as the full transcript has it (native argument values) and its acknowledgement."""
+        response = planner(1, agy_call("invoke_subagent", encoded=False, TypeName="self", Role="craftsman-reviewer", Prompt="p"), at=5)
+        return response, subagent_ack(2, SUB, 5)
+
+    def launched(self) -> list[str]:
+        return [run.launch.conversation_id for run in observe_runs(self.app.root, MAIN)]
+
+    def test_a_launch_only_the_full_file_has_is_found(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        self.write([first, compact(response, tool_calls=None), ack], [first, response, ack])
+
+        self.assertEqual(self.launched(), [SUB])
+
+    def test_an_acknowledgement_cut_in_the_compact_file_is_read_from_the_full_one(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        self.write([first, response, compact(ack, content="Created the follow...")], [first, response, ack])
+
+        self.assertEqual(self.launched(), [SUB])
+
+    def test_a_cut_response_without_a_launch_is_no_launch_and_no_problem(self) -> None:
+        first = user_input(0, "/craft-review", 0)
+        ran = planner(1, agy_call("run_command", encoded=False, CommandLine="ls"), at=5)
+        self.write([first, compact(ran, tool_calls=None)], [first, ran])
+
+        self.assertEqual(self.launched(), [])
+
+    def test_the_compact_file_stays_the_authority_on_the_lines_that_exist(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        self.write([first, compact(response, tool_calls=None), ack], [first])  # the full file is behind
+
+        with self.assertRaisesRegex(TranscriptError, "cut from the compact transcript"):
+            observe_runs(self.app.root, MAIN)
+
+    def test_a_cut_step_without_a_full_file_is_a_problem_never_no_launch(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        for label, entries in (
+            ("tool_calls", [first, compact(response, tool_calls=None), ack]),
+            ("content", [first, response, compact(ack, content="Created the follow...")]),
+        ):
+            with self.subTest(cut=label):
+                self.write(entries, None)
+
+                with self.assertRaisesRegex(TranscriptError, f"the {label} of step"):
+                    observe_runs(self.app.root, MAIN)
+
+    def test_a_cut_result_that_is_no_acknowledgement_does_not_matter(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        read = planner(3, agy_call("view_file", encoded=False, AbsolutePath="/x"), at=6)
+        result = generic(4, "a long file", 6)
+        self.write([first, response, ack, read, compact(result, content="a lo...")], None)
+
+        self.assertEqual(self.launched(), [SUB])
+
+    def test_a_cut_acknowledgement_of_another_call_than_a_launch_is_not_read(self) -> None:
+        # Two calls in one response: the k-th result belongs to the k-th call; only the launch's result is looked at.
+        first = user_input(0, "/craft-review", 0)
+        response = planner(1, agy_call("view_file", encoded=False, AbsolutePath="/x"), at=5)
+        self.write([first, response, compact(generic(2, "long", 5), content="lo...")], None)
+
+        self.assertEqual(self.launched(), [])
+
+    def test_the_full_file_past_the_byte_cap_is_a_problem(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        self.write([first, compact(response, tool_calls=None), ack], [first, response, ack])
+        small = self.app.transcript_path(MAIN).stat().st_size
+        large = self.app.transcript_path(MAIN, full=True).stat().st_size
+        self.assertLess(small, large)
+
+        with unittest.mock.patch("craftsman.transcript.MAX_TRANSCRIPT_BYTES", small + 1):
+            with self.assertRaisesRegex(TranscriptError, "transcript_full.jsonl is larger than"):
+                observe_runs(self.app.root, MAIN)
+
+    def test_a_cap_hit_costs_a_problem_line_and_credits_nothing(self) -> None:
+        response, ack = self.launch_steps()
+        first = user_input(0, "/craft-review", 0)
+        self.write([first, compact(response, tool_calls=None), ack], [first, response, ack])
+        repo = EvidenceRepo(self.tmp / "repo")
+        ledger_path = ledger_path_for(repo.root)
+        env = {"ANTIGRAVITY_CONVERSATION_ID": MAIN, "ANTIGRAVITY_APP_DATA_DIR": str(self.app.root)}
+        err = io.StringIO()
+
+        with redirect_stderr(err), unittest.mock.patch(
+            "craftsman.transcript.MAX_TRANSCRIPT_BYTES", self.app.transcript_path(MAIN).stat().st_size + 1
+        ):
+            sync_antigravity_runs(Workspace(repo.root, None, ledger_path), env)
+
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertIn("not synced", err.getvalue())
+        self.assertIn("transcript_full.jsonl is larger than", err.getvalue())
+        self.assertFalse(ledger_path.exists())
 
 
 class ConversationTests(SyncTestCase):

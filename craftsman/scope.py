@@ -39,7 +39,7 @@ from craftsman.records import CRAFTSMAN_AGENTS, AgentRole, LedgerError, craftsma
 from craftsman.review_guard import arm_for_review_command, review_in_progress
 from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 from craftsman.streams import configure_std_streams
-from craftsman.tool_names import READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
+from craftsman.tool_names import READ_PATH_KEYS, READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
 from craftsman.transcript import TranscriptError, decode_arg, parent_conversation, subagent_role
 from craftsman.workspace import read_marker
 
@@ -194,14 +194,15 @@ def _is_within(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _is_forbidden_store(candidate: Path) -> bool:
+def _is_forbidden_store(candidate: Path, protected: Sequence[Path]) -> bool:
+    """Whether `candidate` lies in a session store or shell history: a home path of `FORBIDDEN_HOME_RELPATHS`, or
+    a transcript root of `protected` (the roots the command policy protects; they follow the environment)."""
     home = user_home()
     resolved_cand = candidate.resolve()
-    for base in {home, home.resolve()}:
-        for rel in FORBIDDEN_HOME_RELPATHS:
-            store = base / rel
-            if _is_within(candidate, store) or _is_within(resolved_cand, store.resolve()):
-                return True
+    stores = [base / rel for base in {home, home.resolve()} for rel in FORBIDDEN_HOME_RELPATHS]
+    for store in (*stores, *protected):
+        if _is_within(candidate, store) or _is_within(resolved_cand, store.resolve()):
+            return True
     return False
 
 
@@ -273,9 +274,9 @@ def _escapes_via_symlink(candidate: Path, roots: Sequence[Path]) -> bool:
 
 
 def _check_target(
-    candidate: Path, *, is_recursive: bool, repo_root: Path, policy: ScopePolicy, label: str
+    candidate: Path, *, is_recursive: bool, repo_root: Path, policy: ScopePolicy, label: str, protected: Sequence[Path]
 ) -> ScopeDecision:
-    if _is_forbidden_store(candidate):
+    if _is_forbidden_store(candidate, protected):
         return _deny(label, "targets a protected session store or shell history")
     resolved_repo = repo_root.resolve()
     resolved_extras = tuple(d.resolve() for d in policy.allowed_dirs)
@@ -372,7 +373,9 @@ def _has_unmatched_quotes(command_line: str) -> bool:
     return False
 
 
-def _evaluate_shell(command_line: str, cwd: Path, repo_root: Path, policy: ScopePolicy) -> ScopeDecision:
+def _evaluate_shell(
+    command_line: str, cwd: Path, repo_root: Path, policy: ScopePolicy, protected: Sequence[Path]
+) -> ScopeDecision:
     if not command_line.strip():
         return ScopeDecision("allow")
     if _has_unmatched_quotes(command_line):
@@ -390,7 +393,7 @@ def _evaluate_shell(command_line: str, cwd: Path, repo_root: Path, policy: Scope
         targets = _extract_path_candidates(simple.tokens[1:], eff_cwd) or ([eff_cwd] if is_rec else [])
         for target in targets:
             decision = _check_target(
-                target, is_recursive=is_rec, repo_root=repo_root, policy=policy, label=label
+                target, is_recursive=is_rec, repo_root=repo_root, policy=policy, label=label, protected=protected
             )
             if decision.decision == "deny":
                 return decision
@@ -407,10 +410,19 @@ def _strip_glob_prefix(raw: str) -> str:
 
 
 def evaluate_scope(
-    tool_name: str, tool_input: Mapping[str, Any], cwd: Path, repo_root: Path, policy: ScopePolicy
+    tool_name: str,
+    tool_input: Mapping[str, Any],
+    cwd: Path,
+    repo_root: Path,
+    policy: ScopePolicy,
+    protected: Sequence[Path] | None = None,
 ) -> ScopeDecision:
+    """The search-scope verdict on one tool call. `protected` are the transcript roots no read may touch (default:
+    the roots of the process environment, `command_policy.default_transcript_roots`)."""
     if policy.mode == "off":
         return ScopeDecision("allow")
+    if protected is None:
+        protected = default_transcript_roots()
     lowered = tool_name.strip().lower()
     if lowered in SHELL_TOOL_NAMES:
         cmd = tool_input.get("command") or tool_input.get("CommandLine") or ""
@@ -418,9 +430,9 @@ def evaluate_scope(
         eff_cwd = (
             _to_path(_expand_vars(raw_cwd), cwd) if isinstance(raw_cwd, str) and raw_cwd.strip() else cwd
         )
-        return _evaluate_shell(cmd if isinstance(cmd, str) else "", eff_cwd, repo_root, policy)
+        return _evaluate_shell(cmd if isinstance(cmd, str) else "", eff_cwd, repo_root, policy, protected)
     if lowered in READ_TOOL_NAMES:
-        for key in ("file_path", "filePath", "path", "TargetFile", "AbsolutePath", "notebook_path"):
+        for key in READ_PATH_KEYS:
             val = tool_input.get(key)
             if isinstance(val, str) and val.strip():
                 target = _to_path(_expand_vars(val.strip()), cwd)
@@ -430,6 +442,7 @@ def evaluate_scope(
                     repo_root=repo_root,
                     policy=policy,
                     label=f"{tool_name}({val!r})",
+                    protected=protected,
                 )
         return ScopeDecision("allow")
     if lowered in SEARCH_TOOL_NAMES:
@@ -448,6 +461,7 @@ def evaluate_scope(
                     repo_root=repo_root,
                     policy=policy,
                     label=f"{tool_name}({val!r})",
+                    protected=protected,
                 )
                 if dec.decision == "deny":
                     return dec
@@ -533,6 +547,12 @@ def _antigravity_directory(args: Mapping[str, Any], payload: Mapping[str, Any]) 
     return Path.cwd()
 
 
+def _protected_roots(env: Mapping[str, str], app: Path) -> tuple[Path, ...]:
+    """The transcript roots of a call: the platforms' (`default_transcript_roots` of `env`) and `<app data dir>/brain`.
+    The command policy and the search scope both protect exactly these."""
+    return tuple(dict.fromkeys((*default_transcript_roots(env), app / "brain")))
+
+
 def _policy_context(caller: AntigravityCaller, checkout: _Checkout, app: Path, env: Mapping[str, str]) -> PolicyContext:
     def ledger_dir() -> Path | None:
         try:
@@ -552,8 +572,7 @@ def _policy_context(caller: AntigravityCaller, checkout: _Checkout, app: Path, e
         except (LedgerError, DiffScanError):
             return None
 
-    roots = tuple(dict.fromkeys((*default_transcript_roots(env), app / "brain")))
-    return PolicyContext(ledger_dir, owns_gate, in_progress, roots)
+    return PolicyContext(ledger_dir, owns_gate, in_progress, _protected_roots(env, app))
 
 
 def _scope_applies(caller: AntigravityCaller, checkout: _Checkout) -> bool:
@@ -569,7 +588,9 @@ def _scope_applies(caller: AntigravityCaller, checkout: _Checkout) -> bool:
     return not caller.is_main and marker is not None and marker.guarding and marker.is_of(caller.owner)
 
 
-def _scope_decision(name: str, args: Mapping[str, Any], base: Path, checkout: _Checkout) -> tuple[str, str | None]:
+def _scope_decision(
+    name: str, args: Mapping[str, Any], base: Path, checkout: _Checkout, protected: Sequence[Path]
+) -> tuple[str, str | None]:
     """The search-scope verdict on one call whose caller the scope binds."""
     try:
         policy = load_scope_policy(base, checkout.root)
@@ -577,7 +598,7 @@ def _scope_decision(name: str, args: Mapping[str, Any], base: Path, checkout: _C
         return "force_ask", f"[CRAFTSMAN SCOPE-GUARD] {exc}"
     if policy.mode == "off":
         return "allow", None
-    decision = evaluate_scope(name, args, base, checkout.root, policy)
+    decision = evaluate_scope(name, args, base, checkout.root, policy, protected)
     if decision.decision == "deny" and policy.mode == "deny":
         return "deny", decision.reason
     if decision.decision == "deny":
@@ -624,7 +645,9 @@ def evaluate_antigravity_payload(
         return "allow", None
     try:
         if is_scope_checked_tool(name) and _scope_applies(caller, checkout):
-            verdict = _scope_decision(name, args, Path(call.cwd) if os.path.isdir(call.cwd) else base, checkout)
+            verdict = _scope_decision(
+                name, args, Path(call.cwd) if os.path.isdir(call.cwd) else base, checkout, _protected_roots(values, app)
+            )
             if verdict[0] != "allow":
                 return verdict
         if caller.is_main and caller.main_id is not None and decision.review:

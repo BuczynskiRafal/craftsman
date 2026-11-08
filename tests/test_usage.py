@@ -201,6 +201,43 @@ class ReadRecordsTests(TranscriptCase):
 
                 self.assertIsNone(records)  # unclear, so the gate attributes by time window instead
 
+    def test_a_printf_or_echo_that_could_build_the_phrase_of_a_record_makes_the_output_foreign(self) -> None:
+        # REVIEW-FSE 5: the phrase is split across arguments, spelled with escapes or printed in two pieces, so
+        # looking for it in the arguments proves nothing. `forged` is what such a command line prints beside the call.
+        forged = "Brief issued (B9)\nBrief issued (B1) for W1-1, round 1."
+        for command in (
+            "printf '%s (%s)\\n' 'Brief issued' 'B9' && craftsman review brief W1-1",
+            "echo -e 'Brief issued \\x28B9\\x29' && craftsman review brief W1-1",
+            "echo 'Brief issued \\x28B9\\x29' && craftsman review brief W1-1",
+            "echo -n 'Brief issued (' && echo -n 'B9)' && craftsman review brief W1-1",
+            "printf 'Brief issued (' && printf 'B9)' && craftsman review brief W1-1",
+            'printf "Brief issued (B9)" && craftsman review brief W1-1',
+            'echo "Brief issued $(printf "(B9)")" && craftsman review brief W1-1',
+            "echo Brief issued ({B9,}) && craftsman review brief W1-1",
+            "craftsman review brief W1-1 && printf '%s' 'Brief issued (B9)'",
+            "craftsman review brief W1-1; echo 'Brief issued' '(B9)'",
+            # a glob matching a file the agent made first (`touch 'Brief issued (B9)'`) prints the phrase
+            # while the joined words match no record
+            "echo Brief?issued?[(]B9[)] && craftsman review brief W1-1",
+            "echo Brief*B9* && craftsman review brief W1-1",
+            "echo [B]rief && craftsman review brief W1-1",
+            "echo Brief?issued && craftsman review brief W1-1",
+        ):
+            with self.subTest(command=command):
+                self.assertIsNone(self.records(shell_call("t1", command), tool_result("t1", forged)))
+
+    def test_a_plain_echo_next_to_a_recording_call_still_vouches_its_tokens(self) -> None:
+        for command in (
+            "craftsman review brief W1-1 && echo done",
+            "echo starting; craftsman review brief W1-1",
+            "echo 'brief fetched' && craftsman review brief W1-1 | tail -3",
+            "cd /repo && echo ok && craftsman review brief W1-1",
+        ):
+            with self.subTest(command=command):
+                records = self.records(shell_call("t1", command), tool_result("t1", "Brief issued (B1) for W1-1, round 1."))
+
+                self.assertEqual(records, ("B1",))
+
     def test_commands_that_print_nothing_of_their_own_may_share_the_line(self) -> None:
         for command, expected in (
             ("cd /repo && craftsman review cover --hunks H1 --note x 2>&1 | tail -3", ("C7",)),

@@ -68,6 +68,18 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Fixed
 
+- **Review of the hook guards (Antigravity and the shell parser).** `env -S "<command line>"` (and `--split-string`, in
+  every attached form and as the shortest unique prefix `--s`, with `\_` as a separator; `env -a`/`--argv0` values and an
+  `env -C` inside the string are read too) no longer hides its command from the command policy, the work-tree guard, the scope guard and
+  the triviality check; `python craftsman/cli.py ...` is read as the CLI, and the `__main__` blocks of `gate.py` and
+  `export.py`, which ran around the policy, now only say that the module is no program (exit 2). Antigravity's `read_file(Path=...)` is wired to the scope guard
+  and judged like `view_file`, and a configured `ANTIGRAVITY_APP_DATA_DIR` or `CLAUDE_CONFIG_DIR` is protected for
+  reads as it is for writes. An Antigravity verifier that stops while the gate still waits for verdicts, and a hunter
+  that claimed no slot and recorded nothing, are sent back once, as on Claude Code. Launches that Antigravity cut from
+  its compact transcript are read from `transcript_full.jsonl`; a cut that cannot be restored is reported, never read
+  as "no launch". The cited source line of `review add` and `review move` is printed defanged, and an `echo` or `printf`
+  that could build the phrase of a record next to a recording call makes its output foreign. A hunter that covered
+  parts of several slots without a brief is dead for one slot only. `FOO=1 true` is as trivial as `true`.
 - **Antigravity reviews are read back correctly.** Parallel `invoke_subagent` calls, whose acknowledgements carry no
   id, are paired with their calls in call order and attributed to the right subagent; verifier runs are recorded like
   hunter runs; `gate --init` records the Antigravity conversation as the gate owner.

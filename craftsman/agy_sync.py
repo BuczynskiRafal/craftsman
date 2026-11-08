@@ -95,8 +95,10 @@ def main_conversation(app_dir: Path, conversation_id: str, transcript: Path | No
 
 def observe_runs(app_dir: Path, main_id: str, transcript: Path | None = None) -> tuple[ObservedRun, ...]:
     """The Craftsman subagents `main_id` launched and where each stands. Reads transcripts only; raises
-    `TranscriptError` when the main transcript cannot be read."""
-    entries = read_transcript_entries(transcript or conversation_transcript(app_dir, main_id))
+    `TranscriptError` when the main transcript cannot be read, or when a step that may hold a launch was cut from
+    its compact form and `transcript_full.jsonl` cannot give it back (a missing, oversized or unreadable full file):
+    a launch that cannot be seen is a problem for the caller to report, never "no launch"."""
+    entries = read_transcript_entries(transcript or conversation_transcript(app_dir, main_id), restore=True)
     return tuple(
         ObservedRun(launch, subagent_finish(app_dir, launch.conversation_id, main_id))
         for launch in subagent_launches(entries)

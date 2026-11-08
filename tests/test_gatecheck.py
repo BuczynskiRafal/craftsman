@@ -1194,7 +1194,40 @@ class SlotStatusTests(unittest.TestCase):
 
         result = statuses(ledger)
 
-        self.assertEqual((result["W1-1"].state, result["W1-2"].state), ("done", "dead"))
+        # The run answers for its slot W1-1 (its claim); the coverage it tagged W1-2 does not make W1-2 a dead hunter's.
+        self.assertEqual((result["W1-1"].state, result["W1-2"].state), ("done", "unlaunched"))
+
+    def two_partial_slots(self) -> Ledger:
+        base, _ = prepared(hunt_snap(2))
+        base = replace(base, rounds=(replace(base.rounds[0], prepared_at=T0, enforced=True),))
+        both = ("H1", "H2")
+        return planned(base, *(make_slot(slot_id, hunks=both) for slot_id in ("W1-1", "W1-2", "W1-3")))
+
+    def test_one_run_that_covered_part_of_two_slots_without_a_brief_ended_only_the_first(self) -> None:
+        # REVIEW-FSE 9: coverage tagged with several slots by one exactly attributed run, and no brief.
+        ledger = cover(cover(self.two_partial_slots(), "W1-1", 12, hunks=["H1"]), "W1-2", 13, hunks=["H1"])
+        ledger = with_agents(ledger, *run_events("h1", 10, 60, records=("C1", "C2")))
+
+        result = statuses(ledger)
+
+        self.assertEqual({slot_id: item.state for slot_id, item in result.items()}, {"W1-1": "dead", "W1-2": "unlaunched", "W1-3": "unlaunched"})
+
+    def test_the_slot_a_run_answers_for_is_the_first_in_plan_order_whatever_it_covered_first(self) -> None:
+        ledger = cover(cover(self.two_partial_slots(), "W1-2", 12, hunks=["H1"]), "W1-1", 13, hunks=["H1"])
+        ledger = with_agents(ledger, *run_events("h1", 10, 60, records=("C1", "C2")))
+
+        result = statuses(ledger)
+
+        self.assertEqual((result["W1-1"].state, result["W1-2"].state), ("dead", "unlaunched"))
+
+    def test_a_run_that_only_a_time_window_vouches_for_ended_every_slot_it_covered(self) -> None:
+        # No transcript was read, so the window cannot tell which slot the run answered for.
+        ledger = cover(cover(self.two_partial_slots(), "W1-1", 12, hunks=["H1"]), "W1-2", 13, hunks=["H1"])
+        ledger = with_agents(ledger, *run_events("h1", 10, 60, records=None))
+
+        result = statuses(ledger)
+
+        self.assertEqual((result["W1-1"].state, result["W1-2"].state), ("dead", "dead"))
 
     def test_a_hunter_that_crashed_after_its_brief_leaves_its_slot_dead(self) -> None:
         # Its transcript shows the `B` token the brief printed, so the claim is vouched by it: the hunter ended.

@@ -20,6 +20,7 @@ from craftsman.attribution import (
     AgentRun,
     Voucher,
     agent_runs,
+    bound_slots,
     distinct_verdict_runs,
     identity,
     round_vouchers,
@@ -27,7 +28,7 @@ from craftsman.attribution import (
     verdict_vouched,
 )
 from craftsman.diffscan import DiffSnapshot
-from craftsman.huntplan import plan_due_waves, required_slots, slots_missing, window_slots
+from craftsman.huntplan import plan_due_waves, required_slots, slot_order, slots_missing, window_slots
 from craftsman.ledger import uncovered_hunks
 from craftsman.records import (
     MIN_TESTS_HINT,
@@ -543,6 +544,7 @@ def _hunter_signs(
         if index is not None:
             accounted.add(index)
             ended[slot_id].append(runs[index].started + RUN_STALE_AFTER)
+    answers_for = bound_slots(ledger, runs, slot_order(ledger))
     for position, record in enumerate(ledger.coverage, 1):
         if record.round == number and record.hunter is not None:
             recorded = round_vouchers(
@@ -554,7 +556,13 @@ def _hunter_signs(
                 recorded_at=parse_timestamp(record.recorded_at),
                 by=record.by,
             )
-            ended[record.hunter].extend(_stopped(voucher.run) for voucher in recorded)
+            # An exactly attributed run answers for ONE slot (see `attribution.bound_slots`): coverage it tagged with
+            # another slot does not end that one. A run only a time window vouches for ended whichever slot it covered.
+            ended[record.hunter].extend(
+                _stopped(voucher.run)
+                for voucher in recorded
+                if not voucher.exact or answers_for.get((number, run_key(voucher.run, voucher.index))) == record.hunter
+            )
     # A slot can be done (credited from another slot's coverage) while its own hunter is still going on: that
     # open run is the hunter of the slot, not one that is still starting.
     done_slots = [slot_id for slot_id in done_claims if slot_id not in finished_done]

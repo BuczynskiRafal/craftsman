@@ -778,4 +778,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Not a program: the command policy reads one CLI (`craftsman gate ...`), and a module run around it would
+    # skip the rules. Failing loud keeps a script that still runs the module from believing it did the work.
+    sys.stderr.write("craftsman.gate is not a program: run `craftsman gate ...` instead\n")
+    raise SystemExit(2)

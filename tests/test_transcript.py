@@ -13,6 +13,7 @@ from craftsman.transcript import (
     SubagentLaunch,
     TranscriptError,
     decode_arg,
+    has_cut_tool_calls,
     is_waiting_on_question,
     latest_user_input,
     latest_user_input_text,
@@ -267,6 +268,133 @@ class SubagentFinishTests(unittest.TestCase):
         self.app.write_transcript("sub-1", parent_message(0, MAIN), planner(1, at=6))
         self.app.write_transcript("sub-1", parent_message(0, MAIN), planner(1, at=9), full=True)
         self.assertEqual(subagent_finish(self.app.root, "sub-1", MAIN).finished_at, agy_time(6))
+
+
+class CutFieldsTests(unittest.TestCase):
+    """Antigravity's compact transcript cuts long fields and lists them in `truncated_fields`."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = AgyApp(Path(tmp.name).resolve())
+
+    @staticmethod
+    def cut(entry: dict[str, object], *fields: str) -> dict[str, object]:
+        return {**{key: value for key, value in entry.items() if key not in fields}, "truncated_fields": list(fields)}
+
+    def test_without_restore_the_compact_entries_are_returned_as_written(self) -> None:
+        full = planner(1, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)
+        self.app.write_transcript("c", user_input(0, "go", 0), self.cut(full, "tool_calls"))
+        self.app.write_transcript("c", user_input(0, "go", 0), full, full=True)
+
+        entries = read_transcript_entries(self.app.transcript_path("c"))
+
+        self.assertEqual(entries[1]["truncated_fields"], ["tool_calls"])
+        self.assertNotIn("tool_calls", entries[1])
+
+    def test_restore_takes_the_cut_entry_from_the_same_line_of_the_full_file(self) -> None:
+        full = planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)
+        path = self.app.write_transcript("c", user_input(0, "go", 0), self.cut(full, "tool_calls"))
+        self.app.write_transcript("c", user_input(0, "go", 0), full, full=True)
+
+        entries = read_transcript_entries(path, restore=True)
+
+        self.assertEqual(entries[1], full)
+        self.assertEqual(entries[0], user_input(0, "go", 0))
+
+    def test_a_cut_response_is_a_question_only_while_nothing_restored_it(self) -> None:
+        question = ask_question(2)
+        cut = self.cut(question, "tool_calls")
+        command = planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)
+
+        self.assertTrue(has_cut_tool_calls([user_input(0, "go", 0), cut]))
+        self.assertTrue(is_waiting_on_question([user_input(0, "go", 0), cut]))  # unrestored: never trap the user
+        self.assertFalse(has_cut_tool_calls([user_input(0, "go", 0), question]))  # restored
+        self.assertTrue(is_waiting_on_question([user_input(0, "go", 0), question]))
+        self.assertFalse(is_waiting_on_question([user_input(0, "go", 0), command]))
+        self.assertFalse(is_waiting_on_question([cut, user_input(1, "answer", 4)]))  # the user spoke last
+        self.assertFalse(has_cut_tool_calls([self.cut(command, "content"), user_input(1, "answer", 4)]))
+        self.assertFalse(is_waiting_on_question([user_input(0, "go", 0), self.cut(command, "content")]))  # another field was cut
+
+    def test_restore_follows_line_numbers_across_blank_lines(self) -> None:
+        full = planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)
+        path = self.app.transcript_path("c")
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(user_input(0, "go", 0)) + "\n\n" + json.dumps(self.cut(full, "tool_calls")) + "\n", encoding="utf-8")
+        self.app.transcript_path("c", full=True).write_text(
+            json.dumps(user_input(0, "go", 0)) + "\n\n" + json.dumps(full) + "\n", encoding="utf-8"
+        )
+
+        self.assertEqual(read_transcript_entries(path, restore=True)[1], full)
+
+    def test_a_line_of_the_full_file_that_is_another_entry_is_not_taken(self) -> None:
+        cut = self.cut(planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=3), "tool_calls")
+        path = self.app.write_transcript("c", user_input(0, "go", 0), cut)
+        self.app.write_transcript("c", user_input(0, "go", 0), planner(7, at=3), full=True)  # another step
+
+        self.assertEqual(read_transcript_entries(path, restore=True)[1], cut)
+
+    def test_restore_reads_nothing_when_no_entry_was_cut(self) -> None:
+        path = self.app.write_transcript("c", user_input(0, "go", 0), planner(1, at=3))
+        self.app.transcript_path("c", full=True).write_text("not json at all\n", encoding="utf-8")  # never opened
+
+        self.assertEqual(len(read_transcript_entries(path, restore=True)), 2)
+
+    def test_a_transcript_that_is_not_the_compact_file_has_no_full_sibling(self) -> None:
+        full = planner(1, agy_call("run_command", encoded=False, CommandLine="ls"), at=3)
+        other = self.app.transcript_path("c").with_name("elsewhere.jsonl")
+        other.parent.mkdir(parents=True)
+        other.write_text(json.dumps(self.cut(full, "tool_calls")) + "\n", encoding="utf-8")
+        self.app.write_transcript("c", full, full=True)
+
+        self.assertEqual(read_transcript_entries(other, restore=True)[0]["truncated_fields"], ["tool_calls"])
+
+    def test_a_full_file_that_cannot_be_read_is_an_error_only_when_it_is_needed(self) -> None:
+        cut = self.cut(planner(1, agy_call("run_command", encoded=False, CommandLine="ls"), at=3), "tool_calls")
+        path = self.app.write_transcript("c", cut)
+        self.app.transcript_path("c", full=True).write_text("not json\n", encoding="utf-8")  # a line that is not JSON: skipped
+
+        self.assertEqual(read_transcript_entries(path, restore=True), [cut])  # nothing restores, nothing raises here
+
+        self.app.transcript_path("c", full=True).unlink()
+        self.app.transcript_path("c", full=True).mkdir()  # unreadable as a file
+
+        with self.assertRaisesRegex(TranscriptError, "cannot read the transcript .*transcript_full.jsonl"):
+            read_transcript_entries(path, restore=True)
+
+    def test_a_launch_in_a_cut_response_is_never_read_as_no_launch(self) -> None:
+        response = planner(1, agy_call("invoke_subagent", encoded=False, TypeName="self", Role="craftsman-reviewer", Prompt="p"), at=5)
+        ack = subagent_ack(2, "sub-1", 5)
+
+        with self.assertRaisesRegex(TranscriptError, "the tool_calls of step 1 was cut"):
+            subagent_launches([self.cut(response, "tool_calls"), ack])
+        with self.assertRaisesRegex(TranscriptError, "the content of step 2 was cut"):
+            subagent_launches([response, {**ack, "content": "Created the foll", "truncated_fields": ["content"]}])
+        self.assertEqual([item.conversation_id for item in subagent_launches([response, ack])], ["sub-1"])
+
+    def test_a_subagent_whose_last_response_lost_its_tool_calls_has_not_finished(self) -> None:
+        # The compact file shows a response without tool calls, which would end a turn; it may be a call that was cut.
+        running = planner(2, agy_call("run_command", encoded=False, CommandLine="ls"), at=9)
+        self.app.write_subagent(MAIN, "sub-1", planner(1, at=3), self.cut(running, "tool_calls"))
+
+        state = subagent_finish(self.app.root, "sub-1", MAIN)
+
+        self.assertEqual((state.finished_at, state.readable, state.last_step), (None, True, 2))
+
+    def test_a_cut_last_response_is_restored_from_the_full_file_alone(self) -> None:
+        running = planner(2, at=9)  # the full file says it really ended the turn
+        self.app.write_subagent(MAIN, "sub-1", planner(1, at=3), self.cut(running, "tool_calls"))
+        self.app.write_transcript("sub-1", parent_message(0, MAIN), planner(1, at=3), running, full=True)
+
+        self.assertEqual(subagent_finish(self.app.root, "sub-1", MAIN).finished_at, agy_time(9))
+
+    def test_the_role_of_a_subagent_is_read_from_the_full_file_when_the_registry_has_none(self) -> None:
+        response = planner(1, agy_call("invoke_subagent", encoded=False, TypeName="self", Role="craftsman-verifier", Prompt="p"), at=5)
+        ack = subagent_ack(2, "sub-1", 5)
+        self.app.write_transcript(MAIN, user_input(0, "go", 0), self.cut(response, "tool_calls"), ack)
+        self.app.write_transcript(MAIN, user_input(0, "go", 0), response, ack, full=True)
+
+        self.assertEqual(subagent_role(self.app.root, "sub-1", MAIN), "verifier")
 
 
 class ParentConversationTests(unittest.TestCase):

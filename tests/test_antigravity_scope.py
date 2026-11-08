@@ -225,6 +225,68 @@ class ScopeBindingTests(AntigravityPreToolTestCase):
         self.assertIn("gate state", reason or "")
 
 
+class ReadFileTests(AntigravityPreToolTestCase):
+    """`read_file(Path=...)` is the CLI variant's file reader: it is judged exactly like `view_file` (REVIEW-FSE 2)."""
+
+    def own_gate(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("antigravity", MAIN))
+
+    def test_a_read_of_another_repository_is_denied_like_view_file(self) -> None:
+        self.own_gate()
+        other = EvidenceRepo(self.tmp / "other-repo")
+        target = str(other.root / "app.py")
+
+        by_view = self.call(MAIN, "view_file", {"AbsolutePath": target})
+        by_read = self.call(MAIN, "read_file", {"Path": target})
+
+        self.assertEqual(by_view[0], "deny")
+        self.assertEqual(by_read[0], "deny")
+        self.assertIn("belongs to another git repository", by_read[1] or "")
+        self.assertEqual(self.call(MAIN, "read_file", {"Path": str(self.repo.root / "app.py")}), ("allow", None))
+
+    def test_a_read_of_a_protected_transcript_is_denied_like_view_file(self) -> None:
+        self.subagent()
+        transcript = str(self.app.transcript_path(MAIN))
+
+        by_view = self.call(SUB, "view_file", {"AbsolutePath": transcript})
+        by_read = self.call(SUB, "read_file", {"Path": transcript})
+
+        self.assertEqual(by_view[0], "deny")
+        self.assertEqual(by_read[0], "deny")
+        self.assertIn("protected session store", by_read[1] or "")
+
+    def test_the_app_data_directory_of_the_call_is_protected_for_reads(self) -> None:
+        # The conversation store of an app data directory that is not under the home directory.
+        stored = AgyApp(self.tmp / "custom-app")
+        stored.write_transcript(MAIN, user_input(0, "x", 0))
+        stored.write_subagent(MAIN, SUB, planner(1, at=3), role="craftsman-reviewer")
+        payload = stored.payload(SUB, self.repo.root, toolCall={"name": "read_file", "args": {"Path": str(stored.transcript_path(MAIN))}})
+
+        decision, reason = evaluate_antigravity_payload(payload, {}, clock(10))
+
+        self.assertEqual(decision, "deny")
+        self.assertIn("protected session store", reason or "")
+
+    def test_a_configured_app_data_directory_or_claude_directory_is_protected_for_reads(self) -> None:
+        self.subagent()
+        app_dir = self.tmp / "configured-app"
+        claude_dir = self.tmp / "configured-claude"
+        stores = {
+            "antigravity transcript": app_dir / "brain" / "c1" / ".system_generated" / "logs" / "transcript.jsonl",
+            "claude transcript": claude_dir / "projects" / "slug" / "session.jsonl",
+        }
+        env = {"ANTIGRAVITY_APP_DATA_DIR": str(app_dir), "CLAUDE_CONFIG_DIR": str(claude_dir)}
+        for label, path in stores.items():
+            path.parent.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+            for tool, key in (("read_file", "Path"), ("view_file", "AbsolutePath")):
+                with self.subTest(store=label, tool=tool):
+                    payload = self.app.payload(SUB, self.repo.root, toolCall={"name": tool, "args": {key: str(path)}})
+
+                    self.assertEqual(evaluate_antigravity_payload(payload, env, clock(10))[0], "deny")
+                    self.assertEqual(evaluate_antigravity_payload(payload, {}, clock(10))[0], "allow")  # nobody configured it
+
+
 class ArmingTests(AntigravityPreToolTestCase):
     def test_a_review_command_of_the_main_conversation_arms_the_guard(self) -> None:
         self.assertEqual(self.shell(MAIN, "craftsman review prepare", now=clock(10)), ("allow", None))
@@ -406,12 +468,28 @@ class HooksJsonTests(unittest.TestCase):
             {name for name, kind in kinds.items() if kind == "shell"}, {"run_command"}
         )
         self.assertEqual(
-            {name for name, kind in kinds.items() if kind == "read"}, {"view_file", "grep_search", "find_by_name", "list_dir"}
+            {name for name, kind in kinds.items() if kind == "read"},
+            {"view_file", "read_file", "grep_search", "find_by_name", "list_dir"},
         )
         self.assertGreaterEqual(
             {name for name, kind in kinds.items() if kind == "write"},
             {"write_to_file", "replace_file_content", "multi_replace_file_content", "write_file", "edit_file"},
         )
+
+    def test_every_tool_of_the_cli_variant_is_wired_and_none_of_the_ide_names_is_dropped(self) -> None:
+        # `agy` listed its own tools: run_command(CommandLine), read_file(Path), write_file(Path), edit_file(Path).
+        # `view_file`, `write_to_file`, `replace_file_content` and `multi_replace_file_content` are the IDE variant's.
+        wired = {group["matcher"] for group in self.config["craftsman-scope-guard"]["PreToolUse"]}
+
+        self.assertGreaterEqual(
+            wired,
+            {"run_command", "read_file", "write_file", "edit_file", "view_file", "write_to_file", "replace_file_content", "multi_replace_file_content"},
+        )
+
+    def test_the_read_file_group_is_the_view_file_group(self) -> None:
+        groups = {group["matcher"]: group["hooks"] for group in self.config["craftsman-scope-guard"]["PreToolUse"]}
+
+        self.assertEqual(groups["read_file"], groups["view_file"])
 
     def test_each_matcher_is_one_plain_tool_name(self) -> None:
         # Right whether the platform compares the matcher as a name or searches it as a regular expression. (Under

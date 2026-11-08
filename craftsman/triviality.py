@@ -17,7 +17,7 @@ import shlex
 from collections.abc import Sequence
 
 from craftsman.records import Run, RunKind
-from craftsman.shell import python_program
+from craftsman.shell import is_env_assignment, python_program, read_env_option
 
 # Test and end-to-end runs are what counts as verification.
 PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
@@ -36,9 +36,6 @@ _SHELL_PUNCTUATION = "();<>|&\n"
 _SEPARATOR_CHARS = frozenset("();|&\n")
 _PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?|py")
 _PYTHON_EXITS = frozenset({"exit", "quit"})
-# `env` options that consume a value: -u NAME, -C DIR, -S STRING and their long forms.
-_ENV_SHORT_VALUE_OPTIONS = frozenset("uCS")
-_ENV_LONG_VALUE_OPTIONS = {"--unset": "u", "--chdir": "C", "--split-string": "S"}
 
 
 def is_trivial_run(argv: Sequence[str], kind: str | None = None) -> bool:
@@ -78,52 +75,34 @@ def _program_name(token: str) -> str:
 
 
 def command_without_env(argv: Sequence[str]) -> list[str]:
-    """`argv` without a leading `env [options] [NAME=VALUE ...]` wrapper."""
+    """`argv` without the leading `NAME=VALUE` words and `env [options] [NAME=VALUE ...]` wrappers."""
     tokens = list(argv)
-    if not tokens or _program_name(tokens[0]) != "env":
-        return tokens
+    while tokens:
+        if is_env_assignment(tokens[0]):
+            tokens.pop(0)
+        elif _program_name(tokens[0]) == "env":
+            tokens = _after_env(tokens)
+        else:
+            break
+    return tokens
+
+
+def _after_env(tokens: list[str]) -> list[str]:
+    """`tokens` (starting with `env`) after the wrapper: its options, its assignments, and the words an `-S`
+    string stands for, which are read as the start of the command line."""
     rest = tokens[1:]
     while rest:
         token = rest.pop(0)
         if token == "--":
             break
-        if token.startswith("--"):
-            _consume_env_long_option(token, rest)
-        elif token.startswith("-") and token != "-":
-            _consume_env_short_options(token[1:], rest)
+        if token.startswith("-") and token != "-":
+            option = read_env_option(token, rest[:1])
+            del rest[: option.taken]
+            rest[:0] = option.words
         elif "=" not in token and token != "-":
             rest.insert(0, token)
             break
     return rest
-
-
-def _consume_env_long_option(token: str, rest: list[str]) -> None:
-    name, has_value, value = token.partition("=")
-    option = _ENV_LONG_VALUE_OPTIONS.get(name)
-    if option is None:
-        return
-    _apply_env_value(option, value if has_value else _pop_value(rest), rest)
-
-
-def _consume_env_short_options(flags: str, rest: list[str]) -> None:
-    for index, flag in enumerate(flags):
-        if flag in _ENV_SHORT_VALUE_OPTIONS:
-            inline = flags[index + 1 :]
-            _apply_env_value(flag, inline or _pop_value(rest), rest)
-            return
-
-
-def _apply_env_value(option: str, value: str, rest: list[str]) -> None:
-    if option != "S":
-        return
-    try:  # the value is itself the start of the command line
-        rest[:0] = shlex.split(value)
-    except ValueError:  # unbalanced quotes: env rejects it, so keep it as an opaque program
-        rest[:0] = [value]
-
-
-def _pop_value(rest: list[str]) -> str:
-    return rest.pop(0) if rest else ""
 
 
 def _is_trivial_python(code: str) -> bool:

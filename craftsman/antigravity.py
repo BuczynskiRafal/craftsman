@@ -34,6 +34,7 @@ from craftsman import hook_errors
 from craftsman.agy_sync import (
     AGENT_OF_ROLE,
     PLATFORM,
+    ObservedRun,
     apply_runs,
     events_of,
     observe_runs,
@@ -57,10 +58,12 @@ from craftsman.paths import user_home
 from craftsman.records import AgentEvent, Ledger, LedgerError, format_timestamp, parse_timestamp
 from craftsman.review_guard import gate_stop_inputs, serve_review_stop
 from craftsman.streams import configure_std_streams
+from craftsman.subagent_stop import REVIEWER_STOP_REASON, records_since, verifier_debt
 from craftsman.transcript import (
     Entry,
     TranscriptError,
     conversation_transcript,
+    has_cut_tool_calls,
     is_waiting_on_question,
     latest_user_input,
     latest_user_input_text,
@@ -69,7 +72,6 @@ from craftsman.transcript import (
     request_body,
     review_request,
     step_of,
-    subagent_role,
 )
 from craftsman.trigger import detect_trigger, task_from_prompt
 from craftsman.workspace import arm_marker, end_review_guard, read_marker
@@ -144,8 +146,11 @@ class StopPayload:
         return GateOwner(PLATFORM, self.conversation_id)
 
     def entries(self) -> list[Entry]:
-        """The transcript of this conversation (none yet is no entries)."""
-        return read_transcript_entries(self.transcript or conversation_transcript(self.app_dir, self.conversation_id))
+        """The transcript of this conversation (none yet is no entries). The full transcript is read as well when
+        the compact one cut the calls of the agent's latest response: they may be a question to the user."""
+        path = self.transcript or conversation_transcript(self.app_dir, self.conversation_id)
+        entries = read_transcript_entries(path)
+        return read_transcript_entries(path, restore=True) if has_cut_tool_calls(entries) else entries
 
 
 def is_final_stop(payload: Mapping[str, Any]) -> bool:
@@ -327,21 +332,22 @@ def _claimed(state: GateState, entries: Sequence[Entry], caller: GateOwner) -> G
 
 
 def _subagent_stop(stop: StopPayload, root: Path, parent: str, now: datetime) -> str | None:
-    """The stop of a subagent conversation: sent back once when it leaves a slot it claimed unfinished, else recorded.
+    """The stop of a subagent conversation: sent back once when it still owes work, else recorded.
 
+    A reviewer owes the slot it claimed (unfinished) or, holding no claim, some coverage or a finding; a verifier
+    owes the verdicts the gate waits for (`subagent_stop`, the rules the Claude Code SubagentStop hook applies).
     The decision is made on the ledger as if the subagent had stopped (its run synced from its transcript);
     that ledger is stored only when the subagent may stop. The nudge-once memory is the `nudge` event.
     """
     runs = observe_runs(stop.app_dir, parent)
     mine = next((run for run in runs if run.launch.conversation_id == stop.conversation_id), None)
-    role = mine.launch.role if mine is not None else subagent_role(stop.app_dir, stop.conversation_id, parent)
 
     def judge(ledger: Ledger) -> tuple[Ledger, str | None]:
         candidate = apply_runs(ledger, runs)
-        problem = None
-        if mine is not None and role == "reviewer" and not _was_sent_back(ledger, stop.conversation_id):
-            problem = _unfinished_slot(candidate, events_of(ledger, mine), now)
-        if problem is None or mine is None:
+        if mine is None or _was_sent_back(ledger, stop.conversation_id):
+            return candidate, None  # not a Craftsman subagent of this conversation, or already sent back once
+        problem = _owed(candidate, mine, events_of(ledger, mine), now)
+        if problem is None:
             return candidate, None
         nudge = AgentEvent(
             PLATFORM,
@@ -363,12 +369,16 @@ def _was_sent_back(ledger: Ledger, conversation_id: str) -> bool:
     )
 
 
-def _unfinished_slot(candidate: Ledger, run_events: Sequence[AgentEvent], now: datetime) -> str | None:
-    """What the subagent still owes on a slot it claimed in the latest round, None when it owes nothing.
+REPORT_TO_PARENT = "send your 2-3 line summary to your parent with send_message."
+
+
+def _owed(candidate: Ledger, run: ObservedRun, run_events: Sequence[AgentEvent], now: datetime) -> str | None:
+    """What the subagent still owes, None when it owes nothing.
 
     `run_events` are the events its transcript gives (`agy_sync.events_of`). This is its final Stop, so when the
     transcript does not show the end of the turn yet (the last entry is not written when the hook runs) it is
     judged as stopping `now`; that stop is used for the judgement only, the transcript decides what is stored.
+    Its records name it (`antigravity:<conversation id>`), which is how its own work is told from anyone else's.
     """
     start = run_events[0]
     stop = next((event for event in run_events if event.event == "stop"), None)
@@ -377,17 +387,28 @@ def _unfinished_slot(candidate: Ledger, run_events: Sequence[AgentEvent], now: d
         candidate = add_agent_event(candidate, stop)
     if not candidate.rounds:
         return None
+    started = parse_timestamp(start.at)
+    who = f"{PLATFORM}:{start.agent_id}"
+    if run.launch.role == "verifier":
+        reminder = verifier_debt(candidate, None, started, by=who)
+        return None if reminder is None else f"{reminder} Then {REPORT_TO_PARENT}"
+    return _reviewer_debt(candidate, who, started, parse_timestamp(stop.at), now)
+
+
+def _reviewer_debt(candidate: Ledger, who: str, started: datetime, stop_at: datetime, now: datetime) -> str | None:
     latest = candidate.rounds[-1]
-    mine = {claim.slot for claim in candidate.claims if claim.round == latest.number and claim.by == f"{PLATFORM}:{start.agent_id}"}
-    for slot_id, missing in unfinished_slots(candidate, latest, parse_timestamp(stop.at), now):
+    mine = {claim.slot for claim in candidate.claims if claim.round == latest.number and claim.by == who}
+    for slot_id, missing in unfinished_slots(candidate, latest, stop_at, now):
         if slot_id in mine:
             hunks = hunk_ranges(missing)
             return (
                 f"Your slot {slot_id} is not finished: cover hunks {hunks} with "
                 f'`craftsman review cover --hunter {slot_id} --hunks {hunks} --note "..."`, '
-                "then send your 2-3 line summary to your parent with send_message."
+                f"then {REPORT_TO_PARENT}"
             )
-    return None
+    if mine or records_since(candidate, started, who):
+        return None
+    return f"{REVIEWER_STOP_REASON} Then {REPORT_TO_PARENT}"
 
 
 # --- the answer ------------------------------------------------------------------------------------------

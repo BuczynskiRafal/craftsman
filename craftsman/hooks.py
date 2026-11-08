@@ -70,7 +70,7 @@ from craftsman.gate import (
     state_path_for,
     update_state,
 )
-from craftsman.gatecheck import claim_holders, unfinished_slots, verification_debt
+from craftsman.gatecheck import claim_holders, unfinished_slots
 from craftsman.huntview import hunk_ranges
 from craftsman.ledger import (
     add_agent_event,
@@ -80,7 +80,6 @@ from craftsman.ledger import (
 )
 from craftsman.paths import user_home
 from craftsman.records import (
-    GROUPED_EVIDENCE_PREFIX,
     AgentEvent,
     AgentEventKind,
     AgentRole,
@@ -103,6 +102,7 @@ from craftsman.scope import (
     is_scope_checked_tool,
     load_scope_policy,
 )
+from craftsman.subagent_stop import REVIEWER_STOP_REASON, verifier_debt
 from craftsman.trigger import detect_trigger, is_review_prompt, review_request, task_from_prompt
 from craftsman.usage import TranscriptFacts, read_transcript
 from craftsman.workspace import arm_marker, end_review_guard
@@ -122,11 +122,6 @@ HOOK_EVENT_NAMES: dict[Event, str] = {
 }
 # Characters that a shell or PowerShell would interpret inside a double-quoted argument.
 SHELL_ACTIVE_CHARS_RE = re.compile(r'["`$\\%!\n\r]')
-REVIEWER_STOP_REASON = (
-    "Before finishing, record coverage (`craftsman review cover ...`) for the slice you "
-    "examined, and a finding (`craftsman review add ...`) for every defect you found. If your prompt "
-    "names a slot <ID>, run `craftsman review brief <ID>` first and add `--hunter <ID>` to both commands."
-)
 
 
 class UsageError(Exception):
@@ -789,7 +784,7 @@ def _unfinished_work(
     since = _run_start(before, hook, role, stop_at)
     assert since is not None  # `on_subagent_stop` dropped the stop of a run the ledger never saw start
     if role == "verifier":
-        return _verifier_debt(after, stop.records, since)
+        return verifier_debt(after, stop.records, since)
     latest = after.rounds[-1]
     unfinished = unfinished_slots(after, latest, stop_at, now)
     if unfinished:
@@ -830,52 +825,6 @@ def _holds_claim(after: Ledger, latest: Round, stop: AgentEvent, now: datetime) 
         for index, run in enumerate(agent_runs(after))
         if run.role == "reviewer" and run.stopped == stop_at
     )
-
-
-def _verifier_debt(after: Ledger, records: tuple[str, ...] | None, since: datetime) -> str | None:
-    """The reminder for a verifier that judged nothing of what the gate still waits for, None when it may finish.
-
-    What a verifier owes is the gate's own verification debt (`gatecheck.verification_debt`: findings without a
-    verdict, with a verdict no verifier vouches for, or dismissed serious ones that lack a second opinion).
-    Per verifier: its OWN records must hold the token of a real verdict (a transcript was read), else a real
-    verdict event must have been recorded since it started. A merge is no verdict, and a finding judged by
-    someone else does not excuse it.
-    """
-    owed = verification_debt(after, after.rounds[-1])
-    if not owed or _judged_since(after, records, since):
-        return None
-    unjudged = {finding.id for finding in after.findings if finding.verdict is None}
-    ids = ", ".join(owed)
-    if unjudged.issuperset(owed):
-        subject = f"Findings still without a verdict: {ids}."
-    else:
-        subject = f"Findings that still need your independent verdict: {ids}."
-    return (
-        f"{subject} Record one for each with "
-        '`craftsman review verdict <id> --as proven|probable|question|dismissed --evidence "..."` '
-        "before finishing."
-    )
-
-
-def _judged_since(ledger: Ledger, records: tuple[str, ...] | None, since: datetime) -> bool:
-    """Whether the verifier that started at `since` recorded a verdict (a merge is none).
-
-    With its transcript's `records`, one of them is the token of a verdict event that is no merge. Without
-    (no transcript was readable), a verdict event that is no merge was recorded at or after `since`; a chained
-    or repeated merge leaves several merge events, and every one of them is skipped.
-    """
-    if records is not None:
-        judging = {event.token for finding in ledger.findings for event in finding.verdict_log if not event.merge}
-        return any(token in judging for token in records)
-    for finding in ledger.findings:
-        if finding.verdict is None:
-            continue
-        if any(not event.merge and parse_timestamp(event.at) >= since for event in finding.verdict_log):
-            return True
-        merged = finding.verdict_evidence.startswith(GROUPED_EVIDENCE_PREFIX)
-        if not finding.verdict_log and not merged and parse_timestamp(finding.updated_at) >= since:
-            return True  # a verdict from before verdict events existed
-    return False
 
 
 def transcript_roots(platform: Platform, hook: HookInput, env: Mapping[str, str] | None = None) -> tuple[Path, ...]:

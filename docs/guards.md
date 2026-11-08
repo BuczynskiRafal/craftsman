@@ -64,7 +64,8 @@ denies, in this order, for a shell command (a file-writing tool is checked again
 
 - **Hook entry points.** `craftsman hook ...` in every spelling, `python -m craftsman.hooks`, the guard scripts, and
   inline Python programs that import `craftsman` are run by the platform, never by an agent. What a `python` command
-  line runs is decided by `shell.python_program`.
+  line runs is decided by `shell.python_program`; the words of an `env -S "<command line>"` string are read as the command
+  they start (`shell.read_env_option`: every spelling of the options that take a value, `-C`'s directory included), so no wrapper hides a command from any rule below.
 - **The evidence.** Writes into `<git-dir>/craftsman/` (the ledger, the gate state, the hook error log; `inbox/` and
   `scratch/` stay open) and into the transcript folders of the platforms, by any write verb, redirection, inline
   program or file-writing tool (the Claude Code matcher covers `Write|Edit|MultiEdit|NotebookEdit`). Reading stays
