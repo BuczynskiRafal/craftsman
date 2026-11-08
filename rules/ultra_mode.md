@@ -28,7 +28,8 @@ Before writing or editing any code, include a section **`### Design analysis`** 
 2. Include the `ultrathink` design analysis before implementing.
 3. Build with explicit types and explicit error handling: no silent failures, no broad catch-alls,
    invalid states made impossible where the type system allows it.
-4. Run the final review of `/craft-review` in deep mode, then tests **and** an end-to-end run
-   through `craftsman run`.
+4. Run the final review of `/craft-review` in deep mode (`craftsman review prepare --deep`: every
+   slot of the hunt plan launched through `craftsman review brief`), then tests **and** an end-to-end
+   run through `craftsman run`.
 5. Finish only when `craftsman review check` passes, then `craftsman gate --complete` and report
    with `craftsman review report`.

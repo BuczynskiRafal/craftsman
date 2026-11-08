@@ -109,6 +109,9 @@ Doctor checks:
 - Platform hooks configuration (Copilot, Claude Code, Antigravity)
 - Hook collisions between user-level settings and Claude Code plugins
 
+When `craftsman review prepare` prints `Advisory:` instead of `Enforced:`, no Craftsman hook saw the session: run `craftsman doctor` to find the missing or duplicate hooks. The hooks also write what they could not do to `<git-dir>/craftsman/hook-errors.log`, and `craftsman review check` reports it.
+
+
 ---
 
 ## Uninstallation & Backups

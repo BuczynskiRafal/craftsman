@@ -8,14 +8,15 @@
 
 Craftsman makes an AI coding agent prove its change was reviewed and tested. The idea is **build
 freely, review hard**: while building, the agent works without review loops or ceremony. When it
-finishes, the final diff is frozen and attacked by fresh-context hunter subagents that did not write
-the code, independent verifiers try to disprove every finding, and the hunt continues while it keeps
-turning up real defects. The agent cannot finish until the tests pass on the final code.
+finishes, the final diff is frozen and the CLI plans the hunt from it. Fresh-context hunter subagents that
+did not write the code take every planned slot, separate verifier subagents try to disprove every finding, and the
+hunt continues while it keeps turning up real defects. The agent cannot finish until every slot is done and
+the tests pass on the final code.
 
-Craftsman keeps a ledger in the `.git` directory with the evidence: which hunks the hunters covered,
+Craftsman keeps a ledger in the `.git` directory with the evidence: which hunks each hunter covered,
 what each finding was judged to be and why, and the test runs. A platform hook checks the ledger when
 the agent tries to stop and sends it back with a list of what is missing. The gate checks outcomes,
-not effort.
+not effort, and a hook that fails is logged, never silent.
 
 It works with Claude Code, GitHub Copilot, and Google Antigravity. In Codex and Cursor, the same
 protocol runs without hooks.
@@ -63,17 +64,19 @@ Depth never goes down during a session. The final report explains what the agent
 ![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
 
 ```text
-/craftsman <task>  ->  build freely  ->  review prepare (freeze the diff, risk map)
-  ->  hunters (fresh context, parallel)  ->  verifiers try to disprove every finding
+/craftsman <task>  ->  build freely  ->  review prepare (freeze the diff, hunt plan)
+  ->  one hunter per slot (fresh context, parallel)  ->  verifiers try to disprove every finding
   ->  another wave while it finds real defects  ->  fix, confirm, re-check the fix delta
   ->  craftsman run (tests on the final code)  ->  stop hook lets the agent finish  ->  report
 ```
 
-The agent builds with no gate activity. Then the diff is frozen into a round, fresh-context hunters
-record every candidate defect with a concrete trigger, and separate verifiers try to disprove each one
-and reproduce the survivors. Hunters maximize recall; verifiers maximize precision. While a wave
-proves a defect, another one runs. Confirmed defects are fixed at the root cause, the fix delta is
-re-checked by a fresh hunter, and the tests run through `craftsman run` on the final code.
+The agent builds with no gate activity. Then the diff is frozen into a round and the CLI turns it into a
+hunt plan: slots of hunks and lenses, sized by the diff and its risk signals, not by how hard the model
+feels like trying. Each slot goes to a fresh-context hunter that records every candidate defect with a
+concrete trigger, and separate verifiers try to disprove each one and reproduce the survivors. Hunters
+maximize recall; verifiers maximize precision. While a wave proves a defect, another one runs. Confirmed
+defects are fixed at the root cause, the fix delta is re-checked by fresh hunters, and the tests run through
+`craftsman run` on the final code.
 `/craft-review` runs the same hunt on an existing change, and fixes only when you ask.
 
 The full protocol, with diagrams, is in
@@ -89,8 +92,9 @@ The full protocol, with diagrams, is in
 | Google Antigravity | `Stop` hook |
 | Codex, Cursor, and other tools that read `AGENTS.md` | `craftsman gate --complete` |
 
-Where the platform cannot confirm that a separate subagent performed the review, the gate still
-closes and the report marks it as `SELF-REVIEWED`.
+Where the platform cannot confirm that a separate subagent performed the review (Codex, Cursor, or a
+session without hooks), the review is advisory: it is complete when every hunk is covered, the gate still
+closes, and the report marks it as `SELF-REVIEWED`.
 
 ## Measurements
 
@@ -110,9 +114,9 @@ recall on any agent platform.
 ## Documentation
 
 - [Usage](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md): example requests, what the agent decides, optional flags
-- [How it works](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md): the protocol in full, what hunters read, ledger, gate, lenses, platform enforcement
+- [How it works](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md): the protocol in full, the hunt plan, what hunters read, ledger, gate, lenses, platform enforcement
 - [Installation](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md): flags, platform setup, uninstall, `craftsman doctor`
-- [Guards](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/guards.md): gate state machine, search scope guard
+- [Guards](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/guards.md): gate state machine, review guard, command policy, search scope guard, hook error log
 - [Skills](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md): catalog of bundled skills
 - [Benchmark](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md): methodology, results, replication
 - [Architecture](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/harness-architecture.md): project internals for contributors

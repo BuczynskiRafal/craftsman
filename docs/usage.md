@@ -38,8 +38,8 @@ You never have to choose these. The agent reads the request and the repository.
 | :--- | :--- |
 | **Target** | Nothing named: the working tree against the gate's base commit, else `HEAD`. A branch or commit: that ref. A PR number or URL: it checks the PR out and reviews against its merge base. "Staged changes", "tracked files", or a path freezes that scope for the review. |
 | **Fixing** | `/craftsman` always fixes. `/craft-review` fixes when the words ask for it; otherwise it only reports. |
-| **Depth** | One adaptive depth, `deep`: every lens, at least two waves, an end-to-end run in addition to the tests. The agent goes deep for risky changes or when you ask for care ("critical", "be thorough", `ultracraft`); the list of triggers is under **Depth** in the [`craft-review` skill](../skills/craft-review/SKILL.md). Depth never goes down within a session. |
-| **Hunt plan** | How many hunters, which lenses each gets, how the diff is split between them, and whether another wave is worth running. |
+| **Depth** | One adaptive depth, `deep`: every lens on every production hunk, a fresh second look, an end-to-end run in addition to the tests. `review prepare` goes deep by itself when a security or concurrency signal fires in a production hunk or the change is large (over 250 changed production lines); the agent adds its own judgment, and goes deep when you ask for care ("critical", "be thorough", `ultracraft`). The list is under **Depth** in the [`craft-review` skill](../skills/craft-review/SKILL.md). Depth never goes down within a session. |
+| **Hunt plan** | Not a decision of the agent: `review prepare` computes it from the diff. How many hunters, which lenses each gets and how the diff is split between them follow from the kinds of hunks and their risk signals; findings that are proven call for further waves, up to three generations. The agent launches every slot and cannot skip one. |
 | **When to ask you** | Only for an ambiguity that changes what gets built, to accept a `major` finding instead of fixing it, and when the round cap is reached. |
 
 ---
@@ -49,16 +49,18 @@ You never have to choose these. The agent reads the request and the repository.
 The final report is plain Markdown for a human reader:
 
 - what was built or reviewed, file by file;
-- the agent's decisions in plain words: the depth and why, the hunters and their lenses, the waves
+- the agent's decisions in plain words: the depth and why, the hunt plan's slots and their lenses, the waves
   and why another one ran or stopped, how findings were verified (reproduced, or read statically);
 - findings fixed, accepted (with reasons), and dismissed (count), by severity;
 - the verification commands and their results;
 - the agent usage per role (hunters, verifiers), where the platform provides it;
-- what the gate did not assess, and a `SELF-REVIEWED` banner when the platform could not confirm that
-  separate subagents did the review.
+- what the gate did not assess, a `SELF-REVIEWED` banner when the platform could not confirm that
+  separate subagents did the review (an advisory round), and a count of hook errors if any hook failed
+  while the review ran.
 
 `/craft-review` without fixes ends with a review-only report. `partial` marks a review in which some
-slices stayed uncovered after retries and lists them under `Not covered`.
+slots stayed uncovered after retries and lists them under `Not covered`; `REVIEW ABANDONED - NOT COMPLETE` marks one
+that the review guard let the agent leave after six reminders without progress.
 
 ---
 
@@ -83,11 +85,18 @@ slices stayed uncovered after retries and lists them under `Not covered`.
 
 ```bash
 craftsman status                       # deep flag, round, coverage, findings and verdicts, latest runs, agent usage
+craftsman review check                 # what is missing: slots to launch, verifiers, runs (--review-only outside a gate)
 craftsman review show --hunks          # the hunks still to cover (H# -> file:lines)
 craftsman review scout H3              # base version, callers and tests of a hunk (or path:line, or a symbol)
 craftsman review report                # the final report, with agent usage per role
 craftsman skill show craft-review --lenses trust,state   # lens playbooks
 ```
+
+`craftsman review check --json` (and `report --json`) print the verdict of the gate for scripts: `passed`,
+`partial`, `self_reviewed`, `enforced`, `platform`, `abandoned`, `slots` (each with `id`, `state` of `done`,
+`running`, `dead` or `unlaunched`, `lenses`, `hunks` and `missing`), `issues` (`code`, `message`), `warnings`,
+`summary`, and `hook_errors` (`count`, `since_round`, `path`) when a hook failed since the round was prepared.
+`check` exits 1 while `passed` is false.
 
 ---
 
@@ -100,9 +109,13 @@ words above do the same.
 | :--- | :--- | :--- |
 | `--deep` | `/craftsman`, `/craft-review`, `gate --init`, `review prepare` | Starts or raises the review to deep. Inside a gate session it raises the gate for good; nothing lowers it. |
 | `--base <ref>` | `/craft-review`, `review prepare` | Review against this ref instead of the default base. |
+| `--task "<text>"` / `--task-file <path or ->` | `review prepare` | The intent brief that every hunter and verifier brief quotes as `Task:` (at most 4000 characters, for both `--task` and `--task-file`). |
 | `--staged` / `--tracked` / `--paths <csv>` | `/craft-review`, `review prepare` | Freeze the review-only scope to the index, to tracked changes, or to these files and directories. |
 | `--add-paths <csv>` | `review prepare` | Extend a frozen scope, for example with a new regression test. |
 | `--fix` | `/craft-review` | Fix confirmed findings, re-check the fix delta, and run the tests. |
 | `--comment` | `/craft-review` | Post the report on the PR with `gh pr comment`. |
-| `--partial` | `review report --review-only` | Report a review that stayed incomplete after retries. |
+| `--partial` | `review report --review-only` | Report a review that stayed incomplete after retries. Refused when the round is enforced and no hunter was launched in it; it never ends the review guard (only a report of a review that passed does). |
+| `--hunter <slot or lead>` | `review add`, `review cover` | The hunt-plan slot that did the work, as the brief prints it (required in an enforced round). `lead` marks the orchestrator's own findings and never credits coverage. |
+| `brief <slot>` | `review brief` | Records that a hunter took the slot, then prints its task, slice, lenses and the commands that record its work. A hunter's launch prompt is one line naming the slot. |
+| `brief --verifier F1,F2` | `review brief` | Prints a verifier's instruction for these findings and records nothing. |
 | `--takeover` | `gate --init` | Take over a gate opened by another session. |

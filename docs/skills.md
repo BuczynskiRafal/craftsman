@@ -9,7 +9,7 @@ Craftsman includes 13 specialized skills and agent roles designed to assist thro
 | `/modernize` | **Legacy Track**: Pins legacy behavior using characterization tests and rule cards before safe transformation. |
 | `/batch` | **Mass-Change Track**: Splits extensive mechanical migrations (API updates, type sweeps) into disjoint work units for parallel execution. |
 | `/simplify` | **Cleanup Loop**: Applies behavior-preserving cleanups: reduces complexity, eliminates duplication, and prunes unused work. |
-| `/craft-review` | **Review Engine**: Freezes the diff, runs fresh-context hunters and verifiers in adaptive waves, and records the outcome in the evidence ledger. |
+| `/craft-review` | **Review Engine**: Freezes the diff, plans the hunt from it, runs fresh-context hunters and verifiers in waves, and records the outcome in the evidence ledger. |
 | `/verify` | **Runtime Verification**: Exercises changed behavior against live environments, recording exit codes and outputs. |
 | `/audit` | **Targeted Multi-Lens Audit**: In-depth audit across selectable lenses (errors, tests, types, comments, security). |
 | `/audit-comments` | **Docstring & Comment Audit**: Verifies factual accuracy of docstrings and comments against actual implementation code. |
