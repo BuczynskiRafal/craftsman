@@ -40,6 +40,7 @@ from craftsman.attribution import (
     credited_lenses,
     finding_slots,
     slot_work,
+    window_run_slots,
 )
 from craftsman.diffscan import (
     DiffSnapshot,
@@ -625,6 +626,24 @@ class _Stored:
     def since(self, number: int, slot_id: str) -> datetime | None:
         slot = self.slot(number, slot_id)
         return None if slot is None or slot.since is None else parse_timestamp(slot.since)
+
+
+def window_slots(
+    ledger: Ledger, runs: Sequence[AgentRun] | None = None, *, matched_only: bool = False
+) -> dict[tuple[int, str], str]:
+    """The slot each window run serves, by (round number, `attribution.run_key`): the assignment that `slots_missing` credits by.
+
+    `matched_only` lists just the run each slot was matched to (see `attribution.window_run_slots`).
+    """
+    stored = _Stored(ledger)
+    return window_run_slots(
+        ledger,
+        agent_runs(ledger) if runs is None else runs,
+        stored.order,
+        slot_hunks=stored.hunks,
+        slot_since=stored.since,
+        matched_only=matched_only,
+    )
 
 
 def required_slots(ledger: Ledger, round_: Round) -> tuple[Slot, ...]:

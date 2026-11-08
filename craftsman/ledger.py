@@ -354,9 +354,10 @@ def _still_carried(
 ) -> tuple[HunkRef, ...]:
     """`hunks` with every carried hunk that lacks a lens of `required` made open again.
 
-    This is the in-place raise of a round to deep: its carried hunks were carried against the lenses
-    required at normal depth. A hunk is never carried again by this, only released. Without `required`
-    and `credited` nothing changes.
+    This is the re-check of a round that is prepared again for the same diff: its carried hunks were
+    carried against the lenses required at normal depth (an in-place raise to deep), or against a credit
+    that counted more than the round now accepts (an upgrade to enforced). A hunk is never carried again
+    by this, only released. Without `required` and `credited` nothing changes.
     """
     if required is None or credited is None:
         return tuple(hunks)
@@ -385,8 +386,11 @@ def open_round(
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op.
 
     Asking for `deep` on an unchanged diff raises the latest round in place: its coverage stays.
-    Given `required` and `credited` (the deep ones), a carried hunk that lacks a deep lens becomes
-    open again, so the raised round owes it; nothing else changes.
+    On every reuse of the latest round, given `required` and `credited` (as that round sees them: the
+    deep lenses, the credit judged for its enforcement), a carried hunk whose required lenses are not
+    all credited becomes open again, so the round owes it; a hunk is never carried by this, only
+    released. A round upgraded to enforced in place thus cannot keep hunks that only an unvouched
+    self-review carried into it.
 
     Given both `required` (hunk id -> the lenses the hunk must be examined with) and `credited` (hunk
     digest -> the lenses accepted coverage has examined it with), a hunk is carried over only when
@@ -402,10 +406,11 @@ def open_round(
         )
         latest = ledger.rounds[-1]
         if round_unchanged(ledger, snap, scope):
-            if latest.deep or not deep:
+            hunks = _still_carried(latest.hunks, required, credited)
+            if hunks == latest.hunks and (latest.deep or not deep):
                 return ledger, latest
-            raised = replace(latest, deep=True, hunks=_still_carried(latest.hunks, required, credited))
-            return replace(ledger, rounds=(*ledger.rounds[:-1], raised)), raised
+            refreshed = replace(latest, deep=latest.deep or deep, hunks=hunks)
+            return replace(ledger, rounds=(*ledger.rounds[:-1], refreshed)), refreshed
     unknown = sorted(set(symbols_by_hunk) - {hunk.id for hunk in snap.hunks})
     if unknown:
         raise LedgerError(f"symbols given for hunks not in the snapshot: {', '.join(unknown)}")

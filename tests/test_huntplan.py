@@ -48,6 +48,7 @@ from craftsman.huntplan import (
     slots_missing,
     sweep_pending,
     unanswered_triggers,
+    window_slots,
 )
 from craftsman.ledger import add_agent_event, add_finding, open_round, stable_hunk_ids
 from craftsman.records import (
@@ -74,6 +75,7 @@ from tests.support import (
     FINDING,
     agent_event,
     at,
+    cover_open_hunks,
     coverage_note,
     make_hunk,
     make_slot,
@@ -742,11 +744,13 @@ def prepare_round(
     same: bool = False,
     task: str = "",
     symbols: Mapping[str, tuple[str, ...]] | None = None,
+    enforced: bool = True,
 ) -> _Prepared:
     """`craftsman review prepare` on `ledger` for `hunks` at `seconds` after T0: `review._plan_round` itself.
 
     `same` hands it the fingerprint of the latest round (an unchanged diff: the round is re-prepared in
-    place), otherwise it is a new diff. Only the workspace and the clock are stand-ins.
+    place), otherwise it is a new diff. `enforced` is what the hooks say about the session (an advisory round
+    when False). Only the workspace and the clock are stand-ins.
     """
     fingerprint = ledger.rounds[-1].fingerprint if same else f"fp{len(ledger.rounds) + 1}"
     snap = stable_hunk_ids(ledger, make_snap(*hunks, fingerprint=fingerprint))
@@ -765,7 +769,7 @@ def prepare_round(
         now=parse_timestamp(at(seconds + 1)),
     )
     with (
-        patch("craftsman.review.review_enforcement", return_value=(True, "cli")),
+        patch("craftsman.review.review_enforcement", return_value=(enforced, "cli")),
         patch("craftsman.ledger._now", return_value=at(seconds)),
     ):
         return _plan_round(ledger, ctx, lambda _ids: ())
@@ -981,6 +985,7 @@ class CarryOverTests(unittest.TestCase):
 
     def legacy(self, hunks: Sequence[Hunk], *, vouched: bool) -> Ledger:
         legacy, _ = prepared(make_snap(*hunks))
+        legacy = replace(legacy, rounds=(replace(legacy.rounds[0], prepared_at=at(0)),))  # a run before it vouches nothing
         legacy = replace(legacy, coverage=(Coverage(1, tuple(h.digest for h in hunks), coverage_note(["H1", "H2"]), at(1)),))
         if vouched:
             legacy = add_agent_event(legacy, agent_event("start", REVIEWER, "legacy", 0))  # no transcript: by time
@@ -3186,6 +3191,133 @@ class RandomSequenceTests(unittest.TestCase):
         for name in ("deep prepared", "first deep round", "raised after a wave ran", "fresh set carried",
                      "wave scope checked", "fresh complement checked"):  # fmt: skip
             self.assertGreater(len(self.reached[name]), 20, name)
+
+
+class WindowSlotsTests(unittest.TestCase):
+    """The wrapper `window_slots` hands the stored plan's hunks and `since` to the attribution, as `slots_missing` does."""
+
+    def wave_ledger(self, tagged_hunk: str, seconds: float) -> Ledger:
+        ledger = hunt([code("H1", "a.py", 300), code("H2", "b.py", 300)])
+        wave = replace(make_slot("W2-X1", hunks=("H1",), lenses=("intent",)), since=at(100))
+        ledger = with_slots(ledger, wave)
+        round_ = ledger.rounds[0]
+        digests = tuple(ref.digest for ref in round_.hunks if ref.id == tagged_hunk)
+        record = Coverage(1, digests, coverage_note((tagged_hunk,)), at(seconds), hunter="W2-X1")
+        ledger = replace(ledger, coverage=(*ledger.coverage, record))
+        for event in (
+            agent_event("start", REVIEWER, "r", 90, platform="copilot"),
+            agent_event("stop", REVIEWER, "r", 130, platform="copilot"),
+        ):
+            ledger = add_agent_event(ledger, event)
+        return ledger
+
+    def test_a_run_whose_only_record_precedes_the_since_of_the_slot_serves_nothing(self) -> None:
+        self.assertEqual(window_slots(self.wave_ledger("H1", 95)), {})
+
+    def test_a_run_whose_only_record_covers_hunks_the_slot_does_not_own_serves_nothing(self) -> None:
+        self.assertEqual(window_slots(self.wave_ledger("H2", 110)), {})
+
+    def test_a_run_with_a_record_after_the_since_serves_the_slot(self) -> None:
+        ledger = self.wave_ledger("H1", 110)
+
+        self.assertEqual(window_slots(ledger), {(1, "id:r"): "W2-X1"})
+        self.assertEqual(window_slots(ledger, matched_only=True), {(1, "id:r"): "W2-X1"})
+
+
+class UpgradeToEnforcedTests(unittest.TestCase):
+    """D3 item 1 (agy REVIEW-D2 F1): an advisory round upgraded to enforced in place re-judges its carried hunks."""
+
+    def advisory_rounds(self) -> Ledger:
+        """Round 2 (advisory) carries H1, which only the orchestrator's own self-review of round 1 covered."""
+        first = prepare_round(Ledger(), [code("H1", "a.py")], seconds=0, enforced=False)
+        reviewed = cover_open_hunks(first.ledger)
+        second = prepare_round(reviewed, [code("H1", "a.py"), code("H2", "b.py")], seconds=100, enforced=False)
+        return second.ledger
+
+    def upgrade(self, ledger: Ledger) -> _Prepared:
+        return prepare_round(ledger, [code("H1", "a.py"), code("H2", "b.py")], seconds=200, same=True)
+
+    def test_the_advisory_round_carries_the_self_reviewed_hunk(self) -> None:
+        ledger = self.advisory_rounds()
+
+        self.assertEqual({ref.id: ref.carried for ref in ledger.rounds[-1].hunks}, {"H1": True, "H2": False})
+        self.assertEqual([slot.hunks for slot in ledger.rounds[-1].plan.slots if slot.kind == "bug"], [("H2",)])  # type: ignore[union-attr]
+
+    def test_the_upgrade_releases_the_hunk_and_plans_the_lenses_it_owes(self) -> None:
+        upgraded = self.upgrade(self.advisory_rounds())
+
+        round_ = upgraded.round
+        self.assertTrue(round_.enforced)
+        self.assertEqual({ref.id: ref.carried for ref in round_.hunks}, {"H1": False, "H2": False})
+        assert round_.plan is not None
+        lenses_of_h1 = {lens for slot in round_.plan.slots if "H1" in slot.hunks for lens in slot.lenses}
+        self.assertTrue(set(CORE) <= lenses_of_h1, lenses_of_h1)
+        self.assertTrue(upgraded.refreshed)
+        self.assertFalse(upgraded.created)
+
+    def test_the_stored_plan_stays_append_only_and_every_slot_is_required(self) -> None:
+        before = self.advisory_rounds()
+        upgraded = self.upgrade(before)
+
+        stored_is_required(self, upgraded.ledger)
+        old = before.rounds[-1].plan
+        assert old is not None and upgraded.round.plan is not None
+        self.assertEqual(upgraded.round.plan.slots[: len(old.slots)], old.slots)
+
+    def test_untagged_coverage_of_the_round_itself_does_not_keep_the_hunk_carried_once_it_is_enforced(self) -> None:
+        """A run's window vouches the orchestrator's untagged cover of H1 in the advisory round; the enforced round accepts none."""
+        ledger = self.advisory_rounds()
+        digest = next(ref.digest for ref in ledger.rounds[-1].hunks if ref.id == "H1")
+        ledger = replace(ledger, coverage=(*ledger.coverage, Coverage(2, (digest,), coverage_note(["H1"]), at(150))))
+        ledger = add_agent_event(ledger, agent_event("start", REVIEWER, "w", 120))
+        ledger = add_agent_event(ledger, agent_event("stop", REVIEWER, "w", 160))
+        still = prepare_round(ledger, [code("H1", "a.py"), code("H2", "b.py")], seconds=200, same=True, enforced=False)
+        self.assertTrue(next(ref for ref in still.round.hunks if ref.id == "H1").carried)
+
+        upgraded = self.upgrade(ledger)
+
+        self.assertFalse(next(ref for ref in upgraded.round.hunks if ref.id == "H1").carried)
+
+    def test_without_an_upgrade_the_carried_hunk_stays_carried(self) -> None:
+        again = prepare_round(
+            self.advisory_rounds(), [code("H1", "a.py"), code("H2", "b.py")], seconds=200, same=True, enforced=False
+        )
+
+        self.assertEqual({ref.id: ref.carried for ref in again.round.hunks}, {"H1": True, "H2": False})
+        self.assertFalse(again.refreshed)
+
+    def test_a_round_that_was_enforced_already_is_not_refreshed_by_a_second_prepare(self) -> None:
+        upgraded = self.upgrade(self.advisory_rounds())
+
+        again = self.upgrade(upgraded.ledger)
+
+        self.assertFalse(again.refreshed)
+        self.assertEqual(again.round, upgraded.round)
+
+    def test_a_hunk_a_vouched_hunter_covered_is_not_released(self) -> None:
+        """Round 1 is enforced: a hunter of its plan covered H1 for every lens; round 2 carries it and stays so."""
+        first = prepare_round(Ledger(), [code("H1", "a.py")], seconds=0)
+        plan = first.round.plan
+        assert plan is not None
+        ledger = first.ledger
+        digest = first.round.hunks[0].digest
+        for index, slot in enumerate(plan.slots, 1):
+            ledger = replace(
+                ledger,
+                claims=(*ledger.claims, SlotClaim(1, slot.id, f"B{index}", at(1))),
+                coverage=(*ledger.coverage, Coverage(1, (digest,), coverage_note(["H1"]), at(2), hunter=slot.id)),
+            )
+            ledger = add_agent_event(ledger, agent_event("start", REVIEWER, f"h{index}", 1))
+            ledger = add_agent_event(
+                ledger, agent_event("stop", REVIEWER, f"h{index}", 3, records=(f"B{index}", f"C{len(ledger.coverage)}"))
+            )
+        second = prepare_round(ledger, [code("H1", "a.py"), code("H2", "b.py")], seconds=100)
+        self.assertTrue(next(ref for ref in second.round.hunks if ref.id == "H1").carried)
+
+        again = prepare_round(second.ledger, [code("H1", "a.py"), code("H2", "b.py")], seconds=200, same=True)
+
+        self.assertTrue(next(ref for ref in again.round.hunks if ref.id == "H1").carried)
+        self.assertFalse(again.refreshed)
 
 
 if __name__ == "__main__":

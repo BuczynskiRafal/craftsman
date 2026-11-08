@@ -16,8 +16,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from craftsman.ledger import reopened_in, verdict_streak
 from craftsman.lenses import LENS_IDS
@@ -37,6 +38,9 @@ from craftsman.triviality import is_trivial_run
 # Platforms where every honest record names its caller (`by`): a record without `by` is vouched by no run of
 # these, not even by the time window, so withholding the identity cannot borrow a run.
 IDENTITY_PLATFORMS = ("antigravity",)
+
+# A hunter or verifier that started longer ago than this and never reported is taken for dead.
+RUN_STALE_AFTER = timedelta(minutes=30)
 
 # Test and end-to-end runs are what counts as verification (the same kinds as `gatecheck.PASSING_KINDS`,
 # which cannot be imported here: the gate imports this module).
@@ -79,6 +83,29 @@ class _Start:
     at: datetime
 
 
+def pair_unnamed_stop(starts: Sequence[datetime], stop_at: datetime, prepared: datetime | None) -> int | None:
+    """Which of `starts` a stop without an agent id ends: an index into `starts`, None when it ends none.
+
+    `starts` are the times of the unpaired starts of the stop's role (and name), `prepared` the `prepared_at`
+    of the latest round that began no later than the stop (None before any round). The stop ends the oldest
+    start that began at or after `prepared` and is not after the stop: the hunter of the CURRENT round, so a
+    hunter of an earlier round that hung without a stop never takes the place of one that began in this
+    round. Only when there is none, the oldest start that began less than `RUN_STALE_AFTER` before the stop
+    (a run kept across the preparation of a round, or a ledger whose rounds say nothing). Otherwise the stop
+    is an orphan (a stop of a run the ledger never saw start, e.g. one from before a reset) and ends nothing.
+
+    The one place that pairs such a stop: reading the ledger (`agent_runs`) and recording a stop (the
+    SubagentStop hook) must agree on it.
+    """
+    eligible = [i for i, began in enumerate(starts) if began <= stop_at]
+    if prepared is not None:
+        current = [i for i in eligible if starts[i] >= prepared]
+        if current:
+            return min(current, key=lambda i: (starts[i], i))
+    recent = [i for i in eligible if stop_at - starts[i] < RUN_STALE_AFTER]
+    return min(recent, key=lambda i: (starts[i], i)) if recent else None
+
+
 def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
     """Every craftsman reviewer and verifier run in `ledger.agents`, oldest start first.
 
@@ -87,10 +114,12 @@ def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
       never with a start of another id. When every such start is paired already (a subagent that was
       sent back and stopped again), it extends the run of the latest of them instead of making a
       second run: later stop time, records of both (unknown if either is), so one start stays one run;
-    - a stop without an id, and a stop whose id no start carries, pairs first-in, first-out with the
-      unpaired starts of its name, but only with a start that has no id when the stop has one (Copilot
-      starts by name only), so parallel runs of one name keep their own windows;
-    - a stop that finds no start begins at the `prepared_at` of the round that was current.
+    - a stop whose id no start carries pairs first-in, first-out with the unpaired starts of its name that
+      have no id (Copilot starts by name only), so parallel runs of one name keep their own windows;
+    - a stop without an id pairs by `pair_unnamed_stop`: with the oldest unpaired start of its name that
+      began since the latest round was prepared, else with one that began less than `RUN_STALE_AFTER` before
+      it; a stop that finds none is an orphan and ignored;
+    - any other stop that finds no start begins at the `prepared_at` of the round that was current.
     Starts no stop claims become runs that have not stopped. Agents that are not a craftsman role are
     ignored.
     """
@@ -119,6 +148,13 @@ def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
             and craftsman_agent_name(item.event.agent) == name
             and (not event.agent_id or not item.event.agent_id)
         ]
+        if not event.agent_id:
+            before = [r for r in ledger.rounds if parse_timestamp(r.prepared_at) <= at]
+            prepared = parse_timestamp(before[-1].prepared_at) if before else None
+            pick = pair_unnamed_stop([starts[i].at for i in by_name], at, prepared)
+            if pick is None:
+                continue  # an orphan: no start of this round (or just before it) is left for it
+            by_name = [by_name[pick]]
         if untaken_of_id or not same_id and by_name:
             chosen = untaken_of_id[0] if untaken_of_id else by_name[0]
             started = min(starts[chosen].at, at)
@@ -186,6 +222,31 @@ def vouching_runs(
     return tuple(exact or window)
 
 
+def round_vouchers(
+    ledger: Ledger,
+    runs: Sequence[AgentRun],
+    round_number: int,
+    *,
+    role: AgentRole,
+    token: str,
+    recorded_at: datetime,
+    by: str | None,
+) -> tuple[Voucher, ...]:
+    """`vouching_runs` for a record of round `round_number`: a run that started before the round was prepared vouches for nothing.
+
+    Such a run belongs to an earlier round (a hunter or verifier still going, or hung, when this one was
+    prepared). The cut is applied after the vouchers are chosen, so an exact voucher from before the round
+    is not replaced by a window run that happened to be going on. Every path that asks who vouches for a
+    record of a round goes through here.
+    """
+    prepared = parse_timestamp(ledger.rounds[round_number - 1].prepared_at)
+    return tuple(
+        voucher
+        for voucher in vouching_runs(runs, role=role, token=token, recorded_at=recorded_at, by=by)
+        if voucher.run.started >= prepared
+    )
+
+
 # --- slot work ------------------------------------------------------------------------------
 
 SlotLenses = Callable[[int, str], tuple[str, ...] | None]  # (round number, slot id) -> lenses, None if unknown
@@ -226,18 +287,15 @@ def _tagged_records(ledger: Ledger, runs: Sequence[AgentRun]) -> dict[int, list[
             continue
         token = f"C{index}"
         at = parse_timestamp(record.recorded_at)
-        prepared = parse_timestamp(ledger.rounds[record.round - 1].prepared_at)
-        vouchers = tuple(
-            voucher
-            for voucher in vouching_runs(runs, role="reviewer", token=token, recorded_at=at, by=record.by)
-            if voucher.run.started >= prepared
+        vouchers = round_vouchers(
+            ledger, runs, record.round, role="reviewer", token=token, recorded_at=at, by=record.by
         )
         if vouchers:
             by_round[record.round].append(_Tagged(token, record, at, vouchers))
     return by_round
 
 
-def _run_key(run: AgentRun, index: int) -> str:
+def run_key(run: AgentRun, index: int) -> str:
     """What makes two runs one: the agent id (a resumed agent keeps it), or the position when a platform reports none."""
     return f"id:{run.agent_id}" if run.agent_id else f"run:{index}"
 
@@ -257,8 +315,10 @@ def _bound_slots(
     claimed: dict[tuple[int, str], tuple[datetime, str]] = {}
     for claim in ledger.claims:
         at = parse_timestamp(claim.at)
-        for voucher in vouching_runs(runs, role="reviewer", token=claim.token, recorded_at=at, by=claim.by):
-            slot_key = (claim.round, _run_key(voucher.run, voucher.index))
+        for voucher in round_vouchers(
+            ledger, runs, claim.round, role="reviewer", token=claim.token, recorded_at=at, by=claim.by
+        ):
+            slot_key = (claim.round, run_key(voucher.run, voucher.index))
             if voucher.exact and (slot_key not in claimed or at < claimed[slot_key][0]):
                 claimed[slot_key] = (at, claim.slot)
     bound = {slot_key: slot for slot_key, (_, slot) in claimed.items()}
@@ -268,16 +328,16 @@ def _bound_slots(
         for item in items:
             assert item.record.hunter is not None
             for voucher in item.vouchers:
-                run_key = _run_key(voucher.run, voucher.index)
-                best = first.get(run_key)
+                key = run_key(voucher.run, voucher.index)
+                best = first.get(key)
                 if voucher.exact and (
                     best is None
                     or (order.get(item.record.hunter, len(order)), item.record.hunter)
                     < (order.get(best, len(order)), best)
                 ):
-                    first[run_key] = item.record.hunter
-        for run_key, slot in first.items():
-            bound.setdefault((number, run_key), slot)
+                    first[key] = item.record.hunter
+        for key, slot in first.items():
+            bound.setdefault((number, key), slot)
     return bound
 
 
@@ -285,18 +345,22 @@ def _round_digests(ledger: Ledger, number: int, hunk_ids: frozenset[str]) -> fro
     return frozenset(ref.digest for ref in ledger.rounds[number - 1].hunks if ref.id in hunk_ids)
 
 
-def _window_slots_kept(rank_order: Sequence[str], vouched_by: Mapping[str, set[str]]) -> set[str]:
-    """The slots, taken in plan order, that can each be given a run of their own: a maximum matching.
+def _window_matching(rank_order: Sequence[str], vouched_by: Mapping[str, Mapping[str, AbstractSet[str]]]) -> dict[str, str]:
+    """The slots, taken in plan order, that can each be given a run of their own, and that run: a maximum matching.
 
-    `vouched_by` maps a slot to the keys of the window runs that vouch for its records. A slot is kept
-    when it can be matched to a run no other kept slot needs, moving an earlier match to another of its
-    runs if that frees one (an augmenting path). Earlier slots win, so a run that covers several slots
-    credits the first and leaves the rest to other runs.
+    `vouched_by` maps a slot to the window runs that vouch for its records (run key -> the digests the run
+    vouches for). A slot is kept when it can be matched to a run no other kept slot needs, moving an
+    earlier match to another of its runs if that frees one (an augmenting path). Earlier slots win, so a
+    run that covers several slots credits the first and leaves the rest to other runs. A slot tries the
+    run that vouches for the most of its digests first: honest hunters that overlap in time are all
+    vouched for by every window, and the run that holds the most of a slot's work is the likeliest to be
+    its hunter, so the others are left for the other slots. The result maps each kept slot to its run key.
     """
     owner: dict[str, str] = {}  # run key -> the slot it is matched to
 
     def assign(slot: str, tried: set[str]) -> bool:
-        for key in sorted(vouched_by[slot]):
+        runs = vouched_by[slot]
+        for key in sorted(runs, key=lambda key: (-len(runs[key]), key)):
             if key in tried:
                 continue
             tried.add(key)
@@ -305,7 +369,26 @@ def _window_slots_kept(rank_order: Sequence[str], vouched_by: Mapping[str, set[s
                 return True
         return False
 
-    return {slot for slot in rank_order if assign(slot, set())}
+    for slot in rank_order:
+        assign(slot, set())
+    return {slot: key for key, slot in owner.items()}
+
+
+def _window_run_slots(
+    matched: Mapping[str, str], rank_order: Sequence[str], vouched_by: Mapping[str, Mapping[str, AbstractSet[str]]]
+) -> dict[str, str]:
+    """The one slot each window run serves: a run never completes two slots.
+
+    A run matched to a slot (`_window_matching`) serves that slot. Any other run that vouches for records of
+    kept slots serves the first of them in plan order, so a slot a dead hunter left half done is still
+    finished by the replacement runs that vouch for it, but no run serves two slots.
+    """
+    served = {key: slot for slot, key in matched.items()}
+    for slot in rank_order:
+        if slot in matched:
+            for key in sorted(vouched_by[slot]):
+                served.setdefault(key, slot)
+    return served
 
 
 def _window_candidates(
@@ -359,32 +442,69 @@ def slot_work(
     - by time window only, from a run that is not bound to a slot in that round. Parallel runs
       overlap, so a window cannot tell their claims apart and skips binding; instead the slots that
       rest on windows alone ("window slots") are matched one-to-one to the window runs that vouch
-      for their records, earlier slots in plan order first (see `_window_slots_kept`): a run can
-      carry one slot, whatever it recorded. Slots with an exact voucher are never capped, and they
-      are credited with their exact records, plus one exception for a relaunch: when the exact hunter
+      for their records, earlier slots in plan order first (see `_window_matching`): a run serves
+      ONE slot (`_window_run_slots`), whatever it recorded, and only the records made under that run
+      count. Slots with an exact voucher are never capped, and they are credited with their exact records, plus one exception for a relaunch: when the exact hunter
       died with the slot half done, a replacement whose transcript cannot be read must still be able
       to finish it. A window record tagged with such a slot therefore adds the digests no exact record
       of the slot covers, but only when the window run is apart in time from every exact holder of the
       slot (it ran before or after them, in whatever order the relaunches came; a run that overlaps one
       comes from an agent nobody can name and adds nothing). For a slot with a `since` (`slot_since`),
-      exact coverage recorded before it does not count as covered, so a relaunch that covers the digest
-      again after the trigger still completes the slot. These top-ups take part in the one-to-one
-      matching to window runs like any other window slot.
+      a record of the slot made before it is dropped up front (it counts for nothing, here and in
+      `credited_lenses`), so a relaunch that covers the digest again after the trigger completes the slot.
+      These top-ups take part in the one-to-one matching to window runs like any other window slot.
 
     With `slot_hunks`, a record counts only for the hunks that belong to its slot: its digests are
     cut to those of the slot's hunks, and a record left with none adds nothing. A slot `slot_hunks`
     does not know (None) is not cut.
     """
+    return _slot_work(ledger, runs, slot_order, slot_hunks, slot_since)[0]
+
+
+def window_run_slots(
+    ledger: Ledger,
+    runs: Sequence[AgentRun],
+    slot_order: SlotOrder,
+    *,
+    slot_hunks: SlotHunks | None = None,
+    slot_since: SlotSince | None = None,
+    matched_only: bool = False,
+) -> dict[tuple[int, str], str]:
+    """The slot each window run (a run whose records cannot be read) serves, by (round, `run_key`).
+
+    The same assignment `slot_work` credits by: a run serves one slot, the slot whose accepted window
+    records it holds. A run that served no slot is absent. With `matched_only`, only the runs the
+    matching gave a slot of their own (`_window_matching`: one run per slot) are listed, not the further
+    runs that finish a slot a dead hunter left half done: those are evidence of the slot's work, but not
+    the one run that is certainly its hunter's.
+    """
+    _, serves, matched = _slot_work(ledger, runs, slot_order, slot_hunks, slot_since)
+    return matched if matched_only else serves
+
+
+def _slot_work(
+    ledger: Ledger,
+    runs: Sequence[AgentRun],
+    slot_order: SlotOrder,
+    slot_hunks: SlotHunks | None,
+    slot_since: SlotSince | None,
+) -> tuple[dict[tuple[int, str], SlotWork], dict[tuple[int, str], str], dict[tuple[int, str], str]]:
     tagged = _tagged_records(ledger, runs)
     bound = _bound_slots(ledger, runs, tagged, slot_order)
     work: dict[tuple[int, str], SlotWork] = {}
+    window_runs: dict[tuple[int, str], str] = {}  # every window run -> the slot it serves
+    matched_runs: dict[tuple[int, str], str] = {}  # the runs the matching gave a slot of their own -> that slot
     for number, all_items in tagged.items():
         order = {slot: place for place, slot in enumerate(slot_order(number))}
         digests_of: dict[str, frozenset[str]] = {}
         items: list[_Tagged] = []
         for item in all_items:
+            assert item.record.hunter is not None
+            since = None if slot_since is None else slot_since(number, item.record.hunter)
+            if since is not None and item.at < since:
+                continue  # made before the slot's trigger: it counts for nothing, anywhere
             digests = frozenset(item.record.digests)
-            allowed = None if slot_hunks is None or item.record.hunter is None else slot_hunks(number, item.record.hunter)
+            allowed = None if slot_hunks is None else slot_hunks(number, item.record.hunter)
             if allowed is not None:
                 digests &= _round_digests(ledger, number, allowed)
             if digests:
@@ -396,28 +516,36 @@ def slot_work(
             exact = tuple(
                 v
                 for v in item.vouchers
-                if v.exact and bound.get((number, _run_key(v.run, v.index))) == item.record.hunter
+                if v.exact and bound.get((number, run_key(v.run, v.index))) == item.record.hunter
             )
             if exact:
                 accepted.append((item, exact))
             elif window := tuple(
-                v for v in item.vouchers if not v.exact and (number, _run_key(v.run, v.index)) not in bound
+                v for v in item.vouchers if not v.exact and (number, run_key(v.run, v.index)) not in bound
             ):
                 windowed.append((item, window))
         exact_tokens = {item.token for item, _ in accepted}
         exact_covered: dict[str, frozenset[str]] = {}
         for item, _ in accepted:
             assert item.record.hunter is not None
-            since = None if slot_since is None else slot_since(number, item.record.hunter)
-            if since is None or item.at >= since:
-                exact_covered[item.record.hunter] = exact_covered.get(item.record.hunter, frozenset()) | digests_of[item.token]
+            exact_covered[item.record.hunter] = exact_covered.get(item.record.hunter, frozenset()) | digests_of[item.token]
         window_candidates = _window_candidates(windowed, accepted, exact_covered, digests_of)
-        vouched_by: dict[str, set[str]] = defaultdict(set)
+        vouched_by: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
         for item, vouchers in window_candidates:
             assert item.record.hunter is not None
-            vouched_by[item.record.hunter].update(_run_key(v.run, v.index) for v in vouchers)
-        kept = _window_slots_kept(sorted(vouched_by, key=lambda slot: (order.get(slot, len(order)), slot)), vouched_by)
-        accepted.extend(pair for pair in window_candidates if pair[0].record.hunter in kept)
+            for v in vouchers:
+                vouched_by[item.record.hunter][run_key(v.run, v.index)] |= digests_of[item.token]
+        rank = sorted(vouched_by, key=lambda slot: (order.get(slot, len(order)), slot))
+        matched = _window_matching(rank, vouched_by)
+        serves = _window_run_slots(matched, rank, vouched_by)
+        for key, serving in serves.items():
+            window_runs[(number, key)] = serving
+        for matched_slot, key in matched.items():
+            matched_runs[(number, key)] = matched_slot
+        for item, vouchers in window_candidates:
+            own = tuple(v for v in vouchers if serves.get(run_key(v.run, v.index)) == item.record.hunter)
+            if own:
+                accepted.append((item, own))
         for slot in dict.fromkeys(item.record.hunter for item, _ in accepted):
             assert slot is not None
             mine = [(item, vouchers) for item, vouchers in accepted if item.record.hunter == slot]
@@ -442,14 +570,14 @@ def slot_work(
                 runs=tuple(
                     sorted(
                         {
-                            voucher.run.agent_id or _run_key(voucher.run, voucher.index)
+                            voucher.run.agent_id or run_key(voucher.run, voucher.index)
                             for _, vouchers in mine
                             for voucher in vouchers
                         }
                     )
                 ),
             )
-    return work
+    return work, window_runs, matched_runs
 
 
 def bound_slots(
@@ -478,14 +606,16 @@ def finding_slots(
     asks about many findings and has it already.
     """
     table = bound_slots(ledger, runs, slot_order) if bound is None else bound
-    vouchers = vouching_runs(
+    vouchers = round_vouchers(
+        ledger,
         runs,
+        finding.round,
         role="reviewer",
         token=finding.id,
         recorded_at=parse_timestamp(finding.recorded_at),
         by=finding.by,
     )
-    slots = (table.get((finding.round, _run_key(v.run, v.index))) for v in vouchers if v.exact)
+    slots = (table.get((finding.round, run_key(v.run, v.index))) for v in vouchers if v.exact)
     return frozenset(slot for slot in slots if slot is not None)
 
 
@@ -539,8 +669,10 @@ def credited_lenses(
             continue  # the hooks hold this round to its hunters: only `slot_work` credits there
         credits: frozenset[str] = LENS_IDS
         if enforced:
-            if record.hunter is not None or not vouching_runs(
+            if record.hunter is not None or not round_vouchers(
+                ledger,
                 seen_runs,
+                record.round,
                 role="reviewer",
                 token=f"C{index}",
                 recorded_at=parse_timestamp(record.recorded_at),
@@ -566,9 +698,7 @@ def verdict_vouched(ledger: Ledger, finding: Finding, event: VerdictEvent, runs:
     current = next((item for item in ledger.findings if item.id == finding.id), None)
     if current is None or event not in current.verdict_log:
         return False
-    return bool(
-        vouching_runs(runs, role="verifier", token=event.token, recorded_at=parse_timestamp(event.at), by=event.by)
-    )
+    return bool(_verifier_keys(ledger, current, event, runs))
 
 
 def distinct_verdict_runs(ledger: Ledger, finding: Finding, runs: Sequence[AgentRun]) -> int:
@@ -587,7 +717,7 @@ def distinct_verdict_runs(ledger: Ledger, finding: Finding, runs: Sequence[Agent
     current = next((item for item in ledger.findings if item.id == finding.id), None)
     if current is None:
         return 0
-    return _matching_size([_verifier_keys(event, runs) for event in verdict_streak(current)])
+    return _matching_size([_verifier_keys(ledger, current, event, runs) for event in verdict_streak(current)])
 
 
 def _matching_size(candidates: Sequence[set[str]]) -> int:
@@ -610,12 +740,18 @@ def _matching_size(candidates: Sequence[set[str]]) -> int:
 # --- progress -------------------------------------------------------------------------------
 
 
-def _verifier_keys(event: VerdictEvent, runs: Sequence[AgentRun]) -> set[str]:
-    """The keys of the verifier runs that vouch for `event`."""
+def _verifier_keys(ledger: Ledger, finding: Finding, event: VerdictEvent, runs: Sequence[AgentRun]) -> set[str]:
+    """The keys of the verifier runs that vouch for `event`, a verdict event of `finding` (see `round_vouchers`)."""
     return {
-        _run_key(v.run, v.index)
-        for v in vouching_runs(
-            runs, role="verifier", token=event.token, recorded_at=parse_timestamp(event.at), by=event.by
+        run_key(v.run, v.index)
+        for v in round_vouchers(
+            ledger,
+            runs,
+            finding.round,
+            role="verifier",
+            token=event.token,
+            recorded_at=parse_timestamp(event.at),
+            by=event.by,
         )
     }
 
@@ -642,8 +778,14 @@ def evidence_counter(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
     """
     vouched = sum(
         bool(
-            vouching_runs(
-                runs, role="reviewer", token=f"C{index}", recorded_at=parse_timestamp(record.recorded_at), by=record.by
+            round_vouchers(
+                ledger,
+                runs,
+                record.round,
+                role="reviewer",
+                token=f"C{index}",
+                recorded_at=parse_timestamp(record.recorded_at),
+                by=record.by,
             )
         )
         for index, record in enumerate(ledger.coverage, 1)
@@ -651,7 +793,7 @@ def evidence_counter(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
     judged = 0
     resolutions = 0
     for finding in ledger.findings:
-        events = [(event.verdict, _verifier_keys(event, runs)) for event in finding.verdict_log]
+        events = [(event.verdict, _verifier_keys(ledger, finding, event, runs)) for event in finding.verdict_log]
         for verdict in dict.fromkeys(verdict for verdict, _ in events):
             judged += _matching_size([keys for judged_as, keys in events if judged_as == verdict])
         if finding.resolution is None:

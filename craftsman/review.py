@@ -16,6 +16,7 @@ from typing import Any, TypeVar
 from craftsman import huntplan, huntview
 from craftsman.agy_sync import sync_antigravity_runs
 from craftsman.assets import TemplateRole, load_agent_templates
+from craftsman.attribution import agent_runs
 from craftsman.diffscan import (
     IGNORE_FILE,
     DiffScanError,
@@ -107,7 +108,6 @@ from craftsman.records import (
     Slot,
     SlotClaim,
     Verdict,
-    agent_role,
     as_choice,
     check_coverage_note,
     collecting_problems,
@@ -243,6 +243,7 @@ class _Prepared:
     raised: bool
     added_slots: tuple[str, ...]  # slots a re-prepare of the same diff appended to the plan
     task_changed: bool = False  # a re-prepare of the same diff gave the round a different task text
+    refreshed: bool = False  # a re-prepare of the same diff released carried hunks or made the round enforced
 
 
 def _read_task_file(source: str) -> str:
@@ -329,7 +330,7 @@ def _prepare(args: argparse.Namespace) -> int:
     # The hints parse every changed Python file: compute them before the ledger lock is taken, for
     # the hunks this round will have to review (carried hunks were reviewed already).
     planned = _plan_round(ledger, ctx, lambda _ids: ())
-    hint_ids = planned.round.open_hunk_ids if planned.created else None
+    hint_ids = planned.round.open_hunk_ids if planned.created or planned.refreshed else None
     hints = collect_quality_signals(ws.root, snap.only(hint_ids)) if hint_ids is not None else ()
 
     def signals_for(open_ids: tuple[str, ...]) -> tuple[QualitySignal, ...]:
@@ -347,7 +348,7 @@ def _prepare(args: argparse.Namespace) -> int:
     ledger, round_ = result.ledger, result.round
     touch_review(ws.ledger_path)
     packet = Path(round_.packet_path)
-    if result.created or result.raised or result.task_changed or not packet.is_file():
+    if result.created or result.raised or result.refreshed or result.task_changed or not packet.is_file():
         pctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task)
         _write_text(packet, render_packet(pctx))
     if ws.state is not None and not owned:
@@ -384,6 +385,11 @@ def _plan_round(
     base = huntplan.plan_due_waves(current, ctx.now) if changing else current
     required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep)
     enforced, platform = review_enforcement(ctx.ws, current, ctx.env, ctx.now)
+    if not changing and enforced and not base.rounds[-1].enforced:
+        # The round is upgraded in place: it is judged as the enforced round it is about to be, so the credit
+        # it gets (and the hunks it keeps carried) never rests on what only an advisory round accepts.
+        upgraded = replace(base.rounds[-1], enforced=True, platform=platform)
+        base = replace(base, rounds=(*base.rounds[:-1], upgraded))
     have = huntplan.credited(base, enforced=enforced)
     carry_sweep = changing and huntplan.sweep_pending(base)
     packet = packet_path(ctx.ws.ledger_path, len(base.rounds) + 1)
@@ -415,13 +421,14 @@ def _plan_round(
     stored_before = current.rounds[-1].plan if current.rounds else None
     known = {slot.id for slot in stored_before.slots} if stored_before is not None and not created else set()
     task = _round_task(ctx, base, round_, created=created)
+    refreshed = not created and (round_.hunks != current.rounds[-1].hunks or enforced != current.rounds[-1].enforced)
     prepared = replace(
         round_,
         plan=plan,
         enforced=enforced,
         platform=platform,
         task=task,
-        signals=signals_for(round_.open_hunk_ids) if created else round_.signals,
+        signals=signals_for(round_.open_hunk_ids) if created or refreshed else round_.signals,
     )
     updated = huntplan.plan_due_waves(replace(opened, rounds=(*opened.rounds[:-1], prepared)), ctx.now)
     prepared = updated.rounds[-1]
@@ -434,6 +441,7 @@ def _plan_round(
         if not created and prepared.plan is not None
         else (),
         task_changed=not created and task != round_.task,
+        refreshed=refreshed,
     )
 
 
@@ -1625,7 +1633,7 @@ def _merge(args: argparse.Namespace) -> int:
             suggestion=args.suggestion,
             by=by,
         )
-        return updated, (target, duplicates)
+        return _store_due_waves(updated), (target, duplicates)  # the merge may judge the last finding a wave waits for
 
     target, duplicates = mutate(ws.ledger_path, record)
     dup_ids = ", ".join(item.id for item in duplicates)
@@ -2247,7 +2255,7 @@ def _require_hunters_launched(ws: Workspace, ledger: Ledger) -> None:
         return
     prepared = parse_timestamp(latest.prepared_at)
     if any(claim.round == latest.number for claim in ledger.claims) or any(
-        agent_role(event.agent) == "reviewer" and parse_timestamp(event.at) >= prepared for event in ledger.agents
+        run.role == "reviewer" and run.started >= prepared for run in agent_runs(ledger)
     ):
         return
     pending = [

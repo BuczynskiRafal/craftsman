@@ -241,6 +241,28 @@ class PrepareEnforcementTests(HuntTestCase):
         self.assertIn("Enforced: Claude Code hooks", out)
         self.assertTrue(self.latest().enforced)
 
+    def test_the_upgrade_of_a_round_to_enforced_releases_a_self_reviewed_hunk_and_rewrites_the_packet(self) -> None:
+        self.write_cart_and_reader()
+        self.review("prepare")  # advisory round 1: H1 is cart.py
+        self.review("cover", "--hunks", "H1", "--note", NOTE)  # the orchestrator reviews it itself
+        self.repo.write("reader.py", READER + "\n\ndef close(handle):\n    handle.close()\n")
+        self.review("prepare")  # advisory round 2: cart.py is carried
+        packet = Path(self.latest().packet_path)
+        self.assertIn("(1 carried)", packet.read_text(encoding="utf-8"))
+        self.assertEqual({ref.path: ref.carried for ref in self.latest().hunks}, {"cart.py": True, "reader.py": False})
+        self.arm()
+
+        out = self.review("prepare").stdout
+
+        self.assertIn("Enforced:", out)
+        latest = self.latest()
+        self.assertEqual((latest.number, latest.enforced), (2, True))
+        self.assertEqual({ref.path: ref.carried for ref in latest.hunks}, {"cart.py": False, "reader.py": False})
+        self.assertIn("(0 carried)", packet.read_text(encoding="utf-8"))
+        assert latest.plan is not None
+        cart = next(ref.id for ref in latest.hunks if ref.path == "cart.py")
+        self.assertTrue(any(cart in slot.hunks and slot.kind == "bug" for slot in latest.plan.slots))
+
     def test_enforcement_is_sticky_across_rounds(self) -> None:
         self.write_cart()
         self.arm()
@@ -1153,6 +1175,14 @@ class PartialReportTests(HuntTestCase):
 
         self.assertEqual(self.review("report", "--review-only", "--partial").returncode, 0)
 
+    def test_a_reviewer_start_made_exactly_when_the_round_was_prepared_counts(self) -> None:
+        self.arm()
+        self.review("prepare")
+        prepared_at = self.ledger().rounds[-1].prepared_at
+        self.add_events(AgentEvent("claude", "start", "craftsman-reviewer", "a1", prepared_at))
+
+        self.assertEqual(self.review("report", "--review-only", "--partial").returncode, 0)
+
     def test_an_event_from_before_the_round_does_not(self) -> None:
         self.arm()
         long_ago = format_timestamp(datetime.now(timezone.utc) - timedelta(hours=2))
@@ -1181,6 +1211,16 @@ class PartialReportTests(HuntTestCase):
         proc = self.review("report", "--review-only", "--partial", check=False)
 
         self.assert_error(proc, 2, "no Craftsman hunter was launched for round 2")
+
+    def test_the_orphan_stop_of_an_earlier_round_is_not_a_launched_hunter(self) -> None:
+        self.arm()
+        self.review("prepare")
+        stopped = format_timestamp(datetime.now(timezone.utc) + timedelta(seconds=1))
+        self.add_events(AgentEvent("copilot", "stop", "craftsman-reviewer", "", stopped))  # no start in this round
+
+        proc = self.review("report", "--review-only", "--partial", check=False)
+
+        self.assert_error(proc, 2, "no Craftsman hunter was launched for round 1")
 
     def test_the_start_of_a_verifier_is_not_a_launched_hunter(self) -> None:
         self.arm()
@@ -1521,6 +1561,36 @@ class RecordingStoresWavesTests(HuntTestCase):
         self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
         payload = json.loads(self.review("check", "--review-only", "--json", check=False).stdout)
         self.assertEqual(payload["slots"], [])
+
+
+class MergeStoresWavesTests(HuntTestCase):
+    """D3 item 6: `merge` stores the waves it makes due, like `cover`, `add` and `verdict` (agy REVIEW-D2 F6)."""
+
+    def flags(self, title: str) -> tuple[str, ...]:
+        titled = list(FINDING_FLAGS)
+        titled[titled.index("--title") + 1] = title
+        return tuple(titled)
+
+    def wave_ids(self) -> list[str]:
+        return [slot_id for slot_id in self.slot_ids() if slot_id.startswith(("W2", "W3"))]
+
+    def test_a_merge_that_judges_the_last_open_finding_stores_the_wave(self) -> None:
+        self.write_cart()
+        self.arm()
+        self.review("prepare")
+        self.review("add", "--hunter", "lead", *self.flags("An early report of the empty cart"))  # F1, round 1, unjudged
+        self.repo.write("cart.py", CART_EDITED)
+        self.arm()
+        self.review("prepare")
+        self.finish_generation_one(briefed=False)
+        self.review("add", "--hunter", "lead", *self.flags("The empty cart still divides by zero"))  # F2
+        self.review("add", "--hunter", "lead", *self.flags("Same defect, found by the second hunter"))  # F3
+        self.review("verdict", "F2", "--as", "probable", "--evidence", STATIC)
+        self.assertEqual(self.wave_ids(), [])  # F3 holds the barrier
+
+        self.review("merge", "F1", "F3")  # F3 is judged (dismissed) and the barrier passes
+
+        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F2"])
 
 
 class AdvisoryDisplaysTests(HuntTestCase):
