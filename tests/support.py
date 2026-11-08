@@ -315,45 +315,157 @@ def open_gate(
 # --- Antigravity transcript entries ---------------------------------------------------------
 
 
-def user_input(step: int, content: str) -> dict[str, Any]:
-    return {"step_index": step, "type": "USER_INPUT", "content": content}
+# --- Antigravity transcripts, in the shapes the platform writes (compact `transcript.jsonl`) -----------------------
+
+AGY_EPOCH = parse_timestamp(T0)  # the fixed clock of `at()`: transcripts and in-memory ledgers share one time axis
 
 
-def invoke_subagent(step: int, *specs: dict[str, str]) -> dict[str, Any]:
-    return {
-        "step_index": step,
-        "type": "PLANNER_RESPONSE",
-        "tool_calls": [{"name": "invoke_subagent", "args": {"Subagents": json.dumps(list(specs))}}],
+def agy_time(seconds: float = 0) -> str:
+    """A whole-second `created_at` `seconds` after a fixed epoch (Antigravity writes whole seconds)."""
+    return (AGY_EPOCH + timedelta(seconds=int(seconds))).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def user_input(step: int, content: str, at: float | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step_index": step, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": content}
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def agy_call(name: str, *, encoded: bool = True, **args: Any) -> dict[str, Any]:
+    """One tool call of a `PLANNER_RESPONSE`; `transcript.jsonl` JSON-encodes the values of `args`, `transcript_full.jsonl` does not."""
+    return {"name": name, "args": {key: json.dumps(value) if encoded else value for key, value in args.items()}}
+
+
+def invoke_call(role: str = "craftsman-reviewer", *, type_name: str = "self", encoded: bool = True) -> dict[str, Any]:
+    return agy_call("invoke_subagent", encoded=encoded, TypeName=type_name, Role=role, Prompt="Review packet-1.md")
+
+
+def planner(step: int, *calls: dict[str, Any], at: float | None = None, status: str = "DONE") -> dict[str, Any]:
+    """A model step: a `PLANNER_RESPONSE`; without calls it ends the turn."""
+    entry: dict[str, Any] = {"step_index": step, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": status}
+    if calls:
+        entry["tool_calls"] = list(calls)
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def generic(step: int, content: str, at: float | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step_index": step, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": content}
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def subagent_ack(step: int, sub_id: str, at: float | None = 0, *, app_dir: str = "/app") -> dict[str, Any]:
+    """The acknowledgement `invoke_subagent` returns: one per call, with the new conversation."""
+    info = {
+        "conversationId": sub_id,
+        "logAbsoluteUri": f"file://{app_dir}/brain/{sub_id}/.system_generated/logs/transcript.jsonl",
+        "workspaceUris": ["file:///work/repo"],
     }
+    text = (
+        "Created At: 2026-11-07T11:43:20+01:00\nCompleted At: 2026-11-07T11:44:08+01:00\n"
+        f"Created the following subagent:\n{json.dumps(info, indent=2)}\n"
+        "The subagent will send you a message when it has completed its task or requires guidance."
+    )
+    return generic(step, text, at)
 
 
-def subagent_ack(step: int, *sub_ids: str) -> dict[str, Any]:
-    ids = ",\n".join(f'  "conversationId": "{sub_id}"' for sub_id in sub_ids)
-    return {
+def parent_message(step: int, sender: str, at: float | None = 0) -> dict[str, Any]:
+    """The first entry of a subagent's transcript: the message of the conversation that launched it."""
+    content = (
+        "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as "
+        f"important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-07T10:44:08Z "
+        f"sender={sender} priority=MESSAGE_PRIORITY_HIGH content=Review the hunks of your slot\n</SYSTEM_MESSAGE>"
+    )
+    entry: dict[str, Any] = {"step_index": step, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "content": content}
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def subagent_done(step: int, sub_id: str, at: float | None = None) -> dict[str, Any]:
+    """The message a subagent sends its parent with `send_message`, as the parent's transcript shows it."""
+    entry: dict[str, Any] = {
         "step_index": step,
-        "type": "GENERIC",
-        "content": f"Created the following subagent:\n{{\n{ids}\n}}",
-    }
-
-
-def subagent_done(step: int, sub_id: str) -> dict[str, Any]:
-    return {
-        "step_index": step,
+        "source": "SYSTEM",
         "type": "SYSTEM_MESSAGE",
-        "content": f"<SYSTEM_MESSAGE>[Message] sender={sub_id} content=done</SYSTEM_MESSAGE>",
+        "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-07T10:45:12Z sender={sub_id} content=done\n</SYSTEM_MESSAGE>",
     }
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
 
 
 def ask_question(step: int) -> dict[str, Any]:
-    return {
-        "step_index": step,
-        "type": "PLANNER_RESPONSE",
-        "tool_calls": [{"name": "ask_question", "args": {"questions": []}}],
-    }
+    return planner(step, agy_call("ask_question", questions=[]))
 
 
-# An Antigravity `invoke_subagent` spec of a Craftsman reviewer.
-REVIEWER = {"TypeName": "self", "Role": "craftsman-reviewer", "Prompt": "Review packet-1.md"}
+def launch_reviewers(first_step: int, *sub_ids: str, at: float = 0, role: str = "craftsman-reviewer") -> list[dict[str, Any]]:
+    """One `PLANNER_RESPONSE` that launches a subagent per id, then the acknowledgements in call order."""
+    calls = [invoke_call(role) for _ in sub_ids]
+    return [
+        planner(first_step, *calls, at=at),
+        *(subagent_ack(first_step + 1 + index, sub_id, at) for index, sub_id in enumerate(sub_ids)),
+    ]
+
+
+class AgyApp:
+    """A throwaway Antigravity app data directory (`brain/<conversation id>/.system_generated/...`)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def conversation_dir(self, conversation_id: str) -> Path:
+        return self.root / "brain" / conversation_id
+
+    def transcript_path(self, conversation_id: str, *, full: bool = False) -> Path:
+        name = "transcript_full.jsonl" if full else "transcript.jsonl"
+        return self.conversation_dir(conversation_id) / ".system_generated" / "logs" / name
+
+    def write_transcript(self, conversation_id: str, *entries: dict[str, Any], full: bool = False) -> Path:
+        path = self.transcript_path(conversation_id, full=full)
+        write_jsonl(path, *entries)
+        return path
+
+    def write_subagent(
+        self,
+        parent_id: str,
+        sub_id: str,
+        *entries: dict[str, Any],
+        role: str = "craftsman-reviewer",
+        state: str = "SUBAGENT_STATE_ALIVE",
+        killed_at: float | None = None,
+    ) -> None:
+        """A subagent of `parent_id`: its transcript (opened by the parent's message) and the parent's registry file."""
+        self.write_transcript(sub_id, parent_message(0, parent_id), *entries)
+        registry = self.conversation_dir(parent_id) / ".system_generated" / "subagents" / f"{sub_id}.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "conversationId": sub_id,
+                    "subagentDescriptor": {"typeName": "self", "role": role},
+                    "state": state,
+                    "spawnStepIndex": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        if killed_at is not None:
+            os.utime(registry, (AGY_EPOCH.timestamp() + killed_at, AGY_EPOCH.timestamp() + killed_at))
+
+    def payload(self, conversation_id: str, workspace: Path, **extra: Any) -> dict[str, Any]:
+        """The common fields of an Antigravity hook payload."""
+        return {
+            "conversationId": conversation_id,
+            "workspacePaths": [str(workspace)],
+            "artifactDirectoryPath": str(self.conversation_dir(conversation_id)),
+            "transcriptPath": str(self.transcript_path(conversation_id)),
+            **extra,
+        }
 
 
 class GitRepo:

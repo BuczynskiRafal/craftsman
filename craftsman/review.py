@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from craftsman import hook_errors, huntplan, huntview
-from craftsman.agy_sync import sync_antigravity_runs
+from craftsman.agy_sync import caller_parent, sync_antigravity_runs
 from craftsman.assets import TemplateRole, load_agent_templates
 from craftsman.attribution import agent_runs
 from craftsman.diffscan import (
@@ -81,6 +81,7 @@ from craftsman.ledger import (
     round_unchanged,
     set_verdict,
     stable_hunk_ids,
+    stamp_prepared,
     uncovered_hunks,
     waive_run,
 )
@@ -346,7 +347,8 @@ def _prepare(args: argparse.Namespace) -> int:
         if stable_hunk_ids(current, snap) != snap:
             raise LedgerError("the ledger changed while the round was prepared; run prepare again")
         result = _plan_round(current, ctx, signals_for)
-        return result.ledger, result
+        stamped, round_ = stamp_prepared(result.ledger)  # the review guard counts a prepare that got this far
+        return stamped, replace(result, ledger=stamped, round=round_)
 
     result = mutate(ws.ledger_path, open_next)
     ledger, round_ = result.ledger, result.round
@@ -1152,6 +1154,7 @@ def _brief(args: argparse.Namespace) -> int:
             trigger=trigger,
             role_text=_role_text("reviewer") if _inline_role_text(env) else None,
             antigravity=brief_platform(env) == "antigravity",
+            parent=caller_parent(env),
         ),
         end="",
     )
@@ -1177,6 +1180,8 @@ def _brief_verifier(ws: Workspace, env: Mapping[str, str], raw_ids: str) -> int:
             base_sha=latest.base_sha if latest is not None else ws.base_sha(ledger),
             task=(latest.task if latest is not None else "") or ws.task,
             role_text=_role_text("verifier") if _inline_role_text(env) else None,
+            antigravity=brief_platform(env) == "antigravity",
+            parent=caller_parent(env),
         ),
         end="",
     )

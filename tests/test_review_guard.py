@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import json
 import tempfile
 import unittest
+import unittest.mock
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from craftsman import hook_errors
 from craftsman.attribution import RUN_STALE_AFTER, agent_runs, evidence_counter
 from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, MAX_CONTINUATIONS, GateOwner
 from craftsman.ledger import add_agent_event, load, mutate
@@ -17,11 +20,14 @@ from craftsman.review_guard import (
     ABANDONED_NOTICE,
     DEEP_REQUESTED,
     HOOKS_ENFORCE,
+    REVIEW_IN_PROGRESS_MAX_AGE,
     REVIEW_NOT_STARTED,
     GuardDecision,
+    arm_for_review_command,
     decide_review_stop,
     gate_stop_inputs,
     review_commands,
+    review_in_progress,
     review_outcome_issues,
     running_work,
     serve_review_stop,
@@ -100,6 +106,7 @@ class RepoCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = EvidenceRepo(Path(tmp.name) / "repo")
         self.ledger_path = self.repo.ledger_dir / "ledger.json"
+        self.state_path = self.repo.ledger_dir / "craftsman_state.json"
 
     def load(self) -> Ledger:
         return load(self.ledger_path)
@@ -270,13 +277,29 @@ class IssueTests(GuardCase):
         self.assertEqual((only.code, only.message), ("no-round", REVIEW_NOT_STARTED))
         self.assertIn("launch the hunters it lists", REVIEW_NOT_STARTED)
 
-    def test_a_hooked_command_since_the_marker_counts_as_touched_even_without_a_round_newer_than_it(self) -> None:
+    def age_the_round(self) -> None:
+        """The round was prepared an hour ago (and last prepared then): a review that begins now is a newer one."""
+        stamp = format_timestamp(datetime.now(timezone.utc) - timedelta(hours=1))
+        mutate(
+            self.ledger_path,
+            lambda ledger: (
+                replace(ledger, rounds=(replace(ledger.rounds[-1], prepared_at=stamp, last_prepared_at=None),)),
+                None,
+            ),
+        )
+
+    def test_a_prepare_since_the_marker_counts_even_when_it_kept_an_older_round(self) -> None:
         self.prepare()
-        marker = self.arm()  # the marker is newer than the round: an unchanged diff keeps its round
+        self.age_the_round()
+        marker = self.arm()  # a newer review begins on the same diff
+        self.assertEqual(self.issues(marker), [f"no-round: {REVIEW_NOT_STARTED}"])
 
-        issues = self.issues(marker)
+        self.prepare()  # an unchanged diff keeps the round and its `prepared_at`, but the prepare is stamped
 
-        self.assertNotIn(REVIEW_NOT_STARTED, "".join(issues))
+        latest = self.load().rounds[-1]
+        self.assertLess(parse_timestamp(latest.prepared_at), parse_timestamp(marker.at))
+        self.assertGreaterEqual(parse_timestamp(latest.latest_prepare_at), parse_timestamp(marker.at))
+        self.assertNotIn(REVIEW_NOT_STARTED, "".join(self.issues(marker)))
 
     def placed(self, seconds: float, **fields: object) -> ReviewMarker:
         """A marker written `seconds` after the latest round was prepared."""
@@ -308,19 +331,32 @@ class IssueTests(GuardCase):
             "--title", "Strings are summed without a check", "--scenario", "total(['a']) raises TypeError",
         )  # fmt: skip
 
-    def test_a_touch_at_the_very_moment_the_marker_was_written_counts(self) -> None:
+    def stamp_prepare(self, seconds: float) -> None:
+        stamp = self.stamp(seconds)
+        mutate(
+            self.ledger_path,
+            lambda ledger: (replace(ledger, rounds=(replace(ledger.rounds[-1], last_prepared_at=stamp),)), None),
+        )
+
+    def test_a_prepare_at_the_very_moment_the_marker_was_written_counts(self) -> None:
+        self.prepare()
+        self.stamp_prepare(60)
+
+        self.assertNotIn(REVIEW_NOT_STARTED, "".join(self.issues(self.placed(60))))
+
+    def test_a_prepare_older_than_the_marker_does_not_count(self) -> None:
+        self.prepare()
+        self.stamp_prepare(59)
+
+        self.assertEqual(self.issues(self.placed(60)), [f"no-round: {REVIEW_NOT_STARTED}"])
+
+    def test_a_hooked_command_touching_the_marker_does_not_begin_the_review(self) -> None:
         self.prepare()
         marker = self.placed(60)
-        marker = replace(marker, touched_at=marker.at)  # the PreToolUse that armed the marker touched it at once
-
-        self.assertNotIn(REVIEW_NOT_STARTED, "".join(self.issues(marker)))
-
-    def test_a_touch_older_than_the_marker_does_not_count(self) -> None:
-        self.prepare()
-        marker = self.placed(60)
-        marker = replace(marker, touched_at=self.stamp(59))
+        marker = replace(marker, touched_at=marker.at)  # PreToolUse armed and touched the marker; nothing was prepared
 
         self.assertEqual(self.issues(marker), [f"no-round: {REVIEW_NOT_STARTED}"])
+        self.assertEqual(self.issues(replace(marker, touched_at=self.stamp(120))), [f"no-round: {REVIEW_NOT_STARTED}"])
 
     def test_coverage_recorded_since_the_marker_counts_and_older_coverage_does_not(self) -> None:
         self.prepare()
@@ -565,3 +601,93 @@ class MarkerJsonTests(GuardCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArmForReviewCommandTests(RepoCase):
+    """What the PreToolUse hooks of every platform do to the marker for a `craftsman review` command."""
+
+    NOW = datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc)
+
+    def arm(self, review: tuple[str, ...], caller: GateOwner = CALLER, now: datetime | None = None) -> None:
+        arm_for_review_command(self.ledger_path, self.state_path, caller, review, now or self.NOW)
+
+    def test_a_review_command_arms_a_marker_that_is_touched(self) -> None:
+        self.arm(("prepare",))
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertEqual((marker.session_id, marker.guarding, marker.touched_at), ("sess-1", True, format_timestamp(self.NOW)))
+
+    def test_a_report_only_touches_a_marker_that_guards(self) -> None:
+        self.arm(("prepare",), now=self.NOW - timedelta(minutes=3))
+        self.arm(("report",))
+
+        marker = read_marker(self.ledger_path)
+        assert marker is not None
+        self.assertEqual(marker.touched_at, format_timestamp(self.NOW))
+        self.assertEqual(marker.at, format_timestamp(self.NOW - timedelta(minutes=3)))
+
+    def test_a_report_arms_nothing(self) -> None:
+        self.arm(("report",))
+
+        self.assertIsNone(read_marker(self.ledger_path))
+
+    def test_a_command_that_is_no_review_command_does_nothing(self) -> None:
+        self.arm(())
+
+        self.assertIsNone(read_marker(self.ledger_path))
+
+    def test_a_session_without_an_id_arms_nothing(self) -> None:
+        self.arm(("prepare",), caller=GateOwner("copilot", None))
+
+        self.assertIsNone(read_marker(self.ledger_path))
+
+    def test_the_owner_of_an_active_gate_is_left_to_the_gate(self) -> None:
+        open_gate(self.repo.root, self.repo.base_sha, owner=CALLER)
+
+        self.arm(("prepare",))
+
+        self.assertIsNone(read_marker(self.ledger_path))
+
+    def test_a_failure_to_write_never_raises(self) -> None:
+        with unittest.mock.patch("craftsman.review_guard.arm_marker", side_effect=OSError("disk full")):
+            with unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.arm(("prepare",))
+
+        self.assertIn("could not arm the review guard: disk full", err.getvalue())
+
+
+class ReviewInProgressTests(RepoCase):
+    def prepare(self) -> None:
+        self.repo.write_lines("app.py", 4)
+        self.repo.cli("review", "prepare")
+
+    def test_an_open_round_is_in_progress(self) -> None:
+        self.prepare()
+
+        self.assertEqual(review_in_progress(self.ledger_path, self.state_path), 1)
+
+    def test_no_ledger_is_no_review(self) -> None:
+        self.assertIsNone(review_in_progress(self.ledger_path, self.state_path))
+
+    def test_an_active_gate_is_not_a_review_only_round(self) -> None:
+        self.prepare()
+        open_gate(self.repo.root, self.repo.base_sha)
+
+        self.assertIsNone(review_in_progress(self.ledger_path, self.state_path))
+
+    def test_a_round_older_than_the_limit_is_over(self) -> None:
+        self.prepare()
+        later = datetime.now(timezone.utc) + REVIEW_IN_PROGRESS_MAX_AGE + timedelta(minutes=1)
+
+        with unittest.mock.patch("craftsman.review_guard.datetime") as clock:
+            clock.now.return_value = later
+            self.assertIsNone(review_in_progress(self.ledger_path, self.state_path))
+
+    def test_an_unreadable_ledger_is_logged_and_is_no_review(self) -> None:
+        self.prepare()
+        self.ledger_path.write_text("{broken", encoding="utf-8")
+        with unittest.mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertIsNone(review_in_progress(self.ledger_path, self.state_path))
+
+        self.assertEqual([entry.kind for entry in hook_errors.read(self.ledger_path.parent)], ["ledger"])

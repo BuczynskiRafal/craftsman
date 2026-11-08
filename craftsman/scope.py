@@ -7,6 +7,10 @@ Models scope checks as candidate paths against forbidden zones:
    directory, or `craftsman.scopeAllow` (excluding other worktrees' git directories).
 3. Outside those roots, deny recursive searches and deny non-recursive reads targeting session
    stores, shell histories, other git repositories/worktrees, or symlinks escaping the work tree.
+
+Antigravity enters through `evaluate_antigravity_payload`: the shared command policy first, then this
+scope check for the callers it binds (a hunter or verifier subagent, the owner of an active gate, a
+subagent of the review-marker holder), then arming the review guard for the main conversation.
 """
 
 from __future__ import annotations
@@ -19,44 +23,27 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, get_args
 
-from craftsman.antigravity import session_id
+from craftsman import hook_errors
+from craftsman.agy_sync import main_conversation
+from craftsman.antigravity import app_dir, session_id, sync_marker_from_user_input
+from craftsman.command_policy import PolicyContext, decide, default_transcript_roots, tool_call
 from craftsman.diffscan import DiffScanError, git_time_left, note_git_timeout, worktree_root
-from craftsman.gate import GateOwner, GateStateError, load_state, state_path_for
+from craftsman.gate import GateOwner, GateStateError, load_state, owns_active_gate, state_path_for
+from craftsman.ledger import ledger_path_for
 from craftsman.paths import user_home
-from craftsman.records import CRAFTSMAN_AGENTS, craftsman_agent_name
+from craftsman.records import CRAFTSMAN_AGENTS, AgentRole, LedgerError, craftsman_agent_name
+from craftsman.review_guard import arm_for_review_command, review_in_progress
 from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
 from craftsman.streams import configure_std_streams
+from craftsman.tool_names import READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
+from craftsman.transcript import TranscriptError, decode_arg, parent_conversation, subagent_role
+from craftsman.workspace import read_marker
 
 ScopeMode = Literal["deny", "warn", "off"]
-SHELL_TOOL_NAMES = frozenset(
-    {
-        "bash",
-        "run_in_terminal",
-        "runinterminal",
-        "terminal",
-        "powershell",
-        "pwsh",
-        "shell",
-        "run_command",
-    }
-)
-READ_TOOL_NAMES = frozenset({"read", "read_file", "view_file", "notebookread", "view"})
-SEARCH_TOOL_NAMES = frozenset(
-    {
-        "grep",
-        "grep_search",
-        "ripgrep",
-        "glob",
-        "file_search",
-        "find_by_name",
-        "ls",
-        "list_dir",
-        "list_directory",
-    }
-)
 SCOPE_CHECKED_TOOLS = SHELL_TOOL_NAMES | READ_TOOL_NAMES | SEARCH_TOOL_NAMES
 ALWAYS_RECURSIVE_CMDS = frozenset({"rg", "ripgrep", "ag", "ack", "fd", "fdfind", "find", "tree", "du"})
 READ_CMDS = frozenset({"cat", "head", "tail", "less", "more", "sed", "awk", "gawk", "bat"})
@@ -66,6 +53,10 @@ FORBIDDEN_HOME_RELPATHS = (
     ".claude/sessions",
     ".gemini/antigravity/brain",
     ".gemini/antigravity/conversations",
+    ".gemini/antigravity-cli/brain",
+    ".gemini/antigravity-cli/conversations",
+    ".gemini/antigravity-ide/brain",
+    ".gemini/antigravity-ide/conversations",
     ".Cursor/User/workspaceStorage",
     ".config/Code/User/workspaceStorage",
     "Library/Application Support/Code/User/workspaceStorage",
@@ -443,9 +434,9 @@ def evaluate_scope(
         return ScopeDecision("allow")
     if lowered in SEARCH_TOOL_NAMES:
         keys = (
-            ("path", "pattern", "folder", "DirectoryPath", "SearchDirectory")
+            ("path", "pattern", "folder", "DirectoryPath", "SearchDirectory", "SearchPath")
             if lowered == "glob"
-            else ("path", "glob", "includePattern", "folder", "DirectoryPath", "SearchDirectory")
+            else ("path", "glob", "includePattern", "folder", "DirectoryPath", "SearchDirectory", "SearchPath")
         )
         for key in keys:
             val = tool_input.get(key)
@@ -463,63 +454,206 @@ def evaluate_scope(
     return ScopeDecision("allow")
 
 
-def _is_active_antigravity_owner(payload: Mapping[str, Any], effective_cwd: Path) -> bool:
-    """Whether the work tree has an active gate that the Antigravity session of `payload` owns."""
-    state = load_state(state_path_for(effective_cwd))
-    caller = GateOwner(platform="antigravity", session_id=session_id(payload))
-    return state is not None and state.active and state.owner.admits(caller)
+# --- the Antigravity PreToolUse hook ---------------------------------------------------------------------
+
+HOOK_EVENT = "antigravity-pre-tool"
 
 
-def evaluate_antigravity_scope(
-    payload: Mapping[str, Any], command_line: str, cwd_str: str | None
-) -> tuple[str, str | None]:
-    """Enforce the repository search scope on Antigravity `run_command` when an Antigravity-owned gate is active."""
+@dataclass(frozen=True)
+class AntigravityCaller:
+    """Who makes an Antigravity tool call: its conversation, and the main conversation it belongs to.
+
+    A subagent conversation has a conversation id of its own; the gate, the review marker and the ledger belong
+    to the MAIN conversation, so everything that asks "whose is this" is asked of `main_id`.
+    """
+
+    conversation: str | None
+    main_id: str | None
+    role: AgentRole | None  # the Craftsman role of a subagent; None for the main conversation and other subagents
+    is_main: bool
+
+    @property
+    def owner(self) -> GateOwner:
+        return GateOwner("antigravity", self.main_id)
+
+
+def antigravity_caller(payload: Mapping[str, Any], env: Mapping[str, str]) -> AntigravityCaller:
+    """The caller of a PreToolUse payload, resolved through the transcripts (see `AntigravityCaller`)."""
+    conversation = session_id(payload)
+    if conversation is None:
+        return AntigravityCaller(None, None, None, True)
+    app = app_dir(payload, env)
+    given = payload.get("transcriptPath")
+    transcript = Path(given).expanduser() if isinstance(given, str) and given.strip() else None
+    parent = parent_conversation(app, conversation, path=transcript)
+    if parent is None:
+        return AntigravityCaller(conversation, conversation, None, True)
+    return AntigravityCaller(
+        conversation, main_conversation(app, conversation, transcript), subagent_role(app, conversation, parent), False
+    )
+
+
+@dataclass
+class _Checkout:
+    """The work tree of a tool call and what the hook asks of it, each read once and only when a rule needs it."""
+
+    directory: Path
+    _root: Path | None = None
+
+    @property
+    def root(self) -> Path:
+        """Raises `DiffScanError` outside a git work tree."""
+        if self._root is None:
+            self._root = worktree_root(self.directory)
+        return self._root
+
+    def in_work_tree(self) -> bool:
+        try:
+            return self.root is not None
+        except DiffScanError:
+            return False
+
+    @property
+    def ledger_path(self) -> Path:
+        return ledger_path_for(self.root)
+
+    @property
+    def state_path(self) -> Path:
+        return state_path_for(self.root)
+
+
+def _antigravity_directory(args: Mapping[str, Any], payload: Mapping[str, Any]) -> Path:
+    """Where the call runs: its `Cwd`, else the first workspace of the payload (file tools carry no `Cwd`), else the process cwd."""
+    cwd = args.get("Cwd")
+    if isinstance(cwd, str) and cwd.strip() and os.path.isdir(cwd):
+        return Path(cwd)
+    workspaces = payload.get("workspacePaths")
+    if isinstance(workspaces, list) and workspaces and isinstance(workspaces[0], str) and os.path.isdir(workspaces[0]):
+        return Path(workspaces[0])
+    return Path.cwd()
+
+
+def _policy_context(caller: AntigravityCaller, checkout: _Checkout, app: Path, env: Mapping[str, str]) -> PolicyContext:
+    def ledger_dir() -> Path | None:
+        try:
+            return checkout.ledger_path.parent
+        except (LedgerError, DiffScanError):
+            return None
+
+    def owns_gate() -> bool:
+        try:
+            return owns_active_gate(load_state(checkout.state_path), caller.owner)
+        except (DiffScanError, GateStateError):
+            return False
+
+    def in_progress() -> int | None:
+        try:
+            return review_in_progress(checkout.ledger_path, checkout.state_path)
+        except (LedgerError, DiffScanError):
+            return None
+
+    roots = tuple(dict.fromkeys((*default_transcript_roots(env), app / "brain")))
+    return PolicyContext(ledger_dir, owns_gate, in_progress, roots)
+
+
+def _scope_applies(caller: AntigravityCaller, checkout: _Checkout) -> bool:
+    """Whether the search scope binds this call: the conversation owns the active gate (a subagent counts as its
+    parent), is a Craftsman subagent, or is a subagent of the conversation whose review the marker guards."""
+    if caller.role is not None:
+        return True
+    if caller.main_id is None:
+        return False
+    if owns_active_gate(load_state(checkout.state_path), caller.owner):
+        return True
+    marker = read_marker(checkout.ledger_path)
+    return not caller.is_main and marker is not None and marker.guarding and marker.is_of(caller.owner)
+
+
+def _scope_decision(name: str, args: Mapping[str, Any], base: Path, checkout: _Checkout) -> tuple[str, str | None]:
+    """The search-scope verdict on one call whose caller the scope binds."""
     try:
-        effective_cwd = Path(cwd_str) if cwd_str and os.path.isdir(cwd_str) else Path.cwd()
-        repo_root = worktree_root(effective_cwd)
-        if not _is_active_antigravity_owner(payload, effective_cwd):
-            return "allow", None
-    except GateStateError as exc:
-        return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
-    except DiffScanError:  # outside a git work tree there is no gate and no scope
-        return "allow", None
-
-    try:
-        policy = load_scope_policy(effective_cwd, repo_root)
+        policy = load_scope_policy(base, checkout.root)
     except ScopeConfigError as exc:
         return "force_ask", f"[CRAFTSMAN SCOPE-GUARD] {exc}"
     if policy.mode == "off":
         return "allow", None
-    scope_decision = evaluate_scope(
-        "run_command",
-        {"CommandLine": command_line, "Cwd": cwd_str},
-        effective_cwd,
-        repo_root,
-        policy,
-    )
-    if scope_decision.decision == "deny" and policy.mode == "deny":
-        return "deny", scope_decision.reason
+    decision = evaluate_scope(name, args, base, checkout.root, policy)
+    if decision.decision == "deny" and policy.mode == "deny":
+        return "deny", decision.reason
+    if decision.decision == "deny":
+        sys.stderr.write(decision.reason + "\n")  # warn mode: the call goes on
     return "allow", None
 
 
-def _extract_antigravity_run_command(payload: Mapping[str, Any]) -> tuple[str | None, str | None]:
-    tool_call = payload.get("toolCall")
-    if not isinstance(tool_call, Mapping) or tool_call.get("name") != "run_command":
-        return None, None
-    args = tool_call.get("args")
-    if not isinstance(args, Mapping):
-        return None, None
-    cmd = args.get("CommandLine")
-    cwd = args.get("Cwd")
-    return (cmd if isinstance(cmd, str) else None), (cwd if isinstance(cwd, str) else None)
+def _decoded_args(raw: object) -> Mapping[str, Any]:
+    """The arguments of a tool call with every text value read the way the transcript spells it (`decode_arg`):
+    the platform may hand over JSON text (`"\\"ls\\""`) as `transcript.jsonl` does, and a command that stays quoted
+    would parse as one word and slip past every shell rule."""
+    if not isinstance(raw, Mapping):
+        return {}
+    return {key: decode_arg(value) if isinstance(value, str) else value for key, value in raw.items()}
 
 
-def evaluate_antigravity_payload(payload: Mapping[str, Any]) -> tuple[str, str | None]:
-    """Evaluate an Antigravity `PreToolUse` payload against the repository search scope."""
-    command_line, cwd_str = _extract_antigravity_run_command(payload)
-    if not isinstance(command_line, str) or not command_line.strip():
+def evaluate_antigravity_payload(
+    payload: Mapping[str, Any], env: Mapping[str, str] | None = None, now: datetime | None = None
+) -> tuple[str, str | None]:
+    """The answer to an Antigravity `PreToolUse` payload: `(decision, reason)`, decision `allow`, `deny` or `force_ask`.
+
+    The shared command policy (`command_policy.decide`) judges every tool the hook is wired to, exactly as the
+    Claude and Copilot hooks do; then the search scope applies to the calls it binds (`_scope_applies`); then a
+    `craftsman review` command of the MAIN conversation arms or touches the review guard, after the
+    conversation's own `/craft-review` request was read from its transcript (`sync_marker_from_user_input`).
+    """
+    values = os.environ if env is None else env
+    raw = payload.get("toolCall")
+    if not isinstance(raw, Mapping):
         return "allow", None
-    return evaluate_antigravity_scope(payload, command_line, cwd_str)
+    name, raw_args = raw.get("name"), raw.get("args")
+    if not isinstance(name, str) or not name.strip():
+        return "allow", None
+    args = _decoded_args(raw_args)
+    caller = antigravity_caller(payload, values)
+    base = _antigravity_directory({}, payload)
+    checkout = _Checkout(_antigravity_directory(args, payload))
+    app = app_dir(payload, values)
+    call = tool_call(name, args, str(base), role=caller.role, main_session=caller.is_main, session_id=caller.conversation)
+    decision = decide(call, _policy_context(caller, checkout, app, values))
+    if decision.action != "allow":
+        return ("deny" if decision.action == "deny" else "force_ask"), decision.reason
+    if not checkout.in_work_tree():  # outside a git work tree there is no gate, no scope and no review
+        return "allow", None
+    try:
+        if is_scope_checked_tool(name) and _scope_applies(caller, checkout):
+            verdict = _scope_decision(name, args, Path(call.cwd) if os.path.isdir(call.cwd) else base, checkout)
+            if verdict[0] != "allow":
+                return verdict
+        if caller.is_main and caller.main_id is not None and decision.review:
+            _arm_for_review(caller, checkout, app, payload, decision.review, now or datetime.now(timezone.utc))
+    except GateStateError as exc:
+        return "force_ask", f"The Craftsman gate state of this work tree is invalid: {exc}"
+    return "allow", None
+
+
+def _arm_for_review(
+    caller: AntigravityCaller,
+    checkout: _Checkout,
+    app: Path,
+    payload: Mapping[str, Any],
+    review: tuple[str, ...],
+    now: datetime,
+) -> None:
+    """The main conversation runs a `craftsman review` command: read its `/craft-review` request first (so `prepare` in
+    the same turn sees the request's depth and task), then arm or touch the guard. Never blocks the call."""
+    assert caller.conversation is not None
+    given = payload.get("transcriptPath")
+    transcript = Path(given).expanduser() if isinstance(given, str) and given.strip() else None
+    try:
+        sync_marker_from_user_input(
+            checkout.root, app, caller.conversation, caller.owner, now, transcript=transcript
+        )
+    except (TranscriptError, OSError, ValueError) as exc:
+        sys.stderr.write(f"craftsman scope-guard: could not read the review request: {exc}\n")
+    arm_for_review_command(checkout.ledger_path, checkout.state_path, caller.owner, review, now)
 
 
 def _emit(decision: str, reason: str | None = None) -> None:
@@ -558,7 +692,19 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    decision, reason = evaluate_antigravity_payload(payload)
+    args = payload.get("toolCall", {}).get("args") if isinstance(payload.get("toolCall"), dict) else None
+    directory = _antigravity_directory(args if isinstance(args, dict) else {}, payload)
+    with hook_errors.hook_run(HOOK_EVENT, directory) as log:
+        try:
+            decision, reason = evaluate_antigravity_payload(payload)
+        except Exception as exc:  # noqa: BLE001 - a crashed hook counts as "allow": ask the user instead
+            problem = f"{type(exc).__name__}: {exc}"
+            kind = hook_errors.kind_of(exc)
+            if kind == "git-timeout":
+                log.git_timeout(problem)
+            else:
+                log.record(kind, problem)
+            decision, reason = "force_ask", f"[CRAFTSMAN SCOPE-GUARD] The call was not checked ({problem})."
     _emit(decision, reason)
     return 0
 

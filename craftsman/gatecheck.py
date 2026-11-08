@@ -18,6 +18,7 @@ from craftsman.attribution import (
     IDENTITY_PLATFORMS,
     RUN_STALE_AFTER,
     AgentRun,
+    Voucher,
     agent_runs,
     distinct_verdict_runs,
     identity,
@@ -388,6 +389,24 @@ def slot_statuses(ledger: Ledger, round_: Round, now: datetime) -> tuple[SlotSta
     return _hunt_state(ledger, round_, _utc(now), agent_runs(ledger)).statuses
 
 
+def unfinished_slots(
+    after: Ledger, latest: Round, stop_at: datetime, now: datetime
+) -> list[tuple[str, tuple[str, ...]]]:
+    """The slots (with their missing hunks) of a planned round whose hunter is the run that stopped at `stop_at`
+    and left them unfinished.
+
+    The gate's own view: a slot is `dead` when the hunter the claims are matched to stopped without completing it
+    (`gatecheck.slot_statuses`, claims matched one-to-one to runs, by token where the transcript shows it).
+    """
+    if latest.plan is None:
+        return []
+    return [
+        (status.slot.id, status.missing)
+        for status in slot_statuses(after, latest, now)
+        if status.state == "dead" and status.since == stop_at
+    ]
+
+
 def claim_holders(ledger: Ledger, round_: Round, now: datetime) -> frozenset[int]:
     """Which finished reviewer runs hold a brief of `round_`, as indices into `attribution.agent_runs(ledger)`.
 
@@ -469,18 +488,28 @@ def _hunter_signs(
     window_claims: dict[str, list[tuple[SlotClaim, list[int]]]] = defaultdict(list)  # slot -> its claims no exact voucher settles
     finished_done: set[str] = set()  # slots in `done` whose hunter a finished run accounts for
     holders: set[int] = set()  # the finished runs that account for any claim
-    for claim in ledger.claims:
-        if claim.round != number:
-            continue
-        finished = round_vouchers(
-            ledger, runs, number, role="reviewer", token=claim.token, recorded_at=parse_timestamp(claim.at), by=claim.by
+    round_claims = [
+        (
+            claim,
+            round_vouchers(
+                ledger, runs, number, role="reviewer", token=claim.token, recorded_at=parse_timestamp(claim.at), by=claim.by
+            ),
         )
+        for claim in ledger.claims
+        if claim.round == number
+    ]
+    bound = _bound_claims(round_claims)
+    for claim, finished in round_claims:
         if any(voucher.exact for voucher in finished):
             holders.update(voucher.index for voucher in finished)
             if claim.slot in done:
                 finished_done.add(claim.slot)
             else:
-                ended[claim.slot].extend(_stopped(voucher.run) for voucher in finished)
+                # An exactly attributed run answers for ONE slot (`attribution` binds it to its earliest claim). The
+                # claim stays vouched, so no other run takes it, but it shows nobody worked on its slot.
+                ended[claim.slot].extend(
+                    _stopped(voucher.run) for voucher in finished if bound[run_key(voucher.run, voucher.index)] == claim.token
+                )
         else:
             window_claims[claim.slot].append((claim, [voucher.index for voucher in finished]))
     explained = _explain_by_finished_runs(window_claims, _window_evidence(ledger, round_, runs))
@@ -540,10 +569,24 @@ def _hunter_signs(
         if index not in accounted
         and index not in done_backers
         and run.role == "reviewer"
-        and run.platform not in IDENTITY_PLATFORMS
         and is_open_run(run, prepared, now)
     )
     return _HunterSigns(running, ended, starting, frozenset(holders))
+
+
+def _bound_claims(round_claims: Sequence[tuple[SlotClaim, tuple[Voucher, ...]]]) -> dict[str, str]:
+    """The token of the one claim each exactly attributed run answers for: its earliest, as `attribution` binds it.
+
+    Keyed by `attribution.run_key` (a resumed agent is one agent); order: claim time, then token number.
+    """
+    earliest: dict[str, tuple[datetime, int, str]] = {}
+    for claim, vouchers in round_claims:
+        order = (parse_timestamp(claim.at), int(claim.token[1:]), claim.token)
+        for voucher in vouchers:
+            key = run_key(voucher.run, voucher.index)
+            if voucher.exact and (key not in earliest or order < earliest[key]):
+                earliest[key] = order
+    return {key: order[2] for key, order in earliest.items()}
 
 
 def _window_evidence(ledger: Ledger, round_: Round, runs: Sequence[AgentRun]) -> dict[int, str]:
@@ -939,16 +982,21 @@ def _finding_ids(findings: Sequence[Finding]) -> str:
     return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
-def _verification_issues(ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: datetime) -> list[GateIssue]:
-    """The findings of an enforced round must be judged by verifier subagents, two of them for a dismissed serious one.
+@dataclass(frozen=True)
+class _VerificationDebt:
+    """The findings a verifier still owes a verdict for, by why (see `_verification_debt`)."""
+
+    no_verdict: tuple[Finding, ...] = ()
+    unverified: tuple[Finding, ...] = ()
+    second: tuple[Finding, ...] = ()
+
+
+def _verification_debt(ledger: Ledger, runs: Sequence[AgentRun]) -> _VerificationDebt:
+    """The findings of an enforced round that need a verifier: no verdict, a verdict no verifier run vouches for,
+    or a dismissed blocker or major one that has no second independent opinion yet.
 
     Findings from before verdict events existed (an empty log) are exempt from the vouching rules.
-    Verifiers that started since the round was prepared and are still going are waited for, not launched again.
     """
-    prepared = parse_timestamp(round_.prepared_at)
-    running = sum(
-        run.role == "verifier" and run.started >= prepared and _is_going(run, now) for run in runs
-    )
     no_verdict: list[Finding] = []
     unverified: list[Finding] = []
     second: list[Finding] = []
@@ -966,6 +1014,34 @@ def _verification_issues(ledger: Ledger, round_: Round, runs: Sequence[AgentRun]
             and distinct_verdict_runs(ledger, finding, runs) < 2
         ):
             second.append(finding)
+    return _VerificationDebt(tuple(no_verdict), tuple(unverified), tuple(second))
+
+
+def verification_debt(ledger: Ledger, round_: Round) -> tuple[str, ...]:
+    """The ids of the findings a verifier still owes work on: what `[no-verdict]`, `[unverified]` and
+    `[second-opinion]` list, in finding order.
+
+    The one definition the gate and the SubagentStop verifier rule share. A round that is not held to
+    verifier subagents (not enforced, or without a plan) owes the 5.0 debt only: findings without a verdict.
+    """
+    if round_.plan is None or not round_.enforced:
+        return tuple(finding.id for finding in ledger.findings if finding.verdict is None)
+    debt = _verification_debt(ledger, agent_runs(ledger))
+    owed = {finding.id for group in (debt.no_verdict, debt.unverified, debt.second) for finding in group}
+    return tuple(finding.id for finding in ledger.findings if finding.id in owed)
+
+
+def _verification_issues(ledger: Ledger, round_: Round, runs: Sequence[AgentRun], now: datetime) -> list[GateIssue]:
+    """The findings of an enforced round must be judged by verifier subagents, two of them for a dismissed serious one.
+
+    Verifiers that started since the round was prepared and are still going are waited for, not launched again.
+    """
+    prepared = parse_timestamp(round_.prepared_at)
+    running = sum(
+        run.role == "verifier" and run.started >= prepared and _is_going(run, now) for run in runs
+    )
+    debt = _verification_debt(ledger, runs)
+    no_verdict, unverified, second = debt.no_verdict, debt.unverified, debt.second
     issues: list[GateIssue] = []
     if no_verdict:
         issues.append(

@@ -17,6 +17,7 @@ import shlex
 from collections.abc import Sequence
 
 from craftsman.records import Run, RunKind
+from craftsman.shell import python_program
 
 # Test and end-to-end runs are what counts as verification.
 PASSING_KINDS: tuple[RunKind, ...] = ("test", "e2e")
@@ -63,8 +64,8 @@ def _is_trivial(argv: Sequence[str], kind: str | None) -> bool:
     if program in _TRIVIAL_PROGRAMS:
         return True
     if _PYTHON_RE.fullmatch(program):
-        code = _python_inline_code(tokens[1:])
-        if code is None:
+        mode, code, _ = python_program(tokens[1:])
+        if mode != "code":
             return False
         return _is_trivial_python(code) or (kind == "test" and _checks_nothing(code))
     script = _shell_script(program, tokens[1:])
@@ -123,24 +124,6 @@ def _apply_env_value(option: str, value: str, rest: list[str]) -> None:
 
 def _pop_value(rest: list[str]) -> str:
     return rest.pop(0) if rest else ""
-
-
-def _python_inline_code(args: Sequence[str]) -> str | None:
-    """The program of `python [options] -c <code>`, or None when Python runs a file or module."""
-    remaining = list(args)
-    while remaining and remaining[0].startswith("-") and not remaining[0].startswith("--"):
-        flags = remaining.pop(0)[1:]
-        for index, flag in enumerate(flags):
-            rest = flags[index + 1 :]
-            if flag == "c":
-                return rest or (remaining[0] if remaining else "")
-            if flag == "m":
-                return None
-            if flag in "WX":  # these take a value: -Wignore or -W ignore
-                if not rest and remaining:
-                    remaining.pop(0)
-                break
-    return None
 
 
 def _is_trivial_python(code: str) -> bool:
@@ -294,7 +277,7 @@ def _is_trivial_segment(segment: list[str], kind: str | None, heredocs: Sequence
         stdin_python = (
             tokens
             and _PYTHON_RE.fullmatch(_program_name(tokens[0]))
-            and (len(tokens) == 1 or tokens[1] == "-")
+            and python_program(tokens[1:])[0] == "stdin"
         )
         if stdin_python:
             return _checks_nothing(heredocs[fed[-1]])

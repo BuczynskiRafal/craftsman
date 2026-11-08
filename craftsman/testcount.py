@@ -36,6 +36,7 @@ _PYTEST_COLLECTED_RE = re.compile(
 _UNITTEST_RAN_RE = re.compile(r"^Ran (\d+) tests? in [\d.]+s$")
 _UNITTEST_RESULT_RE = re.compile(r"^(?:OK|FAILED) \(.*\bskipped=(\d+)")
 _GO_OK_RE = re.compile(r"^ok\s+\S+\s+(?:\d+(?:\.\d+)?s|\(cached\))(?P<rest>.*)$")
+_GO_FAIL_RE = re.compile(r"^FAIL\s+\S+\s+(?:\d+(?:\.\d+)?s|\(cached\)|\[(?:build|setup) failed\])")
 _GO_NO_TESTS_RE = re.compile(r"^\?\s+\S+\s+\[no test files\]$|\[no tests to run\]")
 _GO_RESULT_RE = re.compile(r"^\s*--- (?P<outcome>PASS|FAIL|SKIP):")
 _GO_RUN_RE = re.compile(r"^\s*=== (?:RUN|CONT|PAUSE)\b")
@@ -57,9 +58,12 @@ class RunnerOutputCounter:
         self._skipping = False  # inside a line longer than MAX_LINE_CHARS, up to its newline
         self._total: int | None = None
         self._unittest_last = 0  # tests of the latest `Ran N tests` line that a skip count can still reduce
-        self._go_verbose = 0
-        self._go_verbose_seen = False  # `go test -v` prints `=== RUN`: the `ok` lines then count no package
-        self._go_packages = 0
+        # `go test` prints a count only with -v. Each package is counted on its own: the tests its verbose output
+        # showed, else (an `ok` line with no verbose output before it) one; skipped tests are not counted.
+        self._go_tests = 0
+        self._go_seen = False
+        self._package_tests = 0  # verbose results of the package being read
+        self._package_verbose = False  # the package being read printed verbose output
 
     def feed(self, chunk: bytes) -> None:
         """Take the next bytes of the output."""
@@ -80,10 +84,9 @@ class RunnerOutputCounter:
         if self._line and not self._skipping:
             self._read_line(self._line)
         self._line = ""
-        # `go test` prints a count only with -v; without it each package that passed counts as one.
-        go = self._go_verbose or (0 if self._go_verbose_seen else self._go_packages)
-        seen = self._total is not None or go or self._go_verbose_seen
-        return (self._total or 0) + go if seen else None
+        self._end_go_package(passed=False)  # `go test -v` output cut off before its package line
+        seen = self._total is not None or self._go_seen
+        return (self._total or 0) + self._go_tests if seen else None
 
     def _read_line(self, raw: str) -> None:
         line = _ANSI_RE.sub("", raw[:MAX_LINE_CHARS]).rstrip()
@@ -139,20 +142,33 @@ class RunnerOutputCounter:
     def _read_go(self, line: str) -> bool:
         result = _GO_RESULT_RE.match(line)
         if result is not None:
-            self._go_verbose_seen = True
-            self._go_verbose += result["outcome"] != "SKIP"
+            self._go_seen = self._package_verbose = True
+            self._package_tests += result["outcome"] != "SKIP"
             return True
         if _GO_RUN_RE.match(line):
-            self._go_verbose_seen = True
+            self._go_seen = self._package_verbose = True
             return True
         if _GO_NO_TESTS_RE.search(line):
             self._add(0)
+            self._end_go_package(passed=False)
             return True
         if _GO_OK_RE.match(line):
-            self._go_packages += 1
+            self._end_go_package(passed=True)
+            return True
+        if _GO_FAIL_RE.match(line):
+            self._end_go_package(passed=False)
             return True
         return False
 
+    def _end_go_package(self, *, passed: bool) -> None:
+        """Count the package that just ended: its verbose tests if it printed any, else one for an `ok` line."""
+        if self._package_verbose:
+            self._go_tests += self._package_tests
+        elif passed:
+            self._go_tests += 1
+            self._go_seen = True
+        self._package_tests = 0
+        self._package_verbose = False
     def _read_cargo(self, line: str) -> bool:
         match = _CARGO_RE.match(line)
         if match is None:

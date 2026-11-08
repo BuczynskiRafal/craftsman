@@ -522,6 +522,12 @@ def open_round(
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
 
 
+def stamp_prepared(ledger: Ledger) -> tuple[Ledger, Round]:
+    """The ledger with its latest round marked as prepared just now (see `Round.last_prepared_at`)."""
+    latest = replace(ledger.rounds[-1], last_prepared_at=_now())
+    return replace(ledger, rounds=(*ledger.rounds[:-1], latest)), latest
+
+
 def _reopened_hunk_ids(
     hunks: Sequence[Hunk],
     previous: set[str],
@@ -809,7 +815,7 @@ def merge_findings(
             verdict="dismissed",
             verdict_evidence=evidence,
             updated_at=now,
-            verdict_log=(*dup.verdict_log, VerdictEvent(f"V{first_token + offset}", "dismissed", now, by)),
+            verdict_log=(*dup.verdict_log, VerdictEvent(f"V{first_token + offset}", "dismissed", now, by, merge=True)),
             merged_into=target.id,
         )
         for offset, dup in enumerate(duplicates)
@@ -823,7 +829,7 @@ def merge_findings(
             updated_at=now,
             verdict_log=(
                 *item.verdict_log,
-                VerdictEvent(f"V{first_token + len(dismissed) + offset}", "dismissed", now, by),
+                VerdictEvent(f"V{first_token + len(dismissed) + offset}", "dismissed", now, by, merge=True),
             ),
             merged_into=target.id,
         )

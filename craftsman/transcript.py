@@ -11,15 +11,29 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from craftsman.records import agent_role
+from craftsman.records import (
+    AGENT_ROLES,
+    PLUGIN_AGENT_PREFIX,
+    AgentRole,
+    agent_role,
+    format_timestamp,
+    parse_timestamp,
+)
+from craftsman.trigger import USER_REQUEST_BLOCK_RE, is_review_prompt
+from craftsman.trigger import review_request as prompt_review_request
 
 Entry = dict[str, Any]
 
-SUBAGENT_ACK_MARKER = "Created the following subagent"
-SUBAGENT_ID_RE = re.compile(r'"conversationId"\s*:\s*"([^"]+)"')
+SUBAGENT_ACK_MARKER = "Created the following subagent:"
+LOG_DIR = Path(".system_generated") / "logs"
+TRANSCRIPT_NAMES = ("transcript.jsonl", "transcript_full.jsonl")
+KILLED_STATE = "SUBAGENT_STATE_KILLED"
+EARLY_ENTRIES = 5  # a subagent's transcript opens with the message of its parent
 SENDER_RE = re.compile(r"\bsender=(\S+)")
 QUESTION_TOOLS = frozenset({"ask_question", "AskUserQuestion"})
 NATIVE_TYPES = frozenset({"USER_INPUT", "PLANNER_RESPONSE", "GENERIC", "SYSTEM_MESSAGE"})
@@ -159,76 +173,267 @@ def is_waiting_on_question(entries: Sequence[Entry]) -> bool:
     return False
 
 
-def finished_reviewers(entries: Sequence[Entry], after_step: int) -> tuple[str, ...]:
-    """Conversation ids of `craftsman-reviewer` subagents invoked after `after_step` that finished.
+def decode_arg(value: Any) -> str:
+    """A tool argument as text, whichever transcript wrote it.
 
-    Antigravity records a subagent run in the parent transcript in three steps: the
-    `invoke_subagent` call, an acknowledgement listing the new conversation ids in the order the
-    subagents were requested, and a `SYSTEM_MESSAGE` from `sender=<conversation id>` when the
-    subagent finishes. A subagent counts only once all three are present.
+    `transcript.jsonl` JSON-encodes the values of `tool_calls[].args` (`"\\"self\\""`), `transcript_full.jsonl` keeps
+    native values (`"self"`); both read as `self`. Anything that is not text reads as its `str`, None as "".
     """
-    reviewer_ids: set[str] = set()
-    finished: list[str] = []
-    awaiting_ack: tuple[bool, ...] = ()
-    for position, entry in enumerate(entries, start=1):
-        kind = entry.get("type")
-        raw_content = entry.get("content")
-        content = raw_content if isinstance(raw_content, str) else ""
-        if kind == "PLANNER_RESPONSE":
-            awaiting_ack = _requested_reviewers(entry) if step_of(entry, position) > after_step else ()
-        elif awaiting_ack and SUBAGENT_ACK_MARKER in content:
-            ids = SUBAGENT_ID_RE.findall(content)
-            if len(ids) == len(awaiting_ack):
-                reviewer_ids.update(
-                    sub_id for sub_id, is_reviewer in zip(ids, awaiting_ack, strict=True) if is_reviewer
-                )
-            awaiting_ack = ()
-        elif kind == "SYSTEM_MESSAGE" and (sender := SENDER_RE.search(content)):
-            sub_id = sender.group(1)
-            if sub_id in reviewer_ids and sub_id not in finished:
-                finished.append(sub_id)
-    return tuple(finished)
-
-
-def _requested_reviewers(entry: Entry) -> tuple[bool, ...]:
-    """For each subagent an `invoke_subagent` call in `entry` requests: is it a Craftsman reviewer?"""
-    if entry.get("status") == "ERROR":
-        return ()
-    specs: list[Any] = []
-    for call in entry.get("tool_calls") or []:
-        if isinstance(call, dict) and call.get("name") == "invoke_subagent":
-            specs.extend(_subagent_specs(call.get("args")))
-    return tuple(isinstance(spec, dict) and _is_reviewer_spec(spec) for spec in specs)
-
-
-def _subagent_specs(args: Any) -> list[Any]:
-    """The subagent specs of one call: a `Subagents` list (or its JSON text), or the args themselves."""
-    if not isinstance(args, dict):
-        return []
-    if "Subagents" not in args:
-        return [{key: decode_json_text(value) for key, value in args.items()}]
-    raw = args["Subagents"]
-    if isinstance(raw, str):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
         try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return []
-    return raw if isinstance(raw, list) else []
-
-
-def decode_json_text(value: Any) -> Any:
-    """Antigravity may write a field as JSON text (`'"self"'`): the decoded value, else `value`."""
-    if isinstance(value, str) and len(value) >= 2 and value.startswith('"') and value.endswith('"'):
-        try:
-            return json.loads(value)
+            decoded = json.loads(value)
         except json.JSONDecodeError:
             return value
+        if isinstance(decoded, str):
+            return decoded
     return value
 
 
-def _is_reviewer_spec(spec: dict[str, Any]) -> bool:
-    """A writable (`self`) subagent whose role names the Craftsman reviewer agent."""
-    role = str(spec.get("Role") or "")
-    return (
-        str(spec.get("TypeName") or "self").strip().lower() == "self" and agent_role(role) == "reviewer"
-    )
+def _spelled_role(name: str) -> AgentRole | None:
+    """The Craftsman role a `Role` or `TypeName` text names: an agent name (plugin prefix, case and padding
+    ignored), alone or followed by a space or punctuation (`craftsman-reviewer W1-1`)."""
+    text = name.strip().lower().removeprefix(PLUGIN_AGENT_PREFIX)
+    if (role := agent_role(text)) is not None:
+        return role
+    for agent, agent_role_ in AGENT_ROLES.items():
+        if text.startswith(agent) and not text[len(agent)].isalnum():
+            return agent_role_
+    return None
+
+
+def launch_role(role: Any, type_name: Any) -> AgentRole | None:
+    """The Craftsman role of an `invoke_subagent` call, None for any other subagent.
+
+    The agent must be writable (`TypeName` `self`, none, or itself a Craftsman agent name): a read-only type
+    cannot record anything. `Role` names the role; a `TypeName` that is an agent name does as well.
+    """
+    kind = decode_arg(type_name).strip().lower()
+    by_type = _spelled_role(kind)
+    if kind not in ("", "self") and by_type is None:
+        return None
+    return _spelled_role(decode_arg(role)) or by_type
+
+
+@dataclass(frozen=True)
+class SubagentLaunch:
+    """One subagent the conversation started: the conversation it runs in and when the platform acknowledged it."""
+
+    conversation_id: str
+    role: AgentRole
+    launched_at: str  # the whole-second `created_at` of the acknowledgement
+    log_path: Path | None
+
+
+def subagent_launches(entries: Sequence[Entry]) -> tuple[SubagentLaunch, ...]:
+    """The Craftsman subagents the transcript's conversation launched, in call order.
+
+    A response that calls tools is followed by one `GENERIC` entry per call, in call order (the results of
+    other tools interleave: the k-th result belongs to the k-th call, whatever the tool). An `invoke_subagent`
+    call is paired with the k-th `GENERIC` entry after its response; its text names the new conversation. A
+    call whose acknowledgement is missing (still running), unreadable or without a time, or whose role is not a
+    Craftsman role, is skipped.
+    """
+    launches: list[SubagentLaunch] = []
+    for position, entry in enumerate(entries):
+        calls = entry.get("tool_calls") if entry.get("type") == "PLANNER_RESPONSE" else None
+        if not isinstance(calls, list) or entry.get("status") == "ERROR":
+            continue
+        results = _results_after(entries, position)
+        for index, call in enumerate(calls):
+            if not isinstance(call, dict) or call.get("name") != "invoke_subagent" or index >= len(results):
+                continue
+            raw_args = call.get("args")
+            args: Entry = raw_args if isinstance(raw_args, dict) else {}
+            role = launch_role(args.get("Role"), args.get("TypeName"))
+            created = _ack_created(results[index])
+            if role is None or created is None:
+                continue
+            launches.append(SubagentLaunch(created[0], role, created[1], created[2]))
+    return tuple(launches)
+
+
+def _results_after(entries: Sequence[Entry], position: int) -> list[Entry]:
+    """The `GENERIC` entries after the response at `position`, up to the next response: its tool results in call order."""
+    results: list[Entry] = []
+    for entry in entries[position + 1 :]:
+        if entry.get("type") == "PLANNER_RESPONSE":
+            break
+        if entry.get("type") == "GENERIC":
+            results.append(entry)
+    return results
+
+
+def _ack_created(entry: Entry) -> tuple[str, str, Path | None] | None:
+    """`(conversation id, created_at, log path)` of a subagent acknowledgement, None when it is none or lacks a part."""
+    content = entry.get("content")
+    created_at = entry.get("created_at")
+    if not isinstance(content, str) or not isinstance(created_at, str) or not _is_timestamp(created_at):
+        return None
+    marker = content.find(SUBAGENT_ACK_MARKER)
+    brace = content.find("{", marker) if marker >= 0 else -1
+    if brace < 0:
+        return None
+    try:
+        info, _ = json.JSONDecoder().raw_decode(content[brace:])
+    except json.JSONDecodeError:
+        return None
+    conversation = info.get("conversationId") if isinstance(info, dict) else None
+    if not isinstance(conversation, str) or not conversation.strip():
+        return None
+    uri = info.get("logAbsoluteUri")
+    path = Path(uri.removeprefix("file://")) if isinstance(uri, str) and uri.startswith("file://") else None
+    return conversation.strip(), created_at.strip(), path
+
+
+def _is_timestamp(text: str) -> bool:
+    try:
+        parse_timestamp(text.strip())
+    except ValueError:
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class SubagentState:
+    """Where a subagent stands, as far as its own transcript and its parent's registry tell.
+
+    `finished_at` is the raw `created_at` of the end of its turn (a killed subagent: when the registry file was
+    written); `last_step` is the `step_index` of the last entry of its transcript (None without one), which a
+    subagent that was sent back compares with the step it was sent back at; `readable` is false when no transcript
+    of it could be read.
+    """
+
+    finished_at: str | None = None
+    killed: bool = False
+    readable: bool = False
+    last_step: int | None = None
+
+
+def conversation_transcript(app_dir: Path, conversation_id: str) -> Path | None:
+    """The transcript file of a conversation under `app_dir` (the compact one, else the full one), None if neither exists."""
+    for name in TRANSCRIPT_NAMES:
+        path = app_dir / "brain" / conversation_id / LOG_DIR / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _registry_file(app_dir: Path, parent_id: str, conversation_id: str) -> Path:
+    return app_dir / "brain" / parent_id / ".system_generated" / "subagents" / f"{conversation_id}.json"
+
+
+def subagent_finish(app_dir: Path, conversation_id: str, parent_id: str) -> SubagentState:
+    """The state of the subagent `conversation_id` launched by `parent_id`.
+
+    Finished when the LAST entry of its transcript is a `PLANNER_RESPONSE` with status DONE and no tool calls
+    (the registry keeps saying ALIVE after that). Killed when the parent's registry says
+    `SUBAGENT_STATE_KILLED`, which is final. An unreadable or missing transcript leaves `readable` false.
+    """
+    killed_at = _killed_at(_registry_file(app_dir, parent_id, conversation_id))
+    path = conversation_transcript(app_dir, conversation_id)
+    try:
+        entries = read_transcript_entries(path)
+    except TranscriptError:
+        entries = []
+        path = None
+    finished = _finished_at(entries[-1]) if entries else None
+    last_step = step_of(entries[-1], len(entries)) if entries else None
+    if killed_at is not None:
+        return SubagentState(killed_at, True, path is not None, last_step)
+    return SubagentState(finished, False, path is not None, last_step)
+
+
+def _killed_at(registry: Path) -> str | None:
+    try:
+        info = json.loads(registry.read_text(encoding="utf-8"))
+        if isinstance(info, dict) and info.get("state") == KILLED_STATE:
+            return format_timestamp(datetime.fromtimestamp(registry.stat().st_mtime, timezone.utc))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _finished_at(entry: Entry) -> str | None:
+    """When the turn that `entry` (the last of a transcript) ends was over, None when it does not end one."""
+    created = entry.get("created_at")
+    calls = entry.get("tool_calls")
+    if (
+        entry.get("type") == "PLANNER_RESPONSE"
+        and entry.get("status") == "DONE"
+        and not calls
+        and isinstance(created, str)
+        and _is_timestamp(created)
+    ):
+        return created.strip()
+    return None
+
+
+def parent_conversation(app_dir: Path, conversation_id: str, *, path: Path | None = None) -> str | None:
+    """The conversation that launched `conversation_id`, None when it is a main conversation (or unreadable).
+
+    A subagent's transcript has no `USER_INPUT` and one of its first entries is the message of its parent: a
+    `SYSTEM_MESSAGE` that holds `[Message]` and `sender=<parent id>`. `path` is the transcript when the caller
+    knows it (a hook payload's `transcriptPath`). The file is read line by line and the scan ends at the first
+    `USER_INPUT` (a main conversation opens with one), so a long main transcript costs one line.
+    """
+    source = path or conversation_transcript(app_dir, conversation_id)
+    if source is None:
+        return None
+    sender: str | None = None
+    try:
+        with source.open(encoding="utf-8") as lines:
+            for position, line in enumerate(lines):
+                entry = _json_object_or_none(line) if line.strip() else None
+                if entry is None:
+                    continue
+                if entry.get("type") == "USER_INPUT":
+                    return None
+                content = entry.get("content")
+                if sender is None and position < EARLY_ENTRIES and entry.get("type") == "SYSTEM_MESSAGE":
+                    found = SENDER_RE.search(content) if isinstance(content, str) and "[Message]" in content else None
+                    sender = found.group(1) if found else None
+    except (OSError, UnicodeDecodeError):
+        return None
+    return sender
+
+
+def subagent_role(app_dir: Path, conversation_id: str, parent_id: str) -> AgentRole | None:
+    """The Craftsman role the parent launched `conversation_id` with: its registry file, else the parent's transcript."""
+    try:
+        info = json.loads(_registry_file(app_dir, parent_id, conversation_id).read_text(encoding="utf-8"))
+        descriptor = info.get("subagentDescriptor") if isinstance(info, dict) else None
+        if isinstance(descriptor, dict) and (role := launch_role(descriptor.get("role"), descriptor.get("typeName"))):
+            return role
+    except (OSError, ValueError):
+        pass
+    try:
+        entries = read_transcript_entries(conversation_transcript(app_dir, parent_id))
+    except TranscriptError:
+        return None
+    return next((item.role for item in subagent_launches(entries) if item.conversation_id == conversation_id), None)
+
+
+def latest_user_input_text(entries: Sequence[Entry]) -> tuple[int, str | None, str] | None:
+    """The step, `created_at` (None when the entry has none or an unreadable one) and text of the most recent user input."""
+    for position in range(len(entries), 0, -1):
+        entry = entries[position - 1]
+        if entry.get("type") == "USER_INPUT":
+            created = entry.get("created_at")
+            stamp = created.strip() if isinstance(created, str) and _is_timestamp(created) else None
+            return step_of(entry, position), stamp, str(entry.get("content") or "")
+    return None
+
+
+def request_body(text: str) -> str:
+    """What the user typed in a `USER_INPUT`: the last `<USER_REQUEST>` block Antigravity wraps it in, else `text`."""
+    blocks = USER_REQUEST_BLOCK_RE.findall(text)
+    return blocks[-1] if blocks else text
+
+
+def review_request(text: str) -> tuple[bool, str] | None:
+    """`(deep, task)` when `text` is a `/craft-review` request, else None (the prompt hook's own reading)."""
+    return prompt_review_request(text) if is_review_prompt(text) else None

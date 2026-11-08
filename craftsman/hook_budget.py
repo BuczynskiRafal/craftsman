@@ -16,8 +16,8 @@ HOOK_TIMEOUTS_S: dict[str, int] = {
     "subagent-start": 30,
     "subagent-stop": 30,
     "pre-tool": 30,
-    "antigravity-stop": 10,
-    "antigravity-pre-tool": 10,
+    "antigravity-stop": 30,
+    "antigravity-pre-tool": 30,
 }
 MAX_MARGIN_S = 5.0
 

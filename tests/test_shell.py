@@ -11,6 +11,7 @@ from craftsman.shell import (
     expand_shell_path_token,
     iter_simple_commands,
     parse_git_invocation,
+    python_program,
     redirection_targets,
     split_shell_events,
 )
@@ -170,6 +171,34 @@ class HeredocAndPathExpansionTests(unittest.TestCase):
             self.assertEqual(expand_shell_path_token("%USERPROFILE%/notes"), notes)
             cmds = iter_simple_commands(r"cat ~\notes\todo.txt C:\temp\file.txt")
             self.assertEqual(cmds[0].tokens, [r"cat", r"~\notes\todo.txt", r"C:\temp\file.txt"])
+
+
+class PythonProgramTests(unittest.TestCase):
+    """The one reader of the interpreter's options, shared by the command policy and the triviality rule."""
+
+    def test_what_python_is_asked_to_run_is_read_like_the_interpreter_reads_it(self) -> None:
+        cases = {
+            ("-c", "pass"): ("code", "pass", ()),
+            ("-Bc", "pass"): ("code", "pass", ()),
+            ("-cpass",): ("code", "pass", ()),
+            ("-W", "ignore", "-c", "pass"): ("code", "pass", ()),
+            ("-Wignore", "-X", "dev", "-c", "pass"): ("code", "pass", ()),
+            ("-m", "craftsman.cli", "review"): ("module", "craftsman.cli", ["review"]),
+            ("-Im", "craftsman", "review"): ("module", "craftsman", ["review"]),
+            ("-um", "craftsman.cli"): ("module", "craftsman.cli", []),
+            ("-W", "ignore", "-m", "craftsman"): ("module", "craftsman", []),
+            ("script.py", "-c", "x"): ("script", "script.py", ["-c", "x"]),
+            ("--", "script.py"): ("script", "script.py", []),
+            ("--check-hash-based-pycs", "never", "script.py"): ("script", "script.py", []),
+            (): ("stdin", "", ()),
+            ("-u",): ("stdin", "", ()),
+            ("-B", "-"): ("stdin", "", ()),
+            ("-W", "ignore", "-u"): ("stdin", "", ()),
+        }
+        for args, expected in cases.items():
+            with self.subTest(args=args):
+                kind, value, rest = python_program(args)
+                self.assertEqual((kind, value, list(rest)), (expected[0], expected[1], list(expected[2])))
 
 
 if __name__ == "__main__":

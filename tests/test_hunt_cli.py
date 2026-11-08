@@ -486,14 +486,22 @@ class PrepareReprepareTests(HuntTestCase):
     def test_an_unchanged_reprepare_changes_no_slot_and_launches_everything_not_started(self) -> None:
         self.write_cart()
         self.review("prepare")
-        before = self.ledger_path.read_bytes()
+        before = self.stored_without_prepare_stamp()
 
         out = self.review("prepare").stdout
 
         self.assertIn("Round 1 unchanged (same diff)", out)
         self.assertEqual(out.count("[not launched]"), 3)
         self.assertIn("Launch all 3 hunters now", out)
-        self.assertEqual(self.ledger_path.read_bytes(), before)
+        self.assertEqual(self.stored_without_prepare_stamp(), before)
+        self.assertIsNotNone(self.latest().last_prepared_at)  # only the stamp of the successful prepare moved
+
+    def stored_without_prepare_stamp(self) -> dict[str, Any]:
+        stored = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+        for item in stored["rounds"]:
+            item.pop("last_prepared_at", None)
+        assert isinstance(stored, dict)
+        return stored
 
     def test_a_slot_with_a_fetched_brief_and_a_running_hunter_is_not_launched_again(self) -> None:
         self.write_cart()

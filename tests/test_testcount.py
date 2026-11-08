@@ -84,6 +84,21 @@ GO_VERBOSE_ALL_SKIPPED = "=== RUN   TestA\n--- SKIP: TestA (0.00s)\nPASS\nok  \t
 GO_VERBOSE_SOME_SKIPPED = (
     "=== RUN   TestA\n--- SKIP: TestA (0.00s)\n=== RUN   TestB\n--- PASS: TestB (0.00s)\nPASS\nok  \tpkg\t0.002s\n"
 )
+GO_MIXED = (
+    "=== RUN   TestSkip\n--- SKIP: TestSkip (0.00s)\nPASS\nok  \tpkg1\t0.002s\n"
+    "ok  \tpkg2\t0.003s\nok  \tpkg3\t(cached)\n"
+)
+GO_VERBOSE_TWO_PACKAGES = (
+    "=== RUN   TestA\n--- PASS: TestA (0.00s)\n=== RUN   TestB\n--- PASS: TestB (0.00s)\nPASS\nok  \tpkg1\t0.002s\n"
+    "=== RUN   TestC\n--- PASS: TestC (0.00s)\nPASS\nok  \tpkg2\t0.002s\n"
+)
+GO_VERBOSE_THEN_PLAIN = (
+    "=== RUN   TestA\n--- PASS: TestA (0.00s)\nPASS\nok  \tpkg1\t0.002s\nok  \tpkg2\t0.003s\n?   \tpkg3\t[no test files]\n"
+)
+GO_FAIL_THEN_OK = (
+    "--- FAIL: TestA (0.00s)\nFAIL\nFAIL\tpkg1\t0.003s\nok  \tpkg2\t0.002s\n"
+)
+GO_VERBOSE_CUT_OFF = "=== RUN   TestA\n--- PASS: TestA (0.00s)\n=== RUN   TestB\n--- PASS: TestB (0.00s)\n"
 PYTEST_COLLECT_ONLY = "tests/a.py::test_a\ntests/a.py::test_b\n\n2 tests collected in 0.01s\n"
 PYTEST_COLLECT_ONLY_VERBOSE = "<Function test_a>\n\n=========================== 2 tests collected in 0.01s ===========================\n"
 PYTEST_COLLECT_ONLY_DESELECTED = "1/3 tests collected (2 deselected) in 0.01s\n"
@@ -151,6 +166,11 @@ class CountTestsTests(unittest.TestCase):
             "go test failing": (GO_FAIL, 1),
             "go test -v all skipped": (GO_VERBOSE_ALL_SKIPPED, 0),
             "go test -v some skipped": (GO_VERBOSE_SOME_SKIPPED, 1),
+            "go test a skipped verbose package beside plain ones": (GO_MIXED, 2),
+            "go test -v counts each package on its own": (GO_VERBOSE_TWO_PACKAGES, 3),
+            "go test a verbose package beside plain ones": (GO_VERBOSE_THEN_PLAIN, 2),
+            "go test a failing package beside a passing one": (GO_FAIL_THEN_OK, 2),
+            "go test -v output cut off before its package line": (GO_VERBOSE_CUT_OFF, 2),
             "pytest --collect-only -q": (PYTEST_COLLECT_ONLY, 0),
             "pytest --collect-only": (PYTEST_COLLECT_ONLY_VERBOSE, 0),
             "pytest --collect-only with deselected": (PYTEST_COLLECT_ONLY_DESELECTED, 0),

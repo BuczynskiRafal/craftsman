@@ -46,13 +46,14 @@ from craftsman.records import (
     agent_role,
     craftsman_agent_name,
 )
-from craftsman.scope import READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
 from craftsman.shell import (
     SimpleCommand,
     expand_shell_path_token,
     iter_simple_commands,
+    python_program,
     redirection_targets,
 )
+from craftsman.tool_names import READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
 from craftsman.worktree_guard import find_worktree_mutation
 
 # --- the messages -----------------------------------------------------------------------------------
@@ -91,10 +92,6 @@ _LAUNCHERS: dict[str, tuple[str, ...]] = {"uv": ("run",), "uvx": (), "pipx": ("r
 # Interpreters whose inline program (`-c` / `-e`) can name a file, with the option that carries it.
 _INLINE_OPTIONS: dict[str, str] = {"node": "-e", "nodejs": "-e", "perl": "-e", "ruby": "-e", "php": "-r"}
 
-# Python options that take a value (as the rest of their cluster or as the next word).
-_PYTHON_OPTIONS_WITH_VALUE = frozenset("cmWX")
-_PYTHON_LONG_OPTIONS_WITH_VALUE = frozenset({"--check-hash-based-pycs"})
-
 CallKind = Literal["cli", "entry", "inline", "stdin"]
 
 
@@ -129,43 +126,8 @@ def _invocation(tokens: Sequence[str]) -> tuple[CallKind, tuple[str, ...]] | Non
     return _python_invocation(tokens)
 
 
-def _python_program(args: Sequence[str]) -> tuple[str, str, Sequence[str]]:
-    """What `python <args>` is asked to run, read the way the interpreter reads its options: `("code", program, ())`
-    for `-c`, `("module", name, arguments)` for `-m`, `("script", path, arguments)`, else `("stdin", "", ())`.
-
-    A short option cluster is read letter by letter (`-um`, `-Im`, `-Bc`), and `-c`, `-m`, `-W` and `-X` take the rest
-    of the cluster or the next word as their value, so `-W ignore -m craftsman.hooks` still names the module.
-    """
-    index = 0
-    while index < len(args):
-        word = args[index]
-        index += 1
-        if word == "--":
-            return ("script", args[index], args[index + 1 :]) if index < len(args) else ("stdin", "", ())
-        if word == "-":
-            return "stdin", "", ()
-        if word.startswith("--"):
-            index += word in _PYTHON_LONG_OPTIONS_WITH_VALUE
-            continue
-        if not word.startswith("-"):
-            return "script", word, args[index:]
-        for position, flag in enumerate(word[1:], start=1):
-            if flag not in _PYTHON_OPTIONS_WITH_VALUE:
-                continue
-            value = word[position + 1 :]
-            if not value:
-                value = args[index] if index < len(args) else ""
-                index += 1
-            if flag == "c":
-                return "code", value, ()
-            if flag == "m":
-                return "module", value, args[index:]
-            break
-    return "stdin", "", ()
-
-
 def _python_invocation(tokens: Sequence[str]) -> tuple[CallKind, tuple[str, ...]] | None:
-    kind, value, rest = _python_program(tokens[1:])
+    kind, value, rest = python_program(tokens[1:])
     if kind == "code":
         return "inline", (value,)
     if kind == "module":

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from craftsman.paths import user_home
@@ -771,3 +772,43 @@ def parse_git_invocation(
         return sub, sub_args, cwd
 
     return None, [], cwd
+
+
+# Python options that take a value (as the rest of their cluster or as the next word).
+PYTHON_OPTIONS_WITH_VALUE = frozenset("cmWX")
+PYTHON_LONG_OPTIONS_WITH_VALUE = frozenset({"--check-hash-based-pycs"})
+
+
+def python_program(args: Sequence[str]) -> tuple[str, str, Sequence[str]]:
+    """What `python <args>` is asked to run, read the way the interpreter reads its options: `("code", program, ())`
+    for `-c`, `("module", name, arguments)` for `-m`, `("script", path, arguments)`, else `("stdin", "", ())`.
+
+    A short option cluster is read letter by letter (`-um`, `-Im`, `-Bc`), and `-c`, `-m`, `-W` and `-X` take the rest
+    of the cluster or the next word as their value, so `-W ignore -m craftsman.hooks` still names the module.
+    """
+    index = 0
+    while index < len(args):
+        word = args[index]
+        index += 1
+        if word == "--":
+            return ("script", args[index], args[index + 1 :]) if index < len(args) else ("stdin", "", ())
+        if word == "-":
+            return "stdin", "", ()
+        if word.startswith("--"):
+            index += word in PYTHON_LONG_OPTIONS_WITH_VALUE
+            continue
+        if not word.startswith("-"):
+            return "script", word, args[index:]
+        for position, flag in enumerate(word[1:], start=1):
+            if flag not in PYTHON_OPTIONS_WITH_VALUE:
+                continue
+            value = word[position + 1 :]
+            if not value:
+                value = args[index] if index < len(args) else ""
+                index += 1
+            if flag == "c":
+                return "code", value, ()
+            if flag == "m":
+                return "module", value, args[index:]
+            break
+    return "stdin", "", ()

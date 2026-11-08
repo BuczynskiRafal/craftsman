@@ -80,27 +80,37 @@ class _Start:
     at: datetime
 
 
-def pair_unnamed_stop(starts: Sequence[datetime], stop_at: datetime, prepared: datetime | None) -> int | None:
+def pair_unnamed_stop(
+    starts: Sequence[datetime],
+    stop_at: datetime,
+    prepared: datetime | None,
+    nudged: AbstractSet[datetime] = frozenset(),
+) -> int | None:
     """Which of `starts` a stop without an agent id ends: an index into `starts`, None when it ends none.
 
     `starts` are the times of the unpaired starts of the stop's role (and name), `prepared` the `prepared_at`
-    of the latest round that began no later than the stop (None before any round). The stop ends the oldest
-    start that began at or after `prepared` and is not after the stop: the hunter of the CURRENT round, so a
-    hunter of an earlier round that hung without a stop never takes the place of one that began in this
-    round. Only when there is none, the oldest start that began less than `RUN_STALE_AFTER` before the stop
-    (a run kept across the preparation of a round, or a ledger whose rounds say nothing). Otherwise the stop
-    is an orphan (a stop of a run the ledger never saw start, e.g. one from before a reset) and ends nothing.
+    of the latest round that began no later than the stop (None before any round), `nudged` the starts whose
+    run was sent back already (the `answered` of the nudge events). The stop ends the oldest start that began at
+    or after `prepared` and is not after the stop: the hunter of the CURRENT round, so a hunter of an earlier
+    round that hung without a stop never takes the place of one that began in this round. Among those, a start
+    that was not sent back yet comes first: a nudge does not close its run, and parallel hunters of one name
+    that stop one after the other must each be sent back once, not the first one twice. Only when there is no
+    start of this round, the oldest start that began less than `RUN_STALE_AFTER` before the stop (a run kept
+    across the preparation of a round, or a ledger whose rounds say nothing), by the same preference.
+    Otherwise the stop is an orphan (a stop of a run the ledger never saw start, e.g. one from before a reset)
+    and ends nothing.
 
     The one place that pairs such a stop: reading the ledger (`agent_runs`) and recording a stop (the
     SubagentStop hook) must agree on it.
     """
     eligible = [i for i, began in enumerate(starts) if began <= stop_at]
-    if prepared is not None:
-        current = [i for i in eligible if starts[i] >= prepared]
-        if current:
-            return min(current, key=lambda i: (starts[i], i))
-    recent = [i for i in eligible if stop_at - starts[i] < RUN_STALE_AFTER]
-    return min(recent, key=lambda i: (starts[i], i)) if recent else None
+    tiers = [[i for i in eligible if starts[i] >= prepared]] if prepared is not None else []
+    tiers.append([i for i in eligible if stop_at - starts[i] < RUN_STALE_AFTER])
+    for tier in tiers:
+        if tier:
+            unsent = [i for i in tier if starts[i] not in nudged]
+            return min(unsent or tier, key=lambda i: (starts[i], i))
+    return None
 
 
 def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
@@ -117,12 +127,14 @@ def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
       began since the latest round was prepared, else with one that began less than `RUN_STALE_AFTER` before
       it; a stop that finds none is an orphan and ignored;
     - any other stop that finds no start begins at the `prepared_at` of the round that was current.
-    Starts no stop claims become runs that have not stopped. Agents that are not a craftsman role are
-    ignored.
+    Starts no stop claims become runs that have not stopped. A `nudge` event (a subagent sent back to finish
+    its slot) is neither a start nor a stop: it opens and closes nothing, and its `answered` start is
+    excluded from the first choice of an unnamed stop. Agents that are not a craftsman role are ignored.
     """
     starts: list[_Start] = []
     run_of_start: dict[int, int] = {}  # start index -> index into `runs`, for the starts a stop has claimed
     runs: list[AgentRun] = []
+    nudged: set[datetime] = set()  # starts of runs without an id that were sent back, as far as the events read go
     for event in ledger.agents:
         role = agent_role(event.agent)
         if role is None:
@@ -131,8 +143,10 @@ def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
         if event.event == "start":
             starts.append(_Start(event, role, at))
             continue
-        if event.event != "stop":
-            continue  # a nudge opens and closes nothing
+        if event.event == "nudge":  # opens and closes nothing
+            if event.answered is not None and not event.agent_id:
+                nudged.add(parse_timestamp(event.answered))
+            continue
         same_id = [
             i
             for i, item in enumerate(starts)
@@ -150,7 +164,7 @@ def agent_runs(ledger: Ledger) -> tuple[AgentRun, ...]:
         if not event.agent_id:
             before = [r for r in ledger.rounds if parse_timestamp(r.prepared_at) <= at]
             prepared = parse_timestamp(before[-1].prepared_at) if before else None
-            pick = pair_unnamed_stop([starts[i].at for i in by_name], at, prepared)
+            pick = pair_unnamed_stop([starts[i].at for i in by_name], at, prepared, nudged)
             if pick is None:
                 continue  # an orphan: no start of this round (or just before it) is left for it
             by_name = [by_name[pick]]

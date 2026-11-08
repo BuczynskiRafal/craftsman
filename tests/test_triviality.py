@@ -206,6 +206,25 @@ class TestRunsMustCheckSomethingTests(unittest.TestCase):
         self.assertFalse(is_trivial_run(["bash", "-c", HEREDOC_UNCHECKED], "e2e"))
         self.assertFalse(is_trivial_run(["bash", "-c", HEREDOC_UNCHECKED]))
 
+    def test_a_python_heredoc_fed_to_an_interpreter_with_options_is_just_as_trivial(self) -> None:
+        for command in (
+            "python3 -u <<EOF\nimport app\nEOF",
+            "python3 -B - <<EOF\nimport app\nEOF",
+            "python3 -Bu <<'EOF'\nimport app\nEOF",
+            "python3 -W ignore -u - <<EOF\nimport app\nEOF",
+            "python3 -X utf8 <<EOF\nimport app\nEOF",
+            "env PYTHONPATH=. python3 -I <<EOF\nimport app\nEOF",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(is_trivial_run(["bash", "-c", command], "test"))
+        for command in (
+            "python3 -u <<EOF\nimport app\nassert app.f() == 2\nEOF",
+            "python3 -u script.py <<EOF\nimport app\nEOF",  # the heredoc is the script's input, not its program
+            "python3 -m pytest <<EOF\nimport app\nEOF",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(is_trivial_run(["bash", "-c", command], "test"))
+
     def test_a_python_heredoc_with_a_check_is_a_real_test_run(self) -> None:
         self.assertFalse(is_trivial_run(["bash", "-c", HEREDOC_CHECKED], "test"))
         self.assertFalse(

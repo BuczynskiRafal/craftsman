@@ -6,6 +6,7 @@ import json
 import re
 import unittest
 from dataclasses import replace
+from datetime import timedelta
 from typing import Any
 
 from craftsman.ledger import add_agent_event, resolve, set_verdict
@@ -28,6 +29,8 @@ from craftsman.records import (
     SlotClaim,
     VerdictEvent,
     Wave,
+    format_timestamp,
+    parse_timestamp,
     slot_generation,
 )
 
@@ -673,6 +676,49 @@ class VerdictEventAndClaimTests(unittest.TestCase):
         for change, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 replace(event, **change)
+
+    def test_a_merge_event_is_marked_and_ordinary_events_stay_byte_identical(self) -> None:
+        merge = VerdictEvent("V1", "dismissed", at(1), None, merge=True)
+        plain = VerdictEvent("V2", "dismissed", at(2))
+
+        self.assertEqual(VerdictEvent.from_json(merge.to_json()), merge)
+        self.assertTrue(merge.to_json()["merge"])
+        self.assertNotIn("merge", plain.to_json())
+        self.assertFalse(VerdictEvent.from_json(plain.to_json()).merge)
+        with self.assertRaisesRegex(LedgerError, "merge is only allowed on a dismissed event"):
+            VerdictEvent("V3", "proven", at(3), None, merge=True)
+
+    def test_a_nudge_names_the_start_it_answered_and_only_a_nudge_may(self) -> None:
+        nudge = AgentEvent("copilot", "nudge", "craftsman-reviewer", "", at(5), answered=at(2))
+
+        self.assertEqual(AgentEvent.from_json(json.loads(json.dumps(nudge.to_json()))), nudge)
+        self.assertNotIn("answered", replace(nudge, answered=None).to_json())
+        with self.assertRaisesRegex(LedgerError, "answered is only allowed on a nudge event"):
+            replace(nudge, event="stop")
+        with self.assertRaisesRegex(LedgerError, "answered must be an ISO-8601 timestamp"):
+            replace(nudge, answered="yesterday")
+
+    def test_a_nudge_remembers_the_step_its_subagent_was_sent_back_at_and_only_a_nudge_may(self) -> None:
+        nudge = AgentEvent("antigravity", "nudge", "craftsman-reviewer", "sub-1", at(5), last_step=7)
+
+        self.assertEqual(AgentEvent.from_json(json.loads(json.dumps(nudge.to_json()))), nudge)
+        self.assertNotIn("last_step", replace(nudge, last_step=None).to_json())
+        with self.assertRaisesRegex(LedgerError, "last_step is only allowed on a nudge event"):
+            replace(nudge, event="stop")
+        with self.assertRaisesRegex(LedgerError, "last_step must be an integer or null"):
+            AgentEvent.from_json({**nudge.to_json(), "last_step": "7"})
+
+    def test_a_round_remembers_its_last_successful_prepare(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1")))
+        round_ = ledger.rounds[0]
+
+        self.assertNotIn("last_prepared_at", round_.to_json())
+        self.assertEqual(round_.latest_prepare_at, round_.prepared_at)
+        later = replace(round_, last_prepared_at=format_timestamp(parse_timestamp(round_.prepared_at) + timedelta(seconds=5)))
+        self.assertEqual(Round.from_json(later.to_json()), later)
+        self.assertEqual(later.latest_prepare_at, later.last_prepared_at)
+        with self.assertRaisesRegex(LedgerError, "last_prepared_at must be an ISO-8601 timestamp"):
+            replace(round_, last_prepared_at="soon")
 
     def test_slot_claims_round_trip_and_validate(self) -> None:
         claim = SlotClaim(1, "W2-X1", "B4", at(3), "antigravity:conv-1")

@@ -19,7 +19,7 @@ from craftsman.gate import GateOwner
 from craftsman.scope import (
     ScopeConfigError,
     ScopePolicy,
-    evaluate_antigravity_scope,
+    evaluate_antigravity_payload,
     evaluate_scope,
     is_craftsman_agent,
     load_scope_policy,
@@ -239,6 +239,16 @@ class ScopeEnforcementTests(unittest.TestCase):
                 "deny",
             ),
             ("cat of shell history file is denied", "Bash", {"command": "cat ~/.zsh_history"}, "deny"),
+            *(
+                (
+                    f"cat in the Antigravity {product} {store} is denied",
+                    "Bash",
+                    {"command": f"cat ~/.gemini/{product}/{store}/c-1/session.jsonl"},
+                    "deny",
+                )
+                for product in ("antigravity", "antigravity-cli", "antigravity-ide")
+                for store in ("brain", "conversations")
+            ),
             (
                 "sed reading sibling repository file is denied",
                 "Bash",
@@ -669,19 +679,18 @@ class ScopeEnforcementTests(unittest.TestCase):
 
     def test_antigravity_run_command_enforces_scope_for_owner_session(self) -> None:
         open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
-        dec, reason = evaluate_antigravity_scope(
-            {"artifactDirectoryPath": str(self.tmp / "brain" / "conv-123")},
-            "find ~ -name SKILL.md",
-            str(self.repo),
-        )
+
+        def payload(conversation: str) -> dict[str, Any]:
+            return {
+                "artifactDirectoryPath": str(self.tmp / "brain" / conversation),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "find ~ -name SKILL.md", "Cwd": str(self.repo)}},
+            }
+
+        dec, reason = evaluate_antigravity_payload(payload("conv-123"), {})
         self.assertEqual(dec, "deny")
         self.assertIn("[CRAFTSMAN SCOPE-GUARD]", reason or "")
 
-        other_dec, _ = evaluate_antigravity_scope(
-            {"artifactDirectoryPath": str(self.tmp / "brain" / "conv-other")},
-            "find ~ -name SKILL.md",
-            str(self.repo),
-        )
+        other_dec, _ = evaluate_antigravity_payload(payload("conv-other"), {})
         self.assertEqual(other_dec, "allow")
 
     def _ensure_initial_commit(self) -> None:

@@ -13,12 +13,15 @@ abandoned, never complete). The same progress rule and waiting notice serve the 
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from craftsman import hook_errors
 from craftsman.attribution import agent_runs, evidence_counter
+from craftsman.command_policy import arming_action
 from craftsman.command_policy import review_commands as review_commands
 from craftsman.diffscan import DiffScanError
 from craftsman.evidence import effective_deep
@@ -30,18 +33,21 @@ from craftsman.gate import (
     advance_streak,
     continuation_reason,
     load_state,
+    owns_active_gate,
     state_path_for,
 )
 from craftsman.gatecheck import GateIssue, GatePolicy, GateReport, evaluate, hunters_at_work, is_open_run
 from craftsman.huntplan import plan_due_waves
 from craftsman.huntview import check_command, waiting_notice
-from craftsman.ledger import load, mutate
+from craftsman.ledger import load, mutate, uncovered_hunks
 from craftsman.records import AgentRole, Ledger, LedgerError, Round, parse_timestamp
 from craftsman.workspace import (
     ReviewMarker,
     Workspace,
+    arm_marker,
     cli_visible,
     read_marker,
+    touch_marker,
     write_marker,
 )
 
@@ -131,22 +137,24 @@ def review_outcome_issues(
     """What `craftsman review check --review-only` still lacks for a review begun at `marker`.
 
     Judged by the same rules and evidence as that command, as it runs for `caller`'s session. The review
-    must have been touched since the marker was written (a hooked `craftsman review` command, a round, a
-    coverage record or a finding), else the only issue is that no round exists yet. A re-prepare of an
-    unchanged diff keeps its round and its `prepared_at`, so a round is NOT required to be newer than the
-    marker. A requested deep review needs a deep round, and in a hooked session the latest round must be
-    enforced (a plain `prepare` upgrades both); only then does the ledger decide.
+    must have begun since the marker was written, else the only issue is that no round exists yet. It begins
+    with a `prepare` that succeeded (the round's `last_prepared_at`, which a re-use of an unchanged round
+    stamps too, so a round is NOT required to be newer than the marker) or with a coverage record or a
+    finding. A hooked `craftsman review` command alone does not begin it: PreToolUse fires before the command
+    runs, and a read-only `show` or `check` (or a `prepare` that then failed) would otherwise let a fresh
+    `/craft-review` over an already passed round stop unreviewed. A requested deep review needs a deep
+    round, and in a hooked session the latest round must be enforced (a plain `prepare` upgrades both); only
+    then does the ledger decide.
     """
     ledger = load(ledger_path)
     started = parse_timestamp(marker.at)
     latest = ledger.rounds[-1] if ledger.rounds else None
-    touched = latest is not None and (
-        (marker.touched_at is not None and parse_timestamp(marker.touched_at) >= started)
-        or parse_timestamp(latest.prepared_at) >= started
+    begun = latest is not None and (
+        parse_timestamp(latest.latest_prepare_at) >= started
         or any(parse_timestamp(item.recorded_at) >= started for item in ledger.coverage)
         or any(parse_timestamp(item.recorded_at) >= started for item in ledger.findings)
     )
-    if latest is None or not touched:
+    if latest is None or not begun:
         return [GateIssue("no-round", REVIEW_NOT_STARTED)]
     if marker.deep and not latest.deep:
         return [GateIssue("no-round", DEEP_REQUESTED)]
@@ -229,3 +237,57 @@ def serve_review_stop(root: Path, ledger_path: Path, caller: GateOwner, now: dat
     if decision.marker is not None:
         write_marker(ledger_path, decision.marker)
     return decision
+
+
+# --- what the PreToolUse hooks ask of the review -----------------------------------------------------
+
+REVIEW_IN_PROGRESS_MAX_AGE = timedelta(hours=12)
+
+
+def review_in_progress(ledger_path: Path, state_path: Path) -> int | None:
+    """The latest round number when an open review-only round ran within 12 hours, else None.
+
+    The work-tree guard asks it of the main session. A ledger or gate state that cannot be read is not "no
+    review": the error goes to the hook error log and the guard stays quiet.
+    """
+    try:
+        if not ledger_path.is_file():
+            return None
+        state = load_state(state_path)
+        if state is not None and state.active:
+            return None
+        ledger = load(ledger_path)
+    except (DiffScanError, GateStateError, LedgerError) as exc:
+        sys.stderr.write(f"craftsman hook error: {exc}\n")
+        hook_errors.report(hook_errors.kind_of(exc), f"the work-tree guard could not read the review: {exc}", ledger_path.parent)
+        return None
+    if not ledger.rounds:
+        return None
+    latest = ledger.rounds[-1]
+    if datetime.now(timezone.utc) - parse_timestamp(latest.prepared_at) > REVIEW_IN_PROGRESS_MAX_AGE:
+        return None
+    has_open = bool(uncovered_hunks(ledger, latest)) or any(finding.verdict is None for finding in ledger.findings)
+    return latest.number if has_open else None
+
+
+def arm_for_review_command(
+    ledger_path: Path, state_path: Path, caller: GateOwner, review: Sequence[str], now: datetime
+) -> None:
+    """The main session of `caller` runs the `craftsman review` subcommands `review`: arm the review guard for it
+    (a `report` only touches it). The caller must be the main session; no platform's subagent arms the guard.
+
+    The owner of an active gate is left alone (the gate holds it; a second guard would outlive the gate's own cap).
+    Never blocks the tool call: a failure is reported on stderr and the command goes on.
+    """
+    action = arming_action(review)
+    if action is None or caller.session_id is None:
+        return
+    try:
+        if owns_active_gate(load_state(state_path), caller):
+            return
+        if action == "arm":
+            arm_marker(ledger_path, caller, now, fresh=False)
+        else:
+            touch_marker(ledger_path, caller, now)
+    except (OSError, ValueError, GateStateError) as exc:
+        sys.stderr.write(f"craftsman hook error: could not arm the review guard: {exc}\n")

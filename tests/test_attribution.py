@@ -1881,6 +1881,34 @@ class RoundStartCutTests(unittest.TestCase):
 
         self.assertEqual(pair_unnamed_stop(starts, moment(115), moment(100)), 1)
 
+    def test_pair_unnamed_stop_prefers_a_start_that_was_not_sent_back(self) -> None:
+        starts = [moment(105), moment(110), moment(112)]
+
+        self.assertEqual(pair_unnamed_stop(starts, moment(120), moment(100), {moment(105)}), 1)
+        self.assertEqual(pair_unnamed_stop(starts, moment(120), moment(100), {moment(105), moment(110)}), 2)
+        # every start was sent back already: the oldest one, which the caller then lets go
+        self.assertEqual(pair_unnamed_stop(starts, moment(120), moment(100), set(starts)), 0)
+        self.assertEqual(pair_unnamed_stop(starts, moment(120), moment(100), {moment(999)}), 0)
+
+    def test_the_preference_for_an_unsent_start_stays_inside_the_current_round(self) -> None:
+        starts = [moment(15), moment(105)]
+
+        self.assertEqual(pair_unnamed_stop(starts, moment(115), moment(100), {moment(105)}), 1)  # not the older round's run
+
+    def test_a_nudge_that_answered_a_start_moves_the_next_stop_to_its_sibling(self) -> None:
+        ledger = hunt_ledger(("W1-1",))
+        ledger = with_agents(
+            ledger,
+            agent_event("start", REVIEWER, "", 110, platform="copilot"),
+            agent_event("start", REVIEWER, "", 111, platform="copilot"),
+            replace(agent_event("nudge", REVIEWER, "", 120, platform="copilot"), answered=at(110)),
+            agent_event("stop", REVIEWER, "", 121, platform="copilot"),
+        )
+
+        runs = agent_runs(ledger)
+
+        self.assertEqual([(r.started, r.stopped) for r in runs], [(moment(110), None), (moment(111), moment(121))])
+
     def test_pair_unnamed_stop_counts_a_start_exactly_at_the_round_preparation_as_current(self) -> None:
         self.assertEqual(pair_unnamed_stop([moment(90), moment(100)], moment(115), moment(100)), 1)
 

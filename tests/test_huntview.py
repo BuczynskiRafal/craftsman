@@ -128,8 +128,33 @@ class BriefTests(unittest.TestCase):
         text = self.brief(antigravity=True, role_text="# Craftsman Hunter\nYou assume it has bugs.")
 
         self.assertIn("send that summary to your parent with send_message", text)
-        self.assertTrue(text.rstrip().endswith("You assume it has bugs."))
+        self.assertIn("You assume it has bugs.", text)
         self.assertIn("--- Role text ---", text)
+
+    def test_the_send_message_instruction_is_the_last_thing_an_antigravity_subagent_reads(self) -> None:
+        role = "# Role\nReply with a short summary."
+        sentence = "a plain reply is not seen."
+        verifier = huntview.verifier_brief(
+            findings=[finding()], round_=None, base_sha="abc", task="t", role_text=role, antigravity=True, parent="p-1"
+        )
+
+        for text in (self.brief(antigravity=True, role_text=role), verifier, self.brief(antigravity=True, role_text=role, parent="p-1")):
+            with self.subTest(text=text[-80:]):
+                self.assertTrue(text.rstrip().endswith(sentence))
+                self.assertLess(text.index("Reply with a short summary."), text.index("send_message"))
+
+    def test_an_antigravity_hunter_with_a_known_parent_gets_the_exact_call(self) -> None:
+        text = self.brief(antigravity=True, parent="e2876235-30e1-4306-b200-3fd05bd7566c")
+
+        self.assertIn(
+            "When done, call send_message with Recipient `e2876235-30e1-4306-b200-3fd05bd7566c` and a 2-3 line Message"
+            " (slot, hunks covered, findings)",
+            text,
+        )
+        self.assertNotIn("that launched you", text)
+
+    def test_a_parent_is_named_on_antigravity_only(self) -> None:
+        self.assertNotIn("send_message", self.brief(antigravity=False, parent="e2876235"))
 
     def test_a_variant_brief_describes_the_defect_to_hunt(self) -> None:
         trigger = finding(severity="major", title="Empty list crashes total()", path="app.py", line=3)
@@ -164,6 +189,29 @@ class VerifierBriefTests(unittest.TestCase):
         self.assertIn("craftsman review verdict <ID> --as proven --run <R#>", text)
         self.assertIn("Base ref: abc123 (round 1)", text)
         self.assertIsNone(_FINDING_TOKEN_RE.search(text))
+
+    def verifier_text(self, *, antigravity: bool = False, parent: str | None = None) -> str:
+        return huntview.verifier_brief(
+            findings=[finding()], round_=round_of("H1"), base_sha="abc", task="t", role_text=None,
+            antigravity=antigravity, parent=parent,
+        )  # fmt: skip
+
+    def test_an_antigravity_verifier_reports_to_its_parent(self) -> None:
+        text = self.verifier_text(antigravity=True, parent="e2876235")
+
+        self.assertIn(
+            "When done, call send_message with Recipient `e2876235` and a 2-3 line Message (the findings judged and their verdicts)",
+            text,
+        )
+
+    def test_an_antigravity_verifier_without_a_known_parent_gets_the_generic_sentence(self) -> None:
+        text = self.verifier_text(antigravity=True)
+
+        self.assertIn("send that table to your parent with send_message (Recipient: the conversation that launched you)", text)
+
+    def test_other_platforms_verifiers_are_not_told_about_send_message(self) -> None:
+        self.assertNotIn("send_message", self.verifier_text())
+        self.assertNotIn("send_message", self.verifier_text(parent="e2876235"))
 
     def test_the_role_text_is_appended_when_given(self) -> None:
         text = huntview.verifier_brief(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -26,6 +27,7 @@ from craftsman.gatecheck import (
     passing_runs,
     render_report,
     slot_statuses,
+    verification_debt,
     verifier_clusters,
 )
 from craftsman.huntplan import plan_due_waves, required_slots
@@ -1840,10 +1842,23 @@ class StartingHuntersTests(unittest.TestCase):
         self.assertIn("Launch now, all in one step: W1-1..W1-3.", issue.message)
         self.assertNotIn("Starting:", issue.message)
 
-    def test_an_antigravity_run_is_never_counted_as_starting(self) -> None:
+    def test_an_antigravity_run_that_fetched_no_brief_is_starting_like_any_other(self) -> None:
+        # The sync records every launched subagent (`agy_sync`), so one that has not fetched its brief yet is a
+        # hunter that is starting, and the orchestrator is told to wait, not to launch it again.
         ledger = with_agents(hunt("W1-1"), *run_events("a1", 10, None, platform=AGY))
 
-        self.assertIn("Launch now", check(ledger).issues[0].message)
+        (issue,) = check(ledger).issues
+
+        self.assertIn("Starting: 1 reviewer subagent has started", issue.message)
+        self.assertNotIn("Launch now", issue.message)
+
+    def test_an_antigravity_run_is_not_counted_twice_once_it_holds_a_claim(self) -> None:
+        ledger = with_agents(claim(hunt("W1-1"), "W1-1", 10.5, by=f"{AGY}:a1"), *run_events("a1", 10, None, platform=AGY))
+
+        (issue,) = check(ledger).issues
+
+        self.assertIn("Running: W1-1 -", issue.message)
+        self.assertNotIn("Starting:", issue.message)
 
     def test_running_slots_do_not_count_among_those_the_starting_hunters_are_for(self) -> None:
         # Hunter a fetched its brief at 10.5 and runs W1-1; b started at 11 and has fetched none.
@@ -2399,6 +2414,47 @@ class VerificationTests(unittest.TestCase):
         for issue in report.issues:
             with self.subTest(code=issue.code):
                 self.assertIn("Verifiers running: 1 verifier is still at work", issue.message)
+
+
+class VerificationDebtTests(unittest.TestCase):
+    """`verification_debt` is the one definition the gate's issues and the SubagentStop verifier rule share."""
+
+    def ledger(self, *, enforced: bool = True, planned: bool = True) -> Ledger:
+        ledger = with_findings(one_slot_done(), ("major", "f1.py", "intent"), ("minor", "f1.py", "failure"))
+        ledger = judged(ledger, "F1", VerdictEvent("V1", "dismissed", at(70)))  # the orchestrator's own: nobody vouches
+        round_ = replace(ledger.rounds[0], enforced=enforced, plan=ledger.rounds[0].plan if planned else None)
+        return replace(ledger, rounds=(round_,))
+
+    def test_an_enforced_round_owes_every_finding_the_gate_would_name(self) -> None:
+        ledger = self.ledger()
+
+        self.assertEqual(verification_debt(ledger, ledger.rounds[0]), ("F1", "F2"))
+
+    def test_the_debt_is_what_the_gates_verification_issues_list(self) -> None:
+        ledger = self.ledger()
+        issues = [issue for issue in check(ledger, snap=hunt_snap(1)).issues if issue.code in ("no-verdict", "unverified", "second-opinion")]
+
+        named = {finding for issue in issues for finding in re.findall(r"\bF\d+\b", issue.message)}
+
+        self.assertEqual(named, set(verification_debt(ledger, ledger.rounds[0])))
+        self.assertEqual({issue.code for issue in issues}, {"no-verdict", "unverified"})
+
+    def test_an_advisory_round_owes_findings_without_a_verdict_only(self) -> None:
+        ledger = self.ledger(enforced=False)
+
+        self.assertEqual(verification_debt(ledger, ledger.rounds[0]), ("F2",))
+
+    def test_a_round_without_a_plan_owes_findings_without_a_verdict_only(self) -> None:
+        ledger = self.ledger(planned=False)
+
+        self.assertIsNone(ledger.rounds[0].plan)
+        self.assertEqual(verification_debt(ledger, ledger.rounds[0]), ("F2",))
+
+    def test_a_judged_finding_of_a_round_that_is_not_enforced_owes_nothing(self) -> None:
+        ledger = self.ledger(enforced=False)
+        ledger = judged(ledger, "F2", VerdictEvent("V2", "dismissed", at(71)))
+
+        self.assertEqual(verification_debt(ledger, ledger.rounds[0]), ())
 
 
 class MessageInvariantTests(unittest.TestCase):

@@ -349,6 +349,11 @@ def update_state(path: Path, change: Callable[[GateState | None], tuple[GateStat
         return result
 
 
+def owns_active_gate(state: GateState | None, caller: GateOwner) -> bool:
+    """Whether `state` is an active gate that `caller`'s session owns."""
+    return state is not None and state.active and state.owner.admits(caller)
+
+
 def require_active(state: GateState | None) -> GateState:
     if state is None or not state.active:
         raise GateStateError(NO_ACTIVE_GATE)

@@ -798,12 +798,17 @@ class Round:
     platform: str = "cli"  # where the round was prepared, as the review marker named it
     enforced: bool = False  # the Stop hooks hold the caller to the plan
     task: str = ""
+    # When a `prepare` last succeeded for this round (also when it re-used the round for an unchanged diff, which
+    # keeps `prepared_at`). The review guard asks it to know that a fresh `/craft-review` ran `prepare` at all.
+    last_prepared_at: str | None = None
 
     def __post_init__(self) -> None:
         _require(self.number >= 1, "number", "must be >= 1")
         _require_text(self.fingerprint, "fingerprint")
         _require_text(self.base_sha, "base_sha")
         _require_timestamp(self.prepared_at, "prepared_at")
+        if self.last_prepared_at is not None:
+            _require_timestamp(self.last_prepared_at, "last_prepared_at")
         hunk_ids = [hunk.id for hunk in self.hunks]
         _require(len(set(hunk_ids)) == len(hunk_ids), "hunks", "must not repeat a hunk id")
         sig_ids = [sig.id for sig in self.signals]
@@ -822,8 +827,16 @@ class Round:
     def open_hunk_ids(self) -> tuple[str, ...]:
         return tuple(hunk.id for hunk in self.hunks if not hunk.carried)
 
+    @property
+    def latest_prepare_at(self) -> str:
+        """When a `prepare` last succeeded for this round: `last_prepared_at`, else `prepared_at`."""
+        return max(self.prepared_at, self.last_prepared_at or self.prepared_at, key=parse_timestamp)
+
     def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
+        data = _record_json(self)
+        if self.last_prepared_at is None:
+            del data["last_prepared_at"]
+        return data
 
     @classmethod
     def from_json(cls, raw: Any) -> Round:
@@ -844,6 +857,7 @@ class Round:
                 platform=f.text_or("platform", "cli"),
                 enforced=f.flag_or("enforced", False),
                 task=f.text_or("task", ""),
+                last_prepared_at=f.optional_text_if_present("last_prepared_at"),
             )
         )
 
@@ -950,21 +964,30 @@ def _check_verdict_evidence(verdict: Verdict, evidence: str, run_id: str | None)
 
 @dataclass(frozen=True)
 class VerdictEvent:
-    """One recording of a verdict. The token `V<k>` is what a verifier's transcript shows it printed."""
+    """One recording of a verdict. The token `V<k>` is what a verifier's transcript shows it printed.
+
+    `merge` marks the event `craftsman review merge` writes for a duplicate: it is vouched for like any other
+    event, but it judges nothing, so no stop rule counts it as a verdict.
+    """
 
     token: str
     verdict: Verdict
     at: str
     by: str | None = None
+    merge: bool = False
 
     def __post_init__(self) -> None:
         _require_id(self.token, "V", "token")
         _require_choice(self.verdict, VERDICTS, "verdict")
         _require_timestamp(self.at, "at")
         _require_optional_text(self.by, "by")
+        _require(not self.merge or self.verdict == "dismissed", "merge", "is only allowed on a dismissed event")
 
     def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
+        data = _record_json(self)
+        if not self.merge:
+            del data["merge"]  # ordinary verdicts stay byte-identical
+        return data
 
     @classmethod
     def from_json(cls, raw: Any) -> VerdictEvent:
@@ -975,6 +998,7 @@ class VerdictEvent:
                 verdict=f.choice("verdict", VERDICTS),
                 at=f.text("at"),
                 by=f.optional_text("by"),
+                merge=f.flag_or("merge", False),
             )
         )
 
@@ -1304,6 +1328,12 @@ class AgentEvent:
     # A stop event only: the record tokens (`B1`, `C3`, `F2`, `V4`) the run's own transcript shows it printed;
     # None when no transcript was readable, so the gate attributes records by time instead.
     records: tuple[str, ...] | None = None
+    # A nudge event only: the start (its `at`) of the run this nudge sent back. Copilot names no agent, so this is
+    # how a nudge stays tied to the hunter it answered while its siblings run on (`attribution.pair_unnamed_stop`).
+    answered: str | None = None
+    # A nudge event only (Antigravity): the `step_index` of the last entry of the subagent's transcript when it was
+    # sent back. Its transcript times are whole seconds, so only a later step shows that it worked and finished again.
+    last_step: int | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.platform, "platform")
@@ -1311,12 +1341,16 @@ class AgentEvent:
         _require_timestamp(self.at, "at")
         _require(self.usage is None or self.event == "stop", "usage", "is only allowed on a stop event")
         _require(self.records is None or self.event == "stop", "records", "is only allowed on a stop event")
+        _require(self.answered is None or self.event == "nudge", "answered", "is only allowed on a nudge event")
+        if self.answered is not None:
+            _require_timestamp(self.answered, "answered")
+        _require(self.last_step is None or self.event == "nudge", "last_step", "is only allowed on a nudge event")
         for index, token in enumerate(self.records or ()):
             _require(RECORD_TOKEN_RE.fullmatch(token) is not None, f"records[{index}]", "must look like B1, C3, F2 or V4")
 
     def to_json(self) -> dict[str, Any]:
         data = _record_json(self)
-        for optional in ("usage", "records"):
+        for optional in ("usage", "records", "answered", "last_step"):
             if getattr(self, optional) is None:
                 del data[optional]  # ledgers without telemetry or transcripts stay byte-identical
         return data
@@ -1333,6 +1367,8 @@ class AgentEvent:
                 at=f.text("at"),
                 usage=f.optional_record_if_present("usage", AgentUsage.from_json),
                 records=f.optional_texts_if_present("records"),
+                answered=f.optional_text_if_present("answered"),
+                last_step=f.optional_integer_if_present("last_step"),
             )
         )
 

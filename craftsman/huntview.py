@@ -166,12 +166,14 @@ def hunter_brief(
     trigger: Finding | None,
     role_text: str | None,
     antigravity: bool,
+    parent: str | None = None,
 ) -> str:
     """The whole instruction of the hunter of `slot`.
 
     `hunters` is how many hunters the slot's generation has. `trigger` is the finding a variant slot
     hunts the siblings of. `role_text` is the reviewer role text, for readers that did not load the agent
-    definition themselves. Nothing here resembles what a recording command prints, so a transcript reader
+    definition themselves. `parent` is the conversation that launched an Antigravity hunter (when it is known the
+    brief ends with the exact `send_message` call). Nothing here resembles what a recording command prints, so a transcript reader
     never mistakes this text for a record.
     """
     ranges = hunk_ranges(slot.hunks)
@@ -207,12 +209,21 @@ def hunter_brief(
         "",
         "Finish: reply with a 2-3 line summary (lenses, findings by id and title, anything you could not examine).",
     ]
-    if antigravity:
-        lines.append(
-            "On Antigravity, send that summary to your parent with send_message (Recipient: the conversation"
+    report = _antigravity_report("that summary", parent, "slot, hunks covered, findings") if antigravity else None
+    return _with_role(lines, role_text, report)
+
+
+def _antigravity_report(what: str, parent: str | None, contents: str) -> str:
+    """How an Antigravity subagent reports: its parent does not see a plain reply, only a `send_message`."""
+    if parent is None:
+        return (
+            f"On Antigravity, send {what} to your parent with send_message (Recipient: the conversation"
             " that launched you); a plain reply is not seen."
         )
-    return _with_role(lines, role_text)
+    return (
+        f"When done, call send_message with Recipient `{parent}` and a 2-3 line Message ({contents}); "
+        "a plain reply is not seen."
+    )
 
 
 def _wave_lines(slot: Slot, trigger: Finding | None) -> list[str]:
@@ -245,9 +256,20 @@ def _wave_lines(slot: Slot, trigger: Finding | None) -> list[str]:
 
 
 def verifier_brief(
-    *, findings: Sequence[Finding], round_: Round | None, base_sha: str, task: str, role_text: str | None
+    *,
+    findings: Sequence[Finding],
+    round_: Round | None,
+    base_sha: str,
+    task: str,
+    role_text: str | None,
+    antigravity: bool = False,
+    parent: str | None = None,
 ) -> str:
-    """The whole instruction of a verifier for `findings` (their text comes from the ledger)."""
+    """The whole instruction of a verifier for `findings` (their text comes from the ledger).
+
+    On Antigravity (`antigravity`) it ends with the report to the parent conversation, the exact `send_message`
+    call when `parent` is known.
+    """
     ids = ",".join(finding.id for finding in findings)
     lines = [
         f"You are an independent Craftsman verifier for {ids}. You did not write this code and you did not hunt"
@@ -286,10 +308,15 @@ def verifier_brief(
         "",
         "Finish with a table: finding id, verdict, one-line reason.",
     ]
-    return _with_role(lines, role_text)
+    report = _antigravity_report("that table", parent, "the findings judged and their verdicts") if antigravity else None
+    return _with_role(lines, role_text, report)
 
 
-def _with_role(lines: list[str], role_text: str | None) -> str:
+def _with_role(lines: list[str], role_text: str | None, report: str | None = None) -> str:
+    """The brief: `lines`, the role text, and last the Antigravity `report` instruction (the role text ends with
+    its own 'reply' wording, which must not be the last thing a subagent reads there)."""
     if role_text:
         lines += ["", "--- Role text ---", role_text.strip()]
+    if report is not None:
+        lines += ["", report] if role_text else [report]
     return "\n".join(lines) + "\n"
