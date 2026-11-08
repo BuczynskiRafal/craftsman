@@ -47,10 +47,12 @@ from craftsman.diffscan import (
     Hunk,
     detect_deep_hint_signals,
     detect_signals,
+    is_docs_hunk,
+)
+from craftsman.diffscan_paths import (
     is_agent_prompt_path,
     is_config_path,
     is_data_path,
-    is_docs_hunk,
     is_docs_path,
     is_test_path,
 )

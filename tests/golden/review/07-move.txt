@@ -1,0 +1,6 @@
+$ craftsman review move F1 --line 8
+[exit 0]
+--- stdout
+F1 now points at app.py:8
+  L8: 
+--- stderr

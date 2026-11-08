@@ -1,0 +1,27 @@
+$ craftsman review scout total
+[exit 0]
+--- stdout
+# Scout `total` · base <BASE7>
+## Definition of `total`
+`app.py:L5–L7` total
+```python
+ 5 def total(items):
+ 6     """Sum of prices."""
+ 7     return sum(item["price"] for item in items) / len(items)
+```
+## References to `total`
+`docs/guide.md:3`
+```markdown
+ 1 # Guide
+ 2 
+>3 Use `total` to add prices.
+ 4 
+ 5 Use `label` to name an item.
+```
+## Tests referencing `total`
+`tests/test_app.py:L4–L5` test_total
+```python
+ 4 def test_total():
+ 5     assert app.total([{'price': 2}]) == 2
+```
+--- stderr

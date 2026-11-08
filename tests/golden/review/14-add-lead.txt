@@ -1,0 +1,5 @@
+$ craftsman review add --hunter lead --file app.py --line 11 --lens contracts --severity major --title Label --scenario label({}) raises KeyError
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --title must have 8..160 characters (got 5)

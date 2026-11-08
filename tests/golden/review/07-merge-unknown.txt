@@ -1,0 +1,5 @@
+$ craftsman review merge F3 F99
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: unknown finding 'F99'; known findings: F1, F2, F3, F4

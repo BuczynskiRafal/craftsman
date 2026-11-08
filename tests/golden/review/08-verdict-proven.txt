@@ -1,0 +1,5 @@
+$ craftsman review verdict F1 --as proven --evidence ran total([]) and got ZeroDivisionError --run R1
+[exit 0]
+--- stdout
+F1 verdict recorded (V2): proven (R1)
+--- stderr

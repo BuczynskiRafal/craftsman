@@ -1,0 +1,33 @@
+$ craftsman review prepare --help
+[exit 0]
+--- stdout
+usage: craftsman review prepare [-h] [--cwd CWD] [--deep] [--base BASE]
+                                [--task TASK] [--task-file PATH]
+                                [--paths PATHS] [--add-paths ADD_PATHS]
+                                [--staged] [--tracked]
+
+Snapshot the diff since the base commit and open a review round.
+
+options:
+  -h, --help            show this help message and exit
+  --cwd CWD             Directory inside the repository (default: current)
+  --deep                Make the round deep: every lens is suggested (inside a
+                        gate it raises the gate to deep)
+  --base BASE           Base commit (default: the active task's base or HEAD)
+  --task TASK           One-line description of what the change is for
+  --task-file PATH      Read the description of what the change is for from a
+                        file (use - for stdin; at most 4000 characters)
+  --paths PATHS         Comma-separated file or directory paths to freeze as
+                        the review scope
+  --add-paths ADD_PATHS
+                        Comma-separated file or directory paths to add to an
+                        existing review scope (e.g. files touched in --fix)
+  --staged              Freeze the review scope to paths staged in the index
+                        (content still comes from the work tree)
+  --tracked             Freeze the review scope to tracked files changed since
+                        the base (omit untracked files)
+
+Tool caches (__pycache__, .pytest_cache, node_modules, ...) never enter the
+diff. List further paths to leave out, in .gitignore syntax, in a
+.craftsmanignore file at the repository root.
+--- stderr

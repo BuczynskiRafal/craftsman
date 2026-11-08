@@ -1,0 +1,17 @@
+$ craftsman review brief --help
+[exit 0]
+--- stdout
+usage: craftsman review brief [-h] [--cwd CWD] [--verifier IDS] [SLOT]
+
+`brief SLOT` records that you took the slot, then prints your slice, lenses
+and the commands that record your work. `brief --verifier F1,F2` prints a
+verifier's instruction and records nothing.
+
+positional arguments:
+  SLOT            Slot id from the hunt plan, e.g. W1-2
+
+options:
+  -h, --help      show this help message and exit
+  --cwd CWD       Directory inside the repository (default: current)
+  --verifier IDS  Comma-separated finding ids to verify, e.g. F1,F2
+--- stderr

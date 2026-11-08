@@ -1,8 +1,12 @@
-"""Catalog of review lenses and the policy that suggests them for a change.
+"""Catalog of review lenses: their ids, focus and the risk signals that trigger them.
 
-A lens is one focused review perspective. This module is the single source of truth for lens
-ids and suggestions; the long-form playbook for each lens lives in the skills. Suggestions are
-hints for the orchestrating agent, never a gate input.
+A lens is one focused review perspective. This module is the single source of truth for lens ids
+and for which risk signals call for which lens (`Lens.triggers`); the long-form playbook for each
+lens lives in `skills/craft-review/lenses.md`. Which lenses a hunk of a round actually owes, and
+how they are grouped into hunter slots, is decided by `craftsman.huntplan` from this catalog, and
+that plan is what the gate holds a review to. `select_lenses` and `deep_hint` are the earlier
+suggestion API: nothing in the review commands calls them any more (the tests still do), so they
+shape no hunt and no gate decision.
 """
 
 from __future__ import annotations

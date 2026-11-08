@@ -1,0 +1,6 @@
+$ craftsman review verdict --from-json -
+[exit 0]
+--- stdout
+F2 verdict recorded (V3): dismissed
+F3 verdict recorded (V4): probable
+--- stderr

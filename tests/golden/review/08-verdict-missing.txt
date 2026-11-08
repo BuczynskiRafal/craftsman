@@ -1,0 +1,9 @@
+$ craftsman review verdict
+[exit 2]
+--- stdout
+--- stderr
+usage: craftsman review verdict [-h] [--cwd CWD] [--as VERDICT]
+                                [--evidence EVIDENCE] [--run RUN]
+                                [--from-json PATH] [--check]
+                                [ID]
+craftsman review verdict: error: the following arguments are required: ID, --as, --evidence

@@ -1,0 +1,5 @@
+$ craftsman review inbox cover
+[exit 0]
+--- stdout
+<REPO>/.git/craftsman/inbox/cover-<PID>-<ID>.json
+--- stderr

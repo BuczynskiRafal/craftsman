@@ -1,0 +1,12 @@
+$ craftsman review inbox --help
+[exit 0]
+--- stdout
+usage: craftsman review inbox [-h] [--cwd CWD] {cover,add,verdict}
+
+positional arguments:
+  {cover,add,verdict}  Batch command the file is for
+
+options:
+  -h, --help           show this help message and exit
+  --cwd CWD            Directory inside the repository (default: current)
+--- stderr

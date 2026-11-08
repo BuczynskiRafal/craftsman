@@ -1,0 +1,21 @@
+$ craftsman review prepare
+[exit 0]
+--- stdout
+Round 2 prepared: 7 files, 7 hunks, 22 changed lines; 5 hunks carried, 2 to review.
+Packet: <REPO>/.git/craftsman/packet-2.md
+Depth: normal (no deep signal; 14 changed production lines <= 250)
+Advisory: no Craftsman hook saw this session, so the review will be SELF-REVIEWED (run `craftsman doctor`).
+Hunt plan, round 2:
+  W1-1  H3,H8  intent, contracts, failure, ripple, tests  10 lines
+  W1-2  H3,H8  craft, design (simplicity)                 10 lines  [Claude Code: model haiku]
+  W1-3  H4-H8  sweep                                      19 lines
+This plan is a suggestion: an advisory review is complete when every hunk is covered.
+Launch all 3 hunters now, in one step. Each is a craftsman-reviewer subagent whose whole prompt is:
+  You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly.
+  Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer.
+  Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.
+Then end your turn while they run. When they report back, run `craftsman review check --review-only` and do exactly what it lists.
+Scope: 7 file(s), frozen for this review.
+--- stderr
+Pruned: packet-1.H1-H2.md
+Pruned: packet-1.app-py-lib-util-py-629e058d.md

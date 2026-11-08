@@ -143,6 +143,18 @@ class NoGateTests(AntigravityTestCase):
         entries = hook_errors.read(self.repo.ledger_dir)
         self.assertEqual([(entry.kind, entry.source) for entry in entries], [("transcript", "antigravity-stop")])
 
+    def test_a_transcript_over_the_size_cap_allows_with_an_error(self) -> None:
+        transcript = self.app.transcript_path(MAIN)
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{"step_index": 1, "type": "USER_INPUT", "content": "hi"}\n', encoding="utf-8")
+        with mock.patch("craftsman.transcript.MAX_TRANSCRIPT_BYTES", 10):
+            answer, err = self.stop()
+        self.assertEqual(answer, {"decision": "allow"})
+        self.assertIn("The quality gate was not checked", err)
+        self.assertIn("is larger than", err)
+        entries = hook_errors.read(self.repo.ledger_dir)
+        self.assertEqual([(entry.kind, entry.source) for entry in entries], [("transcript", "antigravity-stop")])
+
     def test_invalid_gate_state_allows_with_an_error(self) -> None:
         path = state_path_for(self.repo.root)
         path.parent.mkdir(parents=True, exist_ok=True)

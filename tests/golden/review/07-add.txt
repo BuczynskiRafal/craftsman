@@ -1,0 +1,6 @@
+$ craftsman review add --file app.py --line 7 --lens contracts --severity major --title Empty cart divides by zero --scenario total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError
+[exit 0]
+--- stdout
+F1 recorded (major, contracts, app.py:7)
+  L7: return sum(item["price"] for item in items) / len(items)
+--- stderr

@@ -1,0 +1,6 @@
+$ craftsman review inbox nope
+[exit 2]
+--- stdout
+--- stderr
+usage: craftsman review inbox [-h] [--cwd CWD] {cover,add,verdict}
+craftsman review inbox: error: argument kind: invalid choice: 'nope' (choose from cover, add, verdict)

@@ -1,0 +1,21 @@
+$ craftsman review scout app.py:7
+[exit 0]
+--- stdout
+# Scout app.py:7 · base <BASE7>
+## app.py:7 · total (function, L5–L7)
+### Base version at <BASE7>
+`app.py:L5–L7`
+```python
+ 5 def total(items):
+ 6     """Sum of prices."""
+ 7     return sum(item["price"] for item in items)
+```
+### Callers of `total`
+(no callers found outside tests)
+### Tests
+`tests/test_app.py:L4–L5` test_total
+```python
+ 4 def test_total():
+ 5     assert app.total([{'price': 2}]) == 2
+```
+--- stderr

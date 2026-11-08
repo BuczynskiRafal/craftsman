@@ -353,6 +353,31 @@ class ReadRecordsTests(TranscriptCase):
         self.assertIsNone(facts.records)
         self.assertIn("not JSON", facts.problem or "")
 
+    def test_blank_lines_between_and_after_the_entries_are_no_bad_lines(self) -> None:
+        call = json.dumps(shell_call("t1", "craftsman review cover --hunks H1 --note x"))
+        result = json.dumps(tool_result("t1", "Coverage recorded (C1): H1 in round 1"))
+        path = self.dir / "blank.jsonl"
+        path.write_text(f"{call}\n\n   \n{result}\n\n", encoding="utf-8")
+
+        facts = read_transcript(path)
+
+        self.assertIsNone(facts.problem)
+        self.assertEqual(facts.records, ("C1",))
+
+    def test_an_undecodable_byte_inside_an_entry_costs_neither_the_tokens_nor_the_vouching(self) -> None:
+        call = json.dumps(shell_call("t1", "craftsman review cover --hunks H1 --note x")).encode()
+        result = json.dumps(tool_result("t1", "Coverage recorded (C1): H1 in round 1 XX")).encode().replace(b"XX", b"\xff")
+        usage = json.dumps(assistant("m1", AT, output_tokens=7)).encode()
+        path = self.dir / "invalid-byte.jsonl"
+        path.write_bytes(b"\n".join((call, result, usage)) + b"\n")
+
+        facts = read_transcript(path)
+
+        self.assertIsNone(facts.problem)
+        self.assertEqual(facts.records, ("C1",))
+        assert facts.usage is not None
+        self.assertEqual(facts.usage.output_tokens, 7)
+
     def test_one_pass_reads_usage_and_records(self) -> None:
         path = self.transcript(
             assistant("m1", AT, output_tokens=5),

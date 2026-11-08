@@ -14,20 +14,17 @@ from pathlib import Path, PurePosixPath
 from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
-    Reference,
-    Scope,
-    WorktreeIndex,
     commit_sha,
     detect_signals,
     files_without_signal_patterns,
     git_output,
-    is_test_path,
-    reference_kind,
 )
+from craftsman.diffscan_paths import is_test_path
 from craftsman.ledger import reopened_mentions
 from craftsman.lenses import LENSES
 from craftsman.records import FieldError, Ledger, QualitySignal, Round, SignalKind
 from craftsman.text import defang_tokens
+from craftsman.worktree_index import Reference, Scope, WorktreeIndex, reference_kind
 
 MAX_PACKET_CHARS = 120_000
 MAX_VIEW_CHARS = 60_000
@@ -368,8 +365,8 @@ def _omit_diffs(
 def _preamble(ctx: PacketContext, assigned: frozenset[str] | None, *, list_hints: bool = True) -> str:
     """The opening sections: only what a hunter lacks elsewhere; a section with nothing to say is left out.
 
-    Lens suggestions are in the risk map `prepare` prints, and the recording commands are in the
-    hunter's agent definition and playbooks.
+    The lenses are in the hunt plan `prepare` prints, and the recording commands are in the
+    hunter's brief (`craftsman review brief`) and agent definition.
     """
     parts = [_header(ctx), _intent(ctx), _conventions_section(ctx)]
     if ctx.unscanned_files:

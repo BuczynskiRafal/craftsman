@@ -9,9 +9,10 @@ from pathlib import Path
 from unittest import mock
 
 from craftsman import scout as scout_module
-from craftsman.diffscan import WorktreeIndex, resolve_base_sha, snapshot
+from craftsman.diffscan import resolve_base_sha, snapshot
 from craftsman.records import FieldError
 from craftsman.scout import Scout, parse_target
+from craftsman.worktree_index import WorktreeIndex
 
 from tests.support import EvidenceRepo, GitRepo
 

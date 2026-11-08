@@ -1,0 +1,13 @@
+$ craftsman review check --help
+[exit 0]
+--- stdout
+usage: craftsman review check [-h] [--cwd CWD] [--json] [--review-only]
+
+options:
+  -h, --help     show this help message and exit
+  --cwd CWD      Directory inside the repository (default: current)
+  --json
+  --review-only  Check only review completeness (round, coverage, verdicts),
+                 without requiring fixes or test runs; refused while a
+                 /craftsman gate is active in the checkout
+--- stderr

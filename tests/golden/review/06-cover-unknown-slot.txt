@@ -1,0 +1,5 @@
+$ craftsman review cover --hunks H1 --hunter W1-99 --note H1 f_1.py:1: x=1 -> returns 2 on boundary input
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: unknown slot W1-99 in round 1; slots of round 1: W1-1, W1-2, W1-3

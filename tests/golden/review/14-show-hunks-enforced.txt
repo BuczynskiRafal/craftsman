@@ -1,0 +1,27 @@
+$ craftsman review show --hunks
+[exit 0]
+--- stdout
+W1-1 [not launched] still misses H1-H7:
+  H1  NOTES.txt:1-1  added
+  H2  app.py:4-19  total
+  H3  docs/guide.md:1-5  modified
+  H4  extra.py:1-2  double
+  H5  lib/util.py:1-6  modified
+  H6  new_name.py  renamed
+  H7  tests/test_extra.py:1-5  added
+W1-2 [not launched] still misses H2,H4-H7:
+  H2  app.py:4-19  total
+  H4  extra.py:1-2  double
+  H5  lib/util.py:1-6  modified
+  H6  new_name.py  renamed
+  H7  tests/test_extra.py:1-5  added
+W1-3 [not launched] still misses H1-H7:
+  H1  NOTES.txt:1-1  added
+  H2  app.py:4-19  total
+  H3  docs/guide.md:1-5  modified
+  H4  extra.py:1-2  double
+  H5  lib/util.py:1-6  modified
+  H6  new_name.py  renamed
+  H7  tests/test_extra.py:1-5  added
+3 slot(s) left to cover
+--- stderr

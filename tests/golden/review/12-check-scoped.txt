@@ -1,0 +1,14 @@
+$ craftsman review check --review-only
+[exit 1]
+--- stdout
+**Craftsman review: INCOMPLETE (1 open items)**
+**SELF-REVIEWED: no evidence that anyone other than the author reviewed this change**
+
+Round 2 (current): 3 hunks in 3 files, +12/-2 lines.
+Coverage: 0/3 hunks; 0 hunk(s) carried from earlier rounds.
+Findings: none.
+Runs: none recorded.
+
+**Next actions**
+1. [uncovered] 3 hunk(s) uncovered in round 2: H1,H3,H2; have them reviewed and run `craftsman review cover --hunks H1,H3,H2 --note "..."`.
+--- stderr

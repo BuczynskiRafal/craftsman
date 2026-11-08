@@ -1,0 +1,5 @@
+$ craftsman review view --files app.py,./lib/util.py
+[exit 0]
+--- stdout
+<REPO>/.git/craftsman/packet-1.app-py-lib-util-py-629e058d.md
+--- stderr

@@ -1,0 +1,7 @@
+$ craftsman review reset
+[exit 0]
+--- stdout
+Archived to <REPO>/.git/craftsman/ledger-<STAMP>.json
+Archived to <REPO>/.git/craftsman/archive-<STAMP>
+--- stderr
+Pruned 1 inbox file(s): cover-<PID>-<ID>.json

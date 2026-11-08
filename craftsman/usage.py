@@ -11,7 +11,6 @@ fail a hook or a report.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Mapping
@@ -21,16 +20,16 @@ from pathlib import Path
 from typing import Any
 
 from craftsman.command_policy import BRIEF_OPTIONS, has_option, invocations
+from craftsman.jsonl import MAX_TRANSCRIPT_BYTES, JsonlReader, StopReason
 from craftsman.records import AgentRole, AgentUsage, Ledger, agent_role, parse_timestamp
 from craftsman.shell import SimpleCommand, iter_simple_commands
 
-MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024
 # A longer pause between two transcript entries is the agent being idle (a resumed agent waits for
 # its parent between runs), not working.
 IDLE_GAP_S = 300.0
 ROLE_LABELS: Mapping[AgentRole, str] = {"reviewer": "hunters", "verifier": "verifiers"}
-# What a successful recording call prints; see `review._record_coverage`, `review._add_one`, `review._brief`
-# (`Brief issued (B1)`) and `review._print_verdict` (`F3 verdict recorded (V7)`, also printed by `merge`).
+# What a successful recording call prints; see `review_records` (`record_coverage`, `_add_one`, `print_verdict`:
+# `F3 verdict recorded (V7)`, also printed by `merge`) and `review._brief` (`Brief issued (B1)`).
 _COVERAGE_TOKEN_RE = re.compile(r"Coverage recorded \((C\d+)\)")
 _FINDING_TOKEN_RE = re.compile(r"\b(F\d+) recorded \(")
 _CLAIM_TOKEN_RE = re.compile(r"Brief issued \((B\d+)\)")
@@ -121,8 +120,6 @@ def read_transcript(path: Path) -> TranscriptFacts:
 
 
 def _read_transcript(path: Path) -> TranscriptFacts:
-    if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
-        return TranscriptFacts(problem=f"the transcript {path} is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB; not read")
     by_message: dict[str, dict[str, int]] = {}
     anonymous: list[dict[str, int]] = []
     previous: datetime | None = None
@@ -131,36 +128,39 @@ def _read_transcript(path: Path) -> TranscriptFacts:
     tokens: list[str] = []
     vouched = True
     bad_line = False
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            entry = _entry(line)
-            if entry is None:
-                if line.strip():
-                    vouched = False
-                    bad_line = True
-                continue
-            stamp = _moment(entry.get("timestamp"))
-            if stamp is not None:
-                if previous is not None:
-                    gap = (stamp - previous).total_seconds()
-                    active_s += gap if 0 < gap <= IDLE_GAP_S else 0.0
-                previous = stamp if previous is None or stamp > previous else previous
-            vouched = _follow_copilot_event(entry, calls, tokens) and vouched
-            message = entry.get("message")
-            if not isinstance(message, dict):
-                continue
-            vouched = _follow_recording_calls(message.get("content"), calls, tokens) and vouched
-            usage = message.get("usage")
-            if entry.get("type") != "assistant" or not isinstance(usage, dict):
-                continue
-            counts = {name: _count(usage.get(key)) for key, name in _TOKEN_KEYS}
-            message_id = message.get("id")
-            if isinstance(message_id, str) and message_id:
-                seen = by_message.setdefault(message_id, dict.fromkeys(counts, 0))
-                for name, value in counts.items():
-                    seen[name] = max(seen[name], value)
-            else:
-                anonymous.append(counts)
+    reader = JsonlReader(path, errors="replace", max_bytes=MAX_TRANSCRIPT_BYTES)
+    for line in reader:
+        if line.blank:
+            continue
+        entry = line.value if isinstance(line.value, dict) else None
+        if entry is None:
+            vouched = False
+            bad_line = True
+            continue
+        stamp = _moment(entry.get("timestamp"))
+        if stamp is not None:
+            if previous is not None:
+                gap = (stamp - previous).total_seconds()
+                active_s += gap if 0 < gap <= IDLE_GAP_S else 0.0
+            previous = stamp if previous is None or stamp > previous else previous
+        vouched = _follow_copilot_event(entry, calls, tokens) and vouched
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        vouched = _follow_recording_calls(message.get("content"), calls, tokens) and vouched
+        usage = message.get("usage")
+        if entry.get("type") != "assistant" or not isinstance(usage, dict):
+            continue
+        counts = {name: _count(usage.get(key)) for key, name in _TOKEN_KEYS}
+        message_id = message.get("id")
+        if isinstance(message_id, str) and message_id:
+            seen = by_message.setdefault(message_id, dict.fromkeys(counts, 0))
+            for name, value in counts.items():
+                seen[name] = max(seen[name], value)
+        else:
+            anonymous.append(counts)
+    if reader.stopped is StopReason.TOO_LARGE:
+        return TranscriptFacts(problem=f"the transcript {path} is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB; not read")
     vouched = vouched and not calls
     records = tuple(dict.fromkeys(tokens)) if vouched else None
     problem = f"the transcript {path} has a line that is not JSON" if bad_line else None
@@ -298,16 +298,6 @@ def _result_text(content: Any) -> str:
             str(item.get("text") or "") for item in content if isinstance(item, dict) and item.get("type") == "text"
         )
     return ""
-
-
-def _entry(line: str) -> dict[str, Any] | None:
-    if not line.strip():
-        return None
-    try:
-        entry = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    return entry if isinstance(entry, dict) else None
 
 
 def _count(value: Any) -> int:

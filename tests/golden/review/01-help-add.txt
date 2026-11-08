@@ -1,0 +1,28 @@
+$ craftsman review add --help
+[exit 0]
+--- stdout
+usage: craftsman review add [-h] [--cwd CWD]
+                            [--lens {contracts,craft,design,failure,intent,model,platform,ripple,state,sweep,tests,trust}]
+                            [--file FILE] [--line LINE] [--severity SEVERITY]
+                            [--title TITLE] [--scenario SCENARIO]
+                            [--suggestion SUGGESTION] [--hunter SLOT]
+                            [--from-json PATH] [--check]
+
+options:
+  -h, --help            show this help message and exit
+  --cwd CWD             Directory inside the repository (default: current)
+  --lens {contracts,craft,design,failure,intent,model,platform,ripple,state,sweep,tests,trust}
+  --file FILE
+  --line LINE
+  --severity SEVERITY
+  --title TITLE
+  --scenario SCENARIO   Trigger -> wrong outcome
+  --suggestion SUGGESTION
+  --hunter SLOT         The hunt-plan slot that found it, or `lead` for the
+                        orchestrator's own (required in an enforced review)
+  --from-json PATH      Bulk JSON list of {"lens", "file", "line", "severity",
+                        "title", "scenario", "suggestion"?, "hunter"?} objects
+                        (use - for stdin)
+  --check               Validate without recording to the ledger or consuming
+                        an inbox file
+--- stderr

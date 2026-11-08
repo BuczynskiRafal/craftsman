@@ -14,9 +14,6 @@ from craftsman import packet
 from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
-    Reference,
-    Scope,
-    WorktreeIndex,
     resolve_base_sha,
     snapshot,
 )
@@ -28,6 +25,7 @@ from craftsman.packet import (
     render_packet_view,
 )
 from craftsman.records import FieldError, HunkRef, Ledger, QualitySignal, Round, SignalKind
+from craftsman.worktree_index import Reference, Scope, WorktreeIndex
 
 from tests.support import GitRepo, record_run
 

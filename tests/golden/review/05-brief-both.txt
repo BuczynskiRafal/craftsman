@@ -1,0 +1,5 @@
+$ craftsman review brief W1-1 --verifier F1
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: pass exactly one of a slot id (your launch prompt names it) or --verifier F1,F2

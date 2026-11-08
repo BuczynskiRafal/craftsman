@@ -1,0 +1,98 @@
+$ craftsman review check --review-only --json
+[exit 1]
+--- stdout
+{
+  "passed": false,
+  "partial": false,
+  "self_reviewed": false,
+  "enforced": true,
+  "platform": "claude",
+  "abandoned": false,
+  "slots": [
+    {
+      "id": "W1-1",
+      "state": "unlaunched",
+      "lenses": [
+        "intent",
+        "ripple",
+        "tests"
+      ],
+      "hunks": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ],
+      "missing": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ]
+    },
+    {
+      "id": "W1-2",
+      "state": "unlaunched",
+      "lenses": [
+        "contracts",
+        "failure",
+        "sweep"
+      ],
+      "hunks": [
+        "H2",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ],
+      "missing": [
+        "H2",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ]
+    },
+    {
+      "id": "W1-3",
+      "state": "unlaunched",
+      "lenses": [
+        "craft",
+        "design"
+      ],
+      "hunks": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ],
+      "missing": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "code": "no-isolation",
+      "message": "No Craftsman subagent was recorded for round 1. If you launched hunters, the Craftsman hooks did not see them: run `craftsman doctor` and fix the install; do not relaunch hunters that already ran. If you did not launch any, launch them now, all in one step: W1-1..W1-3. For each, start a craftsman-reviewer subagent whose whole prompt is: `You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` (Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent craftsman-reviewer; Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)"
+    }
+  ],
+  "warnings": [],
+  "summary": "Round 1 (current): 7 hunks in 7 files, +20/-2 lines.\nCoverage: 0/3 slots done; 0 hunk(s) carried from earlier rounds.\nFindings: none.\nRuns: none recorded."
+}
+--- stderr

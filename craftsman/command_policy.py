@@ -9,7 +9,9 @@ progress) arrives as lazy callbacks in `PolicyContext`, so a call that touches n
 
 What the policy decides, in this order, for a shell command:
 - the hook entry points are run by the platform, never by an agent (`craftsman hook ...` in every spelling,
-  `python -m craftsman.hooks`, the guard scripts, and inline programs that import craftsman);
+  `python -m craftsman.hooks`, the guard scripts, and inline programs that import craftsman; what a `python`
+  command line runs (`-c` code, `-m` module, a script, stdin) is decided by `shell.python_program`, which
+  reads the interpreter's options as Python itself does, and this module does not restate that grammar);
 - the ledger (`<git-dir>/craftsman/`) and the platform transcripts are not written by agents, by any write
   verb, redirection or inline program that names them (reading stays allowed);
 - the identity variables the platform sets are not set or unset for a craftsman command;

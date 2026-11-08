@@ -1,0 +1,5 @@
+$ craftsman review brief W1-1
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: No review round yet; run `craftsman review prepare` to snapshot the diff and see the suggested lenses.

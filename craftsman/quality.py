@@ -9,7 +9,8 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, is_docs_path, is_test_path
+from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk
+from craftsman.diffscan_paths import is_docs_path, is_test_path
 from craftsman.records import QualitySignal, SignalKind
 
 # Functions longer than 40 lines mix multiple responsibilities or levels of abstraction.

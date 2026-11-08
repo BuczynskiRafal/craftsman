@@ -14,16 +14,16 @@ from craftsman import diffscan
 from craftsman.diffscan import (
     DiffScanError,
     Hunk,
-    WorktreeIndex,
     detect_deep_hint_signals,
     detect_signals,
     files_without_signal_patterns,
     git_dir,
     hunks_docs_only,
-    is_agent_prompt_path,
     resolve_base_sha,
     snapshot,
 )
+from craftsman.diffscan_paths import is_agent_prompt_path
+from craftsman.worktree_index import REFERENCES_PER_FILE, WorktreeIndex
 
 from tests.support import GitRepo, change_hunk, make_hunk, make_snap
 
@@ -1176,7 +1176,7 @@ class ReferenceSearchTests(RepoTestCase):
         )
         alphabetical = WorktreeIndex(self.repo.root).references("compute_total", limit=7)
 
-        per_file = diffscan.REFERENCES_PER_FILE
+        per_file = REFERENCES_PER_FILE
         self.assertEqual(
             [(ref.path, ref.line) for ref in ranked],
             [("z_use.py", 1), *(("defs.py", line) for line in range(1, per_file + 1))],

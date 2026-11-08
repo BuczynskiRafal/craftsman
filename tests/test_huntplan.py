@@ -13,7 +13,8 @@ from typing import cast
 from unittest.mock import patch
 
 from craftsman.attribution import agent_runs, bound_slots, slot_work
-from craftsman.diffscan import Hunk, is_config_path
+from craftsman.diffscan import Hunk
+from craftsman.diffscan_paths import is_config_path
 from craftsman.gatecheck import slot_statuses
 from craftsman.huntplan import (
     BUG_LENSES,

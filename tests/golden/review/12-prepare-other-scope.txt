@@ -1,0 +1,5 @@
+$ craftsman review prepare --tracked
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: the review scope is fixed for this ledger; pass --add-paths <paths> to extend it for files touched by fixes, or run `craftsman review reset` to start a new review

@@ -1,0 +1,36 @@
+$ craftsman review --help
+[exit 0]
+--- stdout
+usage: craftsman review [-h]
+                        {prepare,view,scout,cover,brief,add,move,merge,verdict,resolve,waive-run,show,check,report,reset,inbox,scratch} ...
+
+Record and inspect code review evidence in the Craftsman ledger.
+
+positional arguments:
+  {prepare,view,scout,cover,brief,add,move,merge,verdict,resolve,waive-run,show,check,report,reset,inbox,scratch}
+    prepare             Snapshot the diff and open a round
+    view                Build a packet view of some files or hunks
+    scout               Base version, callers and tests for a hunk, a location
+                        or a symbol
+    cover               Record that hunks or files were reviewed
+    brief               The whole instruction of one hunter slot, or of a
+                        verifier
+    add                 Record a finding
+    move                Correct the line (or file) of a finding
+    merge               Group duplicate findings into one root-cause finding
+                        (only when one fix removes every consequence)
+    verdict             Record a verdict on a finding
+    resolve             Mark a finding fixed/accepted
+    waive-run           Retire an obsolete failing run
+    show                Show coverage, findings and runs
+    check               Evaluate the gate; exit 0 only when it passes
+    report              Final Markdown report for the user
+    reset               Archive the ledger and packets
+    inbox               Create a unique managed JSON file in <git-
+                        dir>/craftsman/inbox/ for --from-json
+    scratch             Create a unique managed scratch directory in <git-
+                        dir>/craftsman/scratch/ for repro scripts
+
+options:
+  -h, --help            show this help message and exit
+--- stderr

@@ -1,0 +1,11 @@
+$ craftsman review show --json
+[exit 0]
+--- stdout
+{
+  "round": null,
+  "coverage": {},
+  "hunks": [],
+  "findings": [],
+  "runs": []
+}
+--- stderr

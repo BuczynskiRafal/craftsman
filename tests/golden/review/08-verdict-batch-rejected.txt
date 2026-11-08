@@ -1,0 +1,11 @@
+$ craftsman review verdict --from-json -
+[exit 1]
+--- stdout
+--- stderr
+craftsman review verdict: 2 of 2 entries rejected; nothing was recorded.
+Fix all of them, then send the corrected list once:
+  entry 1 (F1): as: is missing
+  entry 1 (F1): evidence: is missing
+  entry 2: id: is missing
+  entry 2: as: must be one of proven, probable, question, dismissed (got 'zzz')
+  entry 2: evidence: is missing

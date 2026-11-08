@@ -1,0 +1,29 @@
+$ craftsman review show
+[exit 0]
+--- stdout
+Round 1 prepared <TIME> · 7 hunks (0 carried) · stale: the code changed, run `craftsman review prepare`
+Packet: <REPO>/.git/craftsman/packet-1.md
+
+Coverage (covered/total non-carried hunks):
+  7/7 hunks
+
+| ID | Severity | Verdict | Resolution | Location | Title |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| F1 | major | proven (R1) | — | `app.py:8` | Empty cart divides by zero |
+| F2 | major | dismissed | — | `app.py:11` | Label crashes on None name |
+| F3 | minor | probable | accepted | `lib/util.py:5` | Small things |
+| F4 | nit | dismissed | — | `extra.py:2` | Magic number |
+
+F1 scenario (lens contracts): total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError
+F1 evidence (proven, R1): ran total([]) and got ZeroDivisionError
+F2 scenario (lens contracts): label({}) raises KeyError
+F2 evidence (dismissed): guarded by app.py:12, which only receives named items
+F3 scenario (lens ripple): scale() is new and nothing calls it; [F4/craft] 2 is a magic number in double()
+F3 evidence (probable): static: lib/util.py:5 scale has no caller and no test anywhere
+F4 scenario (lens craft): 2 is a magic number in double()
+F4 evidence (dismissed): Grouped into F3 (lib/util.py:5): same root cause.
+
+Runs (last 2):
+- R1 repro exit 0 · <SECONDS>s · stale · `<PY> -c 'pr…`
+- R2 test exit 0 · <SECONDS>s · stale · `<PY> -c 'as…`
+--- stderr

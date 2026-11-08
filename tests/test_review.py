@@ -19,7 +19,7 @@ from craftsman.cli import main as cli_main
 from craftsman.gate import GateOwner
 from craftsman.ledger import holds_lock
 from craftsman.quality import collect_quality_signals
-from craftsman.review import normalize_round_files, view_slug
+from craftsman.review_scope import normalize_round_files, view_slug
 from craftsman.scope import ScopePolicy, evaluate_scope
 
 from tests.ambient import AMBIENT_PLATFORM_ENV_VARS

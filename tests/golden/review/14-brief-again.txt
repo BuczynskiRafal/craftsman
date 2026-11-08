@@ -1,0 +1,26 @@
+$ craftsman review brief W1-1
+[exit 0]
+--- stdout
+Brief issued (B2) for W1-1, round 1.
+
+You are Craftsman hunter W1-1 (bug slot, generation 1): one of 3 hunters of this round. Cover only your slot; the other slots belong to other hunters.
+Hunt for real defects with your lenses; a candidate needs a nameable trigger and a wrong outcome.
+
+Task: Golden task from the review request
+Base ref: <BASE40>
+
+Your slice is 7 hunk(s), 22 changed lines: H1-H7. Read only your slice:
+  craftsman review view --hunks H1-H7
+Your lenses: intent, ripple, tests. Load their playbooks:
+  craftsman skill show craft-review --lenses intent,ripple,tests
+
+Recording (as you go, not in one batch at the end):
+- A candidate defect: craftsman review add --hunter W1-1 --lens <one of your lenses> --file <path> --line <n> --severity <blocker|major|minor|nit> --title "<one line>" --scenario "<trigger -> wrong outcome>" --suggestion "<fix>"
+  Several at once: craftsman review add --from-json - (JSON entries with "hunter": "W1-1").
+- What you examined: craftsman review cover --hunter W1-1 --hunks <ids you examined> --note "<what you examined and which values you tried, one line>"
+  Several at once: craftsman review cover --from-json - (entries with "hunter": "W1-1").
+- Every hunk of your slot (H1-H7) must be covered before you finish.
+- Never run `craftsman review verdict`, `merge`, `prepare` or `reset`: verifiers judge, the orchestrator plans. Never change the work tree or the index.
+
+Finish: reply with a 2-3 line summary (lenses, findings by id and title, anything you could not examine).
+--- stderr

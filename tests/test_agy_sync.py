@@ -409,6 +409,18 @@ class CommandSyncTests(SyncTestCase):
         self.assertIn("not synced", err.getvalue())
         self.assertFalse(self.ledger_path.exists())
 
+    def test_a_transcript_over_the_size_cap_costs_one_line_and_credits_nothing(self) -> None:
+        path = self.app.transcript_path(MAIN)
+        path.write_text('{"step_index": 1, "type": "USER_INPUT", "content": "hi"}\n', encoding="utf-8")
+        err = io.StringIO()
+
+        with redirect_stderr(err), unittest.mock.patch("craftsman.transcript.MAX_TRANSCRIPT_BYTES", 10):
+            sync_antigravity_runs(self.ws, self.env)
+
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertIn("is larger than", err.getvalue())
+        self.assertFalse(self.ledger_path.exists())
+
     def test_a_ledger_that_cannot_be_written_costs_one_line_and_no_exception(self) -> None:
         err = io.StringIO()
         with redirect_stderr(err), unittest.mock.patch.object(agy_sync, "mutate", side_effect=OSError("disk full")):

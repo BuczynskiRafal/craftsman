@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from craftsman.jsonl import MAX_TRANSCRIPT_BYTES, JsonlLine, JsonlReader, StopReason
 from craftsman.records import (
     AGENT_ROLES,
     PLUGIN_AGENT_PREFIX,
@@ -53,41 +54,32 @@ def read_transcript_entries(transcript_path: Path | None) -> list[Entry]:
     """
     if transcript_path is None:
         return []
+    reader = JsonlReader(transcript_path, max_bytes=MAX_TRANSCRIPT_BYTES)
     try:
-        text = transcript_path.read_text(encoding="utf-8")
+        lines = list(reader)
     except FileNotFoundError:
         return []
     except (OSError, UnicodeDecodeError) as exc:
         raise TranscriptError(f"cannot read the transcript {transcript_path}: {exc}") from exc
-    lines = text.split("\n")
-    complete, partial = lines[:-1], lines[-1]
+    if reader.stopped is StopReason.TOO_LARGE:
+        raise TranscriptError(
+            f"the transcript {transcript_path} is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB; not read"
+        )
     entries = [
-        _normalize(_json_object(line, transcript_path, index), index)
-        for index, line in enumerate(complete, start=1)
-        if line.strip()
+        _normalize(_json_object(line, transcript_path), line.number) for line in lines if not line.blank and line.complete
     ]
-    last = _json_object_or_none(partial) if partial.strip() else None
-    if last is not None:  # a finished entry without its newline
-        entries.append(_normalize(last, len(lines)))
+    last = lines[-1] if lines and not lines[-1].complete else None
+    if last is not None and isinstance(last.value, dict):  # a finished entry without its newline
+        entries.append(_normalize(last.value, last.number))
     return entries
 
 
-def _json_object_or_none(line: str) -> Entry | None:
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def _json_object(line: str, path: Path, line_number: int) -> Entry:
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError as exc:
-        raise TranscriptError(f"{path}:{line_number} is not JSON: {exc}") from exc
-    if not isinstance(obj, dict):
-        raise TranscriptError(f"{path}:{line_number} is not a JSON object")
-    return obj
+def _json_object(line: JsonlLine, path: Path) -> Entry:
+    if line.error is not None:
+        raise TranscriptError(f"{path}:{line.number} is not JSON: {line.error}") from line.error
+    if not isinstance(line.value, dict):
+        raise TranscriptError(f"{path}:{line.number} is not a JSON object")
+    return line.value
 
 
 def _normalize(obj: Entry, line_number: int) -> Entry:
@@ -385,17 +377,16 @@ def parent_conversation(app_dir: Path, conversation_id: str, *, path: Path | Non
         return None
     sender: str | None = None
     try:
-        with source.open(encoding="utf-8") as lines:
-            for position, line in enumerate(lines):
-                entry = _json_object_or_none(line) if line.strip() else None
-                if entry is None:
-                    continue
-                if entry.get("type") == "USER_INPUT":
-                    return None
-                content = entry.get("content")
-                if sender is None and position < EARLY_ENTRIES and entry.get("type") == "SYSTEM_MESSAGE":
-                    found = SENDER_RE.search(content) if isinstance(content, str) and "[Message]" in content else None
-                    sender = found.group(1) if found else None
+        for line in JsonlReader(source):
+            entry = line.value if isinstance(line.value, dict) else None
+            if entry is None:
+                continue
+            if entry.get("type") == "USER_INPUT":
+                return None
+            content = entry.get("content")
+            if sender is None and line.number <= EARLY_ENTRIES and entry.get("type") == "SYSTEM_MESSAGE":
+                found = SENDER_RE.search(content) if isinstance(content, str) and "[Message]" in content else None
+                sender = found.group(1) if found else None
     except (OSError, UnicodeDecodeError):
         return None
     return sender
