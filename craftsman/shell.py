@@ -272,7 +272,7 @@ def split_env_string(value: str) -> list[str]:
     separates words in `env -S` (shlex would glue it into one), so it is read as a space: splitting more
     than `env` does only shows more of the command."""
     try:
-        return shlex.split(value.replace("\\_", " "))
+        return shlex.split(_preserve_unquoted_windows_backslashes(value.replace("\\_", " ")))
     except ValueError:  # env rejects it too, so keep it as one opaque program
         return [value]
 
@@ -454,6 +454,11 @@ def _separate_unquoted_redirections(cmd_header: str) -> str:
 _UNQUOTED_WIN_PATH_TOKEN_RE = re.compile(
     r"""
     (?<!\S)                                     # token start (BOL or preceded by whitespace)
+    (?:                                         # optionally glued to an option or assignment:
+        --[A-Za-z][A-Za-z0-9-]*=                #   `--output=C:\x`
+        | [A-Za-z_][A-Za-z0-9_]*=               #   `of=C:\x` (dd), `VAR=C:\x`
+        | -[A-Za-z]                             #   `-oC:\x`
+    )?
     (?:
         [A-Za-z]:                               # Windows drive prefix, e.g. `C:`
         | ~                                     # home-directory tilde prefix, e.g. `~\dir`

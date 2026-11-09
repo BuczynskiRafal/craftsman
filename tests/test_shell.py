@@ -198,6 +198,19 @@ class HeredocAndPathExpansionTests(unittest.TestCase):
             cmds = iter_simple_commands(r"cat ~\notes\todo.txt C:\temp\file.txt")
             self.assertEqual(cmds[0].tokens, [r"cat", r"~\notes\todo.txt", r"C:\temp\file.txt"])
 
+    def test_windows_backslash_paths_glued_to_an_option_stay_intact(self) -> None:
+        for line, tokens in (
+            (r"dd if=/dev/zero of=C:\repo\ledger.json", ["dd", "if=/dev/zero", r"of=C:\repo\ledger.json"]),
+            (r"curl -oC:\repo\ledger.json https://x", ["curl", r"-oC:\repo\ledger.json", "https://x"]),
+            (r"wget --output-document=C:\repo\l.json u", ["wget", r"--output-document=C:\repo\l.json", "u"]),
+            (r"rm -f a.\b", ["rm", "-f", "a.b"]),  # not a path prefix: the backslash still escapes
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(iter_simple_commands(line)[0].tokens, tokens)
+
+    def test_windows_backslash_paths_in_an_env_split_string_stay_intact(self) -> None:
+        self.assertEqual(split_env_string(r"grep -r foo C:\work\other"), ["grep", "-r", "foo", r"C:\work\other"])
+
 
 class EnvSplitStringTests(unittest.TestCase):
     """`env -S STRING` runs STRING as a command line: its words are the command, not the value of an option."""
@@ -295,7 +308,7 @@ class EnvSplitStringTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 found = iter_simple_commands(line, cwd_str="/repo")
-                self.assertEqual((found[0].tokens, found[0].cwd), (["rm", "x"], "/repo/.git"))
+                self.assertEqual((found[0].tokens, found[0].cwd), (["rm", "x"], os.path.normpath("/repo/.git")))
 
 
 class PythonProgramTests(unittest.TestCase):

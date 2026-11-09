@@ -99,7 +99,11 @@ class Session:
         return env
 
     def normalize(self, text: str) -> str:
-        text = text.replace(sys.executable, "<PY>").replace(str(self.root.resolve()), "<REPO>").replace(str(self.root), "<REPO>")
+        for path, token in ((sys.executable, "<PY>"), (str(self.root.resolve()), "<REPO>"), (str(self.root), "<REPO>")):
+            # Raw and as a JSON string escapes it (they differ where the path has backslashes, as on Windows).
+            text = text.replace(json.dumps(path)[1:-1], token).replace(path, token)
+        if os.sep == "\\":
+            text = re.sub(r"<REPO>[^\s\"'`]*", lambda m: m.group(0).replace("\\\\", "/").replace("\\", "/"), text)
         for length in (40, 12, 7):
             text = text.replace(self.base[:length], f"<BASE{length}>")
         text = re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?", "<TIME>", text)
@@ -107,6 +111,17 @@ class Session:
         text = re.sub(r"\b(cover|add|verdict)-\d+-[0-9a-f]+\.json", r"\1-<PID>-<ID>.json", text)
         text = re.sub(r"\b\d+\.\d+s\b", "<SECONDS>s", text)
         text = re.sub(r"(/craftsman/scratch/)[A-Za-z0-9_.-]+", r"\1<NAME>", text)
+        # A recorded command is shortened before `<PY>` replaces the interpreter path, so how much of it is shown (if
+        # it is cut at all, and whether the path is quoted) depends on the path on the machine.
+        text = re.sub(r"`'?<PY>'?(?: [^`\n]*)?`", "`<PY> …`", text)
+        text = re.sub(r"`'?" + re.escape(json.dumps(sys.executable)[1:11]) + r"[^`\n]*…`", "`<PY> …`", text)
+        text = re.sub(r"`'?" + re.escape(sys.executable[:10]) + r"[^`\n]*…`", "`<PY> …`", text)
+        # argparse quotes the choices in its error on some Python releases and not on others.
+        text = re.sub(
+            r"\(choose from ([^)\n]*)\)", lambda m: "(choose from " + m.group(1).replace("'", "") + ")", text
+        )
+        # Before Python 3.13 argparse puts the `...` of a long subcommand list on a line of its own.
+        text = re.sub(r"\n {2,}\.\.\.\n", " ...\n", text)
         return re.sub(r"[0-9a-f]{40}", "<SHA>", text)
 
     def run(

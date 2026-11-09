@@ -199,13 +199,14 @@ class _Prepared:
 
 
 def _read_task_file(source: str) -> str:
-    """The task text of `--task-file` (`-` is stdin): trimmed, at most `MAX_TASK_CHARS` characters."""
+    """The task text of `--task-file` (`-` is stdin): trimmed, with Unix line ends, at most `MAX_TASK_CHARS` characters."""
     label = "stdin" if source == "-" else source
     try:
         data = sys.stdin.buffer.read() if source == "-" else Path(source).read_bytes()
     except OSError as exc:
         raise LedgerError(f"cannot read {label}: {exc}") from exc
-    return decode_input(data, label).strip()[:MAX_TASK_CHARS]
+    text = decode_input(data, label).replace("\r\n", "\n").replace("\r", "\n")
+    return text.strip()[:MAX_TASK_CHARS]
 
 
 def _explicit_task(args: argparse.Namespace) -> str:

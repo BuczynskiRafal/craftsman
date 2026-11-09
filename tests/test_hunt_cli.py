@@ -356,6 +356,14 @@ class PrepareTaskTests(HuntTestCase):
         self.review("prepare", "--task-file", "-", stdin="From stdin\n")
         self.assertEqual(self.prepared_task(), "From stdin")
 
+    def test_a_task_file_with_windows_line_ends_reads_as_unix_lines(self) -> None:
+        self.write_cart()
+        path = self.tmp / "task.txt"
+        path.write_bytes(b"Add cart totals\r\n\r\nwith tax\r\n")
+
+        self.review("prepare", "--task-file", str(path))
+        self.assertEqual(self.prepared_task(), "Add cart totals\n\nwith tax")
+
     def test_a_long_task_file_is_cut_at_4000_characters(self) -> None:
         self.write_cart()
         path = self.tmp / "task.txt"

@@ -7,7 +7,7 @@ $ craftsman review check --review-only
 Round 1 (current): 7 hunks in 7 files, +16/-2 lines.
 Coverage: 7/7 hunks; 0 hunk(s) carried from earlier rounds.
 Findings: 4 total; 0 awaiting verdict, 1 unresolved, 0 fixed, 1 accepted (F3), 2 dismissed.
-Runs: 1 recorded; latest: R1 repro `<PY> -c 'pr…` exit 0 (current).
+Runs: 1 recorded; latest: R1 repro `<PY> …` exit 0 (current).
 
 **Warnings**
 - 1 finding for the author: F1.

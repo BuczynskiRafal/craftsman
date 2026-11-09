@@ -24,6 +24,6 @@ F4 scenario (lens craft): 2 is a magic number in double()
 F4 evidence (dismissed): Grouped into F3 (lib/util.py:5): same root cause.
 
 Runs (last 2):
-- R1 repro exit 0 · <SECONDS>s · stale · `<PY> -c 'pr…`
-- R2 test exit 0 · <SECONDS>s · stale · `<PY> -c 'as…`
+- R1 repro exit 0 · <SECONDS>s · stale · `<PY> …`
+- R2 test exit 0 · <SECONDS>s · stale · `<PY> …`
 --- stderr

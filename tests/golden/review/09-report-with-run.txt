@@ -16,7 +16,7 @@ $ craftsman review report --review-only
 - F4 · nit · `extra.py:2` — Magic number. Dismissed: Grouped into F3 (lib/util.py:5): same root cause.
 
 ## Verification at the final code
-- R2 `<PY> -c 'assert True; print('"'"'3 passed'"'"')'` (test) → exit 0 in <SECONDS>s
+- R2 `<PY> …` (test) → exit 0 in <SECONDS>s
 
 ## Warnings
 - 1 finding for the author: F1.
