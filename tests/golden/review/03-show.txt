@@ -1,0 +1,13 @@
+$ craftsman review show
+[exit 0]
+--- stdout
+Round 1 prepared <TIME> · 7 hunks (0 carried) · current
+Packet: <REPO>/.git/craftsman/packet-1.md
+
+Coverage (covered/total non-carried hunks):
+  0/7 hunks (missing H1,H2,H3,H4,H5,H6,H7)
+
+Findings: none recorded.
+
+Runs: none recorded.
+--- stderr

@@ -1,0 +1,5 @@
+$ craftsman review cover --hunter W1-2 --hunks H99 --note H99 f_99.py:99: x=99 -> returns 100 on boundary input
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --hunks unknown hunk 'H99'

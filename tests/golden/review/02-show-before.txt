@@ -1,0 +1,9 @@
+$ craftsman review show
+[exit 0]
+--- stdout
+No review round yet; run `craftsman review prepare`.
+
+Findings: none recorded.
+
+Runs: none recorded.
+--- stderr

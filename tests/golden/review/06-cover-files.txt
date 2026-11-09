@@ -1,0 +1,5 @@
+$ craftsman review cover --files lib/util.py --note util.py:2 clamp(1, 2, 0) returns 0
+[exit 0]
+--- stdout
+Coverage recorded (C3): lib/util.py in round 1; 5 hunk(s) left to cover in this round.
+--- stderr

@@ -1,0 +1,5 @@
+$ craftsman review prepare --task x --task-file -
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: pass either --task or --task-file, not both

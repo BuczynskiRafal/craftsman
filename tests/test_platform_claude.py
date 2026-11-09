@@ -227,12 +227,12 @@ class ClaudeSkillExportTests(ClaudeTestCase):
 
         export_to_claude_user(REPO_ROOT, self.tmp / "claude")
 
-        review = (self.tmp / "claude" / "commands" / "code-review.md").read_text(encoding="utf-8")
+        review = (self.tmp / "claude" / "commands" / "craft-review.md").read_text(encoding="utf-8")
         verify = (self.tmp / "claude" / "commands" / "verify.md").read_text(encoding="utf-8")
         self.assertNotIn("## Appendix: lenses.md", review)
         self.assertNotIn("## Appendix", review)
         self.assertNotIn("## Appendix", verify)
-        self.assertIn("craftsman skill show code-review --lenses", review)
+        self.assertIn("craftsman skill show craft-review --lenses", review)
 
     def test_users_agent_file_is_moved_aside(self) -> None:
         mine = self.tmp / "agents" / "craftsman-reviewer.md"
@@ -320,7 +320,7 @@ class ClaudeSettingsMergeTests(ClaudeTestCase):
 
         merge_claude_hooks(path, PREFIX)
 
-        self.assertEqual(self.settings()["hooks"]["PreToolUse"][0]["matcher"], "Bash|Read|Grep|Glob|LS")
+        self.assertEqual(self.settings()["hooks"]["PreToolUse"][0]["matcher"], "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit")
 
     def test_first_change_keeps_a_backup_of_the_original(self) -> None:
         path = self.write_settings({"model": "opus"})

@@ -4,23 +4,28 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from craftsman import diffscan
 from craftsman.diffscan import (
     DiffScanError,
     Hunk,
-    WorktreeIndex,
+    detect_deep_hint_signals,
     detect_signals,
     files_without_signal_patterns,
     git_dir,
+    hunks_docs_only,
     resolve_base_sha,
     snapshot,
 )
+from craftsman.diffscan_paths import is_agent_prompt_path
+from craftsman.worktree_index import REFERENCES_PER_FILE, WorktreeIndex
 
-from tests.support import GitRepo, change_hunk, make_snap
+from tests.support import GitRepo, change_hunk, make_hunk, make_snap
 
 
 def numbered_lines(count: int, prefix: str = "line") -> str:
@@ -90,7 +95,6 @@ class SnapshotTests(RepoTestCase):
         self.repo.write("logo.bin", b"\x00\x01three")
         second = snapshot(self.repo.root, base)
 
-        self.assertEqual(first.skipped, ("logo.bin", "new.bin"))
         self.assertEqual([hunk.lines for hunk in first.hunks], [("~ binary file changed",)] * 2)
         self.assertEqual((first.hunks[0].new_start, first.hunks[0].new_len), (0, 0))
         self.assertNotEqual(first.hunks[0].digest, second.hunks[0].digest)
@@ -135,7 +139,6 @@ class SnapshotTests(RepoTestCase):
         snap = snapshot(self.repo.root, base)
 
         self.assertEqual(snap.files, ("empty.txt", "huge.log"))
-        self.assertEqual(snap.skipped, ("huge.log",))
         self.assertEqual(snap.hunks[0].lines, ("~ empty file added",))
         self.assertEqual(snap.hunks[1].lines, ("~ file too large to inline: 1048577 bytes",))
         self.assertFalse(snap.is_empty)
@@ -1173,7 +1176,7 @@ class ReferenceSearchTests(RepoTestCase):
         )
         alphabetical = WorktreeIndex(self.repo.root).references("compute_total", limit=7)
 
-        per_file = diffscan.REFERENCES_PER_FILE
+        per_file = REFERENCES_PER_FILE
         self.assertEqual(
             [(ref.path, ref.line) for ref in ranked],
             [("z_use.py", 1), *(("defs.py", line) for line in range(1, per_file + 1))],
@@ -1218,6 +1221,126 @@ class DocsClassificationTests(RepoTestCase):
 
         self.assertTrue(snap.docs_only)
         self.assertEqual(detect_signals(snap.hunks), {"docs": ("H1",)})
+
+
+class AgentPromptTests(unittest.TestCase):
+    def test_agent_prompt_files_are_recognised(self) -> None:
+        for path in (
+            "skills/x/SKILL.md",
+            "AGENTS.md",
+            "sub/CLAUDE.md",
+            "GEMINI.md",
+            "rules/ultra_mode.md",
+            "pkg/rules/nested/style.md",
+            "agents/reviewer.md",
+            "templates/agents/craftsman.md",
+            ".claude-plugin/agents/craftsman.md",
+            ".github/copilot-instructions.md",
+            "review.prompt.md",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(is_agent_prompt_path(path))
+
+    def test_other_prose_is_not(self) -> None:
+        for path in ("README.md", "docs/usage.md", "CHANGELOG.md", "notes.txt", "rules/engine.py"):
+            with self.subTest(path=path):
+                self.assertFalse(is_agent_prompt_path(path))
+
+    def test_a_prompt_file_change_is_not_docs_only(self) -> None:
+        readme = make_hunk("H1", "README.md")
+        skill = make_hunk("H2", "skills/x/SKILL.md")
+
+        self.assertTrue(hunks_docs_only([readme]))
+        self.assertFalse(hunks_docs_only([readme, skill]))
+        self.assertFalse(make_snap(skill).docs_only)
+        self.assertFalse(hunks_docs_only([]))
+
+
+class SnapshotOnlyTests(unittest.TestCase):
+    def test_only_keeps_the_named_hunks_and_recounts(self) -> None:
+        a = make_hunk("H1", "a.py", ("+one", "+two"))
+        b = make_hunk("H2", "b.py", ("-gone", "+new"))
+        c = make_hunk("H3", "a.py", ("+three",))
+        snap = make_snap(a, b, c)
+
+        part = snap.only({"H2", "H3"})
+
+        self.assertEqual([hunk.id for hunk in part.hunks], ["H2", "H3"])
+        self.assertEqual(part.files, ("a.py", "b.py"))
+        self.assertEqual((part.added, part.deleted), (2, 1))
+        self.assertEqual(part.fingerprint, snap.fingerprint)
+        self.assertEqual(snap.only(()).files, ())
+
+
+class DeepHintSignalTests(unittest.TestCase):
+    def fired(self, path: str, *added: str) -> dict[str, tuple[str, ...]]:
+        return detect_deep_hint_signals([make_hunk("H1", path, [f"+{line}" for line in added])])
+
+    def test_bare_words_do_not_fire(self) -> None:
+        self.assertEqual(self.fired("app.py", "def f(token, session_id, secret):", "    return token"), {})
+
+    def test_everyday_subprocess_calls_do_not_fire_but_a_shell_does(self) -> None:
+        self.assertEqual(self.fired("app.py", "subprocess.run(cmd, check=True)"), {})
+        self.assertEqual(self.fired("app.py", "subprocess.run(cmd, shell=True)"), {"process": ("H1",)})
+
+    def test_real_security_and_concurrency_usage_fires(self) -> None:
+        self.assertEqual(self.fired("app.py", "verify_token(request.token)"), {"auth": ("H1",)})
+        self.assertEqual(self.fired("app.py", "t = threading.Thread(target=run)"), {"concurrency": ("H1",)})
+        self.assertEqual(self.fired("app.py", "pickle.loads(blob)"), {"deserialization": ("H1",)})
+
+    def test_awaiting_alone_is_not_concurrency(self) -> None:
+        self.assertEqual(self.fired("app.py", "async def get():", "    return await fetch()"), {})
+
+    def test_tests_config_and_docs_are_ignored(self) -> None:
+        for path in ("tests/test_auth.py", "test_x.py", "config.yaml", "settings.json", "README.md"):
+            with self.subTest(path=path):
+                self.assertEqual(self.fired(path, "verify_token(t)", "os.system(cmd)"), {})
+
+
+class GitBudgetTests(RepoTestCase):
+    def test_without_a_budget_a_git_call_gets_its_own_limit(self) -> None:
+        self.assertEqual(diffscan.git_time_left(), diffscan.GIT_TIMEOUT_S)
+        self.assertEqual(diffscan.git_time_left(5.0), 5.0)
+
+    def test_a_budget_caps_what_the_next_call_may_take(self) -> None:
+        with diffscan.git_budget(3.0):
+            self.assertLessEqual(diffscan.git_time_left(), 3.0)
+            self.assertGreater(diffscan.git_time_left(), 0.0)
+            self.assertLessEqual(diffscan.git_time_left(1.0), 1.0)
+
+    def test_nested_budgets_cannot_extend_the_outer_one(self) -> None:
+        with diffscan.git_budget(2.0), diffscan.git_budget(500.0):
+            self.assertLessEqual(diffscan.git_time_left(), 2.0)
+        self.assertEqual(diffscan.git_time_left(), diffscan.GIT_TIMEOUT_S)
+
+    def test_a_spent_budget_runs_no_git_and_tells_the_listener_once_per_call(self) -> None:
+        told: list[str] = []
+        with diffscan.git_budget(0.0, on_timeout=told.append):
+            with self.assertRaises(diffscan.GitTimeoutError) as caught:
+                git_dir(self.repo.root)
+        self.assertIn("budget is spent", str(caught.exception))
+        self.assertEqual(told, [str(caught.exception)])
+
+    def test_a_timeout_error_is_a_diff_scan_error(self) -> None:
+        self.assertTrue(issubclass(diffscan.GitTimeoutError, DiffScanError))
+
+    def test_a_git_call_that_times_out_is_reported_with_the_limit_it_had(self) -> None:
+        told: list[str] = []
+        expired = subprocess.TimeoutExpired(["git"], 1)
+        with (
+            diffscan.git_budget(30.0, on_timeout=told.append),
+            mock.patch("craftsman.diffscan.subprocess.run", side_effect=expired),
+            self.assertRaises(diffscan.GitTimeoutError),
+        ):
+            git_dir(self.repo.root)
+        (message,) = told
+        self.assertRegex(message, r"^`git [a-z-]+` timed out after \d+(\.\d+)?s in ")
+
+    def test_the_budget_ends_with_its_block(self) -> None:
+        with diffscan.git_budget(0.0):
+            pass
+
+        self.assertTrue(git_dir(self.repo.root).is_dir())
 
 
 if __name__ == "__main__":

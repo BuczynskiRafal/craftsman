@@ -62,7 +62,7 @@ VS Code Copilot and GitHub Copilot CLI scan multiple directories simultaneously 
 | Entity | User scope (`--copilot`, canonical) | Workspace scope (`--copilot-workspace`, canonical) | Other locations VS Code scans (`doctor` reports duplicates there) |
 | :--- | :--- | :--- | :--- |
 | **Custom agents** (`craftsman`, `craftsman-reviewer`, `craftsman-verifier`) | `~/.copilot/agents/*.agent.md` | `<workspace>/.github/agents/*.agent.md` | `Code/User/prompts/*.agent.md`, `Code/User/profiles/*/prompts/*.agent.md`, `~/.claude/agents/*.md`, `.claude/agents/*.md` |
-| **Slash commands / Agent Skills** (`/craftsman`, `/code-review`, …) | `~/.copilot/skills/<name>/SKILL.md` | `<workspace>/.github/skills/<name>/SKILL.md` | `Code/User/prompts/*.prompt.md`, `Code/User/profiles/*/prompts/*.prompt.md`, `.github/prompts/*.prompt.md`, `~/.claude/skills/*/SKILL.md` |
+| **Slash commands / Agent Skills** (`/craftsman`, `/craft-review`, …) | `~/.copilot/skills/<name>/SKILL.md` | `<workspace>/.github/skills/<name>/SKILL.md` | `Code/User/prompts/*.prompt.md`, `Code/User/profiles/*/prompts/*.prompt.md`, `.github/prompts/*.prompt.md`, `~/.claude/skills/*/SKILL.md` |
 | **Global instructions** | `Code/User/prompts/craftsman-rules.instructions.md` (+ each profile) | `<workspace>/.github/copilot-instructions.md` | — |
 
 - Installing both `--copilot` (user) and `--copilot-workspace` (workspace) in the same project displays duplicate agents and commands in VS Code; `craftsman install` refuses by default unless `--allow-duplicate-scopes` is specified.
@@ -109,6 +109,9 @@ Doctor checks:
 - Platform hooks configuration (Copilot, Claude Code, Antigravity)
 - Hook collisions between user-level settings and Claude Code plugins
 
+When `craftsman review prepare` prints `Advisory:` instead of `Enforced:`, no Craftsman hook saw the session: run `craftsman doctor` to find the missing or duplicate hooks. The hooks also write what they could not do to `<git-dir>/craftsman/hook-errors.log`, and `craftsman review check` reports it.
+
+
 ---
 
 ## Uninstallation & Backups
@@ -127,3 +130,7 @@ craftsman uninstall --dry-run                      # preview changes without rem
 ```
 
 Uninstall cleans only paths registered in `.craftsman-install.json` and restores original configuration files.
+
+Running `craftsman install` again also removes what an earlier install created and this version no longer ships (for example the `code-quality`, `extreme-optimizer`, `high-level-commit-message` and `leetcode-style-code-reviewer` skills, which 5.0 still shipped). Only paths the manifest records are removed; a skill or command of the same name that you wrote yourself stays. A folder Craftsman created is Craftsman's with everything in it: every install replaces it and an upgrade that drops it deletes it, so keep your own skills beside it, not inside it.
+
+A manifest written by Craftsman before 4.0 (it records global git hooks) is no longer migrated: `install`, `uninstall` and `doctor` stop with a message that asks you to delete that file and run `craftsman install` again. If `git config --global core.hooksPath` still points to a Craftsman `git-hooks` folder, unset it with `git config --global --unset core.hooksPath`; `craftsman doctor` reports that setting when it points to `~/.craftsman/git-hooks` or `~/.gemini/config/git-hooks`.

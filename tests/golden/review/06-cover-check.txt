@@ -1,0 +1,5 @@
+$ craftsman review cover --hunks H1 --note H1 f_1.py:1: x=1 -> returns 2 on boundary input --check
+[exit 0]
+--- stdout
+Check passed: 1 entry valid; nothing was recorded.
+--- stderr

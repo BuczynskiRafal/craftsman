@@ -1,0 +1,5 @@
+$ craftsman review prepare --add-paths app.py
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --add-paths extends an existing review scope; in round 1 use --paths (or omit scope flags)

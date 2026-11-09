@@ -1,0 +1,29 @@
+$ craftsman review brief --verifier F1,F2
+[exit 0]
+--- stdout
+You are an independent Craftsman verifier for F1,F2. You did not write this code and you did not hunt these findings: be skeptical in both directions.
+
+Task: Average the prices of a cart and name items nicely
+Base ref: <BASE40> (round 2)
+
+Findings to judge:
+- F1 (major, lens contracts) app.py:8 - Empty cart divides by zero
+  Scenario: total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError
+- F2 (major, lens contracts) app.py:11 - Label crashes on None name
+  Scenario: label({}) raises KeyError
+
+How to judge:
+- First merge duplicates, only when one fix removes every consequence, and before any verdict: craftsman review merge <TARGET> <DUPLICATES...> --scenario "<root cause -> effects>"
+- Re-read the code around each cited file:line yourself, with its callers; do not trust the description. Then try to disprove it: a guard, unreachability, a misreading, or intent.
+- Reproduce blocker and major findings whenever the code can run: craftsman run --kind repro -- <command>. Never dismiss flakiness or platform dependence on one green run.
+- Record each verdict (the only way your judgment counts):
+  craftsman review verdict <ID> --as proven --run <R#> --evidence "<what the run printed and why it is wrong>"
+  craftsman review verdict <ID> --as probable --evidence "static: <file:line chain>" (or "no-repro: <why>; <chain>")
+  craftsman review verdict <ID> --as question --evidence "intent: <source says X>; <file:line>"
+  craftsman review verdict <ID> --as dismissed --evidence "<guard quoted, file:line>" [--run <R#>]
+  Several at once: craftsman review verdict --from-json - (entries {"id","as","evidence","run"}).
+- If the severity is wrong, start the evidence with `[severity: <new>]` and say why.
+- Never edit the work tree or the index; reproductions live in a `craftsman review scratch` directory. Never run `prepare`, `reset`, `add` or `cover`.
+
+Finish with a table: finding id, verdict, one-line reason.
+--- stderr

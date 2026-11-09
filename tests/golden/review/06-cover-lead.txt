@@ -1,0 +1,5 @@
+$ craftsman review cover --hunks H1 --hunter lead --note H1 f_1.py:1: x=1 -> returns 2 on boundary input
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --hunter 'lead' never credits coverage; name the slot that was examined

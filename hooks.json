@@ -8,7 +8,107 @@
           {
             "type": "command",
             "command": "./scripts/craftsman-scope-guard.py",
-            "timeout": 10
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "write_to_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "view_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "grep_search",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "find_by_name",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
+          }
+        ]
+      },
+      {
+        "matcher": "list_dir",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/craftsman-scope-guard.py",
+            "timeout": 30
           }
         ]
       }
@@ -20,7 +120,7 @@
       {
         "type": "command",
         "command": "./scripts/craftsman-stop-gate.py",
-        "timeout": 10
+        "timeout": 30
       }
     ]
   }

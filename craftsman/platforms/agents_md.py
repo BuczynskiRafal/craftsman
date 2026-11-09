@@ -13,11 +13,9 @@ from craftsman.generated import (
     upsert_managed_markdown,
     write_marked,
 )
-from craftsman.lenses import render_reviewer_groups_markdown
 from craftsman.manifest import TargetKind
 from craftsman.staging import TargetSession, Tracker, upsert_markdown
 
-REVIEWER_GROUPS_PLACEHOLDER = "{{reviewer_groups}}"
 AGENTS_MD_TEMPLATE = Path("templates") / "AGENTS.md"
 CURSOR_RULE_HEADER = (
     "---\n"
@@ -36,12 +34,9 @@ def render_agents_md(repo_dir: Path) -> str:
         template = template_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ExportError(f"cannot read the AGENTS.md template {template_path}: {exc}") from exc
-    if REVIEWER_GROUPS_PLACEHOLDER not in template:
-        raise ExportError(f"{template_path} has no {REVIEWER_GROUPS_PLACEHOLDER} placeholder")
-    groups = "\n".join(f"  {line}" for line in render_reviewer_groups_markdown().splitlines())
     skills = "\n".join(f"- **`/{skill.name}`**: {skill.description}" for skill in iter_skills(repo_dir))
     rules = render_combined_rules(repo_dir / "rules", with_frontmatter=False)
-    loop = template.replace(REVIEWER_GROUPS_PLACEHOLDER, groups).strip()
+    loop = template.strip()
     return f"{loop}\n{skills}\n\n---\n\n{rules}"
 
 

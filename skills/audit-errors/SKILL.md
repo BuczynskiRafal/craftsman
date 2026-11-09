@@ -9,7 +9,7 @@ description: >-
 
 # Error-handling audit (`/audit-errors [target]`)
 
-Deepens the `failure` lens (run `craftsman skill show code-review --lenses failure` to read that
+Deepens the `failure` lens (run `craftsman skill show craft-review --lenses failure` to read that
 playbook first; never search the file system for `lenses.md`).
 
 ## Search scope
@@ -39,23 +39,15 @@ HTTP status, log only, or nowhere.
 
 ## 2. Assess each row
 
-Flag a row when any of these holds:
-- **Hidden:** the error ends "nowhere" or "log only" while the caller proceeds as if it succeeded.
-- **Disguised:** the handler returns a value indistinguishable from a legitimate result
-  (`None`, `0`, `""`, `[]`, `{}`, `False`, `True`, a cached or stale value).
-- **Over-broad:** the handler catches far more than the failure it was written for (all
-  exceptions around a large block, catching programming errors such as type or key errors).
-- **Lossy:** re-raised or wrapped without the original cause, or the message lacks the file,
-  value, limit or identifier needed to act.
-- **Half-done:** state already mutated, files partially written, or messages already sent when the
-  error occurs, with no rollback, atomic write, or report.
-- **Unbounded:** retries without limit, backoff or idempotency.
-- **Wrong signal:** CLI exits 0 after an error, API returns 2xx with an error body, a hook
-  "allows" an action because its own check crashed (fail-open).
-- **Missing:** a failure site with no handling where the caller cannot reasonably handle it
-  either (for example a subprocess without a timeout or exit-code check).
+Run every probe of the `failure` lens against each row, and flag the row when a probe fails. Name
+the probe that flagged it (for example "probe 2, disguised: returns `[]` on a parse error"). The
+lens defines the defects: a failure site nobody handles (1, 6), swallowed or disguised errors
+(2), partial effects (3, 4), unbounded retries (5), unhelpful messages (7) and wrong signals to
+the outside, fail-open included (8). The audit adds one question per row, the *Ends at* column: an
+error that ends "nowhere" or "log only" while the caller proceeds as if the call succeeded is
+flagged whatever else the row does.
 
-Leave a row unflagged when the handling is deliberate, narrow and visible — say why in one line.
+Leave a row unflagged when the handling is deliberate, narrow and visible, and say why in one line.
 
 ## 3. Report
 

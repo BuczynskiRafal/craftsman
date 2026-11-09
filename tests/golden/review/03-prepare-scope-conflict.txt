@@ -1,0 +1,5 @@
+$ craftsman review prepare --paths app.py --staged
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --paths, --staged are mutually exclusive; pass at most one scope flag

@@ -1,0 +1,5 @@
+$ craftsman review view --files nope.py
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --files names files not in round 1: nope.py; changed files: NOTES.txt, app.py, docs/guide.md, extra.py, lib/util.py, new_name.py, tests/test_extra.py

@@ -1,0 +1,5 @@
+$ craftsman review view --hunks H1-H2
+[exit 0]
+--- stdout
+<REPO>/.git/craftsman/packet-1.H1-H2.md
+--- stderr

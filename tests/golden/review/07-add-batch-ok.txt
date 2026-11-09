@@ -1,0 +1,8 @@
+$ craftsman review add --from-json -
+[exit 0]
+--- stdout
+F3 recorded (minor, ripple, lib/util.py:5)
+  L5: def scale(value, factor):
+F4 recorded (nit, craft, extra.py:2)
+  L2: return value * 2
+--- stderr

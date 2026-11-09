@@ -192,21 +192,21 @@ class ScratchDirectoryTests(unittest.TestCase):
 class WorkingTreeHygieneE2ETests(unittest.TestCase):
     def test_scratch_survives_the_next_review_round(self) -> None:
         self.repo.write("app.py", "x = 2\n")
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
         scratch = Path(self.repo.cli("review", "scratch").stdout.strip())
         (scratch / "repro.py").write_text("print('repro')\n", encoding="utf-8")
 
         self.repo.write("app.py", "x = 3\n")
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
 
         self.assertTrue((scratch / "repro.py").is_file())
 
     def test_out_of_scope_warning_survives_a_later_round(self) -> None:
         self.repo.write("app.py", "x = 2\n")
-        self.repo.cli("review", "prepare", "--paths", "app.py", "--tier", "quick")
+        self.repo.cli("review", "prepare", "--paths", "app.py")
         self.repo.write("leak.py", "z = 30\n")
         self.repo.write("app.py", "x = 3\n")
-        self.repo.cli("review", "prepare", "--paths", "app.py", "--tier", "quick")
+        self.repo.cli("review", "prepare", "--paths", "app.py")
 
         report = self.repo.cli("review", "report", "--review-only").stdout
 
@@ -232,7 +232,7 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
         self.repo.write("app.py", "x = 42\n")
 
         # Start session
-        self.repo.cli("gate", "--init", "--tier", "quick", "--task", "hygiene test")
+        self.repo.cli("gate", "--init", "--task", "hygiene test")
 
         # Create scratch dir and temporary files
         scratch_proc = self.repo.cli("review", "scratch")
@@ -244,7 +244,7 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
         self.repo.cover_all()
 
         # Run verification
-        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('tests pass')")
+        self.repo.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('tests pass')")
 
         # Check passes
         self.repo.cli("review", "check")
@@ -274,7 +274,7 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
         (scratch_path / "repro.py").write_text("assert False", encoding="utf-8")
 
         # Prepare review-only
-        self.repo.cli("review", "prepare", "--tier", "quick")
+        self.repo.cli("review", "prepare")
         self.repo.cover_all()
 
         # Review check and report
@@ -302,7 +302,7 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
         self.repo.write("other.py", "y = 20\n")
 
         # Prepare with scope restricted to app.py
-        self.repo.cli("review", "prepare", "--paths", "app.py", "--tier", "quick")
+        self.repo.cli("review", "prepare", "--paths", "app.py")
         self.repo.cover_all()
 
         # Report does NOT warn about other.py because it was already dirty at prepare

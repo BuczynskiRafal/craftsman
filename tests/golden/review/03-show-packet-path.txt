@@ -1,0 +1,5 @@
+$ craftsman review show --packet-path
+[exit 0]
+--- stdout
+<REPO>/.git/craftsman/packet-1.md
+--- stderr

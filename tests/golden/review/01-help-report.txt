@@ -1,0 +1,18 @@
+$ craftsman review report --help
+[exit 0]
+--- stdout
+usage: craftsman review report [-h] [--cwd CWD] [--json] [--review-only]
+                               [--partial]
+
+options:
+  -h, --help     show this help message and exit
+  --cwd CWD      Directory inside the repository (default: current)
+  --json
+  --review-only  Check only review completeness (round, coverage, verdicts),
+                 without requiring fixes or test runs; refused while a
+                 /craftsman gate is active in the checkout
+  --partial      Print a partial review-only report when some hunks or
+                 verdicts could not be completed. It ends nothing: the review
+                 guard stays armed and scratch/inbox files are kept until the
+                 review passes
+--- stderr

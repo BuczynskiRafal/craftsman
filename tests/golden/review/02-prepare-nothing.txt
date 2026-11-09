@@ -1,0 +1,5 @@
+$ craftsman review prepare
+[exit 0]
+--- stdout
+Nothing to review: the work tree matches base <BASE12>.
+--- stderr

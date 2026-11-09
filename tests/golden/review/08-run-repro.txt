@@ -1,0 +1,6 @@
+$ craftsman run --kind repro -- <PY> -c print('ZeroDivisionError')
+[exit 0]
+--- stdout
+ZeroDivisionError
+--- stderr
+R1 recorded (repro, exit 0, <SECONDS>s)

@@ -1,0 +1,48 @@
+$ craftsman review report --review-only --json
+[exit 0]
+--- stdout
+{
+  "passed": false,
+  "partial": false,
+  "self_reviewed": true,
+  "enforced": false,
+  "platform": "cli",
+  "abandoned": false,
+  "slots": [],
+  "issues": [
+    {
+      "code": "uncovered",
+      "message": "7 hunk(s) uncovered in round 1: H1,H2,H3,H4,H5,H6,H7; have them reviewed and run `craftsman review cover --hunks H1,H2,H3,H4,H5,H6,H7 --note \"...\"`."
+    }
+  ],
+  "warnings": [],
+  "summary": "Round 1 (current): 7 hunks in 7 files, +16/-2 lines.\nCoverage: 0/7 hunks; 0 hunk(s) carried from earlier rounds.\nFindings: none.\nRuns: none recorded.",
+  "deep": false,
+  "rounds": 1,
+  "base_sha": "<BASE40>",
+  "diff": {
+    "files": 7,
+    "added": 16,
+    "deleted": 2
+  },
+  "not_covered": [
+    "H1",
+    "H2",
+    "H3",
+    "H4",
+    "H5",
+    "H6",
+    "H7"
+  ],
+  "findings": {
+    "fixed": [],
+    "accepted": [],
+    "open": [],
+    "question": [],
+    "dismissed": []
+  },
+  "runs": [],
+  "waived_runs": [],
+  "agent_usage": {}
+}
+--- stderr

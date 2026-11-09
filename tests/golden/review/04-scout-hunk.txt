@@ -1,0 +1,10 @@
+$ craftsman review scout H1
+[exit 0]
+--- stdout
+# Scout H1 · base <BASE7>
+## H1 · NOTES.txt · lines 1-1 (block)
+### Base version at <BASE7>
+new in this change (the file does not exist in the base)
+### Tests
+(no test function references them)
+--- stderr

@@ -1,0 +1,28 @@
+{
+  "defects": [
+    {
+      "id": "inv-1",
+      "kind": "qualifier-not-implemented",
+      "summary": "Search lowercases the term but not the item name, so it is only case-insensitive when the stored name is already lowercase ('bolt' does not find 'Hex Bolt').",
+      "locations": [{"file": "invtool/store.py", "start": 52, "end": 55, "anchor": "needle = term.strip().lower()"}]
+    },
+    {
+      "id": "inv-2",
+      "kind": "help-contradicts-code",
+      "summary": "Help for --min-qty says 'more than N' but the code (and the task) keep items with a quantity of at least N.",
+      "locations": [{"file": "invtool/cli.py", "start": 30, "end": 30, "anchor": "search.add_argument(\"--min-qty\", type=int, help=\"only items with more "}]
+    }
+  ],
+  "decoys": [
+    {
+      "id": "inv-d1",
+      "summary": "Exiting with status 1 and printing nothing when no item matches looks like an error path but is exactly what the task asks for.",
+      "locations": [{"file": "invtool/cli.py", "start": 66, "end": 67, "anchor": "if not items:"}]
+    },
+    {
+      "id": "inv-d2",
+      "summary": "--max-price is kept as text and parsed into a Decimal, then compared with '>' so a price equal to the limit is kept; this is correct (no float rounding, 'at most P').",
+      "locations": [{"file": "invtool/cli.py", "start": 59, "end": 64, "anchor": "max_price = None"}]
+    }
+  ]
+}

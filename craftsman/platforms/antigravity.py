@@ -75,8 +75,6 @@ def install_antigravity_target(repo_dir: Path, home: Path, mode: InstallMode, tr
     # Read before anything is written: a hooks.json that is no JSON object stops the install.
     existing_hooks = read_json_object(hooks_json) if exists(hooks_json) else None
     session = TargetSession.begin(config_dir, TargetKind.ANTIGRAVITY, home, tracker)
-    if session.manifest is not None and TargetKind.GIT_HOOKS in session.manifest.targets:
-        session.manifest = session.manifest.without((TargetKind.GIT_HOOKS,))
     for sub in ("skills", "rules", "scripts", "plugins"):
         session.make_dirs(config_dir / sub)
     install_runtime(session, repo_dir, mode)

@@ -10,7 +10,7 @@ description: >-
 
 # Test-evidence audit (`/audit-tests [target]`)
 
-Deepens the `tests` lens (run `craftsman skill show code-review --lenses tests` to read that
+Deepens the `tests` lens (run `craftsman skill show craft-review --lenses tests` to read that
 playbook first; never search the file system for `lenses.md`).
 
 ## Search scope
@@ -37,16 +37,9 @@ early `return`, wrong argument order) and the assertion that would catch it, or 
 
 ## 2. Gaps to look for
 
-- behaviors with no test, especially error paths, empty inputs, limits and the boundary the change
-  moved;
-- a bug fix with no test that fails before the fix;
-- tests that execute the code but assert nothing meaningful (only "no exception", only types,
-  only the mock was called);
-- mocks that replace the logic under test, or fixtures so large that the test passes because of
-  the setup;
-- dependence on wall-clock time, randomness without a seed, test order, network, environment
-  variables or the developer's machine;
-- shared mutable state between tests, missing cleanup of files or processes.
+Apply probes 1 to 6 of the `tests` lens to every row of the map, not only to the changed ones.
+A row where a probe finds a gap is a gap row. The lens's *Limits* (one finding for missing tests
+per change) do not apply here: this audit lists every gap, then ranks them in step 3.
 
 ## 3. Close the most valuable gaps
 

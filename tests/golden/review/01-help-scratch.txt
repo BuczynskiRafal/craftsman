@@ -1,0 +1,9 @@
+$ craftsman review scratch --help
+[exit 0]
+--- stdout
+usage: craftsman review scratch [-h] [--cwd CWD]
+
+options:
+  -h, --help  show this help message and exit
+  --cwd CWD   Directory inside the repository (default: current)
+--- stderr

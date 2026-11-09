@@ -14,11 +14,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from craftsman.files import UnsafePathError
 from craftsman.generated import ExportError
-from craftsman.legacy_githooks import legacy_git_hooks_bases
-from craftsman.manifest import InstallError, TargetKind
-from craftsman.paths import default_claude_dir, default_repo_dir, user_home
+from craftsman.manifest import InstallError, load_manifest
+from craftsman.paths import default_claude_dir, default_copilot_home, default_repo_dir, user_home
 from craftsman.platforms.agents_md import install_agents_workspace_target
 from craftsman.platforms.antigravity import (
     detect_antigravity,
@@ -40,7 +38,6 @@ from craftsman.platforms.copilot import (
     install_copilot_workspace_target,
 )
 from craftsman.staging import EventKind, InstallMode, Tracker, run_reported
-from craftsman.uninstall import apply_plan, plan_base
 
 
 @dataclass(frozen=True)
@@ -208,22 +205,21 @@ def _check_antigravity_scopes(config: InstallConfig, home: Path) -> None:
         )
 
 
-def _remove_legacy_git_hooks(config: InstallConfig, home: Path, tracker: Tracker) -> None:
-    """Remove Craftsman 3.x global git hooks recorded in any manifest on upgrade to 4.0."""
-    antigravity_base = (home / ".gemini" / "config").resolve()
-    for base in legacy_git_hooks_bases(home):
-        installing_here = config.antigravity and base.resolve() == antigravity_base
-        try:
-            plan = plan_base(base, [TargetKind.GIT_HOOKS], home, roots=(base,))
-            if plan is None:
-                continue
-            apply_plan(plan, home, tracker)
-        except (InstallError, UnsafePathError) as exc:
-            if installing_here:
-                raise
-            tracker.add(EventKind.WARNING, f"could not clean up legacy git hooks in {base}: {exc}")
-            continue
-        tracker.add(EventKind.NOTE, "removed the global git hooks of Craftsman 3.x")
+def _check_manifests(config: InstallConfig, home: Path) -> None:
+    """Read the manifest of every selected target before the first write, so that one the install
+    cannot read (a corrupt one, one from before 4.0) stops it with nothing changed."""
+    bases = [
+        *([home / ".gemini" / "config"] if config.antigravity else []),
+        *([default_claude_dir(home)] if config.claude else []),
+        *([default_copilot_home(home)] if config.copilot else []),
+        *(
+            workspace.resolve()
+            for workspace in (config.copilot_workspace, config.agents_workspace)
+            if workspace is not None
+        ),
+    ]
+    for base in bases:
+        load_manifest(base)
 
 
 def run_install(config: InstallConfig, tracker: Tracker, home: Path | None = None) -> None:
@@ -237,7 +233,7 @@ def run_install(config: InstallConfig, tracker: Tracker, home: Path | None = Non
     _check_copilot_scopes(config, home)
     _check_claude_scopes(config, home)
     _check_antigravity_scopes(config, home)
-    _remove_legacy_git_hooks(config, home, tracker)
+    _check_manifests(config, home)
     if config.antigravity:
         install_antigravity_target(repo_dir, home, config.mode, tracker)
     if config.claude:
@@ -324,7 +320,7 @@ def _build_install_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the full plan without modifying any files or Git configuration.",
+        help="Print the full plan without modifying any files.",
     )
     return parser
 

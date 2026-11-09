@@ -13,7 +13,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 from craftsman import records
-from craftsman.text import ONE_LINE_WARNING, inline_md, one_line
+from craftsman.text import ONE_LINE_WARNING, defang_tokens, inline_md, one_line
 
 from tests.support import EvidenceRepo
 
@@ -236,15 +236,12 @@ class TestInlineMd(unittest.TestCase):
 PROSE_FIELDS: frozenset[str] = frozenset(
     {
         "Coverage.note",
-        "Fact.text",
         "Finding.title",
         "Finding.scenario",
         "Finding.suggestion",
         "Finding.verdict_evidence",
         "Finding.resolution_note",
-        "LensAddition.reason",
         "RunWaiver.reason",
-        "SignalAck.reason",
     }
 )
 
@@ -257,7 +254,6 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "EntryProblem.label",
         "EntryProblem.field",
         "EntryProblem.problem",
-        "EntryProblem.example",
         # HunkRef
         "HunkRef.id",
         "HunkRef.path",
@@ -266,36 +262,26 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "HunkRef.new_len",
         "HunkRef.carried",
         "HunkRef.reopened",
+        # Round
+        "Round.deep",
         # QualitySignal
         "QualitySignal.id",
         "QualitySignal.kind",
         "QualitySignal.file",
         "QualitySignal.line",
         "QualitySignal.detail",
-        # SignalAck
-        "SignalAck.signal_id",
-        "SignalAck.round",
-        "SignalAck.fingerprint",
-        "SignalAck.recorded_at",
-        # RoundFile
-        "RoundFile.path",
-        "RoundFile.digest",
-        "RoundFile.carried",
         # Round
         "Round.number",
         "Round.fingerprint",
         "Round.base_sha",
-        "Round.tier",
         "Round.prepared_at",
         "Round.hunks",
-        "Round.lenses",
         "Round.packet_path",
         "Round.signals",
         "Round.scope",
         "Round.out_of_scope",
         # Coverage
         "Coverage.round",
-        "Coverage.lens",
         "Coverage.digests",
         "Coverage.recorded_at",
         # Finding
@@ -311,7 +297,6 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Finding.resolution",
         "Finding.recorded_at",
         "Finding.updated_at",
-        "Finding.signal_id",
         # RunWaiver
         "RunWaiver.waived_at",
         # Run
@@ -326,34 +311,69 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Run.output_tail",
         "Run.fingerprint_after",
         "Run.waiver",
+        "Run.tests_ran",
+        "Run.min_tests",
         # AgentEvent
         "AgentEvent.platform",
         "AgentEvent.event",
         "AgentEvent.agent",
         "AgentEvent.agent_id",
         "AgentEvent.at",
-        # SourceRef
-        "SourceRef.path",
-        "SourceRef.line",
-        # Fact
-        "Fact.id",
-        "Fact.hunks",
-        "Fact.source",
-        "Fact.file_digest",
-        "Fact.author_lens",
-        # LensAddition
-        "LensAddition.lens",
-        "LensAddition.round",
-        "LensAddition.recorded_at",
+        "AgentEvent.usage",
+        "AgentEvent.records",
+        "AgentEvent.answered",
+        "AgentEvent.last_step",
+        # AgentUsage
+        "AgentUsage.input_tokens",
+        "AgentUsage.output_tokens",
+        "AgentUsage.cache_read_tokens",
+        "AgentUsage.cache_write_tokens",
+        "AgentUsage.duration_s",
         # Ledger
         "Ledger.rounds",
         "Ledger.coverage",
         "Ledger.findings",
         "Ledger.runs",
         "Ledger.agents",
-        "Ledger.signal_acks",
-        "Ledger.facts",
-        "Ledger.lens_additions",
+        # Schema 4: the hunt plan, slot claims and verdict events (ids, enums, timestamps and caller
+        # identities; `Round.task` is the request text as given, not agent prose).
+        "Coverage.hunter",
+        "Coverage.by",
+        "Finding.hunter",
+        "Finding.by",
+        "Finding.verdict_log",
+        "Finding.merged_into",
+        "HuntPlan.reasons",
+        "HuntPlan.slots",
+        "HuntPlan.waves",
+        "Wave.generation",
+        "Wave.planned_at",
+        "Wave.considered",
+        "Wave.slots",
+        "Slot.id",
+        "Slot.generation",
+        "Slot.kind",
+        "Slot.hunks",
+        "Slot.lenses",
+        "Slot.changed_lines",
+        "Slot.trigger",
+        "Slot.since",
+        "Round.plan",
+        "Round.platform",
+        "Round.enforced",
+        "Round.task",
+        "Round.last_prepared_at",
+        "VerdictEvent.token",
+        "VerdictEvent.verdict",
+        "VerdictEvent.at",
+        "VerdictEvent.by",
+        "VerdictEvent.merge",
+        "SlotClaim.round",
+        "SlotClaim.slot",
+        "SlotClaim.token",
+        "SlotClaim.at",
+        "SlotClaim.by",
+        "Ledger.claims",
     }
 )
 
@@ -364,6 +384,34 @@ def _record_classes() -> list[type]:
         for _, cls in inspect.getmembers(records, inspect.isclass)
         if is_dataclass(cls) and cls.__module__ == records.__name__
     ]
+
+
+class TestDefangTokens(unittest.TestCase):
+    def test_every_shape_a_recording_command_prints_is_rewritten(self) -> None:
+        for text, expected in (
+            ("F9 recorded (major)", "F9 recorded [major]"),
+            ("Coverage recorded (C9) for W1-1", "Coverage recorded [C9] for W1-1"),
+            ("Brief issued (B2) for W1-1", "Brief issued [B2] for W1-1"),
+            ("F3 verdict recorded (V7): proven", "F3 verdict recorded [V7]: proven"),
+            ("recorded   (C1)", "recorded   [C1]"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(defang_tokens(text), expected)
+
+    def test_an_unclosed_or_nested_shape_loses_its_opening_parenthesis_too(self) -> None:
+        for text in ("see Coverage recorded (C1", "F1 recorded (a (b) c)", "recorded ((x)"):
+            with self.subTest(text=text):
+                self.assertNotRegex(defang_tokens(text), r"(recorded|issued)\s*\(")
+
+    def test_line_breaks_stay_and_a_break_inside_a_shape_cannot_rejoin_it(self) -> None:
+        self.assertEqual(defang_tokens("one\nF9 recorded (major)\ntwo"), "one\nF9 recorded [major]\ntwo")
+        flattened = one_line(defang_tokens("F9 recorded\n(major)"), warn=False)
+        self.assertNotRegex(flattened, r"recorded\s*\(")
+
+    def test_text_without_a_shape_is_returned_as_it_is(self) -> None:
+        for text in ("", "unrecorded (x)", "recorded", "call issue(1) and record(2)", "a (recorded) b"):
+            with self.subTest(text=text):
+                self.assertEqual(defang_tokens(text), text)
 
 
 class TestRecordFieldsClassification(unittest.TestCase):
@@ -387,7 +435,7 @@ class TestProseFieldsReachTheReportAsOneLine(unittest.TestCase):
 
     def test_cli_and_json_input_are_stored_and_reported_on_one_line(self) -> None:
         repo = self.repo
-        repo.cli("review", "prepare", "--tier", "quick")
+        repo.cli("review", "prepare")
         added = repo.cli(
             "review", "add", "--lens", "intent", "--file", "app.py", "--line", "2",
             "--severity", "major", "--title", r"Off by one\nwhen x is 0",

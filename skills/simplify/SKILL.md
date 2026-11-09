@@ -4,8 +4,8 @@ description: >-
   Behavior-preserving cleanup of the current diff: removes duplication with
   existing helpers, needless complexity, dead weight, dishonest names or
   comments, and wasted work, then proves behavior is unchanged by re-running
-  the same checks. Not a bug hunt (use /code-review). Use when /simplify is
-  invoked or as the first step of the /craftsman quality loop.
+  the same checks. Not a bug hunt (use /craft-review). Use when /simplify is
+  invoked or as the last step of the /craftsman build.
 ---
 
 # Simplify (`/simplify [path | ref]`)
@@ -42,10 +42,10 @@ for an edit, do not make it — mention it as a suggestion instead.
    Simplifying on top of a red baseline hides regressions. Inside `/craftsman`, a failure caused
    by the change you just built is yours: fix it first, then simplify. A failure that already
    exists on the base commit, or any failure when `/simplify` runs on its own, is reported to the
-   user instead (`craftsman gate --await-user` while you wait for their decision).
+   user instead (inside `/craftsman`, `craftsman gate --await-user` while you wait; otherwise just ask).
 2. **Read the diff and its surroundings.** For each changed function, read the whole function and
    the module it lives in; skim neighboring modules for helpers.
-3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show code-review --lenses craft` to read the playbook; never search the file system for `lenses.md`):
+3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show craft-review --lenses craft` to read the playbook; never search the file system for `lenses.md`):
    - reimplemented helpers, constants or patterns that already exist (search by behavior and by
      likely names, not only the exact name);
    - derivable state, single-use indirection, always-constant flags, deep nesting that guard

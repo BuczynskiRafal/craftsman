@@ -1,0 +1,5 @@
+$ craftsman review report --review-only --partial
+[exit 2]
+--- stdout
+--- stderr
+craftsman review: error: No review round yet: run `craftsman review prepare` and launch the hunters it lists.

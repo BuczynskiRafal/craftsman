@@ -1,0 +1,153 @@
+$ craftsman review report --review-only --json
+[exit 0]
+--- stdout
+{
+  "passed": false,
+  "partial": false,
+  "self_reviewed": false,
+  "enforced": true,
+  "platform": "claude",
+  "abandoned": false,
+  "slots": [
+    {
+      "id": "W1-1",
+      "state": "unlaunched",
+      "lenses": [
+        "intent",
+        "ripple",
+        "tests"
+      ],
+      "hunks": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ],
+      "missing": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ]
+    },
+    {
+      "id": "W1-2",
+      "state": "unlaunched",
+      "lenses": [
+        "contracts",
+        "failure",
+        "sweep"
+      ],
+      "hunks": [
+        "H2",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ],
+      "missing": [
+        "H2",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ]
+    },
+    {
+      "id": "W1-3",
+      "state": "unlaunched",
+      "lenses": [
+        "craft",
+        "design"
+      ],
+      "hunks": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ],
+      "missing": [
+        "H1",
+        "H2",
+        "H3",
+        "H4",
+        "H5",
+        "H6",
+        "H7"
+      ]
+    }
+  ],
+  "issues": [
+    {
+      "code": "no-isolation",
+      "message": "No Craftsman subagent was recorded for round 1. If you launched hunters, the Craftsman hooks did not see them: run `craftsman doctor` and fix the install; do not relaunch hunters that already ran. If you did not launch any, launch them now, all in one step: W1-1..W1-3. For each, start a craftsman-reviewer subagent whose whole prompt is: `You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` (Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent craftsman-reviewer; Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)"
+    },
+    {
+      "code": "no-verdict",
+      "message": "1 finding without a verdict: F1. Launch verifiers, one per cluster: [F1]. For each cluster, start a craftsman-verifier subagent whose whole prompt is: `You are a Craftsman verifier. Run craftsman review brief --verifier <IDS> and follow it exactly.` A verdict you record yourself does not count."
+    }
+  ],
+  "warnings": [],
+  "summary": "Round 1 (current): 7 hunks in 7 files, +20/-2 lines.\nCoverage: 0/3 slots done; 0 hunk(s) carried from earlier rounds.\nFindings: 1 total; 1 awaiting verdict, 0 unresolved, 0 fixed, 0 accepted, 0 dismissed.\nRuns: none recorded.",
+  "deep": false,
+  "rounds": 1,
+  "base_sha": "<BASE40>",
+  "diff": {
+    "files": 7,
+    "added": 20,
+    "deleted": 2
+  },
+  "not_covered": [
+    "H1",
+    "H2",
+    "H3",
+    "H4",
+    "H5",
+    "H6",
+    "H7"
+  ],
+  "findings": {
+    "fixed": [],
+    "accepted": [],
+    "open": [
+      {
+        "id": "F1",
+        "round": 1,
+        "lens": "contracts",
+        "path": "app.py",
+        "line": 7,
+        "severity": "major",
+        "title": "Empty cart divides by zero",
+        "scenario": "total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError",
+        "suggestion": "",
+        "fingerprint": "<SHA>f301406b1dfdde037359a63f",
+        "verdict": null,
+        "verdict_evidence": "",
+        "verdict_run": null,
+        "resolution": null,
+        "resolution_note": "",
+        "recorded_at": "<TIME>",
+        "updated_at": "<TIME>",
+        "hunter": "W1-1",
+        "by": null,
+        "verdict_log": [],
+        "merged_into": null
+      }
+    ],
+    "question": [],
+    "dismissed": []
+  },
+  "runs": [],
+  "waived_runs": [],
+  "agent_usage": {}
+}
+--- stderr

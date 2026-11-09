@@ -35,6 +35,7 @@ from craftsman.generated import (
     upsert_managed_markdown,
     write_json_object,
 )
+from craftsman.legacy_skills import owned_legacy_skills
 from craftsman.manifest import (
     InstallError,
     InstallManifest,
@@ -98,7 +99,7 @@ def stop_roots_for(home: Path, *extra: Path) -> frozenset[Path]:
     the configured folders outside it, and the workspaces given on the command line."""
     abs_home = Path(os.path.abspath(home))
     roots = {abs_home, *(Path(os.path.abspath(item)) for item in extra)}
-    for env_key in ("XDG_CONFIG_HOME", "APPDATA", "CRAFTSMAN_HOME"):
+    for env_key in ("XDG_CONFIG_HOME", "APPDATA"):
         value = env_var_for_home(env_key, home)
         if value and not Path(os.path.abspath(value)).is_relative_to(abs_home):
             roots.add(Path(os.path.abspath(value)).parent)
@@ -140,9 +141,7 @@ class TargetSession:
 
     def owns(self, path: Path) -> bool:
         """Whether a Craftsman target of this base folder created `path` or a folder above it."""
-        owned = set(self.manifest.created_paths) if self.manifest else set()
-        absolute = Path(path_key(path))
-        return str(absolute) in owned or any(str(parent) in owned for parent in absolute.parents)
+        return self.manifest is not None and self.manifest.records(path)
 
     def make_dirs(self, directory: Path) -> None:
         """Create `directory`, recording each folder Craftsman created (or another target did)."""
@@ -191,6 +190,7 @@ class TargetSession:
         """Remove what the previous install of this target had and this one no longer has, then
         record the target in the manifest."""
         self._remove_obsolete()
+        self._remove_legacy_skills()
         target = TargetManifest(
             created_paths=tuple(self.created_paths),
             created_dirs=tuple(self.created_dirs),
@@ -199,6 +199,12 @@ class TargetSession:
         )
         manifest = self.manifest or InstallManifest({})
         save_manifest(self.base_dir, manifest.with_target(self.kind, target), dry_run=self.dry_run)
+
+    def _remove_legacy_skills(self) -> None:
+        """Remove the `code-review` skill of Craftsman < 5 when Craftsman owns it; a user's own stays."""
+        for legacy in owned_legacy_skills((self.kind,), self.base_dir, self.manifest):
+            if remove_path(legacy, stop_roots=self.stop_roots, dry_run=self.dry_run):
+                self.tracker.add(EventKind.REMOVED, path_key(legacy))
 
     def _remove_obsolete(self) -> None:
         if self.previous is None or self.manifest is None:

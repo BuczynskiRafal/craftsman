@@ -1,0 +1,12 @@
+$ craftsman review show --hunks
+[exit 0]
+--- stdout
+H1  NOTES.txt:1-1  added
+H2  app.py:4-14  total
+H3  docs/guide.md:1-5  modified
+H4  extra.py:1-2  double
+H5  lib/util.py:1-6  modified
+H6  new_name.py  renamed
+H7  tests/test_extra.py:1-5  added
+7 left to cover
+--- stderr

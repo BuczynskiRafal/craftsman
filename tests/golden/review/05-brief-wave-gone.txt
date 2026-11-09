@@ -1,0 +1,5 @@
+$ craftsman review brief W2-1
+[exit 2]
+--- stdout
+--- stderr
+craftsman review: error: Slot W2-1 is no longer required in round 1 (the findings changed). Reply exactly that to the agent that launched you and stop.

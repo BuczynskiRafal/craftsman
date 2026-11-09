@@ -169,8 +169,8 @@ class WorktreeGuardHookTests(unittest.TestCase):
     def ledger_file(self) -> Path:
         return self.repo.ledger_dir / "ledger.json"
 
-    def prepare_review(self, tier: str = "quick") -> None:
-        self.repo.cli("review", "prepare", "--tier", tier)
+    def prepare_review(self) -> None:
+        self.repo.cli("review", "prepare")
 
     def set_prepared_at(self, when: datetime) -> None:
         raw = json.loads(self.ledger_file.read_text(encoding="utf-8"))
@@ -222,7 +222,7 @@ class WorktreeGuardHookTests(unittest.TestCase):
                 self.assertEqual(out["hookSpecificOutput"]["permissionDecisionReason"], expected)
 
     def test_verifier_subagent_cannot_commit_or_apply_patches(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
+        self.repo.cli("gate", "--init", "--cwd", ".")
         for command in ('git commit -m "repro"', "git apply repro.patch", "git checkout -- app.py"):
             with self.subTest(command=command):
                 payload = claude_shell(self.root, command, agent_type="craftsman-verifier")
@@ -273,7 +273,7 @@ class WorktreeGuardHookTests(unittest.TestCase):
         self.assertEqual(closed_out, {})
 
     def test_closed_review_round_allows_worktree_mutation(self) -> None:
-        self.prepare_review("standard")
+        self.prepare_review()
         self.repo.cover_all()
 
         out, _ = call_hook("pre-tool", "claude", claude_shell(self.root, "git stash"))
@@ -291,8 +291,8 @@ class WorktreeGuardHookTests(unittest.TestCase):
         self.assertEqual(stale_out, {})
 
     def test_active_gate_allows_main_session_worktree_commands(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "standard", "--cwd", ".")
-        self.prepare_review("standard")
+        self.repo.cli("gate", "--init", "--cwd", ".")
+        self.prepare_review()
         for agent_extra in ({}, {"agent_type": "craftsman"}):
             for command in ("git stash", "git checkout -b feat/x", "git reset --soft HEAD~1"):
                 with self.subTest(agent=agent_extra, command=command):
@@ -339,8 +339,8 @@ class WorktreeGuardHookTests(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_closed_gate_does_not_suppress_review_only_prompt(self) -> None:
-        self.repo.cli("gate", "--init", "--tier", "quick", "--cwd", ".")
-        self.repo.record_full_evidence("quick")
+        self.repo.cli("gate", "--init", "--cwd", ".")
+        self.repo.record_full_evidence()
         self.repo.cli("gate", "--complete", "--cwd", ".")
         self.repo.write("app.py", CHANGE + "x = 2\n")
         self.prepare_review()

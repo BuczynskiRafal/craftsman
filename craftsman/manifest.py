@@ -6,6 +6,7 @@ The manifest is the only record uninstall works from: a path it does not list is
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,7 +18,11 @@ from craftsman.files import write_text_atomic
 from craftsman.records import FieldError, Fields, as_choice
 
 MANIFEST_FILENAME = ".craftsman-install.json"
-LEGACY_V1_HOOKS_JSON_KEYS: tuple[str, ...] = ("craftsman-git-guard", "craftsman-stop-gate")
+BEFORE_4_0_MANIFEST_MESSAGE = (
+    "install manifest {path} was written by Craftsman before 4.0, which this version cannot read: "
+    "delete that file and run `craftsman install` again (and `git config --global --unset "
+    "core.hooksPath` when it still points to a Craftsman `git-hooks` folder)"
+)
 
 
 class InstallError(RuntimeError):
@@ -30,7 +35,6 @@ class TargetKind(str, Enum):
     COPILOT = "copilot"
     COPILOT_WORKSPACE = "copilot_workspace"
     AGENTS_WORKSPACE = "agents_workspace"
-    GIT_HOOKS = "git_hooks"  # legacy: read only to remove Craftsman < 4.0 git hooks
 
 
 class ModifiedKind(str, Enum):
@@ -47,8 +51,6 @@ class TargetManifest:
     created_dirs: tuple[str, ...] = ()
     modified_files: Mapping[str, ModifiedKind] = field(default_factory=dict)
     hooks_json_keys: tuple[str, ...] = ()  # the Antigravity hooks.json entries Craftsman added
-    previous_hooks_path: str | None = None  # legacy: read only to remove Craftsman < 4.0 git hooks
-    hooks_dir: str | None = None  # legacy: read only to remove Craftsman < 4.0 git hooks
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "modified_files", MappingProxyType(dict(self.modified_files)))
@@ -59,8 +61,6 @@ class TargetManifest:
             "created_dirs": list(self.created_dirs),
             "modified_files": {path: kind.value for path, kind in self.modified_files.items()},
             "hooks_json_keys": list(self.hooks_json_keys),
-            "previous_hooks_path": self.previous_hooks_path,
-            "hooks_dir": self.hooks_dir,
         }
 
     @classmethod
@@ -71,10 +71,16 @@ class TargetManifest:
             created_dirs=fields.texts("created_dirs"),
             modified_files=fields.record("modified_files", _modified_kinds),
             hooks_json_keys=fields.texts("hooks_json_keys"),
-            previous_hooks_path=fields.optional_text("previous_hooks_path"),
-            hooks_dir=fields.optional_text("hooks_dir"),
         )
+        # Craftsman 4.x and 5.0 wrote these two as null; they only ever held a value for the git
+        # hooks target, which `load_manifest` has already refused.
+        for key in _RETIRED_NULL_FIELDS:
+            if fields.optional_text_if_present(key) is not None:
+                raise FieldError(key, "belongs to the git hooks of Craftsman before 4.0")
         return fields.done(target)
+
+
+_RETIRED_NULL_FIELDS = ("previous_hooks_path", "hooks_dir")
 
 
 def _modified_kinds(raw: Any) -> dict[str, ModifiedKind]:
@@ -97,6 +103,12 @@ class InstallManifest:
     def created_dirs(self) -> tuple[str, ...]:
         return _union(target.created_dirs for target in self.targets.values())
 
+    def records(self, path: Path) -> bool:
+        """Whether a target created `path`, or a folder above it."""
+        owned = set(self.created_paths)
+        absolute = Path(os.path.abspath(path))
+        return str(absolute) in owned or any(str(parent) in owned for parent in absolute.parents)
+
     def paths_of_others(self, kind: TargetKind) -> frozenset[str]:
         """The paths created by every target but `kind`, which uninstalling `kind` must keep."""
         return frozenset(p for k, t in self.targets.items() if k is not kind for p in t.created_paths)
@@ -113,88 +125,7 @@ class InstallManifest:
     @classmethod
     def from_fields(cls, raw: Any) -> InstallManifest:
         fields = Fields(raw)
-        if "schema_version" in raw:
-            return _v1_manifest_from_fields(raw, fields)
         return fields.done(cls(fields.record("targets", _targets)))
-
-
-def _v1_manifest_from_fields(raw: Any, fields: Fields) -> InstallManifest:
-    """Read a Craftsman 3.0-3.2 (`schema_version: 1`) install manifest on upgrade or uninstall."""
-    schema_version = fields.integer("schema_version")
-    if schema_version != 1:
-        raise FieldError("schema_version", f"must be 1 (got {schema_version})")
-    fields.text_if_present("version")
-    fields.text_if_present("mode")
-    if "created_paths" in raw:
-        fields.texts("created_paths")
-    if "created_dirs" in raw:
-        fields.texts("created_dirs")
-    if "previous_hooks_path" in raw:
-        fields.optional_text("previous_hooks_path")
-    if "hooks_dir" in raw:
-        fields.optional_text("hooks_dir")
-    return fields.done(InstallManifest(fields.record("targets", _v1_targets)))
-
-
-def _v1_targets(raw: Any) -> dict[TargetKind, TargetManifest]:
-    fields = Fields(raw)
-    if not raw:
-        raise FieldError("", "is empty")
-    targets: dict[TargetKind, TargetManifest] = {}
-    for key in raw:
-        kind = as_choice(key, tuple(TargetKind))
-        if kind is None:
-            raise FieldError(key, "is not a target")
-        target_kind = TargetKind(kind)
-
-        def parse_target(
-            item: Any, current_kind: TargetKind = target_kind, name: str = key
-        ) -> TargetManifest:
-            return _v1_target_from_fields(current_kind, name, item)
-
-        targets[target_kind] = _require_fields_of(kind, fields.record(key, parse_target), key)
-    return fields.done(targets)
-
-
-def _v1_target_from_fields(kind: TargetKind, key: str, raw: Any) -> TargetManifest:
-    fields = Fields(raw)
-    target_name = fields.text_if_present("target")
-    if target_name is not None and target_name != key:
-        raise FieldError("target", f"must be {key!r} (got {target_name!r})")
-    fields.text_if_present("mode")
-    fields.text_if_present("version")
-    created_paths = fields.texts("created_paths")
-    created_dirs = fields.texts("created_dirs") if "created_dirs" in raw else ()
-    modified_files = (
-        fields.record("modified_files", _modified_kinds) if "modified_files" in raw else {}
-    )
-    previous = fields.optional_text("previous_hooks_path") if "previous_hooks_path" in raw else None
-    hooks_dir = fields.optional_text("hooks_dir") if "hooks_dir" in raw else None
-    hooks_json_keys = _v1_hooks_json_keys(kind, raw, fields, modified_files)
-    if kind is TargetKind.GIT_HOOKS and hooks_dir is not None and not created_dirs:
-        created_dirs = (hooks_dir,)
-    target = TargetManifest(
-        created_paths=created_paths,
-        created_dirs=created_dirs,
-        modified_files=modified_files,
-        hooks_json_keys=hooks_json_keys,
-        previous_hooks_path=previous,
-        hooks_dir=hooks_dir,
-    )
-    return fields.done(target)
-
-
-def _v1_hooks_json_keys(
-    kind: TargetKind,
-    raw: Any,
-    fields: Fields,
-    modified_files: Mapping[str, ModifiedKind],
-) -> tuple[str, ...]:
-    if "hooks_json_keys" in raw:
-        return fields.texts("hooks_json_keys")
-    if kind is TargetKind.ANTIGRAVITY and ModifiedKind.HOOKS_JSON in modified_files.values():
-        return LEGACY_V1_HOOKS_JSON_KEYS
-    return ()
 
 
 def _targets(raw: Any) -> dict[TargetKind, TargetManifest]:
@@ -213,15 +144,18 @@ def _targets(raw: Any) -> dict[TargetKind, TargetManifest]:
 
 
 def _require_fields_of(kind: TargetKind, target: TargetManifest, key: str) -> TargetManifest:
-    """The git hooks fields belong to the git hooks target, the hooks.json keys to Antigravity."""
-    is_hooks = kind is TargetKind.GIT_HOOKS
-    if is_hooks and target.hooks_dir is None:
-        raise FieldError(key, "needs `hooks_dir`, as the git hooks target")
-    if not is_hooks and (target.hooks_dir is not None or target.previous_hooks_path is not None):
-        raise FieldError(key, "has `hooks_dir` or `previous_hooks_path`, which only git hooks have")
+    """The hooks.json keys belong to the Antigravity target."""
     if kind is not TargetKind.ANTIGRAVITY and target.hooks_json_keys:
         raise FieldError(key, "has `hooks_json_keys`, which only Antigravity has")
     return target
+
+
+def _is_before_4_0(raw: Any) -> bool:
+    """Whether `raw` is a manifest of Craftsman 3.x: `schema_version` (3.0 to 3.2) or a git hooks target."""
+    if not isinstance(raw, dict):
+        return False
+    targets = raw.get("targets")
+    return "schema_version" in raw or (isinstance(targets, dict) and "git_hooks" in targets)
 
 
 def load_manifest(base_dir: Path) -> InstallManifest | None:
@@ -233,6 +167,8 @@ def load_manifest(base_dir: Path) -> InstallManifest | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InstallError(f"cannot read install manifest {path}: {exc}") from exc
+    if _is_before_4_0(raw):
+        raise InstallError(BEFORE_4_0_MANIFEST_MESSAGE.format(path=path))
     try:
         return InstallManifest.from_fields(raw)
     except FieldError as exc:

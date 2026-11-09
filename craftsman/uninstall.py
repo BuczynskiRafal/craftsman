@@ -11,7 +11,7 @@ from pathlib import Path
 
 from craftsman.files import exists, remove_path, require_no_symlinked_parent
 from craftsman.generated import require_resolves_within
-from craftsman.legacy_githooks import craftsman_home_dir, restore_hooks_path
+from craftsman.legacy_skills import owned_legacy_skills
 from craftsman.manifest import (
     InstallManifest,
     ModifiedKind,
@@ -57,6 +57,7 @@ class BasePlan:
     manifest: InstallManifest
     kinds: tuple[TargetKind, ...]
     stop_roots: frozenset[Path]
+    legacy_skills: tuple[Path, ...] = ()  # the `code-review` skill of Craftsman < 5, when owned
 
 
 def plan_base(
@@ -93,7 +94,10 @@ def plan_base(
         for raw in target.created_dirs:
             if Path(raw) not in dir_roots:
                 require_within(Path(raw), dir_roots)
-    return BasePlan(base_dir, manifest, matching, stop_roots)
+    legacy_skills = tuple(owned_legacy_skills(matching, base_dir, manifest))
+    for legacy in legacy_skills:
+        require_no_symlinked_parent(legacy, stop_roots)
+    return BasePlan(base_dir, manifest, matching, stop_roots, legacy_skills)
 
 
 def revert_modified_file(
@@ -108,13 +112,11 @@ def revert_modified_file(
         revert_json_file(path, target, tracker, strip_hooks_json(target.hooks_json_keys))
 
 
-def apply_plan(plan: BasePlan, home: Path, tracker: Tracker) -> None:
+def apply_plan(plan: BasePlan, tracker: Tracker) -> None:
     targets = [plan.manifest.targets[kind] for kind in plan.kinds]
     remaining = plan.manifest.without(plan.kinds)
     handled = {*remaining.created_paths}
-    for kind, target in zip(plan.kinds, targets, strict=True):
-        if kind is TargetKind.GIT_HOOKS:
-            restore_hooks_path(target, home, tracker)
+    for target in targets:
         for raw_path, modified_kind in target.modified_files.items():
             revert_modified_file(Path(raw_path), modified_kind, target, tracker)
         handled.update(target.modified_files)
@@ -124,6 +126,9 @@ def apply_plan(plan: BasePlan, home: Path, tracker: Tracker) -> None:
             handled.add(raw_path)  # two targets of one base folder may share a path
             if remove_path(Path(raw_path), stop_roots=plan.stop_roots, dry_run=tracker.dry_run):
                 tracker.add(EventKind.REMOVED, raw_path)
+    for legacy in plan.legacy_skills:
+        if remove_path(legacy, stop_roots=plan.stop_roots, dry_run=tracker.dry_run):
+            tracker.add(EventKind.REMOVED, str(legacy))
     save_manifest(plan.base_dir, remaining, dry_run=tracker.dry_run)
     if not tracker.dry_run:
         pruned = {raw for target in targets for raw in target.created_dirs}
@@ -148,19 +153,13 @@ def run_uninstall(config: UninstallConfig, tracker: Tracker, home: Path | None =
     home = user_home(home)
     plans = [plan for plan in _plans(config, home) if plan is not None]
     for plan in plans:
-        apply_plan(plan, home, tracker)
+        apply_plan(plan, tracker)
 
 
 def _plans(config: UninstallConfig, home: Path) -> Iterator[BasePlan | None]:
-    config_dir = home / ".gemini" / "config"
-    gemini_kinds = [
-        *([TargetKind.ANTIGRAVITY] if config.antigravity else []),
-        TargetKind.GIT_HOOKS,
-    ]
-    yield plan_base(config_dir, gemini_kinds, home, roots=(config_dir,))
-    craftsman_home = craftsman_home_dir(home)
-    if craftsman_home.resolve() != config_dir.resolve():
-        yield plan_base(craftsman_home, [TargetKind.GIT_HOOKS], home, roots=(craftsman_home,))
+    if config.antigravity:
+        config_dir = home / ".gemini" / "config"
+        yield plan_base(config_dir, [TargetKind.ANTIGRAVITY], home, roots=(config_dir,))
     if config.claude:
         claude_dir = default_claude_dir(home)
         yield plan_base(claude_dir, [TargetKind.CLAUDE], home, roots=(claude_dir,))
@@ -181,7 +180,7 @@ def _plans(config: UninstallConfig, home: Path) -> Iterator[BasePlan | None]:
 def _build_uninstall_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="craftsman uninstall",
-        description="Remove what the Craftsman install manifests record and restore any 3.x core.hooksPath. "
+        description="Remove what the Craftsman install manifests record. "
         "Without a target, every user-level target is uninstalled.",
     )
     parser.add_argument("--all", action="store_true", help="Every user-level target.")
@@ -199,7 +198,7 @@ def _build_uninstall_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the plan without modifying any files or Git configuration.",
+        help="Print the plan without modifying any files.",
     )
     return parser
 

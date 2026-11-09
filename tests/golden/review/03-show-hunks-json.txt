@@ -1,0 +1,102 @@
+$ craftsman review show --hunks --json
+[exit 0]
+--- stdout
+{
+  "round": {
+    "number": 1,
+    "deep": false,
+    "prepared_at": "<TIME>",
+    "current": true,
+    "hunks": 7,
+    "carried": 0,
+    "packet": "<REPO>/.git/craftsman/packet-1.md"
+  },
+  "stale": false,
+  "hunks": [
+    {
+      "id": "H1",
+      "path": "NOTES.txt",
+      "new_start": 1,
+      "new_len": 1,
+      "start_line": 1,
+      "end_line": 1,
+      "carried": false,
+      "status": "added",
+      "scope": null,
+      "covered": false
+    },
+    {
+      "id": "H2",
+      "path": "app.py",
+      "new_start": 4,
+      "new_len": 11,
+      "start_line": 4,
+      "end_line": 14,
+      "carried": false,
+      "status": "modified",
+      "scope": "total",
+      "covered": false
+    },
+    {
+      "id": "H3",
+      "path": "docs/guide.md",
+      "new_start": 1,
+      "new_len": 5,
+      "start_line": 1,
+      "end_line": 5,
+      "carried": false,
+      "status": "modified",
+      "scope": null,
+      "covered": false
+    },
+    {
+      "id": "H4",
+      "path": "extra.py",
+      "new_start": 1,
+      "new_len": 2,
+      "start_line": 1,
+      "end_line": 2,
+      "carried": false,
+      "status": "added",
+      "scope": "double",
+      "covered": false
+    },
+    {
+      "id": "H5",
+      "path": "lib/util.py",
+      "new_start": 1,
+      "new_len": 6,
+      "start_line": 1,
+      "end_line": 6,
+      "carried": false,
+      "status": "modified",
+      "scope": null,
+      "covered": false
+    },
+    {
+      "id": "H6",
+      "path": "new_name.py",
+      "new_start": 0,
+      "new_len": 0,
+      "start_line": 0,
+      "end_line": 0,
+      "carried": false,
+      "status": "renamed",
+      "scope": null,
+      "covered": false
+    },
+    {
+      "id": "H7",
+      "path": "tests/test_extra.py",
+      "new_start": 1,
+      "new_len": 5,
+      "start_line": 1,
+      "end_line": 5,
+      "carried": false,
+      "status": "added",
+      "scope": null,
+      "covered": false
+    }
+  ]
+}
+--- stderr

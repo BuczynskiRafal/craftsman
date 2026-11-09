@@ -6,8 +6,10 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import shlex
 import shutil
+import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass
@@ -18,17 +20,14 @@ from typing import Any
 from craftsman import __version__
 from craftsman.assets import craftsman_agent_names, craftsman_skill_names, parse_frontmatter
 from craftsman.generated import ExportError
-from craftsman.legacy_githooks import (
-    git_config_get,
-    is_craftsman_hooks_path,
-    legacy_git_hooks_bases,
-)
-from craftsman.manifest import InstallError, TargetKind, load_manifest
+from craftsman.legacy_skills import inspect_legacy_skills
+from craftsman.manifest import InstallError, TargetKind
 from craftsman.paths import (
     default_claude_dir,
     default_copilot_home,
     default_copilot_skills_dir,
     default_vscode_prompts_dir,
+    env_var_for_home,
     resolve_craftsman_pkg_dir,
     user_home,
 )
@@ -59,8 +58,12 @@ REQUIRED_SCRIPTS = (
     "craftsman-cli.py",
 )
 MIN_RULE_FILES = 1
-LEFTOVER_GIT_HOOKS_PROBLEM = (
-    "leftover git hooks from Craftsman 3.x; run `craftsman install` or `craftsman uninstall`"
+GIT_TIMEOUT_S = 5
+# Where Craftsman before 4.0 put the global git hooks that `core.hooksPath` pointed to.
+LEGACY_GIT_HOOKS_DIRS = ((".gemini", "config", "git-hooks"), (".craftsman", "git-hooks"))
+STALE_HOOKS_PATH_PROBLEM = (
+    "git config --global core.hooksPath points to the git hooks of Craftsman before 4.0 ({path}): "
+    "run `git config --global --unset core.hooksPath`"
 )
 # A SKILL.md body shorter than this is a stub, not a skill.
 MIN_SKILL_BODY_CHARS = 100
@@ -87,7 +90,7 @@ class HooksReport:
 class SkillsReport:
     path: str
     installed: bool
-    code_review_lenses: bool | None  # None when code-review itself is not installed
+    craft_review_lenses: bool | None  # None when craft-review itself is not installed
 
 
 @dataclass(frozen=True)
@@ -381,7 +384,7 @@ def _agents_installed(directory: Path, names: tuple[str, ...], suffix: str) -> b
 
 
 def _skills_report(skills_dir: Path) -> SkillsReport:
-    review = skills_dir / "code-review"
+    review = skills_dir / "craft-review"
     lenses = (review / "lenses.md").is_file() if (review / "SKILL.md").is_file() else None
     return SkillsReport(str(skills_dir), (skills_dir / "craftsman" / "SKILL.md").is_file(), lenses)
 
@@ -617,23 +620,57 @@ def _format_duplicate_problem(dup: CopilotDuplicate) -> str:
     return f"{prefix} (keep {dup.canonical_path}; rename or remove the other copies)"
 
 
-# --- legacy git hooks -----------------------------------------------------------------------
+def inspect_stale_hooks_path(hooks_path: str | None, home: Path) -> list[str]:
+    """A problem when `core.hooksPath` still points to a git hooks folder of Craftsman before 4.0."""
+    if not hooks_path:
+        return []
+    if hooks_path == "~" or hooks_path.startswith(("~/", "~\\")):
+        hooks_path = str(home / hooks_path[2:].lstrip("/\\"))
+    if not Path(hooks_path).is_absolute():
+        return []  # relative to each repository, so no global Craftsman folder
+    legacy = {(home.joinpath(*parts)).resolve() for parts in LEGACY_GIT_HOOKS_DIRS}
+    if Path(hooks_path).resolve() not in legacy:
+        return []
+    return [STALE_HOOKS_PATH_PROBLEM.format(path=hooks_path)]
 
 
-def inspect_legacy_git_hooks(hooks_path: str | None, home: Path) -> list[str]:
-    """Warn when a manifest still lists Craftsman 3.x git hooks or `core.hooksPath` points to them."""
+def inspect_leftover_review_skills(workspace: Path | None, home: Path) -> list[str]:
+    """Problems for the `code-review` skill of Craftsman < 5 that Craftsman still owns."""
+    bases = [
+        (home / ".gemini" / "config", TargetKind.ANTIGRAVITY),
+        (default_claude_dir(home), TargetKind.CLAUDE),
+        (default_copilot_home(home), TargetKind.COPILOT),
+    ]
+    if workspace is not None:
+        bases.append((workspace, TargetKind.COPILOT_WORKSPACE))
+    return [problem for base, kind in bases for problem in inspect_legacy_skills((kind,), base)]
+
+
+# Commands and flags that Craftsman < 5 prompts tell the agent to run and that no longer exist.
+STALE_PROMPT_RE = re.compile(
+    r"review (?:ack|fact)\b|--tier\b|--add-lens\b|--shard\b|--signal\b|skill show code-review"
+)
+STALE_PROMPT_PROBLEM = (
+    "{path} is a prompt of Craftsman before 5.0 (it uses `{marker}`, which was removed); "
+    "run `craftsman install`"
+)
+
+
+def inspect_stale_prompts(workspace: Path | None, home: Path) -> list[str]:
+    """Problems for installed Craftsman commands and agents that still follow the old protocol."""
+    claude, copilot = default_claude_dir(home), default_copilot_home(home)
+    folders = [claude / "commands", claude / "agents", copilot / "agents"]
+    if workspace is not None:
+        folders.append(workspace / ".github" / "agents")
     problems: list[str] = []
-    has_leftover = is_craftsman_hooks_path(hooks_path, home)
-    for base in legacy_git_hooks_bases(home):
-        try:
-            manifest = load_manifest(base)
-        except InstallError as exc:
-            problems.append(str(exc))
-            continue
-        if manifest is not None and TargetKind.GIT_HOOKS in manifest.targets:
-            has_leftover = True
-    if has_leftover:
-        problems.append(LEFTOVER_GIT_HOOKS_PROBLEM)
+    for folder in folders:
+        for path in sorted(folder.glob("*craftsman*.md")) if folder.is_dir() else ():
+            try:
+                found = STALE_PROMPT_RE.search(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError):
+                continue
+            if found:
+                problems.append(STALE_PROMPT_PROBLEM.format(path=path, marker=found.group(0)))
     return problems
 
 
@@ -709,9 +746,9 @@ def _platform_problems(
     copilot: CopilotReport, claude: ClaudeReport, claude_dir: Path | None = None
 ) -> list[str]:
     problems = [
-        f"{entry.path}/code-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
+        f"{entry.path}/craft-review has no lenses.md next to SKILL.md; re-run `craftsman install --copilot`"
         for entry in copilot.skills
-        if entry.code_review_lenses is False
+        if entry.craft_review_lenses is False
     ]
     hooks = copilot.user_hooks
     if hooks.error is not None:
@@ -770,6 +807,36 @@ def _plugin_mismatch(repo_dir: Path, plugin_skills: tuple[str, ...]) -> list[str
     ]
 
 
+def git_config_get(key: str, home: Path) -> str | None:
+    """The global value of `key`, or None when it is not set."""
+    env = {**os.environ, "HOME": str(home)}
+    for name in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME"):
+        value = env_var_for_home(name, home)
+        if value:
+            env[name] = value
+        else:
+            env.pop(name, None)
+    try:
+        proc = subprocess.run(
+            ["git", "config", "--global", "--get", key],
+            env=env,
+            capture_output=True,
+            encoding="utf-8",  # git config files are UTF-8; the locale may not be
+            errors="replace",
+            timeout=GIT_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InstallError(f"cannot run git config --global --get {key}: {exc}") from exc
+    if proc.returncode == 1:  # git's exit code for a key that is not set
+        return None
+    if proc.returncode != 0:
+        raise InstallError(
+            f"git config --global --get {key} failed (exit {proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout.strip() or None
+
+
 def _git_config(home: Path) -> tuple[GitConfig, list[str]]:
     """The global git settings doctor shows; git that cannot read them is a problem to report."""
     try:
@@ -797,10 +864,12 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
     claude = _claude_report(default_claude_dir(home))
     problems = (
         *git_problems,
+        *inspect_stale_hooks_path(git.hooks_path, home),
         *_platform_problems(copilot, claude, default_claude_dir(home)),
-        *inspect_legacy_git_hooks(git.hooks_path, home),
         *inspect_legacy_distribution(),
         *inspect_agy_plugin_duplicate(home),
+        *inspect_leftover_review_skills(workspace, home),
+        *inspect_stale_prompts(workspace, home),
     )
     healthy = (
         skill_count == expected_skills

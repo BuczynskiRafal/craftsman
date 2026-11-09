@@ -1,0 +1,17 @@
+$ craftsman review waive-run --help
+[exit 0]
+--- stdout
+usage: craftsman review waive-run [-h] [--cwd CWD] --reason REASON ID
+
+Stop a failing run from blocking the gate when its command can never pass
+again, e.g. a mistyped or renamed test. The reason appears in the final
+report.
+
+positional arguments:
+  ID
+
+options:
+  -h, --help       show this help message and exit
+  --cwd CWD        Directory inside the repository (default: current)
+  --reason REASON  Why the command is obsolete
+--- stderr
