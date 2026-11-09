@@ -21,44 +21,6 @@ not effort, and a hook that fails is logged, never silent.
 It works with Claude Code, GitHub Copilot, and Google Antigravity. In Codex and Cursor, the same
 protocol runs without hooks.
 
-## Installation
-
-Requires Python 3.10+, with no external dependencies.
-
-```bash
-pipx install craftsman-gate        # or: uv tool install craftsman-gate
-craftsman install                  # detects Claude Code, Copilot, and Antigravity
-```
-
-Or as a plugin:
-
-```bash
-/plugin marketplace add BuczynskiRafal/craftsman              # Claude Code
-/plugin install craftsman@craftsman
-agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
-```
-
-## Usage
-
-Type a request in plain words. There are no flags to remember.
-
-```
-/craftsman add pagination to the catalog search
-/craftsman migrate the session store to Redis, this is critical
-/craft-review review my staged changes and fix what you find
-/craft-review review PR 42
-/craft-review be thorough, this touches authentication
-```
-
-The agent works out the target (working tree, staged changes, a branch, a PR), whether to fix what it
-finds, and how deep to go. It goes deep on its own for risky changes or when you ask for care
-("critical", "be thorough", `ultracraft`); the list of triggers is under **Depth** in the
-[`craft-review` skill](https://github.com/BuczynskiRafal/craftsman/blob/main/skills/craft-review/SKILL.md).
-Depth never goes down during a session. The final report explains what the agent decided and why. See
-[docs/usage.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md).
-
-`craftsman status` shows the current round, coverage, and missing evidence.
-
 ## How It Works
 
 ![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
@@ -110,6 +72,44 @@ recall on any agent platform.
 | Antigravity · Gemini 4 Argon `low` | 2/9 → 4/9 | 1.5 → 4.7 min |
 | Antigravity · Gemini 4 Argon `medium` | 2/9 → 5/9 | 2.0 → 6.7 min |
 | Antigravity · Gemini 4 Argon `high` | 3/9 → 7/9 | 15.6 → 26.3 min |
+
+## Installation
+
+Requires Python 3.10+, with no external dependencies.
+
+```bash
+pipx install craftsman-gate        # or: uv tool install craftsman-gate
+craftsman install                  # detects Claude Code, Copilot, and Antigravity
+```
+
+Or as a plugin:
+
+```bash
+/plugin marketplace add BuczynskiRafal/craftsman              # Claude Code
+/plugin install craftsman@craftsman
+agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
+```
+
+## Usage
+
+Type a request in plain words. There are no flags to remember.
+
+```
+/craftsman add pagination to the catalog search
+/craftsman migrate the session store to Redis, this is critical
+/craft-review review my staged changes and fix what you find
+/craft-review review PR 42
+/craft-review be thorough, this touches authentication
+```
+
+The agent works out the target (working tree, staged changes, a branch, a PR), whether to fix what it
+finds, and how deep to go. It goes deep on its own for risky changes or when you ask for care
+("critical", "be thorough", `ultracraft`); the list of triggers is under **Depth** in the
+[`craft-review` skill](https://github.com/BuczynskiRafal/craftsman/blob/main/skills/craft-review/SKILL.md).
+Depth never goes down during a session. The final report explains what the agent decided and why. See
+[docs/usage.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md).
+
+`craftsman status` shows the current round, coverage, and missing evidence.
 
 ## Documentation
 
