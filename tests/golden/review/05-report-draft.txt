@@ -1,0 +1,23 @@
+$ craftsman review report --review-only
+[exit 0]
+--- stdout
+# Craftsman review report
+**SELF-REVIEWED: no evidence that anyone other than the author reviewed this change**
+- Base `<BASE7>` · 1 review round(s) · 7 files, +16/−2 lines
+- Review: INCOMPLETE (1 open items) — uncovered; see `craftsman review check --review-only`
+
+## Not covered
+- Hunks: H1, H2, H3, H4, H5, H6, H7
+
+## Findings
+No findings recorded.
+
+## Verification at the final code
+No passing test or e2e run at the final code.
+
+## Not assessed by the gate
+- Business requirements fit and domain behavior not exercised by recorded runs.
+- Naming quality and domain clarity.
+- Architecture and invariants outside the changed files.
+- Reviewer isolation status: SELF-REVIEWED: no evidence that anyone other than the author reviewed this change.
+--- stderr

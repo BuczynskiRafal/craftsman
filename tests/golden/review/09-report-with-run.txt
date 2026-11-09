@@ -1,0 +1,30 @@
+$ craftsman review report --review-only
+[exit 0]
+--- stdout
+# Craftsman review report
+**SELF-REVIEWED: no evidence that anyone other than the author reviewed this change**
+- Base `<BASE7>` · 1 review round(s) · 7 files, +16/−2 lines
+- Review: COMPLETE (review-only)
+
+## Findings
+**Accepted (1)**
+- F3 · minor · `lib/util.py:5` — Small things. Accepted because: scale is used by a later change
+**Open (1)**
+- F1 · major · `app.py:8` — Empty cart divides by zero. Verdict: proven
+**Dismissed (2)**
+- F2 · major · `app.py:11` — Label crashes on None name. Dismissed: guarded by app.py:12, which only receives named items
+- F4 · nit · `extra.py:2` — Magic number. Dismissed: Grouped into F3 (lib/util.py:5): same root cause.
+
+## Verification at the final code
+- R2 `<PY> …` (test) → exit 0 in <SECONDS>s
+
+## Warnings
+- 1 finding for the author: F1.
+- Accepted without a fix: F3; tell the user about them.
+
+## Not assessed by the gate
+- Business requirements fit and domain behavior not exercised by recorded runs.
+- Naming quality and domain clarity.
+- Architecture and invariants outside the changed files.
+- Reviewer isolation status: SELF-REVIEWED: no evidence that anyone other than the author reviewed this change.
+--- stderr

@@ -1,0 +1,22 @@
+$ craftsman review prepare --deep
+[exit 0]
+--- stdout
+Round 2 raised to deep (same diff): 7 files, 7 hunks, 22 changed lines; 5 hunks carried, 2 to review.
+Packet: <REPO>/.git/craftsman/packet-2.md
+Depth: deep (requested with --deep)
+Advisory: no Craftsman hook saw this session, so the review will be SELF-REVIEWED (run `craftsman doctor`).
+Hunt plan, round 2:
+  W1-1   H3,H8  intent, contracts, failure, ripple, tests  10 lines  [not launched]
+  W1-2   H3,H8  craft, design (simplicity)                 10 lines  [not launched] [Claude Code: model haiku]
+  W1-3   H4-H8  sweep                                      19 lines  [not launched]
+  W1-4   H8     state, trust, platform, model              8 lines   [not launched]
+  W2-X1  H4-H8  intent, contracts, failure (fresh look)    19 lines  [not launched]
+This plan is a suggestion: an advisory review is complete when every hunk is covered.
+New slots since the last prepare: W1-4, W2-X1
+Launch all 5 hunters now, in one step. Each is a craftsman-reviewer subagent whose whole prompt is:
+  You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly.
+  Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer.
+  Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.
+Then end your turn while they run. When they report back, run `craftsman review check --review-only` and do exactly what it lists.
+Scope: 7 file(s), frozen for this review.
+--- stderr

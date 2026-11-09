@@ -99,7 +99,7 @@ def stop_roots_for(home: Path, *extra: Path) -> frozenset[Path]:
     the configured folders outside it, and the workspaces given on the command line."""
     abs_home = Path(os.path.abspath(home))
     roots = {abs_home, *(Path(os.path.abspath(item)) for item in extra)}
-    for env_key in ("XDG_CONFIG_HOME", "APPDATA", "CRAFTSMAN_HOME"):
+    for env_key in ("XDG_CONFIG_HOME", "APPDATA"):
         value = env_var_for_home(env_key, home)
         if value and not Path(os.path.abspath(value)).is_relative_to(abs_home):
             roots.add(Path(os.path.abspath(value)).parent)

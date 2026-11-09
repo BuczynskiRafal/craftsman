@@ -1,0 +1,5 @@
+$ craftsman review cover --hunks H1 --note H1 f_1.py:1: x=1 -> returns 2 on boundary input
+[exit 0]
+--- stdout
+Coverage recorded (C1): H1 in round 1; 6 hunk(s) left to cover in this round.
+--- stderr

@@ -1,7 +1,9 @@
 # Guardrails & Safety Architecture
 
-Craftsman protects repository integrity and enforces review honesty through three distinct runtime guards:
-the **Stop Gate**, the **Work-tree Mutation Guard**, and the **Repository Search Scope Guard**.
+Craftsman protects repository integrity and enforces review honesty through four runtime guards: the
+**Stop Gate** (with the review guard that serves `/craft-review`), the **Command Policy** (which also holds the
+**Work-tree Mutation Guard**), and the **Repository Search Scope Guard**. Whatever a hook survives goes to the
+**hook error log**, described at the end.
 
 ---
 
@@ -20,8 +22,10 @@ unverified, or failing tests:
 - **Forced continuation cap**: To prevent infinite loops caused by pathological agent behavior, the stop gate permits
   completion after six consecutive forced continuations if no decrease in open defects is detected, alerting the user
   that the gate was not satisfied.
-- **Fail-closed posture**: Malformed or unreadable gate states cause immediate warnings, while tool permission checks
-  fail closed to protect the repository.
+- **Fail-safe posture**: Malformed or unreadable gate states cause immediate warnings and an entry in the hook error
+  log. A `pre-tool` check that cannot decide asks the user to confirm the tool call (Copilot denies it), and the search
+  scope guard blocks a shell command it cannot parse. Every other hook lets the agent go on with a message that the
+  gate was not checked.
 
 ### Review stop guard
 
@@ -30,7 +34,9 @@ session that invoked it, and the Stop hook holds that session to the review-only
 `/craft-review` arms it; the host agent's built-in `/code-review` neither arms it nor opens a gate.
 
 - The guard judges the review with the same rules and the same isolation evidence as
-  `craftsman review check --review-only`. Hooks count as evidence when the marker names the session the command runs in
+  `craftsman review check --review-only`: in an enforced round every slot of the hunt plan must be done, every
+  finding judged by a verifier subagent. It stores the waves that are due before it judges (`store_due_waves`), so a
+  block already lists the next launch. Hooks count as evidence when the marker names the session the command runs in
   (Claude Code only; other platforms export no session id to commands) or when a reviewer or verifier event arrived
   after the current round was prepared. Events of an earlier session prove nothing about this one.
 - The guard ends when the user moves on to another request, not when the platform speaks for the session: a stop hook's
@@ -40,15 +46,47 @@ session that invoked it, and the Stop hook holds that session to the review-only
   only raised.
 - While a Craftsman reviewer or verifier that started in this review has not stopped (a background subagent), the guard
   lets the agent wait for it: its completion wakes the session, and no reminder is spent.
-- Otherwise a review with hunks uncovered, findings without a verdict, no reviewer run or hunks covered outside any
-  reviewer run is sent back, up to six times without progress. Coverage must come from a `craftsman-reviewer`, which
-  Claude Code attributes by the reviewer's own transcript within its run's time window, and other platforms (or an unclear transcript) by time alone; findings may come from anyone.
+- Otherwise a review with slots not done, hunks uncovered, findings without a verdict, no reviewer run or hunks covered
+  outside any reviewer run is sent back, up to six times (`MAX_CONTINUATIONS`) without progress. After that the agent
+  may stop, and the review is marked `REVIEW ABANDONED - NOT COMPLETE`: it is never reported as complete.
+- Coverage must come from a `craftsman-reviewer`, and a verdict from a `craftsman-verifier`. A run vouches for a record
+  by identity (the record names its caller: `antigravity:<conversation id>`), by transcript (the run's own transcript
+  printed the record's token, Claude Code) or, weakest and bounded, by the time window of the run. Findings may come
+  from anyone.
+
+---
+
+## Command Policy
+
+`craftsman/command_policy.py` is the one entry point that decides every PreToolUse call, whichever platform made it:
+the Claude Code and Copilot `craftsman hook pre-tool` hook and the Antigravity scope guard are adapters over it. It
+denies, in this order, for a shell command (a file-writing tool is checked against the same protected places):
+
+- **Hook entry points.** `craftsman hook ...` in every spelling, `python -m craftsman.hooks`, the guard scripts, and
+  inline Python programs that import `craftsman` are run by the platform, never by an agent. What a `python` command
+  line runs is decided by `shell.python_program`; the words of an `env -S "<command line>"` string are read as the command
+  they start (`shell.read_env_option`: every spelling of the options that take a value, `-C`'s directory included), so no wrapper hides a command from any rule below.
+- **The evidence.** Writes into `<git-dir>/craftsman/` (the ledger, the gate state, the hook error log; `inbox/` and
+  `scratch/` stay open) and into the transcript folders of the platforms, by any write verb, redirection, inline
+  program or file-writing tool (the Claude Code matcher covers `Write|Edit|MultiEdit|NotebookEdit`). Reading stays
+  allowed.
+- **Identity.** `CLAUDE_CODE_SESSION_ID`, `CRAFTSMAN_*` and the other identity variables cannot be set or unset for a
+  craftsman command; a made-up `craftsman gate --session-id` is denied; the gate's owner cannot `--takeover` its own
+  gate. The main session records only as `lead`.
+- **Roles.** Hunters and verifiers do not re-plan (`review prepare`, `reset`), and the main session does not fetch a
+  hunter's brief or record a slot-tagged finding or coverage.
+- **The work tree** (below).
+
+These guards stop low-effort shortcuts; they are not a sandbox. A script file written first and run later, a program
+name or path built by command substitution, and an interpreter that assembles the path at run time pass a shell parser
+unseen.
 
 ---
 
 ## Work-tree Mutation Guard
 
-Implemented in `craftsman/worktree_guard.py` and invoked via `craftsman hook pre-tool`:
+Implemented in `craftsman/worktree_guard.py`, called by the command policy:
+
 
 - **Reviewer protection**: During an active review round, `craftsman-reviewer` and `craftsman-verifier` subagents
   are denied access to commands that modify the work tree or index:
@@ -57,7 +95,7 @@ Implemented in `craftsman/worktree_guard.py` and invoked via `craftsman hook pre
   - Subagent git mutations: `commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `am`, `apply`, `pull`, `rm`, `mv`
 - **User confirmation in main sessions**: If the main agent session attempts a worktree-mutating git command while
   a review-only round is open, the hook prompts the user for confirmation (`ask`).
-- **Platform enforcement**: Intercepted in real time on Claude Code, GitHub Copilot in VS Code, and GitHub Copilot CLI.
+- **Platform enforcement**: Intercepted in real time on Claude Code, GitHub Copilot in VS Code, GitHub Copilot CLI, and Antigravity (through the scope guard script).
 
 ---
 
@@ -94,3 +132,15 @@ git config --add craftsman.scopeAllow ../shared-schemas
 git config craftsman.scope warn
 git config craftsman.scope off
 ```
+
+---
+
+## Hook Error Log
+
+A hook never crashes the session it serves, so every failure it survives would otherwise vanish: a crash, an
+unreadable transcript, a git call that ran out of the hook's time budget, a ledger it could not load or had to set
+aside, a transcript without provenance. Each one is appended as a JSON line to `<git-dir>/craftsman/hook-errors.log`
+(`craftsman/hook_errors.py`; the last 512 KB are kept). `craftsman review check`, `review report`, `gate --complete` and
+`status` print `Hook errors since round N was prepared: K (see <path>)` when the log holds entries newer than the latest
+round. The git calls of one hook share the budget of its event (its timeout less a margin, `craftsman/hook_budget.py`),
+so a slow repository ends in a logged timeout and an answer instead of a killed hook.

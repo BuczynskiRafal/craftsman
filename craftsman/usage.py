@@ -3,15 +3,15 @@
 `read_transcript` makes one pass over a subagent's JSONL transcript: it sums the token usage
 (Claude Code writes one assistant entry per content block, all repeating the usage of their message,
 so each message counts once) and lists the record tokens (`C3`, `F2`) that the agent's successful
-`craftsman review cover` and `review add` calls printed, which is how the gate knows what a
-reviewer recorded. `read_usage` is its usage half. `role_totals` adds up what the ledger recorded
+`craftsman review cover` and `review add` calls printed, plus the `B` token of a `review brief` and the `V`
+token of a `review verdict` or `merge`, which is how the gate knows what a hunter or a verifier recorded. `read_usage` is its usage half. `role_totals` adds up what the ledger recorded
 per role for `review report` and `craftsman status`. None of them ever raises: telemetry must not
 fail a hook or a report.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -19,19 +19,33 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from craftsman.command_policy import BRIEF_OPTIONS, has_option, invocations
+from craftsman.jsonl import MAX_TRANSCRIPT_BYTES, JsonlReader, StopReason
 from craftsman.records import AgentRole, AgentUsage, Ledger, agent_role, parse_timestamp
+from craftsman.shell import SimpleCommand, is_env_assignment, iter_simple_commands
 
-MAX_TRANSCRIPT_BYTES = 256 * 1024 * 1024
 # A longer pause between two transcript entries is the agent being idle (a resumed agent waits for
 # its parent between runs), not working.
 IDLE_GAP_S = 300.0
 ROLE_LABELS: Mapping[AgentRole, str] = {"reviewer": "hunters", "verifier": "verifiers"}
-# What a successful recording call prints; see `review._record_coverage` and `review._add_one`.
+# What a successful recording call prints; see `review_records` (`record_coverage`, `_add_one`, `print_verdict`:
+# `F3 verdict recorded (V7)`, also printed by `merge`) and `review._brief` (`Brief issued (B1)`).
 _COVERAGE_TOKEN_RE = re.compile(r"Coverage recorded \((C\d+)\)")
 _FINDING_TOKEN_RE = re.compile(r"\b(F\d+) recorded \(")
-# A `craftsman review cover|add` invocation, however it is spelled: `craftsman`, `craftsman.exe`,
-# `python3 -m craftsman.cli`, `scripts/craftsman-cli.py`, with any spacing.
-_RECORDING_CALL_RE = re.compile(r"craftsman\S*\s+review\s+(?:cover|add)\b")
+_CLAIM_TOKEN_RE = re.compile(r"Brief issued \((B\d+)\)")
+_VERDICT_TOKEN_RE = re.compile(r"verdict recorded \((V\d+)\)")
+_TOKEN_RES = (_COVERAGE_TOKEN_RE, _FINDING_TOKEN_RE, _CLAIM_TOKEN_RE, _VERDICT_TOKEN_RE)
+# The `craftsman review` subcommands whose output is the proof of a record.
+_RECORDING_SUBCOMMANDS = frozenset({"cover", "add", "brief", "verdict", "merge"})
+# Commands that print nothing a transcript reader could take for a record: they may share a command line with a
+# recording call (`cd repo && craftsman review cover ...`), and so may `tail` / `head` / `cat` filtering its output
+# through a pipe (`_filters_a_pipe`).
+_SILENT_COMMANDS = frozenset({"cd", "pushd", "popd", "export", "set", "unset", "true", "false", ":", "test", "[", "exit"})
+_ECHOES = frozenset({"echo", "printf"})
+_ECHO_SPECIAL_CHARS = frozenset("\\$`{}*?[")
+_STDIN_FILTERS = frozenset({"tail", "head", "cat"})
+# Shells that only run the commands inside them, which are read on their own.
+_SHELL_RUNNERS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "eval"})
 # Output of a recording call that recorded nothing, which is not a failure to read it.
 _NOTHING_RECORDED = ("Nothing to record", "Check passed")
 _TOKEN_KEYS = (
@@ -75,15 +89,20 @@ class RoleUsage:
 class TranscriptFacts:
     """What one transcript tells: the agent's usage and the records it made.
 
-    `records` is None when the transcript cannot vouch for them: it was unreadable, oversized, had
-    a line that is not JSON, a recording call whose outcome is unclear (no result, or output
-    that shows neither a token nor that nothing was recorded, e.g. because it was piped away), or a
-    token anywhere in the text that no recognized recording call printed (a call shape this reader
-    does not know), so it fails safe to the time window instead of proving the agent recorded nothing.
+    `records` is None when the transcript cannot vouch for them: it was unreadable, oversized, had a line that
+    is not JSON, or a recording call whose outcome is unclear (no result, or output that shows neither a token
+    nor that nothing was recorded, e.g. because it was piped away), so it fails safe to the time window instead
+    of proving the agent recorded nothing. Only the tokens that a recognized recording call printed count: text
+    the agent merely read (a document that quotes `Coverage recorded (C1)`) is not its record, and a recording
+    made through a wrapper this reader does not know is not vouched.
+
+    `problem` says why a transcript could not be read (it was unreadable, oversized or had a line that is not
+    JSON); the hooks log it. A fail-safe `records` of None for an unclear call is not a problem.
     """
 
     usage: AgentUsage | None = None
     records: tuple[str, ...] | None = None
+    problem: str | None = None
 
 
 def read_usage(path: Path) -> AgentUsage | None:
@@ -98,55 +117,58 @@ def read_transcript(path: Path) -> TranscriptFacts:
     """
     try:
         return _read_transcript(path)
-    except Exception:  # noqa: BLE001 - best effort: any unreadable transcript just has no telemetry
-        return TranscriptFacts()
+    except Exception as exc:  # noqa: BLE001 - best effort: any unreadable transcript just has no telemetry
+        return TranscriptFacts(problem=f"cannot read the transcript {path}: {type(exc).__name__}: {exc}")
 
 
 def _read_transcript(path: Path) -> TranscriptFacts:
-    if path.stat().st_size > MAX_TRANSCRIPT_BYTES:
-        return TranscriptFacts()
     by_message: dict[str, dict[str, int]] = {}
     anonymous: list[dict[str, int]] = []
     previous: datetime | None = None
     active_s = 0.0
-    calls: set[str] = set()  # recording calls still waiting for their result
+    calls: dict[str, bool] = {}  # recording calls still waiting for their result: may it print no token?
     tokens: list[str] = []
-    mentioned: set[str] = set()  # every token the raw text shows, from any kind of entry
     vouched = True
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            mentioned.update(_COVERAGE_TOKEN_RE.findall(line))
-            mentioned.update(_FINDING_TOKEN_RE.findall(line))
-            entry = _entry(line)
-            if entry is None:
-                vouched = vouched and not line.strip()
-                continue
-            stamp = _moment(entry.get("timestamp"))
-            if stamp is not None:
-                if previous is not None:
-                    gap = (stamp - previous).total_seconds()
-                    active_s += gap if 0 < gap <= IDLE_GAP_S else 0.0
-                previous = stamp if previous is None or stamp > previous else previous
-            message = entry.get("message")
-            if not isinstance(message, dict):
-                continue
-            vouched = _follow_recording_calls(message.get("content"), calls, tokens) and vouched
-            usage = message.get("usage")
-            if entry.get("type") != "assistant" or not isinstance(usage, dict):
-                continue
-            counts = {name: _count(usage.get(key)) for key, name in _TOKEN_KEYS}
-            message_id = message.get("id")
-            if isinstance(message_id, str) and message_id:
-                seen = by_message.setdefault(message_id, dict.fromkeys(counts, 0))
-                for name, value in counts.items():
-                    seen[name] = max(seen[name], value)
-            else:
-                anonymous.append(counts)
-    vouched = vouched and not calls and mentioned.issubset(tokens)
+    bad_line = False
+    reader = JsonlReader(path, errors="replace", max_bytes=MAX_TRANSCRIPT_BYTES)
+    for line in reader:
+        if line.blank:
+            continue
+        entry = line.value if isinstance(line.value, dict) else None
+        if entry is None:
+            vouched = False
+            bad_line = True
+            continue
+        stamp = _moment(entry.get("timestamp"))
+        if stamp is not None:
+            if previous is not None:
+                gap = (stamp - previous).total_seconds()
+                active_s += gap if 0 < gap <= IDLE_GAP_S else 0.0
+            previous = stamp if previous is None or stamp > previous else previous
+        vouched = _follow_copilot_event(entry, calls, tokens) and vouched
+        message = entry.get("message")
+        if not isinstance(message, dict):
+            continue
+        vouched = _follow_recording_calls(message.get("content"), calls, tokens) and vouched
+        usage = message.get("usage")
+        if entry.get("type") != "assistant" or not isinstance(usage, dict):
+            continue
+        counts = {name: _count(usage.get(key)) for key, name in _TOKEN_KEYS}
+        message_id = message.get("id")
+        if isinstance(message_id, str) and message_id:
+            seen = by_message.setdefault(message_id, dict.fromkeys(counts, 0))
+            for name, value in counts.items():
+                seen[name] = max(seen[name], value)
+        else:
+            anonymous.append(counts)
+    if reader.stopped is StopReason.TOO_LARGE:
+        return TranscriptFacts(problem=f"the transcript {path} is larger than {MAX_TRANSCRIPT_BYTES // (1024 * 1024)} MB; not read")
+    vouched = vouched and not calls
     records = tuple(dict.fromkeys(tokens)) if vouched else None
+    problem = f"the transcript {path} has a line that is not JSON" if bad_line else None
     messages = [*by_message.values(), *anonymous]
     if not messages:
-        return TranscriptFacts(None, records)
+        return TranscriptFacts(None, records, problem)
     totals = {name: sum(message[name] for message in messages) for _, name in _TOKEN_KEYS}
     usage_total = AgentUsage(
         input_tokens=totals["input_tokens"],
@@ -155,11 +177,11 @@ def _read_transcript(path: Path) -> TranscriptFacts:
         cache_write_tokens=totals["cache_write_tokens"],
         duration_s=active_s,
     )
-    return TranscriptFacts(usage_total, records)
+    return TranscriptFacts(usage_total, records, problem)
 
 
-def _follow_recording_calls(content: Any, calls: set[str], tokens: list[str]) -> bool:
-    """Track the `review cover` / `review add` calls in a message's content blocks.
+def _follow_recording_calls(content: Any, calls: dict[str, bool], tokens: list[str]) -> bool:
+    """Track the recording calls (`review cover|add|brief|verdict|merge`) in a Claude message's content blocks.
 
     A call joins `calls` until its result arrives; the tokens of a successful one join `tokens`.
     False when a call cannot be paired or its output cannot be read.
@@ -170,27 +192,134 @@ def _follow_recording_calls(content: Any, calls: set[str], tokens: list[str]) ->
     for block in content:
         if not isinstance(block, dict):
             continue
-        if block.get("type") == "tool_use" and _is_recording_call(block.get("input")):
-            call_id = block.get("id")
-            if isinstance(call_id, str) and call_id:
-                calls.add(call_id)
-            else:
-                clear = False
+        if block.get("type") == "tool_use":
+            clear = _start_call(block.get("id"), block.get("input"), calls) and clear
         elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
-            calls.discard(block["tool_use_id"])
-            output = _result_text(block.get("content"))
-            # A token is printed only after the record is written, so it counts even when a later
-            # part of the command failed (`craftsman review cover ... && false`).
-            found = _COVERAGE_TOKEN_RE.findall(output) + _FINDING_TOKEN_RE.findall(output)
-            tokens.extend(found)
-            if block.get("is_error") is not True:
-                clear = clear and (bool(found) or any(mark in output for mark in _NOTHING_RECORDED))
+            clear = _finish_call(
+                block["tool_use_id"], _result_text(block.get("content")), block.get("is_error") is True, calls, tokens
+            ) and clear
     return clear
 
 
-def _is_recording_call(tool_input: Any) -> bool:
+def _follow_copilot_event(entry: dict[str, Any], calls: dict[str, bool], tokens: list[str]) -> bool:
+    """The same tracking for the events of a Copilot CLI session log: `tool.execution_start` (the call's
+    `arguments`) and `tool.execution_complete` (its `result`), paired by `toolCallId`."""
+    data = entry.get("data")
+    if not isinstance(data, dict):
+        return True
+    call_id = data.get("toolCallId")
+    if entry.get("type") == "tool.execution_start":
+        return _start_call(call_id, data.get("arguments"), calls)
+    if entry.get("type") == "tool.execution_complete" and call_id in calls:
+        result = data.get("result")
+        text = result if isinstance(result, str) else _result_text(result.get("content")) if isinstance(result, dict) else ""
+        return _finish_call(str(call_id), text, data.get("success") is False, calls, tokens)
+    return True
+
+
+def _start_call(call_id: Any, tool_input: Any, calls: dict[str, bool]) -> bool:
+    """Register a tool call that is a recording call; False when it has no id to pair its result with, or when its
+    command line holds a command whose output could pass for a record."""
+    recording = _recording_call(tool_input)
+    if recording is None:
+        return True
+    if recording.foreign_output:
+        return False
+    if isinstance(call_id, str) and call_id:
+        calls[call_id] = recording.prints_no_token
+        return True
+    return False
+
+
+def _finish_call(call_id: str, output: str, is_error: bool, calls: dict[str, bool], tokens: list[str]) -> bool:
+    """Settle a recording call with its result; False when a successful call's output shows neither a token nor
+    that nothing was recorded."""
+    tokenless = calls.pop(call_id)
+    # A token is printed only after the record is written, so it counts even when a later
+    # part of the command failed (`craftsman review cover ... && false`).
+    found = [token for pattern in _TOKEN_RES for token in pattern.findall(output)]
+    tokens.extend(found)
+    return is_error or bool(found) or tokenless or any(mark in output for mark in _NOTHING_RECORDED)
+
+
+@dataclass(frozen=True)
+class _RecordingCall:
+    """A shell command line that runs `craftsman review cover|add|brief|verdict|merge`.
+
+    `prints_no_token` is true when every such command is a `brief --verifier` (it records nothing); `foreign_output`
+    when the line holds another command whose output could carry a token the recording call did not print.
+    """
+
+    prints_no_token: bool
+    foreign_output: bool
+
+
+def _recording_call(tool_input: Any) -> _RecordingCall | None:
+    """Read a tool call's command line with the parser of the PreToolUse rules: None unless it really runs a
+    recording command, so text that merely names one (`grep -rn "craftsman review cover" docs/`) is no call."""
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
-    return isinstance(command, str) and _RECORDING_CALL_RE.search(command) is not None
+    if not isinstance(command, str):
+        return None
+    commands = iter_simple_commands(command)
+    recording = [
+        call
+        for call in invocations(commands)
+        if call.kind == "cli" and len(call.args) >= 2 and call.args[0] == "review" and call.args[1] in _RECORDING_SUBCOMMANDS
+    ]
+    if not recording:
+        return None
+    mine = {id(call.command) for call in recording}
+    verifier_briefs = [
+        call for call in recording if call.args[1] == "brief" and has_option(call.args[2:], "--verifier", BRIEF_OPTIONS)
+    ]
+    return _RecordingCall(
+        prints_no_token=len(verifier_briefs) == len(recording),
+        foreign_output=any(id(item) not in mine and _prints_text(item) for item in commands),
+    )
+
+
+def _prints_text(item: SimpleCommand) -> bool:
+    """Whether a simple command that is no recording call may print text of its own."""
+    if not item.tokens:
+        return False  # only variable assignments
+    name = os.path.basename(item.tokens[0]).lower()
+    if name in _SILENT_COMMANDS or name in _SHELL_RUNNERS:
+        return False  # a shell runner's inner commands are listed (and judged) on their own
+    if name in _ECHOES:
+        return not _echoes_plain_words(name, item.tokens[1:])
+    if name in _STDIN_FILTERS:
+        return not _filters_a_pipe(item)
+    return True
+
+
+def _filters_a_pipe(item: SimpleCommand) -> bool:
+    """Whether a `tail` / `head` / `cat` only passes on what the command before it printed (`... | tail -3`).
+
+    Any other input is text the agent chose: a file word, a `<`, `<<`, `<<<`, `<&` or `N<` redirection (a quoted
+    `<` counts too, which only errs towards foreign), a heredoc, or the agent's own stdin (`... && cat`, no pipe).
+    A wrapper that is more than a variable assignment (`xargs cat` prints the files its stdin names) is no filter.
+    """
+    return (
+        item.piped
+        and "<" not in item.segment
+        and all(is_env_assignment(word) for word in item.prefix)
+        and all(word.startswith("-") or word.isdigit() for word in item.tokens[1:])
+    )
+
+
+def _echoes_plain_words(name: str, words: list[str]) -> bool:
+    """Whether an `echo` / `printf` provably prints just the words it is given (`echo ok`), which cannot pass for a record.
+
+    That holds for an `echo` with no option (`-n` would join its output with the next command's, `-e` reads
+    escapes), no character the shell or `echo` expands (`\\`, `$`, a backtick, braces, a glob) and words that,
+    joined, do not read as a record. `printf` never qualifies: a format, an escape (`\\x28`) or its lack of a
+    newline lets two harmless arguments or commands make up the phrase.
+    """
+    if name != "echo":
+        return False
+    if any(word.startswith("-") or any(char in word for char in _ECHO_SPECIAL_CHARS) for word in words):
+        return False
+    return not any(pattern.search(" ".join(words)) for pattern in _TOKEN_RES)
 
 
 def _result_text(content: Any) -> str:
@@ -201,16 +330,6 @@ def _result_text(content: Any) -> str:
             str(item.get("text") or "") for item in content if isinstance(item, dict) and item.get("type") == "text"
         )
     return ""
-
-
-def _entry(line: str) -> dict[str, Any] | None:
-    if not line.strip():
-        return None
-    try:
-        entry = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    return entry if isinstance(entry, dict) else None
 
 
 def _count(value: Any) -> int:

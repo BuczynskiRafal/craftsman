@@ -1,0 +1,5 @@
+$ craftsman review cover --hunks H1 --note too short
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --note must have at least 20 characters (got 9)

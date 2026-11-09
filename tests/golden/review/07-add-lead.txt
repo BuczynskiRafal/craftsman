@@ -1,0 +1,6 @@
+$ craftsman review add --file app.py --line 11 --lens contracts --severity major --title Label crashes on None name --scenario label({}) raises KeyError --hunter lead
+[exit 0]
+--- stdout
+F2 recorded (major, contracts, app.py:11)
+  L11: return item["name"].strip().title()
+--- stderr

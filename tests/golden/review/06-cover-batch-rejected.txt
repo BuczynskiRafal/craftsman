@@ -1,0 +1,11 @@
+$ craftsman review cover --from-json -
+[exit 1]
+--- stdout
+--- stderr
+craftsman review cover: 2 of 3 entries rejected; nothing was recorded.
+Fix all of them, then send the corrected list once:
+  entry 2: hunks: must name at least one hunk id or range
+  entry 2: note: must have at least 20 characters (got 1)
+  entry 3: hunks: is missing; pass 'hunks' or 'files'
+  entry 3: note: is missing
+  entry 3: nope: is not a known field

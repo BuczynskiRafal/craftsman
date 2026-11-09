@@ -225,4 +225,7 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Not a program: the command policy reads one CLI (`craftsman export ...`), and a module run around it would
+    # skip the rules. Failing loud keeps a script that still runs the module from believing it did the work.
+    sys.stderr.write("craftsman.export is not a program: run `craftsman export ...` instead\n")
+    raise SystemExit(2)

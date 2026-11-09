@@ -1,0 +1,5 @@
+$ craftsman review cover --from-json -
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --from-json list must not be empty

@@ -1,0 +1,5 @@
+$ craftsman review resolve F3 --as accepted --note scale is used by a later change
+[exit 0]
+--- stdout
+F3 resolved as accepted
+--- stderr

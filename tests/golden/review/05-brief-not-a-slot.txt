@@ -1,0 +1,5 @@
+$ craftsman review brief nonsense
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: slot 'nonsense' is not a slot id (like W1-1)

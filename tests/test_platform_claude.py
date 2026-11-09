@@ -320,7 +320,7 @@ class ClaudeSettingsMergeTests(ClaudeTestCase):
 
         merge_claude_hooks(path, PREFIX)
 
-        self.assertEqual(self.settings()["hooks"]["PreToolUse"][0]["matcher"], "Bash|Read|Grep|Glob|LS")
+        self.assertEqual(self.settings()["hooks"]["PreToolUse"][0]["matcher"], "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit")
 
     def test_first_change_keeps_a_backup_of_the_original(self) -> None:
         path = self.write_settings({"model": "opus"})

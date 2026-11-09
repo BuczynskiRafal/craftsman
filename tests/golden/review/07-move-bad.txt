@@ -1,0 +1,5 @@
+$ craftsman review move F9 --line 1
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: unknown finding 'F9'; known findings: F1, F2, F3, F4

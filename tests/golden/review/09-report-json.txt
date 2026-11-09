@@ -1,0 +1,162 @@
+$ craftsman review report --review-only --json
+[exit 0]
+--- stdout
+{
+  "passed": true,
+  "partial": false,
+  "self_reviewed": true,
+  "enforced": false,
+  "platform": "cli",
+  "abandoned": false,
+  "slots": [],
+  "issues": [],
+  "warnings": [
+    "1 finding for the author: F1.",
+    "Accepted without a fix: F3; tell the user about them."
+  ],
+  "summary": "Round 1 (current): 7 hunks in 7 files, +16/-2 lines.\nCoverage: 7/7 hunks; 0 hunk(s) carried from earlier rounds.\nFindings: 4 total; 0 awaiting verdict, 1 unresolved, 0 fixed, 1 accepted (F3), 2 dismissed.\nRuns: 1 recorded; latest: R1 repro `<PY> …` exit 0 (current).",
+  "deep": false,
+  "rounds": 1,
+  "base_sha": "<BASE40>",
+  "diff": {
+    "files": 7,
+    "added": 16,
+    "deleted": 2
+  },
+  "not_covered": [],
+  "findings": {
+    "fixed": [],
+    "accepted": [
+      {
+        "id": "F3",
+        "round": 1,
+        "lens": "ripple",
+        "path": "lib/util.py",
+        "line": 5,
+        "severity": "minor",
+        "title": "Small things",
+        "scenario": "scale() is new and nothing calls it; [F4/craft] 2 is a magic number in double()",
+        "suggestion": "add a test",
+        "fingerprint": "<SHA>84fd2ea10c9c4d52f4df5ae2",
+        "verdict": "probable",
+        "verdict_evidence": "static: lib/util.py:5 scale has no caller and no test anywhere",
+        "verdict_run": null,
+        "resolution": "accepted",
+        "resolution_note": "scale is used by a later change",
+        "recorded_at": "<TIME>",
+        "updated_at": "<TIME>",
+        "hunter": null,
+        "by": null,
+        "verdict_log": [
+          {
+            "token": "V4",
+            "verdict": "probable",
+            "at": "<TIME>",
+            "by": null
+          }
+        ],
+        "merged_into": null
+      }
+    ],
+    "open": [
+      {
+        "id": "F1",
+        "round": 1,
+        "lens": "contracts",
+        "path": "app.py",
+        "line": 8,
+        "severity": "major",
+        "title": "Empty cart divides by zero",
+        "scenario": "total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError",
+        "suggestion": "",
+        "fingerprint": "<SHA>84fd2ea10c9c4d52f4df5ae2",
+        "verdict": "proven",
+        "verdict_evidence": "ran total([]) and got ZeroDivisionError",
+        "verdict_run": "R1",
+        "resolution": null,
+        "resolution_note": "",
+        "recorded_at": "<TIME>",
+        "updated_at": "<TIME>",
+        "hunter": null,
+        "by": null,
+        "verdict_log": [
+          {
+            "token": "V2",
+            "verdict": "proven",
+            "at": "<TIME>",
+            "by": null
+          }
+        ],
+        "merged_into": null
+      }
+    ],
+    "question": [],
+    "dismissed": [
+      {
+        "id": "F2",
+        "round": 1,
+        "lens": "contracts",
+        "path": "app.py",
+        "line": 11,
+        "severity": "major",
+        "title": "Label crashes on None name",
+        "scenario": "label({}) raises KeyError",
+        "suggestion": "",
+        "fingerprint": "<SHA>84fd2ea10c9c4d52f4df5ae2",
+        "verdict": "dismissed",
+        "verdict_evidence": "guarded by app.py:12, which only receives named items",
+        "verdict_run": null,
+        "resolution": null,
+        "resolution_note": "",
+        "recorded_at": "<TIME>",
+        "updated_at": "<TIME>",
+        "hunter": "lead",
+        "by": null,
+        "verdict_log": [
+          {
+            "token": "V3",
+            "verdict": "dismissed",
+            "at": "<TIME>",
+            "by": null
+          }
+        ],
+        "merged_into": null
+      },
+      {
+        "id": "F4",
+        "round": 1,
+        "lens": "craft",
+        "path": "extra.py",
+        "line": 2,
+        "severity": "nit",
+        "title": "Magic number",
+        "scenario": "2 is a magic number in double()",
+        "suggestion": "",
+        "fingerprint": "<SHA>84fd2ea10c9c4d52f4df5ae2",
+        "verdict": "dismissed",
+        "verdict_evidence": "Grouped into F3 (lib/util.py:5): same root cause.",
+        "verdict_run": null,
+        "resolution": null,
+        "resolution_note": "",
+        "recorded_at": "<TIME>",
+        "updated_at": "<TIME>",
+        "hunter": null,
+        "by": null,
+        "verdict_log": [
+          {
+            "token": "V1",
+            "verdict": "dismissed",
+            "at": "<TIME>",
+            "by": null,
+            "merge": true
+          }
+        ],
+        "merged_into": "F3"
+      }
+    ]
+  },
+  "runs": [],
+  "waived_runs": [],
+  "agent_usage": {}
+}
+--- stderr

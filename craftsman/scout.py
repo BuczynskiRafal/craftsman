@@ -14,9 +14,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from craftsman.diffscan import (
-    DiffScanError,
-    Hunk,
+from craftsman.diffscan import DiffScanError, Hunk
+from craftsman.packet import fence_language, fenced, inside_hunk, omission_marker
+from craftsman.records import FieldError
+from craftsman.worktree_index import (
     Reference,
     Scope,
     WorktreeIndex,
@@ -26,8 +27,6 @@ from craftsman.diffscan import (
     text_scope_at,
     text_scope_named,
 )
-from craftsman.packet import fence_language, fenced, inside_hunk, omission_marker
-from craftsman.records import FieldError
 
 MAX_SCOUT_CHARS = 12_000
 MAX_CALLERS_PER_SYMBOL = 3

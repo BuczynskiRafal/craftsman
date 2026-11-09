@@ -13,7 +13,7 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 
 from craftsman import records
-from craftsman.text import ONE_LINE_WARNING, inline_md, one_line
+from craftsman.text import ONE_LINE_WARNING, defang_tokens, inline_md, one_line
 
 from tests.support import EvidenceRepo
 
@@ -311,6 +311,8 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Run.output_tail",
         "Run.fingerprint_after",
         "Run.waiver",
+        "Run.tests_ran",
+        "Run.min_tests",
         # AgentEvent
         "AgentEvent.platform",
         "AgentEvent.event",
@@ -319,6 +321,8 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "AgentEvent.at",
         "AgentEvent.usage",
         "AgentEvent.records",
+        "AgentEvent.answered",
+        "AgentEvent.last_step",
         # AgentUsage
         "AgentUsage.input_tokens",
         "AgentUsage.output_tokens",
@@ -331,6 +335,45 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Ledger.findings",
         "Ledger.runs",
         "Ledger.agents",
+        # Schema 4: the hunt plan, slot claims and verdict events (ids, enums, timestamps and caller
+        # identities; `Round.task` is the request text as given, not agent prose).
+        "Coverage.hunter",
+        "Coverage.by",
+        "Finding.hunter",
+        "Finding.by",
+        "Finding.verdict_log",
+        "Finding.merged_into",
+        "HuntPlan.reasons",
+        "HuntPlan.slots",
+        "HuntPlan.waves",
+        "Wave.generation",
+        "Wave.planned_at",
+        "Wave.considered",
+        "Wave.slots",
+        "Slot.id",
+        "Slot.generation",
+        "Slot.kind",
+        "Slot.hunks",
+        "Slot.lenses",
+        "Slot.changed_lines",
+        "Slot.trigger",
+        "Slot.since",
+        "Round.plan",
+        "Round.platform",
+        "Round.enforced",
+        "Round.task",
+        "Round.last_prepared_at",
+        "VerdictEvent.token",
+        "VerdictEvent.verdict",
+        "VerdictEvent.at",
+        "VerdictEvent.by",
+        "VerdictEvent.merge",
+        "SlotClaim.round",
+        "SlotClaim.slot",
+        "SlotClaim.token",
+        "SlotClaim.at",
+        "SlotClaim.by",
+        "Ledger.claims",
     }
 )
 
@@ -341,6 +384,34 @@ def _record_classes() -> list[type]:
         for _, cls in inspect.getmembers(records, inspect.isclass)
         if is_dataclass(cls) and cls.__module__ == records.__name__
     ]
+
+
+class TestDefangTokens(unittest.TestCase):
+    def test_every_shape_a_recording_command_prints_is_rewritten(self) -> None:
+        for text, expected in (
+            ("F9 recorded (major)", "F9 recorded [major]"),
+            ("Coverage recorded (C9) for W1-1", "Coverage recorded [C9] for W1-1"),
+            ("Brief issued (B2) for W1-1", "Brief issued [B2] for W1-1"),
+            ("F3 verdict recorded (V7): proven", "F3 verdict recorded [V7]: proven"),
+            ("recorded   (C1)", "recorded   [C1]"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(defang_tokens(text), expected)
+
+    def test_an_unclosed_or_nested_shape_loses_its_opening_parenthesis_too(self) -> None:
+        for text in ("see Coverage recorded (C1", "F1 recorded (a (b) c)", "recorded ((x)"):
+            with self.subTest(text=text):
+                self.assertNotRegex(defang_tokens(text), r"(recorded|issued)\s*\(")
+
+    def test_line_breaks_stay_and_a_break_inside_a_shape_cannot_rejoin_it(self) -> None:
+        self.assertEqual(defang_tokens("one\nF9 recorded (major)\ntwo"), "one\nF9 recorded [major]\ntwo")
+        flattened = one_line(defang_tokens("F9 recorded\n(major)"), warn=False)
+        self.assertNotRegex(flattened, r"recorded\s*\(")
+
+    def test_text_without_a_shape_is_returned_as_it_is(self) -> None:
+        for text in ("", "unrecorded (x)", "recorded", "call issue(1) and record(2)", "a (recorded) b"):
+            with self.subTest(text=text):
+                self.assertEqual(defang_tokens(text), text)
 
 
 class TestRecordFieldsClassification(unittest.TestCase):

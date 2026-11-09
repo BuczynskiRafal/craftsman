@@ -11,46 +11,64 @@ import tempfile
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager, redirect_stderr
+from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from craftsman import ledger as ledger_module
 from craftsman.ledger import (
+    add_claim,
     add_coverage,
+    add_finding,
+    backups_of,
     covered_digests,
     ledger_path_for,
     load,
     locked,
     merge_findings,
     mutate,
+    next_claim_token,
+    next_verdict_token,
+    open_round,
     plan_coverage,
     reopened_mentions,
     resolve,
+    round_unchanged,
     save,
     set_verdict,
     stable_hunk_ids,
     uncovered_hunks,
+    verdict_since,
     waive_run,
 )
 from craftsman.records import (
+    GROUPED_EVIDENCE_PREFIX,
     LEDGER_FILENAME,
     BatchRejected,
     EntryProblem,
     FieldError,
     Ledger,
     LedgerError,
+    NewerSchemaError,
+    OlderSchemaError,
     QualitySignal,
     SignalKind,
+    VerdictEvent,
 )
 
 from tests.support import (
+    FINDING,
     EvidenceRepo,
+    at,
     cover_open_hunks,
     coverage_note,
     fully_reviewed,
     make_hunk,
+    make_slot,
     make_snap,
+    planned,
     prepared,
     record_finding,
     record_run,
@@ -251,6 +269,44 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
             add_coverage(ledger, ["H1"], coverage_note(["H1"]))
         self.assertEqual(plan_coverage(ledger.rounds[-1], ["f1.py"], target_kind="files"), ((), ("H1",)))
+
+
+class SlotCoverageTests(unittest.TestCase):
+    """Coverage tagged with a slot of the stored plan may name the carried hunks the slot lists."""
+
+    def setUp(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py")))
+        ledger = cover_open_hunks(ledger)
+        ledger, round_ = prepared(
+            make_snap(make_hunk("H1", "a.py"), make_hunk("H2", "b.py", ("+y",)), fingerprint="fp2"), ledger=ledger
+        )
+        self.ledger = planned(
+            ledger,
+            make_slot("W1-1", hunks=("H2",), lenses=("intent",)),
+            make_slot("W1-2", hunks=("H1", "H2"), lenses=("sweep",), kind="sweep"),
+        )
+        self.round = round_
+
+    def test_a_slot_that_lists_a_carried_hunk_may_cover_it(self) -> None:
+        ledger, record = add_coverage(
+            self.ledger, ["H1", "H2"], coverage_note(["H1", "H2"]), hunter="W1-2", by="antigravity:c1"
+        )
+
+        self.assertEqual(record.digests, (self.round.hunks[0].digest, self.round.hunks[1].digest))
+        self.assertEqual((record.hunter, record.by), ("W1-2", "antigravity:c1"))
+        self.assertEqual(ledger.coverage[-1], record)
+
+    def test_untagged_coverage_still_refuses_a_carried_hunk(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]))
+
+    def test_a_slot_that_does_not_list_the_carried_hunk_may_not_cover_it(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]), hunter="W1-1")
+
+    def test_a_slot_the_plan_does_not_store_cannot_open_the_carried_hunk(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "not an open hunk of round 2: H1"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]), hunter="W1-9")
 
 
 class StableHunkIdTests(unittest.TestCase):
@@ -544,6 +600,97 @@ class MergeTests(unittest.TestCase):
                 with self.assertRaisesRegex(LedgerError, f"{judged} already has the verdict probable"):
                     merge_findings(verdict, "F1", ["F2"])
 
+    def test_a_merged_finding_cannot_be_a_target(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        with self.assertRaisesRegex(LedgerError, "F2 was merged into F1; merge into F1 instead"):
+            merge_findings(ledger, "F2", ["F3"])
+
+    def test_a_target_of_merges_can_be_merged_and_takes_its_duplicates_along(self) -> None:
+        ledger = self.finding(self.ledger, "The receipt shows NaN for an empty cart.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger, _, _ = merge_findings(ledger, "F2", ["F3"], by="antigravity:a")
+
+        ledger, target, moved = merge_findings(ledger, "F1", ["F2"], by="antigravity:b")
+
+        by_id = {item.id: item for item in ledger.findings}
+        self.assertEqual([item.id for item in moved], ["F2", "F3"])
+        self.assertEqual((by_id["F2"].merged_into, by_id["F3"].merged_into), ("F1", "F1"))
+        self.assertIsNone(target.merged_into)
+        self.assertIsNone(by_id["F1"].merged_into)
+        self.assertEqual(by_id["F3"].verdict, "dismissed")
+        self.assertEqual(by_id["F3"].verdict_evidence, by_id["F2"].verdict_evidence)
+        self.assertTrue(by_id["F3"].verdict_evidence.startswith("Grouped into F1 "))
+        # F3 keeps the event of its first merge and gets a new one that the second merge's caller owns.
+        self.assertEqual([event.by for event in by_id["F3"].verdict_log], ["antigravity:a", "antigravity:b"])
+        tokens = [event.token for item in ledger.findings for event in item.verdict_log]
+        self.assertEqual(len(tokens), len(set(tokens)))
+        Ledger.from_json(ledger.to_json())  # no chain: the ledger still validates and reloads
+
+    def test_two_groups_of_duplicates_can_be_united(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger = self.finding(ledger, "The cart page crashes when it is empty.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+        ledger, _, _ = merge_findings(ledger, "F3", ["F4"])
+
+        ledger, _, _ = merge_findings(ledger, "F1", ["F3"])
+
+        self.assertEqual(
+            {item.id: item.merged_into for item in ledger.findings},
+            {"F1": None, "F2": "F1", "F3": "F1", "F4": "F1"},
+        )
+        Ledger.from_json(ledger.to_json())
+
+    def test_a_verifier_dismissal_with_its_own_evidence_survives_a_move(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger, _, _ = merge_findings(ledger, "F2", ["F3"])
+        guarded = "guarded by cli.py:19, which rejects an empty list before total() runs"
+        ledger, _ = set_verdict(ledger, "F3", "dismissed", guarded, None)
+
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        moved = next(item for item in ledger.findings if item.id == "F3")
+        self.assertEqual(moved.merged_into, "F1")
+        self.assertEqual(moved.verdict_evidence, guarded)
+        self.assertEqual(len(moved.verdict_log), 3)
+
+    def test_two_findings_cannot_be_merged_into_each_other(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        with self.assertRaisesRegex(LedgerError, "F2 was merged into F1"):
+            merge_findings(ledger, "F2", ["F1"])
+
+    def test_a_duplicate_merged_elsewhere_cannot_move_to_another_target(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger = self.finding(ledger, "The receipt shows NaN for an empty cart.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"])
+
+        with self.assertRaisesRegex(LedgerError, "F2 already has the verdict dismissed"):
+            merge_findings(ledger, "F3", ["F2"])
+
+    def test_a_merge_can_be_recorded_again_for_a_verifier_to_vouch(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
+        ledger = self.finding(ledger, "An empty cart shows an error page.")
+        ledger, _, _ = merge_findings(ledger, "F1", ["F2"], by="antigravity:orchestrator")
+
+        again, target, (dup,) = merge_findings(ledger, "F1", ["F2"], by="antigravity:v1")
+
+        self.assertEqual(dup.merged_into, "F1")
+        self.assertEqual([(e.token, e.by) for e in dup.verdict_log], [("V1", "antigravity:orchestrator"), ("V2", "antigravity:v1")])
+        self.assertEqual(target.scenario.count("An empty cart shows an error page."), 1)
+        self.assertEqual(again.findings[1], dup)
+
     def test_invalid_merge_requests_are_rejected(self) -> None:
         ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
         ledger = self.finding(ledger, "An empty cart shows an error page.")
@@ -556,6 +703,176 @@ class MergeTests(unittest.TestCase):
         for target, duplicates, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(LedgerError, message):
                 merge_findings(ledger, target, duplicates)
+
+
+class VerdictEventTests(unittest.TestCase):
+    def setUp(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1")))
+        ledger = record_finding(record_finding(ledger, scenario="Calling total([]) raises ZeroDivisionError."))
+        self.ledger = record_finding(ledger, scenario="An empty cart shows an error page.")
+
+    def test_each_verdict_gets_the_next_token_across_all_findings(self) -> None:
+        ledger = self.ledger
+        tokens: list[str] = []
+        for finding_id, verdict, evidence in (
+            ("F1", "probable", PROBABLE),
+            ("F2", "dismissed", DISMISSED),
+            ("F1", "dismissed", DISMISSED),
+        ):
+            ledger, finding = set_verdict(ledger, finding_id, verdict, evidence, None, by="antigravity:conv-1")  # type: ignore[arg-type]
+            tokens.append(finding.verdict_log[-1].token)
+
+        self.assertEqual(tokens, ["V1", "V2", "V3"])
+        self.assertEqual(next_verdict_token(ledger), "V4")
+        first = ledger.findings[0]
+        self.assertEqual([event.verdict for event in first.verdict_log], ["probable", "dismissed"])
+        self.assertEqual(first.verdict, "dismissed")
+        self.assertEqual({event.by for event in first.verdict_log}, {"antigravity:conv-1"})
+
+    def test_the_event_time_is_the_time_of_the_update(self) -> None:
+        _, finding = set_verdict(self.ledger, "F1", "probable", PROBABLE, None)
+
+        self.assertEqual(finding.verdict_log[-1].at, finding.updated_at)
+        self.assertIsNone(finding.verdict_log[-1].by)
+
+    def test_the_wording_of_a_merge_is_reserved_for_merge(self) -> None:
+        for evidence in (
+            f"{GROUPED_EVIDENCE_PREFIX}F1 (app.py:3): same root cause.",
+            f"   {GROUPED_EVIDENCE_PREFIX}F1 (app.py:3): same root cause.",
+            "Grouped into\nF1 (app.py:3): same root cause.",
+            "Grouped\u00a0into F1 (app.py:3): same root cause.",
+            "Grouped  into F1 (app.py:3): same root cause.",
+            "\tGrouped into F1 (app.py:3): same root cause.",
+            "Grouped into\\nF1 (app.py:3): same root cause.",
+        ):
+            with self.subTest(evidence=evidence), self.assertRaises(FieldError) as caught:
+                set_verdict(self.ledger, "F2", "dismissed", evidence, None)
+            self.assertEqual(caught.exception.field, "verdict_evidence")
+            self.assertIn("craftsman review merge", str(caught.exception))
+        self.assertEqual(self.ledger.findings[1].verdict_log, ())
+
+    def test_merging_records_one_event_per_duplicate_and_points_at_the_target(self) -> None:
+        ledger, _ = set_verdict(self.ledger, "F3", "probable", PROBABLE, None)
+
+        merged, target, duplicates = merge_findings(ledger, "F1", ["F2"], by="antigravity:conv-2")
+
+        (dup,) = duplicates
+        self.assertEqual(dup.merged_into, "F1")
+        self.assertEqual([(e.token, e.verdict, e.by) for e in dup.verdict_log], [("V2", "dismissed", "antigravity:conv-2")])
+        self.assertEqual(dup.verdict_log[-1].at, dup.updated_at)
+        self.assertEqual((target.merged_into, target.verdict_log), (None, ()))
+        self.assertEqual(next_verdict_token(merged), "V3")
+
+    def test_merging_several_duplicates_numbers_their_events_in_order(self) -> None:
+        _, _, duplicates = merge_findings(self.ledger, "F1", ["F3", "F2"])
+
+        self.assertEqual([(d.id, d.verdict_log[-1].token) for d in duplicates], [("F3", "V1"), ("F2", "V2")])
+
+    def test_a_merged_duplicate_stays_merged_while_it_is_dismissed(self) -> None:
+        merged, _, _ = merge_findings(self.ledger, "F1", ["F2"])
+
+        again, finding = set_verdict(merged, "F2", "dismissed", DISMISSED, None, by="antigravity:v1")
+
+        self.assertEqual((finding.merged_into, finding.verdict), ("F1", "dismissed"))
+        self.assertEqual([event.token for event in finding.verdict_log], ["V1", "V2"])
+        self.assertEqual(finding.verdict_evidence, DISMISSED)
+        self.assertEqual(again.findings[1], finding)
+
+    def test_any_other_verdict_un_merges_a_duplicate(self) -> None:
+        for verdict, evidence, run_id in (
+            ("probable", PROBABLE, None),
+            ("proven", "Reproduced via tests/test_app.py::test_empty (fails).", "R1"),
+            ("question", "intent: the task asks for retries; app.py:3 retries forever", None),
+        ):
+            with self.subTest(verdict=verdict):
+                merged, _, _ = merge_findings(record_run(self.ledger, kind="repro", exit_code=1), "F1", ["F2"])
+
+                _, finding = set_verdict(merged, "F2", verdict, evidence, run_id, by="antigravity:v1")  # type: ignore[arg-type]
+
+                self.assertEqual((finding.merged_into, finding.verdict), (None, verdict))
+                self.assertEqual([event.verdict for event in finding.verdict_log], ["dismissed", verdict])
+
+    def test_a_verifier_can_prove_what_the_orchestrator_merged_away(self) -> None:
+        """Hiding a real defect by merging it into a trivial finding does not survive the verifier."""
+        ledger = record_run(self.ledger, kind="repro", exit_code=1)
+        merged, _, _ = merge_findings(ledger, "F1", ["F2"], by="antigravity:orchestrator")
+
+        proven, finding = set_verdict(
+            merged, "F2", "proven", "Reproduced via tests/test_app.py::test_empty (fails).", "R1", by="antigravity:v1"
+        )
+
+        self.assertIsNone(finding.merged_into)
+        self.assertEqual(proven.findings[1].verdict, "proven")
+
+    def test_verdict_since_is_the_first_event_of_the_current_verdict(self) -> None:
+        finding = self.ledger.findings[0]
+        self.assertIsNone(verdict_since(finding))
+        events = (
+            VerdictEvent("V1", "probable", at(1)),
+            VerdictEvent("V2", "dismissed", at(2)),
+            VerdictEvent("V3", "dismissed", at(3)),
+            VerdictEvent("V4", "dismissed", at(4)),
+        )
+
+        def judged(*log: VerdictEvent) -> str | None:
+            evidence = DISMISSED if log[-1].verdict == "dismissed" else PROBABLE
+            return verdict_since(replace(finding, verdict=log[-1].verdict, verdict_evidence=evidence, verdict_log=log))
+
+        self.assertEqual(judged(*events[:1]), at(1))
+        self.assertEqual(judged(*events), at(2))  # repeating the verdict does not move the time
+        flipped = (*events, VerdictEvent("V5", "probable", at(5)))
+        self.assertEqual(judged(*flipped), at(5))  # a different verdict does
+        back = (*flipped, VerdictEvent("V6", "dismissed", at(6)))
+        self.assertEqual(judged(*back), at(6))
+
+    def test_a_verdict_from_before_events_existed_dates_from_the_last_update(self) -> None:
+        legacy = replace(self.ledger.findings[0], verdict="probable", verdict_evidence=PROBABLE)
+
+        self.assertEqual(verdict_since(legacy), legacy.updated_at)
+
+
+class SlotAttributionRecordingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.ledger, _ = prepared(make_snap(make_hunk("H1")))
+
+    def test_coverage_and_findings_record_their_hunter_and_caller(self) -> None:
+        ledger, record = add_coverage(
+            self.ledger, ["H1"], coverage_note(["H1"]), hunter="W1-2", by="antigravity:conv-1"
+        )
+        ledger, finding = add_finding(
+            ledger, **{**FINDING, "severity": "major"}, hunter="lead", by="antigravity:conv-1"
+        )
+
+        self.assertEqual((record.hunter, record.by), ("W1-2", "antigravity:conv-1"))
+        self.assertEqual((finding.hunter, finding.by), ("lead", "antigravity:conv-1"))
+        self.assertEqual(ledger.coverage[0], record)
+
+    def test_hunter_and_caller_are_optional(self) -> None:
+        ledger, record = add_coverage(self.ledger, ["H1"], coverage_note(["H1"]))
+        _, finding = add_finding(ledger, **{**FINDING, "severity": "major"})
+
+        self.assertEqual((record.hunter, record.by, finding.hunter, finding.by), (None, None, None, None))
+
+    def test_coverage_cannot_be_credited_to_the_lead(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "never credits coverage"):
+            add_coverage(self.ledger, ["H1"], coverage_note(["H1"]), hunter="lead")
+
+    def test_claims_get_sequential_tokens_and_the_latest_round(self) -> None:
+        ledger, first = add_claim(self.ledger, "W1-1", by="antigravity:conv-1")
+        ledger, again = add_claim(ledger, "W1-1")  # a relaunched hunter claims the slot again
+        later, _ = prepared(make_snap(make_hunk("H2", "b.py"), fingerprint="fp2"), ledger=ledger)
+        later, third = add_claim(later, "W1-2")
+
+        self.assertEqual([c.token for c in later.claims], ["B1", "B2", "B3"])
+        self.assertEqual((first.round, first.slot, first.by), (1, "W1-1", "antigravity:conv-1"))
+        self.assertEqual((again.round, again.by), (1, None))
+        self.assertEqual((third.round, next_claim_token(later)), (2, "B4"))
+
+    def test_a_claim_needs_a_round_and_a_slot_id(self) -> None:
+        with self.assertRaisesRegex(LedgerError, "craftsman review prepare"):
+            add_claim(Ledger(), "W1-1")
+        with self.assertRaisesRegex(LedgerError, "slot must look like W1-1"):
+            add_claim(self.ledger, "lead")
 
 
 class RunTests(unittest.TestCase):
@@ -614,7 +931,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(load(self.path), Ledger())
 
         self.assertEqual(taken, [True])
-        self.assertTrue(self.path.with_name("ledger.v2.bak.json").is_file())
+        self.assertEqual(len(backups_of(self.path)), 1)
 
     def test_a_ledger_written_while_the_old_one_was_set_aside_is_left_alone(self) -> None:
         self.path.parent.mkdir(parents=True)
@@ -631,7 +948,7 @@ class PersistenceTests(unittest.TestCase):
 
         self.assertEqual(loaded, newer)
         self.assertEqual(load(self.path), newer)
-        self.assertFalse(self.path.with_name("ledger.v2.bak.json").exists())
+        self.assertEqual(backups_of(self.path), ())
 
     def test_setting_an_older_ledger_aside_inside_mutate_does_not_deadlock(self) -> None:
         self.path.parent.mkdir(parents=True)
@@ -641,6 +958,155 @@ class PersistenceTests(unittest.TestCase):
             number = mutate(self.path, lambda ledger: (record_run(ledger), len(ledger.runs) + 1))
 
         self.assertEqual(number, 1)
+
+    def test_older_schemas_are_set_aside_under_the_name_of_their_own_schema(self) -> None:
+        for schema in (1, 2):
+            with self.subTest(schema=schema):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(json.dumps({**Ledger().to_json(), "schema": schema}), encoding="utf-8")
+
+                with redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(load(self.path), Ledger())
+
+                (backup,) = (path for path in backups_of(self.path) if f".v{schema}." in path.name)
+                self.assertRegex(backup.name, rf"^ledger\.v{schema}\.\d{{8}}T\d{{6}}Z\.bak\.json$")
+                self.assertFalse(self.path.exists())
+                self.assertIn(backup.name, err.getvalue())
+
+    def test_a_schema_3_ledger_is_kept_and_written_as_schema_4_on_the_next_save(self) -> None:
+        ledger = cover_open_hunks(fully_reviewed(make_snap(make_hunk("H1"))))
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**ledger.to_json(), "schema": 3}), encoding="utf-8")
+
+        with redirect_stderr(io.StringIO()) as err:
+            loaded = load(self.path)
+
+        self.assertEqual(loaded, ledger)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], [LEDGER_FILENAME])
+        mutate(self.path, lambda current: (record_run(current), None))
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["schema"], 4)
+
+    def test_a_newer_schema_is_an_error_and_is_not_set_aside(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": 5}), encoding="utf-8")
+
+        with self.assertRaisesRegex(LedgerError, r"newer Craftsman \(schema 5\); upgrade craftsman"):
+            load(self.path)
+        self.assertTrue(self.path.is_file())
+
+    def write_schema(self, schema: int) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps({**Ledger().to_json(), "schema": schema}), encoding="utf-8")
+
+    def test_a_newer_schema_is_refused_by_load_and_by_every_writing_command(self) -> None:
+        self.write_schema(5)
+        before = self.path.read_text(encoding="utf-8")
+
+        with self.assertRaises(NewerSchemaError) as caught:
+            load(self.path)
+        with self.assertRaises(NewerSchemaError):
+            mutate(self.path, lambda current: (record_run(current), None))
+        with self.assertRaises(NewerSchemaError):
+            load(self.path, set_aside=False)
+
+        self.assertEqual(caught.exception.schema, 5)
+        self.assertEqual(
+            str(caught.exception),
+            f"{self.path}: this ledger was written by a newer Craftsman (schema 5); upgrade craftsman",
+        )
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertEqual(backups_of(self.path), ())
+
+    def test_a_newer_schema_is_refused_even_when_its_records_would_not_parse(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps({"schema": 9, "rounds": "from the future"}), encoding="utf-8")
+
+        with self.assertRaises(NewerSchemaError):
+            load(self.path)
+
+    def test_a_read_only_load_leaves_an_older_ledger_where_it_is(self) -> None:
+        self.write_schema(2)
+
+        with self.assertRaises(OlderSchemaError) as caught:
+            load(self.path, set_aside=False)
+
+        self.assertEqual(caught.exception.schema, 2)
+        self.assertTrue(self.path.is_file())
+        self.assertEqual(backups_of(self.path), ())
+
+    def test_two_upgrades_in_the_same_second_keep_both_backups(self) -> None:
+        moment = datetime(2026, 11, 8, 10, 30, 5, tzinfo=timezone.utc)
+        first_text = json.dumps({**Ledger().to_json(), "schema": 2, "marker": "first"})
+        second_text = json.dumps({**Ledger().to_json(), "schema": 2, "marker": "second"})
+        self.path.parent.mkdir(parents=True)
+
+        with mock.patch.object(ledger_module, "datetime", wraps=datetime) as clock, redirect_stderr(io.StringIO()):
+            clock.now.return_value = moment
+            self.path.write_text(first_text, encoding="utf-8")
+            load(self.path)
+            self.path.write_text(second_text, encoding="utf-8")
+            load(self.path)
+
+        names = [backup.name for backup in backups_of(self.path)]
+        self.assertEqual(
+            names, ["ledger.v2.20261108T103005Z.bak.json", "ledger.v2.20261108T103005Z.2.bak.json"]
+        )
+        by_name = {backup.name: backup.read_text(encoding="utf-8") for backup in backups_of(self.path)}
+        self.assertEqual(by_name["ledger.v2.20261108T103005Z.bak.json"], first_text)
+        self.assertEqual(by_name["ledger.v2.20261108T103005Z.2.bak.json"], second_text)
+
+    def test_backups_are_listed_oldest_first_by_schema_stamp_and_counter(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        names = [
+            "ledger.v2.20261108T103005Z.bak.json",
+            "ledger.v2.20261108T103005Z.2.bak.json",
+            "ledger.v2.20261108T103005Z.10.bak.json",
+            "ledger.v2.20261108T103006Z.bak.json",
+            "ledger.v10.20260101T000000Z.bak.json",
+        ]
+        for name in ("ledger.v2.bak.json", *reversed(names)):
+            self.path.with_name(name).write_text("{}", encoding="utf-8")
+
+        self.assertEqual([b.name for b in backups_of(self.path)], ["ledger.v2.bak.json", *names])
+
+    def test_a_third_upgrade_does_not_overwrite_either_earlier_backup(self) -> None:
+        moment = datetime(2026, 11, 8, 10, 30, 5, tzinfo=timezone.utc)
+        self.path.parent.mkdir(parents=True)
+        with mock.patch.object(ledger_module, "datetime", wraps=datetime) as clock, redirect_stderr(io.StringIO()):
+            clock.now.return_value = moment
+            for marker in ("a", "b", "c"):
+                self.path.write_text(
+                    json.dumps({**Ledger().to_json(), "schema": 2, "marker": marker}), encoding="utf-8"
+                )
+                load(self.path)
+
+        markers = sorted(json.loads(b.read_text(encoding="utf-8"))["marker"] for b in backups_of(self.path))
+        self.assertEqual(markers, ["a", "b", "c"])
+
+    def test_backups_of_lists_only_set_aside_ledgers_of_that_ledger(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        legacy = self.path.with_name("ledger.v2.bak.json")
+        stamped = self.path.with_name("ledger.v2.20260101T000000Z.bak.json")
+        for name in (legacy, stamped, self.path.with_name("ledger.json.tmp"), self.path.with_name("notes.bak.json")):
+            name.write_text("{}", encoding="utf-8")
+
+        self.assertEqual(backups_of(self.path), (legacy, stamped))
+        self.assertEqual(backups_of(self.path.parent / "missing" / LEDGER_FILENAME), ())
+
+    def test_unknown_fields_of_a_same_schema_ledger_are_named_and_blamed_on_a_newer_craftsman(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        raw = Ledger().to_json()
+        self.path.write_text(json.dumps({**raw, "zeta": 1, "alpha": 2}), encoding="utf-8")
+
+        with self.assertRaises(LedgerError) as caught:
+            load(self.path)
+
+        message = str(caught.exception)
+        self.assertIn("alpha is not a known field (also unknown: zeta)", message)
+        self.assertIn("a newer Craftsman may have written them", message)
+        self.assertTrue(self.path.is_file())
+        self.assertEqual(backups_of(self.path), ())
 
     def test_corrupt_json_raises(self) -> None:
         self.path.parent.mkdir(parents=True)
@@ -716,6 +1182,126 @@ class PersistenceTests(unittest.TestCase):
             self.assertRaisesRegex(LedgerError, "cannot locate"),
         ):
             ledger_path_for(outside)
+
+
+class LensAwareCarryOverTests(unittest.TestCase):
+    """With `required` and `credited` a hunk is carried only when everything it requires is credited."""
+
+    INTENT_TESTS = frozenset({"intent", "tests"})
+
+    def reviewed(self) -> tuple[Ledger, Any, Any]:
+        h1, h2 = make_hunk("H1", "a.py"), make_hunk("H2", "b.py")
+        ledger = fully_reviewed(make_snap(h1, h2))
+        return ledger, h1, h2
+
+    def open_next(self, ledger: Ledger, *hunks: Any, **maps: Any) -> Any:
+        snap = make_snap(*hunks, fingerprint="fp2")
+        _, round_ = open_round(ledger, snap, False, "packet.md", maps.pop("symbols", {}), **maps)
+        return round_
+
+    def test_a_hunk_is_carried_when_its_required_lenses_are_all_credited(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        h3 = make_hunk("H3", "c.py")
+        required = {h.id: self.INTENT_TESTS for h in (h1, h2, h3)}
+        credited = {h1.digest: frozenset({"intent", "tests", "craft"}), h2.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(ledger, h1, h2, h3, required=required, credited=credited)
+
+        self.assertEqual([h.carried for h in round_.hunks], [True, True, False])
+
+    def test_a_missing_lens_keeps_the_hunk_open_although_it_was_covered(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        required = {"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}
+        credited = {h1.digest: frozenset({"intent"}), h2.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(ledger, h1, h2, make_hunk("H3", "c.py"), required={**required, "H3": self.INTENT_TESTS}, credited=credited)
+
+        self.assertEqual([h.carried for h in round_.hunks], [False, True, False])
+        self.assertEqual([h.reopened for h in round_.hunks], [False, False, False])
+
+    def test_the_old_rule_applies_without_the_maps(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+
+        round_ = self.open_next(ledger, h1, h2, make_hunk("H3", "c.py"))
+
+        self.assertEqual([h.carried for h in round_.hunks], [True, True, False])
+
+    def test_giving_only_one_of_the_maps_is_an_error_not_a_silent_fallback(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        h3 = make_hunk("H3", "c.py")
+        for maps in (
+            {"required": {"H1": self.INTENT_TESTS}},
+            {"credited": {h1.digest: self.INTENT_TESTS}},
+        ):
+            with self.subTest(given=sorted(maps)), self.assertRaisesRegex(LedgerError, "both"):
+                self.open_next(ledger, h1, h2, h3, **maps)
+
+    def test_a_hunk_without_an_entry_in_required_is_never_carried(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        credited = {h1.digest: self.INTENT_TESTS, h2.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(ledger, h1, h2, required={"H1": self.INTENT_TESTS}, credited=credited)
+
+        self.assertEqual([h.carried for h in round_.hunks], [True, False])
+
+    def test_a_reopened_hunk_stays_reopened_whatever_is_credited(self) -> None:
+        caller = make_hunk("H1", "a.py", (" total = compute_total(x)", "+y = 1"))
+        ledger = fully_reviewed(make_snap(caller))
+        changed = make_hunk("H2", "c.py", ("-def compute_total(items):", "+def compute_total(items, rate):"))
+        required = {"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}
+        credited = {caller.digest: self.INTENT_TESTS}
+
+        round_ = self.open_next(
+            ledger, caller, changed, required=required, credited=credited, symbols={"H2": ["compute_total"]}
+        )
+
+        self.assertEqual([(h.carried, h.reopened) for h in round_.hunks], [(False, True), (False, False)])
+
+    def test_raising_an_unchanged_round_to_deep_releases_carried_hunks_that_lack_a_required_lens(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        h3 = make_hunk("H3", "c.py")
+        snap = make_snap(h1, h2, h3, fingerprint="fp2")
+        normal = {h.id: self.INTENT_TESTS for h in (h1, h2, h3)}
+        credited = {h1.digest: self.INTENT_TESTS, h2.digest: self.INTENT_TESTS | {"state"}}
+        ledger, second = open_round(ledger, snap, False, "packet.md", {}, required=normal, credited=credited)
+        self.assertEqual(second.open_hunk_ids, ("H3",))
+
+        deep = {h.id: self.INTENT_TESTS | {"state"} for h in (h1, h2, h3)}
+        raised_ledger, raised = open_round(ledger, snap, True, "packet.md", {}, required=deep, credited=credited)
+
+        self.assertTrue(raised.deep)
+        self.assertEqual(len(raised_ledger.rounds), 2)
+        self.assertEqual([(h.id, h.carried) for h in raised.hunks], [("H1", False), ("H2", True), ("H3", False)])
+
+    def test_raising_does_not_carry_again_what_was_open(self) -> None:
+        ledger, h1, h2 = self.reviewed()
+        snap = make_snap(h1, h2, fingerprint="fp2")
+        ledger, second = open_round(ledger, snap, False, "packet.md", {}, required={"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}, credited={})
+        self.assertEqual(second.open_hunk_ids, ("H1", "H2"))
+        full = {h1.digest: self.INTENT_TESTS, h2.digest: self.INTENT_TESTS}
+
+        _, raised = open_round(ledger, snap, True, "packet.md", {}, required={"H1": self.INTENT_TESTS, "H2": self.INTENT_TESTS}, credited=full)
+
+        self.assertEqual(raised.open_hunk_ids, ("H1", "H2"))
+
+    def test_round_unchanged_is_the_fingerprint_and_scope_test_of_open_round(self) -> None:
+        h1 = make_hunk("H1")
+        ledger = fully_reviewed(make_snap(h1))
+        same, other = make_snap(h1), make_snap(h1, fingerprint="fp2")
+
+        self.assertTrue(round_unchanged(ledger, same, None))
+        self.assertFalse(round_unchanged(ledger, other, None))
+        self.assertFalse(round_unchanged(ledger, same, ["a.py"]))  # a different scope is a new round
+        self.assertFalse(round_unchanged(Ledger(), same, None))
+        self.assertIs(open_round(ledger, same, False, "p.md", {})[0], ledger)
+
+    def test_a_first_round_has_nothing_to_carry(self) -> None:
+        h1 = make_hunk("H1")
+        _, round_ = open_round(
+            Ledger(), make_snap(h1), False, "packet.md", {}, required={"H1": self.INTENT_TESTS}, credited={h1.digest: self.INTENT_TESTS}
+        )
+
+        self.assertFalse(round_.hunks[0].carried)
 
 
 if __name__ == "__main__":

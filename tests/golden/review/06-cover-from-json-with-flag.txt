@@ -1,0 +1,5 @@
+$ craftsman review cover --from-json - --note x
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --from-json cannot be combined with --note

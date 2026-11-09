@@ -46,7 +46,7 @@ craftsman gate --init [--deep] --task "<the user's request in one line>"
 The prompt hook runs this on platforms with hooks; if no hook opened the gate, run it yourself
 before touching code. Start deep (`--deep`) when the user's words ask for care ("critical",
 "production", "be thorough"), say `ultracraft` or type `--deep`; otherwise start normal and
-escalate later (Stage 2 step 1). A typed `--quick` or `--standard` is ignored. It records the base
+escalate later (Stage 2 step 2). A typed `--quick` or `--standard` is ignored. It records the base
 commit: the review covers everything since then, commits included.
 A request that only asks for a review (no fixing, no `/craftsman`, no `ultracraft`) starts no
 gate: follow `/craft-review` in review-only mode instead.
@@ -64,36 +64,36 @@ user only when an ambiguity changes what you build: `craftsman gate --await-user
 
 ## Stage 2 - Final review
 
-1. Run `craftsman review prepare` first, even for a one-line change: it freezes the diff into
-   round N and prints the packet path and the risk map. Decide the depth now by the rule in `/craft-review` (Depth); to go deep, run
-   `craftsman review prepare --deep`.
-2. Write the intent brief (`/craft-review` step 2) with the task and what you built per file in
-   a line. It states intent; it must not argue that the code is correct. Decisions a reader could
-   mistake for bugs go only to verifiers, after the shared block, as context for judging; hunters
-   never get them (they would anchor the hunt). Your context holds the reasoning that produced the
-   code, which is what hides its defects, so the hunters are fresh-context subagents and you only
+1. Write the intent brief (`/craft-review` step 1): the task and what you built per file in a line, as
+   claims about what the change must do. It states intent; it must not argue that the code is correct,
+   because every hunter and verifier brief quotes it. Your context holds the reasoning that produced
+   the code, which is what hides its defects, so the hunters are fresh-context subagents and you only
    orchestrate.
-3. Launch the hunters next: follow `/craft-review` from its hunt plan (step 3) through step 6
-   (hunt, verify, saturate, fix, confirm, re-check, tests and `craftsman review check`), in
-   gate-session mode, even for a one-line change. It is the single source for the mechanics. A
-   review that is not in the ledger did not happen.
+2. Run `craftsman review prepare --task-file -` with the brief on stdin, even for a one-line change: it
+   freezes the diff into round N, decides the depth (the rule is under **Depth** in `/craft-review`;
+   `--deep` goes further) and prints the hunt plan, one slot per hunter. You cannot drop a slot: the
+   gate needs every one of them done.
+3. Launch every slot together and follow `/craft-review` from step 2 through step 4 (launch, check,
+   verify, waves, fix, confirm, re-check, tests and `craftsman review check`), in gate-session mode.
+   It is the single source for the mechanics. A review that is not in the ledger did not happen.
 4. Do what `check` lists, then `craftsman gate --complete`. At `round-cap` stop iterating, report
    what remains and let the user decide; the gate lets you finish.
 
 ## Stage 3 - Report
 
 Run `craftsman review report` and give the user a short summary: what was built (files, one line
-each); your decisions in plain language (the depth and why; the hunters and their lenses; the waves; how
+each); your decisions in plain language (the depth and why; the slots and their lenses; the waves; how
 findings were verified); findings fixed, accepted (with reasons) and dismissed
-(count); the verification commands and results; a proposed commit message from
-`/high-level-commit-message`. Write it as rendered Markdown with real line breaks, never `\n`
-escapes, and do not wrap it in quotes, JSON or a code block. Never commit, push or open a pull
-request unless the user asked.
+(count); the verification commands and results; a proposed commit message (Conventional Commits,
+American English, one line stating the intent). Write it as rendered Markdown with real line breaks,
+never `\n` escapes, and do not wrap it in quotes, JSON or a code block. Never commit, push or open a
+pull request unless the user asked.
 
 ## Autonomy
 
 - Never stop to ask what you can decide yourself. Involve the user only for a real ambiguity in
   what to build, for accepting a `major` finding, and at the round cap.
 - Never lower the rigor to save effort: no inline review where subagents exist, no skipped waves.
-- A subagent that fails (rate limit, timeout) is retried once with a smaller slice. If subagents
-  keep failing, run `craftsman gate --await-user` and tell the user what is not covered.
+- A subagent that fails (rate limit, timeout) shows in `craftsman review check` as a slot that
+  stopped without finishing; launch it once more. If subagents keep failing, run
+  `craftsman gate --await-user` and tell the user what is not covered.

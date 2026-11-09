@@ -1,0 +1,5 @@
+$ craftsman review brief --verifier F9
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: unknown finding(s): F9; findings in the ledger: none

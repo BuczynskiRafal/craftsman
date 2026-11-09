@@ -1,0 +1,17 @@
+$ craftsman review show
+[exit 0]
+--- stdout
+Round 1 prepared <TIME> · 7 hunks (0 carried) · current
+Packet: <REPO>/.git/craftsman/packet-1.md
+
+Hunt: 3 slots - 3 pending (W1-1..W1-3)
+Hunks still missing from some slot: H1, H2, H3, H4, H5, H6, H7
+
+| ID | Severity | Verdict | Resolution | Location | Title |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| F1 | major | — | — | `app.py:7` | Empty cart divides by zero |
+
+F1 scenario (lens contracts): total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError
+
+Runs: none recorded.
+--- stderr

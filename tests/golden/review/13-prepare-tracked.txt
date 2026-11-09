@@ -1,0 +1,20 @@
+$ craftsman review prepare --tracked
+[exit 0]
+--- stdout
+Round 1 prepared: 4 files, 4 hunks, 14 changed lines; 0 hunks carried, 4 to review.
+Packet: <REPO>/.git/craftsman/packet-1.md
+Depth: normal (no deep signal; 12 changed production lines <= 250)
+Advisory: no Craftsman hook saw this session, so the review will be SELF-REVIEWED (run `craftsman doctor`).
+Hunt plan, round 1:
+  W1-1  H1-H4     intent, ripple, tests       14 lines
+  W1-2  H1,H3-H4  contracts, failure, sweep   12 lines
+  W1-3  H1-H4     craft, design (simplicity)  14 lines  [Claude Code: model haiku]
+This plan is a suggestion: an advisory review is complete when every hunk is covered.
+Launch all 3 hunters now, in one step. Each is a craftsman-reviewer subagent whose whole prompt is:
+  You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly.
+  Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer.
+  Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.
+Then end your turn while they run. When they report back, run `craftsman review check --review-only` and do exactly what it lists.
+Scope: 4 file(s), frozen for this review.
+Ignored (outside the review scope): NOTES.txt, extra.py, tests/test_extra.py
+--- stderr

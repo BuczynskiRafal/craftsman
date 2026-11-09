@@ -6,7 +6,136 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Hooks cannot be forged and the evidence cannot be edited from the session.** One entry point,
+  `craftsman/command_policy.py`, decides every PreToolUse call for every platform: `craftsman hook ...` (and
+  `import craftsman` in an inline program) is denied, as is any write into `<git-dir>/craftsman/` (ledger, state,
+  hook log; `inbox/` and `scratch/` stay open) or into the transcript folders of the platforms, by a shell command or
+  by a file-writing tool. The Claude Code matcher now covers `Write|Edit|MultiEdit|NotebookEdit`, and the write check
+  runs before the scope filter. Identity variables (`CLAUDE_CODE_SESSION_ID`, `CRAFTSMAN_*`, ...) cannot be set for a
+  craftsman command, the main session records only as `lead`, the gate owner cannot `--takeover` its own gate, and a
+  made-up `--session-id` is denied. A subagent's transcript is read only from under the platform's transcript folders.
+- **Taking a gate over keeps what the hooks proved.** `gate --init --takeover` keeps `isolation_evidence`, so the next
+  round is still enforced.
+
+### Added
+
+- **An enforced hunt plan.** `craftsman review prepare` now computes the hunt from the diff (`craftsman/huntplan.py`)
+  and stores it in the round as slots: `W1-<n>`, each with its hunks and lenses. What a hunk owes follows from its kind
+  (prose, tests, configuration, production) and the risk signals that fired in it, minus the lenses accepted coverage
+  already applied to it; related lenses share a slot (about 400 changed lines each), `craft` and `design` get a slot of
+  their own, a `sweep` joins when there are two or more bug slots, and a small follow-up round (40 changed lines at
+  most, no deep signal) is one bug slot plus a simplicity slot. The round is **enforced** when the platform's hooks see the session (the gate's
+  Stop hook and the review guard then require every slot done) and **advisory** otherwise, as before
+  (`SELF-REVIEWED`). Depth is decided by the CLI too: deep on a security or concurrency signal in a production hunk or
+  at least 251 changed production lines (`Depth: deep (<reasons>)`); `--deep` still raises it.
+- **`craftsman review brief <slot>` and `brief --verifier F1,F2`.** A hunter's whole launch prompt is one line naming its
+  slot; the brief records the claim and prints the task, the slice, the lenses and the recording commands. `review add`
+  and `review cover` take `--hunter <slot>` (required in an enforced round; `lead` marks the orchestrator's own
+  findings and never credits coverage); `review prepare` takes `--task-file` for a longer intent brief.
+- **Waves are stored, not derived.** A proven (or serious probable) bug finding makes `check`, `report`, `brief` and
+  `prepare` store a variant slot per root cause (`W2-F3`) and a fresh set (`W2-X1`), up to three generations. `check`
+  groups the findings without a verdict into clusters for verifiers (one per file, six findings at most), and a
+  `blocker` or `major` finding dismissed without a run needs a second, independent verifier (`hunt-pending`,
+  `wave-pending`, `unverified` and `second-opinion` join the gate issue codes).
+- **Ledger schema 4** (schema 3 is still read): slot plan and waves in the round, slot-tagged coverage and findings, slot
+  claims (`B1`) and a verdict log (`V1`). A run vouches for a record by identity (`by`), by its transcript or, weakest
+  and bounded, by time.
+- **Antigravity reviews are enforced.** The Stop hook and the review commands read the subagent transcripts back into
+  the ledger (`craftsman/agy_sync.py`), and a hunter that claimed a slot and left it unfinished is sent back once.
+- **A hook error log.** Whatever a hook survives (a crash, an unreadable transcript, a git call out of budget, a ledger
+  it cannot load or had to set aside, a transcript without provenance) is appended to
+  `<git-dir>/craftsman/hook-errors.log`; `review check`, `review report`, `gate --complete` and `status` print
+  `Hook errors since round N was prepared: K (see <path>)`. Every git call of a hook shares the budget of its event.
+- **`gate --await-user --question "..."`** stores the time and the question; the Stop hook logs an `await-user` entry
+  when the last message of an agent that parked the gate asks nothing.
+
+### Removed
+
+- **The `mentioned` rule of the usage reader:** a command counts as run only when a recognized recording call printed it.
+- **Four skills unrelated to the review loop:** `leetcode-style-code-reviewer`, `code-quality`,
+  `high-level-commit-message` and `extreme-optimizer`. `craftsman install` removes the copies, links and
+  commands that an earlier install recorded in its manifest (and nothing it did not create); `/audit` no longer
+  lists the `quality` and `perf` aspects, and `/craftsman` proposes the commit message itself.
+- **The migration of Craftsman < 4.0 installs** (`legacy_githooks.py`, `TargetKind.GIT_HOOKS`, the `schema_version: 1`
+  manifest reader and the restore of `core.hooksPath`). A manifest of that age now stops `install`, `uninstall` and
+  `doctor` with a message to delete it and run `craftsman install` again.
+  `craftsman install` reads the manifest of every selected target before it writes anything. `craftsman doctor`
+  still reports a global `core.hooksPath` that points to the git hooks folder of those releases. The manifests this
+  version writes no longer carry the retired `previous_hooks_path` and `hooks_dir` keys, so Craftsman 5.0 cannot read
+  them back: reinstall with 5.0 after a downgrade.
+
+### Fixed
+
+- **Review of the hook guards (Antigravity and the shell parser).** `env -S "<command line>"` (and `--split-string`, in
+  every attached form and as the shortest unique prefix `--s`, with `\_` as a separator; `env -a`/`--argv0` values and an
+  `env -C` inside the string are read too) no longer hides its command from the command policy, the work-tree guard, the scope guard and
+  the triviality check; `python craftsman/cli.py ...` is read as the CLI, and the `__main__` blocks of `gate.py` and
+  `export.py`, which ran around the policy, now only say that the module is no program (exit 2). Antigravity's `read_file(Path=...)` is wired to the scope guard
+  and judged like `view_file`, and a configured `ANTIGRAVITY_APP_DATA_DIR` or `CLAUDE_CONFIG_DIR` is protected for
+  reads as it is for writes. An Antigravity verifier that stops while the gate still waits for verdicts, and a hunter
+  that claimed no slot and recorded nothing, are sent back once, as on Claude Code. Launches that Antigravity cut from
+  its compact transcript are read from `transcript_full.jsonl`; a cut that cannot be restored is reported, never read
+  as "no launch". The cited source line of `review add` and `review move` is printed defanged, and an `echo` or `printf`
+  that could build the phrase of a record next to a recording call makes its output foreign. A hunter that covered
+  parts of several slots without a brief is dead for one slot only. `FOO=1 true` is as trivial as `true`.
+- **Long Antigravity requests and stdin filters.** A `/craft-review` request or continuation prompt that Antigravity
+  cut in `transcript.jsonl` is read whole from `transcript_full.jsonl` (one reader, `transcript.read_conversation`); one
+  that cannot be restored changes nothing and is reported, and so is a stop allowed only because a cut response could not
+  be read. `cat`, `head` and `tail` next to a recording call are foreign output unless they filter a pipe and have no
+  input of their own, so they can no longer forge a record token.
+- **Antigravity reviews are read back correctly.** Parallel `invoke_subagent` calls, whose acknowledgements carry no
+  id, are paired with their calls in call order and attributed to the right subagent; verifier runs are recorded like
+  hunter runs; `gate --init` records the Antigravity conversation as the gate owner.
+- **The depth floor of a review comes from the diff again.** `review prepare` makes a round deep on a security or
+  concurrency signal in a production hunk, or at least 251 changed production lines, on every platform and whatever
+  effort the agent runs at (5.0 lost this floor); `--deep` still raises it.
+- **A test run must have run tests.** `craftsman run --kind test` reads the whole output of the command for the
+  summaries of pytest, unittest, `go test`, `cargo test`, jest, vitest and mocha, adds them up and stores the count
+  (`tests_ran`, with `min_tests`). A run that exited 0 but reported fewer tests than `--min-tests` (default 1;
+  `0` turns the check off) is still recorded, but is no passing evidence anywhere: the gate says "R3 ran 0 tests
+  (minimum 1)" and the progress counter ignores it. Output no runner claims keeps the exit code as the only
+  judge. A run refused for too few tests says how to proceed (`--min-tests 0`), and a run that passes only
+  because of `--min-tests 0` is a gate warning. The run summaries show "exit 0, 0 tests - not counted". `pytest
+  --collect-only` and an all-skipped `go test -v` count as 0 tests. An inline Python program (`python -c`, or a
+  heredoc fed to `python -`) that checks nothing (no `assert`, `raise`, test framework, `subprocess.check_call`,
+  `subprocess.run(check=True)`, `runpy` call or computed exit status) is now trivial as a `test` run; `e2e` runs
+  keep the old rule. A newline in an inline shell script now separates commands, as `;` does.
+- **`craftsman status` never hides a broken ledger.** A corrupted ledger, a ledger of a newer schema and the
+  ledgers an upgrade set aside are reported with their path (text and `--json`: `ledger_path`, `ledger_problem`,
+  `ledger_backups`); a corrupted or newer ledger makes `status` exit 1. `status` only looks: it no longer sets an
+  older ledger aside.
+- **A ledger written by a newer Craftsman is never moved or rewritten.** Every command, `review reset` included,
+  stops with "this ledger was written by a newer Craftsman (schema N); upgrade craftsman". Unknown fields in a
+  same-schema ledger are named in the error, which says a newer Craftsman may have written them.
+- **Set-aside ledgers are never overwritten.** An older ledger now moves to
+  `ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json` (with a counter before `.bak` if that name exists), so two
+  upgrades keep both backups.
+
 ### Changed
+
+- **`review prepare` prints the plan.** After the summary it prints the depth with its reasons (`Depth: deep
+  (<reasons>)`), the slot table (slot, hunks, lenses, state) and the one-line launch prompt for each pending slot.
+- **`--hunter` is required in an enforced round.** `review add` and `review cover` refuse a record without
+  `--hunter <slot>` (or `lead`) there; the main session can record only as `lead`, which never credits coverage.
+- **`review report --partial` is refused when no hunter was launched** in an enforced round, and it never ends the
+  review guard: only a report of a review that passed does. It still needs `--review-only` and a round.
+- **The hook timeouts of Antigravity are 30 s** (`hooks.json`, they were 10 s), and the git calls of a hook share the
+  budget of its event.
+- **The skills, agent templates, `AGENTS.md` block, rules and docs describe the enforced hunt.** `/craft-review` launches the slots `prepare` lists with the one-line prompt and follows `review check`; the hunter and verifier
+  templates start from `review brief` and record with `--hunter`; how-it-works, guards, usage and the architecture
+  reference describe the plan, enforcement, attribution, the command policy and the hook error log.
+- **Internal restructuring, no behavior change.** `craftsman/review.py` is split by responsibility
+  (`review_parser`, `review_common`, `review_scope`, `review_ingest`, `review_records`, `review_inspect`,
+  `review_present`) and stays the entry module; `WorktreeIndex` moved from `diffscan.py` to `worktree_index.py` and the
+  path classifiers to `diffscan_paths.py`; `usage.py` and `transcript.py` share one lazy JSON Lines reader
+  (`jsonl.py`); the one visible difference is that an Antigravity transcript larger than 256 MB is now refused as
+  unreadable (the hooks fail safe and log it) instead of being read in full, as the Claude usage reader already did. The output of every `craftsman review` command is pinned by golden files (`tests/golden/review`)
+  recorded from the code before the split. `lenses.select_lenses` and `deep_hint`, the earlier suggestion API, are no
+  longer called by any command.
+- **The `audit-*` skills load their review lens instead of repeating its probes** (`craftsman skill show craft-review
+  --lenses <id>`) and keep only their own inventory table and method.
 
 - **Diagrams are Excalidraw scenes again.** The five Mermaid diagrams (workflow, evidence ledger, finding
   lifecycle, hooks and guards, stop gate) are redrawn for the 5.0 protocol as editable

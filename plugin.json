@@ -11,13 +11,9 @@
     "./skills/audit-tests",
     "./skills/audit-types",
     "./skills/batch",
-    "./skills/code-quality",
     "./skills/craft-review",
     "./skills/craftsman",
-    "./skills/extreme-optimizer",
     "./skills/feature-dev",
-    "./skills/high-level-commit-message",
-    "./skills/leetcode-style-code-reviewer",
     "./skills/modernize",
     "./skills/simplify",
     "./skills/verify"

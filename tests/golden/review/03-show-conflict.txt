@@ -1,0 +1,5 @@
+$ craftsman review show --packet-path --hunks
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: pass either --packet-path or --hunks, not both

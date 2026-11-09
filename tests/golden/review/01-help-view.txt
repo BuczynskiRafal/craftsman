@@ -1,0 +1,11 @@
+$ craftsman review view --help
+[exit 0]
+--- stdout
+usage: craftsman review view [-h] [--cwd CWD] [--files FILES] [--hunks HUNKS]
+
+options:
+  -h, --help     show this help message and exit
+  --cwd CWD      Directory inside the repository (default: current)
+  --files FILES  Comma-separated changed file paths, e.g. pkg/a.py,pkg/b.py
+  --hunks HUNKS  Comma-separated hunk ids or ranges, e.g. H3-H17
+--- stderr

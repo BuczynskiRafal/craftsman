@@ -1,0 +1,55 @@
+# Craftsman review packet — round 1
+Base `<BASE7>` · fingerprint `28208b1353a0` · 7 files, +16/−2 lines, 7 hunks (0 carried)
+
+## Intent
+**Task:** Average the prices of a cart and name items nicely
+
+## Hunks
+Each hunk is shown inside its enclosing scope at HEAD: `+` added, `-` removed, unmarked unchanged; numbers are HEAD lines; `[H3]` … `[/H3]` bracket hunk H3. More context: `craftsman review scout H3` (base version, callers, tests) or `craftsman review scout <symbol>`.
+
+### H2 · `app.py` L4–L14 · modified · signals: deletion (→ ripple)
+Scope: `total` (function, L5–L7)
+```python
+[H2]
+  4 
+  5 def total(items):
+  6     """Sum of prices."""
+-       return sum(item["price"] for item in items)
++ 7     return sum(item["price"] for item in items) / len(items)
+  8 
+  9 
+ 10 def label(item):
+-       return item["name"].title()
++11     return item["name"].strip().title()
+ 12 
+ 13 
+ 14 def run(command):
+[/H2]
+```
+Defines/changes: `total`, `label`
+References:
+- `total`: `tests/test_app.py:5` `assert app.total([{'price': 2}]) == 2` · `docs/guide.md:3` ``Use `total` to add prices.``
+- `label`: `docs/guide.md:5` ``Use `label` to name an item.``
+
+### H5 · `lib/util.py` L1–L6 · modified
+Scope: `lines 1-6` (block, L1–L6)
+```python
+[H5]
+  1 def clamp(value, low, high):
+  2     return max(low, min(value, high))
++ 3 
++ 4 
++ 5 def scale(value, factor):
++ 6     return value * factor
+[/H5]
+```
+Defines/changes: `scale`
+References:
+- `scale`: (no other references found)
+
+### Other hunks (index)
+- H1 · NOTES.txt · lines 1-1
+- H3 · docs/guide.md · lines 1-5
+- H4 · extra.py · double
+- H6 · new_name.py · renamed
+- H7 · tests/test_extra.py · lines 1-5

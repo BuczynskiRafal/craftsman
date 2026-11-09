@@ -1,0 +1,6 @@
+$ craftsman review merge F3 F4 --title Small things
+[exit 0]
+--- stdout
+F4 merged into F3 (minor, lib/util.py:5)
+F4 verdict recorded (V1): dismissed (merged into F3)
+--- stderr

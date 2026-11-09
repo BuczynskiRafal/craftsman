@@ -1,0 +1,5 @@
+$ craftsman review view
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: pass exactly one of --files or --hunks

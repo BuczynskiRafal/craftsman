@@ -27,34 +27,29 @@ itself a finding.
 
 ## 1. Sources
 
-List every place where data from outside the trust boundary enters the target: command-line
-arguments, environment variables, files a user or a cloned repository controls, network
-requests and responses, IPC and hook payloads, database rows written by users, model output,
-archive contents, file names.
+List every place where data from outside the trust boundary enters the target, exhaustively
+(`trust` lens probe 1): not only request parameters, but also file names, archive contents, hook
+payloads, environment variables and model output.
 
 ## 2. Sinks
 
-List every place where data can cause an effect: shell and process execution, SQL and other
-query languages, filesystem paths (read, write, delete, permissions), deserializers, template
-and HTML rendering, regular expression engines, outgoing URLs, redirects, logs, crypto and
-token handling, authorization decisions.
+List every place where data can cause an effect (`trust` lens probe 2): process execution,
+queries, filesystem paths, deserializers, rendering, regular expression engines, outgoing URLs,
+logs, token handling and authorization decisions.
 
 ## 3. Paths
 
 For each source that can reach a sink, write the path (`source file:line -> … -> sink
-file:line`) and the guard on it, if any: allow-list validation, parameterized API, argument
-vector instead of a shell string, path normalization plus containment check, safe loader,
-escaping, size or time limit. Then judge:
+file:line`) and the guard on it, if any. Judge it with the probes of the lens (3 paths, 4
+authorization, 5 secrets, 6 insecure defaults, 7 resource exhaustion), and also:
 - **Who controls the source?** Anyone on the network, any user, a repository author, only the
   local admin.
 - **What do they gain?** Code execution, data read or write, privilege, denial of service,
   information leak.
-- **Is the guard sufficient?** Try the classic bypasses for that sink (`..` and absolute paths,
-  symlinks, quotes and `;`, encoded characters, nested quantifiers, internal IP addresses).
+- **Is the guard sufficient?** Try the classic bypass for that sink, then say whether the input
+  passes.
 
-Also check: authorization on new entry points, secrets in logs, files and command lines,
-insecure defaults (permissions, disabled verification, predictable temp names), and fail-open
-behavior when a check errors.
+Fail-open behavior (a check that errors and so allows the action) counts as a missing guard.
 
 ## 4. Report
 

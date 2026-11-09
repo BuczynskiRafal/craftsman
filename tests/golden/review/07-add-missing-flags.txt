@@ -1,0 +1,11 @@
+$ craftsman review add --lens contracts
+[exit 2]
+--- stdout
+--- stderr
+usage: craftsman review add [-h] [--cwd CWD]
+                            [--lens {contracts,craft,design,failure,intent,model,platform,ripple,state,sweep,tests,trust}]
+                            [--file FILE] [--line LINE] [--severity SEVERITY]
+                            [--title TITLE] [--scenario SCENARIO]
+                            [--suggestion SUGGESTION] [--hunter SLOT]
+                            [--from-json PATH] [--check]
+craftsman review add: error: the following arguments are required: --file, --line, --severity, --title, --scenario

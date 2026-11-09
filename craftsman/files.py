@@ -17,6 +17,12 @@ REPLACE_RETRIES = 5
 REPLACE_RETRY_S = 0.05
 
 
+def decode_json_bytes(data: bytes) -> str:
+    """The text of a JSON file as `--from-json` reads it: UTF-16 when it starts with a UTF-16 mark (PowerShell's
+    default), else UTF-8 with or without a BOM. Raises `UnicodeDecodeError` for bytes in neither encoding."""
+    return data.decode("utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig")
+
+
 class UnsafePathError(RuntimeError):
     """A path cannot be written or removed without following a symlink out of its folder."""
 

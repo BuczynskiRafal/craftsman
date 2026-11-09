@@ -1,0 +1,12 @@
+$ craftsman review show --hunks
+[exit 0]
+--- stdout
+H1  NOTES.txt:1-1  [round 1]
+H2  app.py:4-14  [round 1]
+H3  docs/guide.md:1-5  [round 1]
+H4  extra.py:1-2  [round 1]
+H5  lib/util.py:1-6  [round 1]
+H6  new_name.py:0  [round 1]
+H7  tests/test_extra.py:1-5  [round 1]
+stale: run `craftsman review prepare`
+--- stderr

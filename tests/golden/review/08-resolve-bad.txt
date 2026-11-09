@@ -1,0 +1,7 @@
+$ craftsman review resolve F1 --as fixed
+[exit 2]
+--- stdout
+--- stderr
+usage: craftsman review resolve [-h] [--cwd CWD] --as RESOLUTION --note NOTE
+                                ID
+craftsman review resolve: error: the following arguments are required: --note

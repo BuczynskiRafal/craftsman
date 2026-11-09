@@ -1,0 +1,5 @@
+$ craftsman review cover --from-json -
+[exit 0]
+--- stdout
+Coverage recorded (C4): H2 in round 1; 4 hunk(s) left to cover in this round.
+--- stderr

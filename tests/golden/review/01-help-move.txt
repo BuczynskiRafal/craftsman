@@ -1,0 +1,17 @@
+$ craftsman review move --help
+[exit 0]
+--- stdout
+usage: craftsman review move [-h] [--cwd CWD] --line LINE [--file FILE] ID
+
+Point a finding at the right line before it has a verdict, instead of
+recording a duplicate.
+
+positional arguments:
+  ID
+
+options:
+  -h, --help   show this help message and exit
+  --cwd CWD    Directory inside the repository (default: current)
+  --line LINE
+  --file FILE  New file (default: keep the finding's file)
+--- stderr

@@ -14,19 +14,17 @@ from pathlib import Path, PurePosixPath
 from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
-    Reference,
-    Scope,
-    WorktreeIndex,
     commit_sha,
     detect_signals,
     files_without_signal_patterns,
     git_output,
-    is_test_path,
-    reference_kind,
 )
+from craftsman.diffscan_paths import is_test_path
 from craftsman.ledger import reopened_mentions
 from craftsman.lenses import LENSES
 from craftsman.records import FieldError, Ledger, QualitySignal, Round, SignalKind
+from craftsman.text import defang_tokens
+from craftsman.worktree_index import Reference, Scope, WorktreeIndex, reference_kind
 
 MAX_PACKET_CHARS = 120_000
 MAX_VIEW_CHARS = 60_000
@@ -129,9 +127,15 @@ def collect_context(
     symbols: Mapping[str, tuple[str, ...]],
     ledger: Ledger,
     index: WorktreeIndex,
+    full_hunks: Collection[str] = (),
 ) -> PacketContext:
-    """Gather commits, conventions, scopes and references for the hunks under review."""
-    carried = {hunk.id for hunk in round_.hunks if hunk.carried}
+    """Gather commits, conventions, scopes and references for the hunks under review.
+
+    A carried hunk is a one-line stub, except those named in `full_hunks`: a slot can own carried hunks
+    (a sweep spans the whole round), and the view of such a slot must show their code.
+    """
+    shown_in_full = frozenset(full_hunks)
+    carried = {hunk.id for hunk in round_.hunks if hunk.carried and hunk.id not in shown_in_full}
     open_hunks = [hunk for hunk in snap.hunks if hunk.id not in carried]
     open_symbols = {hunk.id: symbols.get(hunk.id, ()) for hunk in open_hunks}
     return PacketContext(
@@ -144,7 +148,11 @@ def collect_context(
         symbols=open_symbols,
         references=_references(index, open_hunks, open_symbols),
         signals_by_hunk=_signals_by_hunk(snap.hunks),
-        carried_from=_carried_from(ledger, round_),
+        carried_from={
+            hunk_id: found
+            for hunk_id, found in _carried_from(ledger, round_).items()
+            if hunk_id not in shown_in_full
+        },
         reopened=reopened_mentions(round_, snap.hunks, symbols),
         test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
         last_runs=_last_runs(ledger, snap),
@@ -224,7 +232,7 @@ def _last_runs(ledger: Ledger, snap: DiffSnapshot) -> tuple[str, ...]:
         if run is not None:
             freshness = "current" if run.fingerprint == snap.fingerprint else "stale"
             lines.append(
-                f"{run.id} `{run.short_command}` ({run.kind}) exit {run.exit_code} ({freshness})"
+                f"{run.id} `{run.short_command}` ({run.kind}) {run.exit_text} ({freshness})"
             )
     return tuple(lines)
 
@@ -357,8 +365,8 @@ def _omit_diffs(
 def _preamble(ctx: PacketContext, assigned: frozenset[str] | None, *, list_hints: bool = True) -> str:
     """The opening sections: only what a hunter lacks elsewhere; a section with nothing to say is left out.
 
-    Lens suggestions are in the risk map `prepare` prints, and the recording commands are in the
-    hunter's agent definition and playbooks.
+    The lenses are in the hunt plan `prepare` prints, and the recording commands are in the
+    hunter's brief (`craftsman review brief`) and agent definition.
     """
     parts = [_header(ctx), _intent(ctx), _conventions_section(ctx)]
     if ctx.unscanned_files:
@@ -512,9 +520,9 @@ def _intent(ctx: PacketContext) -> str:
     """The task and the commits since base, whichever exist."""
     parts = []
     if ctx.task:
-        parts.append(f"**Task:** {ctx.task}")
+        parts.append(f"**Task:** {defang_tokens(ctx.task)}")
     if ctx.commits:
-        parts.append("**Commits since base:**\n" + "\n".join(f"- {commit}" for commit in ctx.commits))
+        parts.append("**Commits since base:**\n" + "\n".join(f"- {defang_tokens(commit)}" for commit in ctx.commits))
     return "## Intent\n" + "\n\n".join(parts) if parts else ""
 
 
@@ -526,13 +534,9 @@ def _conventions_section(ctx: PacketContext) -> str:
 
 def _hunk_summary_line(ctx: PacketContext, hunk: Hunk) -> str:
     scope = ctx.scopes.get(hunk.id)
-    if scope is not None:
-        label = scope.name
-    elif hunk.id in ctx.carried_from:
-        label = f"carried (round {ctx.carried_from[hunk.id]})"
-    else:
-        label = hunk.status
-    return f"- {hunk.id} · {hunk.path} · {label}"
+    carried = f"carried (round {ctx.carried_from[hunk.id]})" if hunk.id in ctx.carried_from else None
+    label = " · ".join(part for part in (scope.name if scope is not None else None, carried) if part)
+    return f"- {hunk.id} · {hunk.path} · {label or hunk.status}"
 
 
 def _hunk_section(ctx: PacketContext, hunk: Hunk, owners: _Owners, detail: _Detail) -> str:

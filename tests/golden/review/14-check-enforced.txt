@@ -1,0 +1,19 @@
+$ craftsman review check --review-only
+[exit 1]
+--- stdout
+**Craftsman review: INCOMPLETE (1 open items)**
+
+Round 1 (current): 7 hunks in 7 files, +20/-2 lines.
+Coverage: 0/3 slots done; 0 hunk(s) carried from earlier rounds.
+Findings: none.
+Runs: none recorded.
+Hunt: 3 slots - 3 pending (W1-1..W1-3)
+
+**Next actions**
+1. [no-isolation] No Craftsman subagent was recorded for round 1. If you launched hunters, the Craftsman hooks did not see them: run `craftsman doctor` and fix the install; do not relaunch hunters that already ran. If you did not launch any, launch them now, all in one step: W1-1..W1-3. For each, start a craftsman-reviewer subagent whose whole prompt is: `You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` (Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent craftsman-reviewer; Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)
+
+**Hunt slots**
+  W1-1  H1-H7     intent, ripple, tests       22 lines  [not launched]
+  W1-2  H2,H4-H7  contracts, failure, sweep   19 lines  [not launched]
+  W1-3  H1-H7     craft, design (simplicity)  22 lines  [not launched] [Claude Code: model haiku]
+--- stderr

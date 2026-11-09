@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from craftsman import runner
+from craftsman.gatecheck import passing_runs
+from craftsman.ledger import load
 from craftsman.records import OUTPUT_TAIL_CHARS
 
 from tests.support import REPO_ROOT, EvidenceRepo, assert_cli_error
@@ -94,6 +96,89 @@ class RunTests(unittest.TestCase):
     def test_trivial_commands_are_flagged(self) -> None:
         proc = self.repo.cli("run", "--kind", "test", "--", "echo", "ok")
         self.assertIn("is trivial and does not count as verification", proc.stderr)
+
+    def run_reporting(self, output: str, *flags: str, kind: str = "test", exit_code: int = 0) -> subprocess.CompletedProcess[str]:
+        """Run a command that prints `output` as a test runner would and exits with `exit_code`."""
+        script = f"import sys; sys.stdout.write({output!r}); assert True; sys.exit({exit_code})"
+        return self.repo.cli("run", "--kind", kind, *flags, "--", sys.executable, "-c", script, check=False)
+
+    def test_a_test_run_records_the_tests_its_runner_reported(self) -> None:
+        proc = self.run_reporting("collected 3 items\n\n===== 3 passed in 0.02s =====\n")
+
+        (run,) = self.runs()
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((run["tests_ran"], run["min_tests"]), (3, 1))
+        self.assertNotIn("does not count", proc.stderr)
+        self.assertTrue(self.passing_ids())
+
+    def test_unrecognized_output_is_recorded_as_unknown_and_still_passes(self) -> None:
+        self.run_reporting("all good\n")
+
+        (run,) = self.runs()
+
+        self.assertIsNone(run["tests_ran"])
+        self.assertTrue(self.passing_ids())
+
+    def test_a_run_that_ran_no_tests_is_recorded_but_does_not_pass(self) -> None:
+        proc = self.run_reporting("collected 0 items\n\n===== no tests ran in 0.01s =====\n")
+
+        (run,) = self.runs()
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual((run["exit_code"], run["tests_ran"]), (0, 0))
+        self.assertIn("R1 ran 0 tests (minimum 1); it does not count as a passing run", proc.stderr)
+        self.assertIn("--min-tests 0", proc.stderr)
+        self.assertEqual(self.passing_ids(), [])
+
+    def test_min_tests_raises_or_lowers_the_bar(self) -> None:
+        output = "Ran 3 tests in 0.1s\n\nOK\n"
+        self.run_reporting(output, "--min-tests", "4")
+        self.run_reporting(output, "--min-tests", "3")
+        switched_off = self.run_reporting("Ran 0 tests in 0.0s\n", "--min-tests", "0")
+
+        self.assertIn("R3 reported 0 tests and passes only because of --min-tests 0", switched_off.stderr)
+        self.assertEqual(
+            [(run["tests_ran"], run["min_tests"]) for run in self.runs()], [(3, 4), (3, 3), (0, 0)]
+        )
+        self.assertEqual(self.passing_ids(), ["R2", "R3"])
+
+    def test_a_negative_minimum_is_a_usage_error(self) -> None:
+        proc = self.run_reporting("", "--min-tests", "-1")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--min-tests must be >= 0", proc.stderr)
+        self.assertEqual(self.runs(), [])
+
+    def test_the_whole_output_is_counted_not_only_the_stored_tail(self) -> None:
+        self.run_reporting("7 passed in 0.1s\n" + "noise line\n" * 1000)
+
+        (run,) = self.runs()
+
+        self.assertEqual(run["tests_ran"], 7)
+        self.assertNotIn("passed", str(run["output_tail"]))
+
+    def test_summaries_of_several_runners_add_up(self) -> None:
+        self.run_reporting("test result: ok. 4 passed; 0 failed; 0 ignored\ntest result: ok. 1 passed; 0 failed; 0 ignored\n")
+        self.assertEqual(self.runs()[0]["tests_ran"], 5)
+
+    def test_the_commands_exit_code_still_decides_a_failing_run(self) -> None:
+        proc = self.run_reporting("1 failed, 2 passed in 0.1s\n", exit_code=1)
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual((self.runs()[0]["exit_code"], self.runs()[0]["tests_ran"]), (1, 3))
+
+    def test_only_test_runs_are_counted(self) -> None:
+        self.run_reporting("0 passed in 0.1s\n", kind="e2e")
+
+        (run,) = self.runs()
+
+        self.assertIsNone(run["tests_ran"])
+        self.assertEqual(self.passing_ids(), ["R1"])
+
+    def passing_ids(self) -> list[str]:
+        ledger = load(self.repo.ledger_dir / "ledger.json")
+        fingerprint = ledger.runs[0].fingerprint if ledger.runs else ""
+        return [run.id for run in passing_runs(ledger, fingerprint)]
 
     def test_help_is_printed_without_a_command(self) -> None:
         for flag in ("-h", "--help"):

@@ -1,0 +1,23 @@
+$ craftsman review show
+[exit 0]
+--- stdout
+Round 1 prepared <TIME> · 7 hunks (0 carried) · current
+Packet: <REPO>/.git/craftsman/packet-1.md
+
+Coverage (covered/total non-carried hunks):
+  3/7 hunks (missing H3,H4,H6,H7)
+
+| ID | Severity | Verdict | Resolution | Location | Title |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| F1 | major | — | — | `app.py:8` | Empty cart divides by zero |
+| F2 | major | — | — | `app.py:11` | Label crashes on None name |
+| F3 | minor | — | — | `lib/util.py:5` | scale has no test |
+| F4 | nit | — | — | `extra.py:2` | Magic number |
+
+F1 scenario (lens contracts): total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError
+F2 scenario (lens contracts): label({}) raises KeyError
+F3 scenario (lens ripple): scale() is new and nothing calls it
+F4 scenario (lens craft): 2 is a magic number in double()
+
+Runs: none recorded.
+--- stderr

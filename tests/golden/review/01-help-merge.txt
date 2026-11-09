@@ -1,0 +1,26 @@
+$ craftsman review merge --help
+[exit 0]
+--- stdout
+usage: craftsman review merge [-h] [--cwd CWD] [--title TITLE]
+                              [--scenario SCENARIO] [--suggestion SUGGESTION]
+                              TARGET_ID DUP_ID [DUP_ID ...]
+
+Combine unjudged findings that share a root cause into a single finding
+(listing all consequences in its scenario) and dismiss the duplicates. Merge
+only when ONE fix removes every consequence. Different fixes are separate
+findings, even on the same line, file, or category (for example, a missing
+`--json` flag in `craftsman status` and a stale README example are two
+separate findings, not one 'housekeeping' finding).
+
+positional arguments:
+  TARGET_ID             Finding id to keep (e.g. F1)
+  DUP_ID                Duplicate finding ids to fold into TARGET_ID
+
+options:
+  -h, --help            show this help message and exit
+  --cwd CWD             Directory inside the repository (default: current)
+  --title TITLE         Updated title for the grouped finding
+  --scenario SCENARIO   Combined root-cause -> consequences scenario
+  --suggestion SUGGESTION
+                        Updated suggestion for the grouped finding
+--- stderr

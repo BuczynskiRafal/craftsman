@@ -1,0 +1,8 @@
+$ craftsman review cover --hunks H1
+[exit 2]
+--- stdout
+--- stderr
+usage: craftsman review cover [-h] [--cwd CWD] [--hunks HUNKS] [--files FILES]
+                              [--note NOTE] [--hunter SLOT] [--from-json PATH]
+                              [--check]
+craftsman review cover: error: the following arguments are required: --note

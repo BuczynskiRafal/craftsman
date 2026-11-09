@@ -1,0 +1,5 @@
+$ craftsman review report --partial
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --partial requires --review-only; pass `craftsman review report --review-only --partial`

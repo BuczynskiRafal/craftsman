@@ -336,7 +336,7 @@ Run by the simplicity hunter together with `craft`, over the whole slice rather 
 
 ## `sweep` — Final sweep: interactions between hunks
 
-Run over the whole diff by a hunter who is not busy with other lenses. Read the diff top to
+Run over the whole diff by one slot, alone or beside up to two core lenses. Read the diff top to
 bottom once more and look only for what single-lens passes miss:
 - two hunks that are each correct but disagree (one writes a format the other does not read; one
   adds a step the other skips; one renames, the other still uses the old name);

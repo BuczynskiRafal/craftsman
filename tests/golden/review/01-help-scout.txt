@@ -1,0 +1,19 @@
+$ craftsman review scout --help
+[exit 0]
+--- stdout
+usage: craftsman review scout [-h] [--cwd CWD] [--base BASE] TARGET
+
+Grounded context in at most 12,000 characters, no opinions: for hunks (H3,
+H3-H5, H3,H7) and for path:line, the base version of the enclosing scope, up
+to 3 callers per symbol it defines and up to 3 tests; for a symbol name, its
+definitions, references and tests.
+
+positional arguments:
+  TARGET       H3, H3-H5, H3,H7, path:line or a symbol name
+
+options:
+  -h, --help   show this help message and exit
+  --cwd CWD    Directory inside the repository (default: current)
+  --base BASE  Revision the base version comes from (default: the round's
+               base, else HEAD)
+--- stderr

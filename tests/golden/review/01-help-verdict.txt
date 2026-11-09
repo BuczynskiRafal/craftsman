@@ -1,0 +1,22 @@
+$ craftsman review verdict --help
+[exit 0]
+--- stdout
+usage: craftsman review verdict [-h] [--cwd CWD] [--as VERDICT]
+                                [--evidence EVIDENCE] [--run RUN]
+                                [--from-json PATH] [--check]
+                                [ID]
+
+positional arguments:
+  ID
+
+options:
+  -h, --help           show this help message and exit
+  --cwd CWD            Directory inside the repository (default: current)
+  --as VERDICT
+  --evidence EVIDENCE
+  --run RUN            Id of a recorded run that supports the verdict
+  --from-json PATH     Bulk JSON list of {"id", "as", "evidence", "run"?}
+                       objects (use - for stdin)
+  --check              Validate without recording to the ledger or consuming
+                       an inbox file
+--- stderr

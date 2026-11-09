@@ -1,0 +1,15 @@
+$ craftsman review add --from-json -
+[exit 1]
+--- stdout
+--- stderr
+craftsman review add: 2 of 2 entries rejected; nothing was recorded.
+Fix all of them, then send the corrected list once:
+  entry 1 (F3): title: must have 8..160 characters (got 1)
+  entry 1 (F3): scenario: must have at least 20 characters (got 1)
+  entry 2 (F4): lens: must be one of contracts, craft, design, failure, intent, model, platform, ripple, state, sweep, tests, trust (got 'nope')
+  entry 2 (F4): severity: must be one of blocker, major, minor, nit (got 'huge')
+  entry 2 (F4): extra: is not a known field
+  entry 2 (F4): file: 'missing.py' does not exist in the work tree or the diff
+  entry 2 (F4): line: must be >= 1 (got 0)
+  entry 2 (F4): title: must have 8..160 characters (got 0)
+  entry 2 (F4): scenario: must have at least 20 characters (got 1)

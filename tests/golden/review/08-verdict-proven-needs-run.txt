@@ -1,0 +1,5 @@
+$ craftsman review verdict F1 --as proven --evidence ran total([]) and got ZeroDivisionError
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --run is required for a 'proven' verdict: pass --run <id> of the run that demonstrates the defect (record it with `craftsman run --kind repro -- ...`)

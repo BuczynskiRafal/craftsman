@@ -1,0 +1,5 @@
+$ craftsman review prepare --paths nothing.py
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: --paths 'nothing.py' matched no changed files in the diff since <BASE12> (changed files: NOTES.txt, app.py, docs/guide.md, extra.py, lib/util.py)

@@ -1,0 +1,5 @@
+$ craftsman review waive-run R9 --reason gone
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: unknown run 'R9'; recorded runs: R1

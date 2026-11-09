@@ -1,0 +1,5 @@
+$ craftsman review cover --hunks H1,H2,H3,H4,H5,H6,H7 --note H1 f_1.py:1: x=1 -> returns 2 on boundary input; H2 f_2.py:2: x=2 -> returns 3 on boundary input; H3 f_3.py:3: x=3 -> returns 4 on boundary input; H4 f_4.py:4: x=4 -> returns 5 on boundary input; H5 f_5.py:5: x=5 -> returns 6 on boundary input; H6 f_6.py:6: x=6 -> returns 7 on boundary input; H7 f_7.py:7: x=7 -> returns 8 on boundary input
+[exit 0]
+--- stdout
+Coverage recorded (C5): H1, H2, H3, H4, H5, H6, H7 in round 1; 0 hunk(s) left to cover in this round.
+--- stderr

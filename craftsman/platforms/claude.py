@@ -29,6 +29,7 @@ from craftsman.generated import (
     rewrite_json,
     write_marked,
 )
+from craftsman.hook_budget import HOOK_TIMEOUTS_S
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.manifest import ModifiedKind, TargetKind
 from craftsman.paths import default_claude_dir
@@ -46,15 +47,16 @@ CLAUDE_SUBAGENT_NOTE = (
     "Subagents: the Agent/Task tool with `subagent_type` `craftsman-reviewer` / `craftsman-verifier`."
 )
 CLAUDE_HOOK_EVENTS: dict[str, tuple[str, int]] = {
-    "UserPromptSubmit": ("prompt", 30),
-    "Stop": ("stop", 60),
-    "SubagentStart": ("subagent-start", 30),
-    "SubagentStop": ("subagent-stop", 30),
-    "PreToolUse": ("pre-tool", 30),
+    "UserPromptSubmit": ("prompt", HOOK_TIMEOUTS_S["prompt"]),
+    "Stop": ("stop", HOOK_TIMEOUTS_S["stop"]),
+    "SubagentStart": ("subagent-start", HOOK_TIMEOUTS_S["subagent-start"]),
+    "SubagentStop": ("subagent-stop", HOOK_TIMEOUTS_S["subagent-stop"]),
+    "PreToolUse": ("pre-tool", HOOK_TIMEOUTS_S["pre-tool"]),
 }
-# Claude Code runs a PreToolUse hook for matched tools; pre-tool enforces both the work-tree
-# guard (on Bash) and the repository search scope (on Bash, Read, Grep, Glob, and LS).
-CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash|Read|Grep|Glob|LS"}
+# Claude Code runs a PreToolUse hook for matched tools; pre-tool enforces the work-tree guard and the command
+# policy (on Bash), the repository search scope (on Bash, Read, Grep, Glob, and LS) and the protection of the
+# ledger and the transcripts against the file-writing tools (Write, Edit, MultiEdit, NotebookEdit).
+CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash|Read|Grep|Glob|LS|Write|Edit|MultiEdit|NotebookEdit"}
 
 _QUOTED = r'"(?:[^"\\]|\\.)*"'
 _QUOTED_SHIM = r'"(?:[^"\\]|\\.)*craftsman-cli\.py"'

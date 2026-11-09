@@ -4,24 +4,26 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from craftsman import diffscan
 from craftsman.diffscan import (
     DiffScanError,
     Hunk,
-    WorktreeIndex,
     detect_deep_hint_signals,
     detect_signals,
     files_without_signal_patterns,
     git_dir,
     hunks_docs_only,
-    is_agent_prompt_path,
     resolve_base_sha,
     snapshot,
 )
+from craftsman.diffscan_paths import is_agent_prompt_path
+from craftsman.worktree_index import REFERENCES_PER_FILE, WorktreeIndex
 
 from tests.support import GitRepo, change_hunk, make_hunk, make_snap
 
@@ -1174,7 +1176,7 @@ class ReferenceSearchTests(RepoTestCase):
         )
         alphabetical = WorktreeIndex(self.repo.root).references("compute_total", limit=7)
 
-        per_file = diffscan.REFERENCES_PER_FILE
+        per_file = REFERENCES_PER_FILE
         self.assertEqual(
             [(ref.path, ref.line) for ref in ranked],
             [("z_use.py", 1), *(("defs.py", line) for line in range(1, per_file + 1))],
@@ -1293,6 +1295,52 @@ class DeepHintSignalTests(unittest.TestCase):
         for path in ("tests/test_auth.py", "test_x.py", "config.yaml", "settings.json", "README.md"):
             with self.subTest(path=path):
                 self.assertEqual(self.fired(path, "verify_token(t)", "os.system(cmd)"), {})
+
+
+class GitBudgetTests(RepoTestCase):
+    def test_without_a_budget_a_git_call_gets_its_own_limit(self) -> None:
+        self.assertEqual(diffscan.git_time_left(), diffscan.GIT_TIMEOUT_S)
+        self.assertEqual(diffscan.git_time_left(5.0), 5.0)
+
+    def test_a_budget_caps_what_the_next_call_may_take(self) -> None:
+        with diffscan.git_budget(3.0):
+            self.assertLessEqual(diffscan.git_time_left(), 3.0)
+            self.assertGreater(diffscan.git_time_left(), 0.0)
+            self.assertLessEqual(diffscan.git_time_left(1.0), 1.0)
+
+    def test_nested_budgets_cannot_extend_the_outer_one(self) -> None:
+        with diffscan.git_budget(2.0), diffscan.git_budget(500.0):
+            self.assertLessEqual(diffscan.git_time_left(), 2.0)
+        self.assertEqual(diffscan.git_time_left(), diffscan.GIT_TIMEOUT_S)
+
+    def test_a_spent_budget_runs_no_git_and_tells_the_listener_once_per_call(self) -> None:
+        told: list[str] = []
+        with diffscan.git_budget(0.0, on_timeout=told.append):
+            with self.assertRaises(diffscan.GitTimeoutError) as caught:
+                git_dir(self.repo.root)
+        self.assertIn("budget is spent", str(caught.exception))
+        self.assertEqual(told, [str(caught.exception)])
+
+    def test_a_timeout_error_is_a_diff_scan_error(self) -> None:
+        self.assertTrue(issubclass(diffscan.GitTimeoutError, DiffScanError))
+
+    def test_a_git_call_that_times_out_is_reported_with_the_limit_it_had(self) -> None:
+        told: list[str] = []
+        expired = subprocess.TimeoutExpired(["git"], 1)
+        with (
+            diffscan.git_budget(30.0, on_timeout=told.append),
+            mock.patch("craftsman.diffscan.subprocess.run", side_effect=expired),
+            self.assertRaises(diffscan.GitTimeoutError),
+        ):
+            git_dir(self.repo.root)
+        (message,) = told
+        self.assertRegex(message, r"^`git [a-z-]+` timed out after \d+(\.\d+)?s in ")
+
+    def test_the_budget_ends_with_its_block(self) -> None:
+        with diffscan.git_budget(0.0):
+            pass
+
+        self.assertTrue(git_dir(self.repo.root).is_dir())
 
 
 if __name__ == "__main__":

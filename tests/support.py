@@ -6,12 +6,13 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -21,45 +22,83 @@ from craftsman.diffscan import ChangeStatus, DiffSnapshot, Hunk
 from craftsman.gate import GateOwner, GateState, save_state, state_path_for
 from craftsman.install import install_main
 from craftsman.ledger import add_coverage, add_finding, add_run, open_round
-from craftsman.manifest import (
-    InstallManifest,
-    TargetKind,
-    TargetManifest,
-    load_manifest,
-    save_manifest,
-)
 from craftsman.records import (
+    AgentEvent,
+    AgentEventKind,
+    HuntPlan,
     Ledger,
     QualitySignal,
     Round,
     RunKind,
     Severity,
+    Slot,
+    SlotKind,
     format_timestamp,
     parse_timestamp,
 )
 from craftsman.uninstall import uninstall_main
 
+from tests.ambient import AMBIENT_PLATFORM_ENV_VARS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_COUNT = len(json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))["skills"])
-AMBIENT_PLATFORM_ENV_VARS = frozenset(
-    {
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_SESSION_ID",
-        "CLAUDE_CODE_SESSION_ID",
-        "ANTIGRAVITY_AGENT",
-        "AGY_MANAGED_ENV",
-        "ANTIGRAVITY_CONVERSATION_ID",
-        "ANTIGRAVITY_SESSION_ID",
-        "COPILOT_CLI",
-        "GITHUB_COPILOT_CLI",
-        "COPILOT_SESSION_ID",
-        "VSCODE_PID",
-        "VSCODE_IPC_HOOK",
-        "TERM_PROGRAM",
-        "CRAFTSMAN_SESSION_ID",
-    }
+REMOVED_SKILLS = (
+    "code-quality",
+    "extreme-optimizer",
+    "high-level-commit-message",
+    "leetcode-style-code-reviewer",
 )
+
+
+def repo_with_removed_skills(tmp: Path) -> Path:
+    """The assets of a Craftsman release that still shipped `REMOVED_SKILLS`, for upgrade tests."""
+    repo = tmp / "old-release"
+    for folder in ("skills", "rules", "scripts", "templates"):
+        shutil.copytree(REPO_ROOT / folder, repo / folder, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(REPO_ROOT / "hooks.json", repo / "hooks.json")
+    (repo / "craftsman").mkdir()
+    (repo / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
+    for name in REMOVED_SKILLS:
+        skill = repo / "skills" / name
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: The removed {name} skill.\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+    return repo
+
+
+def write_pre_4_0_install(base: Path) -> Path:
+    """A manifest of Craftsman 3.0 to 3.2 (`schema_version: 1`) with a global git hooks target."""
+    hooks_dir = base / "git-hooks"
+    paths = [str(hooks_dir / "commit-msg"), str(hooks_dir / "pre-push")]
+    hooks_dir.mkdir(parents=True)
+    for path in paths:
+        Path(path).write_text("#!/bin/sh\n", encoding="utf-8")
+    manifest = {
+        "schema_version": 1,
+        "version": "3.2.0",
+        "mode": "copy",
+        "created_paths": paths,
+        "created_dirs": [str(hooks_dir)],
+        "previous_hooks_path": None,
+        "hooks_dir": str(hooks_dir),
+        "targets": {
+            "git_hooks": {
+                "target": "git_hooks",
+                "mode": "copy",
+                "version": "3.2.0",
+                "created_paths": paths,
+                "created_dirs": [str(hooks_dir)],
+                "modified_files": {},
+                "previous_hooks_path": None,
+                "hooks_dir": str(hooks_dir),
+            }
+        },
+    }
+    manifest_path = base / ".craftsman-install.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return manifest_path
 
 
 def coverage_note(hunk_ids: Sequence[str]) -> str:
@@ -73,7 +112,7 @@ def coverage_note(hunk_ids: Sequence[str]) -> str:
 # --- in-memory ledgers ----------------------------------------------------------------------
 
 BASE_SHA = "b" * 40
-FINDING = {
+FINDING: dict[str, Any] = {
     "lens": "intent",
     "path": "app.py",
     "line": 3,
@@ -194,6 +233,61 @@ def shifted(timestamp: str, seconds: float) -> str:
     return format_timestamp(parse_timestamp(timestamp) + timedelta(seconds=seconds))
 
 
+def make_slot(
+    slot_id: str = "W1-1",
+    *,
+    hunks: Sequence[str] = ("H1",),
+    lenses: Sequence[str] = ("intent",),
+    kind: SlotKind | None = None,
+    trigger: str | None = None,
+    changed_lines: int = 1,
+) -> Slot:
+    """A valid slot for `slot_id`; its generation and kind follow the id unless `kind` says otherwise."""
+    suffix = slot_id.split("-", 1)[1]
+    default_kind: SlotKind = "fresh" if suffix.startswith("X") else "variant" if suffix.startswith("F") else "bug"
+    if trigger is None and suffix.startswith("X"):
+        trigger = "deep"
+    if trigger is None and suffix.startswith("F"):
+        trigger = suffix
+    return Slot(
+        id=slot_id,
+        generation=int(slot_id[1]),
+        kind=kind or default_kind,
+        hunks=tuple(hunks),
+        lenses=tuple(lenses),
+        changed_lines=changed_lines,
+        trigger=trigger,
+    )
+
+
+def planned(ledger: Ledger, *slots: Slot, reasons: Sequence[str] = ()) -> Ledger:
+    """`ledger` with the hunt plan `slots` attached to its latest round."""
+    plan = HuntPlan(tuple(reasons), tuple(slots))
+    latest = replace(ledger.rounds[-1], plan=plan)
+    return replace(ledger, rounds=(*ledger.rounds[:-1], latest))
+
+
+T0 = "2026-01-01T00:00:00.000Z"
+
+
+def at(seconds: float) -> str:
+    """The timestamp `seconds` after `T0`: a fixed clock for ledgers whose record times matter."""
+    return shifted(T0, seconds)
+
+
+def agent_event(
+    event: AgentEventKind,
+    agent: str,
+    agent_id: str,
+    seconds: float,
+    *,
+    platform: str = "claude",
+    records: tuple[str, ...] | None = None,
+) -> AgentEvent:
+    """A subagent start or stop event `seconds` after `T0`."""
+    return AgentEvent(platform, event, agent, agent_id, at(seconds), records=records)
+
+
 def assert_cli_error(
     case: unittest.TestCase, proc: subprocess.CompletedProcess[str], exit_code: int, fragment: str
 ) -> None:
@@ -221,45 +315,173 @@ def open_gate(
 # --- Antigravity transcript entries ---------------------------------------------------------
 
 
-def user_input(step: int, content: str) -> dict[str, Any]:
-    return {"step_index": step, "type": "USER_INPUT", "content": content}
+# --- Antigravity transcripts, in the shapes the platform writes (compact `transcript.jsonl`) -----------------------
+
+AGY_EPOCH = parse_timestamp(T0)  # the fixed clock of `at()`: transcripts and in-memory ledgers share one time axis
 
 
-def invoke_subagent(step: int, *specs: dict[str, str]) -> dict[str, Any]:
-    return {
-        "step_index": step,
-        "type": "PLANNER_RESPONSE",
-        "tool_calls": [{"name": "invoke_subagent", "args": {"Subagents": json.dumps(list(specs))}}],
+def agy_time(seconds: float = 0) -> str:
+    """A whole-second `created_at` `seconds` after a fixed epoch (Antigravity writes whole seconds)."""
+    return (AGY_EPOCH + timedelta(seconds=int(seconds))).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def user_input(step: int, content: str, at: float | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step_index": step, "source": "USER_EXPLICIT", "type": "USER_INPUT", "content": content}
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def long_user_input(step: int, request: str, at: float | None = None) -> dict[str, Any]:
+    """A `USER_INPUT` as `transcript_full.jsonl` has a long request: wrapped in `<USER_REQUEST>`, followed by metadata
+    Antigravity appends (so the request's closing tag is not at the end of the text, where the cut keeps the tail)."""
+    metadata = "<ADDITIONAL_METADATA>\n" + "The user has 3 active documents.\n" * 120 + "</ADDITIONAL_METADATA>"
+    return user_input(step, f"<USER_REQUEST>\n{request}\n</USER_REQUEST>\n{metadata}", at)
+
+
+def cut_user_input(entry: dict[str, Any], *, head: int = 1500, tail: int = 2000) -> dict[str, Any]:
+    """`entry` as the compact `transcript.jsonl` keeps a long `content`: the head, `<truncated N bytes>`, the tail."""
+    content = str(entry["content"])
+    omitted = len(content.encode("utf-8")) - head - tail
+    assert omitted > 0, "the content must be longer than head + tail to be cut"
+    cut = f"{content[:head]}\n<truncated {omitted} bytes>\n{content[-tail:]}"
+    return {**entry, "content": cut, "truncated_fields": ["content"]}
+
+
+def agy_call(name: str, *, encoded: bool = True, **args: Any) -> dict[str, Any]:
+    """One tool call of a `PLANNER_RESPONSE`; `transcript.jsonl` JSON-encodes the values of `args`, `transcript_full.jsonl` does not."""
+    return {"name": name, "args": {key: json.dumps(value) if encoded else value for key, value in args.items()}}
+
+
+def invoke_call(role: str = "craftsman-reviewer", *, type_name: str = "self", encoded: bool = True) -> dict[str, Any]:
+    return agy_call("invoke_subagent", encoded=encoded, TypeName=type_name, Role=role, Prompt="Review packet-1.md")
+
+
+def planner(step: int, *calls: dict[str, Any], at: float | None = None, status: str = "DONE") -> dict[str, Any]:
+    """A model step: a `PLANNER_RESPONSE`; without calls it ends the turn."""
+    entry: dict[str, Any] = {"step_index": step, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": status}
+    if calls:
+        entry["tool_calls"] = list(calls)
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def generic(step: int, content: str, at: float | None = None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"step_index": step, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": content}
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def subagent_ack(step: int, sub_id: str, at: float | None = 0, *, app_dir: str = "/app") -> dict[str, Any]:
+    """The acknowledgement `invoke_subagent` returns: one per call, with the new conversation."""
+    info = {
+        "conversationId": sub_id,
+        "logAbsoluteUri": f"file://{app_dir}/brain/{sub_id}/.system_generated/logs/transcript.jsonl",
+        "workspaceUris": ["file:///work/repo"],
     }
+    text = (
+        "Created At: 2026-11-07T11:43:20+01:00\nCompleted At: 2026-11-07T11:44:08+01:00\n"
+        f"Created the following subagent:\n{json.dumps(info, indent=2)}\n"
+        "The subagent will send you a message when it has completed its task or requires guidance."
+    )
+    return generic(step, text, at)
 
 
-def subagent_ack(step: int, *sub_ids: str) -> dict[str, Any]:
-    ids = ",\n".join(f'  "conversationId": "{sub_id}"' for sub_id in sub_ids)
-    return {
+def parent_message(step: int, sender: str, at: float | None = 0) -> dict[str, Any]:
+    """The first entry of a subagent's transcript: the message of the conversation that launched it."""
+    content = (
+        "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as "
+        f"important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-07T10:44:08Z "
+        f"sender={sender} priority=MESSAGE_PRIORITY_HIGH content=Review the hunks of your slot\n</SYSTEM_MESSAGE>"
+    )
+    entry: dict[str, Any] = {"step_index": step, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "content": content}
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
+
+
+def subagent_done(step: int, sub_id: str, at: float | None = None) -> dict[str, Any]:
+    """The message a subagent sends its parent with `send_message`, as the parent's transcript shows it."""
+    entry: dict[str, Any] = {
         "step_index": step,
-        "type": "GENERIC",
-        "content": f"Created the following subagent:\n{{\n{ids}\n}}",
-    }
-
-
-def subagent_done(step: int, sub_id: str) -> dict[str, Any]:
-    return {
-        "step_index": step,
+        "source": "SYSTEM",
         "type": "SYSTEM_MESSAGE",
-        "content": f"<SYSTEM_MESSAGE>[Message] sender={sub_id} content=done</SYSTEM_MESSAGE>",
+        "content": f"<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-07T10:45:12Z sender={sub_id} content=done\n</SYSTEM_MESSAGE>",
     }
+    if at is not None:
+        entry["created_at"] = agy_time(at)
+    return entry
 
 
 def ask_question(step: int) -> dict[str, Any]:
-    return {
-        "step_index": step,
-        "type": "PLANNER_RESPONSE",
-        "tool_calls": [{"name": "ask_question", "args": {"questions": []}}],
-    }
+    return planner(step, agy_call("ask_question", questions=[]))
 
 
-# An Antigravity `invoke_subagent` spec of a Craftsman reviewer.
-REVIEWER = {"TypeName": "self", "Role": "craftsman-reviewer", "Prompt": "Review packet-1.md"}
+def launch_reviewers(first_step: int, *sub_ids: str, at: float = 0, role: str = "craftsman-reviewer") -> list[dict[str, Any]]:
+    """One `PLANNER_RESPONSE` that launches a subagent per id, then the acknowledgements in call order."""
+    calls = [invoke_call(role) for _ in sub_ids]
+    return [
+        planner(first_step, *calls, at=at),
+        *(subagent_ack(first_step + 1 + index, sub_id, at) for index, sub_id in enumerate(sub_ids)),
+    ]
+
+
+class AgyApp:
+    """A throwaway Antigravity app data directory (`brain/<conversation id>/.system_generated/...`)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def conversation_dir(self, conversation_id: str) -> Path:
+        return self.root / "brain" / conversation_id
+
+    def transcript_path(self, conversation_id: str, *, full: bool = False) -> Path:
+        name = "transcript_full.jsonl" if full else "transcript.jsonl"
+        return self.conversation_dir(conversation_id) / ".system_generated" / "logs" / name
+
+    def write_transcript(self, conversation_id: str, *entries: dict[str, Any], full: bool = False) -> Path:
+        path = self.transcript_path(conversation_id, full=full)
+        write_jsonl(path, *entries)
+        return path
+
+    def write_subagent(
+        self,
+        parent_id: str,
+        sub_id: str,
+        *entries: dict[str, Any],
+        role: str = "craftsman-reviewer",
+        state: str = "SUBAGENT_STATE_ALIVE",
+        killed_at: float | None = None,
+    ) -> None:
+        """A subagent of `parent_id`: its transcript (opened by the parent's message) and the parent's registry file."""
+        self.write_transcript(sub_id, parent_message(0, parent_id), *entries)
+        registry = self.conversation_dir(parent_id) / ".system_generated" / "subagents" / f"{sub_id}.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(
+            json.dumps(
+                {
+                    "conversationId": sub_id,
+                    "subagentDescriptor": {"typeName": "self", "role": role},
+                    "state": state,
+                    "spawnStepIndex": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        if killed_at is not None:
+            os.utime(registry, (AGY_EPOCH.timestamp() + killed_at, AGY_EPOCH.timestamp() + killed_at))
+
+    def payload(self, conversation_id: str, workspace: Path, **extra: Any) -> dict[str, Any]:
+        """The common fields of an Antigravity hook payload."""
+        return {
+            "conversationId": conversation_id,
+            "workspacePaths": [str(workspace)],
+            "artifactDirectoryPath": str(self.conversation_dir(conversation_id)),
+            "transcriptPath": str(self.transcript_path(conversation_id)),
+            **extra,
+        }
 
 
 class GitRepo:
@@ -373,7 +595,7 @@ class EvidenceRepo(GitRepo):
         """Everything the gate needs at the current code: a round, coverage and runs."""
         self.cli("review", "prepare", *(["--deep"] if deep else []))
         self.cover_all()
-        self.cli("run", "--kind", "test", "--", sys.executable, "-c", "print('tests ok')")
+        self.cli("run", "--kind", "test", "--", sys.executable, "-c", "assert True; print('tests ok')")
         if deep:
             self.cli("run", "--kind", "e2e", "--", sys.executable, "-c", "print('e2e ok')")
 
@@ -419,7 +641,7 @@ def snapshot_tree(root: Path) -> dict[str, tuple[str, bytes | str, int]]:
 
 
 class IsolatedHomeTestCase(unittest.TestCase):
-    """A throwaway home folder, CRAFTSMAN_HOME and global git configuration; the rest of the
+    """A throwaway home folder and global git configuration; the rest of the
     environment is cleared, so no detected platform or setting of the real user leaks in."""
 
     def setUp(self) -> None:
@@ -467,100 +689,3 @@ class IsolatedHomeTestCase(unittest.TestCase):
 
     def assert_ok(self, result: CliResult) -> None:
         self.assertEqual(result.code, 0, result.err)
-
-    def write_legacy_git_hooks(
-        self,
-        base_dir: Path | None = None,
-        *,
-        previous_hooks_path: str | None = None,
-        set_hooks_path: bool = True,
-    ) -> Path:
-        """Create a Craftsman 3.x `TargetKind.GIT_HOOKS` install under `base_dir` (`~/.craftsman`)."""
-        base = base_dir if base_dir is not None else self.home / ".craftsman"
-        hooks_dir = base / "git-hooks"
-        scripts_dir = base / "scripts"
-        existing = load_manifest(base)
-        created_dirs: list[str] = []
-        for directory in (base, hooks_dir, scripts_dir):
-            if not directory.exists():
-                created_dirs.append(str(directory))
-                directory.mkdir(parents=True, exist_ok=True)
-        hook_files = [hooks_dir / "commit-msg", hooks_dir / "pre-push"]
-        shared_script = scripts_dir / "craftsman-stop-gate.py"
-        for hook_file in hook_files:
-            hook_file.write_text("#!/bin/sh\n", encoding="utf-8")
-        if not shared_script.exists():
-            shared_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-        target = TargetManifest(
-            created_paths=tuple(str(p) for p in (*hook_files, shared_script)),
-            created_dirs=tuple(created_dirs),
-            previous_hooks_path=previous_hooks_path,
-            hooks_dir=str(hooks_dir),
-        )
-        manifest = (existing or InstallManifest({})).with_target(TargetKind.GIT_HOOKS, target)
-        save_manifest(base, manifest, dry_run=False)
-        if set_hooks_path:
-            self.git_global("core.hooksPath", str(hooks_dir))
-        return hooks_dir
-
-    def write_legacy_v1_git_hooks(
-        self,
-        base_dir: Path | None = None,
-        *,
-        previous_hooks_path: str | None = None,
-        created_dirs: Sequence[str] | None = None,
-        extra_targets: Mapping[str, Any] | None = None,
-        set_hooks_path: bool = True,
-    ) -> Path:
-        """Create a Craftsman 3.0-3.2 (`schema_version: 1`) `git_hooks` install under `base_dir`."""
-        base = base_dir if base_dir is not None else self.home / ".craftsman"
-        hooks_dir = base / "git-hooks"
-        scripts_dir = base / "scripts"
-        recorded_dirs: list[str] = []
-        for directory in (base, hooks_dir, scripts_dir):
-            if not directory.exists():
-                recorded_dirs.append(str(directory))
-                directory.mkdir(parents=True, exist_ok=True)
-        hook_files = [hooks_dir / "commit-msg", hooks_dir / "pre-push", hooks_dir / ".python_cmd"]
-        for hook_file in hook_files:
-            hook_file.write_text("#!/bin/sh\n", encoding="utf-8")
-        shared_script = scripts_dir / "craftsman-stop-gate.py"
-        if not shared_script.exists():
-            shared_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
-        git_hooks_paths = [str(p) for p in (*hook_files, shared_script)]
-        git_hooks_dirs = list(recorded_dirs if created_dirs is None else created_dirs)
-        targets: dict[str, Any] = {
-            **(dict(extra_targets) if extra_targets else {}),
-            "git_hooks": {
-                "target": "git_hooks",
-                "mode": "copy",
-                "version": "3.2.0",
-                "created_paths": git_hooks_paths,
-                "created_dirs": git_hooks_dirs,
-                "modified_files": {},
-                "previous_hooks_path": previous_hooks_path,
-                "hooks_dir": str(hooks_dir),
-            },
-        }
-        all_paths = list(
-            dict.fromkeys(p for entry in targets.values() for p in entry.get("created_paths", ()))
-        )
-        all_dirs = list(
-            dict.fromkeys(d for entry in targets.values() for d in entry.get("created_dirs", ()))
-        )
-        raw_manifest = {
-            "schema_version": 1,
-            "version": "3.2.0",
-            "mode": "copy",
-            "created_paths": all_paths,
-            "created_dirs": all_dirs,
-            "previous_hooks_path": previous_hooks_path,
-            "hooks_dir": str(hooks_dir),
-            "targets": targets,
-        }
-        (base / ".craftsman-install.json").write_text(
-            json.dumps(raw_manifest, indent=2) + "\n", encoding="utf-8"
-        )
-        if set_hooks_path:
-            self.git_global("core.hooksPath", str(hooks_dir))
-        return hooks_dir

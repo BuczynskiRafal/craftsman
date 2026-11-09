@@ -138,7 +138,7 @@ class RoundScopeValidationTests(unittest.TestCase):
         return replace(round_, number=number)
 
     def test_schema_errors_distinguish_older_from_newer_ledgers(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 3)
+        self.assertEqual(SCHEMA_VERSION, 4)
         base_payload = Ledger().to_json()
 
         with self.assertRaises(LedgerError) as old_ctx:
@@ -149,9 +149,9 @@ class RoundScopeValidationTests(unittest.TestCase):
         )
 
         with self.assertRaises(LedgerError) as future_ctx:
-            Ledger.from_json({**base_payload, "schema": 4})
+            Ledger.from_json({**base_payload, "schema": 5})
         self.assertIn(
-            "schema 4 is not supported (expected 3); upgrade craftsman",
+            "this ledger was written by a newer Craftsman (schema 5); upgrade craftsman",
             str(future_ctx.exception),
         )
 
@@ -425,7 +425,8 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stderr.count("Archived the review ledger of an older craftsman"), 1)
-        self.assertTrue((self.repo.ledger_dir / "ledger.v2.bak.json").is_file())
+        (backup,) = self.repo.ledger_dir.glob("ledger.v2.*Z.bak.json")
+        self.assertRegex(backup.name, r"^ledger\.v2\.\d{8}T\d{6}Z\.bak\.json$")
         self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
 
     def test_reset_and_prepare_work_over_the_state_and_ledger_of_craftsman_4(self) -> None:
@@ -526,7 +527,8 @@ class FrozenReviewScopeCliTests(unittest.TestCase):
             "--",
             sys.executable,
             "-c",
-            "from pathlib import Path; Path('NOTES.md').write_text('scratch\\n', encoding='utf-8')",
+            "from pathlib import Path; Path('NOTES.md').write_text('scratch\\n', encoding='utf-8'); "
+            "assert Path('NOTES.md').is_file()",
         )
         self.assertEqual(run_proc.returncode, 0, run_proc.stderr)
 

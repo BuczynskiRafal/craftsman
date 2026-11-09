@@ -1,39 +1,40 @@
-"""Deterministic snapshots of a work tree diff: hunks, digests, scopes, references and risk signals.
+"""Deterministic snapshots of a work tree diff: hunks, digests and risk signals.
 
 Everything here is read-only. Paths are repository-root-relative POSIX strings no matter which
 subdirectory the caller starts from, and every changed file yields at least one hunk, so nothing
-that changed can escape review.
+that changed can escape review. Scopes, symbols and references live in `craftsman.worktree_index`, the path
+classifiers (config, tests, docs, data, agent prompts) in `craftsman.diffscan_paths`.
 """
 
 from __future__ import annotations
 
-import ast
-import fnmatch
-import functools
 import hashlib
-import itertools
 import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Collection, Iterator, Sequence
+import time
+from collections.abc import Callable, Collection, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
+from craftsman.diffscan_paths import (
+    is_agent_prompt_path,
+    is_config_path,
+    is_docs_path,
+    is_test_path,
+    outside_signal_patterns,
+)
 from craftsman.diffscan_signals import CONTENT_SIGNAL_PATTERNS, DEEP_HINT_PATTERNS
 
 ChangeStatus = Literal["modified", "added", "deleted", "renamed"]
-ScopeKind = Literal["function", "class", "block"]
 
 GIT_TIMEOUT_S = 60.0
 MAX_UNTRACKED_BYTES = 1_048_576  # 1 MiB
-MAX_SOURCE_BYTES = 1_048_576  # files read for scopes, symbols and references
 BINARY_SNIFF_BYTES = 8000  # the prefix git itself checks for NUL bytes
-SCOPE_SCAN_MAX_LINES = 200
-BLOCK_SCOPE_RADIUS = 30
-REFERENCE_TEXT_MAX_CHARS = 200
-REFERENCES_PER_FILE = 5
 NO_NEWLINE_MARKER = "\\ No newline at end of file"
 
 SIGNALS = (
@@ -58,153 +59,66 @@ SIGNALS = (
 _NULL_BLOB = "0" * 40
 _GIT_ENV = {"LC_ALL": "C", "LANGUAGE": "C"}  # unlocalized messages such as "Binary files ... differ"
 _MODE_KEYS = ("old mode", "new mode", "new file mode", "deleted file mode")
-_PYTHON_SUFFIXES = (".py", ".pyi")
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
 _C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
-_IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
-_SYMBOL_STOPLIST = frozenset(
-    {
-        "main", "run", "get", "set", "init", "__init__", "setup", "teardown", "test", "call",
-        "update", "handle", "process", "apply", "wrapper", "inner", "helper", "render", "build",
-    }
-)  # fmt: skip
-
-_MODIFIERS = (
-    r"(?:(?:export|default|public|private|protected|internal|static|abstract|final|sealed|async|"
-    r"pub(?:\([^)]*\))?|open|data|partial|unsafe|extern|override|virtual|local)\s+)*"
-)
-_DEF_KEYWORDS = (
-    r"(?P<kw>class|struct|impl|interface|trait|type|enum|module|namespace|object|record|fn|fun|func|"
-    r"function|def)"
-)
-_KEYWORD_DEF_RE = re.compile(
-    rf"""
-    ^\s*
-    {_MODIFIERS}                                # optional visibility/storage modifiers
-    {_DEF_KEYWORDS}\b\s*                        # declaration keyword (class, def, fn, ...)
-    """
-    r"""
-    (?:<[^>]*>\s*)?                             # optional generic type parameters
-    (?:\([^)]*\)\s*)?                           # optional receiver, e.g. Go `func (r *Repo)`
-    (?P<name>[A-Za-z_$][\w$]*)?                 # optional symbol identifier
-    """,
-    re.VERBOSE,
-)
-# Stricter than _KEYWORD_DEF_RE: the name must be followed by definition syntax, so prose such as
-# "type annotations for this module" or "record the result" never yields a symbol.
-_DEFINITION_RE = re.compile(
-    rf"""
-    ^\s*
-    {_MODIFIERS}                                # optional visibility/storage modifiers
-    {_DEF_KEYWORDS}                             # declaration keyword
-    """
-    r"""
-    (?:<[^>]*>)?\s+                             # optional generics on keyword + required whitespace
-    (?:\([^)]*\)\s*)?                           # optional receiver, e.g. Go `func (r *Repo)`
-    (?:<[^>]*>\s*)?                             # optional generic parameters before symbol name
-    (?P<name>[A-Za-z_$][\w$]*)\s*               # defined symbol identifier
-    (?:[(<{=:;] | $ | (?:extends|implements)\b) # definition punctuation, EOL, or inheritance clause
-    """,
-    re.VERBOSE,
-)
-_PYTHON_DEF_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        (?:async\s+)? def\s+ (?P<function>[A-Za-z_]\w*)\s*\(   # Python sync/async function header
-        | class\s+ (?P<class>[A-Za-z_]\w*)\s*[(:]              # Python class header
-    )
-    """,
-    re.VERBOSE,
-)
-_CLASS_KEYWORDS = frozenset(
-    {"class", "struct", "impl", "interface", "trait", "type", "enum", "module", "namespace",
-     "object", "record"}
-)  # fmt: skip
-_ASSIGNED_FUNCTION_RE = re.compile(
-    r"""
-    ^\s*
-    (?:export\s+)?                              # optional JS/TS export prefix
-    (?:const|let|var)\s+                        # variable binding keyword
-    (?P<name>[A-Za-z_$][\w$]*)\s*=\s*           # bound function identifier
-    (?:async\s+)?                               # optional async modifier
-    (?:
-        function\b                              # `function (...)` expression
-        | \([^)]*\)\s*(?::[^=]+)?=>             # parenthesized arrow function (with optional TS return type)
-        | [A-Za-z_$][\w$]*\s*=>                 # single-parameter arrow function
-    )
-    """,
-    re.VERBOSE,
-)
-_MODIFIED_METHOD_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        (?:
-            public | private | protected | internal | static | final
-            | abstract | override | virtual | async | synchronized | suspend
-        )\s+                                    # one or more Java/C#/Kotlin method modifiers
-    )+
-    (?:[\w<>\[\],.?]+\s+)*?                     # optional return-type tokens (generics, arrays, nullable)
-    (?P<name>[A-Za-z_]\w*)\s*\(                 # method identifier and opening parameter list
-    """,
-    re.VERBOSE,
-)
-_PROPERTY_FUNCTION_RE = re.compile(
-    r"""
-    (?P<name>[A-Za-z_$][\w$]*)\s*[:=]\s*        # object property or field name followed by `:` or `=`
-    (?:async\s+)?                               # optional async modifier
-    (?:
-        function\b                              # `key: function(...)`
-        | \(                                    # `key: (...) =>`
-        | [A-Za-z_$][\w$]*\s*=>                 # `key: arg =>`
-    )
-    """,
-    re.VERBOSE,
-)
-_CALLEE_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*$")
-_CONTROL_WORDS = frozenset(
-    {
-        "if", "for", "foreach", "while", "switch", "catch", "else", "elif", "elsif", "return",
-        "case", "unless", "until", "with", "using", "lock", "synchronized", "do", "try", "throw",
-        "await", "yield", "assert", "match", "when", "select", "defer", "go", "new", "delete",
-    }
-)  # fmt: skip
-_COMMENT_PREFIXES = ("//", "#", "/*", "*", "--", ";")
-_CLOSER_RE = re.compile(r"^(?:end\b|[}\])])")
-_RUST_LIFETIME_RE = re.compile(r"'[A-Za-z_]\w*\b(?!')")
-_CONFIG_SUFFIXES = frozenset(
-    {".toml", ".yaml", ".yml", ".json", ".ini", ".cfg", ".env", ".lock", ".gradle", ".cmake"}
-)  # fmt: skip
-_CONFIG_NAMES = frozenset(
-    {"Dockerfile", "Makefile", "package.json", "pyproject.toml", "setup.py", "setup.cfg", ".env",
-     "CMakeLists.txt", "Jenkinsfile", "build.gradle.kts", "settings.gradle.kts", "conanfile.txt",
-     "conanfile.py"}
-)  # fmt: skip
-_CONFIG_NAME_GLOBS = (
-    "Dockerfile.*", ".env.*", "requirements*.txt", "constraints*.txt", "Jenkinsfile.*", "*.Jenkinsfile",
-)  # fmt: skip
-_TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "__tests__", "testing"})
-_TEST_NAME_GLOBS = (
-    "test_*.py", "*_test.py", "*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx",
-    "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.spec.jsx", "*_test.go",
-    "*_test.c", "*_test.cc", "*_test.cpp", "*_test.cxx", "*_unittest.cc", "*_unittest.cpp",
-    "test_*.c", "test_*.cc", "test_*.cpp", "*Test.java", "*Tests.java", "*Test.kt", "*Test.groovy",
-    "*Spec.groovy",
-)  # fmt: skip
-_DOCS_SUFFIXES = frozenset({".md", ".rst", ".txt", ".adoc"})
-# Languages whose risky calls the content patterns above know; changed code in any other language
-# is listed by `files_without_signal_patterns` so the reviewer reads it for risks instead.
-_PATTERN_LANGUAGE_SUFFIXES = frozenset(
-    {".py", ".pyi", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".kt", ".cs",
-     ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".groovy", ".gradle"}
-)  # fmt: skip
-_PATTERN_LANGUAGE_NAME_GLOBS = ("Jenkinsfile", "Jenkinsfile.*", "*.Jenkinsfile")
-_DATA_SUFFIXES = frozenset({".json", ".lock", ".toml", ".ini", ".cfg", ".csv", ".tsv", ".svg"})
-
-
 class DiffScanError(RuntimeError):
     """Raised when the repository or a file in it cannot be inspected."""
+
+
+class GitTimeoutError(DiffScanError):
+    """A git call ran out of time: its own limit (`GIT_TIMEOUT_S`) or the budget of the hook it ran in."""
+
+
+@dataclass(frozen=True)
+class _GitBudget:
+    seconds: float
+    deadline: float  # `time.monotonic()` value
+    on_timeout: Callable[[str], None] | None
+
+
+_GIT_BUDGET: ContextVar[_GitBudget | None] = ContextVar("craftsman_git_budget", default=None)
+
+
+@contextmanager
+def git_budget(seconds: float, on_timeout: Callable[[str], None] | None = None) -> Iterator[None]:
+    """Everything that runs git inside this block shares `seconds` of time (a hook must answer within its platform's timeout).
+
+    Each git call gets what is left of the budget, at most `GIT_TIMEOUT_S`; a call that finds it spent, or runs out
+    of it, raises `GitTimeoutError`. `on_timeout` receives the message of every timeout before it is raised, so a
+    caller that catches the error somewhere in the middle still leaves a trace (the hooks log it through
+    `hook_errors`). Nested blocks cannot extend the budget they sit in.
+    """
+    outer = _GIT_BUDGET.get()
+    deadline = time.monotonic() + seconds
+    if outer is not None:
+        deadline = min(deadline, outer.deadline)
+    token = _GIT_BUDGET.set(_GitBudget(seconds, deadline, on_timeout))
+    try:
+        yield
+    finally:
+        _GIT_BUDGET.reset(token)
+
+
+def git_time_left(limit: float | None = None) -> float:
+    """The seconds the next git call may take: `limit`, or less when a `git_budget` is nearly spent; 0 when it is spent."""
+    limit = GIT_TIMEOUT_S if limit is None else limit
+    budget = _GIT_BUDGET.get()
+    if budget is None:
+        return limit
+    return max(0.0, min(limit, budget.deadline - time.monotonic()))
+
+
+def note_git_timeout(message: str) -> None:
+    """Tell the `on_timeout` of the surrounding `git_budget`, if any, that a git call ran out of time."""
+    budget = _GIT_BUDGET.get()
+    if budget is not None and budget.on_timeout is not None:
+        budget.on_timeout(message)
+
+
+def git_timed_out(message: str) -> GitTimeoutError:
+    """The error for a git call that ran out of time, after `note_git_timeout`."""
+    note_git_timeout(message)
+    return GitTimeoutError(message)
 
 
 @dataclass(frozen=True)
@@ -223,11 +137,11 @@ class Hunk:
 
     @property
     def added_lines(self) -> tuple[tuple[int, str], ...]:
-        return tuple((new_no, text) for tag, _, new_no, text in _walk(self) if tag == "+")
+        return tuple((new_no, text) for tag, _, new_no, text in walk_hunk(self) if tag == "+")
 
     @property
     def removed_lines(self) -> tuple[tuple[int, str], ...]:
-        return tuple((old_no, text) for tag, old_no, _, text in _walk(self) if tag == "-")
+        return tuple((old_no, text) for tag, old_no, _, text in walk_hunk(self) if tag == "-")
 
 
 @dataclass(frozen=True)
@@ -262,23 +176,6 @@ class DiffSnapshot:
 
 
 @dataclass(frozen=True)
-class Scope:
-    path: str
-    name: str
-    kind: ScopeKind
-    start: int
-    end: int
-    text: str
-
-
-@dataclass(frozen=True)
-class Reference:
-    path: str
-    line: int
-    text: str
-
-
-@dataclass(frozen=True)
 class _RawHunk:
     old_start: int
     old_len: int
@@ -300,35 +197,10 @@ class _FileDiff:
     skipped: bool
 
 
-@dataclass(frozen=True)
-class _Span:
-    start: int
-    end: int
-    name: str
-    kind: ScopeKind
-    header_line: int  # the `def`/`class` line itself, after any decorators
-
-
-class _Source:
-    """A work tree text file split into lines; Python definitions are parsed on first use."""
-
-    def __init__(self, path: str, text: str) -> None:
-        self.path = path
-        self._text = text
-        lines = text.split("\n")
-        if lines[-1] == "":
-            lines.pop()  # a trailing newline ends the last line; it does not start a new one
-        self.lines = tuple(lines)
-
-    @functools.cached_property
-    def python_spans(self) -> tuple[_Span, ...] | None:
-        return _python_spans(self._text) if _is_python(self.path) else None
-
-
 # --- git plumbing ---------------------------------------------------------------------------
 
 
-def _decode(data: bytes) -> str:
+def decode_text(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
@@ -339,9 +211,12 @@ def _existing_dir(cwd: str | Path) -> Path:
     return directory
 
 
-def _git_bytes(cwd: Path, *args: str) -> tuple[int, bytes, str]:
+def git_bytes(cwd: Path, *args: str) -> tuple[int, bytes, str]:
     """Run git with stable, unlocalized output; return (returncode, raw stdout, decoded stderr)."""
     argv = ["git", "-c", "core.quotepath=off", "-c", "color.ui=never", *args]
+    timeout = git_time_left()
+    if timeout <= 0:
+        raise git_timed_out(f"`git {args[0]}` was not run in {cwd}: the hook's git budget is spent")
     try:
         proc = subprocess.run(
             argv,
@@ -351,26 +226,26 @@ def _git_bytes(cwd: Path, *args: str) -> tuple[int, bytes, str]:
             capture_output=True,
             text=False,
             check=False,
-            timeout=GIT_TIMEOUT_S,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise DiffScanError("git executable not found on PATH") from exc
     except subprocess.TimeoutExpired as exc:
-        raise DiffScanError(f"`git {args[0]}` timed out after {GIT_TIMEOUT_S:.0f}s in {cwd}") from exc
+        raise git_timed_out(f"`git {args[0]}` timed out after {timeout:g}s in {cwd}") from exc
     except OSError as exc:
         raise DiffScanError(f"cannot run git in {cwd}: {exc}") from exc
-    return proc.returncode, proc.stdout, _decode(proc.stderr)
+    return proc.returncode, proc.stdout, decode_text(proc.stderr)
 
 
-def _git(cwd: Path, *args: str) -> tuple[int, str, str]:
-    """Like `_git_bytes`, with stdout decoded as UTF-8."""
-    code, out, err = _git_bytes(cwd, *args)
-    return code, _decode(out), err
+def git_text(cwd: Path, *args: str) -> tuple[int, str, str]:
+    """Like `git_bytes`, with stdout decoded as UTF-8."""
+    code, out, err = git_bytes(cwd, *args)
+    return code, decode_text(out), err
 
 
 def git_output(cwd: Path, *args: str) -> str:
     """Stdout of a git command that must succeed; failures raise `DiffScanError` with stderr."""
-    code, out, err = _git(cwd, *args)
+    code, out, err = git_text(cwd, *args)
     if code != 0:
         raise DiffScanError(f"`git {' '.join(args)}` failed in {cwd} (exit {code}): {err.strip()}")
     return out
@@ -379,7 +254,7 @@ def git_output(cwd: Path, *args: str) -> str:
 def worktree_root(cwd: str | Path) -> Path:
     """Return the root of the git work tree containing `cwd`."""
     directory = _existing_dir(cwd)
-    code, out, err = _git(directory, "rev-parse", "--show-toplevel")
+    code, out, err = git_text(directory, "rev-parse", "--show-toplevel")
     if code != 0 or not out.strip():
         raise DiffScanError(f"{directory} is not inside a git work tree: {err.strip()}")
     return Path(out.strip())
@@ -388,7 +263,7 @@ def worktree_root(cwd: str | Path) -> Path:
 def git_dir(cwd: str | Path) -> Path:
     """Return the absolute, per-worktree git directory for `cwd`."""
     directory = _existing_dir(cwd)
-    code, out, err = _git(directory, "rev-parse", "--absolute-git-dir")
+    code, out, err = git_text(directory, "rev-parse", "--absolute-git-dir")
     if code != 0 or not out.strip():
         raise DiffScanError(f"{directory} is not inside a git repository: {err.strip()}")
     return Path(out.strip()).resolve()
@@ -398,7 +273,7 @@ def commit_sha(cwd: str | Path, ref: str) -> str | None:
     """Full SHA of the commit `ref` names, or None when it names no commit (e.g. an unborn HEAD)."""
     if not ref or ref.startswith("-"):
         raise DiffScanError(f"invalid git revision {ref!r}")
-    code, out, _ = _git(_existing_dir(cwd), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    code, out, _ = git_text(_existing_dir(cwd), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
     return out.strip() if code == 0 and out.strip() else None
 
 
@@ -420,7 +295,7 @@ def resolve_base_sha(cwd: str | Path, ref: str | None) -> str:
     return _base_revision(worktree_root(cwd), ref or "HEAD")
 
 
-def _repo_file(root: Path, path: str) -> Path:
+def repo_file(root: Path, path: str) -> Path:
     parts = PurePosixPath(path).parts
     candidate = Path(os.path.normpath(root.joinpath(*parts)))
     if not parts or ".." in parts or not candidate.is_relative_to(root):
@@ -486,7 +361,7 @@ def snapshot(
         *pathspecs,
     )
     tracked = [_parse_file_section(section) for section in _split_file_sections(tracked_text)]
-    untracked = _filter_untracked(_untracked_paths(root), filters)
+    untracked = _filter_untracked(list_untracked_paths(root), filters)
     # `git rm --cached` leaves a file on disk that the diff reports as deleted and ls-files as new.
     deleted = {chunk.path: chunk for chunk in tracked if chunk.status == "deleted"}
     unindexed = {path: deleted[path] for path in untracked if path in deleted}
@@ -705,7 +580,7 @@ def _unquote(token: str) -> str:
             index += 4
         else:
             raise DiffScanError(f"invalid escape sequence in quoted git path {token!r}")
-    return _decode(bytes(out))
+    return decode_text(bytes(out))
 
 
 def _parse_hunk(lines: list[str], index: int) -> tuple[_RawHunk, int]:
@@ -793,7 +668,7 @@ GENERATED_ARTIFACT_PATTERNS = (
 IGNORE_FILE = ".craftsmanignore"
 
 
-def _untracked_paths(root: Path) -> list[str]:
+def list_untracked_paths(root: Path) -> list[str]:
     args = ["ls-files", "--others", "--exclude-standard", "-z"]
     for pattern in GENERATED_ARTIFACT_PATTERNS:
         args += ["--exclude", pattern]
@@ -805,7 +680,7 @@ def _untracked_paths(root: Path) -> list[str]:
 
 def untracked_paths(cwd: str | Path) -> tuple[str, ...]:
     """Repository-relative paths of untracked, non-ignored files in the work tree."""
-    return tuple(_untracked_paths(worktree_root(cwd)))
+    return tuple(list_untracked_paths(worktree_root(cwd)))
 
 
 def staged_paths(cwd: str | Path, base_sha: str) -> tuple[str, ...]:
@@ -818,7 +693,7 @@ def staged_paths(cwd: str | Path, base_sha: str) -> tuple[str, ...]:
 
 def _untracked_file_diff(root: Path, path: str) -> _FileDiff:
     """Describe an untracked file the way `git diff` describes it once staged."""
-    file = _repo_file(root, path)
+    file = repo_file(root, path)
     try:
         if file.is_symlink():
             return _new_text_file_diff(path, "120000", os.fsencode(os.readlink(file)))
@@ -844,7 +719,7 @@ def _unindexed_file_diff(root: Path, base: str, deleted: _FileDiff) -> _FileDiff
     Returns None when the file on disk matches the base exactly.
     """
     path = deleted.path
-    file = _repo_file(root, path)
+    file = repo_file(root, path)
     if file.is_symlink() or not file.is_file():
         added = _untracked_file_diff(root, path)
         return _FileDiff(
@@ -861,7 +736,7 @@ def _unindexed_file_diff(root: Path, base: str, deleted: _FileDiff) -> _FileDiff
         data = file.read_bytes()
     except OSError as exc:
         raise DiffScanError(f"cannot read {path}: {exc}") from exc
-    code, base_data, err = _git_bytes(root, "cat-file", "blob", f"{base}:{path}")
+    code, base_data, err = git_bytes(root, "cat-file", "blob", f"{base}:{path}")
     if code != 0:
         raise DiffScanError(f"cannot read {path} at {base[:12]} (exit {code}): {err.strip()}")
     base_mode = deleted.meta.get("deleted file mode", mode)
@@ -871,7 +746,7 @@ def _unindexed_file_diff(root: Path, base: str, deleted: _FileDiff) -> _FileDiff
         with tempfile.TemporaryDirectory(prefix="craftsman-diff-") as scratch:
             base_copy = Path(scratch) / "base"
             base_copy.write_bytes(base_data)
-            code, out, err = _git(
+            code, out, err = git_text(
                 root,
                 "diff",
                 "--no-index",
@@ -920,7 +795,7 @@ def _new_file_meta(mode: str, blob: str) -> dict[str, str]:
 
 def _new_text_file_diff(path: str, mode: str, data: bytes) -> _FileDiff:
     meta = _new_file_meta(mode, _blob_id(data))
-    text = _decode(data)
+    text = decode_text(data)
     if not text:
         return _file_diff(path, None, "added", meta, ())
     body = text.split("\n")
@@ -934,7 +809,7 @@ def _new_text_file_diff(path: str, mode: str, data: bytes) -> _FileDiff:
     return _file_diff(path, None, "added", meta, (hunk,))
 
 
-def _walk(hunk: Hunk) -> Iterator[tuple[str, int, int, str]]:
+def walk_hunk(hunk: Hunk) -> Iterator[tuple[str, int, int, str]]:
     """Yield (tag, old line, new line, text) per body line; the inactive side is the cursor."""
     old_no, new_no = hunk.old_start, hunk.new_start
     for line in hunk.lines:
@@ -946,397 +821,6 @@ def _walk(hunk: Hunk) -> Iterator[tuple[str, int, int, str]]:
             old_no += 1
         if tag in (" ", "+"):
             new_no += 1
-
-
-# --- scopes, symbols and references ---------------------------------------------------------
-
-
-class WorktreeIndex:
-    """Scopes, symbols and references in one work tree; each file is read and parsed at most once.
-
-    Build one per snapshot and share it across hunks. It does not notice files that change
-    after they were first read.
-    """
-
-    def __init__(self, cwd: str | Path) -> None:
-        self.root = worktree_root(cwd)
-        self._real_root = self.root.resolve()
-        self._sources: dict[str, _Source | None] = {}
-        self._untracked: tuple[str, ...] | None = None
-        self._mentions: dict[str, tuple[Reference, ...]] = {}
-
-    def scope(self, path: str, line: int) -> Scope | None:
-        """Return the innermost function/class around `line` of the work tree file, or a block window.
-
-        Returns None when the file is missing, binary, too large or a link out of the work tree,
-        or `line` is outside it.
-        """
-        source = self._source(path)
-        return None if source is None else _scope_at(source, line)
-
-    def hunk_scope(self, hunk: Hunk) -> Scope | None:
-        """Scope of the hunk's first added line; for a pure deletion see `_anchor_line`.
-
-        Hunks without content lines (renames, mode changes, binary files) have no scope.
-        """
-        added = hunk.added_lines
-        if added:
-            return self.scope(hunk.path, added[0][0])
-        lines = _touched_new_lines(hunk)
-        return self.scope(hunk.path, lines[0]) if lines else None
-
-    def symbols(self, hunk: Hunk) -> tuple[str, ...]:
-        """Names defined on the hunk's changed lines plus the names of the scopes it touches.
-
-        Comments, docstrings and prose never yield names: Python definitions come from the
-        syntax tree when the file parses, other lines must use definition syntax.
-        """
-        if _is_docs_hunk(hunk):
-            return ()
-        python = _is_python(hunk.path)
-        source = self._source(hunk.path)
-        spans = None if source is None else source.python_spans
-        if spans is not None:
-            added = {number for number, _ in hunk.added_lines}
-            names = [
-                span.name.rsplit(".", 1)[-1]
-                for span in sorted(spans, key=lambda span: span.header_line)
-                if span.header_line in added
-            ]
-        else:
-            names = [
-                name for _, text in hunk.added_lines if (name := _defined_name(text, python=python))
-            ]
-        names += [name for _, text in hunk.removed_lines if (name := _defined_name(text, python=python))]
-        if source is not None:
-            for line in _touched_new_lines(hunk):
-                scope = _scope_at(source, line)
-                if scope is not None and scope.kind != "block":
-                    names.append(scope.name.rsplit(".", 1)[-1])
-        return tuple(dict.fromkeys(name for name in names if _is_meaningful_symbol(name)))
-
-    def references(
-        self, symbol: str, *, limit: int = 20, defined_in: Collection[str] = ()
-    ) -> tuple[Reference, ...]:
-        """Whole-word occurrences of `symbol` in tracked and untracked (not ignored) text files.
-
-        Files outside `defined_in` come first; each file contributes at most
-        `REFERENCES_PER_FILE` lines. Untracked files are the snapshot's own, so generated tool
-        caches and `.craftsmanignore` entries are never searched.
-        """
-        if limit < 1:
-            raise DiffScanError(f"limit must be at least 1, got {limit}")
-        # `mentions` lists each file's references together, so a stable sort keeps them grouped.
-        found = sorted(self.mentions(symbol), key=lambda ref: ref.path in defined_in)
-        return tuple(found[:limit])
-
-    def mentions(self, symbol: str) -> tuple[Reference, ...]:
-        """The first `REFERENCES_PER_FILE` whole-word occurrences of `symbol` in every file that
-        has one, by path; searched once per index."""
-        if not symbol.strip() or any(char in symbol for char in "\n\r\0"):
-            raise DiffScanError(f"invalid symbol to search for: {symbol!r}")
-        if symbol not in self._mentions:
-            self._mentions[symbol] = self._search(symbol)
-        return self._mentions[symbol]
-
-    def _search(self, symbol: str) -> tuple[Reference, ...]:
-        word = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])")
-        candidates = {*self._tracked_files_mentioning(symbol), *self._untracked_paths()}
-        found: list[Reference] = []
-        for path in sorted(candidates):
-            source = self._source(path)
-            if source is None:
-                continue
-            matches = (
-                Reference(path, number, text.strip()[:REFERENCE_TEXT_MAX_CHARS])
-                for number, text in enumerate(source.lines, start=1)
-                if word.search(text)
-            )
-            found.extend(itertools.islice(matches, REFERENCES_PER_FILE))
-        return tuple(found)
-
-    def lines(self, path: str) -> tuple[str, ...] | None:
-        """The lines of a work tree text file; None when it is missing, binary or too large."""
-        source = self._source(path)
-        return None if source is None else source.lines
-
-    def _source(self, path: str) -> _Source | None:
-        if path not in self._sources:
-            self._sources[path] = _load_source(self.root, self._real_root, path)
-        return self._sources[path]
-
-    def _untracked_paths(self) -> tuple[str, ...]:
-        if self._untracked is None:
-            self._untracked = tuple(_untracked_paths(self.root))
-        return self._untracked
-
-    def _tracked_files_mentioning(self, symbol: str) -> list[str]:
-        """Tracked work tree files with a whole-word match; `-l` stops reading each at the first."""
-        code, out, err = _git(self.root, "grep", "-l", "-I", "-w", "-F", "-z", "-e", symbol, "--")
-        if code == 1:
-            return []
-        if code != 0:
-            raise DiffScanError(f"`git grep` for {symbol!r} failed (exit {code}): {err.strip()}")
-        return [path for path in out.split("\0") if path]
-
-
-def file_at_revision(cwd: str | Path, revision: str, path: str) -> str | None:
-    """The text of `path` as committed at `revision`; None when it did not exist there or is binary."""
-    root = worktree_root(cwd)
-    _repo_file(root, path)  # rejects absolute and `..` paths
-    code, data, _ = _git_bytes(root, "show", f"{revision}:{path}")
-    if code != 0 or b"\0" in data[:BINARY_SNIFF_BYTES] or len(data) > MAX_SOURCE_BYTES:
-        return None
-    return _decode(data)
-
-
-def text_scope_at(path: str, text: str, line: int) -> Scope | None:
-    """The innermost function/class (or block window) around `line` of `text`, as `scope` finds it."""
-    return _scope_at(_Source(path, text), line)
-
-
-def text_scope_named(path: str, text: str, name: str, near: int = 1) -> Scope | None:
-    """The definition called `name` in `text`; of several, the one starting closest to `near`.
-
-    `name` is a scope name as `Scope.name` spells it (`Class.method` for Python), or its last part.
-    """
-    source = _Source(path, text)
-    short = name.rsplit(".", 1)[-1]
-    found: list[Scope] = []
-    if source.python_spans is not None:
-        spans = [span for span in source.python_spans if span.name == name] or [
-            span for span in source.python_spans if span.name.rsplit(".", 1)[-1] == short
-        ]
-        found = [scope for span in spans if (scope := _scope_at(source, span.header_line)) is not None]
-    else:
-        for index in range(len(source.lines)):
-            if _looks_like_definition(source.lines, index) and _definition_name(source.lines[index].strip())[0] == short:
-                scope = _scope_at(source, index + 1)
-                if scope is not None and scope.name == short:
-                    found.append(scope)
-    return min(found, key=lambda scope: abs(scope.start - near), default=None)
-
-
-def defines_symbol(path: str, line_text: str, symbol: str) -> bool:
-    """Whether the single line `line_text` defines `symbol` (a `def`, `class`, `function`, ...)."""
-    return _defined_name(line_text, python=_is_python(path)) == symbol
-
-
-def _load_source(root: Path, real_root: Path, path: str) -> _Source | None:
-    file = _repo_file(root, path)
-    try:
-        if not file.is_file() or not file.resolve().is_relative_to(real_root):
-            return None
-        if file.stat().st_size > MAX_SOURCE_BYTES:
-            return None
-        data = file.read_bytes()
-    except OSError as exc:
-        raise DiffScanError(f"cannot read {path}: {exc}") from exc
-    if b"\0" in data[:BINARY_SNIFF_BYTES]:
-        return None
-    return _Source(path, _decode(data))
-
-
-def _is_python(path: str) -> bool:
-    return PurePosixPath(path).suffix in _PYTHON_SUFFIXES
-
-
-def _python_spans(text: str) -> tuple[_Span, ...] | None:
-    try:
-        tree = ast.parse(text)
-    except (SyntaxError, ValueError, RecursionError, MemoryError):
-        # Deeply nested generated code exhausts the parser's stack (RecursionError/MemoryError).
-        return None
-    spans: list[_Span] = []
-    stack: list[tuple[ast.AST, str]] = [(tree, "")]
-    while stack:
-        node, prefix = stack.pop()
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = f"{prefix}{child.name}"
-                start = min([child.lineno, *(dec.lineno for dec in child.decorator_list)])
-                kind: ScopeKind = "class" if isinstance(child, ast.ClassDef) else "function"
-                end = child.end_lineno or child.lineno
-                spans.append(_Span(start, end, name, kind, child.lineno))
-                stack.append((child, f"{name}."))
-            else:
-                stack.append((child, prefix))
-    return tuple(spans)
-
-
-def _scope_at(source: _Source, line: int) -> Scope | None:
-    if not 1 <= line <= len(source.lines):
-        return None
-    if source.python_spans is not None:
-        span = _innermost_span(source.python_spans, line)
-    else:
-        span = _heuristic_span(source.lines, line, rust=source.path.endswith(".rs"))
-    if span is None:
-        start = max(1, line - BLOCK_SCOPE_RADIUS)
-        end = min(len(source.lines), line + BLOCK_SCOPE_RADIUS)
-        span = _Span(start, end, f"lines {start}-{end}", "block", start)
-    text = "\n".join(source.lines[span.start - 1 : span.end])
-    return Scope(source.path, span.name, span.kind, span.start, span.end, text)
-
-
-def _innermost_span(spans: Sequence[_Span], line: int) -> _Span | None:
-    containing = [span for span in spans if span.start <= line <= span.end]
-    return max(containing, key=lambda span: (span.start, -span.end), default=None)
-
-
-def _indent(text: str) -> int:
-    expanded = text.expandtabs(4)
-    return len(expanded) - len(expanded.lstrip())
-
-
-def _effective_indent(lines: Sequence[str], index: int) -> int:
-    """Indentation of the line, or of the nearest non-blank line below/above when it is blank."""
-    for candidate in (*range(index, len(lines)), *range(index - 1, -1, -1)):
-        if lines[candidate].strip():
-            return _indent(lines[candidate])
-    return 0
-
-
-def _heuristic_span(lines: Sequence[str], line: int, *, rust: bool) -> _Span | None:
-    target = line - 1
-    target_indent = _effective_indent(lines, target)
-    for index in range(target, max(-1, target - SCOPE_SCAN_MAX_LINES), -1):
-        text = lines[index]
-        indent = _indent(text)
-        if index != target and indent >= target_indent and indent != 0:
-            continue
-        if not _looks_like_definition(lines, index):
-            continue
-        end = _definition_end(lines, index, indent, rust=rust)
-        if end >= target:
-            name, kind = _definition_name(text.strip())
-            return _Span(index + 1, end + 1, name, kind, index + 1)
-    return None
-
-
-def _looks_like_definition(lines: Sequence[str], index: int) -> bool:
-    stripped = lines[index].strip()
-    if not stripped or stripped.startswith(_COMMENT_PREFIXES):
-        return False
-    code = stripped.lstrip("}").lstrip()
-    first_word = _IDENTIFIER_RE.match(code)
-    if first_word is not None and first_word.group(0) in _CONTROL_WORDS:
-        return False
-    if code.endswith(";"):
-        return False
-    if any(regex.match(code) for regex in (_DEFINITION_RE, _MODIFIED_METHOD_RE, _ASSIGNED_FUNCTION_RE)):
-        return True
-    # Otherwise a body must open: `impl X for Y {` or `name(...) {`, but not a bare `log.info(`.
-    following = lines[index + 1].lstrip() if index + 1 < len(lines) else ""
-    keyword = _KEYWORD_DEF_RE.match(code)
-    if keyword is not None and keyword.group("name"):
-        return "{" in code or following.startswith("{")
-    if "(" not in code:
-        return False
-    return "{" in code[code.index("(") :] or following.startswith("{")
-
-
-def _definition_name(stripped: str) -> tuple[str, ScopeKind]:
-    keyword = _KEYWORD_DEF_RE.match(stripped)
-    if keyword is not None and keyword.group("name"):
-        kind: ScopeKind = "class" if keyword.group("kw") in _CLASS_KEYWORDS else "function"
-        return keyword.group("name"), kind
-    assigned = _PROPERTY_FUNCTION_RE.search(stripped)
-    if assigned is not None:
-        return assigned.group("name"), "function"
-    callee = _CALLEE_RE.search(stripped.split("(", 1)[0])
-    if callee is not None and callee.group(1) != "function":
-        return callee.group(1), "function"
-    return "<anonymous>", "function"
-
-
-def _definition_end(lines: Sequence[str], start: int, indent: int, *, rust: bool) -> int:
-    following = lines[start + 1] if start + 1 < len(lines) else ""
-    if "{" in lines[start] or following.lstrip().startswith("{"):
-        return _brace_end(lines, start, rust=rust)
-    end = start
-    for index in range(start + 1, len(lines)):
-        stripped = lines[index].strip()
-        if not stripped:
-            continue
-        if _indent(lines[index]) > indent:
-            end = index
-            continue
-        if _CLOSER_RE.match(stripped):
-            end = index
-        break
-    return end
-
-
-def _brace_end(lines: Sequence[str], start: int, *, rust: bool) -> int:
-    depth = 0
-    opened = False
-    for index in range(start, len(lines)):
-        for char in _code_chars(lines[index], rust=rust):
-            if char == "{":
-                depth += 1
-                opened = True
-            elif char == "}":
-                depth -= 1
-            if opened and depth <= 0:
-                return index
-    return len(lines) - 1
-
-
-def _code_chars(line: str, *, rust: bool) -> Iterator[str]:
-    """Yield the characters of `line` that are outside simple string literals and `//` comments."""
-    quote = ""
-    index = 0
-    while index < len(line):
-        char = line[index]
-        if quote:
-            if char == "\\":
-                index += 1
-            elif char == quote:
-                quote = ""
-        elif rust and char == "'" and _RUST_LIFETIME_RE.match(line, index):
-            pass  # a lifetime such as 'a or 'static, not a character literal
-        elif char in "\"'`":
-            quote = char
-        elif line.startswith("//", index):
-            return
-        else:
-            yield char
-        index += 1
-
-
-def _defined_name(text: str, *, python: bool) -> str | None:
-    """The name a single changed line defines; None for comments, prose and plain statements."""
-    stripped = text.strip()
-    if not stripped or stripped.startswith(_COMMENT_PREFIXES):
-        return None
-    if python:
-        match = _PYTHON_DEF_RE.match(text)
-        return None if match is None else match.group("function") or match.group("class")
-    for pattern in (_DEFINITION_RE, _ASSIGNED_FUNCTION_RE, _MODIFIED_METHOD_RE):
-        definition = pattern.match(text)
-        if definition is not None:
-            return definition.group("name")
-    return None
-
-
-def _touched_new_lines(hunk: Hunk) -> tuple[int, ...]:
-    """The new-file line that stands for each changed line, in order, see `_anchor_line`."""
-    lines = (_anchor_line(tag, new_no) for tag, _, new_no, _ in _walk(hunk) if tag in ("+", "-"))
-    return tuple(dict.fromkeys(lines))
-
-
-def _anchor_line(tag: str, new_no: int) -> int:
-    """An added line stands for itself; a removed line for the surviving line just above it.
-
-    The line now at a deletion's place may already belong to the next definition, the line above
-    still belongs to the one the deletion was made in.
-    """
-    return new_no if tag == "+" else max(1, new_no - 1)
-
-
-def _is_meaningful_symbol(name: str) -> bool:
-    return len(name) >= 3 and name not in _SYMBOL_STOPLIST and _IDENTIFIER_RE.fullmatch(name) is not None
 
 
 # --- signals --------------------------------------------------------------------------------
@@ -1353,7 +837,7 @@ def detect_signals(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]]:
 
 def _hunk_signals(hunk: Hunk) -> set[str]:
     signals = {name for name, matches in _PATH_SIGNALS.items() if matches(hunk.path)}
-    if _is_docs_hunk(hunk):
+    if is_docs_hunk_paths(hunk):
         signals.add("docs")
     else:
         content = "\n".join(text for _, text in (*hunk.added_lines, *hunk.removed_lines))
@@ -1365,10 +849,6 @@ def _hunk_signals(hunk: Hunk) -> set[str]:
     return signals
 
 
-def _name_matches(name: str, globs: Sequence[str]) -> bool:
-    return any(fnmatch.fnmatchcase(name, glob) for glob in globs)
-
-
 def files_without_signal_patterns(snap: DiffSnapshot) -> tuple[str, ...]:
     """Changed files that add code in a language the risk-signal patterns were not written for.
 
@@ -1376,76 +856,9 @@ def files_without_signal_patterns(snap: DiffSnapshot) -> tuple[str, ...]:
     script or a Dockerfile `RUN` step.
     """
     paths = dict.fromkeys(
-        hunk.path for hunk in snap.hunks if hunk.added_lines and not _is_docs_hunk(hunk)
+        hunk.path for hunk in snap.hunks if hunk.added_lines and not is_docs_hunk_paths(hunk)
     )
-    return tuple(path for path in paths if _outside_signal_patterns(path))
-
-
-def _outside_signal_patterns(path: str) -> bool:
-    posix = PurePosixPath(path)
-    suffix = posix.suffix.lower()
-    if suffix in _DATA_SUFFIXES or _name_matches(posix.name, _PATTERN_LANGUAGE_NAME_GLOBS):
-        return False
-    return suffix not in _PATTERN_LANGUAGE_SUFFIXES
-
-
-def _is_config(path: str) -> bool:
-    posix = PurePosixPath(path)
-    return (
-        posix.suffix in _CONFIG_SUFFIXES
-        or posix.name in _CONFIG_NAMES
-        or _name_matches(posix.name, _CONFIG_NAME_GLOBS)
-        or posix.parts[:2] == (".github", "workflows")
-    )
-
-
-def is_test_path(path: str) -> bool:
-    """Test code by location or name, e.g. `tests/x.py`, `test_x.py`, `x.spec.ts`, `x_test.go`."""
-    posix = PurePosixPath(path)
-    return bool(_TEST_DIRS.intersection(posix.parts[:-1])) or _name_matches(posix.name, _TEST_NAME_GLOBS)
-
-
-_IMPORT_LINE_RE = re.compile(
-    r"^(?:from\s+\S+\s+import\b|import\b|use\s|using\s|#\s*include\b|require\b|extern\s+crate\b"
-    r"|(?:const|let|var)\b.*\brequire\()"
-)
-
-
-def reference_kind(ref: Reference) -> Literal["call", "test", "import", "docs"]:
-    """What a reference most likely is, so real uses can rank before imports and prose."""
-    if is_docs_path(ref.path):
-        return "docs"
-    if _IMPORT_LINE_RE.match(ref.text):
-        return "import"
-    return "test" if is_test_path(ref.path) else "call"
-
-
-def is_docs_path(path: str) -> bool:
-    """Prose by file type alone: a `docs/` folder can hold code (e.g. Sphinx's conf.py)."""
-    return PurePosixPath(path).suffix.lower() in _DOCS_SUFFIXES and not _is_config(path)
-
-
-_AGENT_PROMPT_NAMES = frozenset({"skill.md", "agents.md", "claude.md", "gemini.md"})
-_AGENT_PROMPT_DIRS = frozenset({"agents", "rules"})
-_AGENT_PROMPT_NAME_GLOBS = ("*.prompt.md", "*.instructions.md")
-
-
-def is_agent_prompt_path(path: str) -> bool:
-    """A prompt file that steers an agent: its prose is behavior, not documentation.
-
-    `SKILL.md`, `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `*.prompt.md`, `copilot-instructions.md`,
-    Markdown under a `rules/` or `agents/` folder.
-    """
-    posix = PurePosixPath(path)
-    name = posix.name.lower()
-    if posix.suffix.lower() not in _DOCS_SUFFIXES:
-        return False
-    return (
-        name in _AGENT_PROMPT_NAMES
-        or name == "copilot-instructions.md"
-        or _name_matches(name, _AGENT_PROMPT_NAME_GLOBS)
-        or bool(_AGENT_PROMPT_DIRS.intersection(part.lower() for part in posix.parts[:-1]))
-    )
+    return tuple(path for path in paths if outside_signal_patterns(path))
 
 
 def hunks_docs_only(hunks: Sequence[Hunk]) -> bool:
@@ -1462,7 +875,7 @@ def detect_deep_hint_signals(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]
     """
     fired: dict[str, list[str]] = {}
     for hunk in hunks:
-        if is_test_path(hunk.path) or _is_config(hunk.path) or _is_docs_hunk(hunk):
+        if is_test_path(hunk.path) or is_config_path(hunk.path) or is_docs_hunk_paths(hunk):
             continue
         content = "\n".join(text for _, text in (*hunk.added_lines, *hunk.removed_lines))
         for name, pattern in DEEP_HINT_PATTERNS.items():
@@ -1471,9 +884,14 @@ def detect_deep_hint_signals(hunks: Sequence[Hunk]) -> dict[str, tuple[str, ...]
     return {name: tuple(ids) for name, ids in fired.items()}
 
 
-def _is_docs_hunk(hunk: Hunk) -> bool:
+def is_docs_hunk(hunk: Hunk) -> bool:
+    """Whether the hunk alone is documentation: its path (and its old path, for a rename) is prose, not an agent prompt."""
+    return hunks_docs_only([hunk])
+
+
+def is_docs_hunk_paths(hunk: Hunk) -> bool:
     """A rename counts as documentation only when both its old and new paths are documentation."""
     return is_docs_path(hunk.path) and (hunk.old_path is None or is_docs_path(hunk.old_path))
 
 
-_PATH_SIGNALS = {"config": _is_config, "tests": is_test_path}
+_PATH_SIGNALS = {"config": is_config_path, "tests": is_test_path}

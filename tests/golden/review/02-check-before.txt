@@ -1,0 +1,7 @@
+$ craftsman review check --review-only
+[exit 0]
+--- stdout
+**Craftsman review: COMPLETE (review-only)**
+
+Nothing to review: the work tree matches base <BASE12>.
+--- stderr

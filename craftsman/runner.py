@@ -27,6 +27,8 @@ from craftsman.diffscan import DiffScanError, DiffSnapshot
 from craftsman.gate import GateStateError
 from craftsman.ledger import add_run, load, mutate
 from craftsman.records import (
+    DEFAULT_MIN_TESTS,
+    MIN_TESTS_HINT,
     OUTPUT_TAIL_CHARS,
     RUN_KINDS,
     LedgerError,
@@ -34,6 +36,7 @@ from craftsman.records import (
     RunKind,
     format_timestamp,
 )
+from craftsman.testcount import RunnerOutputCounter
 from craftsman.triviality import is_trivial_run
 from craftsman.workspace import open_workspace
 
@@ -62,6 +65,7 @@ class Outcome:
     duration_s: float
     output_tail: str
     status: RunStatus = RunStatus.COMPLETED
+    tests_ran: int | None = None  # what the test runners in the whole output reported; None: unrecognized
 
 
 class CommandNotStarted(Exception):
@@ -69,12 +73,13 @@ class CommandNotStarted(Exception):
 
 
 class _OutputPump:
-    """Copies the child's output to our stdout as it arrives and keeps the last bytes of it."""
+    """Copies the child's output to our stdout as it arrives, keeps the last bytes of it and counts its tests."""
 
     def __init__(self, source: IO[bytes]) -> None:
         self._source = source
         self._tail = bytearray()
         self._tail_lock = threading.Lock()
+        self._counter = RunnerOutputCounter()
         self._echo = True
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -92,11 +97,17 @@ class _OutputPump:
             data = bytes(self._tail)
         return data.decode("utf-8", errors="replace")[-OUTPUT_TAIL_CHARS:]
 
+    def tests_ran(self) -> int | None:
+        """The tests the runners in all the output so far reported (not only the kept tail)."""
+        with self._tail_lock:
+            return self._counter.result()
+
     def _run(self) -> None:
         source = self._source.fileno()
         while chunk := os.read(source, 65536):
             with self._tail_lock:
                 self._tail += chunk
+                self._counter.feed(chunk)
                 del self._tail[:-_TAIL_BYTES]
             if self._echo:
                 self._write(chunk)
@@ -151,7 +162,7 @@ def execute(argv: Sequence[str], cwd: Path, timeout_s: float) -> Outcome:
         process.stdout.close()
     duration = time.monotonic() - started
     exit_code = code if code >= 0 else 128 - code  # killed by signal N -> 128 + N, like shells
-    return Outcome(exit_code, duration, pump.tail(), status)
+    return Outcome(exit_code, duration, pump.tail(), status, pump.tests_ran())
 
 
 def _program(executable: str, cwd: Path) -> str:
@@ -211,10 +222,19 @@ def _changed_paths(before: DiffSnapshot, after: DiffSnapshot) -> list[str]:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
-        usage=f"{PROG} [--kind KIND] [--cwd DIR] [--timeout SEC] -- <command> [args...]",
+        usage=f"{PROG} [--kind KIND] [--min-tests N] [--cwd DIR] [--timeout SEC] -- <command> [args...]",
         description="Run a command and record its exit code in the Craftsman evidence ledger.",
     )
     parser.add_argument("--kind", choices=RUN_KINDS, default="other", help=", ".join(RUN_KINDS))
+    parser.add_argument(
+        "--min-tests",
+        type=int,
+        default=DEFAULT_MIN_TESTS,
+        help=(
+            "A test run must report at least this many tests to count as passing "
+            f"(default {DEFAULT_MIN_TESTS}; 0 turns the check off). Applies to --kind test."
+        ),
+    )
     parser.add_argument("--cwd", help="Directory to run in (default: current)")
     parser.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT_S, help="Seconds (default 1800)"
@@ -237,14 +257,24 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("missing command after `--`")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.min_tests < 0:
+        parser.error("--min-tests must be >= 0")
     try:
-        return _run_recorded(command, Path(args.cwd or os.getcwd()).resolve(), args.kind, args.timeout)
+        return _run_recorded(
+            command, Path(args.cwd or os.getcwd()).resolve(), args.kind, args.timeout, args.min_tests
+        )
     except (LedgerError, DiffScanError, GateStateError) as exc:
         sys.stderr.write(f"{PROG}: error: {exc}\n")
         return 1
 
 
-def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: float) -> int:
+def _run_recorded(
+    command: Sequence[str],
+    cwd: Path,
+    kind: RunKind,
+    timeout_s: float,
+    min_tests: int = DEFAULT_MIN_TESTS,
+) -> int:
     """Run `command` in `cwd` and record the run; the exit status to report to the caller."""
     ws = open_workspace(str(cwd))
     ledger = load(ws.ledger_path)
@@ -263,12 +293,20 @@ def _run_recorded(command: Sequence[str], cwd: Path, kind: RunKind, timeout_s: f
         return EXIT_INTERRUPTED
     if modified := (after.fingerprint != before.fingerprint):
         _warn_modified(before, after)
-    run = _persist_run(ws.ledger_path, command, cwd, kind, outcome, before, after, started_at, modified)
+    run = _persist_run(
+        ws.ledger_path, command, cwd, kind, outcome, before, after, started_at, modified, min_tests
+    )
     sys.stderr.write(f"{run.id} recorded ({run.kind}, exit {run.exit_code}, {run.duration_s:.1f}s)\n")
-    if is_trivial_run(run.argv):
+    if is_trivial_run(run.argv, run.kind):
         sys.stderr.write(
             f"{PROG}: warning: `{run.command}` is trivial and does not count as verification\n"
         )
+    if run.too_few_tests:
+        sys.stderr.write(
+            f"{PROG}: warning: {run.tests_shortfall}; it does not count as a passing run. {MIN_TESTS_HINT}\n"
+        )
+    elif run.switched_off_test_minimum:
+        sys.stderr.write(f"{PROG}: warning: {run.id} reported 0 tests and passes only because of --min-tests 0\n")
     return EXIT_INTERRUPTED if outcome.status is RunStatus.INTERRUPTED else outcome.exit_code
 
 
@@ -282,6 +320,7 @@ def _persist_run(
     after: DiffSnapshot,
     started_at: str,
     modified: bool,
+    min_tests: int,
 ) -> Run:
     return mutate(
         ledger_path,
@@ -296,6 +335,8 @@ def _persist_run(
             started_at=started_at,
             output_tail=outcome.output_tail,
             fingerprint_after=after.fingerprint if modified else None,
+            tests_ran=outcome.tests_ran if kind == "test" else None,
+            min_tests=min_tests,
         ),
     )
 

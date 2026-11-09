@@ -1,0 +1,15 @@
+$ craftsman review show --help
+[exit 0]
+--- stdout
+usage: craftsman review show [-h] [--cwd CWD] [--json] [--packet-path]
+                             [--hunks]
+
+options:
+  -h, --help     show this help message and exit
+  --cwd CWD      Directory inside the repository (default: current)
+  --json
+  --packet-path  Print only the resolved absolute path of the current review
+                 packet
+  --hunks        Print the hunks still to cover (H# -> file:lines and scope or
+                 status) and how many are left
+--- stderr

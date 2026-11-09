@@ -10,6 +10,7 @@ through an agent-facing CLI command: subagent isolation evidence has to come fro
 from __future__ import annotations
 
 import errno
+import glob
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +28,10 @@ from typing import Literal, TypeVar, cast
 from craftsman.diffscan import DiffScanError, DiffSnapshot, Hunk, git_dir
 from craftsman.files import write_text_atomic
 from craftsman.records import (
+    DEFAULT_MIN_TESTS,
+    GROUPED_EVIDENCE_PREFIX,
     LEDGER_FILENAME,
+    MIN_READABLE_SCHEMA,
     SCHEMA_VERSION,
     SEVERITIES,
     AgentEvent,
@@ -36,6 +41,8 @@ from craftsman.records import (
     HunkRef,
     Ledger,
     LedgerError,
+    NewerSchemaError,
+    OlderSchemaError,
     QualitySignal,
     Resolution,
     Round,
@@ -43,7 +50,9 @@ from craftsman.records import (
     RunKind,
     RunWaiver,
     Severity,
+    SlotClaim,
     Verdict,
+    VerdictEvent,
     format_timestamp,
     next_id,
     scope_contains,
@@ -52,9 +61,6 @@ from craftsman.text import one_line
 from craftsman.triviality import is_trivial_run
 
 LOCK_POLL_S = 0.05
-# The ledger schema of Craftsman 4.x, which 5.x sets aside instead of reading.
-OLDER_LEDGER_VERSION = 2
-GROUPED_EVIDENCE_PREFIX = "Grouped into "
 _WORD_RE = re.compile(r"\w+")
 
 T = TypeVar("T")
@@ -169,8 +175,30 @@ else:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def load(path: Path) -> Ledger:
-    """Read the ledger at `path`; a missing file is an empty ledger."""
+_SET_ASIDE_LISTENER: ContextVar[Callable[[Path], None] | None] = ContextVar("craftsman_set_aside_listener", default=None)
+
+
+@contextmanager
+def watch_set_asides(listener: Callable[[Path], None]) -> Iterator[None]:
+    """Tell `listener` the backup path whenever `load` in this block sets an older ledger aside.
+
+    A hook may move an older ledger aside as a side effect of reading it; its entry point uses this to log the
+    move (`hook_errors`) so that it never goes unnoticed.
+    """
+    token = _SET_ASIDE_LISTENER.set(listener)
+    try:
+        yield
+    finally:
+        _SET_ASIDE_LISTENER.reset(token)
+
+
+def load(path: Path, *, set_aside: bool = True) -> Ledger:
+    """Read the ledger at `path`; a missing file is an empty ledger.
+
+    A ledger of an older craftsman is set aside under a unique name and read as empty; with
+    `set_aside=False` (read-only callers) it raises `OlderSchemaError` and nothing moves. A ledger of
+    a NEWER craftsman always raises `NewerSchemaError`: it is never read as empty, set aside or rewritten.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -183,15 +211,42 @@ def load(path: Path) -> Ledger:
         raise LedgerError(
             f"{path} is not valid JSON ({exc}); restore it or archive it with `craftsman review reset`"
         ) from exc
-    if _is_older_schema(raw):
+    schema = _schema_of(raw)
+    if schema is not None and schema > SCHEMA_VERSION:
+        raise NewerSchemaError(schema, path)
+    older = _unreadable_schema(raw)
+    if older is not None:
+        if not set_aside:
+            raise OlderSchemaError(older)
         _set_aside_older_ledger(path)
         return load(path)  # the old ledger is gone: empty, or a new one written meanwhile
     return Ledger.from_json(raw)
 
 
-def _is_older_schema(raw: object) -> bool:
+def refuse_newer_schema(path: Path) -> None:
+    """Raise `NewerSchemaError` when the file at `path` is a ledger of a newer craftsman; else do nothing.
+
+    For callers that move the file without loading it (`craftsman review reset`): a ledger this
+    craftsman cannot read must stay where the newer craftsman expects it. An unreadable or corrupt
+    file is no concern of this check.
+    """
+    try:
+        schema = _schema_of(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return
+    if schema is not None and schema > SCHEMA_VERSION:
+        raise NewerSchemaError(schema, path)
+
+
+def _schema_of(raw: object) -> int | None:
     schema = raw.get("schema") if isinstance(raw, dict) else None
-    return isinstance(schema, int) and not isinstance(schema, bool) and schema < SCHEMA_VERSION
+    return schema if isinstance(schema, int) and not isinstance(schema, bool) else None
+
+
+def _unreadable_schema(raw: object) -> int | None:
+    """The schema of a ledger this craftsman cannot read because it is too old; None otherwise."""
+    schema = _schema_of(raw)
+    return schema if schema is not None and schema < MIN_READABLE_SCHEMA else None
 
 
 def _set_aside_older_ledger(path: Path) -> None:
@@ -200,14 +255,15 @@ def _set_aside_older_ledger(path: Path) -> None:
     Under the lock and after reading the file again: it may have been replaced by a ledger of this
     craftsman since it was read, and that one must stay where it is.
     """
-    backup = path.with_name(f"{path.stem}.v{OLDER_LEDGER_VERSION}.bak{path.suffix}")
     with locked_unless_held(path):
         try:
             current = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return  # gone, or unreadable: not ours to set aside
-        if not _is_older_schema(current):
+        schema = _unreadable_schema(current)
+        if schema is None:
             return
+        backup = _free_backup_path(path, schema)
         try:
             os.replace(path, backup)
         except FileNotFoundError:
@@ -218,6 +274,46 @@ def _set_aside_older_ledger(path: Path) -> None:
         f"[craftsman] Archived the review ledger of an older craftsman to {backup.name}; "
         "starting a new review.\n"
     )
+    listener = _SET_ASIDE_LISTENER.get()
+    if listener is not None:
+        listener(backup)
+
+
+_BACKUP_NAME_RE = re.compile(r"\.v(?P<schema>\d+)(?:\.(?P<stamp>\d{8}T\d{6}Z))?(?:\.(?P<counter>\d+))?\.bak(?:\..*)?")
+
+
+def _free_backup_path(path: Path, schema: int) -> Path:
+    """`ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json`, with a counter before `.bak` when it exists.
+
+    Always a name no file has: an earlier backup is never overwritten. The caller holds the ledger lock.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"{path.stem}.v{schema}.{stamp}"
+    candidate = path.with_name(f"{base}.bak{path.suffix}")
+    counter = 1
+    while candidate.exists():
+        counter += 1
+        candidate = path.with_name(f"{base}.{counter}.bak{path.suffix}")
+    return candidate
+
+
+def backups_of(path: Path) -> tuple[Path, ...]:
+    """The ledgers set aside next to `path` (`ledger.v<schema>[.<stamp>][.<counter>].bak.json`), oldest first.
+
+    Ordered by schema number, then stamp (the old unstamped name first), then counter (no counter first).
+    """
+    try:
+        found = path.parent.glob(f"{glob.escape(path.stem)}.v[0-9]*.bak{path.suffix}")
+        return tuple(sorted(found, key=lambda backup: _backup_order(path, backup)))
+    except OSError:
+        return ()
+
+
+def _backup_order(ledger: Path, backup: Path) -> tuple[int, str, int, str]:
+    match = _BACKUP_NAME_RE.fullmatch(backup.name.removeprefix(ledger.stem))
+    if match is None:  # the glob is looser than the naming scheme: keep such a name last, in name order
+        return (sys.maxsize, "", 0, backup.name)
+    return (int(match["schema"]), match["stamp"] or "", int(match["counter"] or 1), backup.name)
 
 
 def save(path: Path, ledger: Ledger) -> None:
@@ -330,6 +426,41 @@ def _validate_round_continuation(
         raise LedgerError(FIXED_SCOPE_ERROR)
 
 
+def round_unchanged(ledger: Ledger, snap: DiffSnapshot, scope: Sequence[str] | None) -> bool:
+    """Whether `open_round` would hand back the latest round as it is (or raise it in place) for `snap`.
+
+    The same test `open_round` applies: the snapshot has the latest round's fingerprint and the scope
+    is the one that round was prepared with. A pure predicate: it validates nothing, so a base or
+    scope change that `open_round` would refuse reads as "changed" here.
+    """
+    normalized_scope = None if scope is None else tuple(sorted(scope))
+    return bool(ledger.rounds) and (
+        ledger.rounds[-1].fingerprint == snap.fingerprint and ledger.rounds[-1].scope == normalized_scope
+    )
+
+
+def _still_carried(
+    hunks: Sequence[HunkRef],
+    required: Mapping[str, frozenset[str]] | None,
+    credited: Mapping[str, frozenset[str]] | None,
+) -> tuple[HunkRef, ...]:
+    """`hunks` with every carried hunk that lacks a lens of `required` made open again.
+
+    This is the re-check of a round that is prepared again for the same diff: its carried hunks were
+    carried against the lenses required at normal depth (an in-place raise to deep), or against a credit
+    that counted more than the round now accepts (an upgrade to enforced). A hunk is never carried again
+    by this, only released. Without `required` and `credited` nothing changes.
+    """
+    if required is None or credited is None:
+        return tuple(hunks)
+    return tuple(
+        replace(ref, carried=False)
+        if ref.carried and not (ref.id in required and required[ref.id] <= credited.get(ref.digest, frozenset()))
+        else ref
+        for ref in hunks
+    )
+
+
 def open_round(
     ledger: Ledger,
     snap: DiffSnapshot,
@@ -341,27 +472,41 @@ def open_round(
     scope: Sequence[str] | None = None,
     allow_scope_expansion: bool = False,
     out_of_scope: Sequence[str] = (),
+    required: Mapping[str, frozenset[str]] | None = None,
+    credited: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[Ledger, Round]:
     """Start the next review round for `snap`; re-preparing an unchanged diff is a no-op.
 
-    Asking for `deep` on an unchanged diff raises the latest round in place: its hunks and
-    coverage stay, only the lens suggestions grow.
+    Asking for `deep` on an unchanged diff raises the latest round in place: its coverage stays.
+    On every reuse of the latest round, given `required` and `credited` (as that round sees them: the
+    deep lenses, the credit judged for its enforcement), a carried hunk whose required lenses are not
+    all credited becomes open again, so the round owes it; a hunk is never carried by this, only
+    released. A round upgraded to enforced in place thus cannot keep hunks that only an unvouched
+    self-review carried into it.
+
+    Given both `required` (hunk id -> the lenses the hunk must be examined with) and `credited` (hunk
+    digest -> the lenses accepted coverage has examined it with), a hunk is carried over only when
+    it is not reopened and everything it requires is credited. Without them a hunk is carried when
+    any coverage reviewed its digest, as before. Giving only one of the two is an error.
     """
+    if (required is None) != (credited is None):
+        raise LedgerError("lens-aware carry-over needs both `required` and `credited`, or neither")
     normalized_scope = None if scope is None else tuple(sorted(scope))
     if ledger.rounds:
         _validate_round_continuation(
             ledger, snap, normalized_scope, allow_scope_expansion=allow_scope_expansion
         )
         latest = ledger.rounds[-1]
-        if latest.fingerprint == snap.fingerprint and latest.scope == normalized_scope:
-            if latest.deep or not deep:
+        if round_unchanged(ledger, snap, scope):
+            hunks = _still_carried(latest.hunks, required, credited)
+            if hunks == latest.hunks and (latest.deep or not deep):
                 return ledger, latest
-            raised = replace(latest, deep=True)
-            return replace(ledger, rounds=(*ledger.rounds[:-1], raised)), raised
+            refreshed = replace(latest, deep=latest.deep or deep, hunks=hunks)
+            return replace(ledger, rounds=(*ledger.rounds[:-1], refreshed)), refreshed
     unknown = sorted(set(symbols_by_hunk) - {hunk.id for hunk in snap.hunks})
     if unknown:
         raise LedgerError(f"symbols given for hunks not in the snapshot: {', '.join(unknown)}")
-    carried, reopened = _carry_over(ledger, snap.hunks, symbols_by_hunk)
+    carried, reopened = _carry_over(ledger, snap.hunks, symbols_by_hunk, required, credited)
     round_ = Round(
         number=len(ledger.rounds) + 1,
         fingerprint=snap.fingerprint,
@@ -375,6 +520,12 @@ def open_round(
         out_of_scope=tuple(sorted(out_of_scope)),
     )
     return replace(ledger, rounds=(*ledger.rounds, round_)), round_
+
+
+def stamp_prepared(ledger: Ledger) -> tuple[Ledger, Round]:
+    """The ledger with its latest round marked as prepared just now (see `Round.last_prepared_at`)."""
+    latest = replace(ledger.rounds[-1], last_prepared_at=_now())
+    return replace(ledger, rounds=(*ledger.rounds[:-1], latest)), latest
 
 
 def _reopened_hunk_ids(
@@ -409,15 +560,32 @@ def _reopened_hunk_ids(
 
 
 def _carry_over(
-    ledger: Ledger, hunks: Sequence[Hunk], symbols_by_hunk: Mapping[str, Sequence[str]]
+    ledger: Ledger,
+    hunks: Sequence[Hunk],
+    symbols_by_hunk: Mapping[str, Sequence[str]],
+    required: Mapping[str, frozenset[str]] | None = None,
+    credited: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """Ids of the hunks of the next round that are carried over, and of those that are reopened."""
+    """Ids of the hunks of the next round that are carried over, and of those that are reopened.
+
+    With `required` and `credited` (the planned path) a hunk is carried only when all it requires is
+    credited; a hunk without an entry in `required` is never carried.
+    """
     if not ledger.rounds:
         return frozenset(), frozenset()
     reviewed = covered_digests(ledger, len(ledger.rounds))
     previous = {hunk.digest for hunk in ledger.rounds[-1].hunks}
     reopened = _reopened_hunk_ids(hunks, previous, reviewed, symbols_by_hunk)
-    carried = {hunk.id for hunk in hunks if hunk.id not in reopened and hunk.digest in reviewed}
+    if required is not None and credited is not None:
+        carried = {
+            hunk.id
+            for hunk in hunks
+            if hunk.id not in reopened
+            and hunk.id in required
+            and required[hunk.id] <= credited.get(hunk.digest, frozenset())
+        }
+    else:
+        carried = {hunk.id for hunk in hunks if hunk.id not in reopened and hunk.digest in reviewed}
     return frozenset(carried), frozenset(reopened)
 
 
@@ -501,13 +669,31 @@ def plan_coverage(
     )
 
 
-def add_coverage(ledger: Ledger, hunk_ids: Sequence[str], note: str) -> tuple[Ledger, Coverage]:
+def add_coverage(
+    ledger: Ledger,
+    hunk_ids: Sequence[str],
+    note: str,
+    *,
+    hunter: str | None = None,
+    by: str | None = None,
+) -> tuple[Ledger, Coverage]:
     """Record that the open hunks `hunk_ids` of the latest round were examined, with a free-text
-    note of what was tried. `plan_coverage` turns what a user named into those ids."""
+    note of what was tried. `plan_coverage` turns what a user named into those ids.
+
+    `hunter` names the plan slot the coverage answers and `by` the caller's identity, when known;
+    whether the slot exists and owns these hunks is for the caller to check against the plan. Coverage
+    tagged with a slot of the round's stored plan may also name the carried hunks that slot lists (a
+    sweep or a fresh set looks at the whole round); untagged coverage never does.
+    """
     round_ = _latest_round(ledger)
     if not hunk_ids:
         raise LedgerError("name at least one of the hunks to cover", field="hunks")
-    by_id = {hunk.id: hunk for hunk in round_.hunks if not hunk.carried}
+    slot = round_.plan.slot(hunter) if hunter is not None and round_.plan is not None else None
+    by_id = {
+        hunk.id: hunk
+        for hunk in round_.hunks
+        if not hunk.carried or (slot is not None and hunk.id in slot.hunks)
+    }
     closed = [hunk_id for hunk_id in dict.fromkeys(hunk_ids) if hunk_id not in by_id]
     if closed:
         raise LedgerError(
@@ -520,6 +706,8 @@ def add_coverage(ledger: Ledger, hunk_ids: Sequence[str], note: str) -> tuple[Le
         digests=tuple(dict.fromkeys(by_id[hunk_id].digest for hunk_id in hunk_ids)),
         note=one_line(note),
         recorded_at=_now(),
+        hunter=hunter,
+        by=by,
     )
     return replace(ledger, coverage=(*ledger.coverage, record)), record
 
@@ -534,8 +722,13 @@ def add_finding(
     title: str,
     scenario: str,
     suggestion: str,
+    hunter: str | None = None,
+    by: str | None = None,
 ) -> tuple[Ledger, Finding]:
-    """Record a finding against the latest round and the code it reviewed."""
+    """Record a finding against the latest round and the code it reviewed.
+
+    `hunter` is the slot that found it, or `LEAD_HUNTER` for the orchestrator's own; `by` the caller's identity.
+    """
     round_ = _latest_round(ledger)
     now = _now()
     finding = Finding(
@@ -556,6 +749,8 @@ def add_finding(
         resolution_note="",
         recorded_at=now,
         updated_at=now,
+        hunter=hunter,
+        by=by,
     )
     return replace(ledger, findings=(*ledger.findings, finding)), finding
 
@@ -587,8 +782,15 @@ def merge_findings(
     title: str | None = None,
     scenario: str | None = None,
     suggestion: str | None = None,
+    by: str | None = None,
 ) -> tuple[Ledger, Finding, tuple[Finding, ...]]:
-    """Fold duplicate findings that share a root cause into `target_id` before verification."""
+    """Fold duplicate findings that share a root cause into `target_id` before verification.
+
+    Each duplicate is dismissed with a verdict event of its own, so the merge has a token (`V<k>`)
+    that a verifier run can be shown to have printed. Merges do not chain, so a duplicate that already
+    has duplicates folded into it takes them along: they are re-pointed at `target_id`, each with a new
+    event of its own, and returned after the named duplicates.
+    """
     target, duplicates = _mergeable(ledger, target_id, duplicate_ids)
     now = _now()
     updated_target = replace(
@@ -600,13 +802,42 @@ def merge_findings(
         updated_at=now,
     )
     evidence = f"{GROUPED_EVIDENCE_PREFIX}{target.id} ({target.path}:{target.line}): same root cause."
-    dismissed = tuple(
-        replace(dup, verdict="dismissed", verdict_evidence=evidence, updated_at=now)
-        for dup in duplicates
+    first_token = int(next_verdict_token(ledger)[1:])
+    # Duplicates already folded into a duplicate follow it to the new target: merges do not chain.
+    moved = tuple(
+        item
+        for item in ledger.findings
+        if item.merged_into in duplicate_ids and item.id not in duplicate_ids
     )
-    by_id = {item.id: item for item in (updated_target, *dismissed)}
+    dismissed = tuple(
+        replace(
+            dup,
+            verdict="dismissed",
+            verdict_evidence=evidence,
+            updated_at=now,
+            verdict_log=(*dup.verdict_log, VerdictEvent(f"V{first_token + offset}", "dismissed", now, by, merge=True)),
+            merged_into=target.id,
+        )
+        for offset, dup in enumerate(duplicates)
+    )
+    repointed = tuple(
+        replace(
+            item,
+            verdict_evidence=(
+                evidence if item.verdict_evidence.startswith(GROUPED_EVIDENCE_PREFIX) else item.verdict_evidence
+            ),
+            updated_at=now,
+            verdict_log=(
+                *item.verdict_log,
+                VerdictEvent(f"V{first_token + len(dismissed) + offset}", "dismissed", now, by, merge=True),
+            ),
+            merged_into=target.id,
+        )
+        for offset, item in enumerate(moved)
+    )
+    by_id = {item.id: item for item in (updated_target, *dismissed, *repointed)}
     findings = tuple(by_id.get(item.id, item) for item in ledger.findings)
-    return replace(ledger, findings=findings), updated_target, dismissed
+    return replace(ledger, findings=findings), updated_target, (*dismissed, *repointed)
 
 
 def _mergeable(
@@ -620,13 +851,25 @@ def _mergeable(
         raise LedgerError(f"duplicate finding ids must not repeat: {', '.join(duplicate_ids)}")
     target = _find(ledger, target_id)
     duplicates = tuple(_find(ledger, dup_id) for dup_id in duplicate_ids)
-    for item in (target, *duplicates):
-        if item.verdict is not None:
-            raise LedgerError(
-                "merge only works on findings without a verdict (before verification); "
-                f"{item.id} already has the verdict {item.verdict}"
-            )
+    if target.merged_into is not None:
+        raise LedgerError(
+            f"{target_id} was merged into {target.merged_into}; merge into {target.merged_into} instead "
+            "(merges do not chain)"
+        )
+    if target.verdict is not None:
+        raise LedgerError(_not_mergeable(target))
+    for dup in duplicates:
+        # Recording a merge again is allowed so that a verifier can vouch for a merge someone else made.
+        if dup.verdict is not None and dup.merged_into != target_id:
+            raise LedgerError(_not_mergeable(dup))
     return target, duplicates
+
+
+def _not_mergeable(item: Finding) -> str:
+    return (
+        "merge only works on findings without a verdict (before verification); "
+        f"{item.id} already has the verdict {item.verdict}"
+    )
 
 
 def _merged_scenario(target: Finding, duplicates: Sequence[Finding]) -> str:
@@ -642,30 +885,101 @@ def _merged_suggestion(target: Finding, duplicates: Sequence[Finding]) -> str:
     return target.suggestion or next((dup.suggestion for dup in duplicates if dup.suggestion), "")
 
 
+def next_verdict_token(ledger: Ledger) -> str:
+    """The token (`V<k>`) of the next verdict event: one past the highest in the whole ledger."""
+    return next_id("V", (event.token for finding in ledger.findings for event in finding.verdict_log))
+
+
+def next_claim_token(ledger: Ledger) -> str:
+    """The token (`B<n>`) of the next slot claim."""
+    return next_id("B", (claim.token for claim in ledger.claims))
+
+
+def add_claim(ledger: Ledger, slot_id: str, *, by: str | None = None) -> tuple[Ledger, SlotClaim]:
+    """Record that a hunter took `slot_id` of the latest round.
+
+    Claiming a slot again is allowed (a relaunched hunter); whether the slot exists in the round's plan
+    is for the caller to check.
+    """
+    round_ = _latest_round(ledger)
+    claim = SlotClaim(
+        round=round_.number, slot=slot_id, token=next_claim_token(ledger), at=_now(), by=by
+    )
+    return replace(ledger, claims=(*ledger.claims, claim)), claim
+
+
 def set_verdict(
-    ledger: Ledger, finding_id: str, verdict: Verdict, evidence: str, run_id: str | None
+    ledger: Ledger,
+    finding_id: str,
+    verdict: Verdict,
+    evidence: str,
+    run_id: str | None,
+    *,
+    by: str | None = None,
 ) -> tuple[Ledger, Finding]:
-    """Record an independent verdict; the latest verdict wins and a non-defect verdict drops any resolution."""
+    """Record an independent verdict; the latest verdict wins and a non-defect verdict drops any resolution.
+
+    Every call appends a `VerdictEvent`; its token is `finding.verdict_log[-1].token`. A merged
+    duplicate stays merged when it is dismissed; any other verdict un-merges it, because whoever
+    judged it found it is not a duplicate.
+    """
+    flat = one_line(evidence)  # what is stored, so the reservation holds for any spelling of the space
+    if flat.startswith(GROUPED_EVIDENCE_PREFIX):
+        raise FieldError(
+            "verdict_evidence",
+            f"must not start with '{GROUPED_EVIDENCE_PREFIX}': that wording is reserved for "
+            "`craftsman review merge`",
+        )
     finding = _find(ledger, finding_id)
     if run_id is not None:
         run = _find_run(ledger, run_id)
-        if is_trivial_run(run.argv):
+        if is_trivial_run(run.argv, run.kind):
             raise FieldError(
                 "verdict_run",
                 f"{run_id} (`{run.command}`) is trivial and proves nothing; record the command that "
                 "exercises the code with `craftsman run --kind repro -- ...` and cite that run",
             )
     keeps_resolution = verdict in ("proven", "probable")
+    now = _now()
+    event = VerdictEvent(next_verdict_token(ledger), verdict, now, by)
     updated = replace(
         finding,
         verdict=verdict,
-        verdict_evidence=one_line(evidence),
+        verdict_log=(*finding.verdict_log, event),
+        verdict_evidence=flat,
         verdict_run=run_id,
         resolution=finding.resolution if keeps_resolution else None,
         resolution_note=finding.resolution_note if keeps_resolution else "",
-        updated_at=_now(),
+        updated_at=now,
+        # A merged duplicate stays merged while it is dismissed; any other verdict says it is not a duplicate.
+        merged_into=finding.merged_into if verdict == "dismissed" else None,
     )
     return _with_finding(ledger, updated)
+
+
+def verdict_streak(finding: Finding) -> tuple[VerdictEvent, ...]:
+    """The trailing events of `finding`'s verdict log that record its current verdict, oldest first.
+
+    Empty without a verdict or without events (a verdict from before events existed).
+    """
+    streak: list[VerdictEvent] = []
+    for event in reversed(finding.verdict_log):
+        if event.verdict != finding.verdict:
+            break
+        streak.append(event)
+    return tuple(reversed(streak))
+
+
+def verdict_since(finding: Finding) -> str | None:
+    """When the finding's current verdict was first recorded, or None without a verdict.
+
+    Recording the same verdict again does not move it; a different verdict in between does. A
+    finding from before verdict events existed (empty log) falls back to its last update.
+    """
+    if finding.verdict is None:
+        return None
+    streak = verdict_streak(finding)
+    return streak[0].at if streak else finding.updated_at
 
 
 def resolve(
@@ -723,6 +1037,8 @@ def add_run(
     started_at: str,
     output_tail: str,
     fingerprint_after: str | None,
+    tests_ran: int | None = None,
+    min_tests: int = DEFAULT_MIN_TESTS,
 ) -> tuple[Ledger, Run]:
     """Append a verification run under the next free run id."""
     run = Run(
@@ -736,6 +1052,8 @@ def add_run(
         started_at=started_at,
         output_tail=output_tail,
         fingerprint_after=fingerprint_after,
+        tests_ran=tests_ran,
+        min_tests=min_tests,
     )
     return replace(ledger, runs=(*ledger.runs, run)), run
 
@@ -748,7 +1066,7 @@ def add_agent_event(ledger: Ledger, ev: AgentEvent) -> Ledger:
 # --- coverage accounting -------------------------------------------------------------------
 
 
-def _reopened_in(ledger: Ledger, upto: int) -> dict[str, int]:
+def reopened_in(ledger: Ledger, upto: int) -> dict[str, int]:
     """Per hunk digest, the latest round up to `upto` that reopened it."""
     latest: dict[str, int] = {}
     for round_ in ledger.rounds[:upto]:
@@ -763,7 +1081,7 @@ def covered_digests(ledger: Ledger, upto: int) -> set[str]:
 
     Coverage recorded before the latest round that reopened a digest does not count for it.
     """
-    reopened = _reopened_in(ledger, upto)
+    reopened = reopened_in(ledger, upto)
     return {
         digest
         for record in ledger.coverage

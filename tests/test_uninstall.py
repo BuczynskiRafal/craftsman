@@ -5,16 +5,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import unittest
 
 from craftsman.files import BACKUP_DIR_NAME
-from craftsman.legacy_githooks import git_config_get, git_config_set, git_config_unset
-from craftsman.manifest import MANIFEST_FILENAME, TargetKind, load_manifest
+from craftsman.manifest import BEFORE_4_0_MANIFEST_MESSAGE, MANIFEST_FILENAME
 from craftsman.paths import default_vscode_user_dir
-from craftsman.staging import Tracker
-from craftsman.uninstall import apply_plan, parse_uninstall_args, plan_base
+from craftsman.staging import stop_roots_for
+from craftsman.uninstall import parse_uninstall_args
 
-from tests.support import IsolatedHomeTestCase, snapshot_tree
+from tests.support import IsolatedHomeTestCase, snapshot_tree, write_pre_4_0_install
 
 
 class UninstallTestCase(IsolatedHomeTestCase):
@@ -81,29 +81,32 @@ class RemovalTests(UninstallTestCase):
         self.assertIn("refusing to touch", result.err)
         self.assertTrue(victim.is_file())
 
-    def test_tampered_git_hooks_manifest_changes_no_git_config(self) -> None:
-        hooks_dir = self.write_legacy_git_hooks()
-        manifest_path = self.home / ".craftsman" / MANIFEST_FILENAME
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["targets"]["git_hooks"]["created_paths"].append(str(self.tmp / "victim.txt"))
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-        result = self.uninstall()
-
-        self.assertEqual(result.code, 1)
-        self.assertEqual(self.hooks_path(), str(hooks_dir))
-
     def test_configured_folders_outside_home_are_uninstalled(self) -> None:
         outside = self.tmp / "outside"
-        os.environ["CRAFTSMAN_HOME"] = str(outside / "craftsman")
         os.environ["XDG_CONFIG_HOME"] = str(outside / "xdg")
+        os.environ["APPDATA"] = str(outside / "appdata")
         self.assert_ok(self.install("--copilot"))
-        self.write_legacy_git_hooks(outside / "craftsman")
+        # Only the platform that keeps VS Code's folder there writes below it.
+        self.assertEqual(any(outside.rglob("*")), sys.platform != "darwin")
 
         self.assert_ok(self.uninstall("--all"))
 
-        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(list(outside.rglob("*")), [])
         self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_the_configured_folders_outside_home_are_stop_roots_on_every_platform(self) -> None:
+        outside = self.tmp / "outside"
+        os.environ["XDG_CONFIG_HOME"] = str(outside / "xdg")
+        os.environ["APPDATA"] = str(outside / "appdata")
+
+        roots = stop_roots_for(self.home)
+
+        self.assertEqual(roots, frozenset({self.home, outside}))
+
+    def test_a_configured_folder_inside_home_adds_no_stop_root(self) -> None:
+        os.environ["XDG_CONFIG_HOME"] = str(self.home / "xdg")
+
+        self.assertEqual(stop_roots_for(self.home), frozenset({self.home}))
 
     def test_agents_md_relinked_out_of_the_workspace_is_refused(self) -> None:
         (self.workspace / "CLAUDE.md").write_text("# Mine\n", encoding="utf-8")
@@ -142,56 +145,32 @@ class RemovalTests(UninstallTestCase):
 
         self.assertFalse((self.home / ".copilot").exists())
 
-    def test_shared_scripts_stay_while_another_target_needs_them(self) -> None:
-        self.assert_ok(self.install("--antigravity"))
-        hooks_dir = self.write_legacy_git_hooks(self.config_dir)
+    def test_a_manifest_of_craftsman_before_4_0_asks_for_a_reinstall_and_changes_nothing(self) -> None:
+        self.assert_ok(self.install("--claude"))
+        manifest = write_pre_4_0_install(self.config_dir)
+        before = snapshot_tree(self.home)
 
-        plan = plan_base(self.config_dir, [TargetKind.GIT_HOOKS], self.home, roots=(self.config_dir,))
-        assert plan is not None
-        apply_plan(plan, self.home, Tracker(dry_run=False))
+        result = self.uninstall("--all")
 
-        self.assertTrue((self.config_dir / "scripts" / "craftsman-stop-gate.py").is_file())
-        self.assertFalse(hooks_dir.exists())
+        self.assertEqual(result.code, 1)
+        self.assertIn(BEFORE_4_0_MANIFEST_MESSAGE.format(path=manifest), result.err)
+        self.assertEqual(snapshot_tree(self.home), before)
 
-    def test_uninstall_restores_previous_hooks_path_or_unsets_it(self) -> None:
-        for previous in (None, "~/my-hooks", ".githooks"):
-            with self.subTest(previous=previous):
-                hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=previous)
-                self.assert_ok(self.uninstall("--claude"))
-                self.assertEqual(self.hooks_path(), previous)
-                self.assertFalse(hooks_dir.exists())
-                self.assertIsNone(load_manifest(self.home / ".craftsman"))
+    def test_a_manifest_of_craftsman_before_4_0_does_not_block_another_target(self) -> None:
+        self.assert_ok(self.install("--claude"))
+        write_pre_4_0_install(self.config_dir)
 
-    def test_uninstall_from_v1_manifest_restores_previous_hooks_path_or_unsets_it(self) -> None:
-        for previous in (None, "~/my-hooks"):
-            with self.subTest(previous=previous):
-                hooks_dir = self.write_legacy_v1_git_hooks(previous_hooks_path=previous)
-                self.assert_ok(self.uninstall("--claude"))
-                self.assertEqual(self.hooks_path(), previous)
-                self.assertFalse(hooks_dir.exists())
-                self.assertFalse((self.home / ".craftsman").exists())
+        self.assert_ok(self.uninstall("--claude"))
 
-    def test_uninstall_leaves_user_changed_hooks_path_untouched(self) -> None:
-        hooks_dir = self.write_legacy_git_hooks(previous_hooks_path=None)
-        self.git_global("core.hooksPath", "/opt/husky")
+        self.assertFalse((self.claude_dir / "commands" / "craftsman.md").exists())
 
-        result = self.uninstall()
+    def test_the_craftsman_home_folder_is_no_longer_read(self) -> None:
+        write_pre_4_0_install(self.home / ".craftsman")
+
+        result = self.uninstall("--all")
 
         self.assert_ok(result)
-        self.assertEqual(self.hooks_path(), "/opt/husky")
-        self.assertIn("leaving git config --global core.hooksPath (/opt/husky) untouched", result.err)
-        self.assertFalse(hooks_dir.exists())
-
-    def test_git_config_unset_drops_only_an_empty_section(self) -> None:
-        git_config_set("core.hooksPath", "/tmp/hooks", self.home)
-        git_config_unset("core.hooksPath", self.home)
-        self.assertIsNone(git_config_get("core.hooksPath", self.home))
-        self.assertNotIn("[core]", self.git_config.read_text(encoding="utf-8"))
-
-        git_config_set("core.hooksPath", "/tmp/hooks", self.home)
-        git_config_set("core.autocrlf", "false", self.home)
-        git_config_unset("core.hooksPath", self.home)
-        self.assertEqual(git_config_get("core.autocrlf", self.home), "false")
+        self.assertIn("Nothing to uninstall", result.out)
 
 
 class MergedFileTests(UninstallTestCase):

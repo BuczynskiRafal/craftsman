@@ -1,0 +1,21 @@
+$ craftsman review cover --help
+[exit 0]
+--- stdout
+usage: craftsman review cover [-h] [--cwd CWD] [--hunks HUNKS] [--files FILES]
+                              [--note NOTE] [--hunter SLOT] [--from-json PATH]
+                              [--check]
+
+options:
+  -h, --help        show this help message and exit
+  --cwd CWD         Directory inside the repository (default: current)
+  --hunks HUNKS     Comma-separated hunk ids or ranges, e.g. H1,H3-H7
+  --files FILES     Comma-separated file paths; covers every open hunk of
+                    those files
+  --note NOTE       What you examined and tried (one line, >= 20 characters)
+  --hunter SLOT     The hunt-plan slot this coverage answers (your brief names
+                    it; required in an enforced review)
+  --from-json PATH  Bulk JSON list of {"hunks"|"files", "note", "hunter"?}
+                    objects (use - for stdin)
+  --check           Validate without recording to the ledger or consuming an
+                    inbox file
+--- stderr

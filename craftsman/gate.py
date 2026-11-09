@@ -8,8 +8,10 @@ gate (`craftsman review check`), at most `MAX_CONTINUATIONS` times in a row with
 `craftsman gate --complete` closes the gate, which is the only enforcement on platforms without
 stop hooks.
 
-Each gate belongs to the agent session that opened it (`GateOwner`), so a parallel session in the
-same checkout neither triggers nor changes it.
+Each gate belongs to the agent session that opened it (`GateOwner`): its Stop hooks hold only that
+owner, and only the owner raises or closes it. Every review command in the checkout follows the active
+gate whoever runs it (one evidence ledger per checkout, and an Antigravity hunter is a conversation of its
+own, never the owner), so parallel work in one checkout needs separate worktrees.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -26,6 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal, TypeVar, get_args
 
+from craftsman import hook_errors
 from craftsman.diffscan import (
     DiffScanError,
     git_dir,
@@ -47,6 +50,7 @@ from craftsman.gatecheck import (
     render_next_actions,
     render_report,
 )
+from craftsman.huntview import waiting_notice
 from craftsman.ledger import locked, locked_unless_held
 from craftsman.records import (
     ISOLATION_EVIDENCES,
@@ -68,6 +72,7 @@ MAX_ERROR_CHARS = 400
 CONTINUATION_HEADER = "[CRAFTSMAN GATE"
 REVIEW_CONTINUATION_HEADER = "[CRAFTSMAN REVIEW"
 TAKEOVER_HINT = "start a new gate with `craftsman gate --init --takeover`"
+TAKEOVER_NOTE = "If that session is gone, take its gate over with `craftsman gate --init --takeover`."
 NO_ACTIVE_GATE = "no active gate in this work tree; open one with `craftsman gate --init`"
 ROUND_CAP_NOTICE = (
     "Craftsman gate: the review reached its round cap. The remaining issues need your decision; "
@@ -172,13 +177,18 @@ class GateState:
     best_issue_count: int | None = None
     takeover_from: GateOwner | None = None
     request_step: int | None = None
+    # The evidence counter (`attribution.evidence_counter`) when the gate last blocked a stop; None until it did.
+    evidence_seen: int | None = None
+    # While `awaiting_user`: when `--await-user` was run and the question it was tied to, if it named one.
+    awaiting_since: str | None = None
+    question: str | None = None
 
     def __post_init__(self) -> None:
         if not self.base_sha:
             raise GateStateError("base_sha must not be empty")
         if self.isolation_evidence not in ISOLATION_EVIDENCES:
             raise GateStateError(f"unknown isolation evidence {self.isolation_evidence!r}")
-        if self.forced_continuations < 0 or (self.best_issue_count or 0) < 0:
+        if self.forced_continuations < 0 or (self.best_issue_count or 0) < 0 or (self.evidence_seen or 0) < 0:
             raise GateStateError("counters must not be negative")
 
     @classmethod
@@ -207,6 +217,14 @@ class GateState:
             best_issue_count=fields.optional_integer("best_issue_count"),
             takeover_from=fields.optional_record("takeover_from", GateOwner.from_fields),
             request_step=fields.optional_integer("request_step"),
+            # Older states have no such key.
+            evidence_seen=fields.optional_integer("evidence_seen")
+            if isinstance(raw, dict) and "evidence_seen" in raw
+            else None,
+            awaiting_since=fields.optional_text("awaiting_since")
+            if isinstance(raw, dict) and "awaiting_since" in raw
+            else None,
+            question=fields.optional_text("question") if isinstance(raw, dict) and "question" in raw else None,
         )
         return fields.done(state)
 
@@ -225,7 +243,7 @@ class GateState:
         user up. A deep gate still needed its end-to-end run to get here.
         """
         stage = Stage.COMPLETE_UNISOLATED if report.self_reviewed else Stage.COMPLETED
-        return replace(self, active=False, awaiting_user=False, stage=stage)
+        return replace(self, active=False, awaiting_user=False, awaiting_since=None, question=None, stage=stage)
 
     @property
     def required_isolation(self) -> IsolationEvidence:
@@ -331,6 +349,11 @@ def update_state(path: Path, change: Callable[[GateState | None], tuple[GateStat
         return result
 
 
+def owns_active_gate(state: GateState | None, caller: GateOwner) -> bool:
+    """Whether `state` is an active gate that `caller`'s session owns."""
+    return state is not None and state.active and state.owner.admits(caller)
+
+
 def require_active(state: GateState | None) -> GateState:
     if state is None or not state.active:
         raise GateStateError(NO_ACTIVE_GATE)
@@ -399,35 +422,61 @@ class StopDecision:
     notice: str | None = None
 
 
-def decide_stop(state: GateState, root: Path) -> StopDecision:
-    """Whether the agent that owns `state` may stop now."""
+def decide_stop(
+    state: GateState, root: Path, *, running: Sequence[str] = (), evidence: int | None = None
+) -> StopDecision:
+    """Whether the agent that owns `state` may stop now.
+
+    `running` names the craftsman subagents still working for this review (`review_guard.running_work`):
+    while the gate is not satisfied the agent may stop without spending a continuation, since their
+    reports wake it. `evidence` is the evidence counter (`attribution.evidence_counter`); callers that pass
+    it get the shared progress rule (`advance_streak`), the others the older "fewer open issues" rule.
+    """
     if not state.active or state.awaiting_user:
         return StopDecision(state)
     try:
         evaluation = evaluate_task(state, root)
     except (DiffScanError, LedgerError) as exc:
-        return _continue(state, None, str(exc))
+        return _continue(state, None, str(exc), None)
     outcome = judge(evaluation)
     if outcome in HUMAN_NOTICES:
         return StopDecision(replace(state, stage=Stage.NEEDS_HUMAN), notice=HUMAN_NOTICES[outcome])
     if outcome is Outcome.PASSED:
         return StopDecision(state.closed(evaluation.report))
-    return _continue(state, evaluation.report, None)
+    if running:
+        return StopDecision(state, notice=waiting_notice(running, gate_active=True))
+    return _continue(state, evaluation.report, None, evidence)
 
 
-def _continue(state: GateState, report: GateReport | None, error: str | None) -> StopDecision:
+def advance_streak(forced: int, seen: int | None, evidence: int) -> int:
+    """The continuations spent in the current streak after a Stop that sees `evidence`.
+
+    The one progress rule of both Stop guards (the gate and the review guard): the streak starts over when
+    the vouched evidence grew since the last block (`seen`, None before the first one). Activity that adds
+    no evidence (agents that stop, claims, repeated verdicts) is not progress, so it cannot reset the cap.
+    """
+    return 0 if seen is None or evidence > seen else forced
+
+
+def _continue(state: GateState, report: GateReport | None, error: str | None, evidence: int | None) -> StopDecision:
     """Block the stop, unless the streak of continuations without progress reached the cap.
 
-    Progress means fewer open issues than ever before in this streak; an issue count that merely
-    oscillates must not keep the agent looping. An unreadable ledger counts as one issue.
+    Progress means more vouched evidence than at the last block (`advance_streak`); a caller that cannot
+    say (`evidence` None, or an unreadable ledger) falls back to fewer open issues than ever before in
+    this streak, so that an issue count that merely oscillates cannot keep the agent looping either. An
+    unreadable ledger counts as one issue.
     """
-    issue_count = len(report.issues) if report is not None else 1
-    best = state.best_issue_count
-    forced = 0 if best is not None and issue_count < best else state.forced_continuations
-    best = issue_count if best is None else min(best, issue_count)
+    best_issue_count, evidence_seen = state.best_issue_count, state.evidence_seen
+    if evidence is None:
+        issue_count = len(report.issues) if report is not None else 1
+        forced = 0 if best_issue_count is not None and issue_count < best_issue_count else state.forced_continuations
+        best_issue_count = issue_count if best_issue_count is None else min(best_issue_count, issue_count)
+    else:
+        forced = advance_streak(state.forced_continuations, evidence_seen, evidence)
+        evidence_seen = evidence
     if forced >= MAX_CONTINUATIONS:
         return StopDecision(
-            replace(state, active=False, stage=Stage.ABORTED, best_issue_count=best),
+            replace(state, active=False, stage=Stage.ABORTED, best_issue_count=best_issue_count, evidence_seen=evidence_seen),
             notice=(
                 f"Craftsman gate not satisfied: the agent stopped after {forced} forced continuations "
                 "without passing `craftsman review check`. Run it to see what is still missing."
@@ -435,27 +484,41 @@ def _continue(state: GateState, report: GateReport | None, error: str | None) ->
         )
     header = f"{CONTINUATION_HEADER} {forced + 1}/{MAX_CONTINUATIONS}]"
     return StopDecision(
-        replace(state, forced_continuations=forced + 1, best_issue_count=best),
+        replace(state, forced_continuations=forced + 1, best_issue_count=best_issue_count, evidence_seen=evidence_seen),
         block_reason=continuation_reason(header, report, error),
     )
 
 
-def continuation_reason(header: str, report: GateReport | None, evidence_error: str | None) -> str:
-    """Tell the agent exactly what is missing, within a size the platforms display in full."""
+GATE_CONSEQUENCE = (
+    " Task completion is blocked until the evidence ledger proves the change is reviewed and verified."
+)
+GATE_CLOSING = "Close the gate with `craftsman gate --complete` once `craftsman review check` passes."
+
+
+def continuation_reason(
+    header: str,
+    report: GateReport | None,
+    evidence_error: str | None,
+    *,
+    consequence: str = GATE_CONSEQUENCE,
+    closing: str = GATE_CLOSING,
+    check: str = "craftsman review check",
+) -> str:
+    """Tell the agent exactly what is missing, within a size the platforms display in full.
+
+    The gate and the review guard share this text; they differ in `consequence`, `closing` and the `check`
+    command that lists the actions that did not fit.
+    """
     if evidence_error is not None:
         lead = f"Cannot evaluate the evidence ledger: {evidence_error[:MAX_ERROR_CHARS]}."
     elif report is not None and report.issues:
         lead = f"{format_blocker_summary(report)}."
     else:
         lead = "Review incomplete."
-    lines = [
-        f"{header} {lead} Task completion is blocked until the evidence ledger proves the change is "
-        "reviewed and verified."
-    ]
-    closing = "Close the gate with `craftsman gate --complete` once `craftsman review check` passes."
+    lines = [f"{header} {lead}{consequence}"]
     if report is not None and report.issues:
         lines.append("Next actions:")
-        more = "… run `craftsman review check` for the remaining actions."
+        more = f"… run `{check}` for the remaining actions."
         budget = MAX_CONTINUATION_REASON_CHARS - sum(len(line) + 1 for line in (*lines, closing, more))
         for action in render_next_actions(report.issues):
             if len(action) + 1 > budget:
@@ -495,7 +558,7 @@ def detect_cli_platform(env: Mapping[str, str]) -> GatePlatform:
     """The agent platform a `craftsman gate` command runs under, from its environment."""
     if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT"):
         return "claude"
-    if env.get("ANTIGRAVITY_AGENT") or env.get("AGY_MANAGED_ENV"):
+    if env.get("ANTIGRAVITY_AGENT") or env.get("AGY_MANAGED_ENV") or env.get("ANTIGRAVITY_CONVERSATION_ID", "").strip():
         return "antigravity"
     if (
         env.get("COPILOT_CLI")
@@ -509,10 +572,15 @@ def detect_cli_platform(env: Mapping[str, str]) -> GatePlatform:
 
 
 def cli_caller(session_id: str | None, env: Mapping[str, str]) -> GateOwner:
-    """The session a `craftsman gate` command acts for: `--session-id`, else the one Claude Code
-    exports to the commands it runs."""
+    """The session a `craftsman gate` command acts for: `--session-id`, else the one Claude Code exports to
+    the commands it runs, or the Antigravity conversation id (so a gate opened in a conversation belongs to
+    it, and the Stops of its subagent conversations are not the owner's)."""
     platform = detect_cli_platform(env)
-    exported = env.get("CLAUDE_CODE_SESSION_ID", "") if platform == "claude" else ""
+    exported = ""
+    if platform == "claude":
+        exported = env.get("CLAUDE_CODE_SESSION_ID", "")
+    elif platform == "antigravity":
+        exported = env.get("ANTIGRAVITY_CONVERSATION_ID", "")
     return GateOwner(platform, (session_id or "").strip() or exported.strip() or None)
 
 
@@ -534,6 +602,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     action.add_argument(
         "--resume", action="store_true", help="Enforce the gate again after --await-user."
+    )
+    parser.add_argument(
+        "--question",
+        help="With --await-user: the question you ask the user (the Stop hook looks for it in your last message).",
     )
     parser.add_argument("--cwd", help="A directory inside the work tree (default: the current one).")
     parser.add_argument(
@@ -567,6 +639,8 @@ def _check_combinations(parser: argparse.ArgumentParser, args: argparse.Namespac
     ]
     if init_only and not args.init:
         parser.error(f"{', '.join(init_only)}: only valid with --init")
+    if args.question is not None and not args.await_user:
+        parser.error("--question: only valid with --await-user")
     if (args.complete or args.await_user or args.resume) and (args.deep or args.task):
         parser.error("--deep and --task apply with --init or on their own")
     if not (args.init or args.complete or args.await_user or args.resume or args.deep or args.task):
@@ -613,8 +687,9 @@ def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -
         elif previous is not None and previous.active:
             if not args.takeover:
                 raise ForeignGateError(foreign_gate_refusal(root, previous, "initialize"))
-            # Taking a gate over never makes it shallower.
-            takeover_from, deep = previous.owner, previous.deep or deep
+            # Taking a gate over never weakens it: not shallower, and not less proven. Resetting the isolation
+            # evidence would make the next round advisory and close the gate SELF-REVIEWED.
+            takeover_from, deep, isolation = previous.owner, previous.deep or deep, previous.isolation_evidence
         state = GateState.open(
             owner,
             base_sha,
@@ -639,8 +714,16 @@ def _replaceable_state(path: Path, *, takeover: bool) -> GateState | None:
 
 
 def _updated(state: GateState, args: argparse.Namespace) -> GateState:
-    if args.await_user or args.resume:
-        return replace(state, awaiting_user=bool(args.await_user))
+    if args.await_user:
+        question = " ".join((args.question or "").split())
+        return replace(
+            state,
+            awaiting_user=True,
+            awaiting_since=format_timestamp(datetime.now(timezone.utc)),
+            question=question or None,
+        )
+    if args.resume:
+        return replace(state, awaiting_user=False, awaiting_since=None, question=None)
     return replace(
         state,
         deep=state.deep or bool(args.deep),
@@ -668,6 +751,9 @@ def _complete(root: Path, path: Path, caller: GateOwner) -> int:
         path, lambda current: _close_gate(current, root=root, caller=caller)
     )
     (sys.stdout if code == 0 else sys.stderr).write(message)
+    line = hook_errors.summary_of(path.parent)
+    if line is not None:
+        (sys.stdout if code == 0 else sys.stderr).write(line + "\n")
     if code == 0:
         prune_all_temp_dirs(path.parent)
     return code
@@ -692,4 +778,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Not a program: the command policy reads one CLI (`craftsman gate ...`), and a module run around it would
+    # skip the rules. Failing loud keeps a script that still runs the module from believing it did the work.
+    sys.stderr.write("craftsman.gate is not a program: run `craftsman gate ...` instead\n")
+    raise SystemExit(2)

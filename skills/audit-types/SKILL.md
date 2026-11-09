@@ -38,11 +38,10 @@ messages, database models, configuration objects)
    invariant is enforced.
 3. **Enforcement point.** Where would a violation be noticed: at construction, at load, at first
    use deep inside the system, or never?
-4. **Redesign.** The smallest change that removes each illegal state: a tagged union or separate
-   types instead of flag-plus-optional fields, an enum or `Literal` instead of a free string,
-   a validated value type instead of a raw primitive, `frozen`/read-only views instead of exposed
-   mutable internals, validation on deserialization. Skip redesigns whose cost exceeds the risk
-   and say so.
+4. **Redesign.** The smallest change that removes each illegal state (the `model` lens probes 2
+   to 5 name the usual ones: separate types instead of coupled optionals, validated value types
+   instead of interchangeable scalars, read-only views, validation on load). Skip redesigns whose
+   cost exceeds the risk and say so.
 
 ## Report
 

@@ -1,0 +1,5 @@
+$ craftsman review scout 
+[exit 1]
+--- stdout
+--- stderr
+craftsman review: error: target must name a hunk (H3), a location (path:line) or a symbol

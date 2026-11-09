@@ -1,0 +1,5 @@
+$ craftsman review reset
+[exit 0]
+--- stdout
+Nothing to archive: no ledger or review packets yet.
+--- stderr
