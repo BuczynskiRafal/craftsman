@@ -25,13 +25,6 @@ protocol runs without hooks.
 
 ![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
 
-```text
-/craftsman <task>  ->  build freely  ->  review prepare (freeze the diff, hunt plan)
-  ->  one hunter per slot (fresh context, parallel)  ->  verifiers try to disprove every finding
-  ->  another wave while it finds real defects  ->  fix, confirm, re-check the fix delta
-  ->  craftsman run (tests on the final code)  ->  stop hook lets the agent finish  ->  report
-```
-
 The agent builds with no gate activity. Then the diff is frozen into a round and the CLI turns it into a
 hunt plan: slots of hunks and lenses, sized by the diff and its risk signals, not by how hard the model
 feels like trying. Each slot goes to a fresh-context hunter that records every candidate defect with a
