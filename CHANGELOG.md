@@ -6,6 +6,8 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+## [5.0.0] - 2026-11-09
+
 ### Security
 
 - **Hooks cannot be forged and the evidence cannot be edited from the session.** One entry point,
@@ -51,67 +53,19 @@ All notable changes to Craftsman are recorded here. The format follows
 - **`gate --await-user --question "..."`** stores the time and the question; the Stop hook logs an `await-user` entry
   when the last message of an agent that parked the gate asks nothing.
 
-### Removed
-
-- **The `mentioned` rule of the usage reader:** a command counts as run only when a recognized recording call printed it.
-- **Four skills unrelated to the review loop:** `leetcode-style-code-reviewer`, `code-quality`,
-  `high-level-commit-message` and `extreme-optimizer`. `craftsman install` removes the copies, links and
-  commands that an earlier install recorded in its manifest (and nothing it did not create); `/audit` no longer
-  lists the `quality` and `perf` aspects, and `/craftsman` proposes the commit message itself.
-- **The migration of Craftsman < 4.0 installs** (`legacy_githooks.py`, `TargetKind.GIT_HOOKS`, the `schema_version: 1`
-  manifest reader and the restore of `core.hooksPath`). A manifest of that age now stops `install`, `uninstall` and
-  `doctor` with a message to delete it and run `craftsman install` again.
-  `craftsman install` reads the manifest of every selected target before it writes anything. `craftsman doctor`
-  still reports a global `core.hooksPath` that points to the git hooks folder of those releases. The manifests this
-  version writes no longer carry the retired `previous_hooks_path` and `hooks_dir` keys, so Craftsman 5.0 cannot read
-  them back: reinstall with 5.0 after a downgrade.
-
-### Fixed
-
-- **Review of the hook guards (Antigravity and the shell parser).** `env -S "<command line>"` (and `--split-string`, in
-  every attached form and as the shortest unique prefix `--s`, with `\_` as a separator; `env -a`/`--argv0` values and an
-  `env -C` inside the string are read too) no longer hides its command from the command policy, the work-tree guard, the scope guard and
-  the triviality check; `python craftsman/cli.py ...` is read as the CLI, and the `__main__` blocks of `gate.py` and
-  `export.py`, which ran around the policy, now only say that the module is no program (exit 2). Antigravity's `read_file(Path=...)` is wired to the scope guard
-  and judged like `view_file`, and a configured `ANTIGRAVITY_APP_DATA_DIR` or `CLAUDE_CONFIG_DIR` is protected for
-  reads as it is for writes. An Antigravity verifier that stops while the gate still waits for verdicts, and a hunter
-  that claimed no slot and recorded nothing, are sent back once, as on Claude Code. Launches that Antigravity cut from
-  its compact transcript are read from `transcript_full.jsonl`; a cut that cannot be restored is reported, never read
-  as "no launch". The cited source line of `review add` and `review move` is printed defanged, and an `echo` or `printf`
-  that could build the phrase of a record next to a recording call makes its output foreign. A hunter that covered
-  parts of several slots without a brief is dead for one slot only. `FOO=1 true` is as trivial as `true`.
-- **Long Antigravity requests and stdin filters.** A `/craft-review` request or continuation prompt that Antigravity
-  cut in `transcript.jsonl` is read whole from `transcript_full.jsonl` (one reader, `transcript.read_conversation`); one
-  that cannot be restored changes nothing and is reported, and so is a stop allowed only because a cut response could not
-  be read. `cat`, `head` and `tail` next to a recording call are foreign output unless they filter a pipe and have no
-  input of their own, so they can no longer forge a record token.
-- **Antigravity reviews are read back correctly.** Parallel `invoke_subagent` calls, whose acknowledgements carry no
-  id, are paired with their calls in call order and attributed to the right subagent; verifier runs are recorded like
-  hunter runs; `gate --init` records the Antigravity conversation as the gate owner.
-- **The depth floor of a review comes from the diff again.** `review prepare` makes a round deep on a security or
-  concurrency signal in a production hunk, or at least 251 changed production lines, on every platform and whatever
-  effort the agent runs at (5.0 lost this floor); `--deep` still raises it.
-- **A test run must have run tests.** `craftsman run --kind test` reads the whole output of the command for the
-  summaries of pytest, unittest, `go test`, `cargo test`, jest, vitest and mocha, adds them up and stores the count
-  (`tests_ran`, with `min_tests`). A run that exited 0 but reported fewer tests than `--min-tests` (default 1;
-  `0` turns the check off) is still recorded, but is no passing evidence anywhere: the gate says "R3 ran 0 tests
-  (minimum 1)" and the progress counter ignores it. Output no runner claims keeps the exit code as the only
-  judge. A run refused for too few tests says how to proceed (`--min-tests 0`), and a run that passes only
-  because of `--min-tests 0` is a gate warning. The run summaries show "exit 0, 0 tests - not counted". `pytest
-  --collect-only` and an all-skipped `go test -v` count as 0 tests. An inline Python program (`python -c`, or a
-  heredoc fed to `python -`) that checks nothing (no `assert`, `raise`, test framework, `subprocess.check_call`,
-  `subprocess.run(check=True)`, `runpy` call or computed exit status) is now trivial as a `test` run; `e2e` runs
-  keep the old rule. A newline in an inline shell script now separates commands, as `;` does.
-- **`craftsman status` never hides a broken ledger.** A corrupted ledger, a ledger of a newer schema and the
-  ledgers an upgrade set aside are reported with their path (text and `--json`: `ledger_path`, `ledger_problem`,
-  `ledger_backups`); a corrupted or newer ledger makes `status` exit 1. `status` only looks: it no longer sets an
-  older ledger aside.
-- **A ledger written by a newer Craftsman is never moved or rewritten.** Every command, `review reset` included,
-  stops with "this ledger was written by a newer Craftsman (schema N); upgrade craftsman". Unknown fields in a
-  same-schema ledger are named in the error, which says a newer Craftsman may have written them.
-- **Set-aside ledgers are never overwritten.** An older ledger now moves to
-  `ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json` (with a counter before `.bak` if that name exists), so two
-  upgrades keep both backups.
+- **Scout:** `craftsman review scout <H#|path:line|symbol>` prints the base version of the enclosing
+  scope, callers, and tests, deterministically and capped at 12,000 characters, so hunters need not open
+  whole files.
+- **`craftsman review show --hunks`** lists the hunks still to cover, and `review show` prints each
+  finding's scenario and verdict evidence.
+- **Agent usage.** Where the platform hands over a subagent transcript, tokens and agent time are
+  recorded per subagent, and `craftsman review report` and `craftsman status` total them per role
+  (hunters, verifiers).
+- **Inbox fallback.** When a heredoc needs approval, subagents write their JSON to the path that
+  `craftsman review inbox` prints and pass `--from-json <path>`.
+- **Public seeded-defect suite** in [`evals/`](evals/README.md): six small Python projects with 15 seeded
+  defects and decoys, run with `python3 -m evals.run` and described in
+  [`docs/benchmark.md`](docs/benchmark.md).
 
 ### Changed
 
@@ -140,54 +94,6 @@ All notable changes to Craftsman are recorded here. The format follows
 - **Diagrams are Excalidraw scenes again.** The five Mermaid diagrams (workflow, evidence ledger, finding
   lifecycle, hooks and guards, stop gate) are redrawn for the 5.0 protocol as editable
   `docs/diagrams/*.excalidraw` scenes with rendered PNGs, and the README shows the workflow diagram again.
-
-## [5.0.0] - 2026-11-06
-
-### Fixed
-
-- **The host's `/code-review` no longer arms the review stop guard** (nor opens a gate). Only Craftsman's
-  `/craft-review` and `/craftsman:craft-review` do; there is no alias for the old name.
-- **The review stop guard agrees with `craftsman review check --review-only`.** It uses the same isolation
-  evidence (on Copilot, where no session id reaches the CLI, the two used to disagree), and re-running
-  `review prepare` on an unchanged diff or raising its depth counts as starting the review instead of repeating
-  "no review round yet". A session that waits for a background reviewer or verifier is no longer sent back and no
-  longer spends reminders; benchmark reviews used to be stopped 2 to 6 times for that.
-- **Review-only isolation evidence is per review, not per ledger.** A subagent event from an earlier session or
-  platform no longer makes a terminal or hookless review need a reviewer run it can never record; hooks count only
-  for the session that invoked `/craft-review`, or once a subagent event follows the current round.
-- **Coverage must come from a `craftsman-reviewer`, in every round.** The latest round used to pass once any
-  reviewer had recorded anything, so the orchestrator could cover the remaining hunks itself; now every covered hunk
-  needs a reviewer behind its coverage, and the gate names the hunks that lack one (a reviewer re-covers them, no
-  reset needed). Findings need no reviewer, so an intent finding the orchestrator records no longer fails an earlier
-  round. A round replaced before any review holds no coverage and needs nothing; a reviewer that finished after the
-  next round was prepared still counts for what it recorded.
-- **Claude Code reviewers are identified by their own transcript, not by time.** `review cover` prints a token
-  (`Coverage recorded (C12): ...`, as findings print `F3 recorded`), and the stop hook stores the tokens the
-  reviewer's own transcript shows on its stop event, so the orchestrator's records written while a background
-  reviewer runs no longer count as the reviewer's. A record counts only inside its reviewer's start-to-stop window.
-  The reader fails safe: without a readable transcript (Copilot, Antigravity) or with a token that no recognized
-  `review cover|add` call printed, the gate goes by the window alone instead of concluding the reviewer recorded
-  nothing. A stop whose start cannot be matched by agent id (Copilot starts by name only) pairs first in, first out
-  with the unpaired starts of its name.
-- **A background agent's report no longer ends the review guard.** Claude Code delivers a background subagent's
-  report as a prompt, which the prompt hook took for the user moving on: it disarmed the `/craft-review` stop guard
-  (a session could then stop with findings unjudged) and reset an active gate's continuation count. Such prompts
-  now count as the platform's, like a stop hook's continuation.
-- **Agent time counts active time.** A subagent's `duration_s` adds up the gaps between transcript entries of
-  at most 5 minutes instead of spanning first to last entry, so a resumed agent no longer counts the time it
-  sat idle between runs.
-- **The "session started" text after a needs-human restart** says `deep` when the restarted gate is deep.
-- **`evals` `agent` continues run numbering** per arm and case from the results file and the logs folder. Repeats
-  added later no longer restart at 1 and replace earlier runs, logs and kept ledgers (which skewed `rescore` and
-  the ranges of `compare`).
-- **Safer upgrades from Craftsman 4.x.** The old gate state and ledger are set aside only under their lock, after
-  reading the file again, so a 5.x gate or ledger written in between is never renamed to the backup.
-- **`review prepare` no longer holds the ledger lock while it parses the changed Python files** for quality hints,
-  so a `SubagentStop` event that proves isolation cannot time out behind it.
-- **A reviewer's stop event is written before its transcript is read** for token usage; a hook killed while reading
-  a huge transcript no longer loses the isolation evidence.
-
-### Changed
 
 - **BREAKING: the review skill is now `/craft-review`** (was `/code-review`), because Claude Code ships a
   built-in `/code-review` and the two names collided. The skill lives in `skills/craft-review/`, and the
@@ -267,23 +173,20 @@ All notable changes to Craftsman are recorded here. The format follows
   lens table follows `craftsman/lenses.py`, and the depth triggers live only in the `craft-review`
   skill.
 
-### Added
-
-- **Scout:** `craftsman review scout <H#|path:line|symbol>` prints the base version of the enclosing
-  scope, callers, and tests, deterministically and capped at 12,000 characters, so hunters need not open
-  whole files.
-- **`craftsman review show --hunks`** lists the hunks still to cover, and `review show` prints each
-  finding's scenario and verdict evidence.
-- **Agent usage.** Where the platform hands over a subagent transcript, tokens and agent time are
-  recorded per subagent, and `craftsman review report` and `craftsman status` total them per role
-  (hunters, verifiers).
-- **Inbox fallback.** When a heredoc needs approval, subagents write their JSON to the path that
-  `craftsman review inbox` prints and pass `--from-json <path>`.
-- **Public seeded-defect suite** in [`evals/`](evals/README.md): six small Python projects with 15 seeded
-  defects and decoys, run with `python3 -m evals.run` and described in
-  [`docs/benchmark.md`](docs/benchmark.md).
-
 ### Removed
+
+- **The `mentioned` rule of the usage reader:** a command counts as run only when a recognized recording call printed it.
+- **Four skills unrelated to the review loop:** `leetcode-style-code-reviewer`, `code-quality`,
+  `high-level-commit-message` and `extreme-optimizer`. `craftsman install` removes the copies, links and
+  commands that an earlier install recorded in its manifest (and nothing it did not create); `/audit` no longer
+  lists the `quality` and `perf` aspects, and `/craftsman` proposes the commit message itself.
+- **The migration of Craftsman < 4.0 installs** (`legacy_githooks.py`, `TargetKind.GIT_HOOKS`, the `schema_version: 1`
+  manifest reader and the restore of `core.hooksPath`). A manifest of that age now stops `install`, `uninstall` and
+  `doctor` with a message to delete it and run `craftsman install` again.
+  `craftsman install` reads the manifest of every selected target before it writes anything. `craftsman doctor`
+  still reports a global `core.hooksPath` that points to the git hooks folder of those releases. The manifests this
+  version writes no longer carry the retired `previous_hooks_path` and `hooks_dir` keys, so Craftsman 5.0 cannot read
+  them back: reinstall with 5.0 after a downgrade.
 
 - **Tiers.** The `quick` / `standard` / `deep` tiers, `--tier`, and automatic tier selection (including
   the review-only `quick` default up to 250 changed lines). `--quick` and `--standard` right after
@@ -296,6 +199,95 @@ All notable changes to Craftsman are recorded here. The format follows
   reviewer shards and groups, and the gate issues `tier-too-low`, `sweep-too-early`, the quality-signal
   issues, and design-file coverage. Quality signals (`S#`) stay as display hints.
 - The `{{reviewer_groups}}` placeholder in `templates/AGENTS.md`.
+
+### Fixed
+
+- **Review of the hook guards (Antigravity and the shell parser).** `env -S "<command line>"` (and `--split-string`, in
+  every attached form and as the shortest unique prefix `--s`, with `\_` as a separator; `env -a`/`--argv0` values and an
+  `env -C` inside the string are read too) no longer hides its command from the command policy, the work-tree guard, the scope guard and
+  the triviality check; `python craftsman/cli.py ...` is read as the CLI, and the `__main__` blocks of `gate.py` and
+  `export.py`, which ran around the policy, now only say that the module is no program (exit 2). Antigravity's `read_file(Path=...)` is wired to the scope guard
+  and judged like `view_file`, and a configured `ANTIGRAVITY_APP_DATA_DIR` or `CLAUDE_CONFIG_DIR` is protected for
+  reads as it is for writes. An Antigravity verifier that stops while the gate still waits for verdicts, and a hunter
+  that claimed no slot and recorded nothing, are sent back once, as on Claude Code. Launches that Antigravity cut from
+  its compact transcript are read from `transcript_full.jsonl`; a cut that cannot be restored is reported, never read
+  as "no launch". The cited source line of `review add` and `review move` is printed defanged, and an `echo` or `printf`
+  that could build the phrase of a record next to a recording call makes its output foreign. A hunter that covered
+  parts of several slots without a brief is dead for one slot only. `FOO=1 true` is as trivial as `true`.
+- **Long Antigravity requests and stdin filters.** A `/craft-review` request or continuation prompt that Antigravity
+  cut in `transcript.jsonl` is read whole from `transcript_full.jsonl` (one reader, `transcript.read_conversation`); one
+  that cannot be restored changes nothing and is reported, and so is a stop allowed only because a cut response could not
+  be read. `cat`, `head` and `tail` next to a recording call are foreign output unless they filter a pipe and have no
+  input of their own, so they can no longer forge a record token.
+- **Antigravity reviews are read back correctly.** Parallel `invoke_subagent` calls, whose acknowledgements carry no
+  id, are paired with their calls in call order and attributed to the right subagent; verifier runs are recorded like
+  hunter runs; `gate --init` records the Antigravity conversation as the gate owner.
+- **The depth floor of a review comes from the diff again.** `review prepare` makes a round deep on a security or
+  concurrency signal in a production hunk, or at least 251 changed production lines, on every platform and whatever
+  effort the agent runs at (5.0 lost this floor); `--deep` still raises it.
+- **A test run must have run tests.** `craftsman run --kind test` reads the whole output of the command for the
+  summaries of pytest, unittest, `go test`, `cargo test`, jest, vitest and mocha, adds them up and stores the count
+  (`tests_ran`, with `min_tests`). A run that exited 0 but reported fewer tests than `--min-tests` (default 1;
+  `0` turns the check off) is still recorded, but is no passing evidence anywhere: the gate says "R3 ran 0 tests
+  (minimum 1)" and the progress counter ignores it. Output no runner claims keeps the exit code as the only
+  judge. A run refused for too few tests says how to proceed (`--min-tests 0`), and a run that passes only
+  because of `--min-tests 0` is a gate warning. The run summaries show "exit 0, 0 tests - not counted". `pytest
+  --collect-only` and an all-skipped `go test -v` count as 0 tests. An inline Python program (`python -c`, or a
+  heredoc fed to `python -`) that checks nothing (no `assert`, `raise`, test framework, `subprocess.check_call`,
+  `subprocess.run(check=True)`, `runpy` call or computed exit status) is now trivial as a `test` run; `e2e` runs
+  keep the old rule. A newline in an inline shell script now separates commands, as `;` does.
+- **`craftsman status` never hides a broken ledger.** A corrupted ledger, a ledger of a newer schema and the
+  ledgers an upgrade set aside are reported with their path (text and `--json`: `ledger_path`, `ledger_problem`,
+  `ledger_backups`); a corrupted or newer ledger makes `status` exit 1. `status` only looks: it no longer sets an
+  older ledger aside.
+- **A ledger written by a newer Craftsman is never moved or rewritten.** Every command, `review reset` included,
+  stops with "this ledger was written by a newer Craftsman (schema N); upgrade craftsman". Unknown fields in a
+  same-schema ledger are named in the error, which says a newer Craftsman may have written them.
+- **Set-aside ledgers are never overwritten.** An older ledger now moves to
+  `ledger.v<schema>.<UTC yyyymmddThhmmssZ>.bak.json` (with a counter before `.bak` if that name exists), so two
+  upgrades keep both backups.
+
+- **The host's `/code-review` no longer arms the review stop guard** (nor opens a gate). Only Craftsman's
+  `/craft-review` and `/craftsman:craft-review` do; there is no alias for the old name.
+- **The review stop guard agrees with `craftsman review check --review-only`.** It uses the same isolation
+  evidence (on Copilot, where no session id reaches the CLI, the two used to disagree), and re-running
+  `review prepare` on an unchanged diff or raising its depth counts as starting the review instead of repeating
+  "no review round yet". A session that waits for a background reviewer or verifier is no longer sent back and no
+  longer spends reminders; benchmark reviews used to be stopped 2 to 6 times for that.
+- **Review-only isolation evidence is per review, not per ledger.** A subagent event from an earlier session or
+  platform no longer makes a terminal or hookless review need a reviewer run it can never record; hooks count only
+  for the session that invoked `/craft-review`, or once a subagent event follows the current round.
+- **Coverage must come from a `craftsman-reviewer`, in every round.** The latest round used to pass once any
+  reviewer had recorded anything, so the orchestrator could cover the remaining hunks itself; now every covered hunk
+  needs a reviewer behind its coverage, and the gate names the hunks that lack one (a reviewer re-covers them, no
+  reset needed). Findings need no reviewer, so an intent finding the orchestrator records no longer fails an earlier
+  round. A round replaced before any review holds no coverage and needs nothing; a reviewer that finished after the
+  next round was prepared still counts for what it recorded.
+- **Claude Code reviewers are identified by their own transcript, not by time.** `review cover` prints a token
+  (`Coverage recorded (C12): ...`, as findings print `F3 recorded`), and the stop hook stores the tokens the
+  reviewer's own transcript shows on its stop event, so the orchestrator's records written while a background
+  reviewer runs no longer count as the reviewer's. A record counts only inside its reviewer's start-to-stop window.
+  The reader fails safe: without a readable transcript (Copilot, Antigravity) or with a token that no recognized
+  `review cover|add` call printed, the gate goes by the window alone instead of concluding the reviewer recorded
+  nothing. A stop whose start cannot be matched by agent id (Copilot starts by name only) pairs first in, first out
+  with the unpaired starts of its name.
+- **A background agent's report no longer ends the review guard.** Claude Code delivers a background subagent's
+  report as a prompt, which the prompt hook took for the user moving on: it disarmed the `/craft-review` stop guard
+  (a session could then stop with findings unjudged) and reset an active gate's continuation count. Such prompts
+  now count as the platform's, like a stop hook's continuation.
+- **Agent time counts active time.** A subagent's `duration_s` adds up the gaps between transcript entries of
+  at most 5 minutes instead of spanning first to last entry, so a resumed agent no longer counts the time it
+  sat idle between runs.
+- **The "session started" text after a needs-human restart** says `deep` when the restarted gate is deep.
+- **`evals` `agent` continues run numbering** per arm and case from the results file and the logs folder. Repeats
+  added later no longer restart at 1 and replace earlier runs, logs and kept ledgers (which skewed `rescore` and
+  the ranges of `compare`).
+- **Safer upgrades from Craftsman 4.x.** The old gate state and ledger are set aside only under their lock, after
+  reading the file again, so a 5.x gate or ledger written in between is never renamed to the backup.
+- **`review prepare` no longer holds the ledger lock while it parses the changed Python files** for quality hints,
+  so a `SubagentStop` event that proves isolation cannot time out behind it.
+- **A reviewer's stop event is written before its transcript is read** for token usage; a hook killed while reading
+  a huge transcript no longer loses the isolation evidence.
 
 ### Migration
 
