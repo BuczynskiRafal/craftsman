@@ -10,7 +10,9 @@ import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
+from craftsman.assets import FRONTMATTER_RE
 from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
@@ -20,6 +22,13 @@ from craftsman.diffscan import (
     git_output,
 )
 from craftsman.diffscan_paths import is_test_path
+from craftsman.generated import (
+    CRAFTSMAN_BEGIN_MARKER,
+    CRAFTSMAN_END_MARKER,
+    CRAFTSMAN_GENERATED_MARKER,
+    ExportError,
+    find_managed_block,
+)
 from craftsman.ledger import reopened_mentions
 from craftsman.lenses import LENSES
 from craftsman.records import FieldError, Ledger, QualitySignal, Round, SignalKind
@@ -59,6 +68,11 @@ _CONVENTION_GLOBS = (
     ".cursor/rules/*.mdc",
 )
 _NESTED_CONVENTION_FILES = ("AGENTS.md", "CLAUDE.md")
+MAX_CONVENTION_SCAN_BYTES = 200_000  # a larger file is listed without looking for Craftsman's own text in it
+_MANAGED_BLOCK_NOTE = (
+    f"contains a Craftsman section between `{CRAFTSMAN_BEGIN_MARKER}` and `{CRAFTSMAN_END_MARKER}`; "
+    "that section is not a project convention"
+)
 _FENCE_LANGUAGES = {
     ".py": "python",
     ".pyi": "python",
@@ -178,6 +192,7 @@ def _commits(root: Path, base_sha: str) -> tuple[str, ...]:
 
 
 def _conventions(root: Path, changed_files: Sequence[str]) -> tuple[str, ...]:
+    """The convention files to read, without those that hold nothing but Craftsman's own text."""
     found = [name for name in _CONVENTION_FILES if (root / name).is_file()]
     for pattern in _CONVENTION_GLOBS:
         found.extend(
@@ -191,7 +206,43 @@ def _conventions(root: Path, changed_files: Sequence[str]) -> tuple[str, ...]:
                 candidate = (directory / name).as_posix()
                 if (root / candidate).is_file():
                     found.append(candidate)
-    return tuple(dict.fromkeys(found))
+    entries = []
+    for name in dict.fromkeys(found):
+        share = _craftsman_share(root / name)
+        if share != "all":
+            entries.append(f"{name} ({_MANAGED_BLOCK_NOTE})" if share == "part" else name)
+    return tuple(entries)
+
+
+def _craftsman_share(path: Path) -> Literal["all", "part", "none"]:
+    """How much of the file Craftsman wrote: a generated file or one holding only its managed block is
+    `all`, a file with a managed block among other text `part`. A file that cannot be read as UTF-8 text,
+    is too large, or has markers that do not form one block is `none`, so it is listed as written."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_CONVENTION_SCAN_BYTES + 1)
+        text = raw.decode("utf-8-sig") if len(raw) <= MAX_CONVENTION_SCAN_BYTES else None
+    except (OSError, UnicodeDecodeError):
+        return "none"
+    if text is None:
+        return "none"
+    if _opens_with_generated_marker(text):
+        return "all"
+    try:
+        span = find_managed_block(text, path)
+    except ExportError:
+        return "none"
+    if span is None or text[span[0] - 1 : span[0]] not in ("", "\n"):  # markers quoted inside a line are prose
+        return "none"
+    return "part" if (text[: span[0]] + text[span[1] :]).strip() else "all"
+
+
+def _opens_with_generated_marker(text: str) -> bool:
+    """Whether the generated marker is the first line of `text` after any front matter, where every
+    Craftsman writer puts it: a project file that only quotes the marker stays the project's."""
+    match = FRONTMATTER_RE.match(text)
+    body = match.group(2) if match else text
+    return body.lstrip().partition("\n")[0].strip() == CRAFTSMAN_GENERATED_MARKER
 
 
 def _references(
