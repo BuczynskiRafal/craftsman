@@ -251,22 +251,28 @@ def git_output(cwd: Path, *args: str) -> str:
     return out
 
 
+def _path_line(line: str) -> str:
+    """`line` without the line ending git adds (`\\n`, or `\\r\\n` from Git for Windows), keeping blanks."""
+    line = line.removesuffix("\n")
+    return line.removesuffix("\r")
+
+
 def worktree_root(cwd: str | Path) -> Path:
     """Return the root of the git work tree containing `cwd`."""
     directory = _existing_dir(cwd)
     code, out, err = git_text(directory, "rev-parse", "--show-toplevel")
-    if code != 0 or not out.strip():
+    if code != 0 or not _path_line(out):
         raise DiffScanError(f"{directory} is not inside a git work tree: {err.strip()}")
-    return Path(out.strip())
+    return Path(_path_line(out))
 
 
 def git_dir(cwd: str | Path) -> Path:
     """Return the absolute, per-worktree git directory for `cwd`."""
     directory = _existing_dir(cwd)
     code, out, err = git_text(directory, "rev-parse", "--absolute-git-dir")
-    if code != 0 or not out.strip():
+    if code != 0 or not _path_line(out):
         raise DiffScanError(f"{directory} is not inside a git repository: {err.strip()}")
-    return Path(out.strip()).resolve()
+    return Path(_path_line(out)).resolve()
 
 
 def worktree_paths(cwd: str | Path) -> tuple[Path, Path]:
@@ -278,9 +284,9 @@ def worktree_paths(cwd: str | Path) -> tuple[Path, Path]:
     code, out, err = git_text(directory, "rev-parse", "--show-toplevel", "--absolute-git-dir")
     if code != 0 or not out.strip():
         raise DiffScanError(f"{directory} is not inside a git work tree: {err.strip()}")
-    lines = out.split("\n")
-    if len(lines) == 3 and not lines[2].strip() and lines[0].strip() and lines[1].strip():
-        return Path(lines[0].strip()), Path(lines[1].strip()).resolve()
+    lines = [_path_line(line + "\n") for line in out.split("\n")]
+    if len(lines) == 3 and not lines[2].strip() and lines[0] and lines[1]:
+        return Path(lines[0]), Path(lines[1]).resolve()
     # A line break in a path makes the two answers ambiguous: ask for each on its own.
     return worktree_root(directory), git_dir(directory)
 

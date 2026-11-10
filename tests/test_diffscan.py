@@ -1389,6 +1389,23 @@ class WorktreePathsTests(unittest.TestCase):
         self.assertEqual(worktree_paths(odd.root), (odd.root, odd.root / ".git"))
         self.assert_found_like_the_separate_calls(odd.root, calls=3)
 
+    @unittest.skipIf(os.name == "nt", "Windows file names cannot end or start with a blank")
+    def test_a_blank_at_either_end_of_the_directory_name_is_kept(self) -> None:
+        for name in ("repo ", " repo", " repo  "):
+            with self.subTest(name=name):
+                odd = self.new_repo(name)
+                (odd.root / "pkg").mkdir()
+                for cwd in (odd.root, odd.root / "pkg"):
+                    self.assertEqual(worktree_root(cwd), odd.root)
+                    self.assertEqual(git_dir(cwd), odd.root / ".git")
+                    self.assertEqual(worktree_paths(cwd), (odd.root, odd.root / ".git"))
+                    self.assert_found_like_the_separate_calls(cwd)
+
+    def test_only_the_line_ending_is_removed_from_what_git_prints(self) -> None:
+        for printed, expected in (("a \n", "a "), ("a \r\n", "a "), (" a", " a"), ("\n", "")):
+            with self.subTest(printed=printed):
+                self.assertEqual(diffscan._path_line(printed), expected)
+
     def test_a_spent_budget_runs_no_git(self) -> None:
         with (
             diffscan.git_budget(0.0),
