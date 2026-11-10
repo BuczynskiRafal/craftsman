@@ -556,6 +556,82 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.assertEqual(decision.decision, "deny")
         self.assertIn("blocking unparseable shell command", err.getvalue())
 
+    # Trimmed from the verifier scripts of an end-to-end run whose hook crashed on them (`tokens[0]` of an
+    # assignment-only line): a scratch directory in a variable, heredocs, then the repro.
+    REAL_VERIFIER_SCRIPTS = (
+        "craftsman review merge F1 F5 --scenario \"save truncates in place\"\n"
+        "D=/tmp/case/repo/.git/craftsman/scratch/a94de04a2968\n"
+        "cat > $D/r1.py <<'EOF'\nimport sys\nd=pathlib.Path(tempfile.mkdtemp()); p=d/'db.json'\nEOF\n"
+        "craftsman run --kind repro -- python -B $D/r1.py",
+        "D=$(craftsman review scratch) && mkdir -p \"$D\" && cat > \"$D/repro.py\" <<'EOF'\n"
+        "sys.path.insert(0, '/tmp/case/repo')\nsnap = s.snapshot()\nEOF\n"
+        "python -B \"$D/repro.py\"; echo \"exit $?\"; find . -name __pycache__ -prune -exec rm -rf {} +; git status --short",
+        "d=$(mktemp -d) && cat > $d/r.py <<'E'\nd=pathlib.Path(tempfile.mkdtemp())\nE\n"
+        "craftsman run --kind repro -- python -B $d/r.py; rm -rf $d",
+        "d=$(craftsman review scratch | tail -1); echo $d",
+        "cd /tmp/case/repo; S=.git/craftsman/scratch/53006d1f4126; printf '%s\\n' 'import sys' 'print(1)' > $S/r.py;"
+        " craftsman run --kind repro -- python -B $S/r.py",
+    )
+
+    def test_a_command_without_a_program_word_is_judged_by_what_it_runs(self) -> None:
+        def decision(command: str) -> str:
+            return evaluate_scope("Bash", {"command": command}, self.repo, self.repo, self.policy).decision
+
+        store = self.home / ".claude" / "projects" / "slug" / "session.jsonl"
+        secret = self.other_repo / "secret.py"
+        for command in ("D=1", "D=", "D=1 E=2", "> out.txt", "D=$(craftsman review scratch)", *self.REAL_VERIFIER_SCRIPTS):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), "allow")
+        for command in (
+            "D=1\nfind ~ -name SKILL.md",  # the line after an assignment is still checked
+            "X=1 find ~ -name SKILL.md",  # an assignment in front of a program does not hide it
+            "D=$(find ~ -name SKILL.md)",
+            "D=`ls -R ~`",
+            f'D="$(cat {secret})"',  # a quoted substitution runs as well
+            f"D=\"`cat {secret}`\"",
+            f"x=$(< {store})",  # `$(< file)` reads the file
+            f"< {secret}",
+            f"cat < {store}",
+            "cat > out.txt <<EOF\n$(find ~ -name SKILL.md)\nEOF",  # an unquoted heredoc body is expanded
+            f"{self.REAL_VERIFIER_SCRIPTS[0]}\ngrep -r token ~",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(decision(command), "deny")
+        self.assertEqual(decision("cat > out.txt <<'EOF'\n$(find ~ -name SKILL.md)\nEOF"), "allow")  # quoted: text
+
+    def test_hooks_answer_a_subagent_script_with_an_assignment_line_without_crashing(self) -> None:
+        open_gate(self.repo, UNBORN_BASE)
+        log = self.repo / ".git" / "craftsman" / "hook-errors.log"
+        for command, expected in (
+            *((script, None) for script in self.REAL_VERIFIER_SCRIPTS),
+            ("D=1\nfind ~ -name SKILL.md", "deny"),
+        ):
+            payload = {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(self.repo),
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "session_id": "s-1",
+                "agent_id": "v-1",
+                "agent_type": "craftsman-verifier",
+            }
+            with self.subTest(command=command):
+                out, _ = call_pre_tool("claude", payload)
+                self.assertEqual(out.get("hookSpecificOutput", {}).get("permissionDecision"), expected, out)
+        self.assertFalse(log.exists(), log.read_text(encoding="utf-8") if log.exists() else "")
+
+        open_gate(self.repo, UNBORN_BASE, owner=GateOwner("antigravity", "conv-123"))
+        for command, expected in (
+            *((script, "allow") for script in self.REAL_VERIFIER_SCRIPTS),
+            ("D=1\nfind ~ -name SKILL.md", "deny"),
+        ):
+            agy = {
+                "artifactDirectoryPath": str(self.tmp / "brain" / "conv-123"),
+                "toolCall": {"name": "run_command", "args": {"CommandLine": command, "Cwd": str(self.repo)}},
+            }
+            with self.subTest(antigravity=command):
+                self.assertEqual(evaluate_antigravity_payload(agy, {})[0], expected)
+
     def test_pre_tool_allows_outside_commands_when_gate_is_inactive(self) -> None:
         payload = {
             "cwd": str(self.repo),
