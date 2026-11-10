@@ -48,7 +48,7 @@ GENERATIONS = ("gen 1", "gen 2", "gen 3")
 ROLES: tuple[AgentRole, ...] = ("reviewer", "verifier")
 VERDICT_COLUMNS = ("proven", "probable", "question", "dismissed", "open")
 TOKEN_COLUMNS = (*compare.TOKEN_FIELDS, "total")
-AGENT_COLUMNS = ("hunters", "verifiers", "relaunched", "second opinions")
+AGENT_COLUMNS = ("hunters", "verifiers", "relaunched slots", "idle verifiers", "second opinions")
 HUNTER_COLUMNS = (*SLOT_KINDS, NO_SLOT, *GENERATIONS)
 FINDER_COLUMNS = (*SLOT_KINDS, "lead", NO_SLOT)
 ALL_CASES = "all"
@@ -132,19 +132,13 @@ def slot_columns(ledger: Ledger, place: tuple[int, str] | None) -> tuple[str, st
     return slot.kind, GENERATIONS[slot.generation - 1]
 
 
-def second_opinions(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
-    """The verifier runs that only judged findings another verifier run had judged before them.
-
-    A verdict counts for the runs that vouch for it (`round_vouchers`, the rule of the gate); a merge
-    judges nothing and is left out.
-    """
-    first: set[str] = set()
-    second: set[str] = set()
+def _verdict_vouchers(ledger: Ledger, runs: Sequence[AgentRun]) -> list[tuple[Finding, set[str]]]:
+    """Every verdict event, merges included, with the verifier runs (`run_key`) that vouch for it, in finding and
+    log order. A verdict counts for the runs that vouch for it (`round_vouchers`, the rule of the gate); a merge
+    writes ordinary verdict events (the dismissed duplicates), and the gate holds them to the same rule."""
+    found: list[tuple[Finding, set[str]]] = []
     for finding in ledger.findings:
-        judged: set[str] = set()
         for event in finding.verdict_log:
-            if event.merge:
-                continue
             vouchers = round_vouchers(
                 ledger,
                 runs,
@@ -154,10 +148,33 @@ def second_opinions(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
                 recorded_at=parse_timestamp(event.at),
                 by=event.by,
             )
-            keys = {run_key(voucher.run, voucher.index) for voucher in vouchers}
-            (second if judged else first).update(keys - judged)
-            judged |= keys
+            found.append((finding, {run_key(voucher.run, voucher.index) for voucher in vouchers}))
+    return found
+
+
+def second_opinions(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
+    """The verifier runs that only judged findings another verifier run had judged before them.
+
+    A merge is a judgement here as at the gate: a blocker or major finding dismissed as a duplicate needs a
+    second, independent verifier (`check`'s `[second-opinion]`), and the run launched for it is one.
+    """
+    first: set[str] = set()
+    second: set[str] = set()
+    judged: dict[str, set[str]] = {}
+    for finding, keys in _verdict_vouchers(ledger, runs):
+        before = judged.setdefault(finding.id, set())
+        (second if before else first).update(keys - before)
+        before |= keys
     return len(second - first)
+
+
+def idle_verifiers(ledger: Ledger, runs: Sequence[AgentRun]) -> int:
+    """The verifier runs that vouch for no verdict or merge: launched for nothing (denied its commands, died, or
+    gave up), so another verifier had to judge their findings. A run whose transcript was not read is attributed
+    by time (`round_vouchers`) and may be credited with a verdict its neighbour recorded, so this is a floor."""
+    vouching = {key for _, keys in _verdict_vouchers(ledger, runs) for key in keys}
+    verifiers = {run_key(item, index) for index, item in enumerate(runs) if item.role == "verifier"}
+    return len(verifiers - vouching)
 
 
 def _usage(session: Session, ledger: Ledger, agents: Mapping[str, tuple[AgentRole, Any]]) -> None:
@@ -281,7 +298,8 @@ def analyze(record: dict[str, Any], cases_dir: Path) -> Session:
                 session.agents[generation] += 1
             if place is not None:
                 hunters_of.setdefault(place, set()).add(key)
-    session.agents["relaunched"] = sum(len(keys) > 1 for keys in hunters_of.values())
+    session.agents["relaunched slots"] = sum(len(keys) > 1 for keys in hunters_of.values())
+    session.agents["idle verifiers"] = idle_verifiers(ledger, runs)
     session.agents["second opinions"] = second_opinions(ledger, runs)
     _usage(session, ledger, agents)
     for finding in ledger.findings:

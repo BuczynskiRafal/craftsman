@@ -322,6 +322,24 @@ class FixtureTests(ReviewFixture):
         self.assertEqual(len(record["recall"]["duplicates"]), 1)  # F4 on cart-1 again
 
 
+class VerifierCountTests(unittest.TestCase):
+    def test_a_verifier_after_a_merge_is_a_second_opinion_and_one_that_vouched_nothing_is_idle(self) -> None:
+        # The shape of an end-to-end run: a verifier merges a major duplicate (a dismissal the gate wants a second
+        # verifier for), one verifier is denied its commands and records nothing, and the second opinion judges
+        # only the merged duplicate.
+        with tempfile.TemporaryDirectory() as tmp:
+            review = Review(Path(tmp))
+            review.hunter("h1", "W1-1", 5, 6, used=usage(900))
+            review.verifier("v1", ("merge", "F1", "F2"), judged("F1", "probable", 5), used=usage(500))
+            review.verifier("v2", used=usage(500))
+            review.verifier("v3", judged("F2", "dismissed"), used=usage(500))
+            ledger = review.ledger()
+        self.assertTrue(next(f for f in ledger.findings if f.id == "F2").verdict_log[0].merge)
+        runs = agent_runs(ledger)
+        self.assertEqual(run_breakdown.second_opinions(ledger, runs), 1)  # v3
+        self.assertEqual(run_breakdown.idle_verifiers(ledger, runs), 1)  # v2
+
+
 class BreakdownTests(ReviewFixture):
     def group(
         self, data: dict[str, Any], arm: str, case: str = run_breakdown.ALL_CASES
@@ -354,8 +372,9 @@ class BreakdownTests(ReviewFixture):
             (agents["bug"], agents["simplicity"], agents["variant"], agents["fresh"]), (3, 1, 1, 0)
         )
         self.assertEqual((agents["gen 1"], agents["gen 2"], agents["none"]), (4, 1, 0))
-        self.assertEqual(agents["relaunched"], 1)  # W1-1, whose first hunter died after its brief
+        self.assertEqual(agents["relaunched slots"], 1)  # W1-1, whose first hunter died after its brief
         self.assertEqual(agents["second opinions"], 1)  # v2 only judged F1 again; v3 also judged F6 first
+        self.assertEqual(agents["idle verifiers"], 0)  # every verifier vouches for a verdict
 
     def test_tokens_per_role_and_the_main_sessions_share(self) -> None:
         tokens = self.group(self.breakdown(), "a")["tokens"]
@@ -401,7 +420,7 @@ class BreakdownTests(ReviewFixture):
         self.assertIsNone(b["tokens"])
         self.assertEqual(b["cache_write_per_subagent"], {"hunters": None, "verifiers": None})
         self.assertEqual(b["subagents"]["hunters"], 2)  # h1 was resumed: one agent
-        self.assertEqual(b["subagents"]["relaunched"], 0)
+        self.assertEqual(b["subagents"]["relaunched slots"], 0)
         self.assertEqual(b["found_first_by"]["found"], 1)
 
     def test_the_findings_funnel(self) -> None:
