@@ -9,7 +9,7 @@ progress) arrives as lazy callbacks in `PolicyContext`, so a call that touches n
 
 What the policy decides, in this order, for a shell command:
 - the hook entry points are run by the platform, never by an agent (`craftsman hook ...` in every spelling,
-  `python -m craftsman.hooks`, the guard scripts, and inline programs that import craftsman; what a `python`
+  the plugin's launchers among them, `python -m craftsman.hooks`, the guard scripts, and inline programs that import craftsman; what a `python`
   command line runs (`-c` code, `-m` module, a script, stdin) is decided by `shell.python_program`, which
   reads the interpreter's options as Python itself does, and this module does not restate that grammar);
 - the ledger (`<git-dir>/craftsman/`) and the platform transcripts are not written by agents, by any write
@@ -49,6 +49,7 @@ from craftsman.records import (
     craftsman_agent_name,
 )
 from craftsman.shell import (
+    SHELL_EXECUTABLES,
     SimpleCommand,
     expand_shell_path_token,
     iter_simple_commands,
@@ -82,7 +83,8 @@ RESTARTING_COMMANDS = frozenset({"prepare", "reset"})
 
 # --- reading a craftsman command ----------------------------------------------------------------------
 
-_CRAFTSMAN_EXECUTABLES = frozenset({"craftsman", "craftsman.exe"})
+# The CLI by name, and the plugin's launchers in `bin/`, which start it (`craftsman` is one of them).
+_CRAFTSMAN_EXECUTABLES = frozenset({"craftsman", "craftsman.exe", "craftsman.cmd", "launcher.sh", "launcher.cmd"})
 _CLI_MODULES = frozenset({"craftsman.cli", "craftsman"})
 _CLI_SCRIPT = "craftsman-cli.py"
 _CLI_FILE = "craftsman/cli.py"
@@ -94,6 +96,8 @@ _ENTRY_FILES = ("craftsman/hooks.py", "craftsman/antigravity.py", "craftsman/sco
 _LAUNCHERS: dict[str, tuple[str, ...]] = {"uv": ("run",), "uvx": (), "pipx": ("run",), "poetry": ("run",), "npx": ()}
 # Interpreters whose inline program (`-c` / `-e`) can name a file, with the option that carries it.
 _INLINE_OPTIONS: dict[str, str] = {"node": "-e", "nodejs": "-e", "perl": "-e", "ruby": "-e", "php": "-r"}
+# The options of a POSIX shell that take the next word as their value, before the script it runs.
+_SHELL_OPTIONS_WITH_VALUE = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
 
 CallKind = Literal["cli", "entry", "inline", "stdin"]
 
@@ -111,13 +115,17 @@ class Invocation:
 def _invocation(tokens: Sequence[str]) -> tuple[CallKind, tuple[str, ...]] | None:
     if not tokens:
         return None
-    executable = os.path.basename(tokens[0]).lower()
+    executable = os.path.basename(tokens[0].replace("\\", "/")).lower()
     if executable in _CRAFTSMAN_EXECUTABLES or executable == _CLI_SCRIPT:
         return "cli", tuple(tokens[1:])
     if executable in _ENTRY_SCRIPTS:
         return "entry", tuple(tokens[1:])
     if executable in _LAUNCHERS:
         return _invocation(_launched(executable, tokens[1:]))
+    if executable in SHELL_EXECUTABLES:
+        return _invocation(_shell_script(tokens[1:]))
+    if executable in ("cmd", "cmd.exe"):
+        return _cmd_invocation(tokens[1:])
     if executable in _INLINE_OPTIONS:
         option = _INLINE_OPTIONS[executable]
         if option in tokens[1:]:
@@ -160,6 +168,34 @@ def _launched(launcher: str, tokens: Sequence[str]) -> Sequence[str]:
     return words
 
 
+def _shell_script(tokens: Sequence[str]) -> Sequence[str]:
+    """The script a POSIX shell runs and its arguments (`sh bin/launcher.sh hook stop`), given the words after the
+    shell's name; empty when the shell runs a `-c` string (`shell.iter_simple_commands` reads that one) or stdin."""
+    index = 0
+    while index < len(tokens) and tokens[index][:1] in ("-", "+") and tokens[index] not in ("-", "--"):
+        word = tokens[index]
+        if not word.startswith("--") and ("c" in word[1:] or "s" in word[1:]):
+            return ()
+        index += 2 if word in _SHELL_OPTIONS_WITH_VALUE else 1
+    index += index < len(tokens) and tokens[index] == "--"
+    return tokens[index:]
+
+
+def _cmd_invocation(tokens: Sequence[str]) -> tuple[CallKind, tuple[str, ...]] | None:
+    """What `cmd /c <command>` (or `/k`) runs: the command follows as words, or as one quoted string."""
+    switches = [index for index, word in enumerate(tokens) if word.lower() in ("/c", "/k")]
+    if not switches:
+        return None
+    rest = tokens[switches[0] + 1 :]
+    if len(rest) != 1:
+        return _invocation(rest)
+    for item in iter_simple_commands(rest[0]):
+        parsed = _invocation(item.tokens)
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _after_options(tokens: Sequence[str]) -> Sequence[str]:
     """`tokens` without the options (words that start with `-`) in front of the first plain word."""
     index = 0
@@ -180,9 +216,10 @@ def invocations(commands: Iterable[SimpleCommand]) -> tuple[Invocation, ...]:
 def craftsman_arguments(tokens: Sequence[str]) -> tuple[str, ...] | None:
     """What follows the Craftsman CLI in a simple command, None when the command is another program.
 
-    The executable has to be `craftsman`, `craftsman.exe`, `python -m craftsman.cli` or a `craftsman-cli.py`
-    script, alone or run by a launcher (`uv run`, `uvx`, `pipx run`, `poetry run`, `npx`), so text that merely
-    mentions the command (`echo craftsman review prepare`) names none.
+    The executable has to be `craftsman`, `craftsman.exe`, `python -m craftsman.cli`, a `craftsman-cli.py`
+    script or one of the plugin's launchers (`launcher.sh`, `launcher.cmd`, `craftsman.cmd`, also through `sh`,
+    `bash` or `cmd /c`), alone or run by a launcher (`uv run`, `uvx`, `pipx run`, `poetry run`, `npx`), so text
+    that merely mentions the command (`echo craftsman review prepare`) names none.
     """
     parsed = _invocation(tokens)
     return parsed[1] if parsed is not None and parsed[0] == "cli" else None

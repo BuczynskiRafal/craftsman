@@ -114,6 +114,12 @@ class CommandMatcherTests(unittest.TestCase):
             "uv run craftsman review cover",
             "uvx craftsman review cover",
             "bash -c 'craftsman review cover'",
+            # The plugin's launchers in `bin/`.
+            '"/plugin/bin/launcher.sh" review cover',
+            "sh /plugin/bin/launcher.sh review cover",
+            "/plugin/bin/craftsman.cmd review cover",
+            "C:\\plugin\\bin\\launcher.cmd review cover",
+            'cmd /c "C:\\plugin\\bin\\craftsman.cmd review cover"',
         ):
             with self.subTest(command=command):
                 self.assertEqual(review_commands(command), ("cover",))
@@ -194,6 +200,19 @@ class HookForgeryTests(PolicyCase):
             "python3 ~/.local/lib/python3.12/site-packages/craftsman/craftsman-cli.py hook stop",
             '"$CLAUDE_PLUGIN_ROOT/bin/craftsman-cli.py" hook stop --platform claude',
             "python3 /plugin/bin/craftsman-cli.py hook stop --platform claude",
+            # The plugin's launchers, run directly, quoted, or through a shell or `cmd`.
+            '"$CLAUDE_PLUGIN_ROOT/bin/launcher.sh" hook stop --platform claude',
+            "/plugin/bin/launcher.sh hook stop --platform claude",
+            "sh /plugin/bin/launcher.sh hook stop --platform claude",
+            "bash -e '/opt/my plugin/bin/launcher.sh' hook pre-tool --platform claude",
+            "dash -- /plugin/bin/launcher.sh hook stop",
+            "bin/craftsman hook stop",
+            "sh /plugin/bin/craftsman hook stop",
+            "bin/craftsman.cmd hook stop",
+            "C:\\plugin\\bin\\launcher.cmd hook stop --platform claude",
+            '"C:\\Program Files\\plugin\\bin\\craftsman.cmd" hook stop',
+            "cmd /c C:\\plugin\\bin\\launcher.cmd hook stop --platform claude",
+            'cmd.exe /d /s /c "C:\\plugin\\bin\\launcher.cmd hook stop --platform claude"',
             "/usr/local/bin/craftsman hook stop",
             "env FOO=1 craftsman hook stop",
             "env -u HOME craftsman hook stop",
@@ -250,6 +269,10 @@ class HookForgeryTests(PolicyCase):
             "craftsman gate --complete",
             "ls hook",
             "python script.py hook",
+            "sh other.sh hook",
+            "bash -c 'echo bin/launcher.sh hook stop'",
+            "cmd /c echo launcher.cmd hook stop",
+            "bin/launcher.sh review check",
         ):
             with self.subTest(command=command):
                 self.assertAllowed(self.shell(command))
@@ -822,6 +845,25 @@ class EntryModuleTests(PolicyCase):
                         f"`{command}` runs craftsman/{path.name}, which the command policy does not read: "
                         "teach `command_policy` the module or drop its `__main__` block",
                     )
+
+    def test_every_launcher_the_plugin_ships_is_the_cli(self) -> None:
+        launchers = sorted(path for path in (REPO_ROOT / "bin").iterdir() if path.is_file())
+        self.assertGreaterEqual(
+            {path.name for path in launchers}, {"launcher.sh", "launcher.cmd", "craftsman", "craftsman.cmd", "craftsman-cli.py"}
+        )
+
+        for path in launchers:
+            runners = ("cmd /c", "cmd.exe /d /s /c") if path.suffix == ".cmd" else ("python3",) if path.suffix == ".py" else ("sh", "bash", "dash")
+            for command in (
+                f"{path} hook stop --platform claude",
+                f'"{path}" hook stop --platform claude',
+                f"{path.parent.name}/{path.name} hook stop",
+                *(f'{runner} "{path}" hook stop' for runner in runners),
+            ):
+                with self.subTest(command=command):
+                    self.assertDenied(self.shell(command), HOOKS_ARE_THE_PLATFORMS)
+            with self.subTest(command=f"{path} review cover"):
+                self.assertEqual(review_commands(f'"{path}" review cover'), ("cover",))
 
     def test_the_cli_module_run_as_a_script_is_the_cli(self) -> None:
         self.owns = True

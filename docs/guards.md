@@ -66,7 +66,8 @@ denies, in this order, for a shell command (a file-writing tool is checked again
   inline Python programs that import `craftsman` are run by the platform, never by an agent. Every script named
   `craftsman-cli.py` is the CLI, so the commands the hooks themselves run are denied as well: the plugin's
   `bin/craftsman-cli.py`, the checkout's `scripts/craftsman-cli.py` and the `craftsman/craftsman-cli.py` that user-level
-  hooks run. These bootstraps, and the Antigravity scripts, put Craftsman's own directory first on `sys.path`, so a
+  hooks run. The plugin's launchers are the CLI too (`bin/launcher.sh`, `bin/launcher.cmd`, `bin/craftsman`,
+  `bin/craftsman.cmd`), run directly or through `sh`, `bash`, `dash` or `cmd /c`. These bootstraps, and the Antigravity scripts, put Craftsman's own directory first on `sys.path`, so a
   project's own `craftsman/` directory never stands in for the guard; no hook starts Craftsman with `python -m`, which
   would put the project there first. What a `python` command
   line runs is decided by `shell.python_program`; the words of an `env -S "<command line>"` string are read as the command
