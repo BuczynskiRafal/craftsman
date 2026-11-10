@@ -64,7 +64,9 @@ The README and the [usage guide](usage.md) only summarize it.
      verifier, who are anchored), and the round cap bounds the loop.
 8. **Test.** `craftsman run --kind test -- <cmd>` on the final code; deep also `--kind e2e`. A test run
    counts only when its runner reported at least `--min-tests` tests (default 1); a command that matched
-   no tests is recorded but is no evidence.
+   no tests is recorded but is no evidence. Output prints as it arrives up to 6,000 characters; past
+   that, a line names a log in the scratch area that holds the full output and grows while the
+   command runs, and the last 6,000 characters print when the command exits (`--full` prints it all).
 9. **Close.** `craftsman review check`, then `craftsman gate --complete`, then `craftsman review
    report`.
 

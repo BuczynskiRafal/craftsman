@@ -92,6 +92,21 @@ craftsman review report                # the final report, with agent usage per 
 craftsman skill show craft-review --lenses trust,state   # lens playbooks
 ```
 
+`craftsman run` prints a command's output as it arrives, unchanged, up to 6,000 characters. When the
+output passes that limit, printing stops and a line names the log that holds the full output:
+`[craftsman run: output continues; its end prints when the command exits; full output, written as it arrives: PATH]`.
+`PATH` is `run-output.log` in a directory of the `craftsman review scratch` area, which is pruned when
+the review ends; it holds everything from the first byte, grows while the command runs (so
+`tail PATH` shows where a slow or hung command is) and keeps its name. When the command exits, the
+rest prints whole if it is at most 6,000 characters; otherwise a line
+`[craftsman run: N characters omitted; full output: PATH]` and the last 6,000 characters print. Cuts
+move to a line boundary where that costs at most 200 characters. If the log cannot be written, the
+line says `full output not saved: <reason>` and all of the output prints as it arrives. `--full`
+prints everything as it arrives, with no log. The ledger record, test count and exit code are the
+same either way. On POSIX, SIGTERM or SIGHUP to `craftsman run` stops the command as Ctrl-C does:
+its process group is stopped, the run is recorded as interrupted, the end of the output prints, and
+`craftsman run` exits with 128 plus the signal number (143 or 129).
+
 `craftsman review check --json` (and `report --json`) print the verdict of the gate for scripts: `passed`,
 `partial`, `self_reviewed`, `enforced`, `platform`, `abandoned`, `slots` (each with `id`, `state` of `done`,
 `running`, `dead` or `unlaunched`, `lenses`, `hunks` and `missing`), `issues` (`code`, `message`), `warnings`,
