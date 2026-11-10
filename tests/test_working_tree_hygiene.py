@@ -125,6 +125,7 @@ class ScratchDirectoryTests(unittest.TestCase):
 
 
     @unittest.skipIf(sys.platform == "win32", "POSIX permission bits")
+    @unittest.skipIf(getattr(os, "geteuid", lambda: -1)() == 0, "root opens a directory whatever its mode")
     def test_a_directory_rmtree_cannot_open_is_reported_not_raised(self) -> None:
         # A 0700 directory of another user (a docker bind mount): no chmod can open it, and
         # rmtree reports it as an os.open failure, which takes arguments a retry cannot pass.
