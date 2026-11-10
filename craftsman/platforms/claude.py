@@ -301,7 +301,10 @@ def is_claude_plugin_active(claude_dir: Path) -> bool:
 # manifests and the agents, which need rendering, are generated into .claude-plugin/.
 PLUGIN_DIR = ".claude-plugin"
 PLUGIN_AGENTS_DIR = f"{PLUGIN_DIR}/agents"
-PLUGIN_LAUNCHERS = ("bin/launcher.sh", "bin/launcher.cmd", "bin/craftsman", "bin/craftsman.cmd")
+# `launcher.sh` runs the CLI through `craftsman-cli.py`, which checks the Python version itself.
+PLUGIN_LAUNCHERS = (
+    "bin/launcher.sh", "bin/craftsman-cli.py", "bin/launcher.cmd", "bin/craftsman", "bin/craftsman.cmd",
+)  # fmt: skip
 PLUGIN_DESCRIPTION = "Make AI coding agents prove they reviewed and tested their change."
 PLUGIN_AUTHOR = {"name": "Rafał Buczyński", "email": "buczynski.rafal2@gmail.com"}
 PLUGIN_REPOSITORY = "https://github.com/BuczynskiRafal/craftsman"

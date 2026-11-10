@@ -32,6 +32,7 @@ from typing import Literal, get_args
 
 from craftsman.diffscan import DiffScanError, GitTimeoutError, git_budget
 from craftsman.hook_budget import git_budget_s
+from craftsman.hook_fast import named_git_dir
 from craftsman.ledger import watch_set_asides
 from craftsman.records import LEDGER_FILENAME, Ledger, LedgerError, format_timestamp, parse_timestamp
 
@@ -62,23 +63,17 @@ def craftsman_dir_for(cwd: str | Path) -> Path | None:
     """`<git-dir>/craftsman` of the checkout that contains `cwd`, read from its `.git` entry WITHOUT running git.
 
     A hook that ran out of its git budget still has to log that, so the log cannot depend on git. A `.git`
-    directory and the `gitdir:` pointer file of a linked work tree are understood; None when there is none.
+    directory and the `gitdir:` pointer file of a linked work tree are understood (`hook_fast.named_git_dir`,
+    which the PreToolUse fast path reads them with too); None when there is none.
     """
     directory = Path(cwd)
     for candidate in (directory, *directory.parents):
-        dot_git = candidate / ".git"
         try:
-            if dot_git.is_dir():
-                return dot_git.resolve() / "craftsman"
-            if dot_git.is_file():
-                with dot_git.open("rb") as handle:
-                    line = handle.readline(4096).decode("utf-8", errors="replace").strip()
-                if not line.startswith("gitdir:"):
-                    return None
-                target = Path(line.removeprefix("gitdir:").strip())
-                return (target if target.is_absolute() else candidate / target).resolve() / "craftsman"
-        except OSError:
+            git_dir = named_git_dir(str(candidate))
+        except (OSError, ValueError):
             return None
+        if git_dir is not None:
+            return Path(git_dir) / "craftsman"
     return None
 
 

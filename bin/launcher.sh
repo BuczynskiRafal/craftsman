@@ -1,19 +1,25 @@
 #!/bin/sh
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Runs the Craftsman CLI with the first of python3, python and py that is Python 3.10+, in one
+# interpreter start: craftsman-cli.py checks the version itself and exits, before it reads stdin, when
+# the interpreter is older.
+case $0 in
+  /*) SCRIPT=$0 ;;
+  *) SCRIPT=$PWD/$0 ;;
+esac
+BIN_DIR=${SCRIPT%/*}
+VERSION_CHECK='import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'
 
-for candidate in python3 python py; do
-  if command -v "$candidate" >/dev/null 2>&1; then
-    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1; then
-      PYTHON_CMD="$candidate"
-      break
-    fi
+for PYTHON_CMD in python3 python py; do
+  command -v "$PYTHON_CMD" >/dev/null 2>&1 || continue
+  PYTHONPATH="$BIN_DIR/.." "$PYTHON_CMD" "$BIN_DIR/craftsman-cli.py" "$@"
+  STATUS=$?
+  [ "$STATUS" -eq 0 ] && exit 0
+  # A failure is the command's own unless the interpreter fails the version check (too old, or not a
+  # working Python at all): only then is the next one tried. `craftsman run` passes on any exit code.
+  if "$PYTHON_CMD" -c "$VERSION_CHECK" >/dev/null 2>&1; then
+    exit "$STATUS"
   fi
 done
 
-if [ -z "$PYTHON_CMD" ]; then
-  echo "Craftsman gate inactive: Python 3.10+ not found" >&2
-  exit 0
-fi
-
-PYTHONPATH="$PLUGIN_ROOT" exec "$PYTHON_CMD" -m craftsman.cli "$@"
+echo "Craftsman gate inactive: Python 3.10+ not found" >&2
+exit 0

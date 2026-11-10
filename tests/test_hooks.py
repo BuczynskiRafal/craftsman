@@ -1058,7 +1058,7 @@ class SubagentTests(HookTestCase):
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         path = self.agent_transcript("{}")
 
-        with mock.patch("craftsman.hooks.read_transcript", side_effect=KeyboardInterrupt):
+        with mock.patch("craftsman.usage.read_transcript", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):  # the hook is killed while it reads
                 call_hook(
                     "subagent-stop",
@@ -1091,7 +1091,7 @@ class SubagentTests(HookTestCase):
         self.assertNotIn("usage", event)
 
     def test_a_telemetry_crash_never_fails_the_stop(self) -> None:
-        with mock.patch("craftsman.hooks.read_transcript", side_effect=RuntimeError("boom")):
+        with mock.patch("craftsman.usage.read_transcript", side_effect=RuntimeError("boom")):
             event = self.stop_recording_coverage(agent_transcript_path=str(self.root / "x.jsonl"))
 
         self.assertNotIn("usage", event)
@@ -1319,7 +1319,7 @@ class PreToolTests(HookTestCase):
 
     def test_non_scope_checked_tools_skip_load_scope_policy_subprocesses(self) -> None:
         self.repo.cli("gate", "--init", "--cwd", ".")
-        with mock.patch("craftsman.hooks.load_scope_policy") as mock_policy:
+        with mock.patch("craftsman.scope.load_scope_policy") as mock_policy:
             for tool in ("Edit", "Write", "editFiles", "replace_string_in_file"):
                 out, _ = call_hook(
                     "pre-tool",

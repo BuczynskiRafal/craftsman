@@ -77,6 +77,18 @@ denies, in this order, for a shell command (a file-writing tool is checked again
   hunter's brief or record a slot-tagged finding or coverage.
 - **The work tree** (below).
 
+**Read-only fast path.** A call that only reads never waits for this module to load: `craftsman hook pre-tool` first
+runs `craftsman/hook_fast.py`, which imports nothing of Craftsman but the tool names and answers `{}` (allow) when the
+tool is in the policy's read-only set (`READ_ONLY_TOOL_NAMES`, which `decide` allows whatever the call names), no agent
+name contains `craftsman` (the search scope binds Craftsman's agents even without a gate), and every repository git
+could find from the call's `cwd` has no gate or a valid inactive one, read from
+`<git-dir>/craftsman/craftsman_state.json` without running git. For such a call the full handler allows too and changes
+nothing: neither the scope guard nor the claim of a gate runs. Whatever it cannot be sure of (another tool, input the
+handler would reject, an active gate of any session, a state file it cannot read or validate, a git environment
+variable, a `core.worktree` or a `.git` pointer git may read otherwise that could move the repository, a `cwd` inside a
+git directory) goes to the full handler with the payload already read. The fast path never denies, asks or writes, and
+`tests/test_hook_fast.py` holds its answers to the full handler's.
+
 These guards stop low-effort shortcuts; they are not a sandbox. A script file written first and run later, a program
 name or path built by command substitution, and an interpreter that assembles the path at run time pass a shell parser
 unseen.
