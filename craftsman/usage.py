@@ -345,11 +345,12 @@ def _moment(value: Any) -> datetime | None:
         return None
 
 
-def role_totals(ledger: Ledger) -> dict[AgentRole, RoleUsage]:
-    """Usage per role: the latest stop event with usage of each agent id, summed.
+def agent_usage(ledger: Ledger) -> dict[tuple[AgentRole, str], AgentUsage]:
+    """The usage of each agent, by (role, agent id): its latest stop event with usage.
 
     An agent sent back once stops twice and its transcript then holds both runs, so only its
-    latest stop counts. A stop without an agent id cannot be matched and counts as its own agent.
+    latest stop counts. A stop without an agent id cannot be matched and counts as its own agent,
+    keyed `#<position of the event>`.
     """
     latest: dict[tuple[AgentRole, str], AgentUsage] = {}
     for position, event in enumerate(ledger.agents):
@@ -357,6 +358,12 @@ def role_totals(ledger: Ledger) -> dict[AgentRole, RoleUsage]:
         if event.event != "stop" or event.usage is None or role is None:
             continue
         latest[(role, event.agent_id or f"#{position}")] = event.usage
+    return latest
+
+
+def role_totals(ledger: Ledger) -> dict[AgentRole, RoleUsage]:
+    """Usage per role: the usage of each agent (`agent_usage`), summed."""
+    latest = agent_usage(ledger)
     totals: dict[AgentRole, RoleUsage] = {}
     roles: tuple[AgentRole, ...] = ("reviewer", "verifier")
     for wanted in roles:
