@@ -54,17 +54,31 @@ closes, and the report marks it as `SELF-REVIEWED`.
 ## Measurements
 
 Pilot on [SWR-Bench](https://doi.org/10.1145/3808144): 5 PRs from `pytest`, `flask`, and `requests`,
-9 confirmed defects, 1 repetition per configuration. The sample is too small for statistical
-conclusions. Details and Claude Code runs: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
-These numbers were measured on an earlier protocol. The repository also ships a public seeded-defect
-suite, [`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md), to measure
-recall on any agent platform.
+9 ground-truth review comments (`D1–D9`), 1 repetition per configuration, Craftsman 5.0 `/craft-review`
+against an unassisted baseline. The sample is too small for statistical conclusions. Per-defect matrix,
+ledger verdicts, and token telemetry:
+[docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
+The seeded-defect suite in
+[`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md) measures recall and
+cost on any agent platform.
 
-| Configuration | Defects: without → with Craftsman | Avg. time per PR |
-| :--- | :---: | :---: |
-| Antigravity · Gemini 4 Argon `low` | 2/9 → 4/9 | 1.5 → 4.7 min |
-| Antigravity · Gemini 4 Argon `medium` | 2/9 → 5/9 | 2.0 → 6.7 min |
-| Antigravity · Gemini 4 Argon `high` | 3/9 → 7/9 | 15.6 → 26.3 min |
+| Configuration | Defects: without → with Craftsman | Avg. time / PR | Avg. tokens / PR (in+out · cache read) | Avg. tool calls / PR |
+| :--- | :---: | :---: | :---: | :---: |
+| Antigravity · Gemini 3.8 Flash `low` | 3/9 → **5/9** | 0.7 → 5.1 min | 104k → 162k · 0.26M → 0.28M | 17 → 224 |
+| Antigravity · Gemini 3.8 Flash `medium` | 2/9 → **6/9** | 3.1 → 18.4 min | 246k → 265k · 1.04M → 2.12M | 37 → 663 |
+| Antigravity · Gemini 3.8 Flash `high` | 2/9 → **8/9** | 5.5 → 24.7 min | 346k → 543k · 2.06M → 7.93M | 55 → 707 |
+| Antigravity · Gemini 4 Argon `low` | 1/9 → **4/9** | 2.4 → 12.6 min | 60k → 116k · 0.52M → 1.24M | 16 → 184 |
+| Antigravity · Gemini 4 Argon `medium` | 2/9 → **5/9** | 3.5 → 25.4 min | 72k → 140k · 0.40M → 0.97M | 15 → 525 |
+| Antigravity · Gemini 4 Argon `high` | 2/9 → **5/9** | 5.2 → 28.6 min | 89k → 127k · 0.58M → 0.96M | 20 → 170 |
+| Antigravity · Claude Sonnet 5.5 `low` | 1/9 → **4/9** | 0.2 → 1.3 min | 18k → 43k · 0.03M → 0.44M | 1 → 24 |
+| Antigravity · Claude Sonnet 5.5 `medium` | 1/9 → **3/9** | 0.2 → 1.2 min | 18k → 40k · 0.03M → 0.42M | 1 → 25 |
+| Antigravity · Claude Sonnet 5.5 `high` | 1/9 → **6/9** | 0.3 → 2.9 min | 23k → 56k · 0.05M → 0.62M | 2 → 50 |
+
+Four of the nine items (`D3`, `D4`, `D6`, `D8`) are style, naming, or changelog comments. On the five
+functional and structural items (`D1`, `D2`, `D5`, `D7`, `D9`), Gemini 3.8 Flash (`medium`, `high`) and
+Gemini 4 Argon (`medium`, `high`) all score 5/5. Flash `high` also reports three of the cosmetic items;
+Argon reports none, and Argon `high` uses 4.3× fewer uncached and 8.3× fewer cache-read tokens per PR than
+Flash `high`.
 
 ## Installation
 
