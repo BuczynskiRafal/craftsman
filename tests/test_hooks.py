@@ -480,7 +480,7 @@ class ReviewStopGuardTests(HookTestCase):
         reason = self.stop()["reason"]
 
         self.assertIn("[no-isolation]", reason)  # no craftsman subagent was recorded at all
-        self.assertIn("W1-1..W1-3", reason)
+        self.assertIn("W1-1, W1-2; W1-3 [Claude Code: model haiku]", reason)  # the simplicity slot is marked
         self.assertNotIn("review cover --hunks", reason)
 
     def test_a_finished_review_lets_the_agent_stop_once(self) -> None:

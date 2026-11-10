@@ -42,7 +42,8 @@ The README and the [usage guide](usage.md) only summarize it.
    tries to disprove each finding, reproduces it where the code is runnable, and records a verdict. A
    `blocker` or `major` finding dismissed without a run needs a second, independent verifier. On Claude
    Code, the simplicity slots and the verifiers of clusters that hold only `minor` or `nit` findings run
-   on the cheaper model (`haiku`); everything else, and a verifier resumed to confirm a fix, does not.
+   on the cheaper model (`haiku`) and `check` marks these launches; everything else, and a verifier
+   resumed to confirm a fix, does not.
 6. **Saturate.** Waves are planned, not derived: `check`, `report`, `brief` and `prepare` store a wave
    in the plan when a `proven`, or serious `probable`, bug finding outside documentation calls for it.
    A wave is one **variant** slot per root cause (`W2-F3`, which hunts the siblings of finding F3, at

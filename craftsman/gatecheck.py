@@ -40,6 +40,7 @@ from craftsman.records import (
     Round,
     Run,
     RunKind,
+    Severity,
     SignalKind,
     Slot,
     SlotClaim,
@@ -87,6 +88,9 @@ MAX_LISTED_SLOTS = 12
 MAX_LISTED_FINDINGS = 12
 MAX_LISTED_CLUSTERS = 8
 MAX_CLUSTER_FINDINGS = 6
+# Printed after a launch that runs on the cheaper model: simplicity slots and verifier clusters of minor or nit findings.
+CHEAPER_MODEL_NOTE = "[Claude Code: model haiku]"
+_CHEAPER_MODEL_SEVERITIES: tuple[Severity, ...] = ("minor", "nit")
 # What one hunt issue message may take, so that the stop hooks can show several of them in full.
 MAX_HUNT_ISSUE_CHARS = 900
 
@@ -814,13 +818,28 @@ def _slot_ids(statuses: Sequence[SlotStatus]) -> str:
     return _compress([status.slot.id for status in statuses], MAX_LISTED_SLOTS)
 
 
+def _launch_ids(statuses: Sequence[SlotStatus]) -> str:
+    """`_slot_ids` for slots about to be launched: of the same listed slots, the simplicity ones follow the
+    others with the cheaper-model note."""
+    shown = statuses[:MAX_LISTED_SLOTS]
+    cheaper = [status.slot.id for status in shown if status.slot.kind == "simplicity"]
+    if not cheaper:
+        return _slot_ids(statuses)
+    full = [status.slot.id for status in shown if status.slot.kind != "simplicity"]
+    groups = [_compress(full, MAX_LISTED_SLOTS)] if full else []
+    groups.append(f"{_compress(cheaper, MAX_LISTED_SLOTS)} {CHEAPER_MODEL_NOTE}")
+    if len(statuses) > MAX_LISTED_SLOTS:
+        groups.append(f"+{len(statuses) - MAX_LISTED_SLOTS} more")
+    return "; ".join(groups)
+
+
 def _launch_text(unlaunched: Sequence[SlotStatus], dead: Sequence[SlotStatus]) -> list[str]:
     """What to tell the caller to launch: the slots nobody has started, and the ones whose hunter died."""
     parts: list[str] = []
     if dead:
-        parts.append(f"Stopped without finishing: {_slot_ids(dead)} - launch them again.")
+        parts.append(f"Stopped without finishing: {_launch_ids(dead)} - launch them again.")
     if unlaunched:
-        parts.append(f"Launch now, all in one step: {_slot_ids(unlaunched)}. {_LAUNCH_HOW}")
+        parts.append(f"Launch now, all in one step: {_launch_ids(unlaunched)}. {_LAUNCH_HOW}")
     elif dead:
         parts.append(_LAUNCH_HOW)
     return parts
@@ -890,7 +909,7 @@ def _hunt_issues(
             f"No Craftsman subagent was recorded for round {round_.number}. If you launched hunters, the "
             "Craftsman hooks did not see them: run `craftsman doctor` and fix the install; do not "
             "relaunch hunters that already ran. If you did not launch any, launch them now, all in one "
-            f"step: {_slot_ids(pending)}. {_LAUNCH_HOW}"
+            f"step: {_launch_ids(pending)}. {_LAUNCH_HOW}"
         )
         return [GateIssue("no-isolation", message)], []
     first = [status for status in pending if status.slot.generation == 1]
@@ -979,7 +998,12 @@ def _verifier_text(ledger: Ledger, findings: Sequence[Finding], running: int) ->
             f"Verifiers running: {running} {subject} still at work - do not launch more; "
             "end your turn and wait for their reports."
         )
-    shown = " ".join(f"[{','.join(cluster)}]" for cluster in clusters[:MAX_LISTED_CLUSTERS])
+    severity = {finding.id: finding.severity for finding in findings}
+    shown = " ".join(
+        f"[{','.join(cluster)}]"
+        + (f" {CHEAPER_MODEL_NOTE}" if all(severity[id_] in _CHEAPER_MODEL_SEVERITIES for id_ in cluster) else "")
+        for cluster in clusters[:MAX_LISTED_CLUSTERS]
+    )
     more = f" (+{len(clusters) - MAX_LISTED_CLUSTERS} more clusters)" if len(clusters) > MAX_LISTED_CLUSTERS else ""
     return f"Launch verifiers, one per cluster: {shown}{more}. {_VERIFIER_HOW}"
 
