@@ -47,9 +47,10 @@ All notable changes to Craftsman are recorded here. The format follows
 - **The benchmark reports tokens and where a review spends them.** `python3 -m evals.run compare` gains a `tokens`
   and a `$/defect` column (cost per seeded defect found), their ratios in the versus table, `--tokens` for the
   input / output / cache split, and the new values in `--json` (every existing key is kept). The new
-  `python3 -m evals.run breakdown` reads each run's ledger and shows subagents per run, hunters by slot kind and
-  wave, tokens and agent time per role with the main session's share, the findings funnel, which slot first found
-  each seeded defect, and findings on no defect. Every run it leaves out is named with the reason. A run's tokens
+  `python3 -m evals.run breakdown` reads each run's ledger and shows subagents per run (with relaunched hunt slots,
+  verifiers that vouched for nothing, and second opinions, a merge counting as a first judgement as it does at the
+  gate), hunters by slot kind and wave, tokens and agent time per role with the main session's share, the findings
+  funnel, which slot first found each seeded defect, and findings on no defect. Every run it leaves out is named with the reason. A run's tokens
   come from its per-model usage, which covers the whole session; a run without it counts as having no tokens, never
   as the last turn's usage.
 
@@ -78,7 +79,9 @@ All notable changes to Craftsman are recorded here. The format follows
   reading on Craftsman's instructions.
 - **`review check` marks the launches that run on the cheaper model.** Simplicity slots and verifier clusters of only
   `minor` or `nit` findings carry `[Claude Code: model haiku]` where `check` says what to launch, so the orchestrator
-  no longer has to work this out from the prompts. Messages stay within the stop hook's 900-character budget.
+  no longer has to work this out from the prompts. Verifier clusters are separated by `; `, so the marker can only
+  belong to the cluster before it (`[F15] [Claude Code: model haiku]; [F10,F11,F14]`). Messages stay within the stop
+  hook's 900-character budget.
 - **Shorter skill and agent descriptions.** These are listed in every session whether a skill is used or not: the
   skill descriptions went from 4,293 to 1,993 characters and the agent descriptions from 817 to 450, and the
   workspace `AGENTS.md` from 11,263 to 8,963. The commands and triggers they name are unchanged, and `craft-review`
@@ -90,6 +93,19 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Fixed
 
+- **The scope guard no longer crashes on a shell line without a program word.** A Bash script with a line that only
+  assigns a variable (`D=/path`, `D=$(craftsman review scratch)`), or only redirects (`> out`), made the PreToolUse
+  hook of a guarded subagent fail with `IndexError` and ask, which a non-interactive session takes as a refusal: in
+  a review run, 13 verifier repro commands were refused this way. Such a line now runs nothing of its own, and
+  what it holds is still checked: the files of `<` redirections are reads (`x=$(< file)`), and command substitutions
+  inside quotes or an unquoted heredoc run as commands (`D="$(cat file)"`). This also closes `cat < file` and
+  `echo "$(cat file)"`, which the scope check did not look at before. Claude Code, Copilot and Antigravity share the
+  fix.
+- **The benchmark record counts the whole session.** With background subagents a session prints one result per turn,
+  and `turns`, `duration_ms` and `permission_denials` were read from the last one (a review of 63 turns and 35
+  refused tool calls was recorded as 2 turns and none). They are now summed over every turn, and the record counts
+  the entries of the case checkout's hook error log (`hook_errors`), which `compare` shows in its note column
+  (`13 hook errors`). `rescore` reads both again for older records from the logs they kept.
 - **A work tree whose directory name starts or ends with a blank.** Its path was trimmed, so commands and hooks
   looked for a directory that does not exist; only the line ending git adds is removed now.
 - **A relative `GIT_DIR` with `GIT_WORK_TREE` from a subdirectory.** The git directory is now resolved from the
