@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -127,6 +129,75 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 97)
                 self.assertEqual([call.split()[0] for call in self.calls()], ["python3", "python3"])
 
+    @unittest.skipUnless(os.path.isdir("/proc"), "reads the state of a process in /proc")
+    def test_a_stopped_launcher_stops_the_interpreter(self) -> None:
+        # A platform stops a hook that ran too long by signalling the launcher: the interpreter must not live on.
+        pid_file = self.tmp / "child.pid"
+        self.fake("python3", f'echo $$ > "{pid_file}"\nexec sleep 60')
+        for shell in SHELLS:
+            for sent, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)):
+                with self.subTest(shell=shell, signal=sent.name):
+                    pid_file.unlink(missing_ok=True)
+                    launcher = subprocess.Popen(
+                        [shell, str(LAUNCHER), "hook", "stop"], stdin=subprocess.PIPE, cwd=self.tmp,
+                        env={"PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}", "HOME": str(self.tmp)},
+                    )  # fmt: skip
+                    assert launcher.stdin is not None
+                    self.addCleanup(launcher.stdin.close)
+                    self.addCleanup(launcher.kill)
+                    deadline = time.monotonic() + 30
+                    while not pid_file.is_file() or not pid_file.read_text(encoding="utf-8").strip():
+                        self.assertLess(time.monotonic(), deadline, "the interpreter did not start")
+                        time.sleep(0.02)
+                    child = int(pid_file.read_text(encoding="utf-8"))
+
+                    launcher.send_signal(sent)
+
+                    self.assertEqual(launcher.wait(timeout=30), code)
+                    while running(child):
+                        self.assertLess(time.monotonic(), deadline, "the interpreter outlived the launcher")
+                        time.sleep(0.02)
+
+
+def running(pid: int) -> bool:
+    """Whether process `pid` exists and has not finished (a zombie waits only to be reaped)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
+
+
+class LauncherPathTests(unittest.TestCase):
+    """How the launcher finds its own folder, the first lines of the script, run with a given `$0`."""
+
+    def bin_dir(self, shell: str, zero: str) -> str:
+        lines = LAUNCHER.read_text(encoding="utf-8").splitlines()
+        start = lines.index("case $0 in")
+        end = next(index for index, line in enumerate(lines) if line.startswith("BIN_DIR="))
+        program = "\n".join([*lines[start : end + 1], 'printf %s "$BIN_DIR"'])
+        result = subprocess.run(
+            [shell, "-c", program, zero], cwd=REPO_ROOT, capture_output=True, encoding="utf-8", timeout=30,
+            check=True,
+        )  # fmt: skip
+        return result.stdout
+
+    @unittest.skipIf(os.name == "nt", "runs a POSIX shell")
+    def test_windows_and_posix_paths_resolve_to_the_bin_folder(self) -> None:
+        for zero, expected in (
+            # Git Bash on Windows: "${CLAUDE_PLUGIN_ROOT}/bin/launcher.sh" with a drive letter, either slash.
+            ("C:/Users/Ana Lee/.claude/plugins/craftsman/bin/launcher.sh", "C:/Users/Ana Lee/.claude/plugins/craftsman/bin"),
+            ("C:\\Users\\x\\craftsman\\bin\\launcher.sh", "C:\\Users\\x\\craftsman\\bin"),
+            ("d:\\craftsman/bin\\launcher.sh", "d:\\craftsman/bin"),
+            ("\\\\server\\share\\craftsman\\bin\\launcher.sh", "\\\\server\\share\\craftsman\\bin"),
+            ("/opt/craftsman/bin/launcher.sh", "/opt/craftsman/bin"),
+            ("bin/launcher.sh", f"{REPO_ROOT}/bin"),
+            ("bin\\launcher.sh", f"{REPO_ROOT}/bin"),
+        ):
+            for shell in SHELLS:
+                with self.subTest(zero=zero, shell=shell):
+                    self.assertEqual(self.bin_dir(shell, zero), expected)
+
 
 class BootstrapTests(unittest.TestCase):
     def run_bootstrap(self, *prefix: str) -> subprocess.CompletedProcess[str]:
@@ -148,6 +219,17 @@ class BootstrapTests(unittest.TestCase):
 
         self.assertIn("bin/craftsman-cli.py", PLUGIN_LAUNCHERS)
         self.assertNotIn("dirname", LAUNCHER.read_text(encoding="utf-8"))
+
+
+    def test_the_windows_launcher_runs_the_bootstrap(self) -> None:
+        # Not run here (no Windows): its text is pinned instead. `-m craftsman.cli` would import a
+        # `craftsman/` directory of the hook's working directory, the guarded project, in place of the plugin.
+        text = (REPO_ROOT / "bin" / "launcher.cmd").read_text(encoding="utf-8")
+        self.assertNotIn("-m craftsman", text)
+        self.assertIn('set "SCRIPT_DIR=%~dp0"', text)  # the folder of the script, with its trailing backslash
+        runs = [line for line in text.splitlines() if line.startswith("%PYTHON_CMD% ")]
+        self.assertEqual(runs, ['%PYTHON_CMD% "%SCRIPT_DIR%craftsman-cli.py" %*'])
+        self.assertEqual(text.splitlines()[-1], runs[0])
 
 
 if __name__ == "__main__":

@@ -255,7 +255,8 @@ Skills (`skills/<name>/SKILL.md`), lens playbooks (`skills/craft-review/lenses.m
 | [`craftsman/paths.py`](../craftsman/paths.py) | Platform home, VS Code profile, Copilot, Claude, and asset directories |
 | [`craftsman/assets.py`](../craftsman/assets.py) | Bundled skill, agent template (`{{include ...}}`), and rule loader |
 | [`craftsman/generated.py`](../craftsman/generated.py) | Generated-file markers and managed Markdown blocks |
-| [`craftsman/hook_command.py`](../craftsman/hook_command.py) | Absolute Python + CLI hook command builder |
+| [`craftsman/hook_command.py`](../craftsman/hook_command.py) | Absolute Python + bootstrap hook command builder; recognizes the `-m craftsman.cli` form of earlier installs |
+| [`craftsman/craftsman-cli.py`](../craftsman/craftsman-cli.py) | Bootstrap the user-level hooks run: the package's own directory first on `sys.path`, whatever the working directory holds |
 | [`craftsman/platforms/`](../craftsman/platforms/__init__.py) | Per-platform exporters and installers (`copilot.py`, `claude.py`, `antigravity.py`, `agents_md.py`) |
 | [`craftsman/export.py`](../craftsman/export.py) | `craftsman export` entrypoint |
 | [`craftsman/install.py`](../craftsman/install.py) | Installer orchestration (`craftsman install`) |

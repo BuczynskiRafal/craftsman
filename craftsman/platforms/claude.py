@@ -60,8 +60,10 @@ CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash|Read|Grep|Glob|LS|Wr
 
 _QUOTED = r'"(?:[^"\\]|\\.)*"'
 _QUOTED_SHIM = r'"(?:[^"\\]|\\.)*craftsman-cli\.py"'
-# Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running
-# `-m craftsman.cli` or the checkout's shim, then `hook <event> --platform claude`.
+# Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running a quoted
+# `craftsman-cli.py` bootstrap, then `hook <event> --platform claude`. Installs before the bootstrap wrote
+# `-m craftsman.cli` in its place; those commands are still Craftsman's, so an install replaces them and an
+# uninstall removes them.
 OUR_HOOK_COMMAND_RE = re.compile(
     rf"^{_QUOTED} (?:-m craftsman\.cli|{_QUOTED_SHIM}) hook "
     rf"(?:{'|'.join(re.escape(event) for event, _ in CLAUDE_HOOK_EVENTS.values())}) "

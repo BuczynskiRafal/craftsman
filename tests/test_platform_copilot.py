@@ -185,25 +185,33 @@ class HookExportTests(CopilotTestCase):
         self.assertEqual(shlex.split(entry["bash"])[-4:], ["hook", "stop", "--platform", "copilot"])
         self.assertTrue(entry["powershell"].startswith(f'& "{sys.executable}" '))
 
-    def fake_python(self, folder: Path, imports: Path) -> str:
-        """An interpreter whose `import craftsman` finds the package at `imports`."""
+    def fake_python(self, folder: Path, prints: str) -> str:
+        """An interpreter that prints `prints` whatever it is asked to run."""
         folder.mkdir(parents=True)
         python = folder / "python3"
-        python.write_text(f"#!/bin/sh\nprintf '%s' '{imports}'\n", encoding="utf-8")
+        python.write_text(f"#!/bin/sh\nprintf '%s\\n' '{prints}'\n", encoding="utf-8")
         python.chmod(0o755)
         return str(python)
 
     @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
-    def test_prefix_quotes_the_interpreter_for_bash(self) -> None:
+    def test_prefix_quotes_the_interpreter_and_the_bootstrap_for_bash(self) -> None:
         folder = self.tmp / "py $HOME" / '"x"'
-        python = self.fake_python(folder, Path(hook_command.__file__))
+        python = self.fake_python(folder, f"craftsman {__version__}")
+        bootstrap = self.tmp / "site $PATH" / '"craftsman"' / "craftsman-cli.py"
+        bootstrap.parent.mkdir(parents=True)
+        bootstrap.write_text("", encoding="utf-8")
 
-        bash, powershell = absolute_hook_prefixes(python)
+        with mock.patch.object(hook_command, "BOOTSTRAP", bootstrap):
+            bash, powershell = absolute_hook_prefixes(python)
 
-        quoted = str(folder).replace("$", "\\$").replace('"', '\\"')
-        self.assertEqual(bash, f'"{quoted}/python3" -m craftsman.cli')
-        ps_quoted = str(folder).replace("$", "`$").replace('"', '`"')
-        self.assertEqual(powershell, f'& "{ps_quoted}/python3" -m craftsman.cli')
+        def bash_quoted(path: Path) -> str:
+            return str(path).replace("$", "\\$").replace('"', '\\"')
+
+        def ps_quoted(path: Path) -> str:
+            return str(path).replace("$", "`$").replace('"', '`"')
+
+        self.assertEqual(bash, f'"{bash_quoted(Path(python))}" "{bash_quoted(bootstrap)}"')
+        self.assertEqual(powershell, f'& "{ps_quoted(Path(python))}" "{ps_quoted(bootstrap)}"')
         echoed = subprocess.run(
             ["bash", "-c", f"printf '%s\\n' {bash}"],
             capture_output=True,
@@ -211,24 +219,28 @@ class HookExportTests(CopilotTestCase):
             timeout=30,
             check=True,
         )
-        self.assertEqual(echoed.stdout.splitlines(), [python, "-m", "craftsman.cli"])
+        self.assertEqual(echoed.stdout.splitlines(), [python, str(bootstrap)])
 
-    @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
-    def test_interpreter_without_this_package_runs_the_shim(self) -> None:
-        python = self.fake_python(self.tmp / "py", self.tmp / "elsewhere" / "craftsman" / "__init__.py")
+    def test_the_prefix_runs_the_bootstrap_of_this_package(self) -> None:
+        bash, powershell = absolute_hook_prefixes(sys.executable)
 
-        bash, _ = absolute_hook_prefixes(python)
+        bootstrap = REPO_ROOT / "craftsman" / "craftsman-cli.py"
+        self.assertEqual(hook_command.BOOTSTRAP, bootstrap.resolve())
+        self.assertEqual(shlex.split(bash), [sys.executable, str(hook_command.BOOTSTRAP)])
+        self.assertTrue(powershell.startswith(f'& "{sys.executable}" '))
+        self.assertNotIn("-m", shlex.split(bash))
 
-        shim = str(REPO_ROOT / "scripts" / "craftsman-cli.py")
-        self.assertEqual(shlex.split(bash), [python, shim])
-
-    @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
-    def test_unreachable_package_without_a_shim_is_an_error(self) -> None:
-        python = self.fake_python(self.tmp / "py", self.tmp / "elsewhere" / "craftsman" / "__init__.py")
+    def test_a_missing_bootstrap_is_an_error(self) -> None:
         with (
-            mock.patch.object(hook_command, "CLI_SHIM", Path("scripts") / "no-such-shim.py"),
-            self.assertRaisesRegex(ExportError, "cannot import craftsman"),
+            mock.patch.object(hook_command, "BOOTSTRAP", self.tmp / "craftsman" / "craftsman-cli.py"),
+            self.assertRaisesRegex(ExportError, "is missing"),
         ):
+            absolute_hook_prefixes(sys.executable)
+
+    @unittest.skipIf(os.name == "nt", "the fake interpreter is a POSIX shell script")
+    def test_an_interpreter_that_does_not_start_this_craftsman_is_an_error(self) -> None:
+        python = self.fake_python(self.tmp / "py", "craftsman 0.0.1")
+        with self.assertRaisesRegex(ExportError, f"cannot run craftsman {__version__}"):
             absolute_hook_prefixes(python)
 
     def test_interpreter_that_cannot_run_is_an_error(self) -> None:

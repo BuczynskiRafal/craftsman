@@ -275,7 +275,7 @@ def write_wrapper(bin_dir: Path, src: Path) -> Path:
     bin_dir.mkdir(parents=True, exist_ok=True)
     wrapper = bin_dir / "craftsman"
     wrapper.write_text(
-        f'#!/bin/sh\nPYTHONPATH={shlex.quote(str(src))} exec python3 -m craftsman.cli "$@"\n',
+        f'#!/bin/sh\nexec python3 {shlex.quote(str(src / "bin" / "craftsman-cli.py"))} "$@"\n',
         encoding="utf-8",
     )
     wrapper.chmod(0o755)

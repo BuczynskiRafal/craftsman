@@ -28,7 +28,9 @@ from craftsman.platforms.claude import (
 
 from tests.support import REPO_ROOT
 
-PREFIX = '"/usr/bin/python3" -m craftsman.cli'
+PREFIX = '"/usr/bin/python3" "/usr/lib/python3/site-packages/craftsman/craftsman-cli.py"'
+# The form Craftsman wrote before its hooks ran the bootstrap.
+MODULE_PREFIX = '"/usr/bin/python3" -m craftsman.cli'
 
 
 def frontmatter(text: str) -> list[str]:
@@ -252,6 +254,7 @@ class HookCommandMatchTests(unittest.TestCase):
         for command in (
             f"{PREFIX} hook stop --platform claude",
             f"{shim} hook pre-tool --platform claude",
+            f"{MODULE_PREFIX} hook prompt --platform claude",  # an install made before the bootstrap
         ):
             with self.subTest(command=command):
                 self.assertTrue(is_craftsman_hook_command(command))
@@ -262,6 +265,8 @@ class HookCommandMatchTests(unittest.TestCase):
             f"{PREFIX} hook stop --platform claude && notify-send done",
             f"echo {PREFIX} hook stop --platform claude",
             f"{PREFIX} hook deploy --platform claude",
+            f"{MODULE_PREFIX} hook stop --platform claude; rm -rf ~",
+            '"/usr/bin/python3" "/src/other-cli.py" hook stop --platform claude',
         ):
             with self.subTest(command=command):
                 self.assertFalse(is_craftsman_hook_command(command))
@@ -327,7 +332,7 @@ class ClaudeSettingsMergeTests(ClaudeTestCase):
         original = path.read_text(encoding="utf-8")
         merge_claude_hooks(path, PREFIX)
 
-        merge_claude_hooks(path, '"/other/python" -m craftsman.cli')
+        merge_claude_hooks(path, '"/other/python" "/other/craftsman/craftsman-cli.py"')
 
         self.assertEqual((self.tmp / "settings.json.bak").read_text(encoding="utf-8"), original)
 
@@ -361,6 +366,21 @@ class ClaudeSettingsMergeTests(ClaudeTestCase):
         merge_claude_hooks(path, PREFIX)
 
         self.assertEqual(strip_claude_hooks(self.settings()), original)
+
+    def test_hooks_of_an_install_before_the_bootstrap_are_replaced_and_stripped(self) -> None:
+        user = {"type": "command", "command": "echo"}
+        path = self.write_settings({"hooks": {"Stop": [{"hooks": [user]}]}})
+        merge_claude_hooks(path, MODULE_PREFIX)
+
+        merge_claude_hooks(path, PREFIX)
+
+        commands = [
+            entry["command"] for groups in self.settings()["hooks"].values() for group in groups for entry in group["hooks"]
+        ]
+        self.assertEqual(len(commands), 6)  # one per event, and the user's own
+        self.assertFalse([command for command in commands if "-m craftsman.cli" in command])
+        merge_claude_hooks(path, MODULE_PREFIX)
+        self.assertEqual(strip_claude_hooks(self.settings()), {"hooks": {"Stop": [{"hooks": [user]}]}})
 
 
 if __name__ == "__main__":

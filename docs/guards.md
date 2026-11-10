@@ -63,7 +63,12 @@ the Claude Code and Copilot `craftsman hook pre-tool` hook and the Antigravity s
 denies, in this order, for a shell command (a file-writing tool is checked against the same protected places):
 
 - **Hook entry points.** `craftsman hook ...` in every spelling, `python -m craftsman.hooks`, the guard scripts, and
-  inline Python programs that import `craftsman` are run by the platform, never by an agent. What a `python` command
+  inline Python programs that import `craftsman` are run by the platform, never by an agent. Every script named
+  `craftsman-cli.py` is the CLI, so the commands the hooks themselves run are denied as well: the plugin's
+  `bin/craftsman-cli.py`, the checkout's `scripts/craftsman-cli.py` and the `craftsman/craftsman-cli.py` that user-level
+  hooks run. These bootstraps, and the Antigravity scripts, put Craftsman's own directory first on `sys.path`, so a
+  project's own `craftsman/` directory never stands in for the guard; no hook starts Craftsman with `python -m`, which
+  would put the project there first. What a `python` command
   line runs is decided by `shell.python_program`; the words of an `env -S "<command line>"` string are read as the command
   they start (`shell.read_env_option`: every spelling of the options that take a value, `-C`'s directory included), so no wrapper hides a command from any rule below.
 - **The evidence.** Writes into `<git-dir>/craftsman/` (the ledger, the gate state, the hook error log; `inbox/` and

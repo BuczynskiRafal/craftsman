@@ -68,8 +68,8 @@ python3 -m evals.run compare bench/evals/current.jsonl
 
 **What one run does.** It prepares the case in a fresh temp directory (`repo/`, the base committed and
 the change uncommitted, exactly as `prepare`), puts a `craftsman` wrapper script in front of `PATH`
-(`PYTHONPATH=<src> exec python3 -m craftsman.cli "$@"`, so the session runs the CLI of the checkout
-under test and not an installed one), starts `claude` in `repo/`, scores the ledger in
+(`exec python3 <src>/bin/craftsman-cli.py "$@"`, so the session runs the CLI of the checkout under test,
+not an installed one and not a `craftsman/` directory of the repository it reviews), starts `claude` in `repo/`, scores the ledger in
 `repo/.git/craftsman/ledger.json` and appends the record. The checkout under test is copied once per
 invocation, without `.git`, `evals/`, `docs/` and `tests/`: the arm cannot change while a long run is in
 progress, and the session cannot find `truth.json` next to the plugin. The record holds the source commit

@@ -53,6 +53,13 @@ craftsman install --agents-workspace ~/src/app    # AGENTS.md + .cursor/rules fo
 | `--all` | All platforms, without auto-detection. |
 | `--dry-run` | Prints the install or uninstall plan without modifying files. |
 
+The user-level hooks of `--copilot` and `--claude` run `"<python>" "<package>/craftsman-cli.py" hook <event> ...`: the
+interpreter that ran `craftsman install` and the bootstrap script inside the installed `craftsman` package, both by
+absolute path. The bootstrap puts the directory that holds the package first on `sys.path`, so the hook runs this
+Craftsman whatever the project it guards contains (`python -m craftsman.cli` would import a project's own `craftsman/`
+directory first). An install made before this form wrote `-m craftsman.cli`; `craftsman doctor` reports such hooks as
+outdated, and running `craftsman install` again replaces them.
+
 ---
 
 ## GitHub Copilot Discovery Locations
@@ -79,7 +86,7 @@ Claude Code supports installing Craftsman as a standalone plugin:
 /plugin install craftsman@craftsman
 ```
 
-The repository itself is the plugin: Claude Code loads the skills and the Python package straight from it, and the hooks start the CLI through `bin/launcher.sh`, which needs Python 3.10+ on `PATH`. To prevent duplicate hook executions (hooks firing twice), `craftsman install` skips an auto-detected Claude Code and refuses `--claude` while the Claude Code plugin is active (`--no-claude-hooks` installs the rest without the hooks); use `craftsman uninstall --claude` to clean up user-level hooks installed earlier.
+The repository itself is the plugin: Claude Code loads the skills and the Python package straight from it, and the hooks start the CLI through `bin/launcher.sh`, which runs the `bin/craftsman-cli.py` bootstrap with the first Python 3.10+ on `PATH`. To prevent duplicate hook executions (hooks firing twice), `craftsman install` skips an auto-detected Claude Code and refuses `--claude` while the Claude Code plugin is active (`--no-claude-hooks` installs the rest without the hooks); use `craftsman uninstall --claude` to clean up user-level hooks installed earlier.
 
 ## Antigravity Plugin
 

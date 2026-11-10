@@ -566,7 +566,11 @@ sys.exit(1 if mode == "budget" else 0)
 """
 
 FAKE_CLI = """import sys
-print("fake craftsman cli " + " ".join(sys.argv[1:]))
+
+
+def main():
+    print("fake craftsman cli " + " ".join(sys.argv[1:]))
+    return 0
 """
 
 
@@ -592,6 +596,8 @@ class AgentTestCase(unittest.TestCase):
         (root / "craftsman").mkdir()
         (root / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
         (root / "craftsman" / "cli.py").write_text(FAKE_CLI, encoding="utf-8")
+        (root / "bin").mkdir()
+        shutil.copy2(REPO_ROOT / "bin" / "craftsman-cli.py", root / "bin" / "craftsman-cli.py")
         (root / "evals" / "cases" / "x").mkdir(parents=True)
         (root / "evals" / "cases" / "x" / "truth.json").write_text("{}", encoding="utf-8")
         return root
@@ -724,8 +730,14 @@ class AgentRunTests(AgentTestCase):
         wrapper = run_agent.write_wrapper(self.tmp / "bin", self.src)
         self.assertEqual(
             wrapper.read_text(encoding="utf-8"),
-            f'#!/bin/sh\nPYTHONPATH={self.src} exec python3 -m craftsman.cli "$@"\n',
+            f'#!/bin/sh\nexec python3 {self.src}/bin/craftsman-cli.py "$@"\n',
         )
+        done = subprocess.run([str(wrapper), "status"], capture_output=True, text=True, check=True, cwd=self.tmp)
+        self.assertEqual(done.stdout.strip(), "fake craftsman cli status")
+        # The session's working directory is the repository under review: its own `craftsman/` does not run.
+        (self.tmp / "craftsman").mkdir()
+        (self.tmp / "craftsman" / "__init__.py").write_text("print('the project ran')\n", encoding="utf-8")
+        (self.tmp / "craftsman" / "cli.py").write_text("def main():\n    print('the project ran')\n", encoding="utf-8")
         done = subprocess.run([str(wrapper), "status"], capture_output=True, text=True, check=True, cwd=self.tmp)
         self.assertEqual(done.stdout.strip(), "fake craftsman cli status")
 
@@ -876,7 +888,7 @@ class AgentHelperTests(AgentTestCase):
         (self.src / ".git").mkdir()
         (self.src / "docs").mkdir()
         snapshot = run_agent.snapshot_source(self.src, self.tmp / "snap")
-        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), [".claude-plugin", "craftsman", "skills"])
+        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), [".claude-plugin", "bin", "craftsman", "skills"])
 
     @unittest.skipIf(shutil.which("git") is None, "git is required")
     def test_source_revision_marks_edits_of_plugin_files_only(self) -> None:

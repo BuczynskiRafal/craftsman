@@ -128,6 +128,23 @@ class PlatformReportTests(DoctorTestCase):
         hooks = report["copilot"]["user_hooks"]
         self.assertEqual((hooks["state"], hooks["missing"]), ("broken", ["/no/such/python3"]))
 
+    def test_hooks_that_start_the_module_are_outdated(self) -> None:
+        self.install_user_copilot()
+        hooks_dir = self.tmp / ".copilot" / "hooks"
+        # How Craftsman wrote the hooks before they ran the bootstrap: `-m` runs a project's own `craftsman/`.
+        write_copilot_hooks(
+            hooks_dir, f'"{sys.executable}" -m craftsman.cli', f'& "{sys.executable}" -m craftsman.cli'
+        )
+
+        code, report = self.doctor()
+
+        self.assertEqual(code, 1)
+        hooks = report["copilot"]["user_hooks"]
+        self.assertEqual((hooks["state"], hooks["missing"]), ("outdated", []))
+        (problem,) = report["problems"]
+        self.assertIn("`-m craftsman.cli`", problem)
+        self.assertTrue(problem.endswith("re-run `craftsman install --copilot`"), problem)
+
     def test_hooks_without_this_platforms_command_are_broken(self) -> None:
         self.install_user_copilot()
         hooks_file = self.tmp / ".copilot" / "hooks" / HOOKS_FILENAME
@@ -572,6 +589,25 @@ class HomeInspectionTests(IsolatedHomeTestCase):
         self.assertTrue(
             any("Duplicate Claude Code hooks: both user-level hooks" in p for p in problems)
         )
+
+    def test_claude_hooks_that_start_the_module_are_outdated_until_installed_again(self) -> None:
+        claude_dir = self.home / ".claude"
+        claude_dir.mkdir(parents=True)
+        settings = claude_dir / "settings.json"
+        merge_claude_hooks(settings, f'"{sys.executable}" -m craftsman.cli')
+
+        result = run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT))
+
+        self.assertEqual(result.code, 1)
+        report = json.loads(result.out)
+        self.assertEqual(report["claude"]["hooks"], "outdated")
+        (problem,) = report["problems"]
+        self.assertIn("`-m craftsman.cli`", problem)
+        self.assertTrue(problem.endswith("run craftsman install --claude"), problem)
+
+        merge_claude_hooks(settings, absolute_hook_prefixes()[0])
+        report = json.loads(run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT)).out)
+        self.assertEqual((report["claude"]["hooks"], report["problems"]), ("merged", []))
 
 
 if __name__ == "__main__":

@@ -30,4 +30,4 @@ if "%PYTHON_CMD%"=="" (
 )
 
 set "PYTHONPATH=%PLUGIN_ROOT%"
-%PYTHON_CMD% -m craftsman.cli %*
+%PYTHON_CMD% "%SCRIPT_DIR%craftsman-cli.py" %*

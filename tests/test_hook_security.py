@@ -83,6 +83,7 @@ class HookForgeryTests(PreToolCase):
         for command in (
             "craftsman hook stop --platform claude",
             "python -m craftsman.cli hook pre-tool --platform copilot",
+            '"/usr/bin/python3" "/usr/lib/python3/site-packages/craftsman/craftsman-cli.py" hook stop --platform claude',
             "env X=1 craftsman.exe hook prompt --platform claude",
             "python3 -m craftsman.hooks stop --platform claude",
             "python -c 'import craftsman.hooks'",
