@@ -27,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from craftsman import hook_errors
+
 from evals import run
 
 SCHEMA = 1
@@ -300,10 +302,21 @@ def run_env(bin_dir: Path | None) -> dict[str, str]:
 
 @dataclass
 class Stream:
-    """What a run's ``stream-json`` output says. Fed line by line."""
+    """What a run's ``stream-json`` output says. Fed line by line.
+
+    A session prints one ``result`` event per turn of its main loop, and a background subagent's report starts
+    a turn of its own, so a review prints many. ``result`` is the last one: its ``total_cost_usd``,
+    ``modelUsage``, ``duration_api_ms`` and ``subagent_stats`` are cumulative for the session. ``num_turns``,
+    ``duration_ms``, ``permission_denials`` and ``usage`` are of that one turn, so the first three are summed
+    over every result here (``turns``, ``turn_ms``, ``denials``).
+    """
 
     init: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    results: int = 0
+    turns: int = 0
+    turn_ms: int = 0
+    denials: int = 0
     tool_calls: Counter[str] = field(default_factory=Counter)
     hooks: dict[str, dict[str, int]] = field(default_factory=dict)
 
@@ -315,6 +328,11 @@ class Stream:
             self.init = event
         elif kind == "result":
             self.result = event
+            self.results += 1
+            self.turns += _whole(event.get("num_turns"))
+            self.turn_ms += _whole(event.get("duration_ms"))
+            denials = event.get("permission_denials")
+            self.denials += len(denials) if isinstance(denials, list) else 0
         elif kind == "assistant":
             content = event.get("message", {}).get("content")
             if isinstance(content, list):
@@ -326,6 +344,10 @@ class Stream:
             entry["runs"] += 1
             if event.get("outcome") != "success":
                 entry["failed"] += 1
+
+
+def _whole(value: Any) -> int:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
 
 
 def parse_output(text: str) -> Stream:
@@ -490,6 +512,57 @@ def _status(execution: Execution) -> str:
     return "ok"
 
 
+def hook_errors_of(craftsman_dir: Path) -> dict[str, Any]:
+    """What the Craftsman hooks logged as failing in `craftsman_dir` (`<git-dir>/craftsman` of the case checkout,
+    or a run's log folder holding a copy): how many entries, and the first one. A hook that crashes still answers,
+    so the stream shows it as a success: this log is the only place the crash is seen."""
+    entries = hook_errors.read(craftsman_dir)
+    found: dict[str, Any] = {"count": len(entries)}
+    if entries:
+        first = entries[0]
+        found["first"] = f"{first.source} {first.kind}: {first.message}"[:300]
+    return found
+
+
+def keep_hook_errors(workdir: Path, log_dir: Path, logs: dict[str, str]) -> None:
+    """Copy the hook error log of the case checkout (and its rotated part) next to the run's other logs."""
+    craftsman_dir = run.ledger_path(workdir).parent
+    for name in (hook_errors.ROTATED_NAME, hook_errors.LOG_NAME):
+        if (craftsman_dir / name).is_file():
+            shutil.copyfile(craftsman_dir / name, log_dir / name)
+            logs["hook_errors"] = str(log_dir / hook_errors.LOG_NAME)
+
+
+def refresh_from_logs(record: dict[str, Any]) -> list[str]:
+    """Read the session fields of an older record again from what it kept: ``turns``, ``duration_ms`` and
+    ``permission_denials`` from the stream (`Stream`), ``hook_errors`` from the kept copy of the hook error log or
+    the kept case checkout. Returns a description of each field that changed."""
+    logs = record.get("logs")
+    if not isinstance(logs, dict):
+        return []
+    changed: list[str] = []
+
+    def update(key: str, value: Any) -> None:
+        if record.get(key) != value:
+            changed.append(f"{key} {record.get(key)!r} -> {value!r}")
+            record[key] = value
+
+    stream_log = logs.get("stream")
+    if isinstance(stream_log, str) and Path(stream_log).is_file():
+        stream = parse_output(Path(stream_log).read_text(encoding="utf-8", errors="replace"))
+        if stream.results:
+            update("turns", stream.turns)
+            update("results", stream.results)
+            update("duration_ms", stream.turn_ms)
+            update("permission_denials", stream.denials)
+    kept, workdir = logs.get("hook_errors"), logs.get("workdir")
+    if isinstance(kept, str) and Path(kept).is_file():
+        update("hook_errors", hook_errors_of(Path(kept).parent))
+    elif isinstance(workdir, str) and run.ledger_path(Path(workdir)).parent.is_dir():
+        update("hook_errors", hook_errors_of(run.ledger_path(Path(workdir)).parent))
+    return changed
+
+
 def _slim_usage(usage: Any) -> dict[str, Any]:
     keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
     return {k: usage[k] for k in keys if isinstance(usage, dict) and k in usage}
@@ -504,8 +577,11 @@ def make_record(
     recall: dict[str, Any] | None,
     logs: dict[str, str],
     started_at: str,
+    errors: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    result = execution.stream.result or {}
+    """The result record of one run. `errors` is `hook_errors_of` the case checkout (None: not read)."""
+    stream = execution.stream
+    result = stream.result or {}
     init = execution.stream.init or {}
     hooks = execution.stream.hooks or {}
     warnings: list[str] = []
@@ -513,6 +589,8 @@ def make_record(
         warnings.append("no hook ran: the isolation evidence of the gate was not recorded")
     if recall is None:
         warnings.append("no findings: neither a ledger nor a findings file exists")
+    if errors and errors["count"]:
+        warnings.append(f"{errors['count']} hook errors; the first: {errors['first']}")
     tool_calls = execution.stream.tool_calls
     return {
         "schema": SCHEMA,
@@ -533,16 +611,18 @@ def make_record(
         "is_error": bool(result.get("is_error", False)),
         "recall": recall,
         "cost_usd": float(result.get("total_cost_usd") or 0.0),
-        "duration_ms": int(result.get("duration_ms") or 0),
+        "duration_ms": stream.turn_ms,
         "duration_api_ms": int(result.get("duration_api_ms") or 0),
         "wall_s": round(execution.wall_s, 2),
-        "turns": int(result.get("num_turns") or 0),
+        "turns": stream.turns,
+        "results": stream.results,
         "subagents": result.get("subagent_stats") or {},
         "usage": _slim_usage(result.get("usage")),
         "model_usage": result.get("modelUsage") or {},
         "tool_calls": dict(tool_calls) if tool_calls else {},
         "hooks": hooks,
-        "permission_denials": len(result.get("permission_denials") or []),
+        "permission_denials": stream.denials,
+        **({"hook_errors": errors} if errors is not None else {}),
         "init": {
             "problems": execution.init_problems,
             "plugins": [p.get("name") for p in init.get("plugins", []) if isinstance(p, dict)],
@@ -595,7 +675,9 @@ def run_one(cfg: AgentConfig, case: run.Case, index: int, plugin_dir: Path | Non
             logs["ledger"] = str(log_dir / "ledger.json")
         if cfg.keep_workdirs:
             logs["workdir"] = str(workdir)
-        return make_record(cfg, case, index, prompt, execution, recall, logs, started_at)
+        keep_hook_errors(workdir, log_dir, logs)
+        errors = hook_errors_of(run.ledger_path(workdir).parent)
+        return make_record(cfg, case, index, prompt, execution, recall, logs, started_at, errors)
     except Exception as exc:  # a broken run must not take the other runs down
         record = make_record(
             cfg, case, index, prompt, Execution(None, False, [], Stream(), 0.0), None, logs, started_at

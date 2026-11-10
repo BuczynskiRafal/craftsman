@@ -5,9 +5,11 @@ Usage:
 
 The truth and the matching rule change over time; the runs do not. A record whose ``logs.ledger``
 file still exists is scored again with the current truth and its ``recall`` field is rewritten in
-place. The original file is kept as ``<file>.bak`` (``.bak.1``, ... when that exists). Records
-without a readable ledger, of an unknown case, or of a baseline run (its findings file is not kept)
-stay as they are, with a warning.
+place. The session fields a record of an older harness read from the last turn only (``turns``,
+``duration_ms``, ``permission_denials``) are read again from its kept stream, and ``hook_errors`` from its
+kept copy of the hook error log or its kept case checkout (``agent.refresh_from_logs``). The original file
+is kept as ``<file>.bak`` (``.bak.1``, ... when that exists). Records without a readable ledger, of an
+unknown case, or of a baseline run (its findings file is not kept) keep their recall, with a warning.
 """
 
 from __future__ import annotations
@@ -93,25 +95,21 @@ def rescore_file(path: Path, cases_dir: Path, out: TextIO, err: TextIO) -> tuple
         if not isinstance(record, dict) or "arm" not in record or "case" not in record:
             raise run.EvalError(f"{path}:{number} is not a result record of 'evals.run agent'")
         before = record.get("recall")
+        refreshed = agent.refresh_from_logs(record)
         reason = rescore_record(record, cases_dir)
+        name = f"{path}:{number} {record['arm']} {record['case']}#{record.get('run', '?')}"
         if reason is not None:
-            skipped += 1
-            print(
-                f"warning: {path}:{number} {record['arm']} {record['case']}#{record.get('run', '?')} "
-                f"left as it is: {reason}",
-                file=err,
-            )
-            output.append(line)
-            continue
+            print(f"warning: {name} recall left as it is: {reason}", file=err)
+            if not refreshed:
+                skipped += 1
+                output.append(line)
+                continue
         rescored += 1
         output.append(json.dumps(record, sort_keys=True))
-        after = record["recall"]
+        after = record.get("recall")
         old = f"{before['found']}/{before['total']}" if isinstance(before, dict) else "none"
-        print(
-            f"{path}:{number} {record['arm']} {record['case']}#{record.get('run', '?')}: "
-            f"{old} -> {after['found']}/{after['total']}",
-            file=out,
-        )
+        new = f"{after['found']}/{after['total']}" if isinstance(after, dict) else "none"
+        print(f"{name}: {old} -> {new}" + "".join(f"; {change}" for change in refreshed), file=out)
     if rescored:
         backup = _backup_path(path)
         backup.write_text(original, encoding="utf-8")

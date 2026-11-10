@@ -116,12 +116,20 @@ or arms.
 **Result record** (one JSON object per line): `arm`, `case`, `run`, `status`
 (`ok`, `budget`, `timeout`, `max-turns`, `error`, `load-failed`, `no-result`, `harness-error`),
 `recall` (found, total, ids found and missed, decoy hits, unmatched findings, duplicates, ignored
-dismissed findings), `cost_usd`, `duration_ms` (Claude's own clock), `wall_s` (the harness's clock),
-`turns`, `subagents` (spawned, completed, failed), `model_usage` (tokens and cost per model, cumulative for the whole session, subagents included) and
-`usage` (tokens of the last turn of the main loop only),
-`tool_calls`, `hooks`, `permission_denials`, the `init` check, the prompt, the source commit and `logs`:
-the stream (`stream.jsonl`, without the token-level `stream_event` lines), `stderr.txt` and the ledger
-of the run. `status` other than `ok` makes the command exit 1. Runs with `load-failed`, `no-result`,
+dismissed findings), `cost_usd`, `duration_ms` (Claude's own clock: the time of every turn of the main
+loop, summed), `wall_s` (the harness's clock), `turns` (summed over every turn), `results` (how many turns:
+a session prints a `result` event per turn of its main loop, and each report of a background subagent
+starts one, so a review prints many), `subagents` (spawned, completed, failed), `model_usage` (tokens and
+cost per model, cumulative for the whole session, subagents included) and `usage` (tokens of the last turn
+of the main loop only), `tool_calls`, `hooks`, `permission_denials` (tool calls refused in the whole
+session, by the permission mode or by a hook), `hook_errors` (`count` of the entries in
+`<git-dir>/craftsman/hook-errors.log` of the case checkout, and the `first` one: a hook that crashed still
+answered, so `hooks` shows it as a success and only this log tells; `compare` shows the sum in its `note`
+column, e.g. `13 hook errors`), the `init` check, the prompt, the source commit and `logs`: the stream
+(`stream.jsonl`, without the token-level `stream_event` lines), `stderr.txt`, the ledger of the run and a
+copy of the hook error log (`hook_errors`, when there is one). Records written before the harness summed
+the turns or read the hook error log hold the last turn's figures and no `hook_errors`; `rescore` reads both
+again from the stream and the log copy (or the kept case checkout) they kept. `status` other than `ok` makes the command exit 1. Runs with `load-failed`, `no-result`,
 `error` or `harness-error` are left out of every mean in `compare` and counted in its `invalid` note; a
 `budget` or `timeout` run is kept with the findings it recorded before it stopped, because a protocol that
 runs out of money is a result.
@@ -150,8 +158,9 @@ again later to add repeats: the run numbers of an arm and case continue after th
 Scoring changes (a new matching rule, a corrected truth location) do not need new runs: `agent` keeps each
 run's ledger, and `python3 -m evals.run rescore bench/evals/ab.jsonl` scores those ledgers again with the
 current truth and rewrites the `recall` of every record in place. The original file is kept as `ab.jsonl.bak`
-(`.bak.1`, ... when that exists). Records without a kept ledger (baseline runs, runs without findings) stay
-as they are, with a warning.
+(`.bak.1`, ... when that exists). It also reads `turns`, `results`, `duration_ms`, `permission_denials` and
+`hook_errors` again from the logs a record kept (see the result record above). Records without a kept
+ledger (baseline runs, runs without findings) keep their recall, with a warning.
 
 `compare` prints, per arm and case: runs, recall (mean defects found / seeded), the fewest and most found
 in one run, decoys flagged, unmatched findings (possible false positives), mean cost in USD with the

@@ -137,6 +137,7 @@ class Group:
     bad: int = 0
     other: int = 0  # runs that ended early (timeout, budget) but are counted
     defect_hits: dict[str, int] = field(default_factory=dict)
+    hook_errors: int = 0  # entries of the hook error logs of the valid runs (records that read them)
 
     @property
     def runs(self) -> int:
@@ -152,6 +153,20 @@ class Group:
 
 def _count(value: Any) -> int:
     return len(value) if isinstance(value, list) else 0
+
+
+def hook_error_count(record: dict[str, Any]) -> int:
+    """The entries the run's hook error log held; 0 for a record written before the harness read the log."""
+    errors = record.get("hook_errors")
+    count = errors.get("count") if isinstance(errors, dict) else None
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
+
+def _hook_error_note(count: int) -> str:
+    """A crashed hook still answers (and is asked to confirm or refused), so the run can look clean without this."""
+    if not count:
+        return ""
+    return f"{count} hook error" + ("" if count == 1 else "s")
 
 
 def group_records(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Group]]:
@@ -176,6 +191,7 @@ def group_records(records: Iterable[dict[str, Any]]) -> dict[str, dict[str, Grou
         group.cost.append(float(record.get("cost_usd") or 0.0))
         group.minutes.append(float(record.get("wall_s") or 0.0) / 60)
         group.turns.append(int(record.get("turns") or 0))
+        group.hook_errors += hook_error_count(record)
         group.subagents.append(int((record.get("subagents") or {}).get("spawned", 0)))
         tokens = session_tokens(record)
         if tokens is not None:
@@ -254,6 +270,7 @@ def arm_rows(cases: dict[str, Group]) -> list[dict[str, str]]:
             f"{g.bad} invalid" if g.bad else "",
             f"{g.other} ended early" if g.other else "",
             f"{g.runs - len(g.tokens)} without tokens" if len(g.tokens) < g.runs else "",
+            _hook_error_note(g.hook_errors),
         )
         rows.append(
             {
@@ -294,7 +311,14 @@ def arm_rows(cases: dict[str, Group]) -> list[dict[str, str]]:
             "turns": f"{sum(mean(g.turns) for g in live):.0f}" if live else "-",
             "subagents": f"{sum(mean(g.subagents) for g in live):.1f}" if live else "-",
             **_token_cells(pass_tokens(live), cost_per_defect(live)),
-            "note": f"{sum(g.bad for g in cases.values())} invalid" if any(g.bad for g in cases.values()) else "",
+            "note": "; ".join(
+                note
+                for note in (
+                    f"{sum(g.bad for g in cases.values())} invalid" if any(g.bad for g in cases.values()) else "",
+                    _hook_error_note(sum(g.hook_errors for g in cases.values())),
+                )
+                if note
+            ),
         }
     )
     return rows
