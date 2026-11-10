@@ -128,16 +128,22 @@ def collect_context(
     ledger: Ledger,
     index: WorktreeIndex,
     full_hunks: Collection[str] = (),
+    view_hunks: Collection[str] | None = None,
 ) -> PacketContext:
     """Gather commits, conventions, scopes and references for the hunks under review.
 
     A carried hunk is a one-line stub, except those named in `full_hunks`: a slot can own carried hunks
-    (a sweep spans the whole round), and the view of such a slot must show their code.
+    (a sweep spans the whole round), and the view of such a slot must show their code. A view renders the
+    references of the hunks it shows (`view_hunks`) only, so only theirs are searched for.
     """
     shown_in_full = frozenset(full_hunks)
     carried = {hunk.id for hunk in round_.hunks if hunk.carried and hunk.id not in shown_in_full}
     open_hunks = [hunk for hunk in snap.hunks if hunk.id not in carried]
     open_symbols = {hunk.id: symbols.get(hunk.id, ()) for hunk in open_hunks}
+    viewed = None if view_hunks is None else frozenset(view_hunks)
+    rendered = {
+        hunk_id: items for hunk_id, items in open_symbols.items() if viewed is None or hunk_id in viewed
+    }
     return PacketContext(
         snap=snap,
         round=round_,
@@ -146,7 +152,7 @@ def collect_context(
         conventions=_conventions(root, snap.files),
         scopes={hunk.id: index.hunk_scope(hunk) for hunk in snap.hunks},
         symbols=open_symbols,
-        references=_references(index, open_hunks, open_symbols),
+        references=_references(index, open_hunks, open_symbols, wanted=rendered),
         signals_by_hunk=_signals_by_hunk(snap.hunks),
         carried_from={
             hunk_id: found
@@ -154,7 +160,7 @@ def collect_context(
             if hunk_id not in shown_in_full
         },
         reopened=reopened_mentions(round_, snap.hunks, symbols),
-        test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
+        test_files_by_symbol=_test_files_by_symbol(index, rendered),
         last_runs=_last_runs(ledger, snap),
         unscanned_files=files_without_signal_patterns(snap),
     )
@@ -189,9 +195,14 @@ def _conventions(root: Path, changed_files: Sequence[str]) -> tuple[str, ...]:
 
 
 def _references(
-    index: WorktreeIndex, hunks: Sequence[Hunk], symbols: Mapping[str, tuple[str, ...]]
+    index: WorktreeIndex,
+    hunks: Sequence[Hunk],
+    symbols: Mapping[str, tuple[str, ...]],
+    *,
+    wanted: Mapping[str, tuple[str, ...]],
 ) -> dict[str, tuple[Reference, ...]]:
-    """Ranked references to each symbol, excluding the changed lines of the hunks that define it.
+    """Ranked references to the symbols of the `wanted` hunks, excluding the changed lines of every
+    hunk in `hunks` that defines the symbol.
 
     Real call sites come first, then test uses, imports and prose. The list is cut only after
     ranking, and the render shows fewer than are kept so it can say how many more there are.
@@ -200,8 +211,11 @@ def _references(
     for hunk in hunks:
         for symbol in symbols.get(hunk.id, ()):
             owners.setdefault(symbol, []).append(hunk)
+    searched = {symbol for items in wanted.values() for symbol in items}
     references: dict[str, tuple[Reference, ...]] = {}
     for symbol, defining in owners.items():
+        if symbol not in searched:
+            continue
         defined_in = {hunk.path for hunk in defining}
         outside = [
             ref for ref in index.mentions(symbol) if not any(inside_hunk(ref, hunk) for hunk in defining)

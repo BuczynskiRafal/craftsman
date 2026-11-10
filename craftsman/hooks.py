@@ -55,7 +55,7 @@ from craftsman.diffscan import (
     DiffScanError,
     resolve_base_sha,
     snapshot,
-    worktree_root,
+    worktree_paths,
 )
 from craftsman.evidence import archive_ledger
 from craftsman.gate import (
@@ -274,17 +274,18 @@ class Reply:
 
 @dataclass(frozen=True)
 class Session:
-    """The work tree a hook runs in."""
+    """The work tree a hook runs in, and its git directory when known (None: git is asked for it)."""
 
     root: Path
+    git_dir: Path | None = None
 
     @property
     def state_path(self) -> Path:
-        return state_path_for(self.root)
+        return state_path_for(self.root, git_directory=self.git_dir)
 
     @property
     def ledger_path(self) -> Path:
-        return ledger_path_for(self.root)
+        return ledger_path_for(self.root, git_directory=self.git_dir)
 
     @property
     def craftsman_dir(self) -> Path:
@@ -295,9 +296,10 @@ class Session:
 def open_session(cwd: str) -> Session | None:
     """The session for the work tree containing `cwd`, or None outside a git work tree."""
     try:
-        return Session(worktree_root(cwd))
+        root, git_dir = worktree_paths(cwd)
     except DiffScanError:
         return None
+    return Session(root, git_dir)
 
 
 def claim(state: GateState | None, caller: GateOwner) -> GateState | None:

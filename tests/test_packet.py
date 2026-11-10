@@ -247,6 +247,60 @@ class CollectContextTests(unittest.TestCase):
             ),
         )
 
+    def two_definitions_of_compute_total(self) -> str:
+        """H1 and H2 both change `compute_total` (H2's changed line calls it), H3 changes `scale`."""
+        self.repo.write("a.py", "def compute_total(items):\n    return sum(items)\n")
+        self.repo.write("b.py", "def compute_total(items):\n    return len(items)\n")
+        self.repo.write("c.py", "def scale(value):\n    return value\n")
+        uses = ("from a import compute_total", "from c import scale", "scale(compute_total([1]))")
+        self.repo.write("use.py", "\n".join(uses) + "\n")
+        self.repo.write("tests/test_use.py", "from c import scale\n")
+        base = self.repo.commit()
+        self.repo.write("a.py", "def compute_total(items):\n    return sum(items) * 2\n")
+        self.repo.write("b.py", "def compute_total(items):\n    return len(items) or compute_total(0)\n")
+        self.repo.write("c.py", "def scale(value):\n    return value * 2\n")
+        return base
+
+    def view_context(self, base: str, assigned: tuple[str, ...], *, view: bool) -> PacketContext:
+        snap = snapshot(self.repo.root, base)
+        index = WorktreeIndex(self.repo.root)
+        symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
+        return collect_context(
+            self.repo.root,
+            snap,
+            round_for(snap),
+            "task",
+            symbols=symbols,
+            ledger=Ledger(),
+            index=index,
+            full_hunks=assigned,
+            view_hunks=assigned if view else None,
+        )
+
+    def test_a_view_searches_only_the_symbols_of_the_hunks_it_shows(self) -> None:
+        base = self.two_definitions_of_compute_total()
+
+        search = WorktreeIndex.mentions
+        with mock.patch.object(WorktreeIndex, "mentions", autospec=True, side_effect=search) as spy:
+            ctx = self.view_context(base, ("H1",), view=True)
+
+        self.assertEqual({call.args[1] for call in spy.call_args_list}, {"compute_total"})
+        self.assertEqual(set(ctx.references), {"compute_total"})
+        self.assertEqual(set(ctx.symbols), {"H1", "H2", "H3"})
+
+    def test_a_view_renders_as_if_every_reference_had_been_collected(self) -> None:
+        base = self.two_definitions_of_compute_total()
+
+        def view_of(assigned: tuple[str, ...], *, view: bool) -> str:
+            ctx = self.view_context(base, assigned, view=view)
+            return render_packet_view(ctx, assigned_hunks=assigned)
+
+        for assigned in (("H1",), ("H2",), ("H3",), ("H1", "H3"), ("H1", "H2", "H3")):
+            with self.subTest(assigned=assigned):
+                self.assertEqual(view_of(assigned, view=True), view_of(assigned, view=False))
+        # H2 defines `compute_total` too, so its lines are no references to it, even in a view of H1.
+        self.assertNotIn("b.py:", view_of(("H1",), view=True))
+
     def test_long_function_is_shown_around_a_hunk_in_its_middle(self) -> None:
         body = "".join(f"    line_{index} = {index}\n" for index in range(2, 301))
         self.repo.write("big.py", "def big(x):\n" + body)

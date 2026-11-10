@@ -9,9 +9,9 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from craftsman.diffscan import DiffSnapshot, resolve_base_sha, snapshot, worktree_root
+from craftsman.diffscan import DiffSnapshot, base_revision, snapshot_at, worktree_paths
 from craftsman.files import write_text_atomic
-from craftsman.gate import GateOwner, GateState, cli_caller, load_state, state_path_for
+from craftsman.gate import STATE_FILENAME, GateOwner, GateState, cli_caller, load_state, state_path_for
 from craftsman.ledger import ledger_path_for, load, stable_hunk_ids
 from craftsman.records import IsolationEvidence, Ledger, format_timestamp, parse_timestamp
 
@@ -232,6 +232,11 @@ class Workspace:
     ledger_path: Path
 
     @property
+    def state_path(self) -> Path:
+        """The gate state file, next to the ledger."""
+        return self.ledger_path.parent / STATE_FILENAME
+
+    @property
     def task(self) -> str:
         return self.state.task if self.state is not None else ""
 
@@ -268,13 +273,13 @@ class Workspace:
         """`explicit`, else the latest round's base, else the active task's base, else HEAD."""
         ledger_base = ledger.rounds[-1].base_sha if ledger.rounds else None
         task_base = self.state.base_sha if self.state is not None else None
-        return resolve_base_sha(self.root, explicit or ledger_base or task_base)
+        return base_revision(self.root, explicit or ledger_base or task_base or "HEAD")
 
     def snapshot(self, ledger: Ledger | None = None) -> DiffSnapshot:
         """The diff since the base the review (or else the active task) is measured against."""
         current = load(self.ledger_path) if ledger is None else ledger
         scope = None if self.state is not None else current.current_scope
-        return stable_hunk_ids(current, snapshot(self.root, self.base_sha(current), scope))
+        return stable_hunk_ids(current, snapshot_at(self.root, self.base_sha(current), scope))
 
 
 def open_workspace(cwd: str | None) -> Workspace:
@@ -282,10 +287,11 @@ def open_workspace(cwd: str | None) -> Workspace:
 
     Raises `GateStateError` when the gate state file is invalid.
     """
-    root = worktree_root(cwd or os.getcwd())
-    state = load_state(state_path_for(root))
+    root, git_directory = worktree_paths(cwd or os.getcwd())
+    state = load_state(state_path_for(root, git_directory=git_directory))
     active = state if state is not None and state.active else None
-    return Workspace(root=root, state=active, ledger_path=ledger_path_for(root))
+    ledger_path = ledger_path_for(root, git_directory=git_directory)
+    return Workspace(root=root, state=active, ledger_path=ledger_path)
 
 
 def review_enforcement(

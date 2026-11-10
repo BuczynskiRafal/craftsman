@@ -14,6 +14,7 @@ from craftsman import diffscan
 from craftsman.diffscan import (
     DiffScanError,
     Hunk,
+    base_revision,
     detect_deep_hint_signals,
     detect_signals,
     files_without_signal_patterns,
@@ -21,6 +22,9 @@ from craftsman.diffscan import (
     hunks_docs_only,
     resolve_base_sha,
     snapshot,
+    snapshot_at,
+    worktree_paths,
+    worktree_root,
 )
 from craftsman.diffscan_paths import is_agent_prompt_path
 from craftsman.worktree_index import REFERENCES_PER_FILE, WorktreeIndex
@@ -1295,6 +1299,128 @@ class DeepHintSignalTests(unittest.TestCase):
         for path in ("tests/test_auth.py", "test_x.py", "config.yaml", "settings.json", "README.md"):
             with self.subTest(path=path):
                 self.assertEqual(self.fired(path, "verify_token(t)", "os.system(cmd)"), {})
+
+
+class WorktreePathsTests(unittest.TestCase):
+    """`worktree_paths` answers what `worktree_root` and `git_dir` answer, with one git call."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+        self.repo = self.new_repo("repo")
+        self.repo.write("app.py", "x = 1\n")
+        self.repo.commit()
+
+    def new_repo(self, name: str) -> GitRepo:
+        (self.tmp / name).mkdir()
+        return GitRepo(self.tmp / name)
+
+    def assert_found_like_the_separate_calls(self, cwd: Path, *, calls: int = 1) -> None:
+        expected = (worktree_root(cwd), git_dir(cwd))
+        with mock.patch.object(diffscan, "git_text", wraps=diffscan.git_text) as spy:
+            self.assertEqual(worktree_paths(cwd), expected)
+        self.assertEqual(spy.call_count, calls)
+
+    def assert_refused_like_worktree_root(self, cwd: Path) -> None:
+        with self.assertRaises(DiffScanError) as separate:
+            worktree_root(cwd)
+        with self.assertRaises(DiffScanError) as combined:
+            worktree_paths(cwd)
+        self.assertIs(type(combined.exception), type(separate.exception))
+        self.assertEqual(str(combined.exception), str(separate.exception))
+
+    def test_a_subdirectory_finds_the_root_and_the_git_dir(self) -> None:
+        (self.repo.root / "pkg").mkdir()
+
+        found = worktree_paths(self.repo.root / "pkg")
+
+        self.assertEqual(found, (self.repo.root, self.repo.root / ".git"))
+        self.assert_found_like_the_separate_calls(self.repo.root / "pkg")
+
+    def test_a_linked_worktree_has_its_own_git_dir(self) -> None:
+        linked = self.tmp / "linked"
+        self.repo.git("worktree", "add", "-q", str(linked), "-b", "side")
+
+        root, found = worktree_paths(linked)
+
+        self.assertEqual(found.parent.name, "worktrees")
+        self.assertNotEqual(root, self.repo.root)
+        self.assert_found_like_the_separate_calls(linked)
+
+    def test_a_submodule_is_its_own_work_tree(self) -> None:
+        library = self.new_repo("library")
+        library.write("lib.py", "y = 1\n")
+        library.commit()
+        allow_local = ("-c", "protocol.file.allow=always")  # git refuses local submodules by default
+        self.repo.git(*allow_local, "submodule", "add", "-q", str(library.root), "lib")
+
+        root, found = worktree_paths(self.repo.root / "lib")
+
+        self.assertEqual(root, self.repo.root / "lib")
+        self.assertEqual(found, self.repo.root / ".git" / "modules" / "lib")
+        self.assert_found_like_the_separate_calls(self.repo.root / "lib")
+
+    def test_git_dir_and_work_tree_from_the_environment_are_followed(self) -> None:
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        cases = (
+            {"GIT_DIR": str(self.repo.root / ".git"), "GIT_WORK_TREE": str(self.repo.root)},
+            {"GIT_DIR": str(self.repo.root / ".git")},  # the work tree is then the current directory
+        )
+        for variables in cases:
+            with self.subTest(variables=sorted(variables)), mock.patch.dict(os.environ, variables):
+                self.assertEqual(worktree_paths(elsewhere)[1], self.repo.root / ".git")
+                self.assert_found_like_the_separate_calls(elsewhere)
+
+    def test_places_without_a_work_tree_are_refused_like_worktree_root(self) -> None:
+        bare = self.tmp / "bare.git"
+        self.repo.git("init", "-q", "--bare", str(bare))
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        for place in (bare, self.repo.root / ".git", outside, self.repo.root / "missing"):
+            with self.subTest(place=place.name):
+                self.assert_refused_like_worktree_root(place)
+
+    @unittest.skipIf(os.name == "nt", "Windows file names cannot hold a line break")
+    def test_a_line_break_in_the_path_is_resolved_by_asking_for_each_path_alone(self) -> None:
+        odd = self.new_repo("two\nlines")
+
+        self.assertEqual(worktree_paths(odd.root), (odd.root, odd.root / ".git"))
+        self.assert_found_like_the_separate_calls(odd.root, calls=3)
+
+    def test_a_spent_budget_runs_no_git(self) -> None:
+        with (
+            diffscan.git_budget(0.0),
+            mock.patch("craftsman.diffscan.subprocess.run", side_effect=AssertionError("git was run")),
+            self.assertRaises(diffscan.GitTimeoutError),
+        ):
+            worktree_paths(self.repo.root)
+
+
+class KnownBaseTests(RepoTestCase):
+    def test_a_snapshot_at_a_resolved_base_is_the_snapshot(self) -> None:
+        self.repo.write("app.py", "x = 1\n")
+        self.repo.commit()
+        self.repo.write("app.py", "x = 2\n")
+        self.repo.write("new.py", "y = 1\n")
+
+        base = base_revision(self.repo.root, "HEAD")
+
+        self.assertEqual(base, resolve_base_sha(self.repo.root, None))
+        self.assertEqual(snapshot_at(self.repo.root, base), snapshot(self.repo.root, "HEAD"))
+        only = ["new.py"]
+        self.assertEqual(snapshot_at(self.repo.root, base, only), snapshot(self.repo.root, "HEAD", only))
+
+    def test_before_the_first_commit_the_base_is_the_empty_tree(self) -> None:
+        self.repo.write("app.py", "x = 1\n")
+
+        base = base_revision(self.repo.root, "HEAD")
+
+        self.assertEqual(base, resolve_base_sha(self.repo.root, None))
+        self.assertEqual(snapshot_at(self.repo.root, base), snapshot(self.repo.root, "HEAD"))
+        with self.assertRaisesRegex(DiffScanError, "does not name a commit"):
+            base_revision(self.repo.root, "main")
 
 
 class GitBudgetTests(RepoTestCase):

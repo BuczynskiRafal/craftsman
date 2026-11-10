@@ -11,7 +11,7 @@ from pathlib import Path
 from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
-    snapshot,
+    snapshot_at,
     staged_paths,
     untracked_paths,
 )
@@ -94,10 +94,10 @@ def prepare_scope_and_snapshot(
             queries = _parse_path_queries(ws.root, cwd_of(args), args.add_paths, field="add_paths")
             added = _match_path_queries(queries, full_snap, base_sha, field="add_paths")
             expanded = tuple(sorted(set(current_scope) | set(added)))
-            return expanded, snapshot(ws.root, base_sha, expanded), True
+            return expanded, snapshot_at(ws.root, base_sha, expanded), True
         if used:
             _require_matching_fixed_scope(ws, args, base_sha, full_snap, current_scope)
-        snap = full_snap if current_scope is None else snapshot(ws.root, base_sha, current_scope)
+        snap = full_snap if current_scope is None else snapshot_at(ws.root, base_sha, current_scope)
         return current_scope, snap, False
     if args.add_paths is not None:
         raise LedgerError(
@@ -107,9 +107,9 @@ def prepare_scope_and_snapshot(
         if full_snap.is_empty:
             return None, full_snap, False
         scope = _scope_from_hunks(full_snap.hunks)
-        return scope, snapshot(ws.root, base_sha, scope), False
+        return scope, snapshot_at(ws.root, base_sha, scope), False
     scope = _resolve_flag_scope(ws, args, base_sha, full_snap)
-    return (scope or None), snapshot(ws.root, base_sha, scope), False
+    return (scope or None), snapshot_at(ws.root, base_sha, scope), False
 
 
 def _require_matching_fixed_scope(

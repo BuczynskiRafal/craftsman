@@ -74,8 +74,14 @@ def _now() -> str:
 # --- persistence ----------------------------------------------------------------------------
 
 
-def ledger_path_for(cwd: str | Path) -> Path:
-    """Path of the per-worktree ledger, next to the craftsman state file."""
+def ledger_path_for(cwd: str | Path, *, git_directory: Path | None = None) -> Path:
+    """Path of the per-worktree ledger, next to the craftsman state file.
+
+    A caller that has the git directory of the work tree (`worktree_paths`) passes it as `git_directory`:
+    git is not asked again.
+    """
+    if git_directory is not None:
+        return git_directory / "craftsman" / LEDGER_FILENAME
     try:
         return git_dir(cwd) / "craftsman" / LEDGER_FILENAME
     except DiffScanError as exc:
