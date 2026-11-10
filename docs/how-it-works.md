@@ -148,6 +148,13 @@ A review costs agents times turns times context, so the inputs are kept small.
   finished hunter's findings while other hunters still run, then the slots of a wave as soon as a
   finding is judged. Slots that are running are waited for, never launched twice. Where parallel
   subagents are a barrier (Copilot), the waves stay as they are.
+- **Launch stagger.** On Claude Code a subagent's request reads the prompt cache only once the
+  response that wrote it has begun, so hunters launched together would each write their whole
+  starting context (6,917 tokens per reviewer, measured on Claude Code 2.1.322 with Sonnet, where one
+  started later read 6,920 and wrote none). The `SubagentStart` hook therefore holds every hunter or
+  verifier that starts within 5 seconds of an earlier one of the same role until that earlier start is
+  5 seconds old: one cache write and reads for the rest, instead of a write each. Nothing the agents
+  read or do changes.
 - **Remaining work.** `craftsman review show --hunks` lists the hunks still to cover.
   `review show` also prints each finding's scenario and verdict evidence, so a verifier needs no
   `--json` call.

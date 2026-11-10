@@ -336,14 +336,27 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
         return reply.allow()
     from craftsman.trigger import detect_trigger
 
+    if event == "subagent-start":
+        from craftsman.launch_stagger import forget
+
+        # Only a start this run records is held back: a run that failed after noting a wait (and so
+        # answered at once) leaves it noted, and a later run in this process must not wait for it. Only
+        # this event notes a wait, so the other events do not load the stagger.
+        forget()
     if not session.state_path.exists() and not (
         event == "prompt" and detect_trigger(hook.prompt) is not None
     ):
         # No gate and none to open: nothing to lock.
-        return serve(event, session, None, hook, reply, caller)[1]
-    return update_state(
-        session.state_path, lambda state: serve(event, session, state, hook, reply, caller)
-    )
+        out = serve(event, session, None, hook, reply, caller)[1]
+    else:
+        out = update_state(
+            session.state_path, lambda state: serve(event, session, state, hook, reply, caller)
+        )
+    if event == "subagent-start":
+        from craftsman.launch_stagger import release
+
+        release()  # a held-back subagent start waits here, outside the gate state and ledger locks
+    return out
 
 
 def _now() -> datetime:
@@ -643,7 +656,11 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
     role = agent_role(hook.agent)
     if not active and (role is None or not _has_current_round(session)):
         return reply.allow()
-    ledger, _ = record_agent_event(session, hook, "start", reply.platform)
+    ledger, start = record_agent_event(session, hook, "start", reply.platform)
+    if role is not None:
+        from craftsman.launch_stagger import hold_back
+
+        hold_back(ledger.agents, start)  # `handle` waits it out
     if role is None or not ledger.rounds:
         return reply.allow()
     return reply.inject(briefing(role, ledger))
