@@ -10,10 +10,22 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from craftsman.assets import load_agent_templates, parse_frontmatter, read_skill, render_combined_rules
+from craftsman.assets import (
+    iter_skills,
+    load_agent_templates,
+    parse_frontmatter,
+    read_skill,
+    render_combined_rules,
+)
 from craftsman.generated import ExportError
 from craftsman.paths import default_vscode_user_dir, env_var_for_home, resolve_craftsman_pkg_dir
 from craftsman.platforms.copilot import render_copilot_agent
+
+from tests.support import REPO_ROOT
+
+MAX_SKILL_DESCRIPTION = 200
+MAX_SKILL_DESCRIPTIONS_TOTAL = 2100
+MAX_AGENT_DESCRIPTION = 160
 
 
 class AssetsTestCase(unittest.TestCase):
@@ -173,6 +185,22 @@ class LocationTests(AssetsTestCase):
     def test_assets_without_a_package_are_an_error(self) -> None:
         with self.assertRaisesRegex(ExportError, "no craftsman package next to the assets"):
             resolve_craftsman_pkg_dir(self.tmp)
+
+
+class ListingSizeTests(unittest.TestCase):
+    """Every session carries these descriptions, so they must stay short."""
+
+    def test_skill_descriptions_stay_short(self) -> None:
+        skills = iter_skills(REPO_ROOT)
+        for skill in skills:
+            with self.subTest(skill=skill.name):
+                self.assertLessEqual(len(skill.description), MAX_SKILL_DESCRIPTION)
+        self.assertLessEqual(sum(len(skill.description) for skill in skills), MAX_SKILL_DESCRIPTIONS_TOTAL)
+
+    def test_agent_descriptions_stay_short(self) -> None:
+        for template in load_agent_templates(REPO_ROOT):
+            with self.subTest(agent=template.name):
+                self.assertLessEqual(len(template.description), MAX_AGENT_DESCRIPTION)
 
 
 if __name__ == "__main__":

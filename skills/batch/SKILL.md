@@ -1,11 +1,8 @@
 ---
 name: batch
 description: >-
-  Carry out one mechanical or structural change across many files (API
-  migrations, signature changes, typing or error-handling sweeps) by splitting
-  it into disjoint work units executed in parallel, each with its own check,
-  followed by a whole-repository verification. Use when /batch is invoked or as
-  the mass-change track of /craftsman.
+  Carry out one mechanical change across many files in disjoint, verified work
+  units. Use for /batch or as the mass-change track of /craftsman.
 ---
 
 # Batch change (`/batch <the change to apply everywhere>`)

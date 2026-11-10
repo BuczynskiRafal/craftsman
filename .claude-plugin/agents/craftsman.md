@@ -1,6 +1,6 @@
 ---
 name: craftsman
-description: 'Engineering agent that implements a task freely and then drives the final diff through the Craftsman review: parallel fresh-context hunters, independent verifiers, repeated waves while they keep finding defects, fixes and test runs, until `craftsman review check` passes.'
+description: 'Engineering agent that implements a task and drives the final diff through the Craftsman review until `craftsman review check` passes.'
 ---
 
 <!-- craftsman:generated -->

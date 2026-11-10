@@ -1,6 +1,6 @@
 ---
 name: craftsman-verifier
-description: 'Independent verifier for the Craftsman quality gate. Takes recorded review findings, merges duplicates, tries to disprove each one, reproduces the survivors, and records a verdict (proven, probable, question, dismissed) with checkable evidence. Never edits source code.'
+description: 'Independent verifier for the Craftsman gate: tries to disprove recorded findings, reproduces the survivors and records verdicts with evidence. Never edits code.'
 tools: Read, Grep, Glob, Bash
 ---
 

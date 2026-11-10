@@ -1,10 +1,8 @@
 ---
 name: audit
 description: >-
-  Focused deep audits of a diff, module or directory, one concern at a time:
-  errors, tests, types, comments, security. Each audit is an in-depth run of
-  the matching review lens with its own inventory table. Use when /audit
-  [aspects] [target] is invoked.
+  Focused deep audit of a diff, module or directory, one concern at a time:
+  errors, tests, types, comments, security. Use for /audit [aspects] [target].
 ---
 
 # Audit (`/audit [errors,tests,types,comments,security | all] [target] [--fix]`)

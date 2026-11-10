@@ -1,10 +1,8 @@
 ---
 name: audit-errors
 description: >-
-  Exhaustive error-handling audit: inventories every place where failure can
-  happen or is handled, traces where each error ends up, and flags hidden
-  failures, over-broad handlers, misleading fallbacks, partial side effects and
-  unhelpful messages. Use when /audit-errors is invoked or via /audit errors.
+  Audit error handling: where failures happen, where each error ends up and
+  what stays hidden. Use for /audit-errors or /audit errors.
 ---
 
 # Error-handling audit (`/audit-errors [target]`)

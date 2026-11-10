@@ -1,11 +1,8 @@
 ---
 name: audit-security
 description: >-
-  Security audit of a diff or module by following untrusted data from where it
-  enters to where it is used: inventories sources and sinks, traces each path,
-  checks the guards on it, rates who can exploit it and what they gain, and
-  proposes the minimal fix. Use when /audit-security is invoked or via /audit
-  security.
+  Security audit that follows untrusted data from where it enters to where it
+  is used. Use for /audit-security or /audit security.
 ---
 
 # Security audit (`/audit-security [changes | module | path] [--fix]`)

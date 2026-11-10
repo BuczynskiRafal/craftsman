@@ -1,12 +1,9 @@
 ---
 name: craft-review
 description: >-
-  Bug-hunting review of a local diff, branch or pull request. Freezes the diff,
-  plans the hunt from it, sends fresh-context hunters over every slot, has
-  verifiers try to disprove every finding, hunts again while waves prove
-  defects, and records the outcome in the Craftsman ledger. Use when
-  /craft-review is invoked, when the user asks Craftsman to review a diff,
-  branch or pull request, and as the final review of /craftsman.
+  Bug-hunting review of a diff, branch or pull request by fresh-context
+  hunters and verifiers, recorded in the ledger. Use when the user asks
+  Craftsman to review, and as the final review of /craftsman.
 ---
 
 # Craft Review (`/craft-review`)
