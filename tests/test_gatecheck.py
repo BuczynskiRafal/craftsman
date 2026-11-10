@@ -2227,7 +2227,7 @@ class VerificationTests(unittest.TestCase):
 
         self.assertEqual((issue.code, issue.missing), ("no-verdict", 3))
         self.assertIn("3 findings without a verdict: F1, F2, F3.", issue.message)
-        self.assertIn("one per cluster: [F1,F2] [F3].", issue.message)
+        self.assertIn("one per cluster: [F1,F2]; [F3].", issue.message)
         self.assertIn("Run craftsman review brief --verifier <IDS> and follow it exactly.", issue.message)
         self.assertIn("A verdict you record yourself does not count.", issue.message)
 
@@ -2273,7 +2273,7 @@ class VerificationTests(unittest.TestCase):
         issue = next(i for i in check(ledger, snap=hunt_snap(19)).issues if i.code == "no-verdict")
 
         self.assertIn("19 findings without a verdict: F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12 (+7 more).", issue.message)
-        self.assertIn("[F7] [Claude Code: model haiku] [F8] [Claude Code: model haiku] (+11 more clusters).", issue.message)
+        self.assertIn("[F7] [Claude Code: model haiku]; [F8] [Claude Code: model haiku] (+11 more clusters).", issue.message)
         self.assertNotIn("F13", issue.message)
         self.assertLessEqual(len(issue.message), MAX_HUNT_ISSUE_CHARS)
 
@@ -2419,7 +2419,7 @@ class VerificationTests(unittest.TestCase):
 
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
-        self.assertIn("Launch verifiers, one per cluster: [F1] [F2].", issue.message)
+        self.assertIn("Launch verifiers, one per cluster: [F1]; [F2].", issue.message)
         self.assertNotIn("Verifiers running", issue.message)
 
     def test_clusters_of_minor_and_nit_findings_carry_the_cheaper_model_note(self) -> None:
@@ -2428,7 +2428,7 @@ class VerificationTests(unittest.TestCase):
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
         self.assertIn(
-            "one per cluster: [F1,F2] [Claude Code: model haiku] [F3] [Claude Code: model haiku].", issue.message
+            "one per cluster: [F1,F2] [Claude Code: model haiku]; [F3] [Claude Code: model haiku].", issue.message
         )
 
     def test_a_cluster_with_a_blocker_or_major_finding_runs_on_the_full_model(self) -> None:
@@ -2441,7 +2441,20 @@ class VerificationTests(unittest.TestCase):
 
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
-        self.assertIn("one per cluster: [F1,F2] [F3] [Claude Code: model haiku] [F4].", issue.message)
+        self.assertIn("one per cluster: [F1,F2]; [F3] [Claude Code: model haiku]; [F4].", issue.message)
+
+    def test_the_note_cannot_be_read_as_marking_the_cluster_after_it(self) -> None:
+        # The shape of an end-to-end run: a minor finding alone, then nits clustered with a major one. With spaces
+        # alone the text read `[F1] [Claude Code: model haiku] [F2,F3,F4]`, and the major cluster ran on haiku.
+        ledger = self.base(
+            ("minor", "store.py", "ripple"), ("nit", "test_store.py", "design"), ("nit", "test_store.py", "design"),
+            ("major", "test_store.py", "tests"),
+        )
+
+        (issue,) = check(ledger, snap=hunt_snap(1)).issues
+
+        self.assertIn("one per cluster: [F1] [Claude Code: model haiku]; [F2,F3,F4].", issue.message)
+        self.assertNotIn(f"{CHEAPER_MODEL_NOTE} [", issue.message)
 
     def test_unverified_minor_findings_are_marked_but_second_opinions_never_are(self) -> None:
         ledger = self.base(("minor", "f1.py", "intent"), ("major", "f2.py", "intent"))

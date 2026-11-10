@@ -999,7 +999,9 @@ def _verifier_text(ledger: Ledger, findings: Sequence[Finding], running: int) ->
             "end your turn and wait for their reports."
         )
     severity = {finding.id: finding.severity for finding in findings}
-    shown = " ".join(
+    # `; ` between clusters binds the note to the cluster before it: with spaces alone, `[F3] [note] [F4]` reads
+    # as well as a note on F4, and a cluster after a marked one may hold a major finding.
+    shown = "; ".join(
         f"[{','.join(cluster)}]"
         + (f" {CHEAPER_MODEL_NOTE}" if all(severity[id_] in _CHEAPER_MODEL_SEVERITIES for id_ in cluster) else "")
         for cluster in clusters[:MAX_LISTED_CLUSTERS]
