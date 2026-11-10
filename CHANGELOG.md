@@ -6,6 +6,98 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- **Every hook runs Craftsman's own code.** A hook runs with the guarded project as its working directory, and
+  `python -m craftsman.cli` put that directory first on `sys.path`, so a project's own `craftsman/` directory or
+  `json.py`, which the agent can write like any other file, could stand in for the gate. No entry point starts
+  Craftsman with `-m` any more; each runs a bootstrap script that puts Craftsman's own directory first:
+  - the Claude Code plugin: `bin/launcher.sh` and `bin/launcher.cmd` run the new `bin/craftsman-cli.py`.
+    `launcher.sh` takes a path with a drive letter or a UNC path (Git Bash on Windows) as absolute, and still starts
+    one interpreter, as a child that it stops when the platform stops a hook that ran too long (SIGTERM, SIGINT or
+    SIGHUP), so no hook outlives its time;
+  - the user-level hooks of `craftsman install --claude` and `--copilot`: `"<python>" "<package>/craftsman-cli.py"`, a
+    bootstrap inside the installed package, for a virtual environment, `pip install --user`, an editable install and a
+    source checkout alike (they wrote `"<python>" -m craftsman.cli` before);
+  - the checkout's `scripts/craftsman-cli.py` and the Antigravity hook scripts put their root first even when it is
+    on `PYTHONPATH` already (an empty `PYTHONPATH` entry put the working directory ahead of it);
+  - `install.sh` and the evals' `craftsman` wrapper run a bootstrap too.
+
+  The bootstraps are named `craftsman-cli.py`, so the command policy denies running them as a forged hook like any
+  other spelling of `craftsman hook`. **If you installed user-level hooks with `craftsman install --claude` or
+  `--copilot`, run `craftsman install` again**: it replaces the old hook commands, and `craftsman doctor` reports
+  hooks still in the old form as outdated. The Claude Code plugin needs no action.
+- **An agent can no longer run a hook through the plugin's launchers.** The command policy denied `craftsman hook ...`
+  but did not read `bin/launcher.sh`, `bin/launcher.cmd` or `bin/craftsman.cmd` as the Craftsman CLI, so an agent
+  could forge a hook call with `"<plugin>/bin/launcher.sh" hook stop ...`. These launchers and `bin/craftsman` are now
+  the CLI, run directly, by a Windows path, or through `sh`, `bash`, `dash` or `cmd /c`: `hook` is denied, and any
+  other subcommand is read as the command it is.
+
+### Added
+
+- **`craftsman run` bounds long output and names a live log of all of it.** Output prints as it arrives, unchanged,
+  up to 6,000 characters, so shorter output behaves exactly as before at every moment. Past that, printing stops and
+  a line names `<git-dir>/craftsman/scratch/<id>/run-output.log`, which holds the full output, grows while the
+  command runs and keeps its name until the review ends, so an agent whose shell call returned before the command
+  finished can follow it there. When the command exits, the rest prints whole if it is at most 6,000 characters,
+  else as a line `[craftsman run: N characters omitted; full output: PATH]` and the last 6,000 characters (cuts move
+  to a line where one is near). A long test log no longer fills the agent's context, and memory stays bounded
+  however much the command prints. If the log cannot be written, the line says why and everything prints. The
+  ledger record, test count, fingerprints and exit code are unchanged, and `--full` prints everything as it arrives.
+- **The benchmark reports tokens and where a review spends them.** `python3 -m evals.run compare` gains a `tokens`
+  and a `$/defect` column (cost per seeded defect found), their ratios in the versus table, `--tokens` for the
+  input / output / cache split, and the new values in `--json` (every existing key is kept). The new
+  `python3 -m evals.run breakdown` reads each run's ledger and shows subagents per run, hunters by slot kind and
+  wave, tokens and agent time per role with the main session's share, the findings funnel, which slot first found
+  each seeded defect, and findings on no defect. Every run it leaves out is named with the reason. A run's tokens
+  come from its per-model usage, which covers the whole session; a run without it counts as having no tokens, never
+  as the last turn's usage.
+
+### Changed
+
+- **Hooks and commands start much faster.** A command imports only the modules it needs, and a read-only tool call
+  (`Read`, `Grep`, `Glob`, ...) outside an active gate is answered on Claude Code and Copilot before the gate code
+  loads. Through `bin/launcher.sh`, median of 15 runs, before and after: a read-only `pre-tool` hook 234 -> 31 ms,
+  a `Bash` `pre-tool` hook 227 -> 131 ms, a prompt hook 226 -> 134 ms, `--version` 213 -> 31 ms. Every case where
+  the gate, the scope guard or git could decide otherwise (an active gate, a Craftsman agent, a git directory or work
+  tree moved by configuration or the environment, a gate state the gate would not read as inactive) still goes
+  through the full hook, and tests check that every call answered early gets the full hook's answer.
+- **Fewer git processes per command and hook.** The work tree and git directory are found with one `git rev-parse`
+  and carried along instead of being looked up again for every snapshot and path. Git processes per operation,
+  before and after: `review prepare` 17 -> 12, `review add`, `cover`, `brief` and `check` 9 -> 4, `craftsman run`
+  15 -> 7, the Stop hook with an active gate 9 -> 5, an idle `pre-tool` hook 2 -> 1. Each is a few milliseconds on
+  Linux and tens on Windows. `review view` searches references only for the hunks it shows; its output is unchanged.
+- **Hunters that start together no longer each write their starting context to the prompt cache.** On Claude Code a
+  reviewer or verifier that starts within 5 seconds of an earlier one of the same role waits in its `SubagentStart`
+  hook until 5 seconds after the first, so it reads the cache entry the first one wrote; a resumed agent never
+  waits. Measured on one cold-cache run of three reviewers (Claude Code 2.1.322, Sonnet): the subagents of the burst
+  cost about $0.041 instead of $0.081, and the wave starts about 5 seconds later. Other platforms are unchanged.
+- **The review packet no longer lists Craftsman's own files as conventions.** A file Craftsman generated, or one that
+  holds only Craftsman's managed block, is left out of "Conventions to read first"; a file with the block and text of
+  your own stays listed with a note that the block is not a project convention. Hunters no longer spend their
+  reading on Craftsman's instructions.
+- **`review check` marks the launches that run on the cheaper model.** Simplicity slots and verifier clusters of only
+  `minor` or `nit` findings carry `[Claude Code: model haiku]` where `check` says what to launch, so the orchestrator
+  no longer has to work this out from the prompts. Messages stay within the stop hook's 900-character budget.
+- **Shorter skill and agent descriptions.** These are listed in every session whether a skill is used or not: the
+  skill descriptions went from 4,293 to 1,993 characters and the agent descriptions from 817 to 450, and the
+  workspace `AGENTS.md` from 11,263 to 8,963. The commands and triggers they name are unchanged, and `craft-review`
+  says it is Craftsman's review: for when you ask Craftsman to review, and the final review of `/craftsman`. A test
+  holds the limits.
+- **`craftsman.cli` exports less.** The status report and the skill reader moved to `craftsman/status.py` and
+  `craftsman/skill_reader.py`, so a script that imported `run_status` or `discover_skill_dirs` from `craftsman.cli`
+  must import them from there. The commands and their output are unchanged.
+
+### Fixed
+
+- **A work tree whose directory name starts or ends with a blank.** Its path was trimmed, so commands and hooks
+  looked for a directory that does not exist; only the line ending git adds is removed now.
+- **A relative `GIT_DIR` with `GIT_WORK_TREE` from a subdirectory.** The git directory is now resolved from the
+  directory the command runs in, together with the work tree, so the hooks find the gate there instead of failing.
+- **SIGTERM and SIGHUP stop `craftsman run` the way Ctrl-C does** (POSIX): the command's process group is stopped,
+  the run is recorded as interrupted, the end of its output prints, and `craftsman run` exits with 143 or 129.
+  Before, such a signal left the command running and recorded nothing.
+
 ## [5.0.0] - 2026-11-09
 
 ### Security
