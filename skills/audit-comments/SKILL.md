@@ -1,10 +1,8 @@
 ---
 name: audit-comments
 description: >-
-  Audit comments and docstrings against the code they describe: extracts each
-  factual claim, checks it against the implementation, and classifies it as
-  accurate, stale, misleading, redundant, or missing an important why. Use when
-  /audit-comments is invoked or via /audit comments.
+  Audit comments and docstrings against the code they describe. Use for
+  /audit-comments or /audit comments.
 ---
 
 # Comment & docstring audit (`/audit-comments [target]`)

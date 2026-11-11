@@ -7,11 +7,13 @@ Usage:
     python3 -m evals.run agent --cases all --arm <label> [--craftsman-src <dir>] [--repeat N] ...
     python3 -m evals.run compare results.jsonl [more.jsonl ...]
     python3 -m evals.run rescore results.jsonl [more.jsonl ...]
+    python3 -m evals.run breakdown --out results.jsonl [--arm <label>] [--cases] [--json]
 
 ``agent`` runs a real headless Claude Code review per case and appends one JSON line per run to a
 results file (see ``evals/agent.py``); ``compare`` summarizes such files (see ``evals/compare.py``);
 ``rescore`` scores their kept ledgers again after the scoring rule or the truth changed (see
-``evals/rescore.py``).
+``evals/rescore.py``); ``breakdown`` shows where the subagents, tokens and findings of a results file
+went (see ``evals/breakdown.py``).
 
 Each case under ``evals/cases/<id>/`` holds ``base/`` and ``head/`` trees, ``task.md`` (the change
 description a reviewer receives) and ``truth.json`` (the seeded defects, never copied to the work
@@ -659,7 +661,7 @@ def build_parser() -> argparse.ArgumentParser:
     score.add_argument("workdir", type=Path)
     score.add_argument("--findings", type=Path, help='JSON list of {"file", "line", "title"}')
     score.add_argument("--json", action="store_true", help="machine-readable output")
-    from evals import agent, compare, rescore
+    from evals import agent, breakdown, compare, rescore
 
     agent.add_arguments(
         sub.add_parser("agent", help="run real headless Claude Code reviews and record recall, cost, time")
@@ -667,6 +669,9 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_arguments(sub.add_parser("compare", help="summarize results files written by 'agent'"))
     rescore.add_arguments(
         sub.add_parser("rescore", help="score the kept ledgers of saved results again with the current truth")
+    )
+    breakdown.add_arguments(
+        sub.add_parser("breakdown", help="where the subagents, tokens and findings of results went")
     )
     return parser
 
@@ -689,6 +694,12 @@ def _cmd_rescore(args: argparse.Namespace, out: TextIO) -> int:
     return rescore.cmd_rescore(args, out)
 
 
+def _cmd_breakdown(args: argparse.Namespace, out: TextIO) -> int:
+    from evals import breakdown
+
+    return breakdown.cmd_breakdown(args, out)
+
+
 def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
     args = build_parser().parse_args(argv)
     stream = out if out is not None else sys.stdout
@@ -699,6 +710,7 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
         "agent": _cmd_agent,
         "compare": _cmd_compare,
         "rescore": _cmd_rescore,
+        "breakdown": _cmd_breakdown,
     }
     try:
         return handlers[args.command](args, stream)

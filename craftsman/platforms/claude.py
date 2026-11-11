@@ -63,8 +63,10 @@ CLAUDE_HOOK_MATCHERS: dict[str, str] = {"PreToolUse": "Bash|Read|Grep|Glob|LS|Wr
 
 _QUOTED = r'"(?:[^"\\]|\\.)*"'
 _QUOTED_SHIM = r'"(?:[^"\\]|\\.)*craftsman-cli\.py"'
-# Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running
-# `-m craftsman.cli` or the checkout's shim, then `hook <event> --platform claude`.
+# Exactly the Claude Code hook commands `merge_claude_hooks` writes: a quoted interpreter running a quoted
+# `craftsman-cli.py` bootstrap, then `hook <event> --platform claude`. Installs before the bootstrap wrote
+# `-m craftsman.cli` in its place; those commands are still Craftsman's, so an install replaces them and an
+# uninstall removes them.
 OUR_HOOK_COMMAND_RE = re.compile(
     rf"^{_QUOTED} (?:-m craftsman\.cli|{_QUOTED_SHIM}) hook "
     rf"(?:{'|'.join(re.escape(event) for event, _ in CLAUDE_HOOK_EVENTS.values())}) "
@@ -304,7 +306,10 @@ def is_claude_plugin_active(claude_dir: Path) -> bool:
 # manifests and the agents, which need rendering, are generated into .claude-plugin/.
 PLUGIN_DIR = ".claude-plugin"
 PLUGIN_AGENTS_DIR = f"{PLUGIN_DIR}/agents"
-PLUGIN_LAUNCHERS = ("bin/launcher.sh", "bin/launcher.cmd", "bin/craftsman", "bin/craftsman.cmd")
+# `launcher.sh` runs the CLI through `craftsman-cli.py`, which checks the Python version itself.
+PLUGIN_LAUNCHERS = (
+    "bin/launcher.sh", "bin/craftsman-cli.py", "bin/launcher.cmd", "bin/craftsman", "bin/craftsman.cmd",
+)  # fmt: skip
 PLUGIN_DESCRIPTION = "Make AI coding agents prove they reviewed and tested their change."
 PLUGIN_AUTHOR = {"name": "Rafał Buczyński", "email": "buczynski.rafal2@gmail.com"}
 PLUGIN_REPOSITORY = "https://github.com/BuczynskiRafal/craftsman"

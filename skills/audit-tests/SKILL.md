@@ -1,11 +1,8 @@
 ---
 name: audit-tests
 description: >-
-  Audit whether the tests would actually catch the change being wrong: maps each
-  behavior to the test that proves it, runs revert and mutant thought
-  experiments, checks boundary and error paths, inspects test quality, and
-  writes the most valuable missing tests as code. Use when /audit-tests is
-  invoked or via /audit tests.
+  Audit whether the tests would catch the change being wrong, and write the
+  most valuable missing ones. Use for /audit-tests or /audit tests.
 ---
 
 # Test-evidence audit (`/audit-tests [target]`)

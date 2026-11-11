@@ -15,6 +15,7 @@ from craftsman.attribution import RUN_STALE_AFTER
 from craftsman.diffscan import DiffSnapshot, snapshot
 from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, continuation_reason
 from craftsman.gatecheck import (
+    CHEAPER_MODEL_NOTE,
     MAX_HUNT_ISSUE_CHARS,
     MAX_ROUNDS,
     GateIssue,
@@ -2226,7 +2227,7 @@ class VerificationTests(unittest.TestCase):
 
         self.assertEqual((issue.code, issue.missing), ("no-verdict", 3))
         self.assertIn("3 findings without a verdict: F1, F2, F3.", issue.message)
-        self.assertIn("one per cluster: [F1,F2] [F3].", issue.message)
+        self.assertIn("one per cluster: [F1,F2]; [F3].", issue.message)
         self.assertIn("Run craftsman review brief --verifier <IDS> and follow it exactly.", issue.message)
         self.assertIn("A verdict you record yourself does not count.", issue.message)
 
@@ -2272,8 +2273,9 @@ class VerificationTests(unittest.TestCase):
         issue = next(i for i in check(ledger, snap=hunt_snap(19)).issues if i.code == "no-verdict")
 
         self.assertIn("19 findings without a verdict: F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12 (+7 more).", issue.message)
-        self.assertIn("[F7] [F8] (+11 more clusters).", issue.message)
+        self.assertIn("[F7] [Claude Code: model haiku]; [F8] [Claude Code: model haiku] (+11 more clusters).", issue.message)
         self.assertNotIn("F13", issue.message)
+        self.assertLessEqual(len(issue.message), MAX_HUNT_ISSUE_CHARS)
 
     def test_lists_exactly_at_their_limits_are_not_cut(self) -> None:
         ledger = with_findings(hunt("W1-1", count=12), *(("minor", f"f{n}.py", "intent") for n in range(1, 13)))
@@ -2281,12 +2283,12 @@ class VerificationTests(unittest.TestCase):
         issue = next(i for i in check(ledger, snap=hunt_snap(12)).issues if i.code == "no-verdict")
 
         self.assertIn("F11, F12.", issue.message)
-        self.assertIn("[F8]", issue.message)
+        self.assertIn("[F8] [Claude Code: model haiku]", issue.message)
         self.assertNotIn("[F9]", issue.message)  # eight clusters fit; the ninth is counted
         self.assertIn("(+4 more clusters)", issue.message)
         eight = with_findings(hunt("W1-1", count=8), *(("minor", f"f{n}.py", "intent") for n in range(1, 9)))
         issue = next(i for i in check(eight, snap=hunt_snap(8)).issues if i.code == "no-verdict")
-        self.assertIn("[F8].", issue.message)
+        self.assertIn("[F8] [Claude Code: model haiku].", issue.message)
         self.assertNotIn("more cluster", issue.message)
 
     def test_a_verdict_the_orchestrator_recorded_is_unverified(self) -> None:
@@ -2417,8 +2419,55 @@ class VerificationTests(unittest.TestCase):
 
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
-        self.assertIn("Launch verifiers, one per cluster: [F1] [F2].", issue.message)
+        self.assertIn("Launch verifiers, one per cluster: [F1]; [F2].", issue.message)
         self.assertNotIn("Verifiers running", issue.message)
+
+    def test_clusters_of_minor_and_nit_findings_carry_the_cheaper_model_note(self) -> None:
+        ledger = self.base(("minor", "f1.py", "intent"), ("nit", "f1.py", "failure"), ("nit", "f2.py", "intent"))
+
+        (issue,) = check(ledger, snap=hunt_snap(1)).issues
+
+        self.assertIn(
+            "one per cluster: [F1,F2] [Claude Code: model haiku]; [F3] [Claude Code: model haiku].", issue.message
+        )
+
+    def test_a_cluster_with_a_blocker_or_major_finding_runs_on_the_full_model(self) -> None:
+        ledger = self.base(
+            ("minor", "f1.py", "intent"),
+            ("major", "f1.py", "failure"),
+            ("nit", "f2.py", "intent"),
+            ("blocker", "f3.py", "intent"),
+        )
+
+        (issue,) = check(ledger, snap=hunt_snap(1)).issues
+
+        self.assertIn("one per cluster: [F1,F2]; [F3] [Claude Code: model haiku]; [F4].", issue.message)
+
+    def test_the_note_cannot_be_read_as_marking_the_cluster_after_it(self) -> None:
+        # The shape of an end-to-end run: a minor finding alone, then nits clustered with a major one. With spaces
+        # alone the text read `[F1] [Claude Code: model haiku] [F2,F3,F4]`, and the major cluster ran on haiku.
+        ledger = self.base(
+            ("minor", "store.py", "ripple"), ("nit", "test_store.py", "design"), ("nit", "test_store.py", "design"),
+            ("major", "test_store.py", "tests"),
+        )
+
+        (issue,) = check(ledger, snap=hunt_snap(1)).issues
+
+        self.assertIn("one per cluster: [F1] [Claude Code: model haiku]; [F2,F3,F4].", issue.message)
+        self.assertNotIn(f"{CHEAPER_MODEL_NOTE} [", issue.message)
+
+    def test_unverified_minor_findings_are_marked_but_second_opinions_never_are(self) -> None:
+        ledger = self.base(("minor", "f1.py", "intent"), ("major", "f2.py", "intent"))
+        ledger = judged(ledger, "F1", VerdictEvent("V1", "question", at(70)))
+        ledger = judged(ledger, "F2", VerdictEvent("V2", "dismissed", at(71)))
+        ledger = self.verifier(ledger, "v1", "V2")
+
+        report = check(ledger, snap=hunt_snap(1))
+
+        messages = {issue.code: issue.message for issue in report.issues}
+        self.assertIn("one per cluster: [F1] [Claude Code: model haiku].", messages["unverified"])
+        self.assertIn("one per cluster: [F2].", messages["second-opinion"])
+        self.assertNotIn("model haiku", messages["second-opinion"])
 
     def test_a_verifier_that_never_reported_is_not_waited_for_once_stale(self) -> None:
         ledger = self.open_verifier(self.base(("major", "f1.py", "intent")))
@@ -2610,6 +2659,85 @@ class BudgetTests(unittest.TestCase):
         (issue,) = check(ledger).issues
 
         self.assertIn("Launch now, all in one step: W1-1, W1-3, W1-4.", issue.message)
+
+    @staticmethod
+    def with_simplicity(ledger: Ledger, *slot_ids: str) -> Ledger:
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+        slots = tuple(replace(s, kind="simplicity") if s.id in slot_ids else s for s in plan.slots)
+        return planned(ledger, *slots)
+
+    def test_unlaunched_simplicity_slots_carry_the_cheaper_model_note(self) -> None:
+        ledger = self.with_simplicity(hunt("W1-1", "W1-2", "W1-3", "W1-4", "W1-5", count=5), "W1-3", "W1-5")
+        ledger = with_agents(hunted(ledger, "W1-1", "h1", 10, 60), *run_events("v", 5, None, agent=VERIFIER))
+
+        (issue,) = check(ledger, snap=hunt_snap(5)).issues
+
+        self.assertIn(
+            "Launch now, all in one step: W1-2, W1-4; W1-3, W1-5 [Claude Code: model haiku].", issue.message
+        )
+
+    def test_relaunched_simplicity_slots_carry_the_cheaper_model_note(self) -> None:
+        ledger = self.with_simplicity(claim(hunt("W1-1", "W1-2"), "W1-1", 20), "W1-1")
+        ledger = with_agents(ledger, *run_events("h1", 10, 60, records=("B1",)))
+
+        (issue,) = check(ledger).issues
+
+        self.assertIn(
+            "Stopped without finishing: W1-1 [Claude Code: model haiku] - launch them again.", issue.message
+        )
+
+    def test_the_no_isolation_launch_carries_the_cheaper_model_note(self) -> None:
+        ledger = self.with_simplicity(hunt("W1-1", "W1-2"), "W1-2")
+
+        (issue,) = check(with_agents(ledger, *run_events("v", 10, None, agent=VERIFIER))).issues
+
+        self.assertEqual(issue.code, "no-isolation")
+        self.assertIn("launch them now, all in one step: W1-1; W1-2 [Claude Code: model haiku].", issue.message)
+
+    def test_slots_that_are_waited_for_or_not_simplicity_carry_no_note(self) -> None:
+        ledger = self.with_simplicity(claim(hunt("W1-1", "W1-2", "W1-3"), "W1-1", 20), "W1-1")
+        ledger = with_agents(ledger, *run_events("h1", 10, None))
+
+        (issue,) = check(ledger).issues
+
+        self.assertIn("Running: W1-1 - do not launch these again", issue.message)
+        self.assertIn("Launch now, all in one step: W1-2, W1-3.", issue.message)
+        self.assertNotIn("model haiku", issue.message)
+
+    def test_marked_slot_lists_are_cut_after_twelve_ids_in_all(self) -> None:
+        ids = [f"W1-{n}" for n in range(1, 20)]
+        ledger = self.with_simplicity(hunt(*ids, count=19), "W1-2", "W1-15")
+        ledger = with_agents(ledger, *run_events("h", 5, None))
+
+        (issue,) = check(ledger, snap=hunt_snap(19)).issues
+
+        self.assertIn(
+            "Launch now, all in one step: W1-1, W1-3..W1-12; W1-2 [Claude Code: model haiku]; +7 more.", issue.message
+        )
+
+    def test_many_simplicity_slots_and_minor_findings_stay_in_budget(self) -> None:
+        count = 100
+        ids = [f"W1-{n}" for n in range(1, count + 1)]
+        ledger = self.with_simplicity(hunt(*ids, count=count), *ids[1::2])
+        for n in range(1, count + 1):
+            if n % 3 == 0:  # running
+                ledger = with_agents(claim(ledger, f"W1-{n}", 60 + n), *run_events(f"r{n}", 50 + n, None))
+            elif n % 3 == 1:  # dead
+                token = f"B{len(ledger.claims) + 1}"
+                ledger = with_agents(
+                    claim(ledger, f"W1-{n}", 30 + n), *run_events(f"d{n}", 20 + n, 100 + n, records=(token,))
+                )
+        ledger = with_findings(ledger, *(("minor", f"f{n % count + 1}.py", "failure") for n in range(300)))
+
+        report = check(ledger, 1000, review_only=False, snap=hunt_snap(count))
+
+        hunt_issues = [issue for issue in report.issues if issue.code in HUNT_CODES]
+        self.assertEqual([issue.code for issue in hunt_issues], ["hunt-pending", "no-verdict"])
+        for issue in hunt_issues:
+            with self.subTest(code=issue.code):
+                self.assertIn(CHEAPER_MODEL_NOTE, issue.message)
+                self.assertLessEqual(len(issue.message), MAX_HUNT_ISSUE_CHARS)
 
 
 class HuntReportTests(unittest.TestCase):

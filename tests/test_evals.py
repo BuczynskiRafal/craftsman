@@ -553,6 +553,16 @@ if findings:
     (cwd / ".git" / "evals" / "findings.json").write_text(Path(findings).read_text())
 if mode == "hang":
     time.sleep(60)
+if mode == "background":  # turns started by background subagents' reports, and a hook that crashed in them
+    log = cwd / ".git" / "craftsman" / "hook-errors.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("".join(json.dumps({{"at": f"2026-11-10T17:10:0{{i}}.000Z", "source": "pre-tool", "kind": "crash",
+                                       "message": f"IndexError: list index out of range ({{i}})"}}) + "\n"
+                           for i in range(3)))
+    for turns, denied in ((10, 2), (6, 8)):
+        emit({{"type": "result", "subtype": "success", "is_error": False, "num_turns": turns,
+              "duration_ms": 1000 * turns, "duration_api_ms": 80000, "total_cost_usd": 0.25,
+              "permission_denials": [{{"tool_name": "Bash", "tool_use_id": "t", "tool_input": {{}}}}] * denied}})
 
 subtype = "error_max_budget_usd" if mode == "budget" else "success"
 emit({{"type": "result", "subtype": subtype, "is_error": mode == "budget", "stop_reason": "end_turn",
@@ -566,7 +576,11 @@ sys.exit(1 if mode == "budget" else 0)
 """
 
 FAKE_CLI = """import sys
-print("fake craftsman cli " + " ".join(sys.argv[1:]))
+
+
+def main():
+    print("fake craftsman cli " + " ".join(sys.argv[1:]))
+    return 0
 """
 
 
@@ -592,6 +606,8 @@ class AgentTestCase(unittest.TestCase):
         (root / "craftsman").mkdir()
         (root / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
         (root / "craftsman" / "cli.py").write_text(FAKE_CLI, encoding="utf-8")
+        (root / "bin").mkdir()
+        shutil.copy2(REPO_ROOT / "bin" / "craftsman-cli.py", root / "bin" / "craftsman-cli.py")
         (root / "evals" / "cases" / "x").mkdir(parents=True)
         (root / "evals" / "cases" / "x" / "truth.json").write_text("{}", encoding="utf-8")
         return root
@@ -686,6 +702,33 @@ class AgentRunTests(AgentTestCase):
         self.assertNotIn("stream_event", stream)  # token-level noise is not kept
         self.assertIn('"type": "result"', stream)
 
+    def test_turns_denials_and_hook_errors_are_counted_over_the_whole_session(self) -> None:
+        # Background subagents make a session print a result per turn; the last one alone said 7 turns and no
+        # denial while the session took 23 turns and was refused 10 times, 3 times by a crashed hook.
+        code, records = self.agent(env={"FAKE_CLAUDE_MODE": "background"})
+        self.assertEqual(code, 0)
+        record = records[0]
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual((record["turns"], record["results"], record["permission_denials"]), (23, 3, 10))
+        self.assertEqual(record["duration_ms"], 10_000 + 6_000 + 90_000)
+        self.assertEqual(record["cost_usd"], 0.25)  # cumulative: the last result's
+        self.assertEqual(
+            record["hook_errors"], {"count": 3, "first": "pre-tool crash: IndexError: list index out of range (0)"}
+        )
+        self.assertTrue(any(w.startswith("3 hook errors; the first: pre-tool crash") for w in record["warnings"]))
+        kept = Path(record["logs"]["hook_errors"])
+        self.assertEqual(kept.parent, Path(record["logs"]["dir"]))
+        self.assertEqual(len(kept.read_text(encoding="utf-8").splitlines()), 3)  # the checkout is gone, the copy is not
+        out = io.StringIO()
+        self.assertEqual(run.main(["compare", str(self.out)], out), 0)
+        self.assertEqual(out.getvalue().count("3 hook errors"), 2)  # the case row and the total
+
+    def test_a_clean_run_records_no_hook_errors(self) -> None:
+        _, records = self.agent()
+        self.assertEqual(records[0]["hook_errors"], {"count": 0})
+        self.assertNotIn("hook_errors", records[0]["logs"])
+        self.assertEqual((records[0]["results"], records[0]["permission_denials"]), (1, 0))
+
     def test_the_session_gets_the_plugin_the_wrapper_and_a_clean_case_dir(self) -> None:
         with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent"}):
             _, records = self.agent()
@@ -724,8 +767,14 @@ class AgentRunTests(AgentTestCase):
         wrapper = run_agent.write_wrapper(self.tmp / "bin", self.src)
         self.assertEqual(
             wrapper.read_text(encoding="utf-8"),
-            f'#!/bin/sh\nPYTHONPATH={self.src} exec python3 -m craftsman.cli "$@"\n',
+            f'#!/bin/sh\nexec python3 {self.src}/bin/craftsman-cli.py "$@"\n',
         )
+        done = subprocess.run([str(wrapper), "status"], capture_output=True, text=True, check=True, cwd=self.tmp)
+        self.assertEqual(done.stdout.strip(), "fake craftsman cli status")
+        # The session's working directory is the repository under review: its own `craftsman/` does not run.
+        (self.tmp / "craftsman").mkdir()
+        (self.tmp / "craftsman" / "__init__.py").write_text("print('the project ran')\n", encoding="utf-8")
+        (self.tmp / "craftsman" / "cli.py").write_text("def main():\n    print('the project ran')\n", encoding="utf-8")
         done = subprocess.run([str(wrapper), "status"], capture_output=True, text=True, check=True, cwd=self.tmp)
         self.assertEqual(done.stdout.strip(), "fake craftsman cli status")
 
@@ -876,7 +925,7 @@ class AgentHelperTests(AgentTestCase):
         (self.src / ".git").mkdir()
         (self.src / "docs").mkdir()
         snapshot = run_agent.snapshot_source(self.src, self.tmp / "snap")
-        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), [".claude-plugin", "craftsman", "skills"])
+        self.assertEqual(sorted(p.name for p in snapshot.iterdir()), [".claude-plugin", "bin", "craftsman", "skills"])
 
     @unittest.skipIf(shutil.which("git") is None, "git is required")
     def test_source_revision_marks_edits_of_plugin_files_only(self) -> None:
@@ -909,6 +958,20 @@ class AgentHelperTests(AgentTestCase):
             self.assertEqual((stream.init, stream.result), (init, result))
         self.assertEqual(run_agent.parse_output(json.dumps(result)).result, result)
         self.assertIsNone(run_agent.parse_output("").result)
+
+    def test_per_turn_fields_are_summed_over_every_result_and_cumulative_ones_are_the_last(self) -> None:
+        # The shape of a real stream: a result per turn; cost and API time cumulative, turns, time and denials not.
+        results = [
+            {"type": "result", "num_turns": 10, "duration_ms": 32522, "duration_api_ms": 626793,
+             "total_cost_usd": 1.91, "permission_denials": [{"tool_name": "Bash"}] * 2},
+            {"type": "result", "num_turns": 0, "duration_ms": 280, "duration_api_ms": 0, "total_cost_usd": 1.91,
+             "permission_denials": []},
+            {"type": "result", "num_turns": 2, "duration_ms": 12323, "duration_api_ms": 626793,
+             "total_cost_usd": 1.91, "permission_denials": [{"tool_name": "Bash"}]},
+        ]  # fmt: skip
+        stream = run_agent.parse_output("\n".join(json.dumps(e) for e in results))
+        self.assertEqual((stream.results, stream.turns, stream.turn_ms, stream.denials), (3, 12, 45125, 3))
+        self.assertEqual(stream.result, results[-1])
 
     def test_check_init(self) -> None:
         info = run_agent.PluginInfo("craftsman", "craft-review")
@@ -1099,6 +1162,40 @@ class RescoreTests(unittest.TestCase):
         self.assertEqual(err.count("warning:"), 3)
         self.assertIn("no kept ledger", err)
         self.assertIn("attach#3", err)
+
+    def test_an_older_record_gets_its_session_fields_from_the_kept_stream_and_hook_log(self) -> None:
+        # What a harness that read the last result only wrote for a session with background subagents.
+        logs = self.tmp / "logs"
+        logs.mkdir()
+        results = [
+            {"type": "result", "num_turns": turns, "duration_ms": ms, "permission_denials": [{"tool_name": "Bash"}] * denied}
+            for turns, ms, denied in ((10, 32522, 2), (0, 280, 0), (2, 12323, 0))
+        ]
+        (logs / "stream.jsonl").write_text("".join(json.dumps(e) + "\n" for e in results), encoding="utf-8")
+        entry = {"at": "2026-11-10T17:10:05.520Z", "source": "pre-tool", "kind": "crash", "message": "IndexError: x"}
+        (logs / "hook-errors.log").write_text(json.dumps(entry) + "\n" + json.dumps(entry) + "\n", encoding="utf-8")
+        old = _record("t", "attach", 4, 1, duration_ms=12323, turns=2, permission_denials=0,
+                      logs={"stream": str(logs / "stream.jsonl"), "hook_errors": str(logs / "hook-errors.log")})
+        path = self.tmp / "old.jsonl"
+        path.write_text(json.dumps(old) + "\n", encoding="utf-8")
+
+        _, out, err = self.rescore(path)
+
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((record["turns"], record["results"], record["permission_denials"]), (12, 3, 2))
+        self.assertEqual(record["duration_ms"], 32522 + 280 + 12323)
+        self.assertEqual(record["hook_errors"], {"count": 2, "first": "pre-tool crash: IndexError: x"})
+        self.assertEqual(record["recall"], old["recall"])  # no kept ledger: the recall stays
+        self.assertIn("recall left as it is", err)
+        self.assertIn("turns 2 -> 12", out)
+        compared = io.StringIO()
+        run.main(["compare", str(path)], compared)
+        self.assertIn("2 hook errors", compared.getvalue())
+
+    def test_a_record_without_hook_errors_still_compares_without_a_note(self) -> None:
+        out = io.StringIO()
+        self.assertEqual(run.main(["compare", str(self.path)], out), 0)  # none of these records has the field
+        self.assertNotIn("hook error", out.getvalue())
 
     def test_the_original_is_kept_and_a_second_run_does_not_overwrite_it(self) -> None:
         self.rescore(self.path)

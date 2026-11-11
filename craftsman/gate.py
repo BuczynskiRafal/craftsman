@@ -31,10 +31,10 @@ from typing import Any, Literal, TypeVar, get_args
 from craftsman import hook_errors
 from craftsman.diffscan import (
     DiffScanError,
+    base_revision,
     git_dir,
-    resolve_base_sha,
-    snapshot,
-    worktree_root,
+    snapshot_at,
+    worktree_paths,
 )
 from craftsman.evidence import (
     Evaluation,
@@ -265,9 +265,13 @@ def _parsed(raw: object, parse: Callable[[object], P], where: str) -> P:
 # --- persistence ----------------------------------------------------------------------------
 
 
-def state_path_for(cwd: str | Path) -> Path:
-    """The gate state file of the work tree containing `cwd`, next to its evidence ledger."""
-    return git_dir(cwd) / "craftsman" / STATE_FILENAME
+def state_path_for(cwd: str | Path, *, git_directory: Path | None = None) -> Path:
+    """The gate state file of the work tree containing `cwd`, next to its evidence ledger.
+
+    A caller that has the git directory of the work tree (`worktree_paths`) passes it as `git_directory`:
+    git is not asked again.
+    """
+    return (git_dir(cwd) if git_directory is None else git_directory) / "craftsman" / STATE_FILENAME
 
 
 def load_state(path: Path) -> GateState | None:
@@ -390,7 +394,7 @@ def evaluate_task(state: GateState, root: Path) -> Evaluation:
 
     Raises `DiffScanError` or `LedgerError` when the work tree or the ledger cannot be read.
     """
-    snap = snapshot(root, state.base_sha)
+    snap = snapshot_at(root, base_revision(root, state.base_sha))
     return evaluate_evidence(root, snap, state.deep, state.required_isolation)
 
 
@@ -653,8 +657,8 @@ def run_cli(argv: list[str], env: Mapping[str, str]) -> int:
     _check_combinations(parser, args)
     caller = cli_caller(args.session_id, env)
     try:
-        root = worktree_root(args.cwd or os.getcwd())
-        path = state_path_for(root)
+        root, git_directory = worktree_paths(args.cwd or os.getcwd())
+        path = state_path_for(root, git_directory=git_directory)
         if args.init:
             _init(root, path, args, caller)
             return 0
@@ -672,7 +676,7 @@ def run_cli(argv: list[str], env: Mapping[str, str]) -> int:
 
 def _init(root: Path, path: Path, args: argparse.Namespace, caller: GateOwner) -> None:
     """Open the gate; the previous review is archived first, so a failure leaves no new gate."""
-    base_sha = resolve_base_sha(root, args.base_sha)
+    base_sha = base_revision(root, args.base_sha or "HEAD")
     with state_lock(path):
         previous = _replaceable_state(path, takeover=args.takeover)
         owner = caller

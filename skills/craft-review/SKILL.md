@@ -1,12 +1,9 @@
 ---
 name: craft-review
 description: >-
-  Bug-hunting review of a local diff, branch or pull request. Freezes the diff,
-  plans the hunt from it, sends fresh-context hunters over every slot, has
-  verifiers try to disprove every finding, hunts again while waves prove
-  defects, and records the outcome in the Craftsman ledger. Use when
-  /craft-review is invoked, when the user asks Craftsman to review a diff,
-  branch or pull request, and as the final review of /craftsman.
+  Bug-hunting review of a diff, branch or pull request by fresh-context
+  hunters and verifiers, recorded in the ledger. Use when the user asks
+  Craftsman to review, and as the final review of /craftsman.
 ---
 
 # Craft Review (`/craft-review`)
@@ -83,9 +80,9 @@ what it lists:
 - **Findings** without a verdict: `check` names the clusters. Launch one `craftsman-verifier` per cluster, whole prompt
   `You are a Craftsman verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.` They merge
   duplicates, disprove, reproduce and record verdicts; in an enforced review one you record yourself does not count. A
-  `blocker` or `major` dismissed without a `--run` needs a second, independent verifier. On Claude Code a cluster of
-  only `minor` or `nit` findings gets `model: "haiku"`; any `blocker` or `major`, and a verifier resumed in step 4, gets
-  the full model.
+  `blocker` or `major` dismissed without a `--run` needs a second, independent verifier. `check` marks a cluster of
+  only `minor` or `nit` findings `[Claude Code: model haiku]` (as in step 2, `model: "haiku"`); any other cluster, and a
+  verifier resumed in step 4, gets the full model.
 - **Waves**: a `proven`, or serious `probable`, bug finding outside documentation makes `check` (also `report`, `brief`,
   `prepare`) store a wave: a **variant** slot per root cause (`W2-F3`, hunts its siblings, at most 3) and a **fresh**
   set (`W2-X1`, an unanchored look). A variant of a variant of a variant spawns nothing; the first deep round plans its

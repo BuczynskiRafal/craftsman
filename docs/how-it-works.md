@@ -42,7 +42,8 @@ The README and the [usage guide](usage.md) only summarize it.
    tries to disprove each finding, reproduces it where the code is runnable, and records a verdict. A
    `blocker` or `major` finding dismissed without a run needs a second, independent verifier. On Claude
    Code, the simplicity slots and the verifiers of clusters that hold only `minor` or `nit` findings run
-   on the cheaper model (`haiku`); everything else, and a verifier resumed to confirm a fix, does not.
+   on the cheaper model (`haiku`) and `check` marks these launches; everything else, and a verifier
+   resumed to confirm a fix, does not.
 6. **Saturate.** Waves are planned, not derived: `check`, `report`, `brief` and `prepare` store a wave
    in the plan when a `proven`, or serious `probable`, bug finding outside documentation calls for it.
    A wave is one **variant** slot per root cause (`W2-F3`, which hunts the siblings of finding F3, at
@@ -64,7 +65,9 @@ The README and the [usage guide](usage.md) only summarize it.
      verifier, who are anchored), and the round cap bounds the loop.
 8. **Test.** `craftsman run --kind test -- <cmd>` on the final code; deep also `--kind e2e`. A test run
    counts only when its runner reported at least `--min-tests` tests (default 1); a command that matched
-   no tests is recorded but is no evidence.
+   no tests is recorded but is no evidence. Output prints as it arrives up to 6,000 characters; past
+   that, a line names a log in the scratch area that holds the full output and grows while the
+   command runs, and the last 6,000 characters print when the command exits (`--full` prints it all).
 9. **Close.** `craftsman review check`, then `craftsman gate --complete`, then `craftsman review
    report`.
 
@@ -148,6 +151,13 @@ A review costs agents times turns times context, so the inputs are kept small.
   finished hunter's findings while other hunters still run, then the slots of a wave as soon as a
   finding is judged. Slots that are running are waited for, never launched twice. Where parallel
   subagents are a barrier (Copilot), the waves stay as they are.
+- **Launch stagger.** On Claude Code a subagent's request reads the prompt cache only once the
+  response that wrote it has begun, so hunters launched together would each write their whole
+  starting context (6,917 tokens per reviewer, measured on Claude Code 2.1.322 with Sonnet, where one
+  started later read 6,920 and wrote none). The `SubagentStart` hook therefore holds every hunter or
+  verifier that starts within 5 seconds of an earlier one of the same role until that earlier start is
+  5 seconds old: one cache write and reads for the rest, instead of a write each. Nothing the agents
+  read or do changes.
 - **Remaining work.** `craftsman review show --hunks` lists the hunks still to cover.
   `review show` also prints each finding's scenario and verdict evidence, so a verifier needs no
   `--json` call.

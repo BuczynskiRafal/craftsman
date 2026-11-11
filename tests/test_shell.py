@@ -8,7 +8,9 @@ from pathlib import Path
 from unittest import mock
 
 from craftsman.shell import (
+    command_substitutions,
     expand_shell_path_token,
+    input_redirection_targets,
     iter_simple_commands,
     parse_git_invocation,
     python_program,
@@ -69,6 +71,38 @@ class RedirectionTargetTests(unittest.TestCase):
     def test_descriptor_duplications_and_input_redirections_write_nothing(self) -> None:
         self.assertEqual(self.targets("cmd 2>&1 < in.txt >&2"), [[]])
         self.assertEqual(self.targets("echo '> no.txt' \"> no.txt\""), [[]])
+
+    def test_input_redirections_name_the_files_they_read(self) -> None:
+        def inputs(command: str) -> list[list[str]]:
+            return [input_redirection_targets(item.segment) for item in iter_simple_commands(command)]
+
+        self.assertEqual(inputs("cmd 2>&1 < in.txt >&2"), [["in.txt"]])
+        self.assertEqual(inputs("wc -l <'a b.txt'"), [["a b.txt"]])
+        self.assertEqual(inputs("< in.txt"), [["in.txt"]])  # redirections alone: no program word, still a read
+        for nothing in ("wc -l <<< word", "cat <<EOF\n< x\nEOF", "cat <&3", "echo '< no.txt'", "diff <(ls) x"):
+            with self.subTest(command=nothing):
+                self.assertTrue(all(not found for found in inputs(nothing)), inputs(nothing))
+
+
+class NoProgramWordTests(unittest.TestCase):
+    """A simple command may have no program word: it then runs nothing of its own, but what it holds still runs."""
+
+    def test_an_assignment_alone_has_no_program_word_and_keeps_its_words_as_the_prefix(self) -> None:
+        cmds = iter_simple_commands("D=/tmp/x\nX=1 rm -rf build")
+        self.assertEqual([(c.prefix, c.tokens) for c in cmds], [(("D=/tmp/x",), []), (("X=1",), ["rm", "-rf", "build"])])
+
+    def test_an_unquoted_substitution_is_a_segment_of_its_own(self) -> None:
+        segments = [(c.segment, c.tokens) for c in iter_simple_commands("D=$(craftsman review scratch); echo $D")]
+        self.assertEqual(segments[0], ("D=$", []))
+        self.assertIn(("craftsman review scratch", ["craftsman", "review", "scratch"]), segments)
+
+    def test_quoted_substitutions_and_unquoted_heredoc_bodies_are_found(self) -> None:
+        self.assertEqual(command_substitutions('D="$(cat a)" E="`cat b`"'), ["cat a", "cat b"])
+        self.assertEqual(command_substitutions('echo "$(cat "$(dirname x)/y")"'), ['cat "$(dirname x)/y"'])
+        self.assertEqual(command_substitutions("cat <<EOF\n$(cat c)\nEOF"), ["cat c"])
+        for nothing in ("echo '$(cat a)'", "cat <<'EOF'\n$(cat c)\nEOF", "echo $((1 + 2))", "echo \\$(x)"):
+            with self.subTest(command=nothing):
+                self.assertEqual(command_substitutions(nothing), [])
 
 
 class WorkingDirectoryTrackingTests(unittest.TestCase):

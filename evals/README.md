@@ -48,6 +48,7 @@ python3 -m evals.run agent --cases all --arm current --out bench/evals/current.j
 
 python3 -m evals.run agent --help
 python3 -m evals.run compare bench/evals/current.jsonl
+python3 -m evals.run breakdown --out bench/evals/current.jsonl   # where the subagents and tokens went
 ```
 
 | Flag | Meaning |
@@ -68,8 +69,8 @@ python3 -m evals.run compare bench/evals/current.jsonl
 
 **What one run does.** It prepares the case in a fresh temp directory (`repo/`, the base committed and
 the change uncommitted, exactly as `prepare`), puts a `craftsman` wrapper script in front of `PATH`
-(`PYTHONPATH=<src> exec python3 -m craftsman.cli "$@"`, so the session runs the CLI of the checkout
-under test and not an installed one), starts `claude` in `repo/`, scores the ledger in
+(`exec python3 <src>/bin/craftsman-cli.py "$@"`, so the session runs the CLI of the checkout under test,
+not an installed one and not a `craftsman/` directory of the repository it reviews), starts `claude` in `repo/`, scores the ledger in
 `repo/.git/craftsman/ledger.json` and appends the record. The checkout under test is copied once per
 invocation, without `.git`, `evals/`, `docs/` and `tests/`: the arm cannot change while a long run is in
 progress, and the session cannot find `truth.json` next to the plugin. The record holds the source commit
@@ -115,11 +116,20 @@ or arms.
 **Result record** (one JSON object per line): `arm`, `case`, `run`, `status`
 (`ok`, `budget`, `timeout`, `max-turns`, `error`, `load-failed`, `no-result`, `harness-error`),
 `recall` (found, total, ids found and missed, decoy hits, unmatched findings, duplicates, ignored
-dismissed findings), `cost_usd`, `duration_ms` (Claude's own clock), `wall_s` (the harness's clock),
-`turns`, `subagents` (spawned, completed, failed), `usage` and `model_usage` (tokens and cost per model),
-`tool_calls`, `hooks`, `permission_denials`, the `init` check, the prompt, the source commit and `logs`:
-the stream (`stream.jsonl`, without the token-level `stream_event` lines), `stderr.txt` and the ledger
-of the run. `status` other than `ok` makes the command exit 1. Runs with `load-failed`, `no-result`,
+dismissed findings), `cost_usd`, `duration_ms` (Claude's own clock: the time of every turn of the main
+loop, summed), `wall_s` (the harness's clock), `turns` (summed over every turn), `results` (how many turns:
+a session prints a `result` event per turn of its main loop, and each report of a background subagent
+starts one, so a review prints many), `subagents` (spawned, completed, failed), `model_usage` (tokens and
+cost per model, cumulative for the whole session, subagents included) and `usage` (tokens of the last turn
+of the main loop only), `tool_calls`, `hooks`, `permission_denials` (tool calls refused in the whole
+session, by the permission mode or by a hook), `hook_errors` (`count` of the entries in
+`<git-dir>/craftsman/hook-errors.log` of the case checkout, and the `first` one: a hook that crashed still
+answered, so `hooks` shows it as a success and only this log tells; `compare` shows the sum in its `note`
+column, e.g. `13 hook errors`), the `init` check, the prompt, the source commit and `logs`: the stream
+(`stream.jsonl`, without the token-level `stream_event` lines), `stderr.txt`, the ledger of the run and a
+copy of the hook error log (`hook_errors`, when there is one). Records written before the harness summed
+the turns or read the hook error log hold the last turn's figures and no `hook_errors`; `rescore` reads both
+again from the stream and the log copy (or the kept case checkout) they kept. `status` other than `ok` makes the command exit 1. Runs with `load-failed`, `no-result`,
 `error` or `harness-error` are left out of every mean in `compare` and counted in its `invalid` note; a
 `budget` or `timeout` run is kept with the findings it recorded before it stopped, because a protocol that
 runs out of money is a result.
@@ -148,17 +158,80 @@ again later to add repeats: the run numbers of an arm and case continue after th
 Scoring changes (a new matching rule, a corrected truth location) do not need new runs: `agent` keeps each
 run's ledger, and `python3 -m evals.run rescore bench/evals/ab.jsonl` scores those ledgers again with the
 current truth and rewrites the `recall` of every record in place. The original file is kept as `ab.jsonl.bak`
-(`.bak.1`, ... when that exists). Records without a kept ledger (baseline runs, runs without findings) stay
-as they are, with a warning.
+(`.bak.1`, ... when that exists). It also reads `turns`, `results`, `duration_ms`, `permission_denials` and
+`hook_errors` again from the logs a record kept (see the result record above). Records without a kept
+ledger (baseline runs, runs without findings) keep their recall, with a warning.
 
 `compare` prints, per arm and case: runs, recall (mean defects found / seeded), the fewest and most found
 in one run, decoys flagged, unmatched findings (possible false positives), mean cost in USD with the
-spread over the repeats, minutes, turns and subagents spawned; then a TOTAL row (one pass over all cases;
-its range is the suite recall of each repeat). With several arms it adds, for every later arm, the ratios of
-cost, minutes and turns per case and the **difference of the suite recall with a 90% interval** (Welch's t
-on the per-repeat suite recalls). `--defects` shows how often each seeded defect was found, which is the
-number to look at when the totals look equal: a defect that dropped from 5/5 to 1/5 is a regression the
-mean can hide. `--json` prints the same tables as JSON.
+spread over the repeats, minutes, turns, subagents spawned, **tokens** (the whole session, subagents
+included: uncached input, output, cache read and cache write) and **$/defect**, the cost per found defect
+(mean cost over mean seeded defects found; `-` when none was found); then a TOTAL row (one pass over all
+cases; its range is the suite recall of each repeat, its $/defect the cost of a pass over the defects it
+finds). With several arms it adds, for every later arm, the ratios of cost, minutes, turns, tokens and cost
+per found defect per case and in a TOTAL row, and the **difference of the suite recall with a 90%
+interval** (Welch's t on the per-repeat suite recalls). `--tokens` adds the token split (input, output,
+cache read, cache write). `--defects` shows how often each seeded defect was found, which is the number to
+look at when the totals look equal: a defect that dropped from 5/5 to 1/5 is a regression the mean can
+hide. `--json` prints the same tables as JSON, all columns included, plus the token means and the cost per
+found defect as numbers and, for every later arm, its comparison with the first (`versus`).
+
+The tokens of a session are read from the record's `model_usage`, summed over the models: the cost is
+computed from it, so it counts every agent of the session. The record's `usage` is not used: it is only
+the last turn of the main loop (0.3-7.6% of the session in runs with subagents), so it would understate
+the session. A record without token counts in `model_usage` is counted in the `note` column (`1 without tokens`) and left out of the token means.
+
+### Where the tokens go (`breakdown`)
+
+```bash
+python3 -m evals.run breakdown --out bench/evals/ab.jsonl              # per arm, all cases together
+python3 -m evals.run breakdown --out bench/evals/ab.jsonl --cases      # and a row per case
+python3 -m evals.run breakdown --out bench/evals/ab.jsonl --arm b --json
+```
+
+Reviews score well but cost a lot, and `compare` only shows the sum. `breakdown` combines each record with
+the ledger the run kept (`logs.ledger`) and prints, per arm (and per case with `--cases`), one table each:
+
+| Table | What it holds |
+| :--- | :--- |
+| Runs | valid runs, how many kept a ledger and full token counts, mean cost, mean minutes, cost per found defect |
+| Subagents | per run with a ledger: hunters and verifiers (a resumed agent counts once); `relaunched slots`: hunt slots launched more than once (a hunter died or was relaunched); `idle verifiers`: verifier runs that vouch for no verdict or merge (denied their commands, died or gave up, so their findings went to another verifier; the ledger does not record which findings a verifier was asked to judge, so verifier relaunches are not counted as such, and a verifier whose transcript was not read is attributed by time and may be credited with a neighbour's verdict, which makes this a floor); `second opinions`: verifier runs that only judged findings another verifier run had judged before them, a merge counting as a judgement as it does at the gate (a major dismissed as a duplicate needs a second verifier) |
+| Hunters | per run: by the kind of the slot they hunted (`bug`, `simplicity`, `sweep`, `variant`, `fresh`, or `none` when no slot accounts for them) and by its generation (`gen 1`; the waves are `gen 2` and `gen 3`) |
+| Tokens | per run with full token counts: input, output, cache read, cache write, total and agent minutes of the hunters and of the verifiers (from the stop events of the ledger, as `craftsman review report` counts them), of the **main session** (the whole session minus its subagents) and of the whole session, each with its share |
+| Cache write per subagent | mean and minimum, for the hunters and for the verifiers |
+| Findings | per run: recorded, merged into another, and by current verdict (`proven`, `probable`, `question`, `dismissed`, `open`) |
+| Seeded defects found | sums: for each seeded defect found, the slot that recorded it first, by slot kind (`lead` is the orchestrator's own finding) and by generation |
+| Findings on no seeded defect | sums: the findings the scorer matches to no seeded defect or to a decoy (dismissed ones included, merged duplicates not), by slot kind: the noise the verifiers had to judge |
+
+It ends with one line per arm, `cost per found defect`, and names every run a figure leaves out, with the
+reason. Nothing is estimated: a run without a kept ledger (a baseline run, a session that never prepared a
+review) is left out of every ledger figure, and a run in which a subagent has no usage in the ledger (its
+transcript could not be read), whose record has no token counts, or whose subagents report more tokens of
+a kind than its record (the two sources disagree, so the main session's share would be negative) is left
+out of the token figures only.
+Invalid runs are left out of everything, as in `compare`.
+
+Everything is tied together by the rules the product and the scorer use, not by new ones: a hunter belongs
+to the slot `craftsman.attribution` binds it to (its claim, shown by its transcript), else to the slot a run
+without a readable transcript serves; a verdict to the verifier runs that vouch for it; a finding to the
+stored slot bound to the run that recorded it, else to the slot it names; a finding to a seeded defect by
+the matching rule of `score`, and "first" is the finding recorded earliest. `breakdown` only reads: it
+starts no agent and changes neither the results file nor a ledger.
+
+**How to read it.**
+
+- *Are the waves worth their cost?* Set the `gen 2` and `gen 3` columns of *Hunters* (what the waves launch)
+  against the same columns of *Seeded defects found* (the defects only a wave found first) and the
+  `variant` and `fresh` columns of *Findings on no seeded defect* (the noise the waves add for the
+  verifiers). Waves that launch many hunters, find few defects first and add noise are the first thing to
+  cut; confirm with `compare` that the recall does not drop.
+- *How much is fixed starting context?* The minimum cache write per subagent is about what every subagent
+  pays before it reads anything (system prompt, agent definition, tools, brief); times the subagents per
+  run, it is the floor of a run's cache writes. A mean far above the minimum says the work dominates, not
+  the start; a mean close to it says shorter starting context or fewer subagents is where tokens are saved.
+- *How much is the main session?* The share of the *main session* row. The product's own telemetry
+  (`review report`) counts only the subagents, so this is the one place the orchestrator's tokens show. A
+  large share points at the protocol's own steps (reading briefs, checks, reports) rather than the hunt.
 
 ### What it costs, and how many repeats a claim needs
 
@@ -341,6 +414,6 @@ a ledger or findings file counts as zero defects found, and is marked in the rec
 3. Add the case to the table above. The suite has no cap on defects; keep the large cases few, they
    are what makes a run expensive.
 
-Lint: `python3 -m ruff check evals tests/test_evals.py` and
-`python3 -m mypy --strict --exclude 'evals/cases/' evals tests/test_evals.py` are clean (the case trees
-are fixtures with seeded defects and are not linted).
+Lint: `python3 -m ruff check evals tests/test_evals.py tests/test_evals_usage.py` and
+`python3 -m mypy --strict --exclude 'evals/cases/' evals tests/test_evals.py tests/test_evals_usage.py` are
+clean (the case trees are fixtures with seeded defects and are not linted).

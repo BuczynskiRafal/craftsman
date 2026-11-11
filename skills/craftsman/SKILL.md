@@ -1,12 +1,9 @@
 ---
 name: craftsman
 description: >-
-  Build freely, review hard. Captures a baseline, lets you implement the task
-  without ceremony, then freezes the final diff and runs an adaptive hunt:
-  parallel fresh-context hunters, independent verifiers and repeated waves while
-  they keep finding real defects; then fixes, test runs and the Craftsman gate.
-  The agent picks the depth itself; the user needs no flags. Use when
-  /craftsman is invoked or the prompt contains `ultracraft`.
+  Build freely, review hard: implement the task, then run the planned hunt,
+  verifiers, fixes and tests until the gate passes. Use for /craftsman or
+  `ultracraft`.
 ---
 
 # Craftsman (`/craftsman <task>`)

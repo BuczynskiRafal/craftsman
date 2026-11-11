@@ -519,8 +519,20 @@ def redirection_targets(segment: str) -> list[str]:
     blanked so that a redirection on either side of `<<EOF` is found; quoted text is never a redirection.
     Descriptor duplications (`2>&1`) and input redirections write nothing and are left out.
     """
+    return [target for redirection in _redirections(segment) if (target := _write_target(redirection))]
+
+
+def input_redirection_targets(segment: str) -> list[str]:
+    """The files the unquoted `<` redirections of a simple command read, found the way `redirection_targets` finds
+    the writes. A heredoc (`<<EOF`), a here-string (`<<< word`), a process substitution (`<(...)`) and a descriptor
+    duplication (`<&3`) name no file and are left out."""
+    return [target for redirection in _redirections(segment) if (target := _read_target(redirection))]
+
+
+def _redirections(segment: str) -> list[str]:
+    """The unquoted redirections (as written) on the first line of a simple command, heredoc openers blanked."""
     header = _blank_heredoc_openers(segment.split("\n", 1)[0])
-    targets: list[str] = []
+    found: list[str] = []
     quote: str | None = None
     escaped = False
     i, n = 0, len(header)
@@ -534,17 +546,86 @@ def redirection_targets(segment: str) -> list[str]:
             quote = None if ch == quote else quote
         elif ch in ("'", '"'):
             quote = ch
+        elif header.startswith("<<<", i):  # a here-string: its word is text, not a file
+            i += 3
+            continue
         elif ch in "<>&" or ch.isdigit():
             match = UNQUOTED_REDIR_RE.match(header, i)
             starts_word = i == 0 or header[i - 1].isspace() or header[i - 1] in ";|&("
             if match and (not ch.isdigit() or starts_word):
-                target = _write_target(match.group(0))
-                if target:
-                    targets.append(target)
+                found.append(match.group(0))
                 i = match.end()
                 continue
         i += 1
-    return targets
+    return found
+
+
+def _read_target(redirection: str) -> str | None:
+    """The file a matched redirection reads, None when it is not a `<` from a file."""
+    text = redirection.lstrip("0123456789")
+    if not text.startswith("<") or text.startswith("<&"):
+        return None
+    rest = text[1:].strip()
+    if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "'\"":
+        rest = rest[1:-1]
+    return rest or None
+
+
+def command_substitutions(segment: str) -> list[str]:
+    """The command lines of the `$(...)` and backtick substitutions a simple command runs from inside its words.
+
+    `scan_shell_events` already splits an unquoted substitution into segments of its own; this finds the ones it
+    keeps inside a segment: in double quotes on the first line (`D="$(cat f)"`) and in the body of a heredoc whose
+    delimiter is unquoted (the shell expands those). Single-quoted text and a quoted heredoc body run nothing.
+    """
+    first_line, _, body = segment.partition("\n")
+    found = _substitutions_in(first_line, quotes=True)
+    opener = HEREDOC_OPEN_RE.search(first_line)
+    if opener is not None and opener.group(3) and body:
+        found.extend(_substitutions_in(body, quotes=False))
+    return found
+
+
+def _substitutions_in(text: str, *, quotes: bool) -> list[str]:
+    """The `$(...)` and backtick substitutions of `text`, outside single quotes when `quotes` is set."""
+    found: list[str] = []
+    quote: str | None = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and quote != "'":
+            i += 2
+            continue
+        if quotes and quote is None and ch in ("'", '"'):
+            quote = ch
+        elif quotes and quote == ch:
+            quote = None
+        elif quote != "'" and text.startswith("$(", i) and not text.startswith("$((", i):
+            end = _closing_paren(text, i + 2)
+            found.append(text[i + 2 : end])
+            i = end + 1
+            continue
+        elif quote != "'" and ch == "`":
+            end = text.find("`", i + 1)
+            end = n if end == -1 else end
+            found.append(text[i + 1 : end])
+            i = end + 1
+            continue
+        i += 1
+    return found
+
+
+def _closing_paren(text: str, start: int) -> int:
+    """The index of the `)` that closes a `(` just before `start` (the end of `text` when none does)."""
+    depth = 1
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return len(text)
 
 
 def _blank_heredoc_openers(line: str) -> str:

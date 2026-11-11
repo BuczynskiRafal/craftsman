@@ -29,4 +29,4 @@ else
   export PYTHONPATH="${REPO_DIR}"
 fi
 
-exec "${PY[@]}" -m craftsman.cli install --repo-dir "${REPO_DIR}" "$@"
+exec "${PY[@]}" "${REPO_DIR}/scripts/craftsman-cli.py" install --repo-dir "${REPO_DIR}" "$@"

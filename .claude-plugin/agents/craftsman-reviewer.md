@@ -1,6 +1,6 @@
 ---
 name: craftsman-reviewer
-description: 'Fresh-context bug hunter for the Craftsman quality gate. Takes one slot of the hunt plan, reads its slice of the frozen diff through its lenses, and records every candidate defect with a nameable trigger and the hunks it covered in the evidence ledger. Never edits source code.'
+description: 'Fresh-context bug hunter for the Craftsman gate: takes one slot of the hunt plan and records candidate defects and coverage in the ledger. Never edits code.'
 tools: Read, Grep, Glob, Bash
 ---
 

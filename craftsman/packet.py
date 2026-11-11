@@ -10,7 +10,9 @@ import re
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
+from craftsman.assets import FRONTMATTER_RE
 from craftsman.diffscan import (
     DiffSnapshot,
     Hunk,
@@ -20,6 +22,13 @@ from craftsman.diffscan import (
     git_output,
 )
 from craftsman.diffscan_paths import is_test_path
+from craftsman.generated import (
+    CRAFTSMAN_BEGIN_MARKER,
+    CRAFTSMAN_END_MARKER,
+    CRAFTSMAN_GENERATED_MARKER,
+    ExportError,
+    find_managed_block,
+)
 from craftsman.ledger import reopened_mentions
 from craftsman.lenses import LENSES
 from craftsman.records import FieldError, Ledger, QualitySignal, Round, SignalKind
@@ -59,6 +68,11 @@ _CONVENTION_GLOBS = (
     ".cursor/rules/*.mdc",
 )
 _NESTED_CONVENTION_FILES = ("AGENTS.md", "CLAUDE.md")
+MAX_CONVENTION_SCAN_BYTES = 200_000  # a larger file is listed without looking for Craftsman's own text in it
+_MANAGED_BLOCK_NOTE = (
+    f"contains a Craftsman section between `{CRAFTSMAN_BEGIN_MARKER}` and `{CRAFTSMAN_END_MARKER}`; "
+    "that section is not a project convention"
+)
 _FENCE_LANGUAGES = {
     ".py": "python",
     ".pyi": "python",
@@ -128,16 +142,22 @@ def collect_context(
     ledger: Ledger,
     index: WorktreeIndex,
     full_hunks: Collection[str] = (),
+    view_hunks: Collection[str] | None = None,
 ) -> PacketContext:
     """Gather commits, conventions, scopes and references for the hunks under review.
 
     A carried hunk is a one-line stub, except those named in `full_hunks`: a slot can own carried hunks
-    (a sweep spans the whole round), and the view of such a slot must show their code.
+    (a sweep spans the whole round), and the view of such a slot must show their code. A view renders the
+    references of the hunks it shows (`view_hunks`) only, so only theirs are searched for.
     """
     shown_in_full = frozenset(full_hunks)
     carried = {hunk.id for hunk in round_.hunks if hunk.carried and hunk.id not in shown_in_full}
     open_hunks = [hunk for hunk in snap.hunks if hunk.id not in carried]
     open_symbols = {hunk.id: symbols.get(hunk.id, ()) for hunk in open_hunks}
+    viewed = None if view_hunks is None else frozenset(view_hunks)
+    rendered = {
+        hunk_id: items for hunk_id, items in open_symbols.items() if viewed is None or hunk_id in viewed
+    }
     return PacketContext(
         snap=snap,
         round=round_,
@@ -146,7 +166,7 @@ def collect_context(
         conventions=_conventions(root, snap.files),
         scopes={hunk.id: index.hunk_scope(hunk) for hunk in snap.hunks},
         symbols=open_symbols,
-        references=_references(index, open_hunks, open_symbols),
+        references=_references(index, open_hunks, open_symbols, wanted=rendered),
         signals_by_hunk=_signals_by_hunk(snap.hunks),
         carried_from={
             hunk_id: found
@@ -154,7 +174,7 @@ def collect_context(
             if hunk_id not in shown_in_full
         },
         reopened=reopened_mentions(round_, snap.hunks, symbols),
-        test_files_by_symbol=_test_files_by_symbol(index, open_symbols),
+        test_files_by_symbol=_test_files_by_symbol(index, rendered),
         last_runs=_last_runs(ledger, snap),
         unscanned_files=files_without_signal_patterns(snap),
     )
@@ -172,6 +192,7 @@ def _commits(root: Path, base_sha: str) -> tuple[str, ...]:
 
 
 def _conventions(root: Path, changed_files: Sequence[str]) -> tuple[str, ...]:
+    """The convention files to read, without those that hold nothing but Craftsman's own text."""
     found = [name for name in _CONVENTION_FILES if (root / name).is_file()]
     for pattern in _CONVENTION_GLOBS:
         found.extend(
@@ -185,13 +206,54 @@ def _conventions(root: Path, changed_files: Sequence[str]) -> tuple[str, ...]:
                 candidate = (directory / name).as_posix()
                 if (root / candidate).is_file():
                     found.append(candidate)
-    return tuple(dict.fromkeys(found))
+    entries = []
+    for name in dict.fromkeys(found):
+        share = _craftsman_share(root / name)
+        if share != "all":
+            entries.append(f"{name} ({_MANAGED_BLOCK_NOTE})" if share == "part" else name)
+    return tuple(entries)
+
+
+def _craftsman_share(path: Path) -> Literal["all", "part", "none"]:
+    """How much of the file Craftsman wrote: a generated file or one holding only its managed block is
+    `all`, a file with a managed block among other text `part`. A file that cannot be read as UTF-8 text,
+    is too large, or has markers that do not form one block is `none`, so it is listed as written."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(MAX_CONVENTION_SCAN_BYTES + 1)
+        text = raw.decode("utf-8-sig") if len(raw) <= MAX_CONVENTION_SCAN_BYTES else None
+    except (OSError, UnicodeDecodeError):
+        return "none"
+    if text is None:
+        return "none"
+    if _opens_with_generated_marker(text):
+        return "all"
+    try:
+        span = find_managed_block(text, path)
+    except ExportError:
+        return "none"
+    if span is None or text[span[0] - 1 : span[0]] not in ("", "\n"):  # markers quoted inside a line are prose
+        return "none"
+    return "part" if (text[: span[0]] + text[span[1] :]).strip() else "all"
+
+
+def _opens_with_generated_marker(text: str) -> bool:
+    """Whether the generated marker is the first line of `text` after any front matter, where every
+    Craftsman writer puts it: a project file that only quotes the marker stays the project's."""
+    match = FRONTMATTER_RE.match(text)
+    body = match.group(2) if match else text
+    return body.lstrip().partition("\n")[0].strip() == CRAFTSMAN_GENERATED_MARKER
 
 
 def _references(
-    index: WorktreeIndex, hunks: Sequence[Hunk], symbols: Mapping[str, tuple[str, ...]]
+    index: WorktreeIndex,
+    hunks: Sequence[Hunk],
+    symbols: Mapping[str, tuple[str, ...]],
+    *,
+    wanted: Mapping[str, tuple[str, ...]],
 ) -> dict[str, tuple[Reference, ...]]:
-    """Ranked references to each symbol, excluding the changed lines of the hunks that define it.
+    """Ranked references to the symbols of the `wanted` hunks, excluding the changed lines of every
+    hunk in `hunks` that defines the symbol.
 
     Real call sites come first, then test uses, imports and prose. The list is cut only after
     ranking, and the render shows fewer than are kept so it can say how many more there are.
@@ -200,8 +262,11 @@ def _references(
     for hunk in hunks:
         for symbol in symbols.get(hunk.id, ()):
             owners.setdefault(symbol, []).append(hunk)
+    searched = {symbol for items in wanted.values() for symbol in items}
     references: dict[str, tuple[Reference, ...]] = {}
     for symbol, defining in owners.items():
+        if symbol not in searched:
+            continue
         defined_in = {hunk.path for hunk in defining}
         outside = [
             ref for ref in index.mentions(symbol) if not any(inside_hunk(ref, hunk) for hunk in defining)

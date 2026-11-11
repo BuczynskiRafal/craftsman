@@ -1,10 +1,9 @@
 ---
 name: feature-dev
 description: >-
-  Build a non-trivial feature by first learning how the codebase already solves
-  similar problems, settling open questions with the user, choosing a design on
-  explicit trade-offs, and then implementing it in small verified steps. Use
-  when /feature-dev is invoked or as the feature track of /craftsman.
+  Build a non-trivial feature: learn how the codebase solves similar problems,
+  settle open questions, pick a design, build in verified steps. Use for
+  /feature-dev or as the feature track of /craftsman.
 ---
 
 # Feature development (`/feature-dev <what to build>`)

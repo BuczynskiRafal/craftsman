@@ -17,17 +17,21 @@ from craftsman.diffscan import (
     resolve_base_sha,
     snapshot,
 )
+from craftsman.generated import CRAFTSMAN_BEGIN_MARKER, CRAFTSMAN_END_MARKER, CRAFTSMAN_GENERATED_MARKER
 from craftsman.packet import (
+    MAX_CONVENTION_SCAN_BYTES,
     PacketContext,
     collect_context,
     expand_hunk_spec,
     render_packet,
     render_packet_view,
 )
+from craftsman.platforms.agents_md import export_to_agents_workspace
+from craftsman.platforms.copilot import export_to_workspace
 from craftsman.records import FieldError, HunkRef, Ledger, QualitySignal, Round, SignalKind
 from craftsman.worktree_index import Reference, Scope, WorktreeIndex
 
-from tests.support import GitRepo, record_run
+from tests.support import REPO_ROOT, GitRepo, record_run
 
 PREPARED_AT = "2026-01-01T00:00:00.000Z"
 TWO_FUNCTIONS = (
@@ -246,6 +250,162 @@ class CollectContextTests(unittest.TestCase):
                 "changelog/README.rst",
             ),
         )
+
+    def two_definitions_of_compute_total(self) -> str:
+        """H1 and H2 both change `compute_total` (H2's changed line calls it), H3 changes `scale`."""
+        self.repo.write("a.py", "def compute_total(items):\n    return sum(items)\n")
+        self.repo.write("b.py", "def compute_total(items):\n    return len(items)\n")
+        self.repo.write("c.py", "def scale(value):\n    return value\n")
+        uses = ("from a import compute_total", "from c import scale", "scale(compute_total([1]))")
+        self.repo.write("use.py", "\n".join(uses) + "\n")
+        self.repo.write("tests/test_use.py", "from c import scale\n")
+        base = self.repo.commit()
+        self.repo.write("a.py", "def compute_total(items):\n    return sum(items) * 2\n")
+        self.repo.write("b.py", "def compute_total(items):\n    return len(items) or compute_total(0)\n")
+        self.repo.write("c.py", "def scale(value):\n    return value * 2\n")
+        return base
+
+    def view_context(self, base: str, assigned: tuple[str, ...], *, view: bool) -> PacketContext:
+        snap = snapshot(self.repo.root, base)
+        index = WorktreeIndex(self.repo.root)
+        symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
+        return collect_context(
+            self.repo.root,
+            snap,
+            round_for(snap),
+            "task",
+            symbols=symbols,
+            ledger=Ledger(),
+            index=index,
+            full_hunks=assigned,
+            view_hunks=assigned if view else None,
+        )
+
+    def test_a_view_searches_only_the_symbols_of_the_hunks_it_shows(self) -> None:
+        base = self.two_definitions_of_compute_total()
+
+        search = WorktreeIndex.mentions
+        with mock.patch.object(WorktreeIndex, "mentions", autospec=True, side_effect=search) as spy:
+            ctx = self.view_context(base, ("H1",), view=True)
+
+        self.assertEqual({call.args[1] for call in spy.call_args_list}, {"compute_total"})
+        self.assertEqual(set(ctx.references), {"compute_total"})
+        self.assertEqual(set(ctx.symbols), {"H1", "H2", "H3"})
+
+    def test_a_view_renders_as_if_every_reference_had_been_collected(self) -> None:
+        base = self.two_definitions_of_compute_total()
+
+        def view_of(assigned: tuple[str, ...], *, view: bool) -> str:
+            ctx = self.view_context(base, assigned, view=view)
+            return render_packet_view(ctx, assigned_hunks=assigned)
+
+        for assigned in (("H1",), ("H2",), ("H3",), ("H1", "H3"), ("H1", "H2", "H3")):
+            with self.subTest(assigned=assigned):
+                self.assertEqual(view_of(assigned, view=True), view_of(assigned, view=False))
+        # H2 defines `compute_total` too, so its lines are no references to it, even in a view of H1.
+        self.assertNotIn("b.py:", view_of(("H1",), view=True))
+
+    def edited_app(self) -> str:
+        """Commit `app.py` (and what the test wrote before), edit it, and return the base."""
+        self.repo.write("app.py", "x = 1\n")
+        base = self.repo.commit()
+        self.repo.write("app.py", "x = 2\n")
+        return base
+
+    def test_craftsmans_own_workspace_files_are_not_conventions(self) -> None:
+        export_to_agents_workspace(REPO_ROOT, self.repo.root)
+        export_to_workspace(REPO_ROOT, self.repo.root)
+        for name in ("AGENTS.md", ".cursor/rules/craftsman.mdc", ".github/copilot-instructions.md"):
+            self.assertTrue((self.repo.root / name).is_file(), name)
+
+        self.assertEqual(self.context(self.edited_app()).conventions, ())
+
+    def test_a_nested_agents_file_that_holds_only_the_managed_block_is_not_a_convention(self) -> None:
+        (self.repo.root / "pkg").mkdir()
+        export_to_agents_workspace(REPO_ROOT, self.repo.root)
+        (self.repo.root / "pkg" / "AGENTS.md").write_text(
+            (self.repo.root / "AGENTS.md").read_text(encoding="utf-8") + "\n\n", encoding="utf-8"
+        )
+        self.repo.write("pkg/mod.py", "x = 1\n")
+        base = self.repo.commit()
+        self.repo.write("pkg/mod.py", "x = 2\n")
+
+        self.assertEqual(self.context(base).conventions, ())
+
+    def test_a_file_with_the_managed_block_and_other_text_stays_listed_with_a_note(self) -> None:
+        self.repo.write("AGENTS.md", "# House rules\n\nRun the linter before you commit.\n")
+        self.repo.write(".github/copilot-instructions.md", "Prefer small commits.\n")
+        export_to_agents_workspace(REPO_ROOT, self.repo.root)
+        export_to_workspace(REPO_ROOT, self.repo.root)
+
+        listed = self.context(self.edited_app()).conventions
+
+        note = (
+            f"(contains a Craftsman section between `{CRAFTSMAN_BEGIN_MARKER}` and `{CRAFTSMAN_END_MARKER}`; "
+            "that section is not a project convention)"
+        )
+        self.assertEqual(listed, (f"AGENTS.md {note}", f".github/copilot-instructions.md {note}"))
+
+    def test_the_note_reaches_the_rendered_section(self) -> None:
+        self.repo.write("AGENTS.md", "Keep functions short.\n")
+        export_to_agents_workspace(REPO_ROOT, self.repo.root)
+        base = self.edited_app()
+
+        text = render_packet(self.context(base))
+
+        self.assertIn("## Conventions to read first\n- AGENTS.md (contains a Craftsman section between", text)
+        self.assertIn("that section is not a project convention)", text)
+
+    def test_a_file_that_is_only_whitespace_around_the_block_is_not_a_convention(self) -> None:
+        self.repo.write("CLAUDE.md", f"\n\n{CRAFTSMAN_BEGIN_MARKER}\nrules\n{CRAFTSMAN_END_MARKER}\n\n  \n")
+
+        self.assertEqual(self.context(self.edited_app()).conventions, ())
+
+    def test_a_file_with_the_generated_marker_is_not_a_convention(self) -> None:
+        self.repo.write(".cursor/rules/own.mdc", f"---\nalwaysApply: true\n---\n\n{CRAFTSMAN_GENERATED_MARKER}\n\nrules\n")
+        self.repo.write(".cursor/rules/mine.mdc", "---\nalwaysApply: true\n---\n\nUse tabs.\n")
+
+        self.assertEqual(self.context(self.edited_app()).conventions, (".cursor/rules/mine.mdc",))
+
+    def test_a_project_file_that_quotes_the_markers_stays_listed_as_written(self) -> None:
+        self.repo.write("AGENTS.md", f"# Rules\n\nNever edit a file that starts with `{CRAFTSMAN_GENERATED_MARKER}`.\n")
+        self.repo.write("CLAUDE.md", f"Craftsman keeps its text between {CRAFTSMAN_BEGIN_MARKER} and {CRAFTSMAN_END_MARKER}.\n")
+
+        self.assertEqual(self.context(self.edited_app()).conventions, ("AGENTS.md", "CLAUDE.md"))
+
+    def test_crlf_and_byte_order_marks_do_not_hide_craftsmans_own_text(self) -> None:
+        block = f"{CRAFTSMAN_BEGIN_MARKER}\nrules\n{CRAFTSMAN_END_MARKER}\n"
+        (self.repo.root / "AGENTS.md").write_bytes(f"﻿{block}".encode())
+        (self.repo.root / "CLAUDE.md").write_bytes(f"Use tabs.\n\n{block}".replace("\n", "\r\n").encode())
+        generated = f"---\nalwaysApply: true\n---\n\n{CRAFTSMAN_GENERATED_MARKER}\n\nrules\n"
+        (self.repo.root / ".cursor" / "rules").mkdir(parents=True)
+        (self.repo.root / ".cursor" / "rules" / "own.mdc").write_bytes(generated.replace("\n", "\r\n").encode())
+
+        self.assertEqual(
+            self.context(self.edited_app()).conventions,
+            (
+                "CLAUDE.md (contains a Craftsman section between "
+                f"`{CRAFTSMAN_BEGIN_MARKER}` and `{CRAFTSMAN_END_MARKER}`; that section is not a project convention)",
+            ),
+        )
+
+    def test_files_that_cannot_be_judged_stay_listed_as_they_are(self) -> None:
+        block = f"{CRAFTSMAN_BEGIN_MARKER}\nrules\n{CRAFTSMAN_END_MARKER}\n"
+        self.repo.write("AGENTS.md", block.replace("rules", "r" * (MAX_CONVENTION_SCAN_BYTES + 1)))
+        (self.repo.root / "CLAUDE.md").write_bytes(b"\xff\xfe" + block.encode())
+        self.repo.write("GEMINI.md", block + block)  # two blocks: the markers do not enclose one
+        self.repo.write("CONTRIBUTING.md", f"{CRAFTSMAN_END_MARKER}\n{CRAFTSMAN_BEGIN_MARKER}\n")
+
+        self.assertEqual(
+            self.context(self.edited_app()).conventions,
+            ("AGENTS.md", "CLAUDE.md", "GEMINI.md", "CONTRIBUTING.md"),
+        )
+
+    def test_a_convention_file_that_cannot_be_opened_stays_listed(self) -> None:
+        self.repo.write("AGENTS.md", "Be kind.\n")
+
+        with mock.patch.object(Path, "open", side_effect=PermissionError("denied")):
+            self.assertEqual(packet._conventions(self.repo.root, ["app.py"]), ("AGENTS.md",))
 
     def test_long_function_is_shown_around_a_hunk_in_its_middle(self) -> None:
         body = "".join(f"    line_{index} = {index}\n" for index in range(2, 301))

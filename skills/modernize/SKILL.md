@@ -1,11 +1,9 @@
 ---
 name: modernize
 description: >-
-  Change legacy or poorly understood code safely: write down the rules the code
-  actually enforces, pin them with characterization tests against the current
-  implementation, transform in small steps, and prove equivalence (or document
-  every intended difference). Use when /modernize is invoked or as the legacy
-  track of /craftsman.
+  Change legacy or poorly understood code safely with characterization tests
+  and small proven steps. Use for /modernize or as the legacy track of
+  /craftsman.
 ---
 
 # Modernize (`/modernize <module or area> [goal]`)

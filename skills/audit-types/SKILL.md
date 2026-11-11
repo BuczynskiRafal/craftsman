@@ -1,11 +1,8 @@
 ---
 name: audit-types
 description: >-
-  Audit data structures and type design: for each new or changed type, lists
-  its invariants, the illegal states it still allows (with a constructing
-  example), where each invariant is enforced, and the smallest redesign that
-  makes the illegal states unrepresentable. Use when /audit-types is invoked
-  or via /audit types.
+  Audit data structures and type design for the illegal states they still
+  allow. Use for /audit-types or /audit types.
 ---
 
 # Type & data-model audit (`/audit-types [target]`)

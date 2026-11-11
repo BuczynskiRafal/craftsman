@@ -1,11 +1,9 @@
 ---
 name: simplify
 description: >-
-  Behavior-preserving cleanup of the current diff: removes duplication with
-  existing helpers, needless complexity, dead weight, dishonest names or
-  comments, and wasted work, then proves behavior is unchanged by re-running
-  the same checks. Not a bug hunt (use /craft-review). Use when /simplify is
-  invoked or as the last step of the /craftsman build.
+  Behavior-preserving cleanup of the current diff: duplication, needless
+  complexity, dead weight, dishonest names. Not a bug hunt. Use for /simplify
+  or as the last build step of /craftsman.
 ---
 
 # Simplify (`/simplify [path | ref]`)

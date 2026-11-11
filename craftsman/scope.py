@@ -2,7 +2,9 @@
 
 Models scope checks as candidate paths against forbidden zones:
 1. Extract candidate paths from shell commands (any non-flag argument that looks like a path or
-   exists on disk after `~` and environment-variable expansion) or structured IDE tool inputs.
+   exists on disk after `~` and environment-variable expansion), the files of `<` redirections and the
+   commands of `$(...)` / backtick substitutions, or structured IDE tool inputs. A shell line without a program
+   word (`D=x`, `> out`) is judged by those alone.
 2. Allow paths that resolve inside the active git work tree, its own `<git-dir>/craftsman`
    directory, or `craftsman.scopeAllow` (excluding other worktrees' git directories).
 3. Outside those roots, deny recursive searches and deny non-recursive reads targeting session
@@ -37,7 +39,13 @@ from craftsman.ledger import ledger_path_for
 from craftsman.paths import user_home
 from craftsman.records import CRAFTSMAN_AGENTS, AgentRole, LedgerError, craftsman_agent_name
 from craftsman.review_guard import arm_for_review_command, review_in_progress
-from craftsman.shell import HEREDOC_OPEN_RE, iter_simple_commands, split_shell_events
+from craftsman.shell import (
+    HEREDOC_OPEN_RE,
+    command_substitutions,
+    input_redirection_targets,
+    iter_simple_commands,
+    split_shell_events,
+)
 from craftsman.streams import configure_std_streams
 from craftsman.tool_names import READ_PATH_KEYS, READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
 from craftsman.transcript import TranscriptError, decode_arg, parent_conversation, subagent_role
@@ -373,8 +381,16 @@ def _has_unmatched_quotes(command_line: str) -> bool:
     return False
 
 
+SUBSTITUTION_DEPTH = 4
+
+
 def _evaluate_shell(
-    command_line: str, cwd: Path, repo_root: Path, policy: ScopePolicy, protected: Sequence[Path]
+    command_line: str,
+    cwd: Path,
+    repo_root: Path,
+    policy: ScopePolicy,
+    protected: Sequence[Path],
+    depth: int = SUBSTITUTION_DEPTH,
 ) -> ScopeDecision:
     if not command_line.strip():
         return ScopeDecision("allow")
@@ -382,13 +398,34 @@ def _evaluate_shell(
         sys.stderr.write("craftsman scope: blocking unparseable shell command (unmatched quotes)\n")
         return _deny(f"`{command_line.strip()[:80]}`", "has unmatched quotes")
     for simple in iter_simple_commands(command_line, str(cwd)):
+        eff_cwd = Path(simple.cwd) if simple.cwd else cwd
+        # What a command runs and reads besides its program: the substitutions inside its words and the files of
+        # its `<` redirections. A line without a program word is judged by these alone.
+        for inner in command_substitutions(simple.segment) if depth > 0 else ():
+            decision = _evaluate_shell(inner, eff_cwd, repo_root, policy, protected, depth - 1)
+            if decision.decision == "deny":
+                return decision
+        for raw in input_redirection_targets(simple.segment):
+            decision = _check_target(
+                _to_path(_expand_vars(raw), eff_cwd),
+                is_recursive=False,
+                repo_root=repo_root,
+                policy=policy,
+                label=f"`< {raw}`",
+                protected=protected,
+            )
+            if decision.decision == "deny":
+                return decision
+        if not simple.tokens:
+            # No program word: an assignment alone (`D=x`, `D=$(...)` whose command is a segment of its own), an
+            # empty command, or redirections alone (`> out` creates a file, which the command policy judges).
+            continue
         kind = _classify_shell_tool(simple.tokens)
         if kind == "ignore":
             continue
         label = f"`{' '.join(simple.tokens)}`"
         if kind in ("locate", "mdfind_global"):
             return _deny(label)
-        eff_cwd = Path(simple.cwd) if simple.cwd else cwd
         is_rec = kind == "recursive"
         targets = _extract_path_candidates(simple.tokens[1:], eff_cwd) or ([eff_cwd] if is_rec else [])
         for target in targets:

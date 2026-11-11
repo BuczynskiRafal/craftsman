@@ -1,11 +1,9 @@
 ---
 name: verify
 description: >-
-  Runtime verification of a change: runs the project's checks and then exercises
-  the changed behavior for real (CLI, script, server request, pipeline run,
-  headless UI), recording every execution in the Craftsman ledger so the gate
-  can see exit codes at the final state of the code. Use when /verify is
-  invoked or as the verification step of /craftsman.
+  Runtime verification of a change: run the checks, exercise the changed
+  behavior for real and record every run in the ledger. Use for /verify or as
+  the verification step of /craftsman.
 ---
 
 # Verify (`/verify [target]`)

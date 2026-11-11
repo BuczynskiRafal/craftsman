@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from craftsman import antigravity, command_policy, hooks, review_guard
+from craftsman import antigravity, command_policy, hook_errors, hooks, review_guard
 from craftsman.attribution import agent_runs
 from craftsman.gate import MAX_CONTINUATION_REASON_CHARS, MAX_CONTINUATIONS
 from craftsman.gatecheck import MAX_ROUNDS
 from craftsman.hooks import HookInput, HookInputError
 from craftsman.huntview import hunk_ranges
-from craftsman.ledger import load
+from craftsman.ledger import holds_lock, load
 from craftsman.subagent_stop import REVIEWER_STOP_REASON
 
 from tests.support import EvidenceRepo, coverage_note
@@ -101,6 +101,10 @@ class HookTestCase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config_dir)})
         env.start()
         self.addCleanup(env.stop)
+        # Hunters started together here would be held back for seconds (`launch_stagger`); no test waits.
+        stagger = mock.patch("craftsman.launch_stagger.sleep")
+        self.stagger_sleep = stagger.start()
+        self.addCleanup(stagger.stop)
 
     @property
     def state_file(self) -> Path:
@@ -476,7 +480,7 @@ class ReviewStopGuardTests(HookTestCase):
         reason = self.stop()["reason"]
 
         self.assertIn("[no-isolation]", reason)  # no craftsman subagent was recorded at all
-        self.assertIn("W1-1..W1-3", reason)
+        self.assertIn("W1-1, W1-2; W1-3 [Claude Code: model haiku]", reason)  # the simplicity slot is marked
         self.assertNotIn("review cover --hunks", reason)
 
     def test_a_finished_review_lets_the_agent_stop_once(self) -> None:
@@ -1058,7 +1062,7 @@ class SubagentTests(HookTestCase):
         call_hook("subagent-start", "claude", claude("SubagentStart", self.root, **reviewer))
         path = self.agent_transcript("{}")
 
-        with mock.patch("craftsman.hooks.read_transcript", side_effect=KeyboardInterrupt):
+        with mock.patch("craftsman.usage.read_transcript", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):  # the hook is killed while it reads
                 call_hook(
                     "subagent-stop",
@@ -1091,7 +1095,7 @@ class SubagentTests(HookTestCase):
         self.assertNotIn("usage", event)
 
     def test_a_telemetry_crash_never_fails_the_stop(self) -> None:
-        with mock.patch("craftsman.hooks.read_transcript", side_effect=RuntimeError("boom")):
+        with mock.patch("craftsman.usage.read_transcript", side_effect=RuntimeError("boom")):
             event = self.stop_recording_coverage(agent_transcript_path=str(self.root / "x.jsonl"))
 
         self.assertNotIn("usage", event)
@@ -1319,7 +1323,7 @@ class PreToolTests(HookTestCase):
 
     def test_non_scope_checked_tools_skip_load_scope_policy_subprocesses(self) -> None:
         self.repo.cli("gate", "--init", "--cwd", ".")
-        with mock.patch("craftsman.hooks.load_scope_policy") as mock_policy:
+        with mock.patch("craftsman.scope.load_scope_policy") as mock_policy:
             for tool in ("Edit", "Write", "editFiles", "replace_string_in_file"):
                 out, _ = call_hook(
                     "pre-tool",
@@ -2480,6 +2484,124 @@ class BoundSlotTests(HookTestCase):
         self.assertEqual(shown[second], "unlaunched")  # nobody works on it: launch it, it is not a dead slot
         checked = self.repo.cli("review", "check", "--review-only", check=False).stdout
         self.assertNotIn(f"{second} (dead", checked)
+
+
+class LaunchStaggerTests(HookTestCase):
+    """Hunters and verifiers started together on Claude Code: every start but the first is held back."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.init()
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+        self.moment = datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc)
+
+    def start(self, agent_id: str, after_s: float, agent: str = "craftsman-reviewer") -> dict[str, Any]:
+        """A Claude Code subagent starts `after_s` seconds after `self.moment`; the hook's answer."""
+        payload = claude("SubagentStart", self.root, agent_id=agent_id, agent_type=agent)
+        with mock.patch("craftsman.hooks._now", return_value=self.moment + timedelta(seconds=after_s)):
+            return call_hook("subagent-start", "claude", payload)[0]
+
+    def test_the_first_start_of_a_burst_does_not_wait(self) -> None:
+        self.start("r-1", 0)
+
+        self.stagger_sleep.assert_not_called()
+
+    def test_a_follower_waits_until_the_first_start_plus_the_stagger(self) -> None:
+        self.start("r-1", 0)
+        self.start("r-2", 1.5)
+        self.start("r-3", 2)
+
+        self.assertEqual(self.stagger_sleep.call_args_list, [mock.call(3.5), mock.call(3.0)])
+
+    def test_a_follower_waits_after_its_start_is_recorded_and_every_lock_is_released(self) -> None:
+        seen: list[tuple[int, bool, bool]] = []
+
+        def wait(seconds: float) -> None:
+            ledger_path = self.repo.ledger_dir / "ledger.json"
+            starts = [event for event in load(ledger_path).agents if event.event == "start"]
+            seen.append((len(starts), holds_lock(ledger_path), holds_lock(self.state_file)))
+
+        self.stagger_sleep.side_effect = wait
+        self.start("r-1", 0)
+        self.start("r-2", 1)
+
+        self.assertEqual(seen, [(2, False, False)])
+
+    def test_the_held_back_answer_is_the_briefing_the_first_start_gets(self) -> None:
+        first = self.start("r-1", 0)
+        second = self.start("r-2", 1)
+
+        self.stagger_sleep.assert_called_once()
+        self.assertEqual(second, first)
+        self.assertIn("Craftsman review round 1.", first["hookSpecificOutput"]["additionalContext"])
+
+    def test_a_start_outside_the_window_and_one_of_another_role_or_agent_do_not_wait(self) -> None:
+        self.start("r-1", 0)
+        self.start("v-1", 1, "craftsman-verifier")
+        self.start("e-1", 1, "Explore")
+        self.start("r-2", 5)
+
+        self.stagger_sleep.assert_not_called()
+
+    def test_a_failure_in_the_stagger_neither_waits_nor_changes_the_answer(self) -> None:
+        first = self.start("r-1", 0)
+        with mock.patch("craftsman.launch_stagger.stagger_s", side_effect=RuntimeError("boom")):
+            second = self.start("r-2", 1)
+        self.stagger_sleep.side_effect = OSError("interrupted")
+        third = self.start("r-3", 2)
+
+        self.assertEqual(second, first)
+        self.assertEqual(third, first)
+        self.assertEqual(self.stagger_sleep.call_count, 1)  # only the third start's wait, which failed
+        self.assertFalse(hook_errors.log_path(self.repo.ledger_dir).exists())
+        self.assertEqual([e["agent_id"] for e in self.ledger()["agents"]], ["r-1", "r-2", "r-3"])
+
+    def test_copilot_starts_are_not_held_back(self) -> None:
+        cli = copilot_cli(self.root, agentName="craftsman-reviewer")
+        vs_code = vscode("SubagentStart", self.root, agent_type="craftsman-reviewer")
+        for _ in range(3):
+            call_hook("subagent-start", "copilot", cli)
+            call_hook("subagent-start", "copilot", vs_code)
+
+        self.assertEqual(len(self.ledger()["agents"]), 6)
+        self.stagger_sleep.assert_not_called()
+
+    def test_a_start_recorded_without_a_gate_for_the_current_round_is_held_back_outside_the_ledger_lock(
+        self,
+    ) -> None:
+        self.state_file.unlink()  # no gate state to lock: the start is recorded for the current round
+        locks: list[bool] = []
+        self.stagger_sleep.side_effect = lambda seconds: locks.append(
+            holds_lock(self.repo.ledger_dir / "ledger.json")
+        )
+        self.start("r-1", 0)
+        self.start("r-2", 1)
+
+        self.stagger_sleep.assert_called_once_with(4.0)
+        self.assertEqual(locks, [False])
+
+    def test_a_start_that_took_the_lock_second_but_read_the_clock_first_is_held_back(self) -> None:
+        self.start("r-1", 1)
+        self.start("r-2", 0.999)  # its hook read the clock first and then queued for the ledger lock
+
+        self.stagger_sleep.assert_called_once_with(5.0)
+
+    def test_a_resumed_agent_is_not_held_back(self) -> None:
+        self.start("r-1", 0)
+        self.start("r-1", 1)
+
+        self.stagger_sleep.assert_not_called()
+
+    def test_a_hook_run_that_fails_after_holding_back_neither_waits_nor_makes_a_later_run_wait(self) -> None:
+        self.start("r-1", 0)
+        with mock.patch("craftsman.hooks.briefing", side_effect=RuntimeError("boom")):
+            failed = self.start("r-2", 1)
+        self.start("e-1", 1.5, "Explore")
+        call_hook("stop", "claude", claude("Stop", self.root))
+
+        self.assertIn("boom", json.dumps(failed))
+        self.stagger_sleep.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,12 @@ requires an isolated reviewer for every round with hunks to review. Another sess
 leave the gate alone (its Stop runs its own review guard); its subagents are recorded all the same, since
 one ledger serves the checkout.
 
+`craftsman hook` enters through `craftsman.hook_fast`, which answers a read-only `pre-tool` call outside
+an active gate itself, with the `{}` this module would give, and hands every other call here with the
+input it read. What only some events need (the scope guard, the review guard, transcript reading) is
+imported by the handlers that use it, so a `pre-tool` call loads the command policy, the gate and little
+else.
+
 A hook never crashes the session it serves. When an event cannot be handled, `pre-tool` asks the
 user to confirm the tool call (Copilot denies it), and every other event lets the agent go on with
 a `systemMessage` that says the gate was not checked. Nothing a hook survives is silent: a crash, a transcript
@@ -40,7 +46,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Literal, NoReturn, get_args
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, get_args
 
 from craftsman import hook_errors
 from craftsman.attribution import agent_runs, pair_unnamed_stop
@@ -55,7 +61,7 @@ from craftsman.diffscan import (
     DiffScanError,
     resolve_base_sha,
     snapshot,
-    worktree_root,
+    worktree_paths,
 )
 from craftsman.evidence import archive_ledger
 from craftsman.gate import (
@@ -71,6 +77,7 @@ from craftsman.gate import (
     update_state,
 )
 from craftsman.gatecheck import claim_holders, unfinished_slots
+from craftsman.hook_fast import read_stdin
 from craftsman.huntview import hunk_ranges
 from craftsman.ledger import (
     add_agent_event,
@@ -80,6 +87,7 @@ from craftsman.ledger import (
 )
 from craftsman.paths import user_home
 from craftsman.records import (
+    CRAFTSMAN_AGENTS,
     AgentEvent,
     AgentEventKind,
     AgentRole,
@@ -87,25 +95,14 @@ from craftsman.records import (
     LedgerError,
     Round,
     agent_role,
+    craftsman_agent_name,
     format_timestamp,
     parse_timestamp,
 )
-from craftsman.review_guard import (
-    arm_for_review_command,
-    gate_stop_inputs,
-    review_in_progress,
-    serve_review_stop,
-)
-from craftsman.scope import (
-    evaluate_scope,
-    is_craftsman_agent,
-    is_scope_checked_tool,
-    load_scope_policy,
-)
-from craftsman.subagent_stop import REVIEWER_STOP_REASON, verifier_debt
-from craftsman.trigger import detect_trigger, is_review_prompt, review_request, task_from_prompt
-from craftsman.usage import TranscriptFacts, read_transcript
-from craftsman.workspace import arm_marker, end_review_guard
+from craftsman.tool_names import READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
+
+if TYPE_CHECKING:
+    from craftsman.usage import TranscriptFacts
 
 Platform = Literal["copilot", "claude"]
 Event = Literal["prompt", "stop", "subagent-start", "subagent-stop", "pre-tool"]
@@ -185,6 +182,16 @@ def _text(payload: dict[str, Any], *keys: str) -> str:
         if isinstance(value, str) and value.strip():
             return value
     return ""
+
+
+def is_craftsman_agent(agent: str) -> bool:
+    """`scope.is_craftsman_agent`, without importing the scope guard and its Antigravity code."""
+    return craftsman_agent_name(agent) in CRAFTSMAN_AGENTS
+
+
+def is_scope_checked_tool(tool_name: str) -> bool:
+    """`scope.is_scope_checked_tool`, without importing the scope guard."""
+    return tool_name.strip().lower() in SHELL_TOOL_NAMES | READ_TOOL_NAMES | SEARCH_TOOL_NAMES
 
 
 def _agent_name(payload: dict[str, Any]) -> str:
@@ -274,17 +281,18 @@ class Reply:
 
 @dataclass(frozen=True)
 class Session:
-    """The work tree a hook runs in."""
+    """The work tree a hook runs in, and its git directory when known (None: git is asked for it)."""
 
     root: Path
+    git_dir: Path | None = None
 
     @property
     def state_path(self) -> Path:
-        return state_path_for(self.root)
+        return state_path_for(self.root, git_directory=self.git_dir)
 
     @property
     def ledger_path(self) -> Path:
-        return ledger_path_for(self.root)
+        return ledger_path_for(self.root, git_directory=self.git_dir)
 
     @property
     def craftsman_dir(self) -> Path:
@@ -295,9 +303,10 @@ class Session:
 def open_session(cwd: str) -> Session | None:
     """The session for the work tree containing `cwd`, or None outside a git work tree."""
     try:
-        return Session(worktree_root(cwd))
+        root, git_dir = worktree_paths(cwd)
     except DiffScanError:
         return None
+    return Session(root, git_dir)
 
 
 def claim(state: GateState | None, caller: GateOwner) -> GateState | None:
@@ -313,6 +322,9 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
     session = open_session(hook.cwd)
     caller = GateOwner(platform, hook.session_id)
     if event == "prompt" and session is not None:
+        from craftsman.trigger import is_review_prompt, review_request
+        from craftsman.workspace import arm_marker, end_review_guard
+
         if is_review_prompt(hook.prompt):
             deep, task = review_request(hook.prompt)
             arm_marker(session.ledger_path, caller, _now(), fresh=True, deep=deep, task=task)
@@ -322,14 +334,29 @@ def handle(event: Event, platform: Platform, payload: dict[str, Any]) -> Output:
         return on_pre_tool(hook, reply, session, caller)
     if session is None:
         return reply.allow()
+    from craftsman.trigger import detect_trigger
+
+    if event == "subagent-start":
+        from craftsman.launch_stagger import forget
+
+        # Only a start this run records is held back: a run that failed after noting a wait (and so
+        # answered at once) leaves it noted, and a later run in this process must not wait for it. Only
+        # this event notes a wait, so the other events do not load the stagger.
+        forget()
     if not session.state_path.exists() and not (
         event == "prompt" and detect_trigger(hook.prompt) is not None
     ):
         # No gate and none to open: nothing to lock.
-        return serve(event, session, None, hook, reply, caller)[1]
-    return update_state(
-        session.state_path, lambda state: serve(event, session, state, hook, reply, caller)
-    )
+        out = serve(event, session, None, hook, reply, caller)[1]
+    else:
+        out = update_state(
+            session.state_path, lambda state: serve(event, session, state, hook, reply, caller)
+        )
+    if event == "subagent-start":
+        from craftsman.launch_stagger import release
+
+        release()  # a held-back subagent start waits here, outside the gate state and ledger locks
+    return out
 
 
 def _now() -> datetime:
@@ -371,6 +398,8 @@ def serve(
 
 
 def on_non_owner_prompt(session: Session, state: GateState, hook: HookInput, reply: Reply) -> Output:
+    from craftsman.trigger import detect_trigger
+
     if detect_trigger(hook.prompt) is None:
         return reply.allow()
     return reply.inject(
@@ -396,6 +425,8 @@ def after_user_prompt(state: GateState, prompt: str, deep: bool | None) -> GateS
 def on_prompt(
     session: Session, state: GateState | None, hook: HookInput, reply: Reply, caller: GateOwner
 ) -> tuple[GateState | None, Output]:
+    from craftsman.trigger import detect_trigger, task_from_prompt
+
     deep = detect_trigger(hook.prompt)
     owner = caller
     restarted_deep = False  # a restart after a needs-human stop starts as deep as that gate was
@@ -445,6 +476,9 @@ def on_stop(
     caller: GateOwner | None = None,
     hook: HookInput | None = None,
 ) -> tuple[GateState | None, Output]:
+    from craftsman.review_guard import gate_stop_inputs
+    from craftsman.workspace import end_review_guard
+
     if state is None or not state.active:
         guard = review_stop_guard(session, reply, caller) if caller is not None else reply.allow()
         return state, guard
@@ -540,6 +574,8 @@ def review_stop_guard(session: Session, reply: Reply, caller: GateOwner) -> Outp
 
     The decision is `review_guard.decide_review_stop`, the same one for every platform; this only words it.
     """
+    from craftsman.review_guard import serve_review_stop
+
     decision = serve_review_stop(session.root, session.ledger_path, caller, _now())
     if decision.block is not None:
         return reply.block(decision.block)
@@ -620,7 +656,11 @@ def on_subagent_start(session: Session, active: bool, hook: HookInput, reply: Re
     role = agent_role(hook.agent)
     if not active and (role is None or not _has_current_round(session)):
         return reply.allow()
-    ledger, _ = record_agent_event(session, hook, "start", reply.platform)
+    ledger, start = record_agent_event(session, hook, "start", reply.platform)
+    if role is not None:
+        from craftsman.launch_stagger import hold_back
+
+        hold_back(ledger.agents, start)  # `handle` waits it out
     if role is None or not ledger.rounds:
         return reply.allow()
     return reply.inject(briefing(role, ledger))
@@ -778,6 +818,8 @@ def _unfinished_work(
     included), `before` the ledger without it. The decision is made on `after`: judged on `before` no run
     would vouch for what the agent recorded, and every honest hunter would be sent back.
     """
+    from craftsman.subagent_stop import REVIEWER_STOP_REASON, verifier_debt
+
     if not after.rounds:
         return None
     stop_at = parse_timestamp(stop.at)
@@ -858,6 +900,8 @@ def _agent_transcript(session: Session, hook: HookInput, platform: Platform) -> 
     recorded with `records=None` (the hunter is judged by the time window) and the hook error log says so. A
     transcript that cannot be read is logged too.
     """
+    from craftsman.usage import TranscriptFacts, read_transcript
+
     if not hook.agent_transcript_path:
         return TranscriptFacts()
     path = Path(hook.agent_transcript_path)
@@ -895,6 +939,8 @@ def _with_started_agent_name(session: Session, hook: HookInput) -> HookInput:
 
 def _review_in_progress(session: Session) -> int | None:
     """`review_guard.review_in_progress` for the work tree of `session`."""
+    from craftsman.review_guard import review_in_progress
+
     return review_in_progress(session.ledger_path, session.state_path)
 
 
@@ -919,6 +965,8 @@ def _policy_context(hook: HookInput, session: Session | None, caller: GateOwner)
 def _arm_for_review_command(hook: HookInput, review: tuple[str, ...], session: Session, caller: GateOwner) -> None:
     """The main session runs a `craftsman review` command: arm the review guard for it (a `report` only touches)."""
     if arming_action(review) is not None and is_main_session(hook.agent, hook.agent_id):  # no git for other calls
+        from craftsman.review_guard import arm_for_review_command
+
         arm_for_review_command(session.ledger_path, session.state_path, caller, review, _now())
 
 
@@ -959,6 +1007,8 @@ def _enforce_scope(hook: HookInput, reply: Reply, session: Session | None, calle
         return reply.allow()
     if not _serves_owned_gate(session, caller) and not is_craftsman_agent(hook.agent):
         return reply.allow()
+    from craftsman.scope import evaluate_scope, load_scope_policy
+
     policy = load_scope_policy(Path(hook.cwd), session.root)
     if policy.mode == "off":
         return reply.allow()
@@ -1014,20 +1064,13 @@ def _parser() -> _Parser:
     return parser
 
 
-def _read_stdin() -> str:
-    buffer = getattr(sys.stdin, "buffer", None)
-    if buffer is not None:
-        data: bytes = buffer.read()
-        return data.decode("utf-8", errors="replace")
-    return sys.stdin.read()
-
-
 def _emit(out: Output) -> None:
     sys.stdout.write(json.dumps(out) + "\n")
     sys.stdout.flush()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, stdin: str | None = None) -> int:
+    """Answer one hook event; `stdin` is the payload when the caller has read it (`hook_fast.main`)."""
     try:
         args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     except UsageError as exc:
@@ -1036,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     reply = Reply(args.platform, args.event)
     try:
-        payload = json.loads(_read_stdin().strip() or "{}")
+        payload = json.loads((read_stdin() if stdin is None else stdin).strip() or "{}")
     except (OSError, ValueError) as exc:
         with hook_errors.hook_run(args.event, None) as log:
             _emit(failure(reply, f"unreadable hook input: {exc}", log))

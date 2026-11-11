@@ -63,7 +63,13 @@ the Claude Code and Copilot `craftsman hook pre-tool` hook and the Antigravity s
 denies, in this order, for a shell command (a file-writing tool is checked against the same protected places):
 
 - **Hook entry points.** `craftsman hook ...` in every spelling, `python -m craftsman.hooks`, the guard scripts, and
-  inline Python programs that import `craftsman` are run by the platform, never by an agent. What a `python` command
+  inline Python programs that import `craftsman` are run by the platform, never by an agent. Every script named
+  `craftsman-cli.py` is the CLI, so the commands the hooks themselves run are denied as well: the plugin's
+  `bin/craftsman-cli.py`, the checkout's `scripts/craftsman-cli.py` and the `craftsman/craftsman-cli.py` that user-level
+  hooks run. The plugin's launchers are the CLI too (`bin/launcher.sh`, `bin/launcher.cmd`, `bin/craftsman`,
+  `bin/craftsman.cmd`), run directly or through `sh`, `bash`, `dash` or `cmd /c`. These bootstraps, and the Antigravity scripts, put Craftsman's own directory first on `sys.path`, so a
+  project's own `craftsman/` directory never stands in for the guard; no hook starts Craftsman with `python -m`, which
+  would put the project there first. What a `python` command
   line runs is decided by `shell.python_program`; the words of an `env -S "<command line>"` string are read as the command
   they start (`shell.read_env_option`: every spelling of the options that take a value, `-C`'s directory included), so no wrapper hides a command from any rule below.
 - **The evidence.** Writes into `<git-dir>/craftsman/` (the ledger, the gate state, the hook error log; `inbox/` and
@@ -76,6 +82,18 @@ denies, in this order, for a shell command (a file-writing tool is checked again
 - **Roles.** Hunters and verifiers do not re-plan (`review prepare`, `reset`), and the main session does not fetch a
   hunter's brief or record a slot-tagged finding or coverage.
 - **The work tree** (below).
+
+**Read-only fast path.** A call that only reads never waits for this module to load: `craftsman hook pre-tool` first
+runs `craftsman/hook_fast.py`, which imports nothing of Craftsman but the tool names and answers `{}` (allow) when the
+tool is in the policy's read-only set (`READ_ONLY_TOOL_NAMES`, which `decide` allows whatever the call names), no agent
+name contains `craftsman` (the search scope binds Craftsman's agents even without a gate), and every repository git
+could find from the call's `cwd` has no gate or a valid inactive one, read from
+`<git-dir>/craftsman/craftsman_state.json` without running git. For such a call the full handler allows too and changes
+nothing: neither the scope guard nor the claim of a gate runs. Whatever it cannot be sure of (another tool, input the
+handler would reject, an active gate of any session, a state file it cannot read or validate, a git environment
+variable, a `core.worktree` or a `.git` pointer git may read otherwise that could move the repository, a `cwd` inside a
+git directory) goes to the full handler with the payload already read. The fast path never denies, asks or writes, and
+`tests/test_hook_fast.py` holds its answers to the full handler's.
 
 These guards stop low-effort shortcuts; they are not a sandbox. A script file written first and run later, a program
 name or path built by command substitution, and an interpreter that assembles the path at run time pass a shell parser

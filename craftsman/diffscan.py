@@ -105,7 +105,8 @@ def git_time_left(limit: float | None = None) -> float:
     budget = _GIT_BUDGET.get()
     if budget is None:
         return limit
-    return max(0.0, min(limit, budget.deadline - time.monotonic()))
+    # Never more than the budget itself: with a clock that has not ticked, `deadline - now` can round above it.
+    return max(0.0, min(limit, budget.seconds, budget.deadline - time.monotonic()))
 
 
 def note_git_timeout(message: str) -> None:
@@ -251,22 +252,44 @@ def git_output(cwd: Path, *args: str) -> str:
     return out
 
 
+def _path_line(line: str) -> str:
+    """`line` without the line ending git adds (`\\n`, or `\\r\\n` from Git for Windows), keeping blanks."""
+    line = line.removesuffix("\n")
+    return line.removesuffix("\r")
+
+
 def worktree_root(cwd: str | Path) -> Path:
     """Return the root of the git work tree containing `cwd`."""
     directory = _existing_dir(cwd)
     code, out, err = git_text(directory, "rev-parse", "--show-toplevel")
-    if code != 0 or not out.strip():
+    if code != 0 or not _path_line(out):
         raise DiffScanError(f"{directory} is not inside a git work tree: {err.strip()}")
-    return Path(out.strip())
+    return Path(_path_line(out))
 
 
 def git_dir(cwd: str | Path) -> Path:
     """Return the absolute, per-worktree git directory for `cwd`."""
     directory = _existing_dir(cwd)
     code, out, err = git_text(directory, "rev-parse", "--absolute-git-dir")
-    if code != 0 or not out.strip():
+    if code != 0 or not _path_line(out):
         raise DiffScanError(f"{directory} is not inside a git repository: {err.strip()}")
-    return Path(out.strip()).resolve()
+    return Path(_path_line(out)).resolve()
+
+
+def worktree_paths(cwd: str | Path) -> tuple[Path, Path]:
+    """`worktree_root` and `git_dir` of `cwd`, from one git call.
+
+    Raises `DiffScanError` like `worktree_root` where there is no work tree (in a bare repository too).
+    """
+    directory = _existing_dir(cwd)
+    code, out, err = git_text(directory, "rev-parse", "--show-toplevel", "--absolute-git-dir")
+    if code != 0 or not out.strip():
+        raise DiffScanError(f"{directory} is not inside a git work tree: {err.strip()}")
+    lines = [_path_line(line + "\n") for line in out.split("\n")]
+    if len(lines) == 3 and not lines[2].strip() and lines[0] and lines[1]:
+        return Path(lines[0]), Path(lines[1]).resolve()
+    # A line break in a path makes the two answers ambiguous: ask for each on its own.
+    return worktree_root(directory), git_dir(directory)
 
 
 def commit_sha(cwd: str | Path, ref: str) -> str | None:
@@ -277,8 +300,9 @@ def commit_sha(cwd: str | Path, ref: str) -> str | None:
     return out.strip() if code == 0 and out.strip() else None
 
 
-def _base_revision(root: Path, ref: str) -> str:
-    """A commit SHA, or the empty tree for HEAD before the first commit (unborn or orphan branch)."""
+def base_revision(root: Path, ref: str) -> str:
+    """`resolve_base_sha` for a caller that has the work tree root: `ref` as a commit SHA, or the empty
+    tree for HEAD before the first commit (unborn or orphan branch)."""
     sha = commit_sha(root, ref)
     if sha is not None:
         return sha
@@ -292,7 +316,7 @@ def _base_revision(root: Path, ref: str) -> str:
 
 def resolve_base_sha(cwd: str | Path, ref: str | None) -> str:
     """Resolve `ref` (default HEAD) to a full commit SHA; before the first commit, the empty tree."""
-    return _base_revision(worktree_root(cwd), ref or "HEAD")
+    return base_revision(worktree_root(cwd), ref or "HEAD")
 
 
 def repo_file(root: Path, path: str) -> Path:
@@ -339,7 +363,12 @@ def snapshot(
 ) -> DiffSnapshot:
     """Capture changes between `base_sha` and the work tree (all of it, or restricted to `paths`)."""
     root = worktree_root(cwd)
-    base = _base_revision(root, base_sha)
+    return snapshot_at(root, base_revision(root, base_sha), paths)
+
+
+def snapshot_at(root: Path, base: str, paths: Sequence[str] | None = None) -> DiffSnapshot:
+    """`snapshot` for a caller that has the work tree `root` and a `base` that `base_revision` or
+    `resolve_base_sha` returned: git is asked for neither again."""
     filters = None if paths is None else _normalize_filter_paths(paths)
     if filters is not None and not filters:
         return _assemble(base, ())
@@ -686,7 +715,7 @@ def untracked_paths(cwd: str | Path) -> tuple[str, ...]:
 def staged_paths(cwd: str | Path, base_sha: str) -> tuple[str, ...]:
     """Repository-relative paths staged in the index relative to `base_sha` (both sides of renames)."""
     root = worktree_root(cwd)
-    base = _base_revision(root, base_sha)
+    base = base_revision(root, base_sha)
     out = git_output(root, "diff", "--cached", "--name-only", "--no-renames", "-z", base, "--")
     return tuple(sorted({path for path in out.split("\0") if path}))
 

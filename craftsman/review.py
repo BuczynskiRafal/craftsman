@@ -24,7 +24,8 @@ from craftsman.attribution import agent_runs
 from craftsman.diffscan import (
     DiffScanError,
     DiffSnapshot,
-    snapshot,
+    base_revision,
+    snapshot_at,
 )
 from craftsman.evidence import (
     effective_deep,
@@ -39,7 +40,6 @@ from craftsman.gate import (
     GateState,
     GateStateError,
     cli_caller,
-    state_path_for,
     update_state,
 )
 from craftsman.gatecheck import (
@@ -241,7 +241,7 @@ def _prepare(args: argparse.Namespace) -> int:
     sync_antigravity_runs(ws, env)
     ledger = load(ws.ledger_path)
     base_sha = ws.base_sha(ledger, args.base)
-    full_snap = snapshot(ws.root, base_sha)
+    full_snap = snapshot_at(ws.root, base_sha)
     scope, snap, allow_scope_expansion = prepare_scope_and_snapshot(
         ws, ledger, args, base_sha, full_snap
     )
@@ -259,7 +259,7 @@ def _prepare(args: argparse.Namespace) -> int:
     floor, floor_reason = _depth_floor(args, ws, ledger, marker is not None and marker.deep, owned=owned)
     depth = huntplan.decide_depth(snap, floor=floor, floor_reason=floor_reason)
     if ws.state is not None and owned and depth.deep and not ws.state.deep:
-        update_state(state_path_for(ws.root), lambda current: (_raised_to_deep(current), None))
+        update_state(ws.state_path, lambda current: (_raised_to_deep(current), None))
         print("Gate raised to deep: a passing end-to-end run is now required.")
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
@@ -446,8 +446,10 @@ def _packet_context(
     *,
     task: str,
     full_hunks: Sequence[str] = (),
+    view_hunks: Sequence[str] | None = None,
 ) -> PacketContext:
-    """What the packet of `round_` shows; `full_hunks` are shown in full even when carried (slice views)."""
+    """What the packet of `round_` shows; `full_hunks` are shown in full even when carried (slice views),
+    and a view of `view_hunks` shows the references of those hunks only."""
     return collect_context(
         ws.root,
         snap,
@@ -457,6 +459,7 @@ def _packet_context(
         ledger=ledger,
         index=index,
         full_hunks=full_hunks,
+        view_hunks=view_hunks,
     )
 
 
@@ -479,7 +482,10 @@ def _view(args: argparse.Namespace) -> int:
     assigned = view_hunk_ids(round_, args, files)
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
-    ctx = _packet_context(ws, snap, ledger, round_, index, symbols, task=round_.task or ws.task, full_hunks=assigned)
+    ctx = _packet_context(
+        ws, snap, ledger, round_, index, symbols,
+        task=round_.task or ws.task, full_hunks=assigned, view_hunks=assigned,
+    )  # fmt: skip
     slug = view_slug(hunks=assigned) if args.hunks is not None else view_slug(files=files or ())
     view_path = Path(round_.packet_path).with_name(f"packet-{round_.number}.{slug}.md")
     _write_text(view_path, render_packet_view(ctx, assigned_hunks=assigned))
@@ -754,7 +760,7 @@ def _warn_new_out_of_scope(ws: Workspace, ledger: Ledger) -> None:
     latest = ledger.rounds[-1] if ledger.rounds else None
     if not scoped or latest is None or latest.scope is None:
         return
-    full_now = snapshot(ws.root, latest.base_sha)
+    full_now = snapshot_at(ws.root, base_revision(ws.root, latest.base_sha))
     current_out = set(full_now.files) - set(latest.scope)
     new_out = sorted(current_out - set(scoped[0].out_of_scope))
     if new_out:

@@ -20,6 +20,7 @@ from typing import Any
 from craftsman import __version__
 from craftsman.assets import craftsman_agent_names, craftsman_skill_names, parse_frontmatter
 from craftsman.generated import ExportError
+from craftsman.hook_command import MODULE_FORM_PROBLEM, uses_module_form
 from craftsman.legacy_skills import inspect_legacy_skills
 from craftsman.manifest import InstallError, TargetKind
 from craftsman.paths import (
@@ -74,6 +75,7 @@ class HookState(str, Enum):
     NOT_INSTALLED = "not installed"
     OK = "ok"
     BROKEN = "broken"
+    OUTDATED = "outdated"  # it works, but in the form `craftsman install` no longer writes
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,7 @@ class CopilotReport:
 
 class ClaudeHooks(str, Enum):
     MERGED = "merged"
+    OUTDATED = "outdated"  # merged in the form `craftsman install` no longer writes
     MISSING = "missing"
     UNREADABLE = "unreadable"
 
@@ -376,7 +379,11 @@ def inspect_copilot_hooks(hooks_file: Path) -> HooksReport:
     except ValueError as exc:
         return HooksReport(str(hooks_file), HookState.BROKEN, (), f"unparsable hook command: {exc}")
     missing = sorted(exe for exe in executables if not _is_runnable(exe))
-    return HooksReport(str(hooks_file), HookState.BROKEN if missing else HookState.OK, tuple(missing))
+    if missing:
+        return HooksReport(str(hooks_file), HookState.BROKEN, tuple(missing))
+    if any(uses_module_form(str(command)) for command in commands):
+        return HooksReport(str(hooks_file), HookState.OUTDATED, (), MODULE_FORM_PROBLEM)
+    return HooksReport(str(hooks_file), HookState.OK, ())
 
 
 def _agents_installed(directory: Path, names: tuple[str, ...], suffix: str) -> bool:
@@ -399,17 +406,21 @@ def _claude_report(claude_dir: Path) -> ClaudeReport:
         return ClaudeReport(agents, ClaudeHooks.MISSING, _CLAUDE_HOOKS_HINT)
     try:
         hooks = json.loads(settings_file.read_text(encoding="utf-8")).get("hooks", {})
-        merged = all(
-            any(
-                is_craftsman_hook_command(entry.get("command"))
+        ours = {
+            event: [
+                command
                 for group in hooks.get(event, [])
                 for entry in group.get("hooks", [])
-            )
+                if is_craftsman_hook_command(command := entry.get("command"))
+            ]
             for event in CLAUDE_HOOK_EVENTS
-        )
+        }
     except (OSError, ValueError, AttributeError, TypeError) as exc:
         return ClaudeReport(agents, ClaudeHooks.UNREADABLE, f"unreadable {settings_file} ({exc!r})")
-    if merged:
+    if all(ours.values()):
+        if any(uses_module_form(command) for commands in ours.values() for command in commands):
+            detail = f"{MODULE_FORM_PROBLEM}; {_CLAUDE_HOOKS_HINT}"
+            return ClaudeReport(agents, ClaudeHooks.OUTDATED, detail)
         return ClaudeReport(agents, ClaudeHooks.MERGED, "")
     return ClaudeReport(agents, ClaudeHooks.MISSING, _CLAUDE_HOOKS_HINT)
 
@@ -758,10 +769,10 @@ def _platform_problems(
             f"{hooks.path} runs missing programs ({', '.join(hooks.missing)}); "
             "re-run `craftsman install --copilot`"
         )
-    if claude.hooks is ClaudeHooks.UNREADABLE:
+    if claude.hooks in (ClaudeHooks.UNREADABLE, ClaudeHooks.OUTDATED):
         problems.append(f"Claude Code settings: {claude.detail}")
     if (
-        claude.hooks is ClaudeHooks.MERGED
+        claude.hooks in (ClaudeHooks.MERGED, ClaudeHooks.OUTDATED)
         and claude_dir is not None
         and is_claude_plugin_active(claude_dir)
     ):

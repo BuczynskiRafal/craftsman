@@ -83,6 +83,7 @@ class HookForgeryTests(PreToolCase):
         for command in (
             "craftsman hook stop --platform claude",
             "python -m craftsman.cli hook pre-tool --platform copilot",
+            '"/usr/bin/python3" "/usr/lib/python3/site-packages/craftsman/craftsman-cli.py" hook stop --platform claude',
             "env X=1 craftsman.exe hook prompt --platform claude",
             "python3 -m craftsman.hooks stop --platform claude",
             "python -c 'import craftsman.hooks'",
@@ -210,7 +211,7 @@ class LedgerProtectionTests(PreToolCase):
 
     def test_the_protection_does_not_wait_for_the_scope_filter(self) -> None:
         self.init()
-        with mock.patch("craftsman.hooks.load_scope_policy") as policy:
+        with mock.patch("craftsman.scope.load_scope_policy") as policy:
             self.assertDeniedEverywhere(self.writing(self.repo.ledger_dir / "ledger.json"), LEDGER_IS_WRITTEN_BY_THE_CLI)
         policy.assert_not_called()
 
@@ -437,7 +438,7 @@ class ProvenanceTests(th.HookTestCase):
         self.start_reviewer()
         path = self.covering_transcript(self.transcripts)
 
-        with mock.patch("craftsman.hooks.read_transcript", side_effect=RuntimeError("boom")):
+        with mock.patch("craftsman.usage.read_transcript", side_effect=RuntimeError("boom")):
             out, _ = th.call_hook("subagent-stop", "claude", th.claude("SubagentStop", self.root, agent_transcript_path=str(path), **REVIEWER))
 
         self.assertEqual(out, {})

@@ -1,6 +1,6 @@
 {
   "name": "craftsman",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "license": "MIT",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
   "skills": [

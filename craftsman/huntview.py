@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from craftsman.gatecheck import SlotState, SlotStatus
+from craftsman.gatecheck import CHEAPER_MODEL_NOTE, SlotState, SlotStatus
 from craftsman.records import Finding, Round, Slot
 from craftsman.text import defang_tokens
 
@@ -26,7 +26,6 @@ PLATFORM_LABELS = {
     "antigravity": "Antigravity",
     "cli": "Craftsman",
 }
-SIMPLICITY_NOTE = "[Claude Code: model haiku]"
 STATE_LABELS: dict[SlotState, str] = {
     "done": "done",
     "running": "running",
@@ -129,7 +128,7 @@ def plan_lines(statuses: Sequence[SlotStatus], *, with_state: bool) -> list[str]
 def _row_note(status: SlotStatus, *, with_state: bool) -> str:
     notes = [f"[{STATE_LABELS[status.state]}]"] if with_state else []
     if status.slot.kind == "simplicity":
-        notes.append(SIMPLICITY_NOTE)
+        notes.append(CHEAPER_MODEL_NOTE)
     return " ".join(notes)
 
 
