@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,45 @@ class CommandLineTests(unittest.TestCase):
 
         self.assertEqual(result.code, 2)
         self.assertIn("--no-claude-hooks requires --claude-dir", result.err)
+
+    def test_check_requires_a_plugin_target(self) -> None:
+        result = self.export("--check", "--agents-workspace", str(self.tmp))
+
+        self.assertEqual(result.code, 2)
+        self.assertIn("--check requires --claude-plugin or --plugins", result.err)
+
+    def test_check_does_not_write_other_targets(self) -> None:
+        result = self.export("--plugins", "--check", "--agents-workspace", str(self.tmp))
+
+        self.assertEqual(result.code, 2)
+        self.assertIn("--check only verifies the plugin files", result.err)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_committed_plugins_pass_the_check(self) -> None:
+        result = self.export("--plugins", "--check")
+
+        self.assertEqual(result.code, 0, result.err)
+        self.assertIn("[OK] Claude Code plugin", result.out)
+        self.assertIn("[OK] Codex and Cursor plugins", result.out)
+
+    def test_plugins_check_reports_the_drift_of_every_plugin(self) -> None:
+        repo = self.tmp / "checkout"
+        for folder in ("templates", "rules", "skills", "bin"):
+            shutil.copytree(REPO_ROOT / folder, repo / folder)
+        (repo / "craftsman").mkdir()
+        (repo / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
+        generate = run_main(export.main, "--repo-dir", str(repo), "--plugins")
+        self.assertEqual(generate.code, 0, generate.err)
+        (repo / ".claude-plugin" / "plugin.json").write_text("{}\n", encoding="utf-8")
+        (repo / ".codex-plugin" / "plugin.json").write_text("{}\n", encoding="utf-8")
+
+        result = run_main(export.main, "--repo-dir", str(repo), "--plugins", "--check")
+
+        self.assertEqual(result.code, 1)
+        self.assertIn("differs: .claude-plugin/plugin.json", result.err)
+        self.assertIn("differs: .codex-plugin/plugin.json", result.err)
+        self.assertIn("run 'craftsman export --plugins'", result.err)
+        self.assertNotIn("--claude-plugin", result.err)
 
     def test_refused_settings_are_reported(self) -> None:
         (self.tmp / "settings.json").write_text("{oops", encoding="utf-8")
@@ -150,7 +190,11 @@ class RenderedTextTests(unittest.TestCase):
         export_copilot_home(REPO_ROOT, cls.root / "copilot", ("craftsman", "craftsman"))
         export_to_claude_user(REPO_ROOT, cls.root / "claude")
         export_to_agents_workspace(REPO_ROOT, cls.root / "ws")
-        cls.files = {path: path.read_text(encoding="utf-8") for path in cls.root.rglob("*.md")}
+        cls.files = {
+            path: path.read_text(encoding="utf-8")
+            for pattern in ("*.md", "*.mdc")
+            for path in cls.root.rglob(pattern)
+        }
 
     def test_no_file_looks_skills_up_on_disk(self) -> None:
         lookup = re.compile(r"skills/[a-z0-9_-]+/SKILL\.md")

@@ -11,6 +11,8 @@ Targets:
 3. Claude Code (`--claude-dir`): slash commands, rules, the reviewer/verifier subagents and the
    Craftsman hooks merged into `settings.json` (skip them with `--no-claude-hooks`).
 4. OpenAI Codex / Cursor (`--agents-workspace`): `AGENTS.md` and `.cursor/rules/craftsman.mdc`.
+5. The plugins of a source checkout: `--claude-plugin` regenerates `.claude-plugin/`, `--plugins` that
+   plus the Codex (`.agents/plugins/`, `.codex-plugin/`) and Cursor (`.cursor-plugin/`) manifests.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from craftsman.assets import iter_skills
-from craftsman.generated import ExportError, FileChange
+from craftsman.generated import ExportError, FileChange, PluginDriftError
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.paths import (
     default_claude_dir,
@@ -30,6 +32,7 @@ from craftsman.paths import (
     default_repo_dir,
     default_vscode_prompts_dir,
 )
+from craftsman.platforms.agent_plugins import export_agent_plugins
 from craftsman.platforms.agents_md import export_to_agents_workspace
 from craftsman.platforms.claude import (
     export_claude_plugin,
@@ -108,9 +111,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Regenerate the Claude Code plugin files (.claude-plugin/) of the checkout in --repo-dir.",
     )
     parser.add_argument(
+        "--plugins",
+        action="store_true",
+        help="Regenerate the Claude Code, Codex (.agents/plugins/, .codex-plugin/) and Cursor "
+        "(.cursor-plugin/) plugin files of the checkout in --repo-dir.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
-        help="With --claude-plugin: fail when the committed plugin files differ from the sources.",
+        help="With --claude-plugin or --plugins: fail when the committed plugin files differ from the sources.",
     )
     return parser
 
@@ -126,13 +135,15 @@ def _validate_export_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         args.claude_dir,
         args.agents_workspace,
     )
-    if all(target is None for target in targets) and not args.claude_plugin:
+    if all(target is None for target in targets) and not (args.claude_plugin or args.plugins):
         parser.error(
             "Specify at least one target: --user-dir, --copilot-skills-dir, --copilot-home, "
-            "--workspace <path>, --claude-dir, --agents-workspace <path>, or --claude-plugin"
+            "--workspace <path>, --claude-dir, --agents-workspace <path>, --claude-plugin, or --plugins"
         )
-    if args.check and not args.claude_plugin:
-        parser.error("--check requires --claude-plugin")
+    if args.check and not (args.claude_plugin or args.plugins):
+        parser.error("--check requires --claude-plugin or --plugins")
+    if args.check and any(target is not None for target in targets):
+        parser.error("--check only verifies the plugin files; run the other targets without it")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -216,12 +227,33 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
             args.agents_workspace,
             [agents.agents_md, agents.cursor_rule],
         )
-    if args.claude_plugin:
-        files = export_claude_plugin(repo_dir, check=args.check)
-        if args.check:
-            print(f"[OK] Claude Code plugin in {repo_dir} is up to date ({len(files)} files checked)")
+    if args.check:
+        _check_plugins(repo_dir, agents=args.plugins)
+    elif args.claude_plugin or args.plugins:
+        files = export_claude_plugin(repo_dir)
+        print(f"[OK] Generated the Claude Code plugin files in {repo_dir} ({len(files)} files)")
+        if args.plugins:
+            files = export_agent_plugins(repo_dir)
+            print(f"[OK] Generated the Codex and Cursor plugin files in {repo_dir} ({len(files)} files)")
+
+
+def _check_plugins(repo_dir: Path, *, agents: bool) -> None:
+    """Verify the Claude Code plugin and, with `agents`, the Codex and Cursor ones; report all drift."""
+    checks = [("Claude Code plugin", "is", export_claude_plugin)]
+    if agents:
+        checks.append(("Codex and Cursor plugins", "are", export_agent_plugins))
+    diffs: list[str] = []
+    for label, verb, check in checks:
+        try:
+            files = check(repo_dir, check=True)
+        except PluginDriftError as exc:
+            if not agents:
+                raise
+            diffs.extend(exc.diffs)
         else:
-            print(f"[OK] Generated the Claude Code plugin files in {repo_dir} ({len(files)} files)")
+            print(f"[OK] {label} in {repo_dir} {verb} up to date ({len(files)} files checked)")
+    if diffs:
+        raise PluginDriftError("Plugin", "craftsman export --plugins", diffs)
 
 
 if __name__ == "__main__":
