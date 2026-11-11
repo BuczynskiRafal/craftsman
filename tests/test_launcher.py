@@ -28,6 +28,12 @@ AS_PYTHON_3_9 = (
 )
 
 
+# The signals a platform may stop a hook with, and the exit code the launcher reports for each.
+STOP_SIGNALS: tuple[tuple[signal.Signals, int], ...] = ((signal.SIGTERM, 143), (signal.SIGINT, 130))
+if sys.platform != "win32":  # SIGHUP does not exist on Windows, where these tests are skipped
+    STOP_SIGNALS += ((signal.SIGHUP, 129),)
+
+
 @unittest.skipIf(os.name == "nt", "a POSIX shell script")
 class LauncherTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -135,7 +141,7 @@ class LauncherTests(unittest.TestCase):
         pid_file = self.tmp / "child.pid"
         self.fake("python3", f'echo $$ > "{pid_file}"\nexec sleep 60')
         for shell in SHELLS:
-            for sent, code in ((signal.SIGTERM, 143), (signal.SIGINT, 130), (signal.SIGHUP, 129)):
+            for sent, code in STOP_SIGNALS:
                 with self.subTest(shell=shell, signal=sent.name):
                     pid_file.unlink(missing_ok=True)
                     launcher = subprocess.Popen(

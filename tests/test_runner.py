@@ -24,6 +24,11 @@ from craftsman.records import OUTPUT_TAIL_CHARS, LedgerError
 
 from tests.support import REPO_ROOT, EvidenceRepo, assert_cli_error
 
+if sys.platform == "win32":  # mypy checks this module for Windows too; the tests that send it are skipped there
+    SIGHUP = signal.SIGTERM
+else:
+    SIGHUP = signal.SIGHUP
+
 
 class RunTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -623,8 +628,9 @@ class WhileTheCommandRunsTests(unittest.TestCase):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
-        with suppress(OSError, ValueError):
-            os.killpg(int(pid_file.read_text(encoding="utf-8")), signal.SIGKILL)
+        if sys.platform != "win32":  # the class is skipped on Windows; this keeps mypy's Windows check
+            with suppress(OSError, ValueError):
+                os.killpg(int(pid_file.read_text(encoding="utf-8")), signal.SIGKILL)
         for stream in (proc.stdout, proc.stderr):
             if stream is not None:
                 stream.close()
@@ -696,7 +702,7 @@ class WhileTheCommandRunsTests(unittest.TestCase):
         self.terminate(signal.SIGTERM)
 
     def test_sighup_stops_the_command_records_it_and_prints_the_end(self) -> None:
-        self.terminate(signal.SIGHUP)
+        self.terminate(SIGHUP)
 
     def test_sigterm_records_what_an_interrupt_records(self) -> None:
         codes = []
@@ -712,27 +718,27 @@ class WhileTheCommandRunsTests(unittest.TestCase):
             self.assertEqual(first[key], second[key], key)
 
     def test_the_previous_handlers_come_back(self) -> None:
-        before = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)
+        before = signal.getsignal(signal.SIGTERM), signal.getsignal(SIGHUP)
 
         with runner._TerminationSignals():
             self.assertNotEqual(signal.getsignal(signal.SIGTERM), before[0])
-            self.assertNotEqual(signal.getsignal(signal.SIGHUP), before[1])
+            self.assertNotEqual(signal.getsignal(SIGHUP), before[1])
 
-        self.assertEqual((signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP)), before)
+        self.assertEqual((signal.getsignal(signal.SIGTERM), signal.getsignal(SIGHUP)), before)
 
     def test_a_signal_while_the_command_runs_stops_it_like_ctrl_c(self) -> None:
         with runner._TerminationSignals() as signals, self.assertRaises(KeyboardInterrupt):
-            os.kill(os.getpid(), signal.SIGHUP)
+            os.kill(os.getpid(), SIGHUP)
             time.sleep(5)
 
-        self.assertEqual(signals.exit_code(0), 128 + signal.SIGHUP)
+        self.assertEqual(signals.exit_code(0), 128 + SIGHUP)
 
     def test_a_signal_after_the_command_ended_waits_for_the_record(self) -> None:
         with runner._TerminationSignals() as signals:
             signals.defer()
             os.kill(os.getpid(), signal.SIGTERM)
             time.sleep(0.1)  # the handler runs here and must not raise
-            os.kill(os.getpid(), signal.SIGHUP)  # a second signal changes nothing
+            os.kill(os.getpid(), SIGHUP)  # a second signal changes nothing
             time.sleep(0.1)
 
         self.assertEqual(signals.exit_code(0), 128 + signal.SIGTERM)
