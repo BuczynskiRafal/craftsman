@@ -14,7 +14,16 @@ All notable changes to Craftsman are recorded here. The format follows
   Cursor manifest and catalog with the skills and an always-applied rule. Neither declares hooks, so the
   review stays advisory there; the Codex manifest also stops Codex from falling back to
   `.claude-plugin/plugin.json` and loading the Claude Code hooks. `craftsman export --plugins [--check]`
-  generates (or verifies) every plugin file, and CI runs the check.
+  generates (or verifies) every plugin file, and CI runs the check. With `--check` it reports the drift
+  of every plugin at once, and it refuses to be combined with targets it would write.
+
+### Fixed
+
+- **`craftsman export --claude-plugin` left what `--check` then rejected.** It removed only stale
+  `*.md` agents, so a dangling link or another file in `.claude-plugin/agents/` failed the next check;
+  the export now removes everything the check reports as extra and refuses a directory there. A
+  plugin file that is not UTF-8 is reported as drift instead of crashing the check, and links among the
+  generated files are replaced rather than written through.
 
 ## [5.0.0] - 2026-11-09
 

@@ -114,6 +114,10 @@ setting **Allow Local Plugin Imports**, or an admin imports `BuczynskiRafal/craf
 marketplace. As in Codex, the plugin has no hooks, the review is advisory, and the skills need the
 `craftsman` CLI on `PATH`.
 
+The plugin's rule replaces `.cursor/rules/craftsman.mdc`: both are always applied, so a workspace that
+keeps the `--agents-workspace` copy as well gets the same instructions twice in every turn. Delete that
+file (keep `AGENTS.md` for Codex), or skip the plugin in that workspace.
+
 ## Antigravity Plugin
 
 Antigravity installs the repository as a plugin straight from GitHub:

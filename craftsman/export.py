@@ -23,7 +23,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from craftsman.assets import iter_skills
-from craftsman.generated import ExportError, FileChange
+from craftsman.generated import ExportError, FileChange, PluginDriftError
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.paths import (
     default_claude_dir,
@@ -142,6 +142,8 @@ def _validate_export_args(parser: argparse.ArgumentParser, args: argparse.Namesp
         )
     if args.check and not (args.claude_plugin or args.plugins):
         parser.error("--check requires --claude-plugin or --plugins")
+    if args.check and any(target is not None for target in targets):
+        parser.error("--check only verifies the plugin files; run the other targets without it")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -225,22 +227,30 @@ def _run_exports(args: argparse.Namespace, repo_dir: Path) -> None:
             args.agents_workspace,
             [agents.agents_md, agents.cursor_rule],
         )
-    if args.claude_plugin or args.plugins:
-        files = export_claude_plugin(repo_dir, check=args.check)
-        if args.check:
-            print(f"[OK] Claude Code plugin in {repo_dir} is up to date ({len(files)} files checked)")
-        else:
-            print(f"[OK] Generated the Claude Code plugin files in {repo_dir} ({len(files)} files)")
-    if args.plugins:
-        files = export_agent_plugins(repo_dir, check=args.check)
-        if args.check:
-            print(f"[OK] Codex and Cursor plugins in {repo_dir} are up to date ({len(files)} files checked)")
-        else:
+    if args.check:
+        _check_plugins(repo_dir, agents=args.plugins)
+    elif args.claude_plugin or args.plugins:
+        files = export_claude_plugin(repo_dir)
+        print(f"[OK] Generated the Claude Code plugin files in {repo_dir} ({len(files)} files)")
+        if args.plugins:
+            files = export_agent_plugins(repo_dir)
             print(f"[OK] Generated the Codex and Cursor plugin files in {repo_dir} ({len(files)} files)")
 
 
-if __name__ == "__main__":
-    # Not a program: the command policy reads one CLI (`craftsman export ...`), and a module run around it would
-    # skip the rules. Failing loud keeps a script that still runs the module from believing it did the work.
-    sys.stderr.write("craftsman.export is not a program: run `craftsman export ...` instead\n")
-    raise SystemExit(2)
+def _check_plugins(repo_dir: Path, *, agents: bool) -> None:
+    """Verify the Claude Code plugin and, with `agents`, the Codex and Cursor ones; report all drift."""
+    checks = [("Claude Code plugin", "is", export_claude_plugin)]
+    if agents:
+        checks.append(("Codex and Cursor plugins", "are", export_agent_plugins))
+    diffs: list[str] = []
+    for label, verb, check in checks:
+        try:
+            files = check(repo_dir, check=True)
+        except PluginDriftError as exc:
+            if not agents:
+                raise
+            diffs.extend(exc.diffs)
+        else:
+            print(f"[OK] {label} in {repo_dir} {verb} up to date ({len(files)} files checked)")
+    if diffs:
+        raise PluginDriftError("Plugin", "craftsman export --plugins", diffs)

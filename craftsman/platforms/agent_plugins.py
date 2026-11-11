@@ -17,7 +17,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from craftsman.generated import ExportError
+from craftsman.generated import (
+    ExportError,
+    PluginDriftError,
+    generated_tree_drift,
+    write_generated_tree,
+)
 from craftsman.platforms.agents_md import CURSOR_RULE_HEADER, render_agents_md
 from craftsman.platforms.claude import (
     PLUGIN_AUTHOR,
@@ -143,23 +148,6 @@ def build_agent_plugin_files(repo_dir: Path) -> dict[str, str]:
     }
 
 
-def _drift(repo_dir: Path, files: dict[str, str]) -> list[str]:
-    diffs: list[str] = []
-    for rel_path, expected in files.items():
-        dest = repo_dir / rel_path
-        if not dest.is_file():
-            diffs.append(f"missing: {rel_path}")
-        elif dest.read_text(encoding="utf-8").replace("\r\n", "\n") != expected:
-            diffs.append(f"differs: {rel_path}")
-    rules_dir = repo_dir / CURSOR_RULES_DIR
-    if rules_dir.is_dir():
-        for path in sorted(rules_dir.iterdir()):
-            rel = path.relative_to(repo_dir).as_posix()
-            if rel not in files:
-                diffs.append(f"extra: {rel}")
-    return diffs
-
-
 def export_agent_plugins(repo_dir: Path, *, check: bool = False) -> list[str]:
     """Write, or with `check` verify, the Codex and Cursor plugin files of the checkout at `repo_dir`."""
     if not (repo_dir / "craftsman" / "__init__.py").is_file():
@@ -169,20 +157,9 @@ def export_agent_plugins(repo_dir: Path, *, check: bool = False) -> list[str]:
         )
     files = build_agent_plugin_files(repo_dir)
     if check:
-        diffs = _drift(repo_dir, files)
+        diffs = generated_tree_drift(repo_dir, files, CURSOR_RULES_DIR)
         if diffs:
-            raise ExportError(
-                "Codex/Cursor plugin drift detected (run 'craftsman export --plugins'):\n  "
-                + "\n  ".join(diffs)
-            )
-        return sorted(files)
-    rules_dir = repo_dir / CURSOR_RULES_DIR
-    if rules_dir.is_dir():
-        for stale in rules_dir.iterdir():
-            if stale.is_file() and stale.relative_to(repo_dir).as_posix() not in files:
-                stale.unlink()
-    for rel_path, content in files.items():
-        dest = repo_dir / rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8", newline="\n")
+            raise PluginDriftError("Codex/Cursor plugin", "craftsman export --plugins", diffs)
+    else:
+        write_generated_tree(repo_dir, files, CURSOR_RULES_DIR)
     return sorted(files)

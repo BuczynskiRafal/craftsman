@@ -61,7 +61,8 @@ class CommittedAgentPluginTests(unittest.TestCase):
     def test_codex_interface_stays_within_its_limits(self) -> None:
         interface = load(CODEX_MANIFEST)["interface"]
         self.assertLessEqual(len(interface["defaultPrompt"]), 3)
-        self.assertTrue(all(len(prompt) <= 512 for prompt in interface["defaultPrompt"]))
+        # Codex drops the whole defaultPrompt field, silently, when one prompt is longer than 128.
+        self.assertTrue(all(len(prompt) <= 128 for prompt in interface["defaultPrompt"]))
 
     def test_cursor_manifest_uses_only_schema_fields(self) -> None:
         allowed = {
@@ -116,6 +117,40 @@ class AgentPluginExportTests(unittest.TestCase):
         stale.write_text("", encoding="utf-8")
         export_agent_plugins(self.repo)
         self.assertFalse(stale.exists())
+
+    def test_a_file_that_is_not_utf8_is_drift_not_a_crash(self) -> None:
+        export_agent_plugins(self.repo)
+        (self.repo / CODEX_MANIFEST).write_bytes(b"\xff\xfe{}")
+        with self.assertRaisesRegex(ExportError, f"differs: {CODEX_MANIFEST}"):
+            export_agent_plugins(self.repo, check=True)
+
+    def test_export_drops_a_dangling_link_that_check_reports(self) -> None:
+        export_agent_plugins(self.repo)
+        (self.repo / ".cursor-plugin" / "rules" / "broken.mdc").symlink_to("nope")
+        with self.assertRaisesRegex(ExportError, "extra: .cursor-plugin/rules/broken.mdc"):
+            export_agent_plugins(self.repo, check=True)
+        written = export_agent_plugins(self.repo)
+        self.assertEqual(export_agent_plugins(self.repo, check=True), written)
+
+    def test_export_refuses_a_directory_among_the_rules(self) -> None:
+        export_agent_plugins(self.repo)
+        nested = self.repo / ".cursor-plugin" / "rules" / "nested"
+        nested.mkdir()
+        (nested / "keep.txt").write_text("mine\n", encoding="utf-8")
+        for check in (False, True):
+            with self.subTest(check=check), self.assertRaisesRegex(ExportError, ".cursor-plugin/rules/nested"):
+                export_agent_plugins(self.repo, check=check)
+        self.assertTrue((nested / "keep.txt").is_file())
+
+    def test_export_replaces_a_link_instead_of_writing_through_it(self) -> None:
+        target = self.repo / "elsewhere.json"
+        target.write_text("{}\n", encoding="utf-8")
+        manifest = self.repo / CODEX_MANIFEST
+        manifest.parent.mkdir(parents=True)
+        manifest.symlink_to(target)
+        export_agent_plugins(self.repo)
+        self.assertFalse(manifest.is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "{}\n")
 
     def test_assets_without_the_package_source_are_refused(self) -> None:
         (self.repo / "craftsman" / "__init__.py").unlink()
