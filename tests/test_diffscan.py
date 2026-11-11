@@ -1451,6 +1451,12 @@ class GitBudgetTests(RepoTestCase):
             self.assertGreater(diffscan.git_time_left(), 0.0)
             self.assertLessEqual(diffscan.git_time_left(1.0), 1.0)
 
+    def test_a_clock_that_has_not_ticked_never_gives_more_than_the_budget(self) -> None:
+        # Windows' clock ticks about every 15 ms, so `now` can repeat, and (now + 25) - now can round above 25.
+        with mock.patch("craftsman.diffscan.time.monotonic", return_value=8191.610680565681):  # (t + 25) - t > 25
+            with diffscan.git_budget(25.0):
+                self.assertLessEqual(diffscan.git_time_left(30.0), 25.0)
+
     def test_nested_budgets_cannot_extend_the_outer_one(self) -> None:
         with diffscan.git_budget(2.0), diffscan.git_budget(500.0):
             self.assertLessEqual(diffscan.git_time_left(), 2.0)

@@ -105,7 +105,8 @@ def git_time_left(limit: float | None = None) -> float:
     budget = _GIT_BUDGET.get()
     if budget is None:
         return limit
-    return max(0.0, min(limit, budget.deadline - time.monotonic()))
+    # Never more than the budget itself: with a clock that has not ticked, `deadline - now` can round above it.
+    return max(0.0, min(limit, budget.seconds, budget.deadline - time.monotonic()))
 
 
 def note_git_timeout(message: str) -> None:
