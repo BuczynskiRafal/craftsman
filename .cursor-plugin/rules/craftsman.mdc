@@ -1,0 +1,78 @@
+---
+description: Craftsman Agentic Engineering Rules
+globs: "*"
+alwaysApply: true
+---
+
+<!-- craftsman:generated -->
+
+# AGENTS.md — Craftsman Engineering Standard
+
+This repository uses **Craftsman**: every change is reviewed and verified against an evidence ledger before it counts as done.
+
+## The Craftsman loop
+- **Build freely, review hard:** no gate activity while building. The gate judges the final diff: fresh-context hunters covered every hunk, every finding has a verdict with evidence, the tests pass on the final code. Users write plain words; infer target, fixing and depth yourself.
+- **Depth:** one adaptive depth. `craftsman review prepare` goes deep by itself on a security or concurrency signal in a production hunk or a large change (over 250 changed production lines); add your own judgment with `--deep` by the rules in `/craft-review` (Depth), or start with `/craftsman --deep` / `ultracraft`. Deep adds every lens on every production hunk, a fresh second look and an end-to-end run.
+- **Start (`/craftsman` only):** `craftsman gate --init [--deep] --task "<request>"` records the base commit; the review always covers the whole diff since then (standalone `/craft-review` without fixing does not start a gate session).
+- **Review:** write the intent brief (3-8 claims about what the change must do), then `craftsman review prepare --task-file -` freezes the diff, decides the depth and prints the hunt plan: one slot per hunter (its hunks and lenses), computed from the diff. Launch every slot together as a fresh-context `craftsman-reviewer` subagent whose whole prompt is the line `prepare` prints: `You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` The brief gives the slice, the lenses and the commands that record the work: `craftsman review add --hunter <ID> ...` for every candidate, `craftsman review cover --hunter <ID> --hunks <ids> --note "..."` for what was examined. Then end the turn, run `craftsman review check` and do what it lists.
+- **Verify and saturate:** `check` names the clusters of findings without a verdict; launch one `craftsman-verifier` subagent per cluster with the prompt `You are a Craftsman verifier. Run craftsman review brief --verifier <IDS> and follow it exactly.` Verifiers merge duplicates (`craftsman review merge <target> <dup>`, only when one fix removes every consequence), try to disprove each finding, and record `craftsman review verdict`; a dismissed `blocker` or `major` without a run needs a second verifier. A `proven` (or serious `probable`) defect makes `check` store a further wave of slots (variant hunters `W2-F<n>`, a fresh set `W2-X<j>`, at most 3 generations); launch them like the first.
+- **Fix:** fix confirmed defects at the root cause with a regression test and confirm each fix (the test, or the verifier that judged it); `craftsman review resolve <id> --as fixed --note "..."`; then `craftsman review prepare` again: the fix delta becomes a small round whose slots fresh hunters work through.
+- **Run checks through the ledger:** `craftsman run --kind test -- <command>` (and `--kind e2e` when deep); only runs on the final code count.
+- **Enforcement:** where hooks serve the session (Claude Code, Copilot, Antigravity) finishing needs every slot done; where none do (Codex, Cursor) the round is advisory, complete when every hunk is covered, and the report says `SELF-REVIEWED`.
+- **Done means** `craftsman review check` passes; then `craftsman gate --complete` and report with `craftsman review report` (in standalone review-only `/craft-review`, finish with `craftsman review check --review-only` and `craftsman review report --review-only`).
+- **Skills & lenses:** invoke `/name` as a skill if your platform offers it; otherwise run `craftsman skill show <name>` (and `craftsman skill show craft-review --lenses <lenses>` for the playbooks of the lenses you apply). Never search the file system for skill or lens files.
+
+## Search scope
+- Work only inside this git work tree (`git rev-parse --show-toplevel`): prefer `git ls-files`, `git grep`, and editor search scoped to this folder.
+- Outside the work tree you may read only an exact file cited by a stack trace/error, a temp directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI commands (never open `.git/craftsman` files by hand except a packet, view, scratch or inbox path that `craftsman review prepare`, `show`, `view`, `scratch` or `inbox` prints for this repository).
+- Batch JSON files go only to `craftsman review inbox` paths; never to `%TEMP%` or into the repository; a file you had to create elsewhere must be deleted before you report.
+- Never run recursive searches of `~`, `/`, or parent directories, and never open other repositories, other projects' packets/ledgers/reports, or assistant session stores.
+
+## Available Skills
+- **`/audit`**: Focused deep audit of a diff, module or directory, one concern at a time: errors, tests, types, comments, security. Use for /audit [aspects] [target].
+- **`/audit-comments`**: Audit comments and docstrings against the code they describe. Use for /audit-comments or /audit comments.
+- **`/audit-errors`**: Audit error handling: where failures happen, where each error ends up and what stays hidden. Use for /audit-errors or /audit errors.
+- **`/audit-security`**: Security audit that follows untrusted data from where it enters to where it is used. Use for /audit-security or /audit security.
+- **`/audit-tests`**: Audit whether the tests would catch the change being wrong, and write the most valuable missing ones. Use for /audit-tests or /audit tests.
+- **`/audit-types`**: Audit data structures and type design for the illegal states they still allow. Use for /audit-types or /audit types.
+- **`/batch`**: Carry out one mechanical change across many files in disjoint, verified work units. Use for /batch or as the mass-change track of /craftsman.
+- **`/craft-review`**: Bug-hunting review of a diff, branch or pull request by fresh-context hunters and verifiers, recorded in the ledger. Use when the user asks Craftsman to review, and as the final review of /craftsman.
+- **`/craftsman`**: Build freely, review hard: implement the task, then run the planned hunt, verifiers, fixes and tests until the gate passes. Use for /craftsman or `ultracraft`.
+- **`/feature-dev`**: Build a non-trivial feature: learn how the codebase solves similar problems, settle open questions, pick a design, build in verified steps. Use for /feature-dev or as the feature track of /craftsman.
+- **`/modernize`**: Change legacy or poorly understood code safely with characterization tests and small proven steps. Use for /modernize or as the legacy track of /craftsman.
+- **`/simplify`**: Behavior-preserving cleanup of the current diff: duplication, needless complexity, dead weight, dishonest names. Not a bug hunt. Use for /simplify or as the last build step of /craftsman.
+- **`/verify`**: Runtime verification of a change: run the checks, exercise the changed behavior for real and record every run in the ledger. Use for /verify or as the verification step of /craftsman.
+
+---
+
+# Keyword Triggers: `ultrathink` & `ultracraft`
+
+When the user's request contains one of these keywords (case-insensitive), switch to the matching
+rigor mode. To mention the keyword without triggering it, put it in backticks or quotes.
+
+## `ultrathink` — think before building
+
+Before writing or editing any code, include a section **`### Design analysis`** with:
+1. **Invariants and hazards:** hidden assumptions, edge cases, state and concurrency hazards, and
+   the domain rules the change must preserve.
+2. **Costs:** time and memory complexity of the chosen approach, I/O and network bottlenecks,
+   failure modes of external dependencies.
+3. **Alternatives:** at least two genuinely different approaches (for example the smallest change
+   that fits the current structure vs. a cleaner restructuring) with concrete pros and cons, and
+   the reason for your choice.
+4. **Pre-mortem:** the three most likely ways the chosen solution fails in production and what in
+   your implementation prevents each.
+
+## `ultracraft` — the deep review loop
+
+`ultracraft` is `/craftsman --deep <request>`: follow the `/craftsman` skill end to end.
+1. `craftsman gate --init --deep --task "<request in one line>"` before anything else
+   (`--await-user` / `--resume` around questions to the user).
+2. Include the `ultrathink` design analysis before implementing.
+3. Build with explicit types and explicit error handling: no silent failures, no broad catch-alls,
+   invalid states made impossible where the type system allows it.
+4. Run the final review of `/craft-review` in deep mode (`craftsman review prepare --deep`: every
+   slot of the hunt plan launched through `craftsman review brief`), then tests **and** an end-to-end
+   run through `craftsman run`.
+5. Finish only when `craftsman review check` passes, then `craftsman gate --complete` and report
+   with `craftsman review report`.

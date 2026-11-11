@@ -103,11 +103,17 @@ HOME=$(mktemp -d) python3 -m craftsman.cli doctor
 2. Define hook lifecycle manifests in `hooks.json` or platform-specific settings exporters.
 3. Test platform payload round-tripping and error visibility in `tests/test_hooks.py`.
 
-### Claude Code Plugin Files
-The repository root is the Claude Code plugin. `.claude-plugin/` holds its generated files: the
-manifest (with the hooks), the marketplace catalog, and the agents rendered from `templates/agents/*.md`.
-After changing an agent template, a hook event or the version, run `craftsman export --claude-plugin`;
-`tests/test_platform_claude.py` fails while they are out of date.
+### Plugin Files
+The repository root is the Claude Code, Codex and Cursor plugin. All of their files are generated:
+- `.claude-plugin/`: the manifest (with the hooks), the marketplace catalog, and the agents rendered
+  from `templates/agents/*.md`.
+- `.agents/plugins/marketplace.json` and `.codex-plugin/plugin.json`: the Codex catalog and manifest.
+- `.cursor-plugin/`: the Cursor catalog, manifest and `rules/craftsman.mdc`, rendered from
+  `templates/AGENTS.md` and `rules/`.
+
+After changing an agent template, a hook event, `templates/AGENTS.md`, `rules/`, a skill's
+description or the version, run `craftsman export --plugins`; `tests/test_platform_claude.py`,
+`tests/test_platform_agent_plugins.py` and CI fail while they are out of date.
 
 ### Altering Review Protocol
 The protocol lives in prompts (`skills/`, `templates/agents/`, `rules/`) and in the gate (`craftsman/gatecheck.py`); keep each prompt line earning its tokens. Before proposing changes to review lenses, the hunt protocol, or gate invariants, replicate the benchmark suite (`bench/run.py` against `bench/cases/`, the maintainer's private harness) and run the public seeded-defect suite (`python3 -m evals.run`, see [docs/benchmark.md](docs/benchmark.md)) to ensure defect recall and precision do not regress.

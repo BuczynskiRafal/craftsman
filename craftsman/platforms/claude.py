@@ -25,8 +25,11 @@ from craftsman.generated import (
     CRAFTSMAN_GENERATED_MARKER,
     ExportError,
     FileChange,
+    PluginDriftError,
+    generated_tree_drift,
     read_json_object,
     rewrite_json,
+    write_generated_tree,
     write_marked,
 )
 from craftsman.hook_budget import HOOK_TIMEOUTS_S
@@ -374,19 +377,7 @@ def build_plugin_files(repo_dir: Path) -> dict[str, str]:
 
 
 def _plugin_drift(repo_dir: Path, files: dict[str, str]) -> list[str]:
-    diffs: list[str] = []
-    for rel_path, expected in files.items():
-        dest = repo_dir / rel_path
-        if not dest.is_file():
-            diffs.append(f"missing: {rel_path}")
-        elif dest.read_text(encoding="utf-8").replace("\r\n", "\n") != expected:
-            diffs.append(f"differs: {rel_path}")
-    agents_dir = repo_dir / PLUGIN_AGENTS_DIR
-    if agents_dir.is_dir():
-        for path in sorted(agents_dir.iterdir()):
-            rel = path.relative_to(repo_dir).as_posix()
-            if rel not in files:
-                diffs.append(f"extra: {rel}")
+    diffs = generated_tree_drift(repo_dir, files, PLUGIN_AGENTS_DIR)
     diffs.extend(f"missing: {rel}" for rel in PLUGIN_LAUNCHERS if not (repo_dir / rel).is_file())
     return diffs
 
@@ -404,11 +395,10 @@ def export_claude_plugin(repo_dir: Path, *, check: bool = False) -> list[str]:
     if check:
         diffs = _plugin_drift(repo_dir, files)
         if diffs:
-            raise ExportError(
-                "Claude Code plugin drift detected (run 'craftsman export --claude-plugin'):\n  "
-                + "\n  ".join(diffs)
-            )
-        return sorted(files)
+            raise PluginDriftError("Claude Code plugin", "craftsman export --claude-plugin", diffs)
+    else:
+        write_generated_tree(repo_dir, files, PLUGIN_AGENTS_DIR)
+    return sorted(files)
     agents_dir = repo_dir / PLUGIN_AGENTS_DIR
     if agents_dir.is_dir():
         for stale in agents_dir.glob("*.md"):

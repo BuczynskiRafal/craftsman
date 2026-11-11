@@ -49,7 +49,7 @@ jobs:
           test_env/bin/craftsman doctor --json
           test_env/bin/craftsman install --all --dry-run
           test_env/bin/craftsman skill list
-          test_env/bin/craftsman export --repo-dir . --claude-plugin --check
+          test_env/bin/craftsman export --repo-dir . --plugins --check
 
       - name: Extract release notes from CHANGELOG.md
         id: release_notes

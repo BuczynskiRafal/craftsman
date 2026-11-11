@@ -1,0 +1,39 @@
+{
+  "name": "craftsman",
+  "version": "5.0.0",
+  "description": "Make AI coding agents prove they reviewed and tested their change.",
+  "author": {
+    "name": "Rafał Buczyński",
+    "email": "buczynski.rafal2@gmail.com"
+  },
+  "homepage": "https://github.com/BuczynskiRafal/craftsman",
+  "repository": "https://github.com/BuczynskiRafal/craftsman",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "ai-agents",
+    "code-review",
+    "craft-review",
+    "quality-gate",
+    "testing"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Craftsman",
+    "shortDescription": "Prove the change was reviewed and tested",
+    "longDescription": "Build freely, review hard. Craftsman freezes the final diff, plans a bug hunt from it, sends fresh-context hunters over every slot, has verifiers try to disprove every finding, and records the outcome and the test runs in a ledger in the .git directory. Codex runs the protocol without hooks, so the review is advisory and the report marks it SELF-REVIEWED. The skills call the craftsman CLI: install it with `pipx install craftsman-gate`.",
+    "developerName": "Rafał Buczyński",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/BuczynskiRafal/craftsman",
+    "defaultPrompt": [
+      "Use $craftsman:craftsman to add pagination to the catalog search",
+      "Use $craftsman:craft-review to review my staged changes and fix what you find",
+      "Use $craftsman:craft-review to review this branch, be thorough"
+    ]
+  }
+}

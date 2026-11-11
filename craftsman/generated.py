@@ -145,3 +145,62 @@ def strip_managed_block(text: str, source: Path) -> str:
     before, after = text[: span[0]].rstrip(), text[span[1] :].strip()
     joined = "\n\n".join(part for part in (before, after) if part)
     return f"{joined}\n" if joined else ""
+
+
+class PluginDriftError(ExportError):
+    """Committed plugin files differ from what the sources render; `diffs` lists each one."""
+
+    def __init__(self, label: str, rerun: str, diffs: list[str]) -> None:
+        self.diffs = diffs
+        super().__init__(f"{label} drift detected (run '{rerun}'):\n  " + "\n  ".join(diffs))
+
+
+def generated_tree_drift(repo_dir: Path, files: dict[str, str], owned_dir: str) -> list[str]:
+    """How the files under `repo_dir` differ from `files`; anything else in `owned_dir` is extra."""
+    diffs: list[str] = []
+    for rel_path, expected in files.items():
+        dest = repo_dir / rel_path
+        if not dest.is_file():
+            diffs.append(f"missing: {rel_path}")
+            continue
+        try:
+            actual = dest.read_text(encoding="utf-8").replace("\r\n", "\n")
+        except UnicodeDecodeError:
+            actual = None
+        if actual != expected:
+            diffs.append(f"differs: {rel_path}")
+    owned = repo_dir / owned_dir
+    if owned.is_dir():
+        for path in sorted(owned.iterdir()):
+            rel = path.relative_to(repo_dir).as_posix()
+            if rel not in files:
+                diffs.append(f"extra: {rel}")
+    return diffs
+
+
+def write_generated_tree(repo_dir: Path, files: dict[str, str], owned_dir: str) -> None:
+    """Write `files` under `repo_dir` and remove whatever else is in `owned_dir`.
+
+    It removes exactly what `generated_tree_drift` reports as extra, so a check after a write passes.
+    A directory in `owned_dir` is refused rather than deleted with whatever it holds.
+    """
+    owned = repo_dir / owned_dir
+    stale = [
+        path
+        for path in (sorted(owned.iterdir()) if owned.is_dir() else [])
+        if path.relative_to(repo_dir).as_posix() not in files
+    ]
+    for path in stale:
+        if path.is_dir() and not path.is_symlink():
+            raise ExportError(
+                f"{path.relative_to(repo_dir).as_posix()} is a directory the export does not "
+                "generate; remove it and run the export again"
+            )
+    for path in stale:
+        path.unlink()
+    for rel_path, content in files.items():
+        dest = repo_dir / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_symlink():  # never write through a link into the file it points to
+            dest.unlink()
+        write_text_atomic(dest, content)

@@ -1,0 +1,24 @@
+{
+  "name": "craftsman",
+  "displayName": "Craftsman",
+  "version": "5.0.0",
+  "description": "Make AI coding agents prove they reviewed and tested their change.",
+  "author": {
+    "name": "Rafał Buczyński",
+    "email": "buczynski.rafal2@gmail.com"
+  },
+  "homepage": "https://github.com/BuczynskiRafal/craftsman",
+  "repository": "https://github.com/BuczynskiRafal/craftsman",
+  "license": "MIT",
+  "keywords": [
+    "cursor",
+    "ai-agents",
+    "code-review",
+    "craft-review",
+    "quality-gate",
+    "testing"
+  ],
+  "category": "developer-tools",
+  "skills": "./skills/",
+  "rules": "./.cursor-plugin/rules/craftsman.mdc"
+}

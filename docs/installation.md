@@ -88,6 +88,43 @@ Claude Code supports installing Craftsman as a standalone plugin:
 
 The repository itself is the plugin: Claude Code loads the skills and the Python package straight from it, and the hooks start the CLI through `bin/launcher.sh`, which runs the `bin/craftsman-cli.py` bootstrap with the first Python 3.10+ on `PATH`. To prevent duplicate hook executions (hooks firing twice), `craftsman install` skips an auto-detected Claude Code and refuses `--claude` while the Claude Code plugin is active (`--no-claude-hooks` installs the rest without the hooks); use `craftsman uninstall --claude` to clean up user-level hooks installed earlier.
 
+## Codex Plugin
+
+Codex reads the same repository as a plugin marketplace (`.agents/plugins/marketplace.json`, manifest in
+`.codex-plugin/plugin.json`):
+
+```bash
+codex plugin marketplace add BuczynskiRafal/craftsman
+codex plugin add craftsman@craftsman
+```
+
+Start a new session; the skills are invoked as `$craftsman:craftsman`, `$craftsman:craft-review` and so on.
+To update, run `codex plugin marketplace upgrade craftsman`. The plugin brings the skills only: they call
+the `craftsman` CLI, so install it too (`pipx install craftsman-gate`). It declares no hooks, because
+Craftsman has no adapter for Codex hook events, so the review is advisory (`SELF-REVIEWED`), as with
+`--agents-workspace`. Its own manifest also keeps Codex from falling back to `.claude-plugin/plugin.json`
+and loading the Claude Code hooks.
+
+## Cursor Plugin
+
+`.cursor-plugin/` holds the Cursor manifest and marketplace catalog. The plugin adds the skills and an
+always-applied rule (`.cursor-plugin/rules/craftsman.mdc`, the same content `--agents-workspace` writes
+to `.cursor/rules/craftsman.mdc`). Install it as a local plugin:
+
+```bash
+rm -rf ~/.cursor/plugins/local/craftsman
+git clone --depth 1 https://github.com/BuczynskiRafal/craftsman ~/.cursor/plugins/local/craftsman
+```
+
+Then run **Developer: Reload Window**. On Cursor Teams and Enterprise, local plugins need the admin
+setting **Allow Local Plugin Imports**, or an admin imports `BuczynskiRafal/craftsman` as a team
+marketplace. As in Codex, the plugin has no hooks, the review is advisory, and the skills need the
+`craftsman` CLI on `PATH`.
+
+The plugin's rule replaces `.cursor/rules/craftsman.mdc`: both are always applied, so a workspace that
+keeps the `--agents-workspace` copy as well gets the same instructions twice in every turn. Delete that
+file (keep `AGENTS.md` for Codex), or skip the plugin in that workspace.
+
 ## Antigravity Plugin
 
 Antigravity installs the repository as a plugin straight from GitHub:
