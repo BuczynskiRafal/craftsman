@@ -227,6 +227,14 @@ class Layouts:
             handle.write(text)
 
 
+def _relative(name: str, path: Path) -> dict[str, str]:
+    """`{name: path relative to the working directory}`, or nothing where none exists (another drive on Windows)."""
+    try:
+        return {name: os.path.relpath(path)}
+    except ValueError:
+        return {}
+
+
 class FastPathCase(unittest.TestCase):
     layouts: Layouts
     environ: dict[str, str]
@@ -288,7 +296,7 @@ class EquivalenceTests(FastPathCase):
             "linked work tree, idle": str(layouts.linked_idle),
             **({"symlink to an idle repository": str(layouts.link_idle)} if layouts.link_idle else {}),
             "missing directory in an idle repository": str(layouts.idle / "no" / "such"),
-            "relative path": os.path.relpath(layouts.idle),
+            **_relative("relative path", layouts.idle),
             "active gate": str(layouts.mine),
             "linked work tree, active": str(layouts.linked_active),
             **({"symlink to an active gate": str(layouts.link_mine)} if layouts.link_mine else {}),
@@ -442,7 +450,8 @@ class DeferTests(FastPathCase):
         # Why the user's and the system's configuration need not be read.
         layouts = self.layouts
         global_config = layouts.tmp / "global-config"
-        global_config.write_text(f"[core]\n\tworktree = {layouts.plain}\n", encoding="utf-8")
+        # Forward slashes: git reads a backslash in a config value as an escape.
+        global_config.write_text(f"[core]\n\tworktree = {layouts.plain.as_posix()}\n", encoding="utf-8")
         environ = {**self.environ, "GIT_CONFIG_GLOBAL": str(global_config)}
         top = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"], cwd=layouts.idle, env=environ,
@@ -465,8 +474,9 @@ class DeferTests(FastPathCase):
             environ = {**self.environ, name: "~no-such-user-here/root"}
             with self.subTest(name=name):
                 self.assertDefers(payload, environ)
-                # `Path.expanduser` fails there, and the full handler asks.
-                self.assertNotEqual(run_full("claude", payload, environ), (0, hook_fast.ALLOW))
+                if os.name != "nt":  # Windows expands `~user` next to the current home instead of failing
+                    # `Path.expanduser` fails there, and the full handler asks.
+                    self.assertNotEqual(run_full("claude", payload, environ), (0, hook_fast.ALLOW))
                 self.assertTrue(self.allows(payload, {**self.environ, name: str(self.layouts.home)}))
 
     def test_a_state_file_that_cannot_be_read_or_validated(self) -> None:
