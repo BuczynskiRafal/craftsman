@@ -81,7 +81,13 @@ Or as a plugin:
 /plugin marketplace add BuczynskiRafal/craftsman              # Claude Code
 /plugin install craftsman@craftsman
 agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
+codex plugin marketplace add BuczynskiRafal/craftsman            # Codex
+codex plugin add craftsman@craftsman
 ```
+
+In Codex and Cursor the plugin brings the skills (and, in Cursor, an always-on rule) but no hooks, so
+the review stays advisory there. Cursor installs it as a local plugin; see
+[docs/installation.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md#cursor-plugin).
 
 ## Usage
 

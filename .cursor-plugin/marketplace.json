@@ -1,0 +1,17 @@
+{
+  "name": "craftsman",
+  "owner": {
+    "name": "Rafał Buczyński",
+    "email": "buczynski.rafal2@gmail.com"
+  },
+  "metadata": {
+    "description": "Make AI coding agents prove they reviewed and tested their change."
+  },
+  "plugins": [
+    {
+      "name": "craftsman",
+      "source": "./",
+      "description": "Make AI coding agents prove they reviewed and tested their change."
+    }
+  ]
+}

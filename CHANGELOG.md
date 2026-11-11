@@ -6,6 +6,16 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Codex and Cursor plugins.** The repository is now also a Codex plugin marketplace
+  (`.agents/plugins/marketplace.json`, `.codex-plugin/plugin.json`): `codex plugin marketplace add
+  BuczynskiRafal/craftsman` and `codex plugin add craftsman@craftsman`. `.cursor-plugin/` holds the
+  Cursor manifest and catalog with the skills and an always-applied rule. Neither declares hooks, so the
+  review stays advisory there; the Codex manifest also stops Codex from falling back to
+  `.claude-plugin/plugin.json` and loading the Claude Code hooks. `craftsman export --plugins [--check]`
+  generates (or verifies) every plugin file, and CI runs the check.
+
 ## [5.0.0] - 2026-11-09
 
 ### Security

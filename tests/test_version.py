@@ -61,6 +61,11 @@ class TestVersionConsistency(unittest.TestCase):
                     versions[".claude-plugin/marketplace.json"] = str(p["version"])
                     break
 
+        # 6. Codex and Cursor plugin manifests
+        for manifest in (".codex-plugin/plugin.json", ".cursor-plugin/plugin.json"):
+            with (self.repo_root / manifest).open(encoding="utf-8") as f:
+                versions[manifest] = str(json.load(f)["version"])
+
         # Validate format
         for file_name, version in versions.items():
             self.assertRegex(
