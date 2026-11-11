@@ -6,6 +6,13 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The wheel now contains `craftsman/py.typed`, so type checkers read Craftsman's type hints.
+- The source archive (sdist) now contains `install.sh`, `bin/` and the plugin manifests. The installer and the
+  plugin tests need them.
+- `SECURITY.md` lists 5.x as the supported version instead of 4.x.
+
 ## [5.1.0] - 2026-11-11
 
 ### Security
