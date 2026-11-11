@@ -254,3 +254,10 @@ def _check_plugins(repo_dir: Path, *, agents: bool) -> None:
             print(f"[OK] {label} in {repo_dir} {verb} up to date ({len(files)} files checked)")
     if diffs:
         raise PluginDriftError("Plugin", "craftsman export --plugins", diffs)
+
+
+if __name__ == "__main__":
+    # Not a program: the command policy reads one CLI (`craftsman export ...`), and a module run around it would
+    # skip the rules. Failing loud keeps a script that still runs the module from believing it did the work.
+    sys.stderr.write("craftsman.export is not a program: run `craftsman export ...` instead\n")
+    raise SystemExit(2)
