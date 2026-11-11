@@ -66,6 +66,10 @@ HOME=$(mktemp -d) python3 -m craftsman.cli doctor
   git pull origin devel
   git checkout -b feat/my-new-feature
   ```
+- Name a branch `<type>/<short-description>`: a Conventional Commits type (`feat`, `fix`, `perf`, `docs`, ...) and
+  a few lowercase words joined by hyphens that say what the branch changes, for example `fix/scope-guard-crash`.
+  Use `feat/` or `fix/` when the branch should run CI before a pull request exists.
+- Do not put a tool, agent or author name in a branch name, and no generated or random words or suffixes.
 - Submit pull requests targeting the `devel` branch.
 - The `main` branch is reserved for tagged production releases. Direct pushes to `main` are strictly forbidden.
 
