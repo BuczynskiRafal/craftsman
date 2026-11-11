@@ -6,6 +6,8 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+## [5.1.0] - 2026-11-11
+
 ### Security
 
 - **Every hook runs Craftsman's own code.** A hook runs with the guarded project as its working directory, and
@@ -779,7 +781,8 @@ All notable changes to Craftsman are recorded here. The format follows
 - Hook parsers, verdict detection and worktree state handling were hardened (see the v2.1.0
   follow-up fixes).
 
-[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v5.0.0...HEAD
+[Unreleased]: https://github.com/BuczynskiRafal/craftsman/compare/v5.1.0...HEAD
+[5.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/v5.0.0...v5.1.0
 [5.0.0]: https://github.com/BuczynskiRafal/craftsman/compare/v4.1.0...v5.0.0
 [4.1.0]: https://github.com/BuczynskiRafal/craftsman/compare/a4458c4...v4.1.0
 [4.0.0]: https://github.com/BuczynskiRafal/craftsman/commit/a4458c4
