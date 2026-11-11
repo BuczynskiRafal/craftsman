@@ -590,7 +590,7 @@ class LongOutputTests(unittest.TestCase):
 
         printed = stdout.buffer.getvalue()
         self.assertEqual(path_in(found(END_MARKER, printed)).name, "run-output.log")
-        self.assertTrue(printed.endswith(b"FAILED (failures=1)\n"))
+        self.assertTrue(printed.endswith((b"FAILED (failures=1)\n", b"FAILED (failures=1)\r\n")))  # print on Windows
 
 
 @unittest.skipIf(os.name == "nt", "process groups, SIGHUP and select on pipes are POSIX-only")

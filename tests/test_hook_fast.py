@@ -217,6 +217,8 @@ class Layouts:
     @staticmethod
     def write(path: Path, data: bytes) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Git for Windows marks a `.git` file hidden, and Windows refuses to open a hidden file for overwriting.
+        path.unlink(missing_ok=True)
         path.write_bytes(data)
 
     @staticmethod
