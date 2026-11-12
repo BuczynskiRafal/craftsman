@@ -65,6 +65,9 @@ craftsman = "craftsman.cli:main"
 where = ["."]
 include = ["craftsman*"]
 
+[tool.setuptools.package-data]
+craftsman = ["py.typed"]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 105

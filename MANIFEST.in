@@ -2,5 +2,10 @@ graft skills
 graft rules
 graft scripts
 graft templates
-include plugin.json hooks.json LICENSE NOTICE README.md setup.py pyproject.toml .gitattributes
+graft bin
+graft .agents
+graft .claude-plugin
+graft .codex-plugin
+graft .cursor-plugin
+include install.sh plugin.json hooks.json LICENSE NOTICE README.md setup.py pyproject.toml .gitattributes
 global-exclude __pycache__ *.py[cod] .DS_Store
