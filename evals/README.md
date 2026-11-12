@@ -270,7 +270,7 @@ python3 -m evals.run list                               # case, size, defects, d
 python3 -m evals.run prepare quotes ~/evals/quotes-1     # a fresh, empty directory
 ```
 
-This is for other agents and platforms, or to look at a case. `agent` below does the same, unattended,
+This is for other agents and platforms, or to look at a case. `agent` above does the same, unattended,
 for Claude Code.
 
 `prepare` creates a git repository in the destination, commits the case's `base/` tree, then

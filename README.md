@@ -6,17 +6,21 @@
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE)
 
-Craftsman makes an AI coding agent prove its change was reviewed and tested. The idea is **build
-freely, review hard**: while building, the agent works without review loops or ceremony. When it
-finishes, the final diff is frozen and the CLI plans the hunt from it. Fresh-context hunter subagents that
-did not write the code take every planned slot, separate verifier subagents try to disprove every finding, and the
-hunt continues while it keeps turning up real defects. The agent cannot finish until every slot is done and
-the tests pass on the final code.
+Craftsman is a loop that an AI coding agent is locked in. Normally an agent judges its own work and
+declares itself done. Inside Craftsman it cannot finish a task until it proves that its change was
+reviewed and tested.
 
-Craftsman keeps a ledger in the `.git` directory with the evidence: which hunks each hunter covered,
-what each finding was judged to be and why, and the test runs. A platform hook checks the ledger when
-the agent tries to stop and sends it back with a list of what is missing. The gate checks outcomes,
-not effort, and a hook that fails is logged, never silent.
+Craftsman does not affect how the agent codes; the principle is **build freely, review hard**. The
+review starts only once the agent decides the task is done. Its change (the diff) is frozen, and the
+code is checked by agents that did not write it and are seeing it for the first time. Some hunt for
+bugs; others try to disprove every report, so that only the real ones remain. The hunt continues while
+it keeps turning up real bugs. The agent fixes them and finishes only when the tests pass on the final
+code.
+
+The evidence goes into a ledger in the `.git` directory: who checked which part of the change, what
+each report was judged to be and why, and how the tests ran. When the agent tries to stop, a platform
+hook reads the ledger and sends it back with a list of what is missing. Outcomes count, not the agent's
+claims. A failure of the hook itself is logged, never silent.
 
 It works with Claude Code, GitHub Copilot, and Google Antigravity. In Codex and Cursor, the same
 protocol runs without hooks.
@@ -25,17 +29,38 @@ protocol runs without hooks.
 
 ![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
 
-The agent builds with no gate activity. Then the diff is frozen into a round and the CLI turns it into a
-hunt plan: slots of hunks and lenses, sized by the diff and its risk signals, not by how hard the model
-feels like trying. Each slot goes to a fresh-context hunter that records every candidate defect with a
-concrete trigger, and separate verifiers try to disprove each one and reproduce the survivors. Hunters
-maximize recall; verifiers maximize precision. While a wave proves a defect, another one runs. Confirmed
-defects are fixed at the root cause, the fix delta is re-checked by fresh hunters, and the tests run through
-`craftsman run` on the final code.
-`/craft-review` runs the same hunt on an existing change, and fixes only when you ask.
+The agent builds its own way; Craftsman reviews nothing in the meantime. Once the agent considers the task
+done, the review runs in four steps:
+
+1. **Freeze and plan.** The diff is frozen and the CLI splits it into portions to check (slots). Each
+   portion is a part of the change plus the perspectives to examine it from (lenses). The number of
+   portions is set by the size of the diff and its risk signals, not by how hard the model feels like
+   trying. The agent cannot skip any.
+2. **Bug hunt.** Each portion goes to a separate fresh-context agent. It records every suspected bug
+   together with the concrete situation that triggers it.
+3. **Verification.** Separate agents try to disprove every suspicion and reproduce the ones that
+   survive. Hunters must miss nothing; verifiers must filter out false alarms. While a wave of the hunt
+   confirms at least one bug, another one runs.
+4. **Fixes and tests.** The agent fixes confirmed bugs at the root cause, fresh-context hunters re-check
+   the fixes, and the tests run through `craftsman run` on the final code.
+
+`/craft-review` runs the same review on an existing change, and fixes only when you ask.
 
 The full protocol, with diagrams, is in
 [docs/how-it-works.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md).
+
+## Where It Fits Best
+
+Craftsman works best for:
+
+- coding hard solutions,
+- working with legacy code,
+- moving an old codebase to a new solution,
+- scientific problems, where certainty about the result matters.
+
+It works well with cheap models, and even more so with self-hosted ones.
+
+It is not needed for prototypes and small fixes.
 
 ## Platforms
 
