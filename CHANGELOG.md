@@ -6,12 +6,41 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Brand assets and plugin manifest metadata.** Added `assets/logo.svg` (vector shield/anvil mark), `assets/icon.png`
+  (`1024x1024` PNG), and `assets/social-preview.png` (`1280x640` PNG). Wired them into `plugin.json` (`displayName`,
+  `logo`, `author`, `homepage`, `repository`, `suggestedPrompts`) and the exported Claude Code (`icon`), Codex (`logo`,
+  `composerIcon`, `brandColor`), and Cursor (`logo`) manifests, and bundled `assets/` in `MANIFEST.in`, `setup.py`,
+  `craftsman/platforms/antigravity.py`, and `craftsman doctor` drift checks.
+- **Standalone Agent Skills (`agentskills.io` / `skills.sh`) portability.** Added `license`, `compatibility`, and
+  `metadata` frontmatter fields across all 13 `skills/*/SKILL.md` files (enforced by `tests/test_skill_portability.py`),
+  generated six synced `references/<lens>-lens.md` playbooks from `skills/craft-review/lenses.md` for
+  `audit-security`, `audit-errors`, `audit-tests`, `audit-types`, `audit-comments`, and `simplify`, and added
+  standalone fallbacks (including ungated mode in `/craft-review`) so the 11 audit and workflow skills run without the
+  `craftsman` CLI.
+- **Gemini 3.8 Flash (`low`) seeded-suite A/B benchmark** in [`docs/benchmark.md`](docs/benchmark.md) (`32` runs across
+  `8` cases in `evals/`, `2` passes via `agy -p`: baseline `89%` recall in `11.9 min/pass` vs. Craftsman 5.1.0 `98%`
+  recall in `144.1 min/pass`), and refreshed `.github/ISSUE_TEMPLATE/benchmark_replication.yml`.
+- **`CITATION.cff`** (CFF 1.2.0) and **Windows PowerShell demo setup (`examples/demo/setup.ps1`)** alongside
+  [`examples/demo/README.md`](examples/demo/README.md).
+
+### Changed
+
+- **README and documentation onboarding.** Updated `README.md` with the brand logo, PyPI and Agent Skills badges, a
+  4-row "How It Differs" comparison table, real CLI walkthrough ("See It In Action" from `examples/demo`), Flash
+  seeded-suite measurements, and standalone skills highlight (`npx skills add BuczynskiRafal/craftsman`). Updated
+  [`docs/installation.md`](docs/installation.md), [`docs/skills.md`](docs/skills.md), and
+  [`docs/usage.md`](docs/usage.md) to group standalone vs. gated skills, and replaced the unfinished
+  `Claude Code Pilot Runs` TODO stub in [`docs/benchmark.md`](docs/benchmark.md) with a note in the overview.
+
 ### Fixed
 
 - The wheel now contains `craftsman/py.typed`, so type checkers read Craftsman's type hints.
 - The source archive (sdist) now contains `install.sh`, `bin/` and the plugin manifests. The installer and the
   plugin tests need them.
 - `SECURITY.md` lists 5.x as the supported version instead of 4.x.
+- Removed unreachable dead code in `craftsman/platforms/claude.py` (`export_claude_plugin`).
 
 ## [5.1.0] - 2026-11-11
 

@@ -46,9 +46,18 @@ what is missing:
 
 Set up an isolated demo repository:
 
+**macOS / Linux / Git Bash:**
+
 ```bash
 ./setup.sh /tmp/craftsman-demo
 cd /tmp/craftsman-demo
+```
+
+**Windows (PowerShell):**
+
+```powershell
+.\setup.ps1 "$env:TEMP\craftsman-demo"
+cd "$env:TEMP\craftsman-demo"
 ```
 
 Then, in Claude Code, GitHub Copilot, or Antigravity, ask for the feature in your own words:

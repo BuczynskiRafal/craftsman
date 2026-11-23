@@ -6,7 +6,7 @@ You describe the work in plain words. The agent infers the rest.
 
 ## Ask in Plain Words
 
-In Claude Code, Copilot Chat, or Google Antigravity:
+In Claude Code, Copilot Chat, Google Antigravity, or Codex (`$craftsman:craftsman`, `$craftsman:craft-review`):
 
 ```text
 /craftsman add pagination to the catalog search
@@ -25,6 +25,9 @@ ultracraft rewrite the token refresh logic
   you find").
 - `ultracraft` in a request starts `/craftsman` at full depth. Inside `/craft-review` it means a deep
   review; it never opens a gate.
+- For standalone workflows or single-concern audits without opening a gate (`/feature-dev`, `/modernize`,
+  `/batch`, `/simplify`, `/verify`, `/audit-*`), see the [Bundled Skills Catalog](skills.md). To try
+  `/craftsman` safely on a disposable repository, see the [catalog pagination demo](../examples/demo/README.md).
 
 To mention a trigger word without starting a session, put it in backticks or quotes.
 

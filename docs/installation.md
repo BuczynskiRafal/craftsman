@@ -26,6 +26,32 @@ craftsman install                  # auto-detects Copilot, Claude Code, Antigrav
 
 ---
 
+## Agent Skills (`npx skills add` / skills.sh)
+
+All 13 Craftsman skills follow the [Agent Skills](https://agentskills.io) format and can be installed directly without Python:
+
+```bash
+npx skills add BuczynskiRafal/craftsman
+```
+
+Or pick individual skills with `--skill <name>`:
+
+```bash
+npx skills add BuczynskiRafal/craftsman --skill audit-security --skill audit-errors
+npx skills add BuczynskiRafal/craftsman --skill feature-dev --skill simplify --skill verify
+npx skills add BuczynskiRafal/craftsman --skill craft-review
+```
+
+What works standalone vs. what `craftsman-gate` adds:
+
+- **11 workflow & audit skills work standalone (no Python needed):** `feature-dev`, `modernize`, `batch`, `simplify`, `verify`, `audit`, `audit-comments`, `audit-errors`, `audit-security`, `audit-tests`, and `audit-types` run without installing `craftsman-gate`. The six lens-deepening skills (`audit-security`, `audit-errors`, `audit-tests`, `audit-types`, `audit-comments`, `simplify`) bundle their own `references/<lens>-lens.md` playbooks inside each skill folder, and test/check steps run directly in the shell when `craftsman` is absent.
+- **`craft-review` works standalone in ungated mode:** without the CLI, `/craft-review` reads its bundled `skills/craft-review/lenses.md` playbook, splits changed hunks across fresh-context subagents where the platform allows, verifies candidate findings, and marks the report **UNGATED**.
+- **Installing `craftsman-gate` adds the enforced review loop:** installing the Python CLI (`pipx install craftsman-gate` + `craftsman install`, or a hook-enabled platform plugin) adds the deterministic diff-driven hunt plan, `craftsman review scout`, the Git-local evidence ledger, and the Stop and PreToolUse hooks that block premature completion. `/craftsman` requires `craftsman-gate` because its gate and hooks enforce the full build-and-review loop.
+
+See the [Bundled Skills Catalog](skills.md) for the full list.
+
+---
+
 ## Automated Installation
 
 For manual or scoped installation, pass target flags to `craftsman install` (or `./install.sh`):

@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use Craftsman, please cite it using the metadata from this file."
+title: "Craftsman"
+version: "5.1.0"
+date-released: "2026-11-11"
+abstract: >-
+  Craftsman is a zero-dependency quality gate and multi-agent review loop for
+  AI coding agents. It freezes the final diff, plans risk-driven bug hunts with
+  fresh-context hunters and verifiers, records outcomes in a Git-local
+  evidence ledger, and enforces completion through platform hooks.
+authors:
+  - family-names: "Buczyński"
+    given-names: "Rafał"
+    email: "buczynski.rafal2@gmail.com"
+license: "MIT"
+repository-code: "https://github.com/BuczynskiRafal/craftsman"
+url: "https://github.com/BuczynskiRafal/craftsman"
+keywords:
+  - ai-agents
+  - code-review
+  - quality-gate
+  - agent-skills
+  - claude-code
+  - github-copilot
+  - antigravity
+  - codex
+  - cursor

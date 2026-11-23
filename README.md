@@ -1,7 +1,11 @@
+![Craftsman](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/assets/logo.svg)
+
 # Craftsman
 
 [![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/craftsman-gate)](https://pypi.org/project/craftsman-gate/)
 [![Version](https://img.shields.io/badge/version-5.1.0-emerald.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/plugin.json)
+[![Agent Skills](https://img.shields.io/badge/Agent_Skills-skills.sh-0F766E.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md)
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE)
@@ -24,6 +28,15 @@ claims. A failure of the hook itself is logged, never silent.
 
 It works with Claude Code, GitHub Copilot, and Google Antigravity. In Codex and Cursor, the same
 protocol runs without hooks.
+
+## How It Differs
+
+| | Plain `CLAUDE.md` / prompt | External PR bots | Craftsman |
+| :--- | :--- | :--- | :--- |
+| **When it runs** | Only if the agent remembers | After a pull request is opened | Before the agent can stop, on the local diff |
+| **Who checks the work** | The same context that wrote the bug | A single remote pass on the PR | Fresh-context hunters + verifiers who try to disprove every report |
+| **What counts as done** | Agent claims the tests pass | Review comments posted on GitHub | A Git-local ledger of covered hunks, reproduced verdicts, and passing `craftsman run` checks |
+| **Runtime & setup** | Prompt text only | Cloud service / repo webhook | Local stdlib-only Python CLI (zero dependencies) or standalone Agent Skills |
 
 ## How It Works
 
@@ -48,6 +61,62 @@ done, the review runs in four steps:
 
 The full protocol, with diagrams, is in
 [docs/how-it-works.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md).
+
+## See It In Action
+
+Captured on the [catalog pagination demo](https://github.com/BuczynskiRafal/craftsman/blob/main/examples/demo/README.md)
+(`./setup.sh` on POSIX, `.\setup.ps1` on Windows):
+
+**1. `craftsman review prepare` builds the hunt plan from the diff**
+
+```text
+$ craftsman review prepare --task "Add 1-based pagination to catalog search results (page number and optional page size)"
+Round 1 prepared: 2 files, 2 hunks, 45 changed lines; 0 hunks carried, 2 to review.
+Packet: .git/craftsman/packet-1.md
+Depth: normal (no deep signal; 33 changed production lines <= 250)
+Enforced: Copilot hooks serve this review; finishing requires every slot below.
+Hunt plan, round 1:
+  W1-1  H1-H2  intent, ripple, tests       45 lines
+  W1-2  H1-H2  contracts, failure, sweep   45 lines
+  W1-3  H1     model                       33 lines
+  W1-4  H1-H2  craft, design (simplicity)  45 lines  [Claude Code: model haiku]
+```
+
+**2. If the agent tries to finish early, the Stop hook sends it back**
+
+```text
+[CRAFTSMAN GATE 1/6] review incomplete: no passing test run; no reviewer isolation evidence. Task completion is blocked until the evidence ledger proves the change is reviewed and verified.
+Next actions:
+1. [no-isolation] No Craftsman subagent was recorded for round 1. ... launch them now, all in one step: W1-1..W1-3; W1-4 [Claude Code: model haiku].
+2. [no-passing-run] No passing test or e2e run at the current code; run `craftsman run --kind test -- <your test command>`.
+Close the gate with `craftsman gate --complete` once `craftsman review check` passes.
+```
+
+**3. Once hunters, verifiers, fixes, round 2, and tests pass, `craftsman review report` shows the evidence**
+
+```text
+$ craftsman review report
+- Base `7a8b04a` · 2 review round(s) · 2 files, +48/−10 lines
+- Gate: PASSED
+
+## Hunt
+Hunt: 6 slots - 6 done
+  W1-1   H3-H4  intent, ripple, tests                58 lines  [done]
+  W1-2   H3-H4  contracts, failure, sweep            58 lines  [done]
+  W1-3   H3     model                                37 lines  [done]
+  W1-4   H3-H4  craft, design (simplicity)           58 lines  [done] [Claude Code: model haiku]
+  W2-X1  H3-H4  state, trust, platform (fresh look)  58 lines  [done]
+  W2-F1  H3     contracts (variant of F1)            37 lines  [done]
+
+## Findings
+**Fixed (2)**
+- F1 · major · `shop/catalog.py:37` — total_pages truncates partial pages via floor division. Fix: Used ceiling division in shop/catalog.py; confirmed by test_list_products_partial_last_page (R3).
+- F2 · major · `shop/catalog.py:36` — page < 1 uses negative slice indices instead of raising ValueError. Fix: Added page >= 1 and page_size >= 1 checks; confirmed by test_list_products_rejects_non_positive_page (R3).
+
+## Verification at the final code
+- R3 `python -m unittest discover -s tests` (test) → exit 0 in 0.2s
+- R4 `python -m unittest discover -s tests` (test) → exit 0 in 0.1s
+```
 
 ## Where It Fits Best
 
@@ -84,6 +153,16 @@ each reviewed with and without Craftsman in nine model configurations.
 - Human review comments found: 16 without Craftsman, **30 with** (of 81).
 - Bugs no human reviewer raised, reproduced with a script: 22 without Craftsman, **30 with** (of 54).
 
+Seeded-defect suite (`evals/`, 8 cases, 27 defects, 18 decoys) on `gemini-3.8-flash-low` via Antigravity
+(`agy -p`, Craftsman 5.1.0 vs. unassisted baseline, 2 complete passes, 32 runs):
+
+- **Recall**: `89%` (`24.00/27`) without Craftsman → **`98%`** (`26.50/27`, `27/27` in pass 2) with
+  Craftsman (`+9.3 pts`, 90% Welch interval `-2.4 to +21.0 pts`). Craftsman caught all three defects the
+  baseline missed in both passes (`inv-2`, `od-6`, `tb-3`).
+- **Trade-offs**: precision `100%` → `83%` (`1.50` decoy hits and `29.00` unmatched findings per pass),
+  wall time `11.9 min` → `144.1 min` per pass (`×12.14`, two large pass-1 runs hit the 30 min cap),
+  tokens `3.3M` → `111.3M` per pass (`×33.54`, `84.8%` in subagents).
+
 Full tables and limits:
 [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
 
@@ -114,6 +193,28 @@ In Codex and Cursor the plugin brings the skills (and, in Cursor, an always-on r
 the review stays advisory there. Cursor installs it as a local plugin; see
 [docs/installation.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md#cursor-plugin).
 
+### Try the Skills Without Installing Python
+
+All 13 skills follow the [Agent Skills](https://agentskills.io) standard and can be installed directly via
+`skills.sh`:
+
+```bash
+npx skills add BuczynskiRafal/craftsman
+# or pick specific standalone skills:
+npx skills add BuczynskiRafal/craftsman --skill audit-security --skill simplify
+```
+
+Eleven audit and workflow skills (`feature-dev`, `modernize`, `batch`, `simplify`, `verify`, `audit`,
+`audit-comments`, `audit-errors`, `audit-security`, `audit-tests`, and `audit-types`) work completely
+standalone with no Python needed, bundling their own `references/<lens>-lens.md` playbooks where needed.
+`/craft-review` also works standalone (ungated) using its bundled
+[`lenses.md`](https://github.com/BuczynskiRafal/craftsman/blob/main/skills/craft-review/lenses.md).
+
+Install `craftsman-gate` when you want the enforced loop: deterministic hunt plans,
+`craftsman review scout`, the Git-local evidence ledger, and Stop hooks that block early completion. See
+the [skills catalog](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md) and
+[installation guide](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md).
+
 ## Usage
 
 Type a request in plain words. There are no flags to remember.
@@ -139,10 +240,11 @@ Depth never goes down during a session. The final report explains what the agent
 
 - [Usage](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md): example requests, what the agent decides, optional flags
 - [How it works](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md): the protocol in full, the hunt plan, what hunters read, ledger, gate, lenses, platform enforcement
-- [Installation](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md): flags, platform setup, uninstall, `craftsman doctor`
+- [Installation](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md): flags, platform setup, Agent Skills (`npx skills add`), uninstall, `craftsman doctor`
 - [Guards](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/guards.md): gate state machine, review guard, command policy, search scope guard, hook error log
-- [Skills](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md): catalog of bundled skills
+- [Skills](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md): catalog of standalone and gated skills
 - [Benchmark](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md): methodology, results, replication
+- [Demo](https://github.com/BuczynskiRafal/craftsman/blob/main/examples/demo/README.md): isolated catalog pagination demo (`setup.sh` / `setup.ps1`)
 - [Architecture](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/harness-architecture.md): project internals for contributors
 
 ## Contributing
@@ -150,6 +252,10 @@ Depth never goes down during a session. The final report explains what the agent
 See [CONTRIBUTING.md](https://github.com/BuczynskiRafal/craftsman/blob/main/CONTRIBUTING.md).
 
 ## Citation
+
+To cite Craftsman itself, see
+[CITATION.cff](https://github.com/BuczynskiRafal/craftsman/blob/main/CITATION.cff). For the SWR-Bench
+pilot dataset:
 
 ```bibtex
 @article{zeng2026swrbench,
