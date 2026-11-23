@@ -123,12 +123,12 @@ Tam, gdzie środowisko nie udostępnia hooków subagentów (Codex, Cursor lub se
 
 ## Pomiary
 
-Benchmark A/B na zasianym zestawie defektów w [`evals/`](evals/README.pl.md) (`8` przypadków, `27` defektów, `18` pułapek) na `gemini-3.8-flash-low` przez Antigravity (`agy -p`, Craftsman `5.1.0` vs. baseline bez wsparcia, `2` pełne przebiegi = `32` uruchomienia):
+Zmierzone na modelu `gemini-3.8-flash-low` w dwóch zestawach A/B pod Antigravity (`n=2` przebiegi na ramię):
 
-- **Skuteczność wykrywania (recall)**: `89%` (`24.00/27`) bez Craftsmanna → **`98%`** (`26.50/27`, `27/27` w 2. przebiegu, `+9.3 pkt`, 90% przedział Welcha `-2.4 do +21.0 pkt`), z wykryciem wszystkich trzech defektów pominiętych przez baseline w obu przebiegach (`inv-2`, `od-6`, `tb-3`).
-- **Kompromisy**: precyzja `100%` → `83%` (`1.50` trafień w pułapki i `29.00` niedopasowanych znalezisk na przebieg), czas `11.9` → `144.1 min`/przebieg (`×12.14`, w tym dwa przekroczenia limitu 30 min w 1. przejściu), tokeny `3.3M` → `111.3M`/przebieg (`×33.54`, `84.8%` w subagentach).
+- **Recenzja z zasianymi defektami ([`evals/`](evals/README.pl.md), 8 przypadków / 27 błędów / 18 pułapek):** `89%` (`24.00/27`) bez wsparcia → **`98%`** (`26.50/27`, przed optymalizacją `5.1.0`, `111.3M` tokenów) oraz **`94%`** (`25.50/27`) po optymalizacji fal (`27556a4`, która ścięła subagentów o **44%** `208.0 → 116.5` i tokeny o **36%** `111.3M → 71.2M` na przebieg, `×21.46` wobec `3.3M` w baseline). Oba warianty Craftmana wykryły wszystkie 3 defekty pominięte dwukrotnie przez baseline (`inv-2`, `od-6`, `tb-3`) przy precyzji `81%–83%`.
+- **Build-and-verify (`evals/build_cases/`, 6 wielomodułowych zadań / 110 ukrytych testów):** W zadaniach greenfield, gdzie sam baseline Flash `low` osiągnął już `96.4%` ukrytych testów (`8/12` pełnych zaliczeń, `404k` tokenów, `2.9 min`), pełne `/craftsman` poprawiło `82` ze `181` zgłoszeń i uzyskało `2/2` na `config_overlay` (vs `1/2` w baseline), ale przekroczyło limit `40 min` w `3/12` przebiegach i dało `7/12` wszystkich / `5/9` `ok` (`95.5%` / `95.2%` ukrytych testów) przy zużyciu `21M–28M` tokenów (`25.5–29.1 min`).
 
-Najbardziej opłaca się przy trudnych zmianach, migracjach legacy i kodzie o wysokich wymaganiach niezawodności — zbędne przy szybkich prototypach i drobnych poprawkach. Pełne tabele i ograniczenia: [docs/benchmark.md](docs/benchmark.md).
+Wniosek: do rutynowych zadań greenfield lepiej używać samych skilli z `skills.sh`, a pełną bramkę Stop zachować dla ryzykownych diffów, migracji legacy i krytycznych recenzji. Pełne tabele i ograniczenia: [docs/benchmark.md](docs/benchmark.md).
 
 ## Dokumentacja
 

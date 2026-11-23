@@ -238,3 +238,26 @@ Aby porównać ramiona ręcznie, oceń każde uruchomienie, następnie uśrednij
 3. Dopisz przypadek do powyższej tabeli. Zestaw nie ma limitu liczby defektów; ogranicz jednak liczbę dużych przypadków, bo to one podnoszą koszt uruchomień.
 
 Linting: `python3 -m ruff check evals tests/test_evals.py tests/test_evals_usage.py` oraz `python3 -m mypy --strict --exclude 'evals/cases/' evals tests/test_evals.py tests/test_evals_usage.py` przechodzą czysto (drzewa przypadków to fixtury z zasianymi defektami i nie podlegają lintowaniu).
+
+---
+
+## Benchmark build-and-verify (`evals.build_bench`)
+
+Uzupełniający zestaw zadań kodujących w `evals/build_cases/` (`6` wielomodułowych projektów Pythona opartych wyłącznie o stdlib), służący do porównywania pełnej implementacji z bramką `/craftsman` przeciwko nieuzbrojonemu wariantowi baseline na podstawie ukrytych testów `hidden_tests.py` niewidocznych w workspace agenta.
+
+| Przypadek | Pakiet | Ukryte testy | Co sprawdza |
+| :--- | :--- | :---: | :--- |
+| `ledger_batch` | `ledger_batch` | 10 | Podwójny zapis księgowy, atomowy rollback partii, konflikt vs. powtórka idempotencji, storna, bilans próbny |
+| `jobqueue_retry` | `jobqueue_retry` | 10 | Priorytety i `seq`, wygaszanie dzierżaw, ochrona przed spóźnionymi workerami, wykładniczy backoff, DLQ, anulowanie, JSON |
+| `config_overlay` | `config_overlay` | 9 | Dziedziczenie diamentowe, dyrektywy `$merge`/`$unset`, interpolacja z detekcją cykli i escapowaniem `\${...}`, walidacja i redakcja sekretów |
+| `docindex_search` | `docindex_search` | 9 | Czyszczenie indeksów przy update/delete, offsety po stopwordach, frazy pozycyjne, operatory logiczne, wielokrotne fasety, migawki |
+| `pkgcache_sync` | `pkgcache_sync` | 9 | Weryfikacja SHA-256, atomowy staging, przechodnie pinowanie zależności, transakcyjny limit pojemności, deduplikacja i GC |
+| `schedule_rrule` | `schedule_rrule` | 8 | Deterministyczne reguły DST w stdlib, `DAILY`/`WEEKLY`/`MONTHLY` (`skip`/`clamp`), `COUNT`/`EXDATE`/`RECURRENCE-ID`, konflikty |
+
+```bash
+python3 -m evals.build_bench list
+python3 -m evals.build_bench prepare ledger_batch ~/evals/ledger-1   # kopiuje tylko starter/ i TASK.md (bez hidden_tests.py)
+python3 -m evals.build_bench grade ledger_batch ~/evals/ledger-1     # uruchamia tests/test_starter.py oraz ukryte hidden_tests.py
+python3 -m evals.build_bench summary bench/build_eval.jsonl          # podsumowuje wyniki JSONL per ramię i przypadek
+python3 -m unittest tests.test_build_cases                           # weryfikuje projekty startowe, ukryte testy, LF oraz brak przecieków
+```

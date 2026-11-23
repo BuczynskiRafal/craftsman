@@ -123,12 +123,12 @@ Where a host does not expose subagent hooks (Codex, Cursor, or unhooked sessions
 
 ## Measurements
 
-Seeded-defect A/B benchmark on [`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md) (`8` cases, `27` defects, `18` decoys) using `gemini-3.8-flash-low` via Antigravity (`agy -p`, Craftsman `5.1.0` vs. unassisted baseline, `2` passes = `32` runs):
+Measured on `gemini-3.8-flash-low` across two Antigravity A/B suites (`n=2` passes/arm):
 
-- **Recall**: `89%` (`24.00/27`) without Craftsman → **`98%`** (`26.50/27`, `27/27` in pass 2, `+9.3 pts`, 90% Welch CI `-2.4 to +21.0 pts`), catching all three defects the baseline missed in both passes (`inv-2`, `od-6`, `tb-3`).
-- **Trade-offs**: precision `100%` → `83%` (`1.50` decoy hits and `29.00` unmatched findings/pass), time `11.9` → `144.1 min`/pass (`×12.14`, with two pass-1 timeouts at 30 min), tokens `3.3M` → `111.3M`/pass (`×33.54`, `84.8%` in subagents).
+- **Seeded-defect review ([`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md), 8 cases / 27 bugs / 18 decoys):** `89%` (`24.00/27`) unassisted → **`98%`** (`26.50/27`, pre-opt `5.1.0`, `111.3M` tokens) and **`94%`** (`25.50/27`) after wave optimization (`27556a4`, which cut subagents **-44%** `208.0 → 116.5` and tokens **-36%** `111.3M → 71.2M` per pass, `×21.46` baseline `3.3M`). Both Craftsman runs caught all 3 bugs the baseline missed twice (`inv-2`, `od-6`, `tb-3`) at `81%–83%` precision.
+- **Build-and-verify ([`evals/build_cases/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md#build-and-verify-benchmark), 6 multi-module tasks / 110 hidden tests):** On greenfield tasks where Flash `low` baseline already scored `96.4%` of hidden tests (`8/12` full pass, `404k` tokens, `2.9 min`), full `/craftsman` review fixed `82` of `181` reported findings and scored `2/2` on `config_overlay` (vs `1/2` baseline) but hit `3/12` `40m` timeouts and scored `7/12` all / `5/9` `ok` (`95.5%` / `95.2%` hidden) at `21M–28M` tokens (`25.5–29.1 min`).
 
-Best suited for hard changes, legacy migrations, and high-stakes code — unnecessary for quick prototypes or trivial fixes. Full tables and limits: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
+Takeaway: use standalone `skills.sh` skills for routine greenfield tasks, and enable the full Stop-hook gate on risky diffs, legacy changes, and high-stakes reviews. Full tables and limits: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
 
 ## Documentation
 
