@@ -14,10 +14,6 @@ pipx install craftsman-gate
 uv tool install craftsman-gate
 ```
 
-Upgrading from a `pip install .` of a checkout older than 4.0, which installed the distribution under the
-name `craftsman`? Run `pip uninstall craftsman` first: both names install the same files, and uninstalling
-the old one later would delete them from under `craftsman-gate`. `craftsman doctor` reports the leftover.
-
 Then run the installer to automatically configure your active environments:
 
 ```bash
@@ -28,27 +24,15 @@ craftsman install                  # auto-detects Copilot, Claude Code, Antigrav
 
 ## Agent Skills (`npx skills add` / skills.sh)
 
-All 13 Craftsman skills follow the [Agent Skills](https://agentskills.io) format and can be installed directly without Python:
+All 13 Craftsman skills follow the [Agent Skills](https://agentskills.io) format and install without Python:
 
 ```bash
 npx skills add BuczynskiRafal/craftsman
-```
-
-Or pick individual skills with `--skill <name>`:
-
-```bash
+# or pick individual skills:
 npx skills add BuczynskiRafal/craftsman --skill audit-security --skill audit-errors
-npx skills add BuczynskiRafal/craftsman --skill feature-dev --skill simplify --skill verify
-npx skills add BuczynskiRafal/craftsman --skill craft-review
 ```
 
-What works standalone vs. what `craftsman-gate` adds:
-
-- **11 workflow & audit skills work standalone (no Python needed):** `feature-dev`, `modernize`, `batch`, `simplify`, `verify`, `audit`, `audit-comments`, `audit-errors`, `audit-security`, `audit-tests`, and `audit-types` run without installing `craftsman-gate`. The six lens-deepening skills (`audit-security`, `audit-errors`, `audit-tests`, `audit-types`, `audit-comments`, `simplify`) bundle their own `references/<lens>-lens.md` playbooks inside each skill folder, and test/check steps run directly in the shell when `craftsman` is absent.
-- **`craft-review` works standalone in ungated mode:** without the CLI, `/craft-review` reads its bundled `skills/craft-review/lenses.md` playbook, splits changed hunks across fresh-context subagents where the platform allows, verifies candidate findings, and marks the report **UNGATED**.
-- **Installing `craftsman-gate` adds the enforced review loop:** installing the Python CLI (`pipx install craftsman-gate` + `craftsman install`, or a hook-enabled platform plugin) adds the deterministic diff-driven hunt plan, `craftsman review scout`, the Git-local evidence ledger, and the Stop and PreToolUse hooks that block premature completion. `/craftsman` requires `craftsman-gate` because its gate and hooks enforce the full build-and-review loop.
-
-See the [Bundled Skills Catalog](skills.md) for the full list.
+Eleven workflow and audit skills run standalone (using bundled `references/<lens>-lens.md` playbooks and direct shell checks), and `/craft-review` falls back to standalone **UNGATED** mode using `skills/craft-review/lenses.md`. Install `craftsman-gate` above for deterministic hunt plans, the `.git` evidence ledger, and Stop hooks required by `/craftsman`. Full list: [Bundled Skills Catalog](skills.md).
 
 ---
 
@@ -201,6 +185,9 @@ craftsman uninstall --dry-run                      # preview changes without rem
 
 Uninstall cleans only paths registered in `.craftsman-install.json` and restores original configuration files.
 
-Running `craftsman install` again also removes what an earlier install created and this version no longer ships (for example the `code-quality`, `extreme-optimizer`, `high-level-commit-message` and `leetcode-style-code-reviewer` skills, which 5.0 still shipped). Only paths the manifest records are removed; a skill or command of the same name that you wrote yourself stays. A folder Craftsman created is Craftsman's with everything in it: every install replaces it and an upgrade that drops it deletes it, so keep your own skills beside it, not inside it.
+---
 
-A manifest written by Craftsman before 4.0 (it records global git hooks) is no longer migrated: `install`, `uninstall` and `doctor` stop with a message that asks you to delete that file and run `craftsman install` again. If `git config --global core.hooksPath` still points to a Craftsman `git-hooks` folder, unset it with `git config --global --unset core.hooksPath`; `craftsman doctor` reports that setting when it points to `~/.craftsman/git-hooks` or `~/.gemini/config/git-hooks`.
+## Upgrading from Older Versions
+
+- **From `5.0` or `4.x`:** Re-running `craftsman install` removes skills shipped in earlier versions that are no longer bundled (such as `code-quality`, `extreme-optimizer`, `high-level-commit-message`, and `leetcode-style-code-reviewer`), keeping any files you wrote outside Craftsman-managed folders. The first CLI command also archives any pre-5.0 gate state (`craftsman_state.json.v4.bak`) or schema 2 ledger (`ledger.v2.<UTC stamp>.bak.json`), so neither `gate --init --takeover` nor `review reset` is needed.
+- **From pre-`4.0` checkouts:** If you previously ran `pip install .` when the distribution was named `craftsman`, run `pip uninstall craftsman` before installing `craftsman-gate` (`doctor` flags leftovers). Pre-4.0 global git-hook manifests are no longer migrated: delete the stale manifest, run `git config --global --unset core.hooksPath` if it still points to `~/.craftsman/git-hooks` or `~/.gemini/config/git-hooks`, and re-run `craftsman install`.

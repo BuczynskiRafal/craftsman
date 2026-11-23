@@ -76,9 +76,7 @@ that the review guard let the agent leave after six reminders without progress.
   the agent extends the scope with `--add-paths`.
 - **Archives.** Packets, views, and ledger snapshots live in `.git/craftsman/`. Superseded packets
   are pruned on every `review prepare`; archives keep the newest `CRAFTSMAN_KEEP_ARCHIVES` entries
-  (default `5`). `craftsman review reset` archives the current ledger before an independent review. A
-  pre-5.0 gate state or schema 2 ledger is archived automatically, so there is nothing to reset when
-  upgrading.
+  (default `5`). `craftsman review reset` archives the current ledger before an independent review.
 - **Initial commit.** In a repository with no commits, the empty tree is the base, so the first
   bootstrap can be reviewed too.
 
@@ -95,20 +93,7 @@ craftsman review report                # the final report, with agent usage per 
 craftsman skill show craft-review --lenses trust,state   # lens playbooks
 ```
 
-`craftsman run` prints a command's output as it arrives, unchanged, up to 6,000 characters. When the
-output passes that limit, printing stops and a line names the log that holds the full output:
-`[craftsman run: output continues; its end prints when the command exits; full output, written as it arrives: PATH]`.
-`PATH` is `run-output.log` in a directory of the `craftsman review scratch` area, which is pruned when
-the review ends; it holds everything from the first byte, grows while the command runs (so
-`tail PATH` shows where a slow or hung command is) and keeps its name. When the command exits, the
-rest prints whole if it is at most 6,000 characters; otherwise a line
-`[craftsman run: N characters omitted; full output: PATH]` and the last 6,000 characters print. Cuts
-move to a line boundary where that costs at most 200 characters. If the log cannot be written, the
-line says `full output not saved: <reason>` and all of the output prints as it arrives. `--full`
-prints everything as it arrives, with no log. The ledger record, test count and exit code are the
-same either way. On POSIX, SIGTERM or SIGHUP to `craftsman run` stops the command as Ctrl-C does:
-its process group is stopped, the run is recorded as interrupted, the end of the output prints, and
-`craftsman run` exits with 128 plus the signal number (143 or 129).
+`craftsman run` streams live output up to 6,000 characters, then appends the full log to `run-output.log` in the `craftsman review scratch` area (pruned when the review ends) and prints the last 6,000 characters on exit (adjusting cuts by up to 200 chars to stay on line boundaries; `full output not saved: <reason>` prints full output if the log cannot be written; `--full` skips truncation). On POSIX, `SIGTERM`/`SIGHUP` stops the process group, marks the run interrupted, and exits `128 + signal` (`143`/`129`).
 
 `craftsman review check --json` (and `report --json`) print the verdict of the gate for scripts: `passed`,
 `partial`, `self_reviewed`, `enforced`, `platform`, `abandoned`, `slots` (each with `id`, `state` of `done`,

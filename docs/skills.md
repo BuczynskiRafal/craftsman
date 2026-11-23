@@ -1,14 +1,6 @@
 # Bundled Skills Catalog
 
-Craftsman ships 13 skills following the [Agent Skills](https://agentskills.io) specification. Eleven audit and workflow skills work completely standalone (zero Python or CLI required); the two core loop skills drive the gated build-and-review workflow (with an ungated standalone fallback for `/craft-review`).
-
-Install all 13 skills via [`skills.sh`](https://skills.sh) / `npx skills add`:
-
-```bash
-npx skills add BuczynskiRafal/craftsman
-```
-
-Or install only the standalone skills you need:
+Craftsman ships 13 skills following the [Agent Skills](https://agentskills.io) specification (`npx skills add BuczynskiRafal/craftsman`). Eleven workflow and audit skills work standalone without Python; `/craft-review` works standalone in `UNGATED` mode; `/craftsman` requires the `craftsman-gate` CLI.
 
 ```bash
 npx skills add BuczynskiRafal/craftsman --skill audit-security --skill audit-errors
@@ -16,7 +8,7 @@ npx skills add BuczynskiRafal/craftsman --skill feature-dev --skill simplify --s
 npx skills add BuczynskiRafal/craftsman --skill craft-review
 ```
 
-See the [Installation Guide](installation.md) for full CLI and platform plugin setup.
+See the [Installation Guide](installation.md) for CLI and platform plugin setup.
 
 ---
 
@@ -31,7 +23,7 @@ See the [Installation Guide](installation.md) for full CLI and platform plugin s
 
 ## Standalone Audit & Workflow Skills (zero CLI required)
 
-These 11 skills work standalone via `npx skills add` with no Python installation. When `craftsman` is installed, they use `craftsman run` for ledger-recorded tests and `craftsman skill show craft-review --lenses <id>`; when it is absent, lens-deepening skills read their bundled `references/<lens>-lens.md` file and check commands run directly in the shell.
+When `craftsman` is absent, these 11 skills run check commands directly in the shell and read their bundled `references/<lens>-lens.md` files (with the CLI installed, checks run via `craftsman run` and playbooks via `craftsman skill show craft-review --lenses <id>`).
 
 ### Workflow Tracks
 

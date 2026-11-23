@@ -8,31 +8,27 @@ All notable changes to Craftsman are recorded here. The format follows
 
 ### Added
 
-- **Brand assets and plugin manifest metadata.** Added `assets/logo.svg` (vector shield/anvil mark), `assets/icon.png`
-  (`1024x1024` PNG), and `assets/social-preview.png` (`1280x640` PNG). Wired them into `plugin.json` (`displayName`,
-  `logo`, `author`, `homepage`, `repository`, `suggestedPrompts`) and the exported Claude Code (`icon`), Codex (`logo`,
-  `composerIcon`, `brandColor`), and Cursor (`logo`) manifests, and bundled `assets/` in `MANIFEST.in`, `setup.py`,
-  `craftsman/platforms/antigravity.py`, and `craftsman doctor` drift checks.
+- **Brand assets and plugin manifest metadata.** Added `assets/logo.svg`, `assets/icon.png` (`1024x1024` PNG), and
+  `assets/social-preview.png` (`1280x640` PNG), wired into `plugin.json`, exported Claude Code / Codex / Cursor
+  manifests, `MANIFEST.in`, `setup.py`, `craftsman/platforms/antigravity.py`, and `craftsman doctor`.
 - **Standalone Agent Skills (`agentskills.io` / `skills.sh`) portability.** Added `license`, `compatibility`, and
   `metadata` frontmatter fields across all 13 `skills/*/SKILL.md` files (enforced by `tests/test_skill_portability.py`),
-  generated six synced `references/<lens>-lens.md` playbooks from `skills/craft-review/lenses.md` for
-  `audit-security`, `audit-errors`, `audit-tests`, `audit-types`, `audit-comments`, and `simplify`, and added
-  standalone fallbacks (including ungated mode in `/craft-review`) so the 11 audit and workflow skills run without the
-  `craftsman` CLI.
+  synced `references/<lens>-lens.md` playbooks from `skills/craft-review/lenses.md` for `audit-security`,
+  `audit-errors`, `audit-tests`, `audit-types`, `audit-comments`, and `simplify`, and added standalone fallbacks so 11
+  skills (plus ungated `/craft-review`) run without `craftsman-gate`.
 - **Gemini 3.8 Flash (`low`) seeded-suite A/B benchmark** in [`docs/benchmark.md`](docs/benchmark.md) (`32` runs across
-  `8` cases in `evals/`, `2` passes via `agy -p`: baseline `89%` recall in `11.9 min/pass` vs. Craftsman 5.1.0 `98%`
-  recall in `144.1 min/pass`), and refreshed `.github/ISSUE_TEMPLATE/benchmark_replication.yml`.
+  `8` cases in `evals/`, `2` passes via `agy -p`: baseline `89%` recall in `11.9 min/pass` vs. Craftsman `5.1.0`
+  `98%` recall in `144.1 min/pass`), and updated `.github/ISSUE_TEMPLATE/benchmark_replication.yml`.
 - **`CITATION.cff`** (CFF 1.2.0) and **Windows PowerShell demo setup (`examples/demo/setup.ps1`)** alongside
   [`examples/demo/README.md`](examples/demo/README.md).
 
 ### Changed
 
-- **README and documentation onboarding.** Updated `README.md` with the brand logo, PyPI and Agent Skills badges, a
-  4-row "How It Differs" comparison table, real CLI walkthrough ("See It In Action" from `examples/demo`), Flash
-  seeded-suite measurements, and standalone skills highlight (`npx skills add BuczynskiRafal/craftsman`). Updated
-  [`docs/installation.md`](docs/installation.md), [`docs/skills.md`](docs/skills.md), and
-  [`docs/usage.md`](docs/usage.md) to group standalone vs. gated skills, and replaced the unfinished
-  `Claude Code Pilot Runs` TODO stub in [`docs/benchmark.md`](docs/benchmark.md) with a note in the overview.
+- **Slimmed README and documentation.** Reorganized [`README.md`](README.md) with installation first, concise
+  hook/report captures, and only the `5.1.0` Flash A/B measurement; pruned legacy `4.1.0`/`5.0` benchmark tables and
+  SWR-Bench pilot notes from [`docs/benchmark.md`](docs/benchmark.md), and deduplicated repeated setup/migration text
+  across [`docs/installation.md`](docs/installation.md), [`docs/skills.md`](docs/skills.md),
+  [`docs/usage.md`](docs/usage.md), and [`docs/how-it-works.md`](docs/how-it-works.md).
 
 ### Fixed
 

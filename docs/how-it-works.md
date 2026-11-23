@@ -252,23 +252,8 @@ The gate reports an issue list. It passes when the list is empty:
   call out of budget, a ledger set aside) is appended to `<git-dir>/craftsman/hook-errors.log`, and
   `review check`, `review report`, `gate --complete` and `status` print `Hook errors since round N was
   prepared: K (see <path>)`.
-- **What a passing gate proves, and what it does not.** It proves that coverage and verdicts were recorded
-  by separate subagent runs (attributed by identity on Antigravity, by transcript token on Claude Code, by
-  time window on Copilot), that hook commands cannot be run from the agent's shell, that the ledger cannot
-  be edited by the agent's tools, and that the tests passed on the final code. It does not prove that the
-  review was good: a passing gate is no evidence that the hunters looked hard or found everything.
-- **What it does not assess.** Business-requirement fit, naming quality, and architecture outside the
-  files touched by the diff. Every report lists these under `Not assessed by the gate`. The gate also
-  does not judge how hard the hunters looked beyond the plan: it checks that every slot of the plan is
-  done, that fresh hunters covered every hunk of the frozen diff and that every finding has checkable
-  evidence. A very large diff produces a warning in `prepare` and in the report; it does not hand off
-  to the user.
-
-### Upgrading from Craftsman 4.x
-
-Nothing to run. The first command that reads a pre-5.0 gate state or a schema 2 ledger archives it
-(`craftsman_state.json.v4.bak`, `ledger.v2.<UTC stamp>.bak.json`) and starts fresh, so neither `gate --init
---takeover` nor `review reset` is needed. Re-run `craftsman install` to refresh the skills and agents.
+- **What a passing gate proves.** Coverage and verdicts were recorded by separate subagent runs (attributed by identity on Antigravity, transcript token on Claude Code, or time window on Copilot), forged hook calls from the shell and direct edits to the ledger were blocked, and the tests passed on the final code.
+- **What the gate does not judge or assess.** Hunt thoroughness beyond completing every planned slot, business-requirement fit, naming quality, and architecture outside the diff (listed under `Not assessed by the gate`). Very large diffs emit a warning in `prepare` and the report without pausing for confirmation.
 
 ---
 
