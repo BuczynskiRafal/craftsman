@@ -4,6 +4,11 @@ description: >-
   Build a non-trivial feature: learn how the codebase solves similar problems,
   settle open questions, pick a design, build in verified steps. Use for
   /feature-dev or as the feature track of /craftsman.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI for ledger-recorded test runs.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Feature development (`/feature-dev <what to build>`)
@@ -19,8 +24,9 @@ list, and read only inside it (prefer `git ls-files`, `git grep`, and editor sea
 folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
 directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI
 commands. Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (run
-`craftsman skill show craftsman --file scope.md` for the full contract).
+repositories, other projects' packets/ledgers/reports, or assistant session stores (when the
+`craftsman` CLI is installed, run `craftsman skill show craftsman --file scope.md` for the full
+contract).
 
 ## 1. Frame the feature
 Write two or three sentences: who needs what, and how they will notice it works. Add explicit
@@ -52,7 +58,8 @@ get agreement when the choice is not obvious or is expensive to reverse.
 ## 5. Build in verified steps
 Implement in small steps that each leave the project working. Write or extend tests alongside
 the code — at least the main path, the edge cases settled in step 3, and one error path. Run them
-through `craftsman run --kind test` as you go.
+through `craftsman run --kind test` as you go. If the `craftsman` CLI is not installed, run the
+test command directly in the shell (ungated).
 
 ## 6. Hand over to the final review
 Inside `/craftsman`, run `/simplify`, then continue with its Stage 2. Standalone, run `/simplify`, `/craft-review`, and

@@ -3,6 +3,11 @@ name: audit
 description: >-
   Focused deep audit of a diff, module or directory, one concern at a time:
   errors, tests, types, comments, security. Use for /audit [aspects] [target].
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI for ledger-recorded test runs.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Audit (`/audit [errors,tests,types,comments,security | all] [target] [--fix]`)
@@ -19,8 +24,8 @@ folder). Outside the work tree you may read only an exact file cited by a stack 
 directory you created, or Craftsman's own data via `craftsman …` CLI commands (invoke `/audit-*` as
 a skill or run `craftsman skill show <name>`). Never run recursive searches of `~`, `/`, or parent
 directories, and never open other repositories, other projects' packets/ledgers/reports, or
-assistant session stores (run `craftsman skill show craftsman --file scope.md` for the full
-contract).
+assistant session stores (when the `craftsman` CLI is installed, run
+`craftsman skill show craftsman --file scope.md` for the full contract).
 
 | Aspect | Skill | Lens it deepens | Selected by `all` when the target… |
 | :--- | :--- | :--- | :--- |
@@ -44,4 +49,5 @@ contract).
 5. **Report** one merged list ordered by severity (`blocker`, `major`, `minor`), each entry with
    `file:line`, the concrete trigger and outcome, the verdict, and a fix. With `--fix`, apply the
    fixes that do not change intended behavior, then run the project's tests through
-   `craftsman run --kind test`.
+   `craftsman run --kind test`. If the `craftsman` CLI is not installed, run the test command
+   directly in the shell (ungated).

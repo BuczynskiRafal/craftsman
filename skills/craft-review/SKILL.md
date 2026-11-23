@@ -4,6 +4,11 @@ description: >-
   Bug-hunting review of a diff, branch or pull request by fresh-context
   hunters and verifiers, recorded in the ledger. Use when the user asks
   Craftsman to review, and as the final review of /craftsman.
+license: MIT
+compatibility: Works standalone with Git (ungated); full ledger-enforced hunt plans and subagent verification use the craftsman-gate CLI.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Craft Review (`/craft-review`)
@@ -27,8 +32,17 @@ own blind spots, and a review not in the ledger did not happen. The user needs n
   the user asks for care ("critical", "production", "be thorough", `ultracraft`). Deep: every lens on each production
   hunk, a fresh second look, an end-to-end run when fixing; it raises a gate. Depth never goes down.
 
-Search scope: `craftsman skill show craftsman --file scope.md`. Never modify the work tree or index under review (no
+Search scope: stay inside the work tree (`git rev-parse --show-toplevel`, prefer `git ls-files` and
+`git grep`), or run `craftsman skill show craftsman --file scope.md` (when the `craftsman` CLI is
+installed) for the full contract. Never modify the work tree or index under review (no
 `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`); old code: `git show <base>:<path>`.
+
+## Standalone mode (without the `craftsman` CLI)
+
+If `craftsman` is not installed, review `git diff` against `HEAD` (or `--base` / staged diff):
+1. Read `lenses.md` in this skill directory and select core lenses (`intent`, `contracts`, `failure`, `ripple`, `tests`, `craft`, `design`, `sweep`) plus risk-triggered lenses (`trust`, `state`, `platform`, `model`).
+2. Split changed hunks into slices and delegate each slice to a fresh-context subagent when the platform allows (otherwise review lens-by-lens yourself).
+3. Challenge candidate findings with an independent verifier (or reproduction check), run tests directly in the shell if fixing, and label the report **UNGATED**.
 
 ## 1. Prepare
 

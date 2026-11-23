@@ -4,6 +4,11 @@ description: >-
   Build freely, review hard: implement the task, then run the planned hunt,
   verifiers, fixes and tests until the gate passes. Use for /craftsman or
   `ultracraft`.
+license: MIT
+compatibility: Requires Git and the craftsman-gate CLI (craftsman) for gate hooks, review plans, and ledger enforcement.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Craftsman (`/craftsman <task>`)
