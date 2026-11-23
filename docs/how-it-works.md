@@ -35,22 +35,19 @@ The README and the [usage guide](usage.md) only summarize it.
    records that the slot was taken and prints the task, the base ref, the slice, the lenses and the
    recording commands, which carry `--hunter W1-2`. Every review launches at least one hunter, even for
    a one-line change, wherever the platform has subagents.
-5. **Check and verify.** When the hunters report, `review check` says what is missing, in order:
-   slots to launch or relaunch, then findings without a verdict, grouped into clusters (one per file,
-   at most 6 findings each). One `craftsman-verifier` per cluster, with the prompt `You are a Craftsman
-   verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.`, merges duplicates,
-   tries to disprove each finding, reproduces it where the code is runnable, and records a verdict. A
-   `blocker` or `major` finding dismissed without a run needs a second, independent verifier. On Claude
-   Code, the simplicity slots and the verifiers of clusters that hold only `minor` or `nit` findings run
-   on the cheaper model (`haiku`) and `check` marks these launches; everything else, and a verifier
-   resumed to confirm a fix, does not.
-6. **Saturate.** Waves are planned, not derived: `check`, `report`, `brief` and `prepare` store a wave
-   in the plan when a `proven`, or serious `probable`, bug finding outside documentation calls for it.
-   A wave is one **variant** slot per root cause (`W2-F3`, which hunts the siblings of finding F3, at
-   most 3 per wave) plus one **fresh** set (`W2-X1`, an unanchored look at the hunks with the lenses
-   nobody applied there). Waves count as generations, at most 3: a variant of a variant of a variant
-   spawns nothing. The hunt stops at the first wave that adds nothing. A deep round plans its fresh
-   set up front.
+5. **Check and verify.** After the hunters of the current wave report, `review check` lists what is missing in order:
+   slots to launch or relaunch, then findings without a verdict, grouped into verifier clusters (up to 6 findings each,
+   packed across files separately for `minor`/`nit` vs. serious findings). Wait for all hunters of the current wave
+   before launching verifiers so cross-hunter duplicates share a cluster. One `craftsman-verifier` per cluster, with the
+   prompt `You are a Craftsman verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.`, merges
+   duplicates, tries to disprove each finding, reproduces it where runnable, and records a verdict. A `blocker` or
+   `major` finding dismissed without a run needs a second, independent verifier. On Claude Code, simplicity slots and
+   `minor`/`nit`-only verifier clusters run on `haiku`; everything else uses the full model.
+6. **Saturate.** Waves are planned, not derived: `check`, `report`, `brief`, and `prepare` store a wave when a `proven`
+   or `probable` `blocker`/`major` bug finding outside documentation calls for it. Normal depth plans one `fresh` set
+   (`W2-X1`) and stops after generation 2. Deep depth plans its static `fresh` set up front, allows up to 1 `variant`
+   slot per wave (`W<g>-F<n>`), and spawns generation 3 only for a generation-2 `blocker`. The hunt stops at the first
+   wave that adds nothing.
 7. **Fix, confirm, re-check.** Three separate jobs.
    - *Fix.* Every `proven` or `probable` finding is fixed at the root cause, with a regression test
      where the project has tests.
@@ -91,7 +88,7 @@ slots, and the CLI stores them in the round.
 | **Generation 1 slots** (`W1-<n>`) | Owed hunks are cut into slices of about 400 changed lines, whole files first. Each slice becomes up to four bug slots, one per group of related lenses (`intent`/`ripple`/`tests`, `contracts`/`failure`, `state`/`platform`, `trust`/`model`), plus a simplicity slot for `craft` and `design`. Prose-only slices get one slot. |
 | **Sweep** | When the plan has two or more bug slots, one whole-diff slot (or a core slot with room) also applies `sweep`: hunks that are each correct but disagree. |
 | **Delta rounds** | A later round with at most 40 owed changed lines and no deep signal is one bug slot with every owed bug lens, a simplicity slot when `craft` or `design` is owed, and no new sweep (a sweep an earlier round left unfinished is still carried). |
-| **Later generations** | `W<g>-F<n>` variant slots and `W<g>-X<j>` fresh slots, from proven or probable bug findings, up to generation 3. |
+| **Later generations** | `W<g>-X<j>` fresh sets (gen 2 at normal depth; `gen 3` and up to 1 `W<g>-F<n>` variant per wave on deep rounds, triggered by `blocker`/`major` bug findings; gen 3 for gen-2 blockers only). |
 
 Plans are append-only: re-running `prepare` on the same diff, or raising the round to deep, adds the
 slots newly owed and keeps every slot and wave already stored, so the same finding never triggers the
@@ -146,11 +143,7 @@ A review costs agents times turns times context, so the inputs are kept small.
   hunks. A verifier's brief (`review brief --verifier F1,F2`) lists its findings with their scenarios
   and the verdict commands, and records nothing. On Antigravity and on platforms without agent definitions (Codex, Cursor) the brief ends with the
   role text of the agent template, because the reader did not load it itself.
-- **Pipelining.** Where agents run in the background (Claude Code, Antigravity async subagents), the
-  orchestrator runs `review check` after every report and launches what is ready: the verifiers of a
-  finished hunter's findings while other hunters still run, then the slots of a wave as soon as a
-  finding is judged. Slots that are running are waited for, never launched twice. Where parallel
-  subagents are a barrier (Copilot), the waves stay as they are.
+- **Wave batching.** Wait for all hunters of the current generation/wave to finish before launching verifiers so `review check` packs up to 6 findings across files into one verifier cluster and lets a single verifier merge duplicates across hunters. Slots that are already running are waited for, never launched twice.
 - **Launch stagger.** On Claude Code a subagent's request reads the prompt cache only once the
   response that wrote it has begun, so hunters launched together would each write their whole
   starting context (6,917 tokens per reviewer, measured on Claude Code 2.1.322 with Sonnet, where one

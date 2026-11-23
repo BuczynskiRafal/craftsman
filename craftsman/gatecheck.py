@@ -962,26 +962,40 @@ def _finding_number(finding_id: str) -> int:
 
 
 def verifier_clusters(ledger: Ledger, findings: Sequence[Finding]) -> tuple[tuple[str, ...], ...]:
-    """Group `findings` for verifiers: one cluster per file, at most `MAX_CLUSTER_FINDINGS` findings each.
+    """Group `findings` for verifiers: at most `MAX_CLUSTER_FINDINGS` findings per cluster.
 
-    Findings keep their order. Findings in the same hunk and lens (duplicate candidates) stay in one
-    cluster, unless there are more of them than a cluster holds.
+    Duplicate candidates in the same file, lens, and hunk stay together first; compatible file chunks
+    then pack across files up to `MAX_CLUSTER_FINDINGS` within two separate severity buckets (`minor`/`nit`
+    only vs. everything else) so cheaper-model verifier routing stays pure.
     """
     by_path: dict[str, dict[tuple[str, str | None], list[Finding]]] = defaultdict(lambda: defaultdict(list))
     for finding in findings:
         by_path[finding.path][(finding.lens, _hunk_of(ledger, finding))].append(finding)
-    clusters: list[tuple[str, ...]] = []
+    file_chunks: list[list[Finding]] = []
     for groups in by_path.values():
         current: list[Finding] = []
         for group in groups.values():
             for start in range(0, len(group), MAX_CLUSTER_FINDINGS):
                 chunk = group[start : start + MAX_CLUSTER_FINDINGS]
                 if len(current) + len(chunk) > MAX_CLUSTER_FINDINGS:
-                    clusters.append(_cluster_ids(current))
+                    file_chunks.append(current)
                     current = []
                 current.extend(chunk)
         if current:
-            clusters.append(_cluster_ids(current))
+            file_chunks.append(current)
+    clusters: list[tuple[str, ...]] = []
+    open_by_bucket: dict[str, list[Finding]] = {}
+    for file_chunk in file_chunks:
+        bucket = "minor" if all(item.severity in _CHEAPER_MODEL_SEVERITIES for item in file_chunk) else "serious"
+        active = open_by_bucket.setdefault(bucket, [])
+        if active and len(active) + len(file_chunk) > MAX_CLUSTER_FINDINGS:
+            clusters.append(_cluster_ids(active))
+            open_by_bucket[bucket] = list(file_chunk)
+        else:
+            active.extend(file_chunk)
+    for active in open_by_bucket.values():
+        if active:
+            clusters.append(_cluster_ids(active))
     return tuple(clusters)
 
 

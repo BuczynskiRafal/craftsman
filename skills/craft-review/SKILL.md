@@ -97,13 +97,15 @@ what it lists:
   `blocker` or `major` dismissed without a `--run` needs a second, independent verifier. `check` marks a cluster of
   only `minor` or `nit` findings `[Claude Code: model haiku]` (as in step 2, `model: "haiku"`); any other cluster, and a
   verifier resumed in step 4, gets the full model.
-- **Waves**: a `proven`, or serious `probable`, bug finding outside documentation makes `check` (also `report`, `brief`,
-  `prepare`) store a wave: a **variant** slot per root cause (`W2-F3`, hunts its siblings, at most 3) and a **fresh**
-  set (`W2-X1`, an unanchored look). A variant of a variant of a variant spawns nothing; the first deep round plans its
-  fresh set up front. Launch them as in step 2. The hunt ends at the first wave that adds nothing.
+- **Waves**: a `proven` or `probable` `blocker`/`major` bug finding outside documentation makes `check` (also
+  `report`, `brief`, `prepare`) store a wave: a **fresh** set (`W2-X1`, an unanchored look) at normal depth, stopping
+  after generation 2; at deep depth it also adds up to 1 **variant** slot (`W2-F3`, hunting siblings) per wave, and
+  spawns generation 3 only for a generation-2 `blocker`. Launch wave slots as in step 2. The hunt stops at the first
+  wave that adds nothing.
 
-Where agents run in the background (Claude Code, Antigravity), launch each verifier as soon as its hunters report
-(Copilot's parallel subagents are a barrier). When `check` lists only fixes and runs, the hunt is saturated.
+Batch verification per wave: wait until all hunters of the current generation finish before launching verifiers so
+`check` packs findings across files (up to 6 per verifier) and lets one verifier merge duplicate reports across slots
+(Copilot's parallel subagents also barrier per wave). When `check` lists only fixes and runs, the hunt is saturated.
 
 ## 4. Fix, confirm, re-check, test (when asked to fix, and always in a gate session)
 

@@ -76,7 +76,9 @@ from craftsman.records import (
 DEEP_MIN_PRODUCTION_LINES = 251
 SLICE_MAX_CHANGED_LINES = 400
 DELTA_MAX_CHANGED_LINES = 40
-MAX_VARIANTS_PER_WAVE = 3
+MAX_GENERATION_NORMAL = 2
+MAX_VARIANTS_PER_WAVE = 1
+MAX_VARIANTS_PER_WAVE_NORMAL = 0
 MAX_FRESH_LENSES = 3
 MAX_REASON_HUNK_IDS = 6
 
@@ -590,15 +592,15 @@ def _with_sweep(
 def is_trigger(finding: Finding, hunk_is_docs: bool) -> bool:
     """Whether `finding` calls for a further wave of hunters.
 
-    A proven or probable finding of a bug lens, outside documentation, that is either serious (blocker,
-    major) or proven. Craft and design findings, documentation findings and merged duplicates never do.
+    A proven or probable `blocker` or `major` finding of a bug lens, outside documentation.
+    Minor/nit findings, craft and design findings, documentation findings and merged duplicates never do.
     """
     return (
         finding.verdict in ("proven", "probable")
         and finding.lens in BUG_LENSES
         and not hunk_is_docs
         and finding.merged_into is None
-        and (finding.severity in ("blocker", "major") or finding.verdict == "proven")
+        and finding.severity in ("blocker", "major")
     )
 
 
@@ -878,20 +880,43 @@ def _plan_next_wave(ledger: Ledger, planned_at: str) -> Ledger:
     return ledger
 
 
+def _max_generation(deep: bool, g: int, triggers: Sequence[Finding]) -> int:
+    """Depth-aware wave ceiling: normal stops after gen 2; deep runs gen 3 only for a gen-2 blocker."""
+    if not deep:
+        return MAX_GENERATION_NORMAL
+    if g < 2 or any(item.severity == "blocker" for item in triggers):
+        return MAX_GENERATION
+    return MAX_GENERATION_NORMAL
+
+
 def _store_wave(ledger: Ledger, state: _WaveState, g: int, triggers: Sequence[Finding], planned_at: str) -> Ledger:
     """`ledger` with the wave that answers `triggers` (findings of generation `g`) stored in the latest round."""
     latest = state.latest
     assert latest.plan is not None
     plan = latest.plan
     considered = tuple(item.id for item in sorted(triggers, key=_finding_number))
-    if g >= MAX_GENERATION:
-        return _with_wave(ledger, latest, Wave(MAX_GENERATION, planned_at, considered), ())
+    max_gen = _max_generation(latest.deep, g, triggers)
+    if g >= max_gen:
+        return _with_wave(ledger, latest, Wave(max_gen, planned_at, considered), ())
     target = g + 1
     units = [unit for unit in _unit_refs(latest.hunks) if not unit.docs]
     open_ids = {ref.id for ref in _open_refs(latest)}
     open_units = [unit for unit in units if unit.id in open_ids]
     adding = _fresh_slots(state, plan, target, considered[0], triggers, units, open_units, planned_at)
-    adding.extend(_variant_slots(ledger, plan, target, triggers, units, open_units, planned_at, {slot.id for slot in adding}))
+    variant_triggers = [item for item in triggers if item.severity == "blocker"] if target == 3 else triggers
+    adding.extend(
+        _variant_slots(
+            ledger,
+            plan,
+            target,
+            variant_triggers,
+            units,
+            open_units,
+            planned_at,
+            {slot.id for slot in adding},
+            deep=latest.deep,
+        )
+    )
     return _with_wave(ledger, latest, Wave(target, planned_at, considered, tuple(slot.id for slot in adding)), adding)
 
 
@@ -942,18 +967,22 @@ def _variant_slots(
     open_units: Sequence[_Unit],
     planned_at: str,
     taken: set[str],
+    *,
+    deep: bool,
 ) -> list[Slot]:
     """The variant slots `W<target>-F<n>` for `triggers`: one per (file, lens) cluster, best first.
 
-    `MAX_VARIANTS_PER_WAVE` is the budget of a whole generation of a round: the variants of this
-    generation the plan stores already (carried ones included) are subtracted. A cluster that cannot get
-    a slot (its id is taken, no hunk to read) does not use the budget; the clusters left over are
-    considered all the same, since the wave names every trigger.
+    Normal depth spawns `MAX_VARIANTS_PER_WAVE_NORMAL` variants (`0`); deep rounds allow up to
+    `MAX_VARIANTS_PER_WAVE` (`1`) per generation of a round (carried ones subtracted). Clusters left
+    over by the budget are considered all the same, since the wave names every trigger.
     """
+    cap = MAX_VARIANTS_PER_WAVE if deep else MAX_VARIANTS_PER_WAVE_NORMAL
+    if cap <= 0 or not triggers:
+        return []
     by_id = {item.id: item for item in ledger.findings}
     stored = [slot for slot in plan.slots if slot.kind == "variant" and slot.generation == target]
     held = {(by_id[slot.trigger].path, by_id[slot.trigger].lens) for slot in stored if slot.trigger in by_id}
-    budget = MAX_VARIANTS_PER_WAVE - len(stored)
+    budget = cap - len(stored)
     clusters: dict[tuple[str, str], list[Finding]] = defaultdict(list)
     for item in sorted(triggers, key=_finding_number):
         clusters[(item.path, item.lens)].append(item)
