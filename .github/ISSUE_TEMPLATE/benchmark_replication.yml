@@ -12,8 +12,8 @@ body:
     id: agent-setup
     attributes:
       label: Model & Platform
-      description: e.g. Claude 3.7 Sonnet (effort high), Gemini 2.5 Flash, Copilot GPT-4o
-      placeholder: Claude 3.7 Sonnet (effort=high), Claude Code CLI v0.2.29
+      description: e.g. Claude Sonnet 5.5 (Claude Code), Gemini 3.8 Flash (Antigravity), Copilot CLI, Codex CLI
+      placeholder: Gemini 3.8 Flash (low), Antigravity CLI (agy -p)
     validations:
       required: true
 
@@ -23,8 +23,8 @@ body:
       label: Benchmark Suite
       description: Which benchmark dataset did you evaluate?
       options:
-        - Synthetic Review Benchmark (bench/cases/)
-        - SWR-Bench (benchmarks/swr-bench/)
+        - Seeded Defect Suite (evals/)
+        - SWR-Bench
         - Custom Project / Repository
       default: 0
     validations:
@@ -35,7 +35,7 @@ body:
     attributes:
       label: Repetition Count (n)
       description: Number of repetitions per configuration
-      placeholder: "1"
+      placeholder: "3"
     validations:
       required: true
 
@@ -43,12 +43,12 @@ body:
     id: results-table
     attributes:
       label: Evaluation Results Table
-      description: Report defect recall, precision, duration, and cost comparison between baseline and Craftsman.
+      description: Report defect recall, precision, duration, and cost or token usage comparison between baseline and Craftsman.
       placeholder: |
-        | Configuration | Defect Recall | Precision | Duration (min/PR) | Cost ($/PR) |
+        | Configuration | Defect Recall | Precision | Duration (min/pass) | Cost / Tokens |
         | :--- | :--- | :--- | :--- | :--- |
-        | Baseline | 2/9 (22%) | 50% | 0.5 min | $0.05 |
-        | Craftsman | 9/9 (100%) | 90% | 6.7 min | $0.55 |
+        | Baseline | 15/27 (56%) | 85% | 12.0 min | $0.45 / 2.5M |
+        | Craftsman | 26/27 (96%) | 75% | 17.3 min | $2.58 / 30M |
     validations:
       required: true
 

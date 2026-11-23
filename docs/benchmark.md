@@ -22,6 +22,10 @@ SWR-Bench types three of them as functional (`D1`, `D3`, `D9`) and six as evolva
 formatting, test structure, changelog); the list is in the per-item matrix below. SWR-Bench labels a PR a control
 when it was merged without review comments.
 
+Exploratory Claude Code pilot runs (one repetition per configuration) were also made on the same five PRs under
+Craftsman 5.0 and are omitted from the pilot tables; automated Claude Code and Antigravity runs on the seeded defect
+suite are reported below.
+
 ---
 
 ## Antigravity Pilot Results (Craftsman 5.0)
@@ -177,14 +181,6 @@ instead of inserted alphabetically (`probable` in most ledgers). No reviewer com
 
 ---
 
-## Claude Code Pilot Runs
-
-Pilot runs with Claude Code were made on the same 5 PRs and are not reported on this page yet.
-<!-- TODO(author, plan 4.5): state why the Claude Code pilot numbers are left out. -->
-Claude Code is part of the expanded benchmark, with one repetition per configuration.
-
----
-
 ## Seeded Suite Results (November 2026)
 
 End-to-end runs of `python3 -m evals.run agent` on the 8 cases of the seeded suite: 27 defects and 18 decoys. Each run
@@ -220,6 +216,75 @@ the orchestrator to end its turn instead of polling.
   issues that the cases did not seed; the scorer counts them as unmatched.
 - These numbers rest on 1-3 passes per version, small synthetic cases, one model and one platform. At this sample size
   a recall difference below about 13 points cannot be told apart from noise.
+
+---
+
+## Seeded Suite A/B Results: Gemini 3.8 Flash (Craftsman 5.1.0)
+
+End-to-end A/B evaluation on the 8-case seeded defect suite (`27` defects, `18` decoys) using the Antigravity CLI
+(`agy -p --output-format json --dangerously-skip-permissions`) with `gemini-3.8-flash-low`, comparing an unassisted
+`baseline` (`evals.run.BASELINE_PROMPT`, no plugin or `craftsman` on `PATH`) against Craftsman `5.1.0` (`/craft-review`
+loaded via `.agents/plugins/craftsman` and `bin/craftsman.cmd`). Each arm ran `2` complete passes across all 8 cases
+(`32` runs total, interleaved at concurrency `3` with a `30 min` per-run timeout; a third pass was omitted after
+passes 1 and 2 took ~59 min and ~53 min wall time respectively, exceeding the 45-minute budget cutoff).
+
+Methodology and Windows notes:
+- **Windows hook workaround**: `agy` runs plugin hooks via `cmd.exe /c` on Windows, where `./scripts/craftsman-*.py`
+  fails (`'.' is not recognized as an internal or external command`). The temporary plugin copy rewrote the hook
+  commands in `.agents/plugins/craftsman/hooks.json` to `python scripts\craftsman-*.py` without altering the repository
+  files.
+- **Baseline output handling**: `~/.gemini/antigravity-cli/settings.json` includes `"deny": ["write_file(.git/)"]`.
+  Baseline agents still produced `.git/evals/findings.json` via shell commands (two PowerShell UTF-8 BOMs in pass 1
+  were stripped before `evals.run.read_findings_file`, with stdout JSON extraction as fallback).
+- **Subscription billing & timeouts**: `agy` runs are subscription-billed (`$0.00` per-run USD), so cost is measured
+  in tokens (`input`, `output`, `cache read`; Antigravity records `0` cache-write tokens) summed across the orchestrator
+  and all subagent transcripts. Two pass-1 large Craftsman runs (`feedbox#1` at `5/6` and `orderdesk#1` at `6/6`) hit
+  the 30-minute timeout during late verification and are included (`14/16` finished `ok`, `2/16` ended early) with
+  their kept ledgers and transcript-recovered telemetry.
+
+### Summary Comparison (Mean per Pass, `n=2` Repeats)
+
+| Arm | Passes (Runs) | Recall (Range) | Precision | Decoys / Pass | Unmatched / Pass | Protocol / Hook Errors | Time / Pass | Main Steps / Pass | Subagents / Pass | Tokens / Pass (`in` · `out` · `cache read`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `baseline` | 2 (16/16 `ok`) | **89%** `24.00/27` (`89%–89%`) | **100%** | 0.00 | 0.00 | n/a | **11.9 min** | 138 | 0.0 | **3.3M** (`417k` · `14k` · `2.9M`) |
+| `craftsman` (`5.1.0`) | 2 (14 `ok`, 2 `timeout`) | **98%** `26.50/27` (`96%–100%`) | **83%** | 1.50 | 29.00 | 16/16 enforced · 0 errors | **144.1 min** (`×12.14`) | 426 (`×3.08`) | 208.0 | **111.3M** (`×33.54`; `13.6M` · `460k` · `97.3M`) |
+
+Suite recall difference (`craftsman` minus `baseline`): **+9.3 pts** (Welch 90% interval `-2.4 to +21.0 pts` at `n=2` repeats).
+
+### Per-Case Breakdown (`baseline` → `craftsman`)
+
+| Case (Size) | Defects | Recall (`base → craft`, `Δ`) | Precision (`base → craft`) | Craft Decoys | Craft Unmatched | Time / Run (`base → craft`) | Main Steps (`base → craft`) | Craft Subagents | Tokens / Run (`base → craft`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `attach` (small) | 2 | `2.00` → `2.00` (100% → 100%, `+0 pts`) | `100%` → `90%` | 0.50 | 1.00 | `1.3` → `19.7 min` (`×14.76`) | `15` → `40` | 18.5 | `214k` → `8.0M` (`×37.17`) |
+| `invtool` (small) | 2 | `1.00` → `2.00` (50% → 100%, `+50 pts`) | `100%` → `79%` | 0.00 | 2.00 | `0.7` → `12.4 min` (`×18.92`) | `8` → `38` | 18.0 | `108k` → `5.5M` (`×50.71`) |
+| `kvstore` (small) | 2 | `2.00` → `2.00` (100% → 100%, `+0 pts`) | `100%` → `86%` | 0.00 | 2.00 | `0.9` → `19.5 min` (`×21.71`) | `11` → `47` | 21.0 | `144k` → `8.2M` (`×57.01`) |
+| `quotes` (small) | 3 | `3.00` → `3.00` (100% → 100%, `+0 pts`) | `100%` → `88%` | 0.00 | 1.50 | `0.6` → `13.4 min` (`×20.65`) | `8` → `40` | 18.0 | `109k` → `5.5M` (`×50.73`) |
+| `reminders` (small) | 3 | `3.00` → `3.00` (100% → 100%, `+0 pts`) | `100%` → `100%` | 0.00 | 0.00 | `1.3` → `12.1 min` (`×9.66`) | `14` → `42` | 21.0 | `209k` → `6.0M` (`×28.88`) |
+| `taskboard` (small) | 3 | `2.00` → `3.00` (67% → 100%, `+33 pts`) | `100%` → `86%` | 0.00 | 1.50 | `0.9` → `11.6 min` (`×12.68`) | `10` → `38` | 19.0 | `164k` → `5.9M` (`×36.10`) |
+| `feedbox` (large) | 6 | `6.00` → `5.50` (100% → 92%, `-8 pts`) | `100%` → `70%` | 1.00 | 8.50 | `4.5` → `28.6 min` (`×6.33`) | `54` → `90` | 39.5 | `1.9M` → `30.6M` (`×16.15`) |
+| `orderdesk` (large) | 6 | `5.00` → `6.00` (83% → 100%, `+17 pts`) | `100%` → `66%` | 0.00 | 12.50 | `1.7` → `26.9 min` (`×16.27`) | `18` → `93` | 53.0 | `476k` → `41.6M` (`×87.32`) |
+| **TOTAL (1 pass)** | **27** | **`24.00` → `26.50` (`89% → 98%`, `+9 pts`)** | **`100%` → `83%`** | **1.50** | **29.00** | **`11.9` → `144.1 min` (`×12.14`)** | **`138` → `426`** | **208.0** | **`3.3M` → `111.3M` (`×33.54`)** |
+
+### Observations
+
+1. **Craftsman caught every defect the Flash baseline missed (`inv-2`, `od-6`, `tb-3`), lifting pass-2 recall to `27/27` (`100%`).**
+   Baseline missed the exact same three defects in both passes (`0/2` each): `inv-2` (`help-contradicts-code`: `--min-qty` help
+   wording vs. `>= N` logic), `od-6` (`weak-test`: `assertLessEqual` cannot fail at the threshold boundary), and `tb-3`
+   (`weak-test`: substring-only CSV test assertion). Craftsman detected all three `2/2` times. Its sole miss (`fb-6`,
+   `incomplete-propagation`, `1/2`) occurred in pass 1 when `feedbox#1` timed out at 30 min while waiting on a subagent;
+   pass 2 finished in `27.2 min` at `27/27` (`100%`).
+2. **Wave proliferation on Flash drives a `12.1×` time and `33.5×` token trade-off.**
+   Per `evals.run breakdown`, `49` of `53` seeded-defect first detections (`92%`) occurred in generation 1 (`42` `bug`,
+   `3` `simplicity`, `4` `sweep`), `4` (`8%`) came from generation-2 `fresh` hunters on the two large cases, and **0**
+   came from `variant` slots (`4.9` hunters/run) or generation 3 (`3.1` hunters/run). Because `proven` findings trigger
+   follow-up waves, each run averaged `12.9` hunters and `13.1` verifiers (`26.0` subagents/run), with subagents
+   consuming `84.8%` of Craftsman's tokens (`94.4M` of `111.3M` per pass) vs. `15.2%` (`16.9M`) in the orchestrator.
+3. **Precision (`83%` vs. `100%`) reflects non-seeded findings and three decoy hits on larger/edge cases.**
+   Verifiers filtered out `5.4` merged duplicates and `1.6` dismissed findings per run (`24.5` recorded → `14.8` `proven`,
+   `2.6` `probable`, `0.2` `question`). Of the `29.00` unmatched findings per pass, `21.00` came from `orderdesk` (`12.50`)
+   and `feedbox` (`8.50`), and `1.50` decoy hits per pass occurred on `att-d1` (`attach#1`, 1 hit) and `fb-d3`
+   (`feedbox#1`/`#2`, 1 hit each). On `gemini-3.8-flash-low`, the full multi-wave protocol trades substantial wall time
+   and token volume for near-complete recall on subtle test-weakness and doc-vs-code defects.
 
 ---
 
