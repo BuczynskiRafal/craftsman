@@ -109,6 +109,8 @@ Batch verification per wave: wait until all hunters of the current generation fi
 
 ## 4. Fix, confirm, re-check, test (when asked to fix, and always in a gate session)
 
+Wait until every running hunter and verifier of the current round has finished and the hunt is saturated (no open slots or unjudged findings) before editing files—editing mid-round changes the working tree underneath in-flight hunters.
+
 1. Fix each `proven`/`probable` finding at the root cause, with a regression test where the project has tests.
 2. **Is it fixed?** `proven`: its regression test fails before the fix and passes after (`craftsman run`). `probable`:
    resume the verifier that judged it where the platform can (Claude Code: agent id; Antigravity: conversation id), send
