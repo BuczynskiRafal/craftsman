@@ -278,10 +278,17 @@ def _plugin_drift(repo_dir: Path, cfg: Path) -> Iterator[str]:
             yield f"{label}/{name} (missing in {cfg})"
         elif _sha256_file(repo_dir / name) != _sha256_file(installed):
             yield f"{label}/{name}"
-    for subdir, pattern in (("skills", "**/*.md"), ("rules", "*.md"), ("scripts", "*.py")):
+    for subdir, pattern in (
+        ("skills", "**/*.md"),
+        ("rules", "*.md"),
+        ("scripts", "*.py"),
+        ("assets", "**/*"),
+    ):
         yield from _copied_file_drift(
             repo_dir / subdir, plugin_dir / subdir, f"{label}/{subdir}", pattern, cfg
         )
+    if (repo_dir / "assets").is_dir() and not (plugin_dir / "assets").is_dir():
+        yield f"{label}/assets (missing in {cfg})"
     yield from _copied_file_drift(
         resolve_craftsman_pkg_dir(repo_dir), plugin_dir / "craftsman", f"{label}/craftsman", "**/*.py", cfg
     )

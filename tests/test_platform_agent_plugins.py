@@ -63,6 +63,11 @@ class CommittedAgentPluginTests(unittest.TestCase):
         self.assertLessEqual(len(interface["defaultPrompt"]), 3)
         # Codex drops the whole defaultPrompt field, silently, when one prompt is longer than 128.
         self.assertTrue(all(len(prompt) <= 128 for prompt in interface["defaultPrompt"]))
+        self.assertEqual(interface["brandColor"], "#0F766E")
+        self.assertEqual(interface["composerIcon"], "./assets/logo.svg")
+        self.assertEqual(interface["logo"], "./assets/icon.png")
+        self.assertTrue((REPO_ROOT / interface["composerIcon"]).is_file())
+        self.assertTrue((REPO_ROOT / interface["logo"]).is_file())
 
     def test_cursor_manifest_uses_only_schema_fields(self) -> None:
         allowed = {
@@ -73,6 +78,8 @@ class CommittedAgentPluginTests(unittest.TestCase):
         manifest = load(CURSOR_MANIFEST)
         self.assertLessEqual(set(manifest), allowed)
         self.assertEqual(set(manifest["author"]), {"name", "email"})
+        self.assertEqual(manifest["logo"], "./assets/logo.svg")
+        self.assertTrue((REPO_ROOT / manifest["logo"]).is_file())
         self.assertTrue((REPO_ROOT / manifest["rules"]).is_file())
 
     def test_cursor_rule_is_always_applied(self) -> None:

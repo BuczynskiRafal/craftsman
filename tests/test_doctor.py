@@ -27,8 +27,9 @@ from craftsman.doctor import (
 )
 from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.hook_command import absolute_hook_prefixes
-from craftsman.manifest import BEFORE_4_0_MANIFEST_MESSAGE, MANIFEST_FILENAME
+from craftsman.manifest import BEFORE_4_0_MANIFEST_MESSAGE, MANIFEST_FILENAME, TargetKind
 from craftsman.paths import default_vscode_prompts_dir, default_vscode_user_dir
+from craftsman.platforms.antigravity import PLUGIN_NAME, _install_plugin
 from craftsman.platforms.claude import export_to_claude_user, merge_claude_hooks
 from craftsman.platforms.copilot import (
     HOOKS_FILENAME,
@@ -37,6 +38,7 @@ from craftsman.platforms.copilot import (
     export_to_workspace,
     write_copilot_hooks,
 )
+from craftsman.staging import TargetSession, Tracker
 
 from tests.support import REPO_ROOT, CliResult, IsolatedHomeTestCase, run_main, write_pre_4_0_install
 
@@ -305,6 +307,25 @@ class DriftTests(DoctorTestCase):
         self.assertIn("skills/craftsman/SKILL.md", drifted)
         self.assertIn("craftsman/scope.py", drifted)
         self.assertIn("craftsman/platforms/copilot.py", drifted)
+
+    def test_changed_or_missing_plugin_assets_are_drift(self) -> None:
+        config = self.tmp / ".gemini" / "config"
+        session = TargetSession.begin(config, TargetKind.ANTIGRAVITY, self.tmp, Tracker(dry_run=False))
+        _install_plugin(session, REPO_ROOT, config / "plugins" / PLUGIN_NAME)
+        session.finish()
+        self.assertEqual(detect_antigravity_drift(REPO_ROOT, config), [])
+
+        logo = config / "plugins" / PLUGIN_NAME / "assets" / "logo.svg"
+        logo.write_text("<svg/>", encoding="utf-8")
+        self.assertIn(f"plugins/{PLUGIN_NAME}/assets/logo.svg", detect_antigravity_drift(REPO_ROOT, config))
+
+        shutil.rmtree(config / "plugins" / PLUGIN_NAME / "assets")
+        self.assertTrue(
+            any(
+                entry.startswith(f"plugins/{PLUGIN_NAME}/assets (missing in")
+                for entry in detect_antigravity_drift(REPO_ROOT, config)
+            )
+        )
 
 
 class JsoncTests(unittest.TestCase):

@@ -92,7 +92,7 @@ def install_antigravity_target(repo_dir: Path, home: Path, mode: InstallMode, tr
 
 # What the plugin loader reads besides `scripts/` and the package, which the hooks run.
 # The agent templates stay out; agy would load them unrendered.
-PLUGIN_ENTRIES = ("plugin.json", "hooks.json", "skills", "rules")
+PLUGIN_ENTRIES = ("plugin.json", "hooks.json", "skills", "rules", "assets")
 
 
 def _install_plugin(session: TargetSession, repo_dir: Path, plugin_dir: Path) -> None:
@@ -100,7 +100,8 @@ def _install_plugin(session: TargetSession, repo_dir: Path, plugin_dir: Path) ->
     session.stage(plugin_dir)
     session.make_dirs(plugin_dir)
     for name in PLUGIN_ENTRIES:
-        install_tree(session, repo_dir / name, plugin_dir / name, InstallMode.COPY)
+        if (repo_dir / name).exists():
+            install_tree(session, repo_dir / name, plugin_dir / name, InstallMode.COPY)
     session.make_dirs(plugin_dir / "scripts")
     for script in sorted(path for path in (repo_dir / "scripts").glob("*.py") if path.is_file()):
         target = plugin_dir / "scripts" / script.name

@@ -10,6 +10,7 @@
   "homepage": "https://github.com/BuczynskiRafal/craftsman",
   "repository": "https://github.com/BuczynskiRafal/craftsman",
   "license": "MIT",
+  "logo": "./assets/logo.svg",
   "keywords": [
     "cursor",
     "ai-agents",

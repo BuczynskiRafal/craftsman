@@ -69,7 +69,7 @@ class CommandLineTests(unittest.TestCase):
 
     def test_plugins_check_reports_the_drift_of_every_plugin(self) -> None:
         repo = self.tmp / "checkout"
-        for folder in ("templates", "rules", "skills", "bin"):
+        for folder in ("templates", "rules", "skills", "bin", "assets"):
             shutil.copytree(REPO_ROOT / folder, repo / folder)
         (repo / "craftsman").mkdir()
         (repo / "craftsman" / "__init__.py").write_text("", encoding="utf-8")

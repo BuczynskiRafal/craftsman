@@ -1,8 +1,21 @@
 {
   "name": "craftsman",
+  "displayName": "Craftsman",
   "version": "5.1.0",
   "license": "MIT",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
+  "author": {
+    "name": "Rafał Buczyński",
+    "url": "https://github.com/BuczynskiRafal"
+  },
+  "homepage": "https://github.com/BuczynskiRafal/craftsman",
+  "repository": "https://github.com/BuczynskiRafal/craftsman",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Run /craft-review to review my current changes against HEAD",
+    "Use /craftsman to plan, implement, and verify a new feature",
+    "Run /verify to execute checks and confirm the change is ready"
+  ],
   "skills": [
     "./skills/audit",
     "./skills/audit-comments",

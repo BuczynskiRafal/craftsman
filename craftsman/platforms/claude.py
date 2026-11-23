@@ -310,6 +310,7 @@ PLUGIN_AGENTS_DIR = f"{PLUGIN_DIR}/agents"
 PLUGIN_LAUNCHERS = (
     "bin/launcher.sh", "bin/craftsman-cli.py", "bin/launcher.cmd", "bin/craftsman", "bin/craftsman.cmd",
 )  # fmt: skip
+PLUGIN_ASSETS = ("assets/icon.png",)
 PLUGIN_DESCRIPTION = "Make AI coding agents prove they reviewed and tested their change."
 PLUGIN_AUTHOR = {"name": "Rafał Buczyński", "email": "buczynski.rafal2@gmail.com"}
 PLUGIN_REPOSITORY = "https://github.com/BuczynskiRafal/craftsman"
@@ -337,6 +338,7 @@ def _render_plugin_manifest(agent_names: list[str]) -> str:
         "homepage": PLUGIN_REPOSITORY,
         "repository": PLUGIN_REPOSITORY,
         "license": "MIT",
+        "icon": "./assets/icon.png",
         "keywords": ["ai-agents", "claude-code", "code-review", "craft-review", "quality-gate", "testing"],
         # Replaces the default agents/ folder, which holds the unrendered templates.
         "agents": [f"./{PLUGIN_AGENTS_DIR}/{name}.md" for name in agent_names],
@@ -378,7 +380,9 @@ def build_plugin_files(repo_dir: Path) -> dict[str, str]:
 
 def _plugin_drift(repo_dir: Path, files: dict[str, str]) -> list[str]:
     diffs = generated_tree_drift(repo_dir, files, PLUGIN_AGENTS_DIR)
-    diffs.extend(f"missing: {rel}" for rel in PLUGIN_LAUNCHERS if not (repo_dir / rel).is_file())
+    diffs.extend(
+        f"missing: {rel}" for rel in (*PLUGIN_LAUNCHERS, *PLUGIN_ASSETS) if not (repo_dir / rel).is_file()
+    )
     return diffs
 
 
@@ -398,14 +402,4 @@ def export_claude_plugin(repo_dir: Path, *, check: bool = False) -> list[str]:
             raise PluginDriftError("Claude Code plugin", "craftsman export --claude-plugin", diffs)
     else:
         write_generated_tree(repo_dir, files, PLUGIN_AGENTS_DIR)
-    return sorted(files)
-    agents_dir = repo_dir / PLUGIN_AGENTS_DIR
-    if agents_dir.is_dir():
-        for stale in agents_dir.glob("*.md"):
-            if stale.relative_to(repo_dir).as_posix() not in files:
-                stale.unlink()
-    for rel_path, content in files.items():
-        dest = repo_dir / rel_path
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(content, encoding="utf-8", newline="\n")
     return sorted(files)

@@ -106,6 +106,9 @@ def _render_codex_manifest() -> str:
                     "Use $craftsman:craft-review to review my staged changes and fix what you find",
                     "Use $craftsman:craft-review to review this branch, be thorough",
                 ],
+                "brandColor": "#0F766E",
+                "composerIcon": "./assets/logo.svg",
+                "logo": "./assets/icon.png",
             },
         }
     )
@@ -128,6 +131,7 @@ def _render_cursor_manifest() -> str:
             "name": PLUGIN_NAME,
             "displayName": DISPLAY_NAME,
             **{key: value for key, value in _common_manifest_fields().items() if key != "name"},
+            "logo": "./assets/logo.svg",
             "keywords": ["cursor", *KEYWORDS],
             "category": "developer-tools",
             "skills": SKILLS_PATH,
