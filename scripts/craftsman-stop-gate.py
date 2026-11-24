@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import sys
+if sys.version_info < (3, 10):
+    raise SystemExit(1)
 from pathlib import Path
 
 # First on the path even when it is there already: an empty `PYTHONPATH` entry puts the working directory,
