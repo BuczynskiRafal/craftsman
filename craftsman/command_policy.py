@@ -1021,18 +1021,18 @@ def _has_shell_expansion(text: str) -> bool:
             i += 1
             continue
         if ch == "\\":
-            if i + 1 >= n or text[i + 1] in ("\n", "\r", "'", '"', "\\"):
+            if i + 1 >= n or not (text[i + 1].isalnum() or text[i + 1] in "._-:/"):
                 return True
             i += 1
             continue
+        if text.startswith(('@"', "@'"), i) and (i == 0 or text[i - 1] in _PS_HERESTRING_OPEN_BOUNDARIES):
+            return True
+        if ch in ("`", "(", ")", "{", "}") or text.startswith(("$(", "@(", "<(", ">(", "$'", '$"'), i):
+            return True
         if ch in ("'", '"'):
             quote = ch
             i += 1
             continue
-        if text.startswith('@"', i) and (i == 0 or text[i - 1] in _PS_HERESTRING_OPEN_BOUNDARIES):
-            return True
-        if ch == "`" or text.startswith(("$(", "<(", ">("), i):
-            return True
         if ch == "\n" and pending_heredoc is not None:
             delim, strip_tabs = pending_heredoc
             pending_heredoc = None

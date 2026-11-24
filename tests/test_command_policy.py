@@ -1015,12 +1015,23 @@ class SafeAutoApproveShellTests(PolicyCase):
             "craftsman status 'a'\\''b'",
             'craftsman status \\"foo\\"',
             "craftsman status \\\\foo",
+            "craftsman status \\; Write-Output PWNED",
+            "craftsman status \\| whoami",
+            "craftsman status \\> evil.txt",
+            "craftsman status \\  echo hi",
+            "craftsman review cover --note @'\n'; rm -rf /; echo '\n'@",
+            "craftsman status (Write-Output PWNED)",
+            "craftsman status @(Write-Output PWNED)",
+            "craftsman status { Write-Output PWNED }",
+            "craftsman status $'foo'",
+            'craftsman status $"foo"',
         ):
             with self.subTest(command=command):
                 self.assertFalse(self.is_safe(command))
         self.assertTrue(self.is_safe("craftsman status 2>&1"))
         self.assertTrue(self.is_safe('craftsman review cover --note "a > b and it\'s ok"'))
         self.assertTrue(self.is_safe('craftsman review cover --note "C:\\repo\\sub"'))
+        self.assertTrue(self.is_safe("craftsman review cover --from-json C:\\repo\\sub_1\\batch-1.json"))
 
     def test_bash_heredocs_allow_only_closed_single_quoted_heredocs(self) -> None:
         good = (
