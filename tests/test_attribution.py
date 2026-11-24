@@ -9,6 +9,7 @@ from datetime import datetime
 
 from craftsman.attribution import (
     LEGACY_CREDIT_LENSES,
+    REOPENED_LENSES,
     RUN_STALE_AFTER,
     AgentRun,
     SlotWork,
@@ -1081,6 +1082,55 @@ class CreditedLensesTests(unittest.TestCase):
         self.assertEqual(self.credited(ledger, upto=1), {digest: frozenset(["intent"])})
         self.assertEqual(self.credited(ledger, upto=2), {})
 
+    def test_scoped_reopening_clears_reopened_lenses_and_keeps_local_lenses(self) -> None:
+        snap = make_snap(make_hunk("H1", "f1.py"))
+        first, _ = prepared(snap)
+        first = replace(first, rounds=(replace(first.rounds[0], prepared_at=T0, enforced=True),))
+        first = planned(
+            first,
+            make_slot("W1-1", hunks=("H1",), lenses=("intent", "ripple", "tests")),
+            make_slot("W1-2", hunks=("H1",), lenses=("contracts", "failure")),
+            make_slot("W1-3", hunks=("H1",), lenses=("state", "platform")),
+            make_slot("W1-4", hunks=("H1",), lenses=("craft", "design")),
+        )
+        digest = first.rounds[0].hunks[0].digest
+        second_round = replace(
+            first.rounds[0],
+            number=2,
+            prepared_at=at(20),
+            hunks=(HunkRef("H1", "f1.py", digest, 1, 1, carried=False, reopened=True),),
+        )
+        ledger = replace(first, rounds=(*first.rounds, second_round))
+        for index, slot_id in enumerate(("W1-1", "W1-2", "W1-3", "W1-4"), 1):
+            ledger, _ = cover(ledger, slot_id, 2 + index, by=f"antigravity:a{index}")
+            ledger = with_agents(ledger, *run_events(f"a{index}", 0, 10, platform=AGY))
+
+        self.assertEqual(
+            self.credited(ledger, upto=1),
+            {digest: frozenset((*CORE_LENSES, "state", "platform", *SIMPLICITY_LENSES))},
+        )
+        self.assertEqual(
+            self.credited(ledger, upto=2),
+            {digest: frozenset(("state", "platform", *SIMPLICITY_LENSES))},
+        )
+
+        # Covering in the reopening round restores the re-checked cross-boundary lenses.
+        ledger, _ = cover(ledger, "W1-1", 22, by="antigravity:r2", number=2)
+        ledger = with_agents(ledger, *run_events("r2", 20, 25, platform=AGY))
+        self.assertEqual(
+            self.credited(ledger, upto=2),
+            {digest: frozenset(("intent", "ripple", "tests", "state", "platform", *SIMPLICITY_LENSES))},
+        )
+
+        # A third round that reopens the same digest clears round 2's re-checked lenses too, while still
+        # retaining the local lenses credited in round 1.
+        third_round = replace(second_round, number=3, prepared_at=at(40))
+        ledger = replace(ledger, rounds=(*ledger.rounds, third_round))
+        self.assertEqual(
+            self.credited(ledger, upto=3),
+            {digest: frozenset(("state", "platform", *SIMPLICITY_LENSES))},
+        )
+
     def test_coverage_of_the_reopening_round_counts(self) -> None:
         first = hunt_ledger(("W1-1",))
         digest = first.rounds[0].hunks[0].digest
@@ -1220,6 +1270,9 @@ class CreditedLensesTests(unittest.TestCase):
     def test_the_legacy_lenses_are_the_core_and_simplicity_lenses_of_the_planner(self) -> None:
         self.assertEqual(LEGACY_CREDIT_LENSES, frozenset((*CORE_LENSES, *SIMPLICITY_LENSES)))
 
+    def test_the_reopened_lenses_are_the_core_lenses_of_the_planner(self) -> None:
+        self.assertEqual(REOPENED_LENSES, frozenset(CORE_LENSES))
+
     def test_judging_without_enforcement_still_credits_every_lens_to_unvouched_legacy_coverage(self) -> None:
         ledger, digest = self.legacy_ledger()
 
@@ -1240,7 +1293,19 @@ class CreditedLensesTests(unittest.TestCase):
             coverage=(Coverage(1, (digest,), coverage_note(["H1"]), at(1)),),
         )
 
-        self.assertEqual(self.credited(ledger, upto=2), {})
+        self.assertEqual(self.credited(ledger, upto=2), {digest: LENS_IDS - REOPENED_LENSES})
+
+    def test_vouched_legacy_coverage_after_a_reopening_keeps_simplicity_lenses(self) -> None:
+        ledger, digest = self.legacy_ledger()
+        second_round = replace(
+            ledger.rounds[0], number=2, hunks=(HunkRef("H1", "f1.py", digest, 1, 1, carried=False, reopened=True),)
+        )
+        ledger = replace(ledger, rounds=(*ledger.rounds, second_round))
+        ledger = with_agents(ledger, *run_events("r", 0, 5))
+
+        credit = credited_lenses(ledger, 2, lambda number, slot: None, order_of(ledger), enforced=True)
+
+        self.assertEqual(credit, {digest: frozenset(SIMPLICITY_LENSES)})
 
 
 class SlotHunkCreditTests(unittest.TestCase):

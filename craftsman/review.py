@@ -333,14 +333,29 @@ def _plan_round(
     snap = ctx.snap
     changing = not round_unchanged(current, snap, ctx.scope)
     base = huntplan.plan_due_waves(current, ctx.now) if changing else current
-    required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep)
     enforced, platform = review_enforcement(ctx.ws, current, ctx.env, ctx.now)
-    if not changing and enforced and not base.rounds[-1].enforced:
+    if not changing and base.rounds[-1].enforced:
+        enforced, platform = True, base.rounds[-1].platform
+    elif not changing and enforced and not base.rounds[-1].enforced:
         # The round is upgraded in place: it is judged as the enforced round it is about to be, so the credit
         # it gets (and the hunks it keeps carried) never rests on what only an advisory round accepts.
         upgraded = replace(base.rounds[-1], enforced=True, platform=platform)
         base = replace(base, rounds=(*base.rounds[:-1], upgraded))
     have = huntplan.credited(base, enforced=enforced)
+    earlier = base.rounds if changing else base.rounds[:-1]
+    first_deep_round = ctx.depth.deep and not any(item.deep for item in earlier)
+    follow_up = (
+        huntplan.follow_up_context(
+            base,
+            upto=len(earlier),
+            enforced=enforced,
+            first_deep_round=first_deep_round,
+            credited=have if changing else None,
+        )
+        if earlier
+        else huntplan.FollowUpContext()
+    )
+    required = huntplan.required_by_hunk(snap.hunks, deep=ctx.depth.deep, follow_up=follow_up)
     carry_sweep = changing and huntplan.sweep_pending(base)
     packet = packet_path(ctx.ws.ledger_path, len(base.rounds) + 1)
     opened, round_ = open_round(
@@ -350,7 +365,6 @@ def _plan_round(
     )  # fmt: skip
     created = len(opened.rounds) > len(base.rounds)
     previous = base.rounds[-1] if base.rounds and not created else None
-    earlier = base.rounds if created else base.rounds[:-1]
     open_ids = set(round_.open_hunk_ids)
     open_hunks = [hunk for hunk in snap.hunks if hunk.id in open_ids]
     pending = huntplan.pending_wave_slots(base, open_hunks=open_hunks, round_hunks=snap.hunks) if created else ()
@@ -359,12 +373,14 @@ def _plan_round(
         huntplan.owed_lenses(required, round_.hunks, have),
         depth=ctx.depth,
         round_number=round_.number,
-        first_deep_round=ctx.depth.deep and not any(item.deep for item in earlier),
+        first_deep_round=first_deep_round,
         existing=round_.plan,
         pending_wave_slots=pending,
         round_hunks=snap.hunks,
         carry_sweep=carry_sweep,
         credited=huntplan.credited(opened, enforced=enforced),
+        reopened_ids={ref.id for ref in round_.hunks if ref.reopened},
+        prior_reviewed=follow_up.prior_reviewed,
     )
     if round_.enforced:  # sticky: the round keeps the platform that first held it
         enforced, platform = True, round_.platform

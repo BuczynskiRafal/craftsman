@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -19,6 +20,7 @@ from craftsman.cli import main as cli_main
 from craftsman.gate import GateOwner
 from craftsman.ledger import holds_lock
 from craftsman.quality import collect_quality_signals
+from craftsman.records import format_timestamp, parse_timestamp
 from craftsman.review_scope import normalize_round_files, view_slug
 from craftsman.scope import ScopePolicy, evaluate_scope
 from craftsman.usage import TranscriptFacts, read_transcript
@@ -1880,6 +1882,149 @@ class InboxCliTests(FastCliTestCase):
         )
         self.assertEqual(verdict_cli.code, 0)
         self.assertIsNone(self.repo.show()["findings"][0]["verdict"])
+
+
+class AdaptiveLoopTests(RepoTestCase):
+    """End-to-end adaptive follow-up rounds drop redundant subagents while passing the enforced gate."""
+
+    def _vouch_slot(
+        self,
+        slot_id: str,
+        hunks: list[str],
+        *,
+        finding: bool = False,
+        finding_severity: str = "minor",
+    ) -> None:
+        brief_out = self.review("brief", slot_id).stdout
+        claim_token = brief_out.split("Brief issued (", 1)[1].split(")", 1)[0]
+        cover_out = self.review(
+            "cover", "--hunter", slot_id, "--hunks", ",".join(hunks), "--note", coverage_note(hunks)
+        ).stdout
+        cover_token = cover_out.split("Coverage recorded (", 1)[1].split(")", 1)[0]
+        tokens = [claim_token, cover_token]
+        if finding:
+            add_out = self.review(
+                "add",
+                "--hunter",
+                slot_id,
+                "--file",
+                "cart.py",
+                "--line",
+                "3",
+                "--lens",
+                "contracts",
+                "--severity",
+                finding_severity,
+                "--title",
+                "Empty cart divides by zero",
+                "--scenario",
+                "total([]) evaluates sum([]) / len([]) and raises ZeroDivisionError",
+            ).stdout
+            tokens.append(add_out.split(" recorded", 1)[0].strip())
+        path = self.repo.ledger_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        latest = data["rounds"][-1]
+        stop_at = format_timestamp(
+            parse_timestamp(data["coverage"][-1]["recorded_at"]) + timedelta(seconds=1)
+        )
+        agent_id = f"r{latest['number']}-{slot_id}"
+        data["agents"].extend(
+            [
+                {
+                    "platform": "claude",
+                    "event": "start",
+                    "agent": "craftsman-reviewer",
+                    "agent_id": agent_id,
+                    "at": latest["prepared_at"],
+                },
+                {
+                    "platform": "claude",
+                    "event": "stop",
+                    "agent": "craftsman-reviewer",
+                    "agent_id": agent_id,
+                    "at": stop_at,
+                    "records": tokens,
+                },
+            ]
+        )
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def _vouch_verdict(self, finding_id: str) -> None:
+        out = self.verdict(finding_id, "probable", STATIC_EVIDENCE).stdout
+        token = out.split("verdict recorded (", 1)[1].split(")", 1)[0]
+        path = self.repo.ledger_dir / "ledger.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        latest = data["rounds"][-1]
+        event_at = data["findings"][-1]["verdict_log"][-1]["at"]
+        stop_at = format_timestamp(parse_timestamp(event_at) + timedelta(seconds=1))
+        data["agents"].extend(
+            [
+                {
+                    "platform": "claude",
+                    "event": "start",
+                    "agent": "craftsman-verifier",
+                    "agent_id": f"v-{finding_id}",
+                    "at": latest["prepared_at"],
+                },
+                {
+                    "platform": "claude",
+                    "event": "stop",
+                    "agent": "craftsman-verifier",
+                    "agent_id": f"v-{finding_id}",
+                    "at": stop_at,
+                    "records": [token],
+                },
+            ]
+        )
+        path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def test_round_two_fix_and_regression_test_consolidates_to_one_bug_hunter(self) -> None:
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("claude", "s1"))
+
+        r1_out = self.review("prepare", "--task", "Add cart totals").stdout
+        self.assertIn("Launch all 3 hunters now, in one step.", r1_out)
+        r1_slots = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))["rounds"][0][
+            "plan"
+        ]["slots"]
+        self.assertEqual([slot["id"] for slot in r1_slots], ["W1-1", "W1-2", "W1-3"])
+
+        self._vouch_slot("W1-1", ["H1"])
+        self._vouch_slot("W1-2", ["H1"], finding=True, finding_severity="minor")
+        self._vouch_slot("W1-3", ["H1"])
+        self._vouch_verdict("F1")
+
+        # Fix the bug and add a regression test, then resolve F1 and prepare Round 2.
+        self.repo.write(
+            "cart.py",
+            'def total(items):\n    """Sum of prices."""\n    if not items:\n        return 0\n    return sum(item["price"] for item in items) / len(items)\n',
+        )
+        self.repo.write(
+            "tests/test_cart.py",
+            "from cart import total\n\n\ndef test_total_empty():\n    assert total([]) == 0\n",
+        )
+        self.review("resolve", "F1", "--as", "fixed", "--note", "Guard empty list in total() before dividing")
+
+        r2_out = self.review("prepare").stdout
+        self.assertIn("Round 2 prepared:", r2_out)
+        self.assertIn("Launch 1 hunter now, in one step.", r2_out)
+        self.assertNotIn("W1-2", r2_out)
+
+        r2_slots = json.loads((self.repo.ledger_dir / "ledger.json").read_text(encoding="utf-8"))["rounds"][1][
+            "plan"
+        ]["slots"]
+        self.assertEqual(len(r2_slots), 1)
+        self.assertEqual(
+            (r2_slots[0]["id"], r2_slots[0]["kind"], tuple(r2_slots[0]["lenses"])),
+            ("W1-1", "bug", ("intent", "contracts", "failure", "ripple", "tests")),
+        )
+        self.assertEqual(tuple(r2_slots[0]["hunks"]), ("H2", "H3"))
+
+        self._vouch_slot("W1-1", ["H2", "H3"])
+        self.run_tests("from cart import total; assert total([]) == 0")
+        checked = self.review("check", check=False)
+        self.assertEqual(checked.returncode, 0, checked.stdout)
+        self.assertTrue(self.json_of("check")["passed"])
 
 
 if __name__ == "__main__":

@@ -637,6 +637,12 @@ def finding_slots(
 # `SIMPLICITY_LENSES`, which `tests/test_attribution.py` keeps equal), never a conditional lens or the sweep.
 LEGACY_CREDIT_LENSES = frozenset(("intent", "contracts", "failure", "ripple", "tests", "craft", "design"))
 
+# Lenses a reopened hunk (an unchanged caller of a changed symbol) must re-examine even when earlier
+# rounds already covered it: the cross-boundary lenses (`huntplan.CORE_LENSES`, kept equal by
+# `tests/test_attribution.py`). Local lenses (`state`, `trust`, `platform`, `model`, `craft`, `design`)
+# remain credited from before the reopening.
+REOPENED_LENSES = frozenset(("intent", "contracts", "failure", "ripple", "tests"))
+
 
 def credited_lenses(
     ledger: Ledger,
@@ -652,11 +658,12 @@ def credited_lenses(
     """Per hunk digest, the lenses that acceptable coverage of rounds up to `upto` has examined it with.
 
     A slot's coverage credits that slot's lenses (`slot_lenses` returns None for a slot it does not
-    know, which credits nothing). Coverage from before the latest round that reopened a digest does
-    not count for it, as in `ledger.covered_digests`. Coverage of a round that is not held to a hunt (no plan,
-    or advisory), tagged or not, credits by the 5.0 rules: every lens, vouched or not, as nothing there
-    asks for a hunter. Judged for an `enforced` round that is too generous: a self-review of an earlier
-    advisory or legacy round must not pay for a hunt the enforced round owes. So then
+    know, which credits nothing). For a digest reopened in `reopened_round`, coverage from earlier
+    rounds retains only non-`REOPENED_LENSES` lenses (clearing cross-boundary lenses while keeping local
+    lenses). Coverage of a round that is not held to a hunt (no plan, or advisory), tagged or not,
+    credits by the 5.0 rules: every lens, vouched or not, as nothing there asks for a hunter. Judged for
+    an `enforced` round that is too generous: a self-review of an earlier advisory or legacy round must
+    not pay for a hunt the enforced round owes. So then
     - untagged coverage credits only when a finished reviewer run vouches for it (by any means), and then
       only `LEGACY_CREDIT_LENSES`;
     - tagged coverage credits through its slot only (`slot_work`).
@@ -672,8 +679,14 @@ def credited_lenses(
         if number > upto or lenses is None:
             continue
         for digest in done.digests:
-            if number >= reopened.get(digest, 1):
-                credit[digest].update(lenses)
+            reopened_round = reopened.get(digest, 1)
+            kept_lenses = (
+                lenses
+                if number >= reopened_round
+                else tuple(lens for lens in lenses if lens not in REOPENED_LENSES)
+            )
+            if kept_lenses:
+                credit[digest].update(kept_lenses)
     for index, record in enumerate(ledger.coverage, 1):
         if record.round > upto:
             continue
@@ -694,8 +707,10 @@ def credited_lenses(
                 continue
             credits = LEGACY_CREDIT_LENSES
         for digest in record.digests:
-            if record.round >= reopened.get(digest, 1):
-                credit[digest].update(credits)
+            reopened_round = reopened.get(digest, 1)
+            kept_credits = credits if record.round >= reopened_round else (credits - REOPENED_LENSES)
+            if kept_credits:
+                credit[digest].update(kept_credits)
     return {digest: frozenset(lenses) for digest, lenses in credit.items()}
 
 
