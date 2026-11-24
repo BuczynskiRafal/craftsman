@@ -35,3 +35,16 @@ SEARCH_TOOL_NAMES = frozenset(
         "list_directory",
     }
 )
+SUBAGENT_TOOL_NAMES = frozenset(
+    {"runsubagent", "agent/runsubagent", "run_subagent", "subagent", "agent", "task"}
+)
+SUBAGENT_NAME_KEYS = (
+    "agentName",
+    "agent_name",
+    "subagent_type",
+    "subagentType",
+    "agent_type",
+    "agentType",
+    "agent",
+    "name",
+)

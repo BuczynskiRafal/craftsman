@@ -19,6 +19,7 @@ from craftsman.doctor import (
     build_report,
     command_executables,
     detect_antigravity_drift,
+    inspect_copilot_subagent_settings,
     inspect_legacy_distribution,
     loads_jsonc_dict,
     plugin_skill_names,
@@ -629,6 +630,74 @@ class HomeInspectionTests(IsolatedHomeTestCase):
         merge_claude_hooks(settings, absolute_hook_prefixes()[0])
         report = json.loads(run_main(cli.main, "doctor", "--json", "--repo-dir", str(REPO_ROOT)).out)
         self.assertEqual((report["claude"]["hooks"], report["problems"]), ("merged", []))
+
+
+class CopilotSubagentSettingsTests(DoctorTestCase):
+    def write_settings(self, content: str, *, profile: str | None = None) -> Path:
+        user_dir = default_vscode_prompts_dir(self.tmp).parent
+        target_dir = user_dir / "profiles" / profile if profile else user_dir
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / "settings.json"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_missing_or_permissive_jsonc_settings_report_no_problems(self) -> None:
+        self.assertEqual(inspect_copilot_subagent_settings(self.tmp), [])
+        self.write_settings(
+            '{\n  // allow subagents\n  "chat.customAgentInSubagent.enabled": true,\n'
+            '  "chat.tools.eligibleForAutoApproval": {"runSubagent": true, "agent/runSubagent": true,},\n}\n'
+        )
+        self.assertEqual(inspect_copilot_subagent_settings(self.tmp), [])
+
+    def test_disabled_custom_agent_or_auto_approval_in_user_or_profile_is_reported(self) -> None:
+        user_settings = self.write_settings('{"chat.customAgentInSubagent.enabled": false}')
+        profile_settings = self.write_settings(
+            '{"chat.tools.eligibleForAutoApproval": {"runSubagent": false, "agent/runSubagent": false}}',
+            profile="work",
+        )
+
+        problems = inspect_copilot_subagent_settings(self.tmp)
+
+        self.assertEqual(len(problems), 2)
+        self.assertIn(str(user_settings), problems[0])
+        self.assertIn("chat.customAgentInSubagent.enabled", problems[0])
+        self.assertIn(str(profile_settings), problems[1])
+        self.assertIn("chat.tools.eligibleForAutoApproval", problems[1])
+        self.assertIn("runSubagent", problems[1])
+        self.assertIn("agent/runSubagent", problems[1])
+
+    def test_malformed_or_unreadable_settings_are_ignored_gracefully(self) -> None:
+        self.write_settings("{not valid jsonc")
+        self.write_settings("[1, 2]", profile="array")
+        dir_settings = default_vscode_prompts_dir(self.tmp).parent / "profiles" / "dir" / "settings.json"
+        dir_settings.mkdir(parents=True)
+
+        self.assertEqual(inspect_copilot_subagent_settings(self.tmp), [])
+
+    def test_doctor_reports_blocking_settings_only_when_copilot_is_installed(self) -> None:
+        self.write_settings('{"chat.tools.eligibleForAutoApproval": {"agent/runSubagent": false}}')
+
+        code_idle, report_idle = self.doctor()
+        self.assertEqual((code_idle, report_idle["problems"]), (0, []))
+
+        self.install_user_copilot()
+        code_installed, report_installed = self.doctor()
+        self.assertEqual(code_installed, 1)
+        self.assertTrue(
+            any("chat.tools.eligibleForAutoApproval" in problem for problem in report_installed["problems"])
+        )
+
+    def test_doctor_reports_blocking_settings_for_workspace_copilot_install(self) -> None:
+        workspace = self.tmp / "ws"
+        export_to_workspace(REPO_ROOT, workspace)
+        self.write_settings('{"chat.customAgentInSubagent.enabled": false}')
+
+        code, report = self.doctor("--workspace", str(workspace))
+
+        self.assertEqual(code, 1)
+        self.assertTrue(
+            any("chat.customAgentInSubagent.enabled" in problem for problem in report["problems"])
+        )
 
 
 if __name__ == "__main__":

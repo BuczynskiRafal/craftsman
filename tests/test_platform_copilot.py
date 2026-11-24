@@ -19,6 +19,7 @@ from craftsman.generated import CRAFTSMAN_GENERATED_MARKER, ExportError
 from craftsman.hook_command import absolute_hook_prefixes
 from craftsman.paths import default_vscode_prompts_dir
 from craftsman.platforms.copilot import (
+    COPILOT_SUBAGENT_NOTE,
     CopilotDiscoveryLocation,
     DiscoveryRoot,
     EntityPattern,
@@ -61,6 +62,16 @@ class CopilotAgentRenderingTests(CopilotTestCase):
             ],
         )
         self.assertIn("`craftsman-reviewer` and `craftsman-verifier` custom agents", orchestrator)
+        self.assertIn("launch every slot of the current wave in parallel in one turn without asking", orchestrator)
+        self.assertIn("return in the same turn", orchestrator)
+        self.assertIn("craftsman review check", orchestrator)
+
+    def test_copilot_skills_carry_parallel_same_turn_subagent_guidance(self) -> None:
+        out = self.tmp / "skills"
+        export_to_copilot_skills(REPO_ROOT, out)
+        craft_review = (out / "craft-review" / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn(COPILOT_SUBAGENT_NOTE, craft_review)
 
     def test_copilot_subagents_are_read_only(self) -> None:
         templates = self.templates()

@@ -792,6 +792,44 @@ def _platform_problems(
     return problems
 
 
+def inspect_copilot_subagent_settings(home: Path) -> list[str]:
+    """Problems in VS Code settings that disable Copilot custom-agent subagents or auto-approval."""
+    user_dir = default_vscode_prompts_dir(home).parent
+    settings_files = [user_dir / "settings.json"]
+    profiles_root = user_dir / "profiles"
+    if profiles_root.is_dir():
+        settings_files.extend(
+            profile / "settings.json" for profile in sorted(profiles_root.iterdir()) if profile.is_dir()
+        )
+    problems: list[str] = []
+    for settings_path in settings_files:
+        if not settings_path.is_file():
+            continue
+        try:
+            data = loads_jsonc_dict(settings_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if data is None:
+            continue
+        if data.get("chat.customAgentInSubagent.enabled") is False:
+            problems.append(
+                f"{settings_path}: `chat.customAgentInSubagent.enabled` is false; VS Code Copilot "
+                "cannot invoke `craftsman-reviewer` or `craftsman-verifier` custom agents as subagents "
+                "(remove the setting or set it to true)"
+            )
+        eligible = data.get("chat.tools.eligibleForAutoApproval")
+        if isinstance(eligible, dict):
+            blocked = [key for key in ("runSubagent", "agent/runSubagent") if eligible.get(key) is False]
+            if blocked:
+                keys_text = ", ".join(f'"{key}": false' for key in blocked)
+                problems.append(
+                    f"{settings_path}: `chat.tools.eligibleForAutoApproval` disables auto-approval "
+                    f"({keys_text}), forcing confirmation prompts even in Autopilot (remove these "
+                    "entries or set them to true)"
+                )
+    return problems
+
+
 def _installed_targets(repo_dir: Path, workspace: Path | None, home: Path) -> InstalledTargets:
     copilot_home = default_copilot_home(home)
     gemini = home / ".gemini" / "config"
@@ -880,6 +918,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
     config_drift = tuple(detect_antigravity_drift(repo_dir, home / ".gemini" / "config"))
     copilot = _copilot_report(repo_dir, workspace, home)
     claude = _claude_report(default_claude_dir(home))
+    installed = _installed_targets(repo_dir, workspace, home)
     problems = (
         *git_problems,
         *inspect_stale_hooks_path(git.hooks_path, home),
@@ -888,6 +927,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         *inspect_agy_plugin_duplicate(home),
         *inspect_leftover_review_skills(workspace, home),
         *inspect_stale_prompts(workspace, home),
+        *(inspect_copilot_subagent_settings(home) if installed.github_copilot else ()),
     )
     healthy = (
         skill_count == expected_skills
@@ -909,7 +949,7 @@ def build_report(repo_dir: Path, workspace: Path | None, home: Path) -> DoctorRe
         missing_scripts=missing_scripts,
         config_drift=config_drift,
         git_config=git,
-        installed_targets=_installed_targets(repo_dir, workspace, home),
+        installed_targets=installed,
         copilot=copilot,
         claude=claude,
         problems=tuple(problems),

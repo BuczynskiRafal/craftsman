@@ -168,8 +168,11 @@ COPILOT_TERMINAL_NOTE = (
     "`Set-Content -LiteralPath <path> -Encoding utf8` and passed via `--from-json <path>`."
 )
 COPILOT_SUBAGENT_NOTE = (
-    "Subagents: use the `craftsman-reviewer` and `craftsman-verifier` custom agents (agent tool / "
-    "runSubagent)."
+    "Subagents: invoke the `craftsman-reviewer` and `craftsman-verifier` custom agents directly via "
+    "the `agent` / `runSubagent` tool — launch every slot of the current wave in parallel in one "
+    "turn without asking the user for confirmation. Because Copilot subagent calls return in the "
+    "same turn, run `craftsman review check` (or `--review-only`) immediately when they return "
+    "instead of ending your turn."
 )
 # Copilot CLI event name -> `craftsman hook` event, with the timeout in seconds.
 COPILOT_HOOK_EVENTS: dict[str, tuple[str, int]] = {

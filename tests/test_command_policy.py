@@ -19,6 +19,8 @@ from craftsman.command_policy import (
     LEDGER_IS_WRITTEN_BY_THE_CLI,
     NO_RESTART,
     OWNER_CANNOT_TAKE_OVER,
+    SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS,
+    SAFE_AUTO_APPROVE_TOP_COMMANDS,
     TRANSCRIPTS_ARE_THE_PLATFORMS,
     Decision,
     PolicyContext,
@@ -30,12 +32,15 @@ from craftsman.command_policy import (
     default_transcript_roots,
     invocations,
     is_main_session,
+    is_safe_auto_approve_shell,
     review_commands,
+    subagent_target,
     tool_call,
     tool_kind,
 )
 from craftsman.diffscan import DiffScanError
 from craftsman.shell import iter_simple_commands
+from craftsman.tool_names import SUBAGENT_NAME_KEYS
 from craftsman.worktree_guard import find_worktree_mutation
 
 from tests.support import REPO_ROOT
@@ -164,6 +169,28 @@ class ToolCallTests(unittest.TestCase):
         for name in ("Write", "Edit", "MultiEdit", "NotebookEdit", "editFiles", "replace_string_in_file",
                      "insert_edit_into_file", "create_file", "write_to_file", "apply_patch", "mcp__fs__save"):  # fmt: skip
             self.assertEqual(tool_kind(name), "write", name)
+        for name in ("runSubagent", "agent/runSubagent", "run_subagent", "subagent", "agent", "Task", " Agent "):
+            self.assertEqual(tool_kind(name), "subagent", name)
+        for name in ("mcp__x__agent", "mcp__x__runSubagent", "mcp__x__task", "mcp__x__subagent"):
+            self.assertEqual(tool_kind(name), "write", name)
+
+    def test_subagent_target_extracts_first_name_and_never_classifies_as_write(self) -> None:
+        for key in SUBAGENT_NAME_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(subagent_target({key: " craftsman-reviewer "}), "craftsman-reviewer")
+        self.assertEqual(subagent_target({"agentName": "  ", "subagent_type": "craftsman-verifier"}), "craftsman-verifier")
+        self.assertEqual(subagent_target({"agentName": 123, "prompt": "review"}), "")
+
+        call = tool_call(
+            "runSubagent",
+            {"agentName": " craftsman-reviewer ", "file_path": ".git/craftsman/ledger.json"},
+            "/work",
+            role=None,
+            main_session=True,
+            session_id="s",
+        )
+        self.assertEqual((call.kind, call.subagent_target, call.paths), ("subagent", "craftsman-reviewer", ()))
+        self.assertEqual(decide(call).action, "allow")
 
     def test_a_shell_calls_own_directory_is_applied(self) -> None:
         call = tool_call("Bash", {"command": "ls", "cwd": "sub"}, "/work", role=None, main_session=True, session_id="s")
@@ -906,6 +933,139 @@ class WorktreeGuardTests(PolicyCase):
         self.in_review = 2
 
         self.assertDenied(self.shell("git checkout main && craftsman hook stop"), HOOKS_ARE_THE_PLATFORMS)
+
+
+class SafeAutoApproveShellTests(PolicyCase):
+    def is_safe(self, command: str, *, kind: str = "shell") -> bool:
+        call = ToolCall(kind, str(self.repo), command=command, main_session=True, session_id="S1")  # type: ignore[arg-type]
+        return is_safe_auto_approve_shell(call)
+
+    def test_safe_top_commands_and_review_subcommands_pass(self) -> None:
+        self.assertEqual(SAFE_AUTO_APPROVE_TOP_COMMANDS, frozenset({"skill", "gate", "status", "doctor"}))
+        for unsafe in ("reset", "run", "hook", "install", "uninstall", "export"):
+            self.assertNotIn(unsafe, SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS)
+        for command in (
+            "craftsman skill show craft-review --lenses contracts,failure",
+            "craftsman gate --init --session-id S1 --task 'fix bug'",
+            "craftsman status --json",
+            "craftsman doctor",
+            "python -m craftsman.cli review check --review-only",
+            "python3 scripts/craftsman-cli.py review prepare --deep",
+            "uv run craftsman review show --json",
+            "craftsman review cover --hunter W1-1 --hunks H1 --note 'literal $(not run) `ok` > x'",
+            *(f"craftsman review {sub}" for sub in sorted(SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS)),
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(self.is_safe(command))
+
+    def test_non_cli_non_shell_and_excluded_commands_fail_closed(self) -> None:
+        self.assertFalse(self.is_safe("craftsman status", kind="read"))
+        self.assertFalse(self.is_safe("craftsman status", kind="subagent"))
+        for command in (
+            "",
+            "   ",
+            "craftsman",
+            "craftsman --version",
+            "craftsman --help",
+            "craftsman review",
+            "craftsman review --help",
+            "craftsman review reset",
+            "craftsman run --kind test -- pytest",
+            "craftsman hook pre-tool --platform copilot",
+            "craftsman install --copilot",
+            "craftsman uninstall --copilot",
+            "craftsman export --copilot",
+            "craftsman scope-guard",
+            "python -m craftsman.hooks pre-tool --platform copilot",
+            "python -c 'import craftsman'",
+            "python",
+            "git status",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(self.is_safe(command))
+
+    def test_chaining_redirections_and_shell_expansions_are_rejected(self) -> None:
+        for command in (
+            "craftsman status && rm -rf /",
+            "craftsman status || true",
+            "craftsman status; id",
+            "craftsman status | cat",
+            "craftsman status & id",
+            "craftsman status\nrm -rf /",
+            "bash -c 'craftsman status'",
+            'cmd /c "craftsman status && calc.exe"',
+            "cmd /c craftsman status",
+            "craftsman status > out.txt",
+            "craftsman status >> out.txt",
+            "craftsman status >| out.txt",
+            "craftsman status &> out.txt",
+            "craftsman status 2> err.txt",
+            "craftsman status $(id)",
+            'craftsman gate --init --task "$(id)"',
+            'craftsman gate --init --task "\\$(id)"',
+            "craftsman status `id`",
+            'craftsman gate --init --task "`id`"',
+            "craftsman status <(cat /etc/passwd)",
+            "craftsman status >(cat)",
+            "craftsman status 'unclosed",
+            'craftsman status "unclosed',
+            "craftsman status \\",
+        ):
+            with self.subTest(command=command):
+                self.assertFalse(self.is_safe(command))
+        self.assertTrue(self.is_safe("craftsman status 2>&1"))
+        self.assertTrue(self.is_safe('craftsman review cover --note "a > b and it\'s ok"'))
+
+    def test_bash_heredocs_allow_only_closed_single_quoted_heredocs(self) -> None:
+        good = (
+            "craftsman review add --from-json - <<'EOF'\n"
+            "[{\"note\": \"$(not expanded) `safe` 'apostrophe\"}]\n"
+            "EOF"
+        )
+        good_crlf_trailing = (
+            "craftsman review add --from-json - <<-'EOF'\r\n"
+            "\t[{\"note\": \"safe\"}]\r\n"
+            "\tEOF\r\n"
+        )
+        self.assertTrue(self.is_safe(good))
+        self.assertTrue(self.is_safe(good + "\n"))
+        self.assertTrue(self.is_safe(good_crlf_trailing))
+        for bad in (
+            "craftsman review add --from-json - <<EOF\n[]\nEOF",
+            'craftsman review add --from-json - <<"EOF"\n[]\nEOF',
+            "craftsman review add --from-json - <<-EOF\n[]\nEOF",
+            'craftsman review add --from-json - <<-"EOF"\n[]\nEOF',
+            "craftsman review add --from-json - <<'EOF'\n[]",
+            "craftsman review add --from-json - <<'EOF'\n[]\n  EOF\n",
+            "craftsman review add --from-json - <<'EOF'\n[]\nEOF\necho pwned",
+            "craftsman review add --from-json - <<'EOF'\n[]\nEOF\n$(id)",
+            "craftsman review add --from-json - <<'EOF' > out.json\n[]\nEOF",
+            "craftsman review add --from-json - <<'A' <<'B'\n[]\nA\n[]\nB",
+        ):
+            with self.subTest(command=bad):
+                self.assertFalse(self.is_safe(bad))
+
+    def test_powershell_literal_herestring_pipe_prefix_and_double_quote_rejection(self) -> None:
+        good = "@'\n[{\"hunks\": \"H1\", \"note\": \"$(safe) `safe` 'ok'\"}]\n'@ | craftsman review cover --from-json -"
+        good_crlf = "@'\r\n[]\r\n'@|craftsman review add --from-json -"
+        good_empty = "@'\n'@ | craftsman review verdict --from-json -"
+        self.assertTrue(self.is_safe(good))
+        self.assertTrue(self.is_safe(good_crlf))
+        self.assertTrue(self.is_safe(good_empty))
+        for bad in (
+            '@"\n[]\n"@ | craftsman review cover --from-json -',
+            '@"\n$(id)\n"@ | craftsman review cover --from-json -',
+            'craftsman review add --title @"\nfoo\n"@',
+            "@'\nfoo\n'@; calc.exe\n'@ | craftsman review cover --from-json -",
+            "@'\n[]\n'@ || craftsman review check",
+            "@'\n[]\n'@ |& craftsman review check",
+            "@'\n[]\n'@ ; evil | craftsman review check",
+            "@'\n[]\n'@ | craftsman review check && evil",
+            "@'\n[]\n'@ | craftsman review reset",
+            "@'\n[]\n'@ | @'\n[]\n'@ | craftsman review cover --from-json -",
+        ):
+            with self.subTest(command=bad):
+                self.assertFalse(self.is_safe(bad))
 
 
 if __name__ == "__main__":
