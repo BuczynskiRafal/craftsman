@@ -200,8 +200,8 @@ def follow_up_context(
     """Construct a `FollowUpContext` from earlier rounds (`ledger.rounds[:upto]`).
 
     Returns an empty context (`prior_reviewed=False`) when no earlier round exists, on the first deep
-    round, or when earlier rounds hold no accepted coverage credit (skipping Round 1 cannot unlock
-    follow-up relaxations).
+    round, or when no earlier hunk holds a full core+simplicity credit set (partial/skipped Round 1
+    work cannot unlock follow-up relaxations).
     """
     limit = len(ledger.rounds) if upto is None else max(upto, 0)
     earlier = ledger.rounds[:limit]
@@ -209,20 +209,26 @@ def follow_up_context(
         return FollowUpContext()
     last_number = earlier[-1].number
     credit = credited_upto(ledger, last_number, enforced=enforced) if credited is None else credited
-    if not any(credit.values()):
+    base_review_set = frozenset((*CORE_LENSES, *SIMPLICITY_LENSES))
+    conditional_set = frozenset(CONDITIONAL_LENSES)
+    if not any(
+        base_review_set <= credit.get(ref.digest, frozenset())
+        for round_ in earlier
+        for ref in round_.hunks
+    ):
         return FollowUpContext()
     prior_reviewed_files = frozenset(
         ref.path
         for round_ in earlier
         for ref in round_.hunks
-        if credit.get(ref.digest)
+        if base_review_set <= credit.get(ref.digest, frozenset())
     )
     prior_deep_files = frozenset(
         ref.path
         for round_ in earlier
         if round_.deep
         for ref in round_.hunks
-        if credit.get(ref.digest)
+        if conditional_set <= credit.get(ref.digest, frozenset())
     )
     by_file: dict[str, set[str]] = defaultdict(set)
     fixed_simplicity: set[str] = set()

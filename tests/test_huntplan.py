@@ -3575,6 +3575,71 @@ class AdaptiveFollowUpTests(unittest.TestCase):
         self.assertEqual(with_c["H4"], solo_a)
         self.assertEqual(with_c["H5"], frozenset((*BUG_LENSES, *SIMPLICITY)))
 
+    def test_round_one_normal_plus_empty_round_two_deep_does_not_unlock_prior_deep_files(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        r1 = run_all(hunt([h1], deep=False, first_deep=False))
+        # Round 2 runs with --deep, but zero hunters finish before Round 3 starts.
+        r2_prep = prepare_round(r1, [h1], seconds=1000, deep=True)
+        r2 = r2_prep.ledger
+
+        r3_hunks = [h1, code("H2", "b.py", 5)]
+        ctx3 = follow_up_context(r2, enforced=True, first_deep_round=False)
+        self.assertTrue(ctx3.prior_reviewed)
+        self.assertEqual(ctx3.prior_reviewed_files, frozenset({"a.py"}))
+        self.assertEqual(ctx3.prior_deep_files, frozenset())
+
+        required3 = required_by_hunk(r3_hunks, deep=True, follow_up=ctx3)
+        self.assertEqual(required3["H1"], frozenset(BUG_LENSES))
+        r3_prep = prepare_round(r2, r3_hunks, seconds=2000, deep=True)
+        self.assertFalse(r3_prep.round.hunks[0].carried)
+
+        # Even if Round 1 itself was deep, skipping any conditional lens must not mark a.py deep.
+        r1_deep_led = hunt([h1], deep=True, first_deep=True)
+        deep_plan = r1_deep_led.rounds[0].plan
+        assert deep_plan is not None
+        conditional_only = set(BUG_LENSES) - set(CORE)
+        skip_one_cond = [
+            slot.id
+            for slot in deep_plan.slots
+            if set(slot.lenses) & conditional_only
+        ][:1]
+        self.assertTrue(skip_one_cond)
+        r1_partial_deep = run_all(r1_deep_led, skip=skip_one_cond)
+        ctx_partial_deep = follow_up_context(r1_partial_deep, enforced=True, first_deep_round=False)
+        self.assertEqual(ctx_partial_deep.prior_deep_files, frozenset())
+        self.assertEqual(
+            required_by_hunk([code("H3", "a.py", 5)], deep=True, follow_up=ctx_partial_deep)["H3"],
+            frozenset(BUG_LENSES),
+        )
+
+    def test_partial_round_one_missing_simplicity_does_not_unlock_prior_reviewed(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        led = hunt([h1])
+        plan1 = led.rounds[0].plan
+        assert plan1 is not None
+        all_slots = list(plan1.slots)
+
+        # Partial core coverage (single bug slot) must not unlock prior_reviewed.
+        partial_bug = run_slot(led, all_slots[0].id, "a1", 100.0)
+        ctx_partial = follow_up_context(partial_bug, enforced=True)
+        self.assertEqual(ctx_partial, FollowUpContext())
+        self.assertEqual(
+            required_by_hunk([code("H2", "a.py", 5)], deep=False, follow_up=ctx_partial)["H2"],
+            frozenset((*CORE, *SIMPLICITY)),
+        )
+
+        # Full core lenses without SIMPLICITY_LENSES must still keep prior_reviewed=False.
+        simplicity_slots = [slot.id for slot in all_slots if set(slot.lenses) & set(SIMPLICITY)]
+        self.assertTrue(simplicity_slots)
+        no_simplicity = run_all(led, skip=simplicity_slots)
+        ctx_no_simplicity = follow_up_context(no_simplicity, enforced=True)
+        self.assertEqual(ctx_no_simplicity, FollowUpContext())
+        self.assertEqual(ctx_no_simplicity.prior_reviewed_files, frozenset())
+        self.assertEqual(
+            required_by_hunk([code("H2", "a.py", 5)], deep=False, follow_up=ctx_no_simplicity)["H2"],
+            frozenset((*CORE, *SIMPLICITY)),
+        )
+
 
 class ReopenedWaveScopingTests(unittest.TestCase):
     """Wave fresh sets in Round 2+ skip unchanged reopened callers unless triggered there."""
