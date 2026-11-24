@@ -42,8 +42,17 @@ You never have to choose these. The agent reads the request and the repository.
 | **Target** | Nothing named: the working tree against the gate's base commit, else `HEAD`. A branch or commit: that ref. A PR number or URL: it checks the PR out and reviews against its merge base. "Staged changes", "tracked files", or a path freezes that scope for the review. |
 | **Fixing** | `/craftsman` always fixes. `/craft-review` fixes when the words ask for it; otherwise it only reports. |
 | **Depth** | One adaptive depth, `deep`: every lens on every production hunk, a fresh second look, an end-to-end run in addition to the tests. `review prepare` goes deep by itself when a security or concurrency signal fires in a production hunk or the change is large (over 250 changed production lines); the agent adds its own judgment, and goes deep when you ask for care ("critical", "be thorough", `ultracraft`). The list is under **Depth** in the [`craft-review` skill](../skills/craft-review/SKILL.md). Depth never goes down within a session. |
-| **Hunt plan** | Not a decision of the agent: `review prepare` computes it from the diff. How many hunters, which lenses each gets and how the diff is split between them follow from the kinds of hunks and their risk signals; findings that are proven call for further waves, up to three generations. The agent launches every slot and cannot skip one. |
+| **Hunt plan** | Not a decision of the agent: `review prepare` computes it from the diff. How many hunters, which lenses each gets and how the diff is split between them follow from the kinds of hunks and their risk signals; findings that are proven call for further waves, up to three generations. Follow-up fix rounds adapt automatically: unchanged hunks carry over, reopened callers re-check cross-boundary lenses only, and small fixes pack into a single bug slot. The agent launches every slot and cannot skip one. |
 | **When to ask you** | Only for an ambiguity that changes what gets built, to accept a `major` finding instead of fixing it, and when the round cap is reached. |
+
+---
+
+## Zero-Prompt Copilot Automation
+
+During an active `/craftsman` or `/craft-review` session on GitHub Copilot (VS Code or Copilot CLI), Craftsman's `PreToolUse` hook automatically approves launching `craftsman-reviewer` and `craftsman-verifier` subagents, running safe `craftsman` review/CLI commands, and in-scope subagent reads. Copilot launches hunters and verifiers directly without confirmation prompts and receives their results synchronously in the same turn.
+
+- **Blocking VS Code settings.** Run `craftsman doctor` to check `settings.json` (and VS Code profiles) for `"chat.customAgentInSubagent.enabled": false` or `"chat.tools.eligibleForAutoApproval"` disabling `runSubagent` / `agent/runSubagent`. Details: [Copilot Zero-Prompt Automation](installation.md#copilot-zero-prompt-automation).
+- **Running project tests (`craftsman run`).** Because `craftsman run` executes project test/e2e/repro commands, Craftsman's hook leaves it unapproved. In VS Code, you can optionally configure a narrow `chat.tools.terminal.autoApprove` rule if you also want test runs to proceed without a terminal prompt.
 
 ---
 

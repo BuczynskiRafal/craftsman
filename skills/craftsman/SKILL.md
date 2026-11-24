@@ -91,6 +91,8 @@ pull request unless the user asked.
 
 - Never stop to ask what you can decide yourself. Involve the user only for a real ambiguity in
   what to build, for accepting a `major` finding, and at the round cap.
+- Launching `craftsman-reviewer` hunters and `craftsman-verifier` verifiers is part of the review
+  protocol — never pause to ask the user before starting them.
 - Never lower the rigor to save effort: no inline review where subagents exist, no skipped waves.
 - A subagent that fails (rate limit, timeout) shows in `craftsman review check` as a slot that
   stopped without finishing; launch it once more. If subagents keep failing, run

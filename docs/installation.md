@@ -85,6 +85,16 @@ VS Code Copilot and GitHub Copilot CLI scan multiple directories simultaneously 
 - Installing both `--copilot` (user) and `--copilot-workspace` (workspace) in the same project displays duplicate agents and commands in VS Code; `craftsman install` refuses by default unless `--allow-duplicate-scopes` is specified.
 - If both GitHub Copilot and Claude Code are present on the same system, VS Code scans `~/.claude/agents` by default. `craftsman doctor` detects this collision and suggests adding `"chat.agentFilesLocations": {"~/.claude/agents": false}` to VS Code `settings.json`.
 
+### Copilot Zero-Prompt Automation
+
+When Craftsman's Copilot hooks are installed (`--copilot` or `--copilot-workspace`), the `PreToolUse` hook automatically approves launching `craftsman-reviewer` and `craftsman-verifier` custom agents, running safe `craftsman` review/gate/status/doctor/skill CLI commands, and in-scope subagent reads during an active Craftsman session — so hunts and verifiers run without confirmation prompts.
+
+`craftsman doctor` inspects VS Code `Code/User/settings.json` and `Code/User/profiles/*/settings.json` for settings that block this automation:
+- `"chat.customAgentInSubagent.enabled": false` — blocks invoking custom agents (`craftsman-reviewer`, `craftsman-verifier`) as subagents; keep it unset (`true` by default) or `true`.
+- `"chat.tools.eligibleForAutoApproval": {"runSubagent": false}` (or `"agent/runSubagent": false`) — forces manual confirmation prompts on every subagent launch even when hooks allow it; remove `false` or set those entries to `true`.
+
+`craftsman run` executes arbitrary project test, e2e, and reproduction commands and intentionally stays outside Craftsman's `PreToolUse` auto-approval. If you want hands-off test runs in VS Code Copilot, you can optionally add a narrow rule to `chat.tools.terminal.autoApprove` in VS Code settings (knowing that `craftsman run` executes the command after `--`).
+
 ---
 
 ## Claude Code Plugin
@@ -162,6 +172,7 @@ Doctor checks:
 - Git identity and hook paths
 - Platform hooks configuration (Copilot, Claude Code, Antigravity)
 - Hook collisions between user-level settings and Claude Code plugins
+- VS Code Copilot settings that block subagent invocation or auto-approval (`chat.customAgentInSubagent.enabled`, `chat.tools.eligibleForAutoApproval`)
 
 When `craftsman review prepare` prints `Advisory:` instead of `Enforced:`, no Craftsman hook saw the session: run `craftsman doctor` to find the missing or duplicate hooks. The hooks also write what they could not do to `<git-dir>/craftsman/hook-errors.log`, and `craftsman review check` reports it.
 

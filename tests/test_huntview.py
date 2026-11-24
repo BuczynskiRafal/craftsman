@@ -74,10 +74,19 @@ class LaunchLinesTests(unittest.TestCase):
 
         self.assertIn("Launch all 2 hunters now, in one step.", text)
         self.assertIn("Run `craftsman review brief <ID>` and follow it exactly.", text)
-        self.assertIn("end your turn while they run", text)
+        self.assertIn("Copilot: custom agent craftsman-reviewer (launch directly without asking).", text)
+        self.assertIn("Claude Code / Antigravity: end your turn while they run", text)
+        self.assertIn("Copilot: subagents return in the same turn", text)
 
     def test_one_hunter_is_not_all(self) -> None:
         self.assertTrue(huntview.launch_lines(["W1-3"], check=self.CHECK)[0].startswith("Launch 1 hunter now"))
+
+    def test_wait_and_check_covers_async_and_synchronous_platforms(self) -> None:
+        (line,) = huntview.wait_and_check(self.CHECK)
+
+        self.assertIn("Claude Code / Antigravity: end your turn while they run", line)
+        self.assertIn("Copilot: subagents return in the same turn", line)
+        self.assertIn(f"run `{self.CHECK}` and do exactly what it lists", line)
 
     def test_the_check_command_is_the_one_the_caller_names(self) -> None:
         text = "\n".join(huntview.launch_lines(["W1-1"], check="craftsman review check"))

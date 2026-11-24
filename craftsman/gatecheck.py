@@ -786,15 +786,15 @@ def _stopped(run: AgentRun) -> datetime:
 
 _SLOT_ID = re.compile(r"(W\d-[A-Z]?)(\d+)")
 _LAUNCH_HOW = (
-    "For each, start a craftsman-reviewer subagent whose whole prompt is: "
+    "For each, start a craftsman-reviewer subagent without asking, prompt: "
     "`You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` "
-    "(Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent "
-    "craftsman-reviewer; Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)"
+    "(Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent, same-turn return; "
+    "Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)"
 )
 _VERIFIER_HOW = (
-    "For each cluster, start a craftsman-verifier subagent whose whole prompt is: "
+    "For each cluster, start a craftsman-verifier subagent without asking, prompt: "
     "`You are a Craftsman verifier. Run craftsman review brief --verifier <IDS> and follow it exactly.` "
-    "A verdict you record yourself does not count."
+    "(Copilot: custom agent, same-turn return.) A verdict you record yourself does not count."
 )
 
 

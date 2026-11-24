@@ -14,7 +14,7 @@ from craftsman.text import defang_tokens
 
 LAUNCH_PROMPT = "You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly."
 LAUNCH_MECHANICS = (
-    "Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer.",
+    "Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer (launch directly without asking).",
     "Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.",
 )
 CHECK_COMMAND = "craftsman review check"
@@ -72,9 +72,10 @@ def waiting_notice(running: Sequence[str], *, gate_active: bool) -> str:
 
 
 def wait_and_check(check: str) -> tuple[str, ...]:
-    """The last lines of the launch block: end the turn, then run `check` and do what it lists."""
+    """The last lines of the launch block: wait for async subagents or check at once on Copilot."""
     return (
-        "Then end your turn while they run. When they report back, run "
+        "Then wait for them to finish (Claude Code / Antigravity: end your turn while they run; "
+        "Copilot: subagents return in the same turn). When they report back, run "
         f"`{check}` and do exactly what it lists.",
     )
 
