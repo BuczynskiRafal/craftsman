@@ -49,6 +49,7 @@ from craftsman.records import (
     craftsman_agent_name,
 )
 from craftsman.shell import (
+    _PS_HERESTRING_OPEN_BOUNDARIES,
     SHELL_EXECUTABLES,
     SimpleCommand,
     expand_shell_path_token,
@@ -328,9 +329,8 @@ SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS = frozenset(
         "verdict", "resolve", "waive-run", "show", "check", "report", "inbox", "scratch",
     }
 )
-_PS_DOUBLE_HERESTRING_BOUNDARIES = frozenset(" \t\n\r(=;|&+,[{")
 _SAFE_HEREDOC_OPEN_RE = re.compile(
-    r"(?<!<)<<(?!<)(-?)[ \t]*(?:'([^'\r\n]+)'|\"([^\"\r\n]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+    r"(?<!<)<<(?!<)(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|\"([^\"\r\n]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
 )
 
 # Tools that only read or search; a path they carry is not a write. Anything else with a path is a candidate.
@@ -958,11 +958,14 @@ def _strip_ps_literal_herestring_prefix(command: str) -> str:
         pos = 3
     else:
         return command
+    body_start = pos
     n = len(trimmed)
     while pos <= n:
         line_end = trimmed.find("\n", pos)
         raw_line = trimmed[pos:] if line_end == -1 else trimmed[pos:line_end]
         if raw_line.startswith("'@"):
+            if "'" in trimmed[body_start:pos]:
+                return command
             after = trimmed[pos + 2 :]
             pipe_match = re.match(r"[ \t]*\|(?!\|)[ \t]*", after)
             if pipe_match is None or after[pipe_match.end() :].startswith("&"):
@@ -1005,9 +1008,9 @@ def _has_shell_expansion(text: str) -> bool:
             continue
         if quote == '"':
             if ch == "\\":
-                if i + 1 >= n:
+                if i + 1 >= n or text[i + 1] in ('"', "\\"):
                     return True
-                i += 2 if text[i + 1] in ('"', "\\") else 1
+                i += 1
                 continue
             if ch == '"':
                 quote = None
@@ -1018,15 +1021,15 @@ def _has_shell_expansion(text: str) -> bool:
             i += 1
             continue
         if ch == "\\":
-            if i + 1 >= n or text[i + 1] in ("\n", "\r"):
+            if i + 1 >= n or text[i + 1] in ("\n", "\r", "'", '"', "\\"):
                 return True
-            i += 2 if text[i + 1] in ("'", '"', "\\") else 1
+            i += 1
             continue
         if ch in ("'", '"'):
             quote = ch
             i += 1
             continue
-        if text.startswith('@"', i) and (i == 0 or text[i - 1] in _PS_DOUBLE_HERESTRING_BOUNDARIES):
+        if text.startswith('@"', i) and (i == 0 or text[i - 1] in _PS_HERESTRING_OPEN_BOUNDARIES):
             return True
         if ch == "`" or text.startswith(("$(", "<(", ">("), i):
             return True
@@ -1077,7 +1080,6 @@ def is_safe_auto_approve_shell(call: ToolCall) -> bool:
     if top in SAFE_AUTO_APPROVE_TOP_COMMANDS:
         return True
     if top == "review":
-        review_index = args.index("review")
-        sub = _first_positional(args[review_index + 1 :])
+        sub = _first_positional(args[1:])
         return sub in SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS
     return False

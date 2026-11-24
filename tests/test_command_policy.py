@@ -1010,11 +1010,17 @@ class SafeAutoApproveShellTests(PolicyCase):
             "craftsman status 'unclosed",
             'craftsman status "unclosed',
             "craftsman status \\",
+            'craftsman status "a\\" ; Write-Output PWNED ; echo \\"b"',
+            'craftsman status "C:\\\\repo\\\\sub"',
+            "craftsman status 'a'\\''b'",
+            'craftsman status \\"foo\\"',
+            "craftsman status \\\\foo",
         ):
             with self.subTest(command=command):
                 self.assertFalse(self.is_safe(command))
         self.assertTrue(self.is_safe("craftsman status 2>&1"))
         self.assertTrue(self.is_safe('craftsman review cover --note "a > b and it\'s ok"'))
+        self.assertTrue(self.is_safe('craftsman review cover --note "C:\\repo\\sub"'))
 
     def test_bash_heredocs_allow_only_closed_single_quoted_heredocs(self) -> None:
         good = (
@@ -1037,6 +1043,7 @@ class SafeAutoApproveShellTests(PolicyCase):
             'craftsman review add --from-json - <<-"EOF"\n[]\nEOF',
             "craftsman review add --from-json - <<'EOF'\n[]",
             "craftsman review add --from-json - <<'EOF'\n[]\n  EOF\n",
+            "craftsman review add --from-json - <<' EOF '\n[]\n EOF \nrm -rf /",
             "craftsman review add --from-json - <<'EOF'\n[]\nEOF\necho pwned",
             "craftsman review add --from-json - <<'EOF'\n[]\nEOF\n$(id)",
             "craftsman review add --from-json - <<'EOF' > out.json\n[]\nEOF",
@@ -1046,7 +1053,7 @@ class SafeAutoApproveShellTests(PolicyCase):
                 self.assertFalse(self.is_safe(bad))
 
     def test_powershell_literal_herestring_pipe_prefix_and_double_quote_rejection(self) -> None:
-        good = "@'\n[{\"hunks\": \"H1\", \"note\": \"$(safe) `safe` 'ok'\"}]\n'@ | craftsman review cover --from-json -"
+        good = "@'\n[{\"hunks\": \"H1\", \"note\": \"$(safe) `safe` ok\"}]\n'@ | craftsman review cover --from-json -"
         good_crlf = "@'\r\n[]\r\n'@|craftsman review add --from-json -"
         good_empty = "@'\n'@ | craftsman review verdict --from-json -"
         self.assertTrue(self.is_safe(good))
@@ -1056,6 +1063,8 @@ class SafeAutoApproveShellTests(PolicyCase):
             '@"\n[]\n"@ | craftsman review cover --from-json -',
             '@"\n$(id)\n"@ | craftsman review cover --from-json -',
             'craftsman review add --title @"\nfoo\n"@',
+            "@'\n'; touch /tmp/pwned; echo '\n'@ | craftsman status",
+            "@'\n'ok'\n'@ | craftsman review cover --from-json -",
             "@'\nfoo\n'@; calc.exe\n'@ | craftsman review cover --from-json -",
             "@'\n[]\n'@ || craftsman review check",
             "@'\n[]\n'@ |& craftsman review check",
