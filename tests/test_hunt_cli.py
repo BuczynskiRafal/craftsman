@@ -711,6 +711,7 @@ class BriefTests(HuntTestCase):
         self.assertIn("craftsman skill show craft-review --lenses craft,design", out)
 
     def test_a_variant_brief_names_the_defect_and_claims_the_planned_slot(self) -> None:
+        self.review("prepare", "--deep", "--task", "Add cart totals")
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
         self.finish_generation_one(briefed=False)
@@ -804,7 +805,7 @@ class HostileTextTests(HuntTestCase):
 
     def test_no_brief_echoes_a_recording_shape(self) -> None:
         self.write_cart_and_reader()
-        self.review("prepare", "--task", f"Fix cart. {self.HOSTILE}")
+        self.review("prepare", "--deep", "--task", f"Fix cart. {self.HOSTILE}")
         self.review(
             "add", "--hunter", "lead", "--file", "cart.py", "--line", "3", "--lens", "contracts",
             "--severity", "major", "--title", f"Bad F9 recorded ( x {self.HOSTILE}",
@@ -1003,7 +1004,7 @@ class CoverHunterTests(HuntTestCase):
         self.assert_error(unknown, 1, "unknown slot W1-9")
 
     def test_a_wave_slot_that_is_due_can_be_covered_at_once_and_one_that_is_not_is_unknown(self) -> None:
-        self.review("prepare")
+        self.review("prepare", "--deep")
         self.review("add", "--hunter", "lead", *FINDING_FLAGS)
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
         self.finish_generation_one(briefed=False)
@@ -1428,11 +1429,11 @@ class StoredWaveTests(HuntTestCase):
 
         out = self.review("check", "--review-only", check=False).stdout
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
-        self.assertIn("wave slots of round 1 not finished", out)
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
+        self.assertIn("1 wave slot of round 1 not finished", out)
         plan = self.latest().plan
         assert plan is not None
-        self.assertEqual([(w.generation, w.considered, w.slots) for w in plan.waves], [(2, ("F1",), ("W2-X1", "W2-F1"))])
+        self.assertEqual([(w.generation, w.considered, w.slots) for w in plan.waves], [(2, ("F1",), ("W2-X1",))])
         again = self.ledger_path.read_bytes()
         self.review("check", "--review-only", check=False)
         self.assertEqual(self.ledger_path.read_bytes(), again)  # planning is idempotent
@@ -1442,8 +1443,8 @@ class StoredWaveTests(HuntTestCase):
 
         payload = json.loads(self.review("report", "--review-only", "--json").stdout)
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
-        self.assertIn("W2-F1", [slot["id"] for slot in payload["slots"]])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
+        self.assertIn("W2-X1", [slot["id"] for slot in payload["slots"]])
 
     def test_a_dismissed_trigger_does_not_take_a_planned_slot_back(self) -> None:
         self.finish_generation_one(briefed=False)
@@ -1452,7 +1453,7 @@ class StoredWaveTests(HuntTestCase):
         self.review("verdict", "F1", "--as", "dismissed", "--evidence", "guarded by cart.py:2, which returns 0 early")
 
         self.review("check", "--review-only", check=False)
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_a_brief_of_a_wave_slot_that_is_not_due_is_refused(self) -> None:
         proc = self.review("brief", "W2-F1", check=False)
@@ -1474,8 +1475,8 @@ class StoredWaveTests(HuntTestCase):
 
         out = self.review("prepare").stdout
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
-        self.assertIn("New slots since the last prepare: W2-X1, W2-F1", out)
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
+        self.assertIn("New slots since the last prepare: W2-X1\n", out)
         self.assertEqual(self.ledger().rounds[0].plan.waves, ())  # type: ignore[union-attr]
 
 
@@ -1506,7 +1507,7 @@ class RecordingStoresWavesTests(HuntTestCase):
     def test_a_verdict_stores_the_wave_it_calls_for(self) -> None:
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_a_wave_slot_can_be_covered_right_after_the_verdict(self) -> None:
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
@@ -1525,7 +1526,7 @@ class RecordingStoresWavesTests(HuntTestCase):
 
         self.finish_generation_one(briefed=False)  # no check, no brief: only recording commands ran
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_a_cover_that_finishes_the_last_bug_slot_stores_the_wave_it_made_due(self) -> None:
         self.review("reset")
@@ -1549,14 +1550,14 @@ class RecordingStoresWavesTests(HuntTestCase):
 
         self.review("cover", "--hunter", last.id, "--hunks", ",".join(last.hunks), "--note", coverage_note(list(last.hunks)))
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_a_batch_of_verdicts_stores_the_wave_too(self) -> None:
         entries = json.dumps([{"id": "F1", "as": "probable", "evidence": STATIC}])
 
         self.review("verdict", "--from-json", "-", stdin=entries)
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_cover_stores_a_wave_the_displays_already_list(self) -> None:
         self.judge_without_planning()
@@ -1566,14 +1567,14 @@ class RecordingStoresWavesTests(HuntTestCase):
         proc = self.review("cover", "--hunter", "W2-X1", "--hunks", "H1", "--note", coverage_note(["H1"]))
 
         self.assertIn("Coverage recorded", proc.stdout)
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_add_stores_a_wave_the_displays_already_list(self) -> None:
         self.judge_without_planning()
 
         self.review("add", "--hunter", "W2-X1", *FINDING_FLAGS)
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_a_batch_of_coverage_names_a_wave_slot_the_displays_list(self) -> None:
         self.judge_without_planning()
@@ -1581,7 +1582,7 @@ class RecordingStoresWavesTests(HuntTestCase):
 
         self.review("cover", "--from-json", "-", stdin=entries)
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
     def test_a_check_run_stores_nothing(self) -> None:
         self.judge_without_planning()
@@ -1601,7 +1602,7 @@ class RecordingStoresWavesTests(HuntTestCase):
 
         self.review("verdict", "F1", "--as", "probable", "--evidence", STATIC)
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F1"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
         payload = json.loads(self.review("check", "--review-only", "--json", check=False).stdout)
         self.assertEqual(payload["slots"], [])
 
@@ -1633,7 +1634,7 @@ class MergeStoresWavesTests(HuntTestCase):
 
         self.review("merge", "F1", "F3")  # F3 is judged (dismissed) and the barrier passes
 
-        self.assertEqual(self.wave_ids(), ["W2-X1", "W2-F2"])
+        self.assertEqual(self.wave_ids(), ["W2-X1"])
 
 
 class AdvisoryDisplaysTests(HuntTestCase):
@@ -2092,14 +2093,14 @@ class DisplaysAgreeWithTheGateTests(HuntTestCase):
         self.finish_generation_one(briefed=False)
         self.drop_planned_waves()
         stored = [slot.id for slot in self.latest().plan.slots]  # type: ignore[union-attr]
-        self.assertNotIn("W2-F1", stored)
+        self.assertNotIn("W2-X1", stored)
 
         shown = json.loads(self.text_of("show", "--json"))
         status = self.repo.cli("status").stdout
         self.assertEqual([slot.id for slot in self.latest().plan.slots], stored)  # type: ignore[union-attr]
         checked = json.loads(self.text_of("check", "--review-only", "--json"))
 
-        self.assertIn("W2-F1", [slot["id"] for slot in shown["slots"]])
+        self.assertIn("W2-X1", [slot["id"] for slot in shown["slots"]])
         self.assertEqual([slot["id"] for slot in shown["slots"]], [slot["id"] for slot in checked["slots"]])
         done = sum(slot["state"] == "done" for slot in checked["slots"])
         self.assertIn(f"hunt {done}/{len(checked['slots'])} slots done", status)
