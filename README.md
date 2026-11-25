@@ -10,104 +10,31 @@
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE)
 
-AI coding agents usually judge their own work and stop as soon as things look green. Craftsman lets an agent **build freely, then forces a hard review**: when the agent thinks it is finished, Craftsman freezes the diff, sends fresh-context bug hunters and disproof-oriented verifiers over the change, logs verdicts and real test runs under `.git/`, and blocks completion in platform hooks until confirmed bugs are fixed and tests pass.
+Craftsman locks an AI coding agent in a quality loop: **build freely, review hard**. The agent codes normally, and only when it thinks it is done does Craftsman freeze the diff, send fresh-context bug hunters and disproof-oriented verifiers over the change, record verdicts and real test runs under `.git/`, and block completion in platform hooks until confirmed bugs are fixed and tests pass.
 
----
-
-## Installation
-
-Requires Python 3.10+ with zero external dependencies (`stdlib` only).
-
-```bash
-pipx install craftsman-gate        # or: uv tool install craftsman-gate
-craftsman install                  # detects Claude Code, Copilot, and Antigravity
-```
-
-Or install as a platform plugin:
-
-```bash
-/plugin marketplace add BuczynskiRafal/craftsman              # Claude Code
-/plugin install craftsman@craftsman
-agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
-codex plugin marketplace add BuczynskiRafal/craftsman            # Codex
-codex plugin add craftsman@craftsman
-```
-
-Cursor installs from a local checkout — see [Cursor plugin setup](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md#cursor-plugin).
-
-### Try the Skills Without Python
-
-All 13 skills follow the [Agent Skills](https://agentskills.io) format and install directly via `skills.sh`:
-
-```bash
-npx skills add BuczynskiRafal/craftsman
-# or pick individual skills:
-npx skills add BuczynskiRafal/craftsman --skill audit-security --skill simplify
-```
-
-Eleven workflow and audit skills run standalone with no Python required, and `/craft-review` works standalone in ungated mode. Install `craftsman-gate` above when you want deterministic hunt plans, the `.git` evidence ledger, and Stop hooks that block premature exit. See the [skills catalog](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md) and [installation guide](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md).
-
-## Usage
-
-Describe the task in plain words — no flags to memorize:
-
-```text
-/craftsman add pagination to the catalog search
-/craftsman migrate the session store to Redis, this is critical
-/craft-review review my staged changes and fix what you find
-/craft-review review PR 42
-/craft-review be thorough, this touches authentication
-```
-
-The agent infers scope, whether to apply fixes, and review depth (scaling up automatically on risky signals or words like `critical` and `ultracraft`; see **Depth** in [`craft-review`](https://github.com/BuczynskiRafal/craftsman/blob/main/skills/craft-review/SKILL.md) and [docs/usage.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md)). Run `craftsman status` at any time to check coverage and missing evidence.
+It works with Claude Code, GitHub Copilot, and Google Antigravity via Stop hooks, and runs without hooks in Codex and Cursor.
 
 ## How It Works
 
-| | Plain `CLAUDE.md` / prompt | External PR bots | Craftsman |
-| :--- | :--- | :--- | :--- |
-| **When it runs** | Only if the agent remembers | After a PR is opened | Before the agent stops, on the local diff |
-| **Who checks** | Same context that wrote the bug | One remote PR pass | Fresh-context hunters + verifiers trying to disprove reports |
-| **Completion proof** | Agent claims tests pass | PR review comments | Git-local ledger of covered hunks, verdicts, and `craftsman run` passes |
-| **Setup** | Prompt text only | Cloud service / webhook | Stdlib-only Python CLI or standalone Agent Skills |
-
 ![Craftsman 5: build freely, review hard](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/docs/diagrams/harness-overview.png)
 
-1. **Freeze and plan.** The diff is frozen and split by size and risk signals into mandatory hunt slices and lenses.
-2. **Hunt.** Fresh-context agents inspect each slice and record suspected bugs with concrete triggers.
-3. **Verify.** Separate verifiers try to disprove every suspicion and reproduce survivors; confirmed bugs trigger follow-up waves.
-4. **Fix and test.** Root-cause fixes are re-checked by fresh hunters and verified by `craftsman run` on the final code.
+1. **Freeze and plan.** The diff is frozen and split by size and risk signals into mandatory review slices and lenses.
+2. **Bug hunt.** Each slice goes to a separate fresh-context agent that records suspected bugs with concrete triggers.
+3. **Verification.** Separate verifiers try to disprove every suspicion and reproduce survivors; confirmed bugs trigger follow-up waves.
+4. **Fixes and tests.** Root-cause fixes are re-checked by fresh hunters, and tests pass on the final code through `craftsman run`.
 
-`/craft-review` runs steps 1–3 on an existing change and applies fixes only when asked. Full protocol: [docs/how-it-works.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md).
+`/craft-review` runs the same review on an existing change and fixes only when asked. Full protocol: [docs/how-it-works.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/how-it-works.md) · Interactive walkthrough: [catalog pagination demo](https://github.com/BuczynskiRafal/craftsman/blob/main/examples/demo/README.md).
 
-## What the Gate Looks Like
+## Where It Fits Best
 
-Captured on the [catalog pagination demo](https://github.com/BuczynskiRafal/craftsman/blob/main/examples/demo/README.md) (`./setup.sh` on POSIX, `.\setup.ps1` on Windows):
+Craftsman works best for:
 
-**1. Stopping early triggers the Stop hook:**
+- non-trivial changes and tricky bug fixes,
+- legacy refactors and migrations,
+- changes touching security, concurrency, or public contracts,
+- code where failing silently is expensive.
 
-```text
-[CRAFTSMAN GATE 1/6] review incomplete: no passing test run; no reviewer isolation evidence. Task completion is blocked until the evidence ledger proves the change is reviewed and verified.
-Next actions:
-1. [no-isolation] No Craftsman subagent was recorded for round 1. ...
-2. [no-passing-run] No passing test or e2e run at the current code; run `craftsman run --kind test -- <your test command>`.
-Close the gate with `craftsman gate --complete` once `craftsman review check` passes.
-```
-
-**2. After verification, fixes, and tests pass, `craftsman review report` shows the ledger:**
-
-```text
-$ craftsman review report
-- Base `7a8b04a` · 2 review round(s) · 2 files, +48/−10 lines
-- Gate: PASSED
-
-## Findings
-**Fixed (2)**
-- F1 · major · `shop/catalog.py:37` — total_pages truncates partial pages via floor division. Fix: Used ceiling division; confirmed by test_list_products_partial_last_page (R3).
-- F2 · major · `shop/catalog.py:36` — page < 1 uses negative slice indices instead of raising ValueError. Fix: Added page >= 1 and page_size >= 1 checks; confirmed by test_list_products_rejects_non_positive_page (R3).
-
-## Verification at the final code
-- R3 `python -m unittest discover -s tests` (test) → exit 0 in 0.2s
-```
+It is overkill for prototypes and small greenfield tasks — for lightweight daily checks, you can install individual skills standalone via `skills.sh` below.
 
 ## Platforms
 
@@ -130,9 +57,48 @@ Tested on `gemini-3.8-flash-low` via Antigravity CLI (2 full passes each):
 | **Finding bugs in existing PRs** ([`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md))<br>8 repos, 27 planted bugs, green unit tests | **24 / 27** bugs caught (`89%`)<br>`12 min` · `3.3M` tokens | **26.5 / 27** bugs caught (**`98%`**)<br>`143 min` · `86.6M` tokens |
 | **Building features from scratch** ([`evals/build_cases/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md#build-and-verify-benchmark))<br>6 multi-file specs graded by hidden tests | **8 / 12** runs passed 100% (`67%`)<br>`3 min` · `404k` tokens | **9 / 12** runs passed 100% (**`75%`**)<br>`34 min` · `21.7M` tokens\* |
 
-*\*In the build-from-scratch test, `7 / 12` Craftsman runs hit the 40-minute timeout while re-checking fixes (`5` after already passing `100%` of hidden tests).*
+*\*In the build-from-scratch test, `7 / 12` Craftsman runs hit the 40-minute timeout while re-checking fixes (`5` after already passing `100%` of hidden tests). Full breakdown and limits: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).*
 
-**Takeaway:** Craftsman catches subtle bugs a plain prompt consistently misses (like CLI docs disagreeing with code or weak test assertions), but it costs significantly more time and tokens. Use the standalone `skills.sh` skills for routine daily coding, and turn on the full Stop-hook gate for risky PRs, legacy refactors, and high-stakes code. Full breakdown and limits: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
+## Installation
+
+Requires Python 3.10+ with zero external dependencies (`stdlib` only):
+
+```bash
+pipx install craftsman-gate        # or: uv tool install craftsman-gate
+craftsman install                  # detects Claude Code, Copilot, and Antigravity
+```
+
+Or install as a platform plugin:
+
+```bash
+/plugin marketplace add BuczynskiRafal/craftsman              # Claude Code
+/plugin install craftsman@craftsman
+agy plugin install https://github.com/BuczynskiRafal/craftsman   # Antigravity
+codex plugin marketplace add BuczynskiRafal/craftsman            # Codex
+codex plugin add craftsman@craftsman
+```
+
+Cursor installs from a local checkout — see [Cursor plugin setup](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/installation.md#cursor-plugin).
+
+Or install individual Agent Skills standalone without Python (`11` run standalone; `/craft-review` runs ungated):
+
+```bash
+npx skills add BuczynskiRafal/craftsman
+```
+
+## Usage
+
+Describe the task in plain words — no flags to remember:
+
+```text
+/craftsman add pagination to the catalog search
+/craftsman migrate the session store to Redis, this is critical
+/craft-review review my staged changes and fix what you find
+/craft-review review PR 42
+/craft-review be thorough, this touches authentication
+```
+
+The agent infers scope, whether to fix findings, and review depth (scaling up on risky signals or words like `critical` and `ultracraft`; see [docs/usage.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/usage.md) and **Depth** in [`craft-review`](https://github.com/BuczynskiRafal/craftsman/blob/main/skills/craft-review/SKILL.md)). Run `craftsman status` at any time to check coverage and missing evidence.
 
 ## Documentation
 
