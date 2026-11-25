@@ -123,12 +123,16 @@ Tam, gdzie środowisko nie udostępnia hooków subagentów (Codex, Cursor lub se
 
 ## Pomiary
 
-Zmierzone na modelu `gemini-3.8-flash-low` w dwóch zestawach A/B pod Antigravity z natywnymi `hooks.json` na Windows (`n=2` przebiegi na ramię, `0` błędów hooków, `28/28` wymuszonych rejestrów):
+Przetestowane na modelu `gemini-3.8-flash-low` przez Antigravity CLI (po 2 pełne przejścia):
 
-- **Recenzja z zasianymi defektami ([`evals/`](evals/README.pl.md), 8 przypadków / 27 błędów / 18 pułapek):** `89%` (`24.00/27`) bez wsparcia → **`98%`** (`26.50/27`, precyzja **`84%`**) w `5.2.0`, z wykryciem wszystkich 3 defektów pominiętych dwukrotnie przez baseline (`inv-2`, `od-6`, `tb-3`) oraz redukcją subagentów o **47%** (`208.0 → 111.0`), niedopasowanego szumu o **45%** (`29.00 → 16.00`) i tokenów o **22%** (`111.3M → 86.6M` na przebieg, `×26.1` wobec `3.3M` w baseline) względem `5.1.0`.
-- **Build-and-verify (`evals/build_cases/`, 6 wielomodułowych zadań / 110 ukrytych testów):** `66.7%` pełnych zaliczeń / `96.4%` ukrytych testów (`8/12`, `106/110`, `404k` tokenów, `2.9 min`) w baseline → **`75.0%`** pełnych zaliczeń / **`97.3%`** ukrytych testów (`9/12`, `107/110`; **`80.0%`** / **`98.0%`** w przebiegach `ok`) w `5.2.0`, przy poprawie `49` zgłoszeń, średnio `21.7M` tokenów (`12.8M` `ok`, `-23%`/`-39%` względem `00a8fab`) oraz `7/12` timeoutach na limicie `40 min` w trakcie dogrywek drugiej rundy (`5` już po zaliczeniu `100%` ukrytych testów).
+| Co sprawdzaliśmy | Bez Craftmana | Z Craftsmanem 5.2 |
+| :--- | :--- | :--- |
+| **Szukanie błędów w gotowych PR-ach** ([`evals/`](evals/README.pl.md))<br>8 repozytoriów, 27 ukrytych błędów, zielone testy | Wykryto **24 / 27** błędów (`89%`)<br>`12 min` · `3.3M` tokenów | Wykryto **26.5 / 27** błędów (**`98%`**)<br>`143 min` · `86.6M` tokenów |
+| **Pisanie funkcji od zera** (`evals/build_cases/`)<br>6 wieloplikowych zadań ocenianych ukrytymi testami | **8 / 12** przejść na 100% (`67%`)<br>`3 min` · `404k` tokenów | **9 / 12** przejść na 100% (**`75%`**)<br>`34 min` · `21.7M` tokenów\* |
 
-Wniosek: do rutynowych zadań greenfield lepiej używać samych skilli z `skills.sh`, a pełną bramkę Stop zachować dla ryzykownych diffów, migracji legacy i krytycznych recenzji. Pełne tabele i ograniczenia: [docs/benchmark.md](docs/benchmark.md).
+*\*W teście pisania od zera `7 / 12` uruchomień Craftmana doszło do limitu 40 minut w trakcie ponownego sprawdzania poprawek (`5` z nich już wcześniej przechodziło `100%` ukrytych testów).*
+
+**Wniosek:** Craftsman wyłapuje subtelne błędy, które zwykły prompt konsekwentnie pomija (np. rozjazd opisu CLI z kodem albo zbyt słabe asercje w testach), ale kosztuje wyraźnie więcej czasu i tokenów. Do zwykłej codziennej pracy lepiej używać lekkich skilli z `skills.sh`, a pełną bramkę Stop włączać przy ryzykownych PR-ach, refaktorach legacy i krytycznym kodzie. Pełne wyniki i ograniczenia: [docs/benchmark.md](docs/benchmark.md).
 
 ## Dokumentacja
 

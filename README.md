@@ -123,12 +123,16 @@ Where a host does not expose subagent hooks (Codex, Cursor, or unhooked sessions
 
 ## Measurements
 
-Measured on `gemini-3.8-flash-low` across two Antigravity A/B suites with native Windows `hooks.json` (`n=2` passes/arm, `0` hook errors, `28/28` enforced):
+Tested on `gemini-3.8-flash-low` via Antigravity CLI (2 full passes each):
 
-- **Seeded-defect review ([`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md), 8 cases / 27 bugs / 18 decoys):** `89%` (`24.00/27`) unassisted → **`98%`** (`26.50/27`, **`84%`** precision) in `5.2.0`, catching all 3 bugs baseline missed twice (`inv-2`, `od-6`, `tb-3`) while cutting subagents **-47%** (`208.0 → 111.0`), unmatched noise **-45%** (`29.00 → 16.00`), and tokens **-22%** (`111.3M → 86.6M` per pass, `×26.1` baseline `3.3M`) vs `5.1.0`.
-- **Build-and-verify ([`evals/build_cases/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md#build-and-verify-benchmark), 6 multi-module tasks / 110 hidden tests):** `66.7%` full pass / `96.4%` hidden (`8/12`, `106/110`, `404k` tokens, `2.9 min`) unassisted → **`75.0%`** full pass / **`97.3%`** hidden (`9/12`, `107/110`; **`80.0%`** / **`98.0%`** on `ok` runs) in `5.2.0`, fixing `49` findings across `21.7M` mean tokens (`12.8M` `ok`, `-23%`/`-39%` vs pre-adaptive `00a8fab`) with `7/12` runs hitting the `40m` timeout during round-2 re-reviews (5 after already passing `100%` of hidden tests).
+| What we tested | Without Craftsman | With Craftsman 5.2 |
+| :--- | :--- | :--- |
+| **Finding bugs in existing PRs** ([`evals/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md))<br>8 repos, 27 planted bugs, green unit tests | **24 / 27** bugs caught (`89%`)<br>`12 min` · `3.3M` tokens | **26.5 / 27** bugs caught (**`98%`**)<br>`143 min` · `86.6M` tokens |
+| **Building features from scratch** ([`evals/build_cases/`](https://github.com/BuczynskiRafal/craftsman/blob/main/evals/README.md#build-and-verify-benchmark))<br>6 multi-file specs graded by hidden tests | **8 / 12** runs passed 100% (`67%`)<br>`3 min` · `404k` tokens | **9 / 12** runs passed 100% (**`75%`**)<br>`34 min` · `21.7M` tokens\* |
 
-Takeaway: use standalone `skills.sh` skills for routine greenfield tasks, and enable the full Stop-hook gate on risky diffs, legacy changes, and high-stakes reviews. Full tables and limits: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
+*\*In the build-from-scratch test, `7 / 12` Craftsman runs hit the 40-minute timeout while re-checking fixes (`5` after already passing `100%` of hidden tests).*
+
+**Takeaway:** Craftsman catches subtle bugs a plain prompt consistently misses (like CLI docs disagreeing with code or weak test assertions), but it costs significantly more time and tokens. Use the standalone `skills.sh` skills for routine daily coding, and turn on the full Stop-hook gate for risky PRs, legacy refactors, and high-stakes code. Full breakdown and limits: [docs/benchmark.md](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/benchmark.md).
 
 ## Documentation
 
