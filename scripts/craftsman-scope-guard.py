@@ -6,6 +6,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+if sys.version_info < (3, 10):  # noqa: UP036
+    raise SystemExit(1)
+
 # First on the path even when it is there already: an empty `PYTHONPATH` entry puts the working directory,
 # a project that may hold a `craftsman/` directory of its own, ahead of it.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

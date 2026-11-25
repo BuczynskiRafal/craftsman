@@ -3,20 +3,28 @@ name: audit-comments
 description: >-
   Audit comments and docstrings against the code they describe. Use for
   /audit-comments or /audit comments.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI to query bundled lens playbooks.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Comment & docstring audit (`/audit-comments [target]`)
 
 Deepens probe 4 of the `craft` lens (run `craftsman skill show craft-review --lenses craft` to
-read that playbook first; never search the file system for `lenses.md`).
+read that playbook first, or if the `craftsman` CLI is not installed, read
+`references/craft-lens.md` inside this skill directory; never search the file system for
+`lenses.md`).
 
 ## Search scope
 
 Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
 list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
 folder). Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (run
-`craftsman skill show craftsman --file scope.md` for the full contract).
+repositories, other projects' packets/ledgers/reports, or assistant session stores (when the
+`craftsman` CLI is installed, run `craftsman skill show craftsman --file scope.md` for the full
+contract).
 
 A comment is a claim about code that no compiler checks. When the code changes and the comment
 does not, the comment starts lying — and readers trust comments more than code.

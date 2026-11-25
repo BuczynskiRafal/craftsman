@@ -3,20 +3,27 @@ name: audit-types
 description: >-
   Audit data structures and type design for the illegal states they still
   allow. Use for /audit-types or /audit types.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI to query bundled lens playbooks.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Type & data-model audit (`/audit-types [target]`)
 
 Deepens the `model` lens (run `craftsman skill show craft-review --lenses model` to read that
-playbook first; never search the file system for `lenses.md`).
+playbook first, or if the `craftsman` CLI is not installed, read `references/model-lens.md` inside
+this skill directory; never search the file system for `lenses.md`).
 
 ## Search scope
 
 Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
 list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
 folder). Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (run
-`craftsman skill show craftsman --file scope.md` for the full contract).
+repositories, other projects' packets/ledgers/reports, or assistant session stores (when the
+`craftsman` CLI is installed, run `craftsman skill show craftsman --file scope.md` for the full
+contract).
 
 The measure of a type here is simple: **how many states can be built that the domain forbids,
 and how far does a bad value travel before anything notices?**

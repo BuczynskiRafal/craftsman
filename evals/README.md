@@ -417,3 +417,26 @@ a ledger or findings file counts as zero defects found, and is marked in the rec
 Lint: `python3 -m ruff check evals tests/test_evals.py tests/test_evals_usage.py` and
 `python3 -m mypy --strict --exclude 'evals/cases/' evals tests/test_evals.py tests/test_evals_usage.py` are
 clean (the case trees are fixtures with seeded defects and are not linted).
+
+---
+
+## Build-and-verify benchmark
+
+A companion end-to-end coding suite under `evals/build_cases/` (`6` pure-stdlib multi-module starter projects) for comparing full implementation + Craftsman gate review (`/craftsman`) against an unassisted baseline using withheld `hidden_tests.py` files.
+
+| Case | Package | Hidden Tests | What It Tests |
+| :--- | :--- | :---: | :--- |
+| `ledger_batch` | `ledger_batch` | 10 | Double-entry posting, atomic batch rollback, idempotency conflict vs. replay, reversals, trial balance |
+| `jobqueue_retry` | `jobqueue_retry` | 10 | Priority/seq tie-breaking, lease expiry sweeps, stale-worker guards, exponential backoff & DLQ, cancellation, JSON round-trip |
+| `config_overlay` | `config_overlay` | 9 | Diamond profile inheritance, `$merge`/`$unset` directives, cycle-safe interpolation & `\${...}` escaping, multi-error schema & redaction |
+| `docindex_search` | `docindex_search` | 9 | Clean re-index/delete pruning, stopword gap positions, positional phrases, boolean precedence, multi-select facets, snapshots |
+| `pkgcache_sync` | `pkgcache_sync` | 9 | SHA-256 verification on read/write, atomic staging, transitive dependency pinning, transactional capacity, blob dedup & GC |
+| `schedule_rrule` | `schedule_rrule` | 8 | Deterministic stdlib DST wall-time rules, `DAILY`/`WEEKLY`/`MONTHLY` (`skip`/`clamp`), `COUNT`/`EXDATE`/`RECURRENCE-ID` overrides, conflicts |
+
+```bash
+python3 -m evals.build_bench list
+python3 -m evals.build_bench prepare ledger_batch ~/evals/ledger-1   # copies starter/ + TASK.md only (no hidden_tests.py)
+python3 -m evals.build_bench grade ledger_batch ~/evals/ledger-1     # runs tests/test_starter.py and external hidden_tests.py
+python3 -m evals.build_bench summary bench/build_eval.jsonl          # summarizes JSONL runs per arm and case
+python3 -m unittest tests.test_build_cases                           # verifies starters pass, hidden fail cleanly, LF-only, no leaks
+```

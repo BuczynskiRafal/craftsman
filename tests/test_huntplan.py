@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
-from craftsman.attribution import agent_runs, bound_slots, slot_work
+from craftsman.attribution import REOPENED_LENSES, agent_runs, bound_slots, slot_work
 from craftsman.diffscan import Hunk
 from craftsman.diffscan_paths import is_config_path
 from craftsman.gatecheck import slot_statuses
@@ -20,10 +20,14 @@ from craftsman.huntplan import (
     BUG_LENSES,
     DEEP_MIN_PRODUCTION_LINES,
     DELTA_MAX_CHANGED_LINES,
+    DELTA_MAX_PRODUCTION_LINES,
     FRESH_DEFAULT_LENSES,
+    MAX_GENERATION_NORMAL,
     MAX_VARIANTS_PER_WAVE,
+    MAX_VARIANTS_PER_WAVE_NORMAL,
     SLICE_MAX_CHANGED_LINES,
     Depth,
+    FollowUpContext,
     _generation_of,
     barrier_passed,
     build_plan,
@@ -31,6 +35,7 @@ from craftsman.huntplan import (
     credited,
     decide_depth,
     finding_generation,
+    follow_up_context,
     hunk_kind,
     is_production_hunk,
     is_trigger,
@@ -320,6 +325,15 @@ class OwedLensesTests(unittest.TestCase):
 
         self.assertEqual(owed, {"H2": frozenset({"intent", "tests"}), "H3": frozenset({"tests"})})
 
+    def test_a_reopened_ref_keeps_local_lenses_and_rechecks_reopened_lenses(self) -> None:
+        reopened = HunkRef("H1", "a.py", "d1", 1, 1, carried=False, reopened=True)
+        required = {"H1": frozenset({"intent", "contracts", "state", "craft", "design"})}
+        have = {"d1": frozenset({"intent", "contracts", "state", "craft", "design"})}
+
+        owed = owed_lenses(required, [reopened], have)
+
+        self.assertEqual(owed, {"H1": frozenset({"intent", "contracts"})})
+
 
 class SlicingTests(unittest.TestCase):
     def test_a_small_change_is_one_slice(self) -> None:
@@ -530,22 +544,49 @@ class DeltaRoundTests(unittest.TestCase):
 
     def test_more_than_the_delta_budget_is_a_normal_round(self) -> None:
         self.assertEqual(DELTA_MAX_CHANGED_LINES, 40)
-        small = plan_of([code("H1", count=40)], round_number=2)
-        large = plan_of([code("H1", count=41)], round_number=2)
+        self.assertEqual(DELTA_MAX_PRODUCTION_LINES, 80)
+        small = plan_of([code("H1", count=80)], round_number=2)
+        large = plan_of([code("H1", count=81)], round_number=2)
 
         self.assertEqual(len(small.slots), 2)
         self.assertEqual(len(large.slots), 3)
 
-    def test_a_deep_signal_in_the_open_hunks_makes_it_a_normal_round(self) -> None:
-        plan = plan_of([code("H1", count=3, extra=(SQL_LINE,))], round_number=2)
+    def test_a_small_deep_signal_fix_stays_delta_and_a_large_one_is_normal(self) -> None:
+        small = plan_of([code("H1", count=3, extra=(SQL_LINE,))], round_number=2)
+        large = plan_of([code("H1", count=40, extra=(SQL_LINE,))], round_number=2)
 
-        self.assertGreater(len(plan.slots), 2)
+        self.assertEqual(len(small.slots), 2)
+        self.assertEqual(small.slots[0].kind, "bug")
+        self.assertEqual(small.slots[1].kind, "simplicity")
+        self.assertGreater(len(large.slots), 2)
 
     def test_a_deep_floor_alone_does_not_end_the_delta_round(self) -> None:
         plan = plan_of([code("H1")], round_number=2, deep=True)
 
         self.assertEqual(len(plan.slots), 2)
         self.assertEqual(plan.slots[0].lenses, BUG_LENSES)
+
+    def test_reopened_callers_do_not_break_delta_consolidation(self) -> None:
+        # 10 new quiet production lines (<= 80) + 100 reopened caller lines (total 110 <= 400): stays 1 delta bug slot.
+        new_hunk = code("H1", "cart.py", count=10)
+        reopened = code("H2", "caller.py", count=100)
+        plan = plan_of([new_hunk, reopened], round_number=2, reopened_ids={"H2"})
+
+        self.assertEqual([slot.kind for slot in plan.slots], ["bug", "simplicity"])
+        self.assertEqual(plan.slots[0].hunks, ("H1", "H2"))
+
+        # Even with a deep signal in the small fix (<= 40) and large reopened callers (> 400 total),
+        # delta bug grouping is preserved per slice without emitting a sweep.
+        small_risky = code("H1", "cart.py", count=5, extra=(SQL_LINE,))
+        big_caller_a = code("H2", "caller_a.py", count=250)
+        big_caller_b = code("H3", "caller_b.py", count=250)
+        sliced = plan_of(
+            [small_risky, big_caller_a, big_caller_b],
+            round_number=2,
+            reopened_ids={"H2", "H3"},
+        )
+        self.assertFalse(any("sweep" in slot.lenses for slot in sliced.slots))
+        self.assertEqual([slot.kind for slot in sliced.slots], ["bug", "simplicity", "bug", "simplicity"])
 
 
 class AppendOnlyTests(unittest.TestCase):
@@ -709,8 +750,20 @@ def advance(
     opening the round; `prepare_round` runs `review._plan_round` itself and is what to use for anything
     that depends on that step."""
     snap = stable_hunk_ids(ledger, make_snap(*hunks, fingerprint=f"fp{len(ledger.rounds) + 2}"))
-    required = required_by_hunk(snap.hunks, deep=deep)
     have = credited(ledger, enforced=True)
+    first_deep_round = first_deep or (deep and not any(item.deep for item in ledger.rounds))
+    follow_up = (
+        follow_up_context(
+            ledger,
+            upto=len(ledger.rounds),
+            enforced=True,
+            first_deep_round=first_deep_round,
+            credited=have,
+        )
+        if ledger.rounds
+        else FollowUpContext()
+    )
+    required = required_by_hunk(snap.hunks, deep=deep, follow_up=follow_up)
     carry_sweep = sweep_pending(ledger)
     opened, round_ = open_round(ledger, snap, deep, "p.md", {}, required=required, credited=have)
     prepared_at = 5000 + 1000 * len(ledger.rounds) if seconds is None else seconds
@@ -722,12 +775,14 @@ def advance(
         owed_lenses(required, round_.hunks, have),
         depth=Depth(deep, ()),
         round_number=round_.number,
-        first_deep_round=first_deep,
+        first_deep_round=first_deep_round,
         existing=None,
         pending_wave_slots=pending,
         round_hunks=snap.hunks,
         carry_sweep=carry_sweep,
         credited=credited(opened, enforced=True),
+        reopened_ids={ref.id for ref in round_.hunks if ref.reopened},
+        prior_reviewed=follow_up.prior_reviewed,
     )
     round_ = replace(round_, plan=plan)
     opened = replace(opened, rounds=(*opened.rounds[:-1], round_))
@@ -815,9 +870,11 @@ class TriggerTests(unittest.TestCase):
                 with self.subTest(severity=severity, verdict=verdict):
                     self.assertTrue(is_trigger(self.finding(severity=severity, verdict=verdict), False))
 
-    def test_a_minor_finding_triggers_only_when_proven(self) -> None:
-        self.assertTrue(is_trigger(self.finding(severity="minor", verdict="proven"), False))
-        self.assertFalse(is_trigger(self.finding(severity="minor", verdict="probable"), False))
+    def test_minor_and_nit_findings_never_trigger(self) -> None:
+        for severity in ("minor", "nit"):
+            for verdict in ("proven", "probable"):
+                with self.subTest(severity=severity, verdict=verdict):
+                    self.assertFalse(is_trigger(self.finding(severity=severity, verdict=verdict), False))
 
     def test_other_verdicts_and_unjudged_findings_do_not_trigger(self) -> None:
         self.assertFalse(is_trigger(self.finding(verdict="dismissed"), False))
@@ -1087,11 +1144,11 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
 
     def test_an_unfinished_variant_is_stored_again_over_the_open_hunks_of_its_file(self) -> None:
         hunks = [code("H1", "a.py"), code("H2", "b.py")]
-        ledger = plan_waves(record_finding(run_all(hunt(hunks)), path="a.py", lens="failure"), 2000)
+        ledger = plan_waves(record_finding(run_all(hunt(hunks, deep=True)), path="a.py", lens="failure"), 2000)
         since = at(2000)
 
         # a.py is edited: the new hunk is open, b.py is carried.
-        ledger, round_ = advance(ledger, [code("H3", "a.py"), hunks[1]])
+        ledger, round_ = advance(ledger, [code("H3", "a.py"), hunks[1]], deep=True)
 
         assert round_.plan is not None
         variant = round_.plan.slot("W2-F1")
@@ -1105,21 +1162,21 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
 
     def test_a_completed_variant_is_not_carried(self) -> None:
         hunks = [code("H1", "a.py")]
-        ledger = plan_waves(record_finding(run_all(hunt(hunks)), path="a.py"), 2000)
+        ledger = plan_waves(record_finding(run_all(hunt(hunks, deep=True)), path="a.py"), 2000)
         ledger = run_waves(ledger, start=3000)
 
         self.assertEqual(pending_wave_slots(ledger, open_hunks=[code("H2", "a.py")], round_hunks=[code("H2", "a.py")]), ())
 
     def test_a_variant_without_open_hunks_follows_the_round_like_the_fresh_set(self) -> None:
         hunks = [code("H1", "a.py")]
-        ledger = plan_waves(record_finding(run_all(hunt(hunks)), path="a.py"))
+        ledger = plan_waves(record_finding(run_all(hunt(hunks, deep=True)), path="a.py"))
 
         slots = pending_wave_slots(ledger, open_hunks=[], round_hunks=[code("H1", "a.py")])
 
         self.assertEqual([(slot.id, slot.hunks) for slot in slots], [("W2-X1", ("H1",)), ("W2-F1", ("H1",))])
 
     def test_a_variant_is_dropped_only_when_the_round_has_nothing_but_documentation(self) -> None:
-        ledger = plan_waves(record_finding(run_all(hunt([code("H1", "a.py")])), path="a.py"))
+        ledger = plan_waves(record_finding(run_all(hunt([code("H1", "a.py")], deep=True)), path="a.py"))
         readme = make_hunk("H2", "README.md", lines(3))
 
         slots = pending_wave_slots(ledger, open_hunks=[readme], round_hunks=[readme])
@@ -1127,10 +1184,10 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
         self.assertEqual(slots, ())
 
     def test_carried_slots_are_ordered_fresh_before_variants_by_generation(self) -> None:
-        ledger = plan_waves(record_finding(run_all(hunt([code("H1", "a.py")])), path="a.py"), 2000)
+        ledger = plan_waves(record_finding(run_all(hunt([code("H1", "a.py")], deep=True)), path="a.py"), 2000)
         ledger = run_waves(ledger, start=3000)
-        ledger = record_finding(ledger, path="a.py", lens="failure", hunter="W2-F1", seconds=3500)
-        ledger = plan_waves(ledger, 4000)  # the generation 2 finding calls for generation 3
+        ledger = record_finding(ledger, path="a.py", lens="failure", severity="blocker", hunter="W2-F1", seconds=3500)
+        ledger = plan_waves(ledger, 4000)  # the generation 2 blocker finding calls for generation 3
         self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1", "W3-X1", "W3-F2"])
         hunk = [code("H9", "a.py")]
 
@@ -1139,7 +1196,7 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
         self.assertEqual([slot.id for slot in slots], ["W2-X1", "W2-F1", "W3-X1", "W3-F2"])
 
     def test_delta_round_with_a_simplicity_slot_that_never_ran(self) -> None:
-        hunks = self.two()
+        hunks = [code("H1", "app.py", count=45), code("H2", "b.py")]
         ledger = run_all(hunt(hunks), skip=("W1-3",))  # [craft, design] never ran
 
         ledger, round_ = advance(ledger, [hunks[0], code("H3", "c.py")])
@@ -1149,7 +1206,7 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
         self.assertEqual([(slot.lenses, slot.hunks) for slot in simplicity], [(SIMPLICITY, ("H1", "H3"))])
 
     def test_a_delta_round_that_owes_only_simplicity_has_no_bug_slot(self) -> None:
-        hunks = self.two()
+        hunks = [code("H1", "app.py", count=45), code("H2", "b.py")]
         ledger = run_all(hunt(hunks), skip=("W1-3",))
 
         ledger, round_ = advance(ledger, [hunks[0]])  # the edited hunk is deleted
@@ -1160,14 +1217,14 @@ class UnfinishedWorkSurvivesAnEditTests(unittest.TestCase):
 
 class AdapterTests(unittest.TestCase):
     def test_lenses_and_order_cover_the_stored_slots_only(self) -> None:
-        ledger = plan_waves(run_all(record_finding(hunt([code("H1")]))), 2000)
+        ledger = plan_waves(run_all(record_finding(hunt([code("H1")], deep=True))), 2000)
         lenses, order = slot_lenses(ledger), slot_order(ledger)
 
         self.assertEqual(lenses(1, "W1-1"), ("intent", "ripple", "tests"))
         self.assertEqual(lenses(1, "W2-F1"), ("intent",))
         self.assertIsNone(lenses(1, "W1-9"))
         self.assertIsNone(lenses(2, "W1-1"))
-        self.assertEqual(list(order(1)), ["W1-1", "W1-2", "W1-3", "W2-X1", "W2-F1"])
+        self.assertEqual(list(order(1)), ["W1-1", "W1-2", "W1-3", "W1-4", "W1-5", "W2-X1", "W2-F1"])
         self.assertEqual(list(order(2)), [])
 
     def test_nothing_is_adapted_before_the_wave_is_planned(self) -> None:
@@ -1178,7 +1235,7 @@ class AdapterTests(unittest.TestCase):
         self.assertIsNone(slot_hunks(ledger)(1, "W2-F1"))
 
     def test_the_hunks_of_a_slot_cover_the_stored_slots(self) -> None:
-        ledger = plan_waves(run_all(record_finding(hunt([code("H1")]))), 2000)
+        ledger = plan_waves(run_all(record_finding(hunt([code("H1")], deep=True))), 2000)
         hunks = slot_hunks(ledger)
 
         self.assertEqual(hunks(1, "W1-1"), frozenset({"H1"}))
@@ -1204,7 +1261,7 @@ class AdapterTests(unittest.TestCase):
 
     def test_a_wave_slot_that_ran_credits_its_lenses(self) -> None:
         hunk = code("H1")
-        ledger = plan_waves(run_all(record_finding(hunt([hunk]), lens="failure")), 2000)
+        ledger = plan_waves(run_all(record_finding(hunt([hunk], deep=True), lens="failure")), 2000)
         ledger = run_waves(ledger, start=3000, only=("W2-F1",))
 
         self.assertIn("failure", credited(ledger)[hunk.digest])
@@ -1373,7 +1430,7 @@ class SliceBoundaryTests(unittest.TestCase):
 
 class VariantDetailTests(unittest.TestCase):
     def ledger(self) -> Ledger:
-        return hunt([code("H1", "a.py"), code("H2", "b.py")])
+        return hunt([code("H1", "a.py"), code("H2", "b.py")], deep=True)
 
     def test_a_cluster_ranks_by_its_best_severity(self) -> None:
         ledger = run_all(self.ledger())
@@ -1388,7 +1445,7 @@ class VariantDetailTests(unittest.TestCase):
 
         variants = [s.id for s in plan_waves(ledger).rounds[0].plan.slots if s.kind == "variant"]  # type: ignore[union-attr]
 
-        self.assertEqual(variants, ["W2-F4", "W2-F1", "W2-F2"])
+        self.assertEqual(variants, ["W2-F4"])
 
     def test_a_wave_is_due_since_the_moment_it_was_planned(self) -> None:
         ledger = record_finding(run_all(self.ledger()), path="a.py", seconds=5)
@@ -1411,7 +1468,7 @@ class VariantDetailTests(unittest.TestCase):
         self.assertTrue(slot_complete(round_, replace(slot, since=first.isoformat().replace("+00:00", "Z")), work))
 
     def test_a_pending_variant_with_no_open_hunk_of_its_file_covers_the_open_hunks(self) -> None:
-        ledger = plan_waves(record_finding(run_all(hunt([code("H1", "a.py")])), path="a.py"))
+        ledger = plan_waves(record_finding(run_all(hunt([code("H1", "a.py")], deep=True)), path="a.py"))
         elsewhere = [code("H5", "b.py"), code("H6", "c.py")]
 
         slots = pending_wave_slots(ledger, open_hunks=elsewhere, round_hunks=elsewhere)
@@ -1521,7 +1578,7 @@ class AgyPlannerFindingTests(unittest.TestCase):
 
     # finding 3
     def test_a_wave_slot_is_completed_by_covering_after_it_was_planned(self) -> None:
-        ledger = record_finding(run_all(hunt([code("H1")])), lens="failure", seconds=5)
+        ledger = record_finding(run_all(hunt([code("H1")], deep=True)), lens="failure", seconds=5)
         ledger = plan_waves(ledger, 100)
         slot = next(s for s in ledger.rounds[0].plan.slots if s.id == "W2-F1")  # type: ignore[union-attr]
         self.assertEqual(slot.since, at(100))
@@ -1537,7 +1594,7 @@ class AgyPlannerFindingTests(unittest.TestCase):
 
     def test_a_wave_slot_needs_every_hunk_covered_at_or_after_it_was_planned(self) -> None:
         hunks = [code("H1", "a.py"), code("H2", "a.py")]
-        ledger = plan_waves(record_finding(run_all(hunt(hunks)), path="a.py", lens="failure", seconds=5), 100)
+        ledger = plan_waves(record_finding(run_all(hunt(hunks, deep=True)), path="a.py", lens="failure", seconds=5), 100)
         slot = next(s for s in ledger.rounds[0].plan.slots if s.id == "W2-F1")  # type: ignore[union-attr]
 
         def complete(current: Ledger) -> bool:
@@ -1552,7 +1609,7 @@ class AgyPlannerFindingTests(unittest.TestCase):
 
     # finding 4
     def test_binding_uses_the_stored_order(self) -> None:
-        ledger = plan_waves(run_all(record_finding(hunt([code("H1")]), lens="failure")), 2000)
+        ledger = plan_waves(run_all(record_finding(hunt([code("H1")], deep=True), lens="failure")), 2000)
         digest = ledger.rounds[0].hunks[0].digest
         for seconds, slot_id in ((2020, "W2-X1"), (2021, "W1-9")):
             ledger = replace(
@@ -1561,7 +1618,7 @@ class AgyPlannerFindingTests(unittest.TestCase):
             )
         ledger = add_agent_event(ledger, agent_event("start", REVIEWER, "a2", 2019, platform=AGY))
         ledger = add_agent_event(ledger, agent_event("stop", REVIEWER, "a2", 2025, platform=AGY))
-        ledger = record_finding(ledger, lens="contracts", by=f"{AGY}:a2", hunter="W2-X1", seconds=2022)
+        ledger = record_finding(ledger, lens="contracts", severity="blocker", by=f"{AGY}:a2", hunter="W2-X1", seconds=2022)
         ledger = run_slot(ledger, "W2-F1", "a3", 2040)  # the rest of generation 2 is finished too
         runs = agent_runs(ledger)
         work = slot_work(ledger, runs, slot_order(ledger))
@@ -1577,7 +1634,7 @@ class AgyPlannerFindingTests(unittest.TestCase):
         self.assertNotIn("W2-F2", ids)  # F2 is a generation 2 finding: it calls for generation 3 only
 
     def test_two_wave_slots_bind_in_stored_order_not_id_order(self) -> None:
-        ledger = plan_waves(run_all(record_finding(hunt([code("H1")]), lens="failure")), 2000)
+        ledger = plan_waves(run_all(record_finding(hunt([code("H1")], deep=True), lens="failure")), 2000)
         ledger = run_slot(ledger, "W2-F1", "a2", 2020)
         ledger = run_slot(ledger, "W2-X1", "a2", 2022)
         ledger = record_finding(ledger, lens="contracts", by=f"{AGY}:a2", seconds=2023)
@@ -1600,10 +1657,10 @@ class AgyPlannerFindingTests(unittest.TestCase):
             stored_is_required(self, ledger)
 
     def test_a_generation_three_fresh_set_takes_its_trigger_and_since_from_a_generation_two_finding(self) -> None:
-        ledger = record_finding(run_all(hunt([code("H1")])), hunter="W1-1", lens="intent", seconds=5)  # F1: generation 1
+        ledger = record_finding(run_all(hunt([code("H1")], deep=True)), hunter="W1-1", lens="intent", seconds=5)  # F1: generation 1
         ledger = plan_waves(ledger, 2000)
         ledger = run_waves(ledger, start=3000)
-        ledger = record_finding(ledger, hunter="W2-F1", lens="failure", seconds=3500)  # F2: generation 2
+        ledger = record_finding(ledger, hunter="W2-F1", lens="failure", severity="blocker", seconds=3500)  # F2: gen 2 blocker
         ledger = plan_waves(ledger, 4000)
 
         w3 = ledger.rounds[0].plan.slot("W3-X1")  # type: ignore[union-attr]
@@ -1714,7 +1771,7 @@ class AgyPlannerFindingTests(unittest.TestCase):
 
     # finding 7
     def test_a_cluster_keeps_the_representative_a_hunter_already_works_on(self) -> None:
-        ledger = run_all(hunt([code("H1", "a.py")]))
+        ledger = run_all(hunt([code("H1", "a.py")], deep=True))
         ledger = record_finding(ledger, path="a.py", lens="failure", verdict="dismissed", seconds=5)  # F1
         ledger = record_finding(ledger, path="a.py", lens="failure", verdict="proven", seconds=6)  # F2
         ledger = plan_waves(ledger, 2000)
@@ -1726,13 +1783,13 @@ class AgyPlannerFindingTests(unittest.TestCase):
         self.assertEqual(unanswered_triggers(ledger), ())
 
     def test_the_cap_applies_to_each_wave_and_the_findings_it_leaves_out_are_decided(self) -> None:
-        ledger = run_all(hunt([code("H1")]))
+        ledger = run_all(hunt([code("H1")], deep=True))
         for lens in ("intent", "contracts", "failure", "ripple"):
             ledger = record_finding(ledger, lens=lens)
 
         ledger = plan_waves(ledger, 2000)
 
-        self.assertEqual([s.id for s in ledger.rounds[0].plan.slots if s.kind == "variant"], ["W2-F1", "W2-F2", "W2-F3"])  # type: ignore[union-attr]
+        self.assertEqual([s.id for s in ledger.rounds[0].plan.slots if s.kind == "variant"], ["W2-F1"])  # type: ignore[union-attr]
         self.assertEqual(ledger.rounds[0].plan.waves[0].considered, ("F1", "F2", "F3", "F4"))  # type: ignore[union-attr]
         self.assertEqual(unanswered_triggers(ledger), ())
 
@@ -1763,7 +1820,7 @@ class WavePlanningTests(unittest.TestCase):
         self.assertEqual(plan_waves(Ledger()), Ledger())
 
     def test_a_proven_finding_plans_a_fresh_set_and_a_variant_and_records_the_wave(self) -> None:
-        ledger = record_finding(finished(), lens="failure", path="a.py")
+        ledger = record_finding(finished(deep=True), lens="failure", path="a.py")
         before = ledger.rounds[0].plan
         assert before is not None
 
@@ -1774,7 +1831,7 @@ class WavePlanningTests(unittest.TestCase):
         self.assertEqual(plan.slots[: len(before.slots)], before.slots)  # append-only
         fresh, variant = plan.slots[len(before.slots) :]
         self.assertEqual((fresh.id, fresh.kind, fresh.generation, fresh.trigger, fresh.since), ("W2-X1", "fresh", 2, "F1", at(2000)))
-        self.assertEqual(fresh.lenses, ("state", "trust", "platform"))  # what the normal plan did not use
+        self.assertEqual(fresh.lenses, FRESH_DEFAULT_LENSES)  # deep gen 1 examined every bug lens; fresh falls back to default
         self.assertEqual(fresh.hunks, ("H1", "H2"))
         self.assertEqual(
             (variant.id, variant.kind, variant.lenses, variant.trigger, variant.since, variant.hunks),
@@ -1784,7 +1841,7 @@ class WavePlanningTests(unittest.TestCase):
         stored_is_required(self, planned_ledger)
 
     def test_a_variant_of_a_file_without_hunks_covers_all_production_hunks(self) -> None:
-        ledger = plan_waves(record_finding(finished(), path="gone.py"), 2000)
+        ledger = plan_waves(record_finding(finished(deep=True), path="gone.py"), 2000)
 
         variant = ledger.rounds[0].plan.slot("W2-F1")  # type: ignore[union-attr]
 
@@ -1842,7 +1899,7 @@ class WavePlanningTests(unittest.TestCase):
         self.assertEqual(planned_ledger.rounds[0].plan.waves[0].considered, ("F2",))  # type: ignore[union-attr]
 
     def test_findings_of_one_file_and_lens_share_a_variant_named_after_the_first(self) -> None:
-        ledger = record_finding(finished(), path="a.py", severity="major")
+        ledger = record_finding(finished(deep=True), path="a.py", severity="major")
         ledger = record_finding(ledger, path="a.py", severity="blocker")
         ledger = record_finding(ledger, path="b.py")
 
@@ -1851,13 +1908,13 @@ class WavePlanningTests(unittest.TestCase):
 
         self.assertEqual(
             [(slot.id, slot.hunks, slot.trigger) for slot in plan.slots if slot.kind == "variant"],
-            [("W2-F1", ("H1",), "F1"), ("W2-F3", ("H2",), "F3")],
+            [("W2-F1", ("H1",), "F1")],
         )
         self.assertEqual(plan.waves[0].considered, ("F1", "F2", "F3"))
 
-    def test_at_most_three_variants_highest_severity_first_then_finding_number(self) -> None:
-        self.assertEqual(MAX_VARIANTS_PER_WAVE, 3)
-        ledger = finished()
+    def test_at_most_one_variant_highest_severity_first_then_finding_number(self) -> None:
+        self.assertEqual(MAX_VARIANTS_PER_WAVE, 1)
+        ledger = finished(deep=True)
         for lens, severity in (("intent", "major"), ("contracts", "major"), ("failure", "blocker"), ("ripple", "major"), ("tests", "blocker")):
             ledger = record_finding(ledger, lens=lens, severity=severity)  # type: ignore[arg-type]
 
@@ -1865,7 +1922,7 @@ class WavePlanningTests(unittest.TestCase):
 
         plan = planned_ledger.rounds[0].plan
         assert plan is not None
-        self.assertEqual([slot.id for slot in plan.slots if slot.kind == "variant"], ["W2-F3", "W2-F5", "W2-F1"])
+        self.assertEqual([slot.id for slot in plan.slots if slot.kind == "variant"], ["W2-F3"])
         self.assertEqual(plan.waves[0].considered, ("F1", "F2", "F3", "F4", "F5"))  # the capped ones are decided too
         self.assertEqual(unanswered_triggers(planned_ledger), ())
 
@@ -1886,14 +1943,14 @@ class WavePlanningTests(unittest.TestCase):
 
                 self.assertEqual({slot.generation for slot in ledger.rounds[0].plan.slots if slot.generation > 1}, {2})  # type: ignore[union-attr]
 
-    def test_a_generation_two_finding_calls_for_generation_three_and_the_third_stops(self) -> None:
-        ledger = plan_waves(record_finding(finished(), hunter="W1-1"), 2000)
+    def test_a_generation_two_blocker_calls_for_generation_three_and_the_third_stops(self) -> None:
+        ledger = plan_waves(record_finding(finished(deep=True), hunter="W1-1"), 2000)
         ledger = run_waves(ledger, start=3000)
-        ledger = plan_waves(record_finding(ledger, hunter="W2-F1", lens="failure", seconds=3500), 4000)
+        ledger = plan_waves(record_finding(ledger, hunter="W2-F1", lens="failure", severity="blocker", seconds=3500), 4000)
         self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1", "W3-X1", "W3-F2"])
         ledger = run_waves(ledger, start=5000, only=("W3-X1", "W3-F2"))
 
-        ledger = plan_waves(record_finding(ledger, hunter="W3-F2", lens="ripple", seconds=5500), 6000)
+        ledger = plan_waves(record_finding(ledger, hunter="W3-F2", lens="ripple", severity="blocker", seconds=5500), 6000)
 
         plan = ledger.rounds[0].plan
         assert plan is not None
@@ -1901,6 +1958,43 @@ class WavePlanningTests(unittest.TestCase):
         self.assertEqual([(w.generation, w.considered, w.slots) for w in plan.waves][-1], (3, ("F3",), ()))
         self.assertEqual(unanswered_triggers(ledger), ())
         self.assertIs(plan_waves(ledger, 7000), ledger)
+
+    def test_normal_depth_plans_fresh_only_and_stops_at_generation_two(self) -> None:
+        self.assertEqual((MAX_GENERATION_NORMAL, MAX_VARIANTS_PER_WAVE_NORMAL), (2, 0))
+        ledger = plan_waves(record_finding(finished(), hunter="W1-1", severity="blocker"), 2000)
+        self.assertEqual(wave_ids(ledger), ["W2-X1"])
+        ledger = run_waves(ledger, start=3000)
+
+        ledger = plan_waves(record_finding(ledger, hunter="W2-X1", lens="failure", severity="blocker", seconds=3500), 4000)
+
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+        self.assertEqual(wave_ids(ledger), ["W2-X1"])
+        self.assertEqual(plan.waves[-1], Wave(2, at(4000), ("F2",), ()))
+        self.assertEqual(unanswered_triggers(ledger), ())
+
+    def test_deep_round_stops_at_generation_two_when_no_blocker_triggers(self) -> None:
+        ledger = plan_waves(record_finding(finished(deep=True), hunter="W1-1"), 2000)
+        ledger = run_waves(ledger, start=3000)
+
+        ledger = plan_waves(record_finding(ledger, hunter="W2-F1", lens="failure", severity="major", seconds=3500), 4000)
+
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+        self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1"])
+        self.assertEqual(plan.waves[-1], Wave(2, at(4000), ("F2",), ()))
+
+    def test_deep_generation_three_variants_ignore_non_blockers_in_same_wave(self) -> None:
+        ledger = plan_waves(record_finding(finished(deep=True), hunter="W1-1"), 2000)
+        ledger = run_waves(ledger, start=3000)
+        ledger = record_finding(ledger, path="a.py", hunter="W2-X1", lens="contracts", severity="major", seconds=3500)
+        ledger = record_finding(ledger, path="b.py", hunter="W2-X1", lens="failure", severity="blocker", seconds=3600)
+
+        ledger = plan_waves(ledger, 4000)
+        plan = ledger.rounds[0].plan
+        assert plan is not None
+        self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1", "W3-X1", "W3-F3"])
+        self.assertEqual(plan.waves[-1].considered, ("F2", "F3"))
 
     def test_a_round_without_a_plan_requires_no_slots_and_plans_nothing(self) -> None:
         ledger = record_finding(record_run(prepared(make_snap(code("H1")))[0], kind="repro", exit_code=1))
@@ -1930,12 +2024,12 @@ class BarrierTests(unittest.TestCase):
         ledger = run_slot(ledger, "W1-2", "late", 3000)
 
         self.assertTrue(barrier_passed(ledger, 1))
-        self.assertEqual(wave_ids(plan_waves(ledger, 3500)), ["W2-X1", "W2-F1"])
+        self.assertEqual(wave_ids(plan_waves(ledger, 3500)), ["W2-X1"])
 
     def test_a_simplicity_slot_that_never_ran_does_not_hold_the_wave(self) -> None:
         ledger = record_finding(run_all(hunt([code("H1", "a.py"), code("H2", "b.py")]), skip=("W1-3",)))
 
-        self.assertEqual(wave_ids(plan_waves(ledger, 3500)), ["W2-X1", "W2-F1"])
+        self.assertEqual(wave_ids(plan_waves(ledger, 3500)), ["W2-X1"])
 
     def test_a_sweep_only_slot_that_never_ran_does_not_hold_the_wave(self) -> None:
         hunks = [code("H1", "a.py", 300), code("H2", "b.py", 300)]
@@ -1953,11 +2047,11 @@ class BarrierTests(unittest.TestCase):
 
         ledger = judge(ledger, "F2", "dismissed", 3000)
 
-        self.assertEqual(wave_ids(plan_waves(ledger, 3500)), ["W2-X1", "W2-F1"])
+        self.assertEqual(wave_ids(plan_waves(ledger, 3500)), ["W2-X1"])
 
     def test_the_next_generation_waits_for_the_wave_before_it(self) -> None:
-        ledger = plan_waves(record_finding(finished(), hunter="W1-1"), 2000)
-        ledger = record_finding(ledger, hunter="W2-F1", lens="failure", seconds=3500)  # the wave has not run
+        ledger = plan_waves(record_finding(finished(deep=True), hunter="W1-1"), 2000)
+        ledger = record_finding(ledger, hunter="W2-F1", lens="failure", severity="blocker", seconds=3500)  # the wave has not run
 
         self.assertIs(plan_waves(ledger, 4000), ledger)
         self.assertTrue(barrier_passed(ledger, 1))
@@ -1973,7 +2067,7 @@ class BarrierTests(unittest.TestCase):
 
         ledger = plan_waves(run_all(ledger, number=2, start=6700), 7000)
 
-        self.assertEqual(sorted(wave_ids(ledger, 2)), ["W2-F1", "W2-X1"])
+        self.assertEqual(sorted(wave_ids(ledger, 2)), ["W2-X1"])
         self.assertEqual(wave_ids(ledger, 1), [])
         stored_is_required(self, ledger)
 
@@ -1986,7 +2080,7 @@ class BarrierTests(unittest.TestCase):
         self.assertIs(plan_waves(ledger, 7000), ledger)
         ledger = plan_waves(run_all(ledger, number=3, start=7100), 8000)
 
-        self.assertEqual(wave_ids(ledger, 3), ["W2-X1", "W2-F1"])
+        self.assertEqual(wave_ids(ledger, 3), ["W2-X1"])
         self.assertEqual(wave_ids(ledger, 2), [])
 
 
@@ -2004,8 +2098,7 @@ class CarriedAndLateWaveTests(unittest.TestCase):
         for round_ in (second, third):
             assert round_.plan is not None
             carried = {slot.id: slot for slot in round_.plan.slots if slot.generation == 2}
-            self.assertEqual(sorted(carried), ["W2-F1", "W2-X1"])
-            self.assertEqual((carried["W2-F1"].trigger, carried["W2-F1"].since), ("F1", at(2000)))
+            self.assertEqual(sorted(carried), ["W2-X1"])
             self.assertEqual((carried["W2-X1"].trigger, carried["W2-X1"].since), (original["W2-X1"].trigger, at(2000)))
             self.assertEqual(round_.plan.waves, ())
         self.assertEqual(unanswered_triggers(ledger), ())  # no round plans F1 a second time
@@ -2018,7 +2111,7 @@ class CarriedAndLateWaveTests(unittest.TestCase):
         ledger = judge(ledger, "F1", "proven", 6500)
         ledger = plan_waves(run_all(ledger, number=2, start=6600), 7000)
         wave = wave_ids(ledger, 2)
-        self.assertEqual(sorted(wave), ["W2-F1", "W2-X1", "W2-X2"])
+        self.assertEqual(sorted(wave), ["W2-X1", "W2-X2"])
         ledger = run_waves(ledger, number=2, start=7100)
         second = ledger.rounds[1].plan
 
@@ -2043,29 +2136,29 @@ class CarriedAndLateWaveTests(unittest.TestCase):
 
         ledger = judge(ledger, "F1", "dismissed", 2100)
 
-        self.assertEqual(wave_ids(plan_waves(ledger, 2200)), ["W2-X1", "W2-F1"])
+        self.assertEqual(wave_ids(plan_waves(ledger, 2200)), ["W2-X1"])
         ledger, second = advance(ledger, [code("H3", "a.py"), self.hunks[1]])
-        self.assertEqual(wave_ids(ledger, 2), ["W2-X1", "W2-F1"])  # unfinished work is not forgiven
+        self.assertEqual(wave_ids(ledger, 2), ["W2-X1"])  # unfinished work is not forgiven
         stored_is_required(self, ledger)
 
     def test_a_flip_to_proven_after_planning_is_a_new_trigger_for_the_next_pass(self) -> None:
-        ledger = record_finding(finished(*self.hunks), path="a.py", lens="failure", verdict="probable", severity="minor")
-        self.assertIs(plan_waves(ledger), ledger)  # a minor probable finding is no trigger
+        ledger = record_finding(finished(*self.hunks), path="a.py", lens="failure", verdict="dismissed", severity="major")
+        self.assertIs(plan_waves(ledger), ledger)  # a dismissed finding is no trigger
 
         ledger = plan_waves(judge(ledger, "F1", "proven", 3000), 3500)
 
-        self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1"])
+        self.assertEqual(wave_ids(ledger), ["W2-X1"])
 
     def test_a_later_trigger_plans_variants_only_when_the_round_stores_the_fresh_set(self) -> None:
-        ledger = plan_waves(record_finding(finished(*self.hunks), path="a.py", lens="failure", seconds=5), 2000)
+        ledger = plan_waves(record_finding(finished(*self.hunks, deep=True), path="a.py", lens="failure", seconds=5), 2000)
         ledger = record_finding(ledger, path="b.py", lens="contracts", seconds=2100)
 
         ledger = plan_waves(ledger, 2200)
 
         plan = ledger.rounds[0].plan
         assert plan is not None
-        self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1", "W2-F2"])
-        self.assertEqual([w.slots for w in plan.waves], [("W2-X1", "W2-F1"), ("W2-F2",)])
+        self.assertEqual(wave_ids(ledger), ["W2-X1", "W2-F1"])
+        self.assertEqual([w.slots for w in plan.waves], [("W2-X1", "W2-F1"), ()])
 
     def test_all_carried_hunks_still_get_the_wave_over_the_round(self) -> None:
         ledger = record_finding(finished(*self.hunks), path="a.py", lens="failure", verdict=None)
@@ -2076,7 +2169,7 @@ class CarriedAndLateWaveTests(unittest.TestCase):
 
         plan = ledger.rounds[1].plan
         assert plan is not None
-        self.assertEqual([(s.id, s.hunks) for s in plan.slots], [("W2-X1", ("H1",)), ("W2-F1", ("H1",))])
+        self.assertEqual([(s.id, s.hunks) for s in plan.slots], [("W2-X1", ("H1",))])
 
 
 class ReviewOfB2Probes(unittest.TestCase):
@@ -2099,12 +2192,12 @@ class ReviewOfB2Probes(unittest.TestCase):
 
         once = plan_waves(ledger, 4000)
 
-        self.assertEqual(wave_ids(once), ["W2-X1", "W2-F1"])  # generation 2 only: no W3-*
+        self.assertEqual(wave_ids(once), ["W2-X1"])  # generation 2 only: no W3-*
         self.assertIs(plan_waves(once, 5000), once)  # and no oscillation: the answer is stable
         stored_is_required(self, once)
 
     def test_a_tag_for_a_slot_that_is_not_stored_yet_plans_one_wave_not_two(self) -> None:
-        ledger = claim(finished(code("H1", "a.py")), "W1-1", 10)
+        ledger = claim(finished(code("H1", "a.py"), deep=True), "W1-1", 10)
         ledger = record_finding(ledger, path="a.py", lens="failure", hunter="W2-F1", by=f"{AGY}:a1", seconds=15)
 
         ledger = plan_waves(ledger, 4000)
@@ -2137,13 +2230,15 @@ class ReviewOfB2Probes(unittest.TestCase):
 
     def test_a_generation_two_finding_in_an_all_carried_round_still_plans_generation_three(self) -> None:
         hunks = [code("H1", "a.py"), code("H2", "b.py")]
-        ledger = record_finding(finished(*hunks), path="a.py", lens="failure", verdict=None)
-        ledger, _ = advance(ledger, [hunks[0]])
+        ledger = record_finding(finished(*hunks, deep=True), path="a.py", lens="failure", verdict=None)
+        ledger, _ = advance(ledger, [hunks[0]], deep=True)
         ledger = plan_waves(judge(ledger, "F1", "proven", 6500), 7000)
         self.assertEqual(wave_ids(ledger, 2), ["W2-X1", "W2-F1"])
         ledger = run_waves(ledger, number=2, start=7100)
 
-        ledger = plan_waves(record_finding(ledger, path="a.py", lens="contracts", hunter="W2-X1", seconds=7500), 8000)
+        ledger = plan_waves(
+            record_finding(ledger, path="a.py", lens="contracts", severity="blocker", hunter="W2-X1", seconds=7500), 8000
+        )
 
         self.assertEqual(wave_ids(ledger, 2), ["W2-X1", "W2-F1", "W3-X1", "W3-F2"])
 
@@ -2172,23 +2267,25 @@ class ReviewOfB2Probes(unittest.TestCase):
     # finding 4: variants cut by the cap leak into later rounds
     def test_triggers_the_cap_left_out_do_not_come_back_in_a_later_round(self) -> None:
         h1, h2 = code("H1", "a.py"), code("H2", "b.py")
-        ledger = finished(h1, h2)
+        ledger = finished(h1, h2, deep=True)
         for lens in ("intent", "contracts", "failure", "ripple"):
             ledger = record_finding(ledger, path="a.py", lens=lens)
         ledger = plan_waves(ledger, 2000)
-        self.assertEqual([s.id for s in ledger.rounds[0].plan.slots if s.kind == "variant"], ["W2-F1", "W2-F2", "W2-F3"])  # type: ignore[union-attr]
+        self.assertEqual([s.id for s in ledger.rounds[0].plan.slots if s.kind == "variant"], ["W2-F1"])  # type: ignore[union-attr]
         ledger = run_waves(ledger, start=3000)
 
-        ledger, second = advance(ledger, [h1, code("H3", "b.py")])
+        ledger, second = advance(ledger, [h1, code("H3", "b.py")], deep=True)
         ledger = plan_waves(run_all(ledger, number=2, start=6100), 7000)
 
         self.assertEqual(wave_ids(ledger, 2), [])
-        self.assertNotIn("W2-F4", [s.id for s in ledger.rounds[1].plan.slots])  # type: ignore[union-attr]
+        stored_ids = [s.id for s in ledger.rounds[1].plan.slots]  # type: ignore[union-attr]
+        self.assertNotIn("W2-F2", stored_ids)
+        self.assertNotIn("W2-F4", stored_ids)
 
     # finding 5: a second variant for the cluster a carried variant already answers
     def test_a_carried_variant_answers_its_cluster_in_the_new_round(self) -> None:
-        ledger = plan_waves(record_finding(finished(code("H1", "a.py")), path="a.py", lens="failure"), 2000)
-        ledger, second = advance(ledger, [code("H2", "a.py")])
+        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), deep=True), path="a.py", lens="failure"), 2000)
+        ledger, second = advance(ledger, [code("H2", "a.py")], deep=True)
         assert second.plan is not None
         self.assertEqual([s.id for s in second.plan.slots if s.kind == "variant"], ["W2-F1"])
 
@@ -2213,7 +2310,7 @@ class ReviewOfB2Probes(unittest.TestCase):
         )
 
     def test_a_carried_sweep_over_a_single_code_hunk_rides_on_the_slot_that_already_lists_it(self) -> None:
-        plan = plan_of([code("H3", "a.py", 55), code("H2", "README.md", 10)], round_number=2, carry_sweep=True)
+        plan = plan_of([code("H3", "a.py", 85), code("H2", "README.md", 10)], round_number=2, carry_sweep=True)
 
         host = next(slot for slot in plan.slots if "sweep" in slot.lenses)
 
@@ -2221,21 +2318,21 @@ class ReviewOfB2Probes(unittest.TestCase):
 
     # finding 7: wave slots in the order they were stored
     def test_wave_slots_are_stored_in_generation_order_fresh_before_variants(self) -> None:
-        ledger = plan_waves(record_finding(finished(), hunter="W1-1"), 2000)
+        ledger = plan_waves(record_finding(finished(deep=True), hunter="W1-1"), 2000)
         ledger = run_waves(ledger, start=3000)
-        ledger = plan_waves(record_finding(ledger, hunter="W2-F1", lens="failure", seconds=3500), 4000)
+        ledger = plan_waves(record_finding(ledger, hunter="W2-F1", lens="failure", severity="blocker", seconds=3500), 4000)
 
         order = list(slot_order(ledger)(1))
 
-        self.assertEqual(order[3:], ["W2-X1", "W2-F1", "W3-X1", "W3-F2"])
+        self.assertEqual(order[5:], ["W2-X1", "W2-F1", "W3-X1", "W3-F2"])
 
     # finding 8: a dismissed trigger's planned slot is not forgotten
     def test_a_planned_slot_of_a_dismissed_trigger_stays_and_is_carried(self) -> None:
-        ledger = plan_waves(record_finding(finished(code("H1", "a.py")), path="a.py", lens="failure"), 2000)
+        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), deep=True), path="a.py", lens="failure"), 2000)
         ledger = judge(ledger, "F1", "dismissed", 2100)
 
-        ledger, second = advance(ledger, [code("H2", "a.py")])
-        ledger, third = advance(ledger, [code("H3", "a.py")])
+        ledger, second = advance(ledger, [code("H2", "a.py")], deep=True)
+        ledger, third = advance(ledger, [code("H3", "a.py")], deep=True)
 
         self.assertIn("W2-F1", [s.id for s in second.plan.slots])  # type: ignore[union-attr]
         self.assertIn("W2-F1", [s.id for s in third.plan.slots])  # type: ignore[union-attr]
@@ -2304,7 +2401,7 @@ class ReviewOfB3Tests(unittest.TestCase):
 
         ledger = plan_waves(ledger, 7000)
 
-        self.assertEqual(sorted(wave_ids(ledger, 2)), ["W2-F2", "W2-X1"])
+        self.assertEqual(sorted(wave_ids(ledger, 2)), ["W2-X1"])
         stored_is_required(self, ledger)
 
     def test_the_fresh_set_of_a_wave_reads_only_the_open_hunks_when_the_trigger_is_new(self) -> None:
@@ -2322,7 +2419,9 @@ class ReviewOfB3Tests(unittest.TestCase):
 
     def test_a_variant_reads_only_the_open_hunks_of_its_file(self) -> None:
         hunks = [code("H1", "a.py"), code("H2", "a.py"), code("H3", "b.py")]
-        ledger, _ = advance(finished(*hunks), [hunks[0], code("H4", "a.py"), code("H5", "b.py")], waves=False)
+        ledger, _ = advance(
+            finished(*hunks, deep=True), [hunks[0], code("H4", "a.py"), code("H5", "b.py")], deep=True, waves=False
+        )
         ledger = run_all(ledger, number=2, start=6700)
         ledger = record_finding(ledger, lens="failure", path="a.py", seconds=6900)
 
@@ -2335,7 +2434,7 @@ class ReviewOfB3Tests(unittest.TestCase):
 
     def test_a_wave_leaves_the_documentation_hunks_out(self) -> None:
         readme = make_hunk("H2", "README.md", lines(3))
-        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), readme), path="a.py"), 2000)
+        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), readme, deep=True), path="a.py"), 2000)
 
         plan = ledger.rounds[0].plan
 
@@ -2344,7 +2443,7 @@ class ReviewOfB3Tests(unittest.TestCase):
 
     def test_a_carried_wave_leaves_the_documentation_hunks_out(self) -> None:
         readme = make_hunk("H4", "README.md", lines(3))
-        ledger = plan_waves(record_finding(finished(code("H1", "a.py")), path="a.py"), 2000)
+        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), deep=True), path="a.py"), 2000)
         open_hunks = [code("H3", "a.py"), readme]
 
         slots = pending_wave_slots(ledger, open_hunks=open_hunks, round_hunks=open_hunks)
@@ -2353,9 +2452,9 @@ class ReviewOfB3Tests(unittest.TestCase):
 
     def test_a_carried_variant_keeps_the_code_when_the_new_round_changes_only_documentation(self) -> None:
         readme = make_hunk("H2", "README.md", lines(3))
-        ledger = plan_waves(record_finding(finished(code("H1", "a.py")), path="a.py", lens="failure"), 2000)
+        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), deep=True), path="a.py", lens="failure"), 2000)
 
-        ledger, round_ = advance(ledger, [code("H1", "a.py"), readme], waves=False)
+        ledger, round_ = advance(ledger, [code("H1", "a.py"), readme], deep=True, waves=False)
 
         assert round_.plan is not None
         variant = round_.plan.slot("W2-F1")
@@ -2364,7 +2463,7 @@ class ReviewOfB3Tests(unittest.TestCase):
         self.assertTrue(all("H2" not in s.hunks for s in round_.plan.slots if s.generation >= 2))
 
     def test_a_carried_variant_is_rebuilt_over_the_open_hunks_of_its_own_file(self) -> None:
-        ledger = plan_waves(record_finding(finished(code("H1", "a.py")), path="a.py"), 2000)
+        ledger = plan_waves(record_finding(finished(code("H1", "a.py"), deep=True), path="a.py"), 2000)
         elsewhere = [code("H3", "a.py"), code("H4", "b.py")]
 
         slots = pending_wave_slots(ledger, open_hunks=elsewhere, round_hunks=elsewhere)
@@ -2408,7 +2507,7 @@ class ReplanningInPlaceTests(unittest.TestCase):
     """B4: a round that is prepared again keeps every wave decision, and a new round starts from what is due."""
 
     def four_findings(self) -> Ledger:
-        ledger = run_all(hunt([code("H1", "cart.py")]), start=100)
+        ledger = run_all(hunt([code("H1", "cart.py")], deep=True), start=100)
         for lens in ("intent", "contracts", "failure", "ripple"):
             ledger = record_finding(ledger, path="cart.py", lens=lens, severity="major", verdict="probable", seconds=200)
         return plan_waves(ledger, 300)
@@ -2418,7 +2517,7 @@ class ReplanningInPlaceTests(unittest.TestCase):
         stored = ledger.rounds[0].plan
         assert stored is not None
         self.assertEqual([len(wave.considered) for wave in stored.waves], [4])
-        self.assertEqual(len(wave_ids(ledger, generation=2)), 4)  # a fresh set and the three capped variants
+        self.assertEqual(len(wave_ids(ledger, generation=2)), 2)  # a fresh set and the single capped variant
 
         result = prepare_round(ledger, [code("H1", "cart.py")], seconds=500, same=True)
 
@@ -2478,7 +2577,7 @@ class ReplanningInPlaceTests(unittest.TestCase):
         first, second = result.ledger.rounds
         assert first.plan is not None and second.plan is not None
         self.assertEqual([wave.considered for wave in first.plan.waves], [("F1",)])
-        self.assertEqual([slot.id for slot in second.plan.slots if slot.generation == 2], ["W2-X1", "W2-F1"])
+        self.assertEqual([slot.id for slot in second.plan.slots if slot.generation == 2], ["W2-X1"])
         for slot in second.plan.slots:
             if slot.generation == 2:
                 self.assertEqual((slot.trigger, slot.since), ("F1", at(1001)))
@@ -2491,32 +2590,31 @@ class ReplanningInPlaceTests(unittest.TestCase):
 
         result = prepare_round(ledger, [code("H1", "cart.py")], seconds=1000, same=True)
 
-        self.assertEqual(result.added_slots, ("W2-X1", "W2-F1"))
+        self.assertEqual(result.added_slots, ("W2-X1",))
 
 
 class VariantBudgetTests(unittest.TestCase):
     def test_the_cap_is_per_generation_of_a_round_not_per_wave(self) -> None:
-        ledger = finished(code("H1", "a.py"), code("H2", "b.py"))
-        for lens in ("intent", "contracts", "failure"):
-            ledger = record_finding(ledger, path="a.py", lens=lens, severity="major", verdict="probable", seconds=10)
-        for lens in ("ripple", "tests", "state"):
-            ledger = record_finding(ledger, path="b.py", lens=lens, severity="minor", verdict="probable", seconds=15)
+        ledger = finished(code("H1", "a.py"), code("H2", "b.py"), deep=True)
+        ledger = record_finding(ledger, path="a.py", lens="intent", severity="major", verdict="probable", seconds=10)
+        for lens in ("contracts", "failure"):
+            ledger = record_finding(ledger, path="b.py", lens=lens, severity="major", verdict="dismissed", seconds=15)
         ledger = plan_waves(ledger, 2000)
-        self.assertEqual(len(wave_ids(ledger, generation=2)), 4)  # the fresh set and F1..F3
+        self.assertEqual(len(wave_ids(ledger, generation=2)), 2)  # the fresh set and F1
 
-        for finding_id in ("F4", "F5", "F6"):
+        for finding_id in ("F2", "F3"):
             ledger = judge(ledger, finding_id, "proven", 2500)
         ledger = plan_waves(ledger, 3000)
 
         plan = ledger.rounds[0].plan
         assert plan is not None
-        self.assertEqual([slot.id for slot in plan.slots if slot.kind == "variant"], ["W2-F1", "W2-F2", "W2-F3"])
-        self.assertEqual([wave.considered for wave in plan.waves], [("F1", "F2", "F3"), ("F4", "F5", "F6")])
+        self.assertEqual([slot.id for slot in plan.slots if slot.kind == "variant"], ["W2-F1"])
+        self.assertEqual([wave.considered for wave in plan.waves], [("F1",), ("F2", "F3")])
         self.assertEqual(plan.waves[1].slots, ())  # considered all the same: none leaks into a later wave
         self.assertEqual(unanswered_triggers(ledger), ())
 
     def test_stored_variants_of_the_generation_count_before_the_new_ones(self) -> None:
-        ledger = finished(code("H1", "a.py"))
+        ledger = finished(code("H1", "a.py"), deep=True)
         ledger = record_finding(ledger, path="a.py", lens="failure", severity="major", verdict="probable", seconds=10)
         ledger = plan_waves(ledger, 2000)  # F1 -> W2-X1, W2-F1
         for lens in ("intent", "contracts", "ripple"):
@@ -2525,23 +2623,23 @@ class VariantBudgetTests(unittest.TestCase):
         plan = plan_waves(ledger, 3000).rounds[0].plan
 
         assert plan is not None
-        self.assertEqual([slot.id for slot in plan.slots if slot.kind == "variant"], ["W2-F1", "W2-F2", "W2-F3"])
+        self.assertEqual([slot.id for slot in plan.slots if slot.kind == "variant"], ["W2-F1"])
         self.assertEqual(plan.waves[1].considered, ("F2", "F3", "F4"))
+        self.assertEqual(plan.waves[1].slots, ())
 
     def test_the_budget_of_a_generation_is_not_charged_for_the_variants_of_another(self) -> None:
-        ledger = finished(code("H1", "a.py"), code("H2", "b.py"), code("H3", "c.py"))
-        for path, lens in (("a.py", "intent"), ("b.py", "contracts"), ("c.py", "failure")):
-            ledger = record_finding(ledger, path=path, lens=lens, severity="major", verdict="probable", seconds=10)
+        ledger = finished(code("H1", "a.py"), code("H2", "b.py"), code("H3", "c.py"), deep=True)
+        ledger = record_finding(ledger, path="a.py", lens="intent", severity="major", verdict="probable", seconds=10)
         ledger = plan_waves(ledger, 2000)
-        self.assertEqual(sorted(wave_ids(ledger, generation=2)), ["W2-F1", "W2-F2", "W2-F3", "W2-X1"])
+        self.assertEqual(sorted(wave_ids(ledger, generation=2)), ["W2-F1", "W2-X1"])
 
         ledger = run_waves(ledger, start=2100)
         ledger = record_finding(
-            ledger, path="a.py", lens="ripple", severity="major", verdict="probable", seconds=2500, hunter="W2-F1"
+            ledger, path="a.py", lens="ripple", severity="blocker", verdict="probable", seconds=2500, hunter="W2-F1"
         )
         ledger = plan_waves(ledger, 3000)
 
-        self.assertIn("W3-F4", wave_ids(ledger, generation=3))  # three variants of generation 2 do not use it up
+        self.assertIn("W3-F2", wave_ids(ledger, generation=3))  # gen 2's variant does not use up gen 3's budget
 
 
 class LateTriggerTests(unittest.TestCase):
@@ -2669,20 +2767,28 @@ def generation_one_lenses(plan: HuntPlan, hunk_id: str) -> frozenset[str]:
 def missing_deep_lenses(ledger: Ledger, round_: Round, hunks: Sequence[Hunk]) -> dict[str, frozenset[str]]:
     """Per open hunk of the deep `round_`, the deep lenses neither its generation 1 slots nor its credit hold.
 
-    The credit is `credited` of the whole ledger, none for a reopened hunk (as `owed_lenses` treats it), so a
-    lens that only a not-yet-run wave slot lists is missing. `hunks` are the diff's hunks, by digest.
+    The credit is `credited` of the whole ledger, keeping only non-`REOPENED_LENSES` credit for a
+    reopened hunk (as `owed_lenses` treats it), so a lens that only a not-yet-run wave slot lists is
+    missing. `hunks` are the diff's hunks, by digest.
     """
     assert round_.plan is not None
-    required = required_by_hunk(hunks, deep=True)
+    earlier = ledger.rounds[: round_.number - 1]
+    first_deep = round_.deep and not any(item.deep for item in earlier)
+    follow_up = (
+        follow_up_context(ledger, upto=len(earlier), enforced=round_.enforced, first_deep_round=first_deep)
+        if earlier
+        else FollowUpContext()
+    )
+    required = required_by_hunk(hunks, deep=True, follow_up=follow_up)
     by_digest = {hunk.digest: hunk.id for hunk in hunks}
     credit = credited(ledger, enforced=round_.enforced)
     missing: dict[str, frozenset[str]] = {}
     for ref in round_.hunks:
         if ref.carried:
             continue
-        have = generation_one_lenses(round_.plan, ref.id) | (
-            frozenset() if ref.reopened else credit.get(ref.digest, frozenset())
-        )
+        base_credit = credit.get(ref.digest, frozenset())
+        prior_credit = (base_credit - REOPENED_LENSES) if ref.reopened else base_credit
+        have = generation_one_lenses(round_.plan, ref.id) | prior_credit
         lacking = required[by_digest[ref.digest]] - have
         if lacking:
             missing[ref.id] = lacking
@@ -2700,7 +2806,7 @@ class UnrunWaveSlotsAreNotGenerationOneTests(unittest.TestCase):
         plan = ledger.rounds[1].plan
         assert plan is not None
         self.assertEqual([(s.id, s.lenses) for s in plan.slots if s.generation == 2],
-                         [("W2-X1", ("state", "trust", "platform")), ("W2-F1", ("contracts",))])  # fmt: skip
+                         [("W2-X1", ("state", "trust", "platform"))])  # fmt: skip
         return ledger, h2
 
     def test_the_wave_slots_have_not_run_so_generation_one_gets_every_deep_lens(self) -> None:
@@ -2717,13 +2823,15 @@ class UnrunWaveSlotsAreNotGenerationOneTests(unittest.TestCase):
 
     def test_a_wave_slot_that_has_run_is_credit_so_generation_one_adds_the_rest(self) -> None:
         ledger, h2 = self.waiting_round_two()
+        assert ledger.rounds[1].plan is not None
+        before_ids = {slot.id for slot in ledger.rounds[1].plan.slots}
         ledger = run_slot(ledger, "W2-X1", "w2x1", 1050, number=2)  # state, trust, platform examined H2
 
         raised = prepare_round(ledger, [h2], seconds=1100, deep=True, same=True)
 
         plan = raised.ledger.rounds[1].plan
         assert plan is not None
-        added = [slot for slot in plan.slots if slot.generation == 1 and slot.id not in {"W1-1", "W1-2", "W1-3"}]
+        added = [slot for slot in plan.slots if slot.generation == 1 and slot.id not in before_ids]
         self.assertEqual([slot.lenses for slot in added], [("model",)])
         self.assertEqual(missing_deep_lenses(raised.ledger, raised.round, [h2]), {})
 
@@ -2777,7 +2885,7 @@ class NoWaveAgainstARoundBeingRefreshedTests(unittest.TestCase):
 
         again = prepare_round(ledger, hunks, seconds=1300, same=True)
 
-        self.assertEqual(again.added_slots, ("W2-X1", "W2-F1"))  # stored after the plan was rebuilt, still stored
+        self.assertEqual(again.added_slots, ("W2-X1",))  # stored after the plan was rebuilt, still stored
         stored_is_required(self, again.ledger)
 
     def test_a_wave_stored_by_a_check_before_the_raise_is_topped_up_by_the_static_set(self) -> None:
@@ -2851,6 +2959,7 @@ class OneFreshCoverageRuleTests(unittest.TestCase):
         ledger = run_waves(plan_waves(ledger, 1250), number=2, start=1300)
         ledger = record_finding(ledger, path="b.py", lens="contracts", verdict="proven", seconds=1400, hunter="W2-X1")
         ledger = plan_waves(ledger, 1450)
+        ledger = with_slots(ledger, replace(make_slot("W3-X1", hunks=("H3",), trigger="F2"), since=at(1450)), number=2)
         self.assertEqual(wave_ids(ledger, 2, generation=3)[:1], ["W3-X1"])
         raised = prepare_round(ledger, hunks, seconds=1500, deep=True, same=True)
         return raised.ledger, hunks
@@ -2869,7 +2978,7 @@ class OneFreshCoverageRuleTests(unittest.TestCase):
     def test_a_later_wave_of_the_generation_tops_the_set_up_over_the_hunks_the_raise_opened(self) -> None:
         ledger, _ = self.raised_round()
         ledger = run_all(ledger, number=2, start=2000)
-        ledger = record_finding(ledger, path="a.py", lens="state", verdict="proven", seconds=2500, hunter="W2-X2")
+        ledger = record_finding(ledger, path="a.py", lens="state", severity="blocker", verdict="proven", seconds=2500, hunter="W2-X2")
 
         ledger = plan_waves(ledger, 2600)
 
@@ -2956,7 +3065,8 @@ class CarriedFreshSetTests(unittest.TestCase):
         ledger = record_finding(ledger, path="a.py", lens="contracts", severity="major", verdict="proven", seconds=200)
         ledger = run_waves(plan_waves(ledger, 300), number=1, start=400)  # W2-X1 examined H2 with state, trust, platform
 
-        # round 2 is deep and edits foo, which reopens the test hunk H2: round 1's credit of it is void
+        # round 2 is deep and edits foo, which reopens the test hunk H2: cross-boundary credit is cleared while
+        # local credit (state, trust, platform) stays, so generation 1 re-checks core and the fresh set takes model.
         h3 = code("H3", "a.py", 300, ("+def foo(): return 2",))
         out = prepare_round(ledger, [h3, h2], seconds=1000, deep=True, symbols={"H3": ("foo",), "H2": ("foo",)})
 
@@ -2964,7 +3074,7 @@ class CarriedFreshSetTests(unittest.TestCase):
         plan = out.round.plan
         assert plan is not None
         fresh = {slot.hunks: slot.lenses for slot in plan.slots if slot.kind == "fresh"}
-        self.assertEqual(fresh[("H2",)], ("state", "trust", "platform"))
+        self.assertEqual(fresh[("H2",)], ("model",))
 
 
 class RandomSequenceTests(unittest.TestCase):
@@ -3319,6 +3429,299 @@ class UpgradeToEnforcedTests(unittest.TestCase):
 
         self.assertTrue(next(ref for ref in again.round.hunks if ref.id == "H1").carried)
         self.assertFalse(again.refreshed)
+
+
+class AdaptiveFollowUpTests(unittest.TestCase):
+    """Adaptive follow-up rounds: anti-cheat, lens reduction, fixed simplicity, monotonicity."""
+
+    def test_prior_reviewed_is_false_without_accepted_round_one_coverage(self) -> None:
+        h1 = code("H1", "a.py", 5)
+        unreviewed = hunt([h1])
+        self.assertEqual(follow_up_context(Ledger()), FollowUpContext())
+        self.assertEqual(follow_up_context(unreviewed, enforced=True), FollowUpContext())
+
+        # Unvouched self-review in Round 1 does not unlock Round 2 relaxations under enforcement.
+        self_reviewed = cover_open_hunks(unreviewed)
+        self.assertEqual(follow_up_context(self_reviewed, enforced=True), FollowUpContext())
+
+        # Round 2 still requires simplicity and avoids delta consolidation when Round 1 was skipped.
+        second = prepare_round(unreviewed, [code("H2", "a.py", 5)], seconds=1000)
+        assert second.round.plan is not None
+        self.assertEqual(len(second.round.plan.slots), 3)
+        self.assertEqual(
+            [slot.lenses for slot in second.round.plan.slots],
+            [("intent", "ripple", "tests"), ("contracts", "failure", "sweep"), SIMPLICITY],
+        )
+
+        # The first deep round resets FollowUpContext even when Round 1 had full normal coverage.
+        reviewed = run_all(unreviewed)
+        self.assertEqual(
+            follow_up_context(reviewed, enforced=True, first_deep_round=True), FollowUpContext()
+        )
+
+    def test_follow_up_omits_simplicity_for_small_reviewed_edits_and_tests_or_configs(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        ledger = run_all(hunt([h1]))
+        ctx = follow_up_context(ledger, enforced=True)
+
+        self.assertTrue(ctx.prior_reviewed)
+        self.assertEqual(ctx.prior_reviewed_files, frozenset({"a.py"}))
+        self.assertEqual(
+            required_lenses(code("H2", "a.py", 40), deep=False, signals=frozenset(), follow_up=ctx),
+            frozenset(CORE),
+        )
+        self.assertEqual(
+            required_lenses(code("H2", "a.py", 41), deep=False, signals=frozenset(), follow_up=ctx),
+            frozenset((*CORE, *SIMPLICITY)),
+        )
+        self.assertEqual(
+            required_lenses(code("H3", "new.py", 5), deep=False, signals=frozenset(), follow_up=ctx),
+            frozenset((*CORE, *SIMPLICITY)),
+        )
+        self.assertEqual(
+            required_lenses(code("H4", "tests/test_new.py", 100), deep=False, signals=frozenset(), follow_up=ctx),
+            frozenset(CORE),
+        )
+        self.assertEqual(
+            required_lenses(code("H5", "settings.toml", 100), deep=False, signals=frozenset(), follow_up=ctx),
+            frozenset(CORE),
+        )
+        self.assertEqual(
+            required_lenses(code("H6", "README.md", 100), deep=False, signals=frozenset(), follow_up=ctx),
+            frozenset(("intent", "craft")),
+        )
+
+    def test_prior_deep_conditional_lens_reduction_vs_new_file_full_deep(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        ledger = run_all(hunt([h1], deep=True, first_deep=True))
+        ledger = record_finding(ledger, path="a.py", lens="model", severity="major", verdict="probable")
+        ledger = record_finding(ledger, path="a.py", lens="state", severity="major", verdict="dismissed")
+        ledger = record_finding(ledger, path="a.py", lens="trust", severity="major", verdict=None)
+        question_finding = replace(
+            ledger.findings[-1],
+            verdict="question",
+            verdict_evidence="intent: task says validate untrusted paths; a.py:1 accepts raw input",
+            verdict_log=(
+                VerdictEvent(
+                    "V3",
+                    "question",
+                    at(12),
+                ),
+            ),
+        )
+        ledger = replace(ledger, findings=(*ledger.findings[:-1], question_finding))
+        merged = replace(
+            record_finding(ledger, path="a.py", lens="platform", severity="major", verdict="dismissed").findings[-1],
+            merged_into="F1",
+        )
+        ledger = replace(ledger, findings=(*ledger.findings[:-1], merged))
+
+        second = prepare_round(
+            ledger,
+            [code("H2", "a.py", 5), code("H3", "new.py", 5)],
+            seconds=1000,
+            deep=True,
+        )
+        ctx = follow_up_context(ledger, enforced=True, first_deep_round=False)
+        self.assertEqual(ctx.prior_deep_files, frozenset({"a.py"}))
+        self.assertEqual(dict(ctx.confirmed_bug_lenses_by_file), {"a.py": frozenset({"model"})})
+
+        req = required_by_hunk([code("H2", "a.py", 5), code("H3", "new.py", 5)], deep=True, follow_up=ctx)
+        self.assertEqual(req["H2"], frozenset((*CORE, "model")))
+        self.assertEqual(req["H3"], frozenset((*BUG_LENSES, *SIMPLICITY)))
+
+        # Signal-triggered conditional lenses still apply on prior-deep files.
+        req_signal = required_by_hunk([code("H2", "a.py", 5, extra=(FS_LINE,))], deep=True, follow_up=ctx)
+        self.assertEqual(req_signal["H2"], frozenset((*CORE, "model", "state", "trust", "platform")))
+
+        # And H3 is a new file so Round 2 kept full deep coverage in its plan.
+        assert second.round.plan is not None
+        h3_lenses = {lens for slot in second.round.plan.slots if "H3" in slot.hunks for lens in slot.lenses}
+        self.assertEqual(h3_lenses, set(BUG_LENSES) | set(SIMPLICITY))
+
+    def test_fixed_simplicity_files_retains_simplicity_lenses(self) -> None:
+        h1, h2 = code("H1", "a.py", 10), code("H2", "b.py", 10)
+        ledger = run_all(hunt([h1, h2]))
+        ledger = record_finding(ledger, path="a.py", lens="craft", severity="minor", verdict="probable")
+        ledger = record_finding(ledger, path="b.py", lens="design", severity="minor", verdict="probable")
+        fixed_a = replace(ledger.findings[0], resolution="fixed", resolution_note="Extracted helper to simplify")
+        accepted_b = replace(ledger.findings[1], resolution="accepted", resolution_note="Acceptable helper size")
+        ledger = replace(ledger, findings=(fixed_a, accepted_b))
+
+        ctx = follow_up_context(ledger, enforced=True)
+        self.assertEqual(ctx.fixed_simplicity_files, frozenset({"a.py"}))
+        req = required_by_hunk([code("H3", "a.py", 5), code("H4", "b.py", 5)], deep=False, follow_up=ctx)
+        self.assertEqual(req["H3"], frozenset((*CORE, *SIMPLICITY)))
+        self.assertEqual(req["H4"], frozenset(CORE))
+
+    def test_cross_round_monotonicity_into_round_three(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        r1 = run_all(hunt([h1], deep=True, first_deep=True))
+        r2_hunks = [code("H2", "a.py", 5), code("H3", "b.py", 5)]
+        r2_prep = prepare_round(r1, r2_hunks, seconds=1000, deep=True)
+        r2 = run_all(r2_prep.ledger, number=2, start=1100)
+
+        # Round 3 keeps b.py unchanged, edits a.py again, and adds a large risky c.py.
+        r3_hunks = [code("H4", "a.py", 5), code("H3", "b.py", 5), code("H5", "c.py", 50, extra=(SQL_LINE,))]
+        r3_prep = prepare_round(r2, r3_hunks, seconds=2000, deep=True)
+        ctx3 = follow_up_context(r2, enforced=True, first_deep_round=False)
+
+        self.assertEqual(ctx3.prior_deep_files, frozenset({"a.py", "b.py"}))
+        # H3 (b.py) carries over cleanly; adding c.py never alters a.py's required lenses.
+        self.assertEqual([ref.id for ref in r3_prep.round.hunks if ref.carried], ["H3"])
+        solo_a = required_by_hunk([r3_hunks[0]], deep=True, follow_up=ctx3)["H4"]
+        with_c = required_by_hunk(r3_hunks, deep=True, follow_up=ctx3)
+        self.assertEqual(solo_a, frozenset(CORE))
+        self.assertEqual(with_c["H4"], solo_a)
+        self.assertEqual(with_c["H5"], frozenset((*BUG_LENSES, *SIMPLICITY)))
+
+    def test_round_one_normal_plus_empty_round_two_deep_does_not_unlock_prior_deep_files(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        r1 = run_all(hunt([h1], deep=False, first_deep=False))
+        # Round 2 runs with --deep, but zero hunters finish before Round 3 starts.
+        r2_prep = prepare_round(r1, [h1], seconds=1000, deep=True)
+        r2 = r2_prep.ledger
+
+        r3_hunks = [h1, code("H2", "b.py", 5)]
+        ctx3 = follow_up_context(r2, enforced=True, first_deep_round=False)
+        self.assertTrue(ctx3.prior_reviewed)
+        self.assertEqual(ctx3.prior_reviewed_files, frozenset({"a.py"}))
+        self.assertEqual(ctx3.prior_deep_files, frozenset())
+
+        required3 = required_by_hunk(r3_hunks, deep=True, follow_up=ctx3)
+        self.assertEqual(required3["H1"], frozenset(BUG_LENSES))
+        r3_prep = prepare_round(r2, r3_hunks, seconds=2000, deep=True)
+        self.assertFalse(r3_prep.round.hunks[0].carried)
+
+        # Even if Round 1 itself was deep, skipping any conditional lens must not mark a.py deep.
+        r1_deep_led = hunt([h1], deep=True, first_deep=True)
+        deep_plan = r1_deep_led.rounds[0].plan
+        assert deep_plan is not None
+        conditional_only = set(BUG_LENSES) - set(CORE)
+        skip_one_cond = [
+            slot.id
+            for slot in deep_plan.slots
+            if set(slot.lenses) & conditional_only
+        ][:1]
+        self.assertTrue(skip_one_cond)
+        r1_partial_deep = run_all(r1_deep_led, skip=skip_one_cond)
+        ctx_partial_deep = follow_up_context(r1_partial_deep, enforced=True, first_deep_round=False)
+        self.assertEqual(ctx_partial_deep.prior_deep_files, frozenset())
+        self.assertEqual(
+            required_by_hunk([code("H3", "a.py", 5)], deep=True, follow_up=ctx_partial_deep)["H3"],
+            frozenset(BUG_LENSES),
+        )
+
+    def test_partial_round_one_missing_simplicity_does_not_unlock_prior_reviewed(self) -> None:
+        h1 = code("H1", "a.py", 10)
+        led = hunt([h1])
+        plan1 = led.rounds[0].plan
+        assert plan1 is not None
+        all_slots = list(plan1.slots)
+
+        # Partial core coverage (single bug slot) must not unlock prior_reviewed.
+        partial_bug = run_slot(led, all_slots[0].id, "a1", 100.0)
+        ctx_partial = follow_up_context(partial_bug, enforced=True)
+        self.assertEqual(ctx_partial, FollowUpContext())
+        self.assertEqual(
+            required_by_hunk([code("H2", "a.py", 5)], deep=False, follow_up=ctx_partial)["H2"],
+            frozenset((*CORE, *SIMPLICITY)),
+        )
+
+        # Full core lenses without SIMPLICITY_LENSES must still keep prior_reviewed=False.
+        simplicity_slots = [slot.id for slot in all_slots if set(slot.lenses) & set(SIMPLICITY)]
+        self.assertTrue(simplicity_slots)
+        no_simplicity = run_all(led, skip=simplicity_slots)
+        ctx_no_simplicity = follow_up_context(no_simplicity, enforced=True)
+        self.assertEqual(ctx_no_simplicity, FollowUpContext())
+        self.assertEqual(ctx_no_simplicity.prior_reviewed_files, frozenset())
+        self.assertEqual(
+            required_by_hunk([code("H2", "a.py", 5)], deep=False, follow_up=ctx_no_simplicity)["H2"],
+            frozenset((*CORE, *SIMPLICITY)),
+        )
+
+
+class ReopenedWaveScopingTests(unittest.TestCase):
+    """Wave fresh sets in Round 2+ skip unchanged reopened callers unless triggered there."""
+
+    def round_two_with_reopened_caller(self) -> Ledger:
+        h1 = code("H1", "other.py", 5, ("+def untouched(): return 0",))
+        h2 = code("H2", "caller.py", 5, ("+def call_it(): return compute()",))
+        h3 = code("H3", "cart.py", 5, ("+def compute(): return 1",))
+        ledger = run_all(hunt([h1, h2, h3]), start=100)
+        h4 = code("H4", "cart.py", 5, ("+def compute(): return 2",))
+        prep = prepare_round(
+            ledger,
+            [h1, h2, h4],
+            seconds=1000,
+            symbols={"H1": ("untouched",), "H2": ("call_it",), "H4": ("compute",)},
+        )
+        self.assertEqual(
+            [(ref.id, ref.carried, ref.reopened) for ref in prep.round.hunks],
+            [("H1", True, False), ("H2", False, True), ("H4", False, False)],
+        )
+        return run_all(prep.ledger, number=2, start=1100)
+
+    def test_wave_fresh_set_excludes_reopened_callers_when_trigger_is_in_changed_file(self) -> None:
+        ledger = self.round_two_with_reopened_caller()
+        ledger = record_finding(ledger, path="cart.py", lens="contracts", severity="major", verdict="proven", seconds=1200)
+
+        plan = plan_waves(ledger, 1300).rounds[1].plan
+        assert plan is not None
+        fresh = plan.slot("W2-X1")
+        assert fresh is not None
+        self.assertEqual(fresh.hunks, ("H4",))
+
+    def test_wave_fresh_set_includes_reopened_caller_when_trigger_is_in_caller_file(self) -> None:
+        ledger = self.round_two_with_reopened_caller()
+        ledger = record_finding(ledger, path="caller.py", lens="contracts", severity="major", verdict="proven", seconds=1200)
+
+        plan = plan_waves(ledger, 1300).rounds[1].plan
+        assert plan is not None
+        fresh = plan.slot("W2-X1")
+        assert fresh is not None
+        self.assertEqual(fresh.hunks, ("H2", "H4"))
+
+    def test_late_trigger_from_earlier_round_still_covers_all_round_hunks(self) -> None:
+        h1 = code("H1", "other.py", 5, ("+def untouched(): return 0",))
+        h2 = code("H2", "caller.py", 5, ("+def call_it(): return compute()",))
+        h3 = code("H3", "cart.py", 5, ("+def compute(): return 1",))
+        ledger = record_finding(run_all(hunt([h1, h2, h3]), start=100), path="cart.py", lens="failure", verdict=None)
+        h4 = code("H4", "cart.py", 5, ("+def compute(): return 2",))
+        prep = prepare_round(
+            ledger,
+            [h1, h2, h4],
+            seconds=1000,
+            symbols={"H1": ("untouched",), "H2": ("call_it",), "H4": ("compute",)},
+        )
+        ledger = run_all(judge(prep.ledger, "F1", "proven", 1050), number=2, start=1100)
+
+        plan = plan_waves(ledger, 1300).rounds[1].plan
+        assert plan is not None
+        fresh = plan.slot("W2-X1")
+        assert fresh is not None
+        self.assertEqual(set(fresh.hunks), {"H1", "H2", "H4"})
+
+    def test_wave_fresh_set_falls_back_to_open_units_when_only_reopened_hunks_are_open(self) -> None:
+        h1 = code("H1", "other.py", 5, ("+def untouched(): return 0",))
+        h2 = code("H2", "caller.py", 5, ("+def call_it(): return gone()",))
+        h3 = code("H3", "cart.py", 5, ("+def gone(): return 1",))
+        ledger = run_all(hunt([h1, h2, h3]), start=100)
+        # cart.py change reverted, leaving only caller.py reopened if marked reopened in round 2
+        prep = prepare_round(ledger, [h1, h2], seconds=1000)
+        round2 = prep.ledger.rounds[1]
+        reopened_h2 = replace(round2.hunks[1], carried=False, reopened=True)
+        round2 = replace(round2, hunks=(round2.hunks[0], reopened_h2))
+        ledger = replace(prep.ledger, rounds=(prep.ledger.rounds[0], round2))
+        ledger = prepare_round(ledger, [h1, h2], seconds=1050, same=True).ledger
+        ledger = run_all(ledger, number=2, start=1100)
+        ledger = record_finding(ledger, path="other.py", lens="contracts", severity="major", verdict="proven", seconds=1200)
+
+        plan = plan_waves(ledger, 1300).rounds[1].plan
+        assert plan is not None
+        fresh = plan.slot("W2-X1")
+        assert fresh is not None
+        self.assertEqual(fresh.hunks, ("H2",))
 
 
 if __name__ == "__main__":

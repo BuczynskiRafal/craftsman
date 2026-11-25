@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" fill="none">
+  <defs>
+    <linearGradient id="shield-rim" x1="64" y1="10" x2="64" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#0F766E" />
+    </linearGradient>
+  </defs>
+  <path
+    d="M64 10L110 26V64C110 91 89 109 64 118C39 109 18 91 18 64V26L64 10Z"
+    fill="#0F766E"
+    stroke="url(#shield-rim)"
+    stroke-width="6"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M32 86V54A32 28 0 0 1 96 54V86C96 97 81 104 64 110C47 104 32 97 32 86Z"
+    fill="#042F2E"
+    stroke="#10B981"
+    stroke-width="3.5"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M53 40L61 47L76 33"
+    stroke="#10B981"
+    stroke-width="5.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <path
+    d="M37 57Q43 53 51 53H90V58L77 63V75L84 82V88H44V82L51 75V65C44 64 39 61 37 57Z"
+    fill="#F8FAFC"
+  />
+</svg>

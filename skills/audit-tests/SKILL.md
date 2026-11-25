@@ -3,20 +3,27 @@ name: audit-tests
 description: >-
   Audit whether the tests would catch the change being wrong, and write the
   most valuable missing ones. Use for /audit-tests or /audit tests.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI for lens playbooks and ledger-recorded test runs.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Test-evidence audit (`/audit-tests [target]`)
 
 Deepens the `tests` lens (run `craftsman skill show craft-review --lenses tests` to read that
-playbook first; never search the file system for `lenses.md`).
+playbook first, or if the `craftsman` CLI is not installed, read `references/tests-lens.md` inside
+this skill directory; never search the file system for `lenses.md`).
 
 ## Search scope
 
 Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
 list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
 folder). Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (run
-`craftsman skill show craftsman --file scope.md` for the full contract).
+repositories, other projects' packets/ledgers/reports, or assistant session stores (when the
+`craftsman` CLI is installed, run `craftsman skill show craftsman --file scope.md` for the full
+contract).
 
 Coverage percentages measure which lines ran, not which mistakes would be caught. This audit
 measures the second.
@@ -43,7 +50,8 @@ per change) do not apply here: this audit lists every gap, then ranks them in st
 Pick the 3–5 gaps with the highest risk (likelihood x impact) and write the tests as real code in
 the project's framework and style, each with a one-line comment on what mistake it catches. With
 `--fix` add them to the suite and run them through `craftsman run --kind test`; a new test that
-passes immediately on a known bug is wrong — fix the test.
+passes immediately on a known bug is wrong — fix the test. If the `craftsman` CLI is not
+installed, run the test command directly in the shell (ungated).
 
 ## 4. Report
 

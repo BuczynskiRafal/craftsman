@@ -52,9 +52,11 @@ from craftsman import hook_errors
 from craftsman.attribution import agent_runs, pair_unnamed_stop
 from craftsman.command_policy import (
     PolicyContext,
+    ToolCall,
     arming_action,
     decide,
     is_main_session,
+    is_safe_auto_approve_shell,
     tool_call,
 )
 from craftsman.diffscan import (
@@ -67,6 +69,7 @@ from craftsman.evidence import archive_ledger
 from craftsman.gate import (
     GateOwner,
     GateState,
+    GateStateError,
     Stage,
     archive_ledger_for_new_base,
     decide_stop,
@@ -261,6 +264,9 @@ class Reply:
 
     def deny(self, reason: str) -> Output:
         return self._permission("deny", reason)
+
+    def approve(self, reason: str) -> Output:
+        return self._permission("allow", reason)
 
     def ask(self, reason: str) -> Output:
         """Ask the user to confirm; Copilot cannot ask reliably, so it denies instead."""
@@ -976,6 +982,54 @@ def _is_refusal(out: Output) -> bool:
     return bool(decisions & {"deny", "ask"})
 
 
+COPILOT_ACTIVE_ROUND_MAX_AGE = timedelta(hours=12)
+
+
+def _copilot_session_active(session: Session | None) -> bool:
+    """Whether `session` has an active Craftsman gate, guarding marker, or recent review round."""
+    if session is None:
+        return False
+    try:
+        state = load_state(session.state_path)
+    except GateStateError:
+        state = None
+    if state is not None and state.active:
+        return True
+    from craftsman.workspace import read_marker
+
+    marker = read_marker(session.ledger_path)
+    if marker is not None and marker.guarding:
+        return True
+    if not session.ledger_path.is_file():
+        return False
+    try:
+        ledger = load(session.ledger_path)
+        if not ledger.rounds:
+            return False
+        prepared = parse_timestamp(ledger.rounds[-1].prepared_at)
+    except (LedgerError, ValueError):
+        return False
+    return _now() - prepared <= COPILOT_ACTIVE_ROUND_MAX_AGE
+
+
+def _copilot_auto_approve(call: ToolCall, reply: Reply, session: Session | None) -> Output | None:
+    """Return an explicit `allow` response for safe Copilot review/subagent calls, or None."""
+    if call.kind == "subagent":
+        if agent_role(call.subagent_target) in ("reviewer", "verifier") and _copilot_session_active(session):
+            return reply.approve(f"Craftsman auto-approved {call.subagent_target} subagent.")
+        return None
+    if call.kind == "shell":
+        if is_safe_auto_approve_shell(call) and (
+            call.role in ("reviewer", "verifier") or _copilot_session_active(session)
+        ):
+            return reply.approve("Craftsman auto-approved Craftsman CLI review command.")
+        return None
+    if call.kind == "read":
+        if call.role in ("reviewer", "verifier") and _copilot_session_active(session):
+            return reply.approve("Craftsman auto-approved in-scope read by Craftsman subagent.")
+    return None
+
+
 def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None, caller: GateOwner) -> Output:
     """Apply the command policy to the tool call, enforce search scope, and arm the review guard for a
     `craftsman review` command that was allowed to run.
@@ -997,8 +1051,14 @@ def on_pre_tool(hook: HookInput, reply: Reply, session: Session | None, caller: 
     if decision.action == "ask":
         return reply.ask(decision.reason)
     out = _enforce_scope(hook, reply, session, caller)
-    if session is not None and not _is_refusal(out):
+    if _is_refusal(out):
+        return out
+    if session is not None:
         _arm_for_review_command(hook, decision.review, session, caller)
+    if reply.platform == "copilot" and not out:
+        approved = _copilot_auto_approve(call, reply, session)
+        if approved is not None:
+            return approved
     return out
 
 

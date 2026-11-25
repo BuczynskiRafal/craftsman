@@ -3,6 +3,11 @@ name: batch
 description: >-
   Carry out one mechanical change across many files in disjoint, verified work
   units. Use for /batch or as the mass-change track of /craftsman.
+license: MIT
+compatibility: Works standalone with Git; optionally runs inside a craftsman-gate (/craftsman) session.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Batch change (`/batch <the change to apply everywhere>`)
@@ -14,7 +19,7 @@ list, and read only inside it (prefer `git ls-files`, `git grep`, and editor sea
 folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
 directory you created, or Craftsman's own data via `craftsman …` CLI commands. Never run recursive
 searches of `~`, `/`, or parent directories, and never open other repositories, other projects'
-packets/ledgers/reports, or assistant session stores (run
+packets/ledgers/reports, or assistant session stores (when the `craftsman` CLI is installed, run
 `craftsman skill show craftsman --file scope.md` for the full contract).
 
 ## 1. Measure the change

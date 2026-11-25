@@ -4,6 +4,11 @@ description: >-
   Bug-hunting review of a diff, branch or pull request by fresh-context
   hunters and verifiers, recorded in the ledger. Use when the user asks
   Craftsman to review, and as the final review of /craftsman.
+license: MIT
+compatibility: Works standalone with Git (ungated); full ledger-enforced hunt plans and subagent verification use the craftsman-gate CLI.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Craft Review (`/craft-review`)
@@ -27,8 +32,17 @@ own blind spots, and a review not in the ledger did not happen. The user needs n
   the user asks for care ("critical", "production", "be thorough", `ultracraft`). Deep: every lens on each production
   hunk, a fresh second look, an end-to-end run when fixing; it raises a gate. Depth never goes down.
 
-Search scope: `craftsman skill show craftsman --file scope.md`. Never modify the work tree or index under review (no
+Search scope: stay inside the work tree (`git rev-parse --show-toplevel`, prefer `git ls-files` and
+`git grep`), or run `craftsman skill show craftsman --file scope.md` (when the `craftsman` CLI is
+installed) for the full contract. Never modify the work tree or index under review (no
 `git stash`, `checkout`, `switch`, `reset`, `restore`, `clean`); old code: `git show <base>:<path>`.
+
+## Standalone mode (without the `craftsman` CLI)
+
+If `craftsman` is not installed, review `git diff` against `HEAD` (or `--base` / staged diff):
+1. Read `lenses.md` in this skill directory and select core lenses (`intent`, `contracts`, `failure`, `ripple`, `tests`, `craft`, `design`, `sweep`) plus risk-triggered lenses (`trust`, `state`, `platform`, `model`).
+2. Split changed hunks into slices and delegate each slice to a fresh-context subagent when the platform allows (otherwise review lens-by-lens yourself).
+3. Challenge candidate findings with an independent verifier (or reproduction check), run tests directly in the shell if fixing, and label the report **UNGATED**.
 
 ## 1. Prepare
 
@@ -46,8 +60,15 @@ commits, PR description and `git diff <base>`); a claim without a line is alread
 unscanned files, the frozen scope, warnings and the **hunt plan**, one slot per line:
 `W1-2  H2,H4-H7  contracts, failure, sweep  19 lines`. The diff alone decides the plan: a hunk's kind (prose, tests,
 configuration, production) and risk signals set the lenses it owes, related lenses share a slot (about 400 changed lines
-each), `craft` and `design` get their own, and a `sweep` joins when there are two or more bug slots. A follow-up round
-of at most 40 changed lines with no deep signal is one bug slot (plus a simplicity slot). You cannot drop a slot.
+each), `craft` and `design` get their own, and a `sweep` joins when there are two or more bug slots. On follow-up rounds
+after a prior reviewed round (not a first deep round), planning is adaptive: unchanged hunks carry over; unchanged
+reopened hunks (referencing modified symbols) re-check cross-boundary lenses only (`intent`, `contracts`, `failure`,
+`ripple`, `tests`); fix edits skip simplicity (`craft`, `design`) on small edits (at most 40 changed lines) to
+already-reviewed production files (unless a simplicity finding was fixed in that file) and on test/configuration edits;
+already-deep-reviewed files owe only signal-triggered conditional lenses plus conditional lenses with previously confirmed
+(`proven`/`probable`) bug findings in that file; and new changes (excluding reopened hunks) of at most 80 quiet production
+lines — or at most 40 production lines with a deep signal — consolidate into a single bug slot (plus simplicity if owed,
+and no new sweep) when all owed hunks fit in 400 lines. You cannot drop a slot.
 `Enforced:` means the platform's hooks see the session and finishing needs every slot; `Advisory:` means no hook saw it,
 the plan is a suggestion, the review is complete when every hunk is covered, and the report says `SELF-REVIEWED` (run
 `craftsman doctor`).
@@ -65,9 +86,12 @@ Launch **every slot `prepare` lists, together**, in parallel where the platform 
 
 `brief` records that the slot was taken and prints the rest: task, base ref, slice, the lenses with the command that
 loads their playbooks (`craftsman skill show craft-review --lenses <ids>`), and the `add` and `cover` commands with
-`--hunter W1-2`. `prepare` prints each platform's launch mechanics under that line. A slot marked
-`[Claude Code: model haiku]` gets `model: "haiku"`; other hunters keep the full model. Then **end your turn**: a
-finished subagent wakes you. Never poll (`sleep`, timers, repeated `review show`). Only where the platform cannot launch
+`--hunter W1-2`. `prepare` prints each platform's launch mechanics under that line. Launching hunters and verifiers is
+part of the review protocol — never ask the user for confirmation before launching them. A slot marked
+`[Claude Code: model haiku]` gets `model: "haiku"`; other hunters keep the full model. On Claude Code and Antigravity,
+subagents run asynchronously — **end your turn** while they run (a finished subagent wakes you; never poll with `sleep`,
+timers, or repeated `review show`). On GitHub Copilot, subagent calls return synchronously in the same turn — immediately
+run `craftsman review check` (or `craftsman review check --review-only`). Only where the platform cannot launch
 subagents at all, play the roles in turn (`brief` each slot), record with `--hunter`, and say **SELF-REVIEWED**.
 
 ## 3. Check, verify, repeat
@@ -83,20 +107,26 @@ what it lists:
   `blocker` or `major` dismissed without a `--run` needs a second, independent verifier. `check` marks a cluster of
   only `minor` or `nit` findings `[Claude Code: model haiku]` (as in step 2, `model: "haiku"`); any other cluster, and a
   verifier resumed in step 4, gets the full model.
-- **Waves**: a `proven`, or serious `probable`, bug finding outside documentation makes `check` (also `report`, `brief`,
-  `prepare`) store a wave: a **variant** slot per root cause (`W2-F3`, hunts its siblings, at most 3) and a **fresh**
-  set (`W2-X1`, an unanchored look). A variant of a variant of a variant spawns nothing; the first deep round plans its
-  fresh set up front. Launch them as in step 2. The hunt ends at the first wave that adds nothing.
+- **Waves**: a `proven` or `probable` `blocker`/`major` bug finding outside documentation makes `check` (also
+  `report`, `brief`, `prepare`) store a wave: a **fresh** set (`W2-X1`, an unanchored look) at normal depth, stopping
+  after generation 2; at deep depth it also adds up to 1 **variant** slot (`W2-F3`, hunting siblings) per wave, and
+  spawns generation 3 only for a generation-2 `blocker`. Launch wave slots as in step 2. The hunt stops at the first
+  wave that adds nothing.
 
-Where agents run in the background (Claude Code, Antigravity), launch each verifier as soon as its hunters report
-(Copilot's parallel subagents are a barrier). When `check` lists only fixes and runs, the hunt is saturated.
+Batch verification per wave: wait until all hunters of the current generation finish before launching verifiers so
+`check` packs findings across files (up to 6 per verifier) and lets one verifier merge duplicate reports across slots
+(Copilot's parallel subagents also barrier per wave). When `check` lists only fixes and runs, the hunt is saturated.
 
 ## 4. Fix, confirm, re-check, test (when asked to fix, and always in a gate session)
+
+Wait until every running hunter and verifier of the current round has finished and the hunt is saturated (no open slots or unjudged findings) before editing files—editing mid-round changes the working tree underneath in-flight hunters.
 
 1. Fix each `proven`/`probable` finding at the root cause, with a regression test where the project has tests.
 2. **Is it fixed?** `proven`: its regression test fails before the fix and passes after (`craftsman run`). `probable`:
    resume the verifier that judged it where the platform can (Claude Code: agent id; Antigravity: conversation id), send
-   only the fix diff, ask "fixed or not, with evidence"; else a fresh verifier gets the finding plus the diff. Then
+   only the fix diff, ask "fixed or not, with evidence"; on platforms without agent resume (e.g., GitHub Copilot), pass the
+   findings plus the fix diff to a fresh `craftsman-verifier`, batching multiple `probable` findings into a single
+   `craftsman-verifier` confirmation run instead of launching separate verifiers one by one. Then
    `craftsman review resolve F# --as fixed --note "<what changed; the run or confirmation>"`.
    `--as accepted --note "<why; who decided>"` is for real trade-offs: never a `blocker`; a `major` only after the user
    agreed (gate session: `gate --await-user` / `--resume`).

@@ -14,6 +14,7 @@ from craftsman.files import BACKUP_DIR_NAME
 from craftsman.generated import ExportError, is_craftsman_generated_file
 from craftsman.platforms.claude import (
     CLAUDE_HOOK_EVENTS,
+    PLUGIN_ASSETS,
     PLUGIN_LAUNCHERS,
     claude_agent_templates,
     export_claude_plugin,
@@ -117,9 +118,9 @@ class ClaudePluginExportTests(ClaudeTestCase):
         repo = self.fake_repo("Review the packet.\n")
         (repo / "craftsman").mkdir()
         (repo / "craftsman" / "__init__.py").write_text("", encoding="utf-8")
-        for launcher in PLUGIN_LAUNCHERS:
-            (repo / launcher).parent.mkdir(exist_ok=True)
-            (repo / launcher).write_text("launcher\n", encoding="utf-8")
+        for rel in (*PLUGIN_LAUNCHERS, *PLUGIN_ASSETS):
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text("placeholder\n", encoding="utf-8")
         return repo
 
     def test_committed_plugin_matches_the_source(self) -> None:
@@ -134,6 +135,8 @@ class ClaudePluginExportTests(ClaudeTestCase):
         # Claude Code refuses a marketplace without an owner.
         self.assertIn("name", catalog["owner"])
         self.assertEqual([entry["source"] for entry in catalog["plugins"]], ["./"])
+        self.assertEqual(manifest["icon"], "./assets/icon.png")
+        self.assertTrue((REPO_ROOT / manifest["icon"]).is_file())
         self.assertTrue(all((REPO_ROOT / path).is_file() for path in manifest["agents"]))
         self.assertEqual(sorted(manifest["hooks"]), sorted(CLAUDE_HOOK_EVENTS))
         for groups in manifest["hooks"].values():
@@ -166,6 +169,7 @@ class ClaudePluginExportTests(ClaudeTestCase):
         (repo / ".claude-plugin" / "agents" / "removed.md").write_text("", encoding="utf-8")
         (repo / ".claude-plugin" / "marketplace.json").unlink()
         (repo / "bin" / "launcher.sh").unlink()
+        (repo / "assets" / "icon.png").unlink()
         with self.assertRaises(ExportError) as caught:
             export_claude_plugin(repo, check=True)
         for line in (
@@ -173,6 +177,7 @@ class ClaudePluginExportTests(ClaudeTestCase):
             "extra: .claude-plugin/agents/removed.md",
             "missing: .claude-plugin/marketplace.json",
             "missing: bin/launcher.sh",
+            "missing: assets/icon.png",
         ):
             self.assertIn(line, str(caught.exception))
 

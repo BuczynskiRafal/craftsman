@@ -24,11 +24,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Callable, Container, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Literal
 
 from craftsman.attribution import (
+    REOPENED_LENSES,
     AgentRun,
     SlotHunks,
     SlotLenses,
@@ -76,7 +77,10 @@ from craftsman.records import (
 DEEP_MIN_PRODUCTION_LINES = 251
 SLICE_MAX_CHANGED_LINES = 400
 DELTA_MAX_CHANGED_LINES = 40
-MAX_VARIANTS_PER_WAVE = 3
+DELTA_MAX_PRODUCTION_LINES = 80
+MAX_GENERATION_NORMAL = 2
+MAX_VARIANTS_PER_WAVE = 1
+MAX_VARIANTS_PER_WAVE_NORMAL = 0
 MAX_FRESH_LENSES = 3
 MAX_REASON_HUNK_IDS = 6
 
@@ -174,6 +178,80 @@ def decide_depth(snap: DiffSnapshot, *, floor: bool, floor_reason: str | None = 
 # --- required and owed lenses ---------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class FollowUpContext:
+    """Monotone earlier-round facts that adapt required lenses on follow-up rounds."""
+
+    prior_reviewed: bool = False
+    prior_reviewed_files: frozenset[str] = frozenset()
+    prior_deep_files: frozenset[str] = frozenset()
+    confirmed_bug_lenses_by_file: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    fixed_simplicity_files: frozenset[str] = frozenset()
+
+
+def follow_up_context(
+    ledger: Ledger,
+    *,
+    upto: int | None = None,
+    enforced: bool = False,
+    first_deep_round: bool = False,
+    credited: Mapping[str, frozenset[str]] | None = None,
+) -> FollowUpContext:
+    """Construct a `FollowUpContext` from earlier rounds (`ledger.rounds[:upto]`).
+
+    Returns an empty context (`prior_reviewed=False`) when no earlier round exists, on the first deep
+    round, or when no earlier hunk holds a full core+simplicity credit set (partial/skipped Round 1
+    work cannot unlock follow-up relaxations).
+    """
+    limit = len(ledger.rounds) if upto is None else max(upto, 0)
+    earlier = ledger.rounds[:limit]
+    if not earlier or first_deep_round:
+        return FollowUpContext()
+    last_number = earlier[-1].number
+    credit = credited_upto(ledger, last_number, enforced=enforced) if credited is None else credited
+    base_review_set = frozenset((*CORE_LENSES, *SIMPLICITY_LENSES))
+    conditional_set = frozenset(CONDITIONAL_LENSES)
+    if not any(
+        base_review_set <= credit.get(ref.digest, frozenset())
+        for round_ in earlier
+        for ref in round_.hunks
+    ):
+        return FollowUpContext()
+    prior_reviewed_files = frozenset(
+        ref.path
+        for round_ in earlier
+        for ref in round_.hunks
+        if base_review_set <= credit.get(ref.digest, frozenset())
+    )
+    prior_deep_files = frozenset(
+        ref.path
+        for round_ in earlier
+        if round_.deep
+        for ref in round_.hunks
+        if conditional_set <= credit.get(ref.digest, frozenset())
+    )
+    by_file: dict[str, set[str]] = defaultdict(set)
+    fixed_simplicity: set[str] = set()
+    for finding in ledger.findings:
+        if finding.round > last_number:
+            continue
+        if (
+            finding.verdict in ("proven", "probable")
+            and finding.merged_into is None
+            and finding.lens in CONDITIONAL_LENSES
+        ):
+            by_file[finding.path].add(finding.lens)
+        if finding.lens in SIMPLICITY_LENSES and finding.resolution == "fixed":
+            fixed_simplicity.add(finding.path)
+    return FollowUpContext(
+        prior_reviewed=True,
+        prior_reviewed_files=prior_reviewed_files,
+        prior_deep_files=prior_deep_files,
+        confirmed_bug_lenses_by_file={path: frozenset(lenses) for path, lenses in by_file.items()},
+        fixed_simplicity_files=frozenset(fixed_simplicity),
+    )
+
+
 def signals_by_hunk(hunks: Sequence[Hunk]) -> dict[str, frozenset[str]]:
     """The risk signals that fired in each hunk (an empty set when none did)."""
     fired: dict[str, set[str]] = {hunk.id: set() for hunk in hunks}
@@ -183,31 +261,66 @@ def signals_by_hunk(hunks: Sequence[Hunk]) -> dict[str, frozenset[str]]:
     return {hunk_id: frozenset(signals) for hunk_id, signals in fired.items()}
 
 
-def required_lenses(hunk: Hunk, *, deep: bool, signals: frozenset[str]) -> frozenset[str]:
-    """The lenses `hunk` must be examined with, given its risk `signals`.
+def required_lenses(
+    hunk: Hunk,
+    *,
+    deep: bool,
+    signals: frozenset[str],
+    follow_up: FollowUpContext | None = None,
+) -> frozenset[str]:
+    """The lenses `hunk` must be examined with, given its risk `signals` and optional `follow_up` context.
 
     Production code gets the core and simplicity lenses plus every conditional lens whose trigger fired
     in this very hunk (all of them when deep). Tests and configuration get the core and simplicity
     lenses only: a filesystem call in a test is not a filesystem risk. Prose gets `intent` and `craft`.
+
+    When `follow_up` has `prior_reviewed=True`, tests and configuration omit `SIMPLICITY_LENSES`, small
+    (`<= DELTA_MAX_CHANGED_LINES`) production edits to previously reviewed files omit `SIMPLICITY_LENSES`
+    unless a simplicity finding was fixed there, and already deep-reviewed files keep only signal-triggered
+    and previously confirmed conditional lenses.
     """
     kind = hunk_kind(hunk)
     if kind == "docs":
         return frozenset(DOCS_LENSES)
-    base = frozenset((*CORE_LENSES, *SIMPLICITY_LENSES))
+    if follow_up is None or not follow_up.prior_reviewed:
+        base = frozenset((*CORE_LENSES, *SIMPLICITY_LENSES))
+        if kind != "production":
+            return base
+        if deep:
+            return base | frozenset(CONDITIONAL_LENSES)
+        return base | frozenset(
+            lens for lens in CONDITIONAL_LENSES if get_lens(lens).triggers & signals
+        )
     if kind != "production":
-        return base
-    if deep:
+        return frozenset(CORE_LENSES)
+    want_simplicity = (
+        hunk.path not in follow_up.prior_reviewed_files
+        or changed_lines(hunk) > DELTA_MAX_CHANGED_LINES
+        or hunk.path in follow_up.fixed_simplicity_files
+    )
+    base = frozenset((*CORE_LENSES, *SIMPLICITY_LENSES)) if want_simplicity else frozenset(CORE_LENSES)
+    if deep and hunk.path not in follow_up.prior_deep_files:
         return base | frozenset(CONDITIONAL_LENSES)
-    return base | frozenset(
+    signal_lenses = frozenset(
         lens for lens in CONDITIONAL_LENSES if get_lens(lens).triggers & signals
     )
+    finding_lenses = follow_up.confirmed_bug_lenses_by_file.get(hunk.path, frozenset())
+    return base | signal_lenses | finding_lenses
 
 
-def required_by_hunk(hunks: Sequence[Hunk], *, deep: bool) -> dict[str, frozenset[str]]:
+def required_by_hunk(
+    hunks: Sequence[Hunk],
+    *,
+    deep: bool,
+    follow_up: FollowUpContext | None = None,
+) -> dict[str, frozenset[str]]:
     """`required_lenses` for every hunk, by hunk id."""
     signals = signals_by_hunk(hunks)
     return {
-        hunk.id: required_lenses(hunk, deep=deep, signals=signals[hunk.id]) for hunk in hunks
+        hunk.id: required_lenses(
+            hunk, deep=deep, signals=signals[hunk.id], follow_up=follow_up
+        )
+        for hunk in hunks
     }
 
 
@@ -219,15 +332,16 @@ def owed_lenses(
     """Per hunk id, the lenses still owed: `required` minus what `credited` holds for the hunk's digest.
 
     Only hunks that owe something appear. A `HunkRef` of a prepared round is judged by its state: a
-    carried hunk owes nothing, and a reopened one gets no credit, because coverage from before the
-    reopening does not count.
+    carried hunk owes nothing, and a reopened one keeps only non-`REOPENED_LENSES` credit from before
+    so cross-boundary lenses are re-checked while local lenses remain credited.
     """
     owed: dict[str, frozenset[str]] = {}
     for hunk in hunks:
         if isinstance(hunk, HunkRef):
             if hunk.carried:
                 continue
-            have = frozenset() if hunk.reopened else credited.get(hunk.digest, frozenset())
+            base_credit = credited.get(hunk.digest, frozenset())
+            have = (base_credit - REOPENED_LENSES) if hunk.reopened else base_credit
         else:
             have = credited.get(hunk.digest, frozenset())
         missing = required.get(hunk.id, frozenset()) - have
@@ -381,6 +495,8 @@ def build_plan(
     round_hunks: Sequence[Hunk] | None = None,
     carry_sweep: bool = False,
     credited: Mapping[str, frozenset[str]] | None = None,
+    reopened_ids: Container[str] = (),
+    prior_reviewed: bool = True,
 ) -> HuntPlan:
     """The hunt plan of a round, or `existing` extended with what is newly owed (append-only).
 
@@ -413,7 +529,17 @@ def build_plan(
     weight = {hunk.id: changed_lines(hunk) for hunk in (*open_hunks, *scope)}
     docs = {hunk.id: is_docs_hunk(hunk) for hunk in taking}
 
-    new, slice_count, delta = _generation_one(taking, needs, docs, weight, kept, round_number)
+    new, slice_count, delta = _generation_one(
+        taking,
+        needs,
+        docs,
+        weight,
+        kept,
+        round_number,
+        first_deep_round=first_deep_round,
+        reopened_ids=reopened_ids,
+        prior_reviewed=prior_reviewed,
+    )
     new = _with_sweep(new, slice_count, kept, taking, scope, weight, carry_sweep=carry_sweep, delta=delta)
 
     taken_ids = {slot.id for slot in (*kept, *new)}
@@ -450,11 +576,15 @@ def _generation_one(
     weight: Mapping[str, int],
     kept: Sequence[Slot],
     round_number: int,
+    *,
+    first_deep_round: bool = False,
+    reopened_ids: Container[str] = (),
+    prior_reviewed: bool = True,
 ) -> tuple[list[Slot], int, bool]:
     """The new generation 1 bug and simplicity slots for the hunks in `taking`.
 
-    Also how many slices they came from and whether the round is a delta round (a later round whose
-    owed hunks are few and quiet, planned as one bug slot).
+    Also how many slices they came from and whether the round is a delta round (a follow-up round whose
+    freshly edited hunks are small enough to consolidate into one bug slot per slice).
     """
     if not taking:
         return [], 0, False
@@ -481,13 +611,22 @@ def _generation_one(
     def listed(members: Sequence[Hunk], candidates: Sequence[str]) -> list[str]:
         return [lens for lens in candidates if any(lens in needs[hunk.id] for hunk in members)]
 
-    total = sum(weight[hunk.id] for hunk in taking)
+    fresh_taking = [hunk for hunk in taking if hunk.id not in reopened_ids]
+    new_prod = [hunk for hunk in fresh_taking if is_production_hunk(hunk)]
+    new_prod_lines = sum(weight[hunk.id] for hunk in new_prod)
+    new_total_lines = sum(weight[hunk.id] for hunk in fresh_taking)
+    new_deep_signals = _deep_signals(new_prod)
     delta = (
         round_number >= 2
-        and total <= DELTA_MAX_CHANGED_LINES
-        and not _deep_signals(taking)
+        and prior_reviewed
+        and not first_deep_round
+        and new_total_lines <= SLICE_MAX_CHANGED_LINES
+        and (
+            (new_prod_lines <= DELTA_MAX_PRODUCTION_LINES and not new_deep_signals)
+            or (new_prod_lines <= DELTA_MAX_CHANGED_LINES and bool(new_deep_signals))
+        )
     )
-    if delta:
+    if delta and sum(weight[hunk.id] for hunk in taking) <= SLICE_MAX_CHANGED_LINES:
         parts = [list(taking)]
     else:
         by_id = {hunk.id: hunk for hunk in taking}
@@ -590,15 +729,15 @@ def _with_sweep(
 def is_trigger(finding: Finding, hunk_is_docs: bool) -> bool:
     """Whether `finding` calls for a further wave of hunters.
 
-    A proven or probable finding of a bug lens, outside documentation, that is either serious (blocker,
-    major) or proven. Craft and design findings, documentation findings and merged duplicates never do.
+    A proven or probable `blocker` or `major` finding of a bug lens, outside documentation.
+    Minor/nit findings, craft and design findings, documentation findings and merged duplicates never do.
     """
     return (
         finding.verdict in ("proven", "probable")
         and finding.lens in BUG_LENSES
         and not hunk_is_docs
         and finding.merged_into is None
-        and (finding.severity in ("blocker", "major") or finding.verdict == "proven")
+        and finding.severity in ("blocker", "major")
     )
 
 
@@ -878,20 +1017,43 @@ def _plan_next_wave(ledger: Ledger, planned_at: str) -> Ledger:
     return ledger
 
 
+def _max_generation(deep: bool, g: int, triggers: Sequence[Finding]) -> int:
+    """Depth-aware wave ceiling: normal stops after gen 2; deep runs gen 3 only for a gen-2 blocker."""
+    if not deep:
+        return MAX_GENERATION_NORMAL
+    if g < 2 or any(item.severity == "blocker" for item in triggers):
+        return MAX_GENERATION
+    return MAX_GENERATION_NORMAL
+
+
 def _store_wave(ledger: Ledger, state: _WaveState, g: int, triggers: Sequence[Finding], planned_at: str) -> Ledger:
     """`ledger` with the wave that answers `triggers` (findings of generation `g`) stored in the latest round."""
     latest = state.latest
     assert latest.plan is not None
     plan = latest.plan
     considered = tuple(item.id for item in sorted(triggers, key=_finding_number))
-    if g >= MAX_GENERATION:
-        return _with_wave(ledger, latest, Wave(MAX_GENERATION, planned_at, considered), ())
+    max_gen = _max_generation(latest.deep, g, triggers)
+    if g >= max_gen:
+        return _with_wave(ledger, latest, Wave(max_gen, planned_at, considered), ())
     target = g + 1
     units = [unit for unit in _unit_refs(latest.hunks) if not unit.docs]
     open_ids = {ref.id for ref in _open_refs(latest)}
     open_units = [unit for unit in units if unit.id in open_ids]
     adding = _fresh_slots(state, plan, target, considered[0], triggers, units, open_units, planned_at)
-    adding.extend(_variant_slots(ledger, plan, target, triggers, units, open_units, planned_at, {slot.id for slot in adding}))
+    variant_triggers = [item for item in triggers if item.severity == "blocker"] if target == 3 else triggers
+    adding.extend(
+        _variant_slots(
+            ledger,
+            plan,
+            target,
+            variant_triggers,
+            units,
+            open_units,
+            planned_at,
+            {slot.id for slot in adding},
+            deep=latest.deep,
+        )
+    )
     return _with_wave(ledger, latest, Wave(target, planned_at, considered, tuple(slot.id for slot in adding)), adding)
 
 
@@ -916,7 +1078,19 @@ def _fresh_slots(
     """
     stored = [slot for slot in plan.slots if slot.kind == "fresh" and slot.generation == target]
     from_earlier_round = any(item.round < state.latest.number for item in triggers)
-    wanted = open_units if open_units and not from_earlier_round else units
+    wanted: Sequence[_Unit]
+    if open_units and not from_earlier_round:
+        if state.latest.number >= 2:
+            reopened_ids = {ref.id for ref in state.latest.hunks if ref.reopened}
+            trigger_paths = {item.path for item in triggers}
+            changed_or_triggered = [
+                unit for unit in open_units if unit.id not in reopened_ids or unit.path in trigger_paths
+            ]
+            wanted = changed_or_triggered or open_units
+        else:
+            wanted = open_units
+    else:
+        wanted = units
     listed = {hunk_id for slot in stored for hunk_id in slot.hunks}
     scope = [unit for unit in wanted if unit.id not in listed]
     if not scope:
@@ -942,18 +1116,22 @@ def _variant_slots(
     open_units: Sequence[_Unit],
     planned_at: str,
     taken: set[str],
+    *,
+    deep: bool,
 ) -> list[Slot]:
     """The variant slots `W<target>-F<n>` for `triggers`: one per (file, lens) cluster, best first.
 
-    `MAX_VARIANTS_PER_WAVE` is the budget of a whole generation of a round: the variants of this
-    generation the plan stores already (carried ones included) are subtracted. A cluster that cannot get
-    a slot (its id is taken, no hunk to read) does not use the budget; the clusters left over are
-    considered all the same, since the wave names every trigger.
+    Normal depth spawns `MAX_VARIANTS_PER_WAVE_NORMAL` variants (`0`); deep rounds allow up to
+    `MAX_VARIANTS_PER_WAVE` (`1`) per generation of a round (carried ones subtracted). Clusters left
+    over by the budget are considered all the same, since the wave names every trigger.
     """
+    cap = MAX_VARIANTS_PER_WAVE if deep else MAX_VARIANTS_PER_WAVE_NORMAL
+    if cap <= 0 or not triggers:
+        return []
     by_id = {item.id: item for item in ledger.findings}
     stored = [slot for slot in plan.slots if slot.kind == "variant" and slot.generation == target]
     held = {(by_id[slot.trigger].path, by_id[slot.trigger].lens) for slot in stored if slot.trigger in by_id}
-    budget = MAX_VARIANTS_PER_WAVE - len(stored)
+    budget = cap - len(stored)
     clusters: dict[tuple[str, str], list[Finding]] = defaultdict(list)
     for item in sorted(triggers, key=_finding_number):
         clusters[(item.path, item.lens)].append(item)

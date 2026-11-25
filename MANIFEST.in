@@ -2,6 +2,7 @@ graft skills
 graft rules
 graft scripts
 graft templates
+graft assets
 graft bin
 graft .agents
 graft .claude-plugin

@@ -4,6 +4,11 @@ description: >-
   Behavior-preserving cleanup of the current diff: duplication, needless
   complexity, dead weight, dishonest names. Not a bug hunt. Use for /simplify
   or as the last build step of /craftsman.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI for lens playbooks and ledger-recorded test runs.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Simplify (`/simplify [path | ref]`)
@@ -19,8 +24,8 @@ list, and read only inside it (prefer `git ls-files`, `git grep`, and editor sea
 folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
 directory you created, or Craftsman's own data via `craftsman …` CLI commands. Never run recursive
 searches of `~`, `/`, or parent directories, and never open other repositories, other projects'
-packets/ledgers/reports, or assistant session stores (run `craftsman skill show craftsman --file
-scope.md` for the full contract).
+packets/ledgers/reports, or assistant session stores (when the `craftsman` CLI is installed, run
+`craftsman skill show craftsman --file scope.md` for the full contract).
 
 ## What "behavior-preserving" means here
 
@@ -37,13 +42,14 @@ for an edit, do not make it — mention it as a suggestion instead.
    ```bash
    craftsman run --kind test -- <test command>
    ```
+   If the `craftsman` CLI is not installed, run the test command directly in the shell (ungated).
    Simplifying on top of a red baseline hides regressions. Inside `/craftsman`, a failure caused
    by the change you just built is yours: fix it first, then simplify. A failure that already
    exists on the base commit, or any failure when `/simplify` runs on its own, is reported to the
    user instead (inside `/craftsman`, `craftsman gate --await-user` while you wait; otherwise just ask).
 2. **Read the diff and its surroundings.** For each changed function, read the whole function and
    the module it lives in; skim neighboring modules for helpers.
-3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show craft-review --lenses craft` to read the playbook; never search the file system for `lenses.md`):
+3. **Look for cost, using the `craft` lens probes** (run `craftsman skill show craft-review --lenses craft` to read the playbook, or if the `craftsman` CLI is not installed, read `references/craft-lens.md` inside this skill directory; never search the file system for `lenses.md`):
    - reimplemented helpers, constants or patterns that already exist (search by behavior and by
      likely names, not only the exact name);
    - derivable state, single-use indirection, always-constant flags, deep nesting that guard
@@ -57,7 +63,7 @@ for an edit, do not make it — mention it as a suggestion instead.
    expressions, nested conditionals-in-expressions, or clever one-liners. Do not merge unrelated
    responsibilities, and do not remove an abstraction that the rest of the code relies on for
    organization.
-5. **Prove nothing changed.** Re-run exactly the same command through the ledger; it must pass.
+5. **Prove nothing changed.** Re-run the same command through the ledger (or directly in the shell if ungated); it must pass.
    If it fails, undo the offending edit rather than "fixing" the test.
 6. **Summarize** in a short list: each edit with `file:line`, the cost it removed, and the
    suggestions you deliberately did not apply (with the reason).

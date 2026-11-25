@@ -49,6 +49,7 @@ from craftsman.records import (
     craftsman_agent_name,
 )
 from craftsman.shell import (
+    _PS_HERESTRING_OPEN_BOUNDARIES,
     SHELL_EXECUTABLES,
     SimpleCommand,
     expand_shell_path_token,
@@ -56,7 +57,14 @@ from craftsman.shell import (
     python_program,
     redirection_targets,
 )
-from craftsman.tool_names import READ_PATH_KEYS, READ_TOOL_NAMES, SEARCH_TOOL_NAMES, SHELL_TOOL_NAMES
+from craftsman.tool_names import (
+    READ_PATH_KEYS,
+    READ_TOOL_NAMES,
+    SEARCH_TOOL_NAMES,
+    SHELL_TOOL_NAMES,
+    SUBAGENT_NAME_KEYS,
+    SUBAGENT_TOOL_NAMES,
+)
 from craftsman.worktree_guard import find_worktree_mutation
 
 # --- the messages -----------------------------------------------------------------------------------
@@ -311,8 +319,19 @@ def has_option(args: Sequence[str], option: str, options: Sequence[str]) -> bool
 
 # --- the call -----------------------------------------------------------------------------------------
 
-ToolKind = Literal["shell", "write", "read"]
+ToolKind = Literal["shell", "write", "read", "subagent"]
 Action = Literal["allow", "deny", "ask"]
+
+SAFE_AUTO_APPROVE_TOP_COMMANDS = frozenset({"skill", "gate", "status", "doctor"})
+SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS = frozenset(
+    {
+        "prepare", "view", "scout", "cover", "brief", "add", "move", "merge",
+        "verdict", "resolve", "waive-run", "show", "check", "report", "inbox", "scratch",
+    }
+)
+_SAFE_HEREDOC_OPEN_RE = re.compile(
+    r"(?<!<)<<(?!<)(-?)[ \t]*(?:'([A-Za-z_][A-Za-z0-9_]*)'|\"([^\"\r\n]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+)
 
 # Tools that only read or search; a path they carry is not a write. Anything else with a path is a candidate.
 READ_ONLY_TOOL_NAMES = READ_TOOL_NAMES | SEARCH_TOOL_NAMES | frozenset(
@@ -331,11 +350,14 @@ _PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* 
 
 
 def tool_kind(tool_name: str) -> ToolKind:
-    """`shell` for a tool that runs a command line, `read` for one that only reads or searches, else `write`: any
-    other tool that carries a path argument is a write candidate."""
+    """`shell` for a tool that runs a command line, `subagent` for one that launches a subagent,
+    `read` for one that only reads or searches, else `write`: any other tool that carries a path argument
+    is a write candidate."""
     name = tool_name.strip().lower()
     if name in SHELL_TOOL_NAMES:
         return "shell"
+    if name in SUBAGENT_TOOL_NAMES:
+        return "subagent"
     action = name.rsplit("__", 1)[-1]  # an MCP tool is `mcp__<server>__<tool>`: the tool decides
     if name in READ_ONLY_TOOL_NAMES or action in READ_ONLY_TOOL_NAMES or action.startswith(_READ_ONLY_PREFIXES):
         return "read"
@@ -367,6 +389,15 @@ def _collect_paths(value: object, is_path: bool, found: list[str]) -> None:
             _collect_paths(item, is_path, found)
 
 
+def subagent_target(tool_input: Mapping[str, object]) -> str:
+    """Return the target subagent name from a subagent tool input, or empty string."""
+    for key in SUBAGENT_NAME_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 @dataclass(frozen=True)
 class ToolCall:
     """One tool call, described the same way for every platform.
@@ -382,6 +413,7 @@ class ToolCall:
     role: AgentRole | None = None
     main_session: bool = False
     session_id: str | None = None
+    subagent_target: str = ""
 
 
 def tool_call(
@@ -401,6 +433,15 @@ def tool_call(
         where = os.path.join(cwd, tool_cwd) if isinstance(tool_cwd, str) and tool_cwd else cwd
         return ToolCall(kind, where, command=command if isinstance(command, str) else "", role=role,
                         main_session=main_session, session_id=session_id)  # fmt: skip
+    if kind == "subagent":
+        return ToolCall(
+            kind,
+            cwd,
+            role=role,
+            main_session=main_session,
+            session_id=session_id,
+            subagent_target=subagent_target(tool_input),
+        )
     paths = candidate_paths(tool_input) if kind == "write" else ()
     return ToolCall(kind, cwd, paths=paths, role=role, main_session=main_session, session_id=session_id)
 
@@ -901,3 +942,144 @@ def decide(call: ToolCall, context: PolicyContext | None = None) -> Decision:
     if call.kind == "write" and call.paths:
         return _decide_write(call, ProtectedPlaces(context))
     return Decision()
+
+
+# --- Copilot safe auto-approval -----------------------------------------------------------------------
+
+
+def _strip_ps_literal_herestring_prefix(command: str) -> str:
+    """Strip a leading PowerShell single-quoted literal here-string pipe prefix (`@'\\n...\\n'@ | `)."""
+    trimmed = command.lstrip(" \t\r\n")
+    if not trimmed.startswith("@'"):
+        return command
+    if trimmed.startswith("\r\n", 2):
+        pos = 4
+    elif trimmed.startswith("\n", 2):
+        pos = 3
+    else:
+        return command
+    body_start = pos
+    n = len(trimmed)
+    while pos <= n:
+        line_end = trimmed.find("\n", pos)
+        raw_line = trimmed[pos:] if line_end == -1 else trimmed[pos:line_end]
+        if raw_line.startswith("'@"):
+            if "'" in trimmed[body_start:pos]:
+                return command
+            after = trimmed[pos + 2 :]
+            pipe_match = re.match(r"[ \t]*\|(?!\|)[ \t]*", after)
+            if pipe_match is None or after[pipe_match.end() :].startswith("&"):
+                return command
+            return after[pipe_match.end() :]
+        if line_end == -1:
+            break
+        pos = line_end + 1
+    return command
+
+
+def _consume_single_quoted_heredoc(text: str, start: int, delim: str, strip_tabs: bool) -> int | None:
+    """Advance past a single-quoted bash heredoc body starting at `start`, returning None if unclosed."""
+    pos, n = start, len(text)
+    while pos < n:
+        line_end = text.find("\n", pos)
+        line = text[pos:] if line_end == -1 else text[pos:line_end]
+        candidate = line.removesuffix("\r")
+        if strip_tabs:
+            candidate = candidate.lstrip("\t")
+        if candidate == delim:
+            return n if line_end == -1 else line_end + 1
+        if line_end == -1:
+            return None
+        pos = line_end + 1
+    return None
+
+
+def _has_shell_expansion(text: str) -> bool:
+    """Fail-closed check for shell substitutions, unclosed quotes, or non-literal heredocs/here-strings."""
+    quote: str | None = None
+    pending_heredoc: tuple[str, bool] | None = None
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\":
+                if i + 1 >= n or text[i + 1] in ('"', "\\"):
+                    return True
+                i += 1
+                continue
+            if ch == '"':
+                quote = None
+                i += 1
+                continue
+            if ch == "`" or text.startswith(("$(", "<(", ">("), i):
+                return True
+            i += 1
+            continue
+        if ch == "\\":
+            if i + 1 >= n or not (text[i + 1].isalnum() or text[i + 1] in "._-:/"):
+                return True
+            i += 1
+            continue
+        if text.startswith(('@"', "@'"), i) and (i == 0 or text[i - 1] in _PS_HERESTRING_OPEN_BOUNDARIES):
+            return True
+        if ch in ("`", "(", ")", "{", "}") or text.startswith(("$(", "@(", "<(", ">(", "$'", '$"'), i):
+            return True
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\n" and pending_heredoc is not None:
+            delim, strip_tabs = pending_heredoc
+            pending_heredoc = None
+            next_pos = _consume_single_quoted_heredoc(text, i + 1, delim, strip_tabs)
+            if next_pos is None:
+                return True
+            i = next_pos
+            continue
+        if text.startswith("<<<", i):
+            i += 3
+            continue
+        if text.startswith("<<", i):
+            match = _SAFE_HEREDOC_OPEN_RE.match(text, i)
+            if match is None or match.group(2) is None or pending_heredoc is not None:
+                return True
+            pending_heredoc = (match.group(2), bool(match.group(1)))
+            i = match.end()
+            continue
+        i += 1
+    return quote is not None or pending_heredoc is not None
+
+
+def is_safe_auto_approve_shell(call: ToolCall) -> bool:
+    """Whether `call` is a single, unredirected, expansion-free safe Craftsman CLI invocation."""
+    if call.kind != "shell" or not call.command.strip():
+        return False
+    effective_command = _strip_ps_literal_herestring_prefix(call.command)
+    if not effective_command.strip() or _has_shell_expansion(effective_command):
+        return False
+    commands = iter_simple_commands(effective_command, call.cwd)
+    if len(commands) != 1 or commands[0].piped or not commands[0].tokens:
+        return False
+    top_exe = os.path.basename(commands[0].tokens[0].replace("\\", "/")).lower()
+    if top_exe in ("cmd", "cmd.exe"):
+        return False
+    calls = invocations(commands)
+    if len(calls) != 1 or calls[0].kind != "cli":
+        return False
+    if redirection_targets(commands[0].segment):
+        return False
+    args = calls[0].args
+    if args and args[0].startswith("-"):
+        return False
+    top = _first_positional(args)
+    if top in SAFE_AUTO_APPROVE_TOP_COMMANDS:
+        return True
+    if top == "review":
+        sub = _first_positional(args[1:])
+        return sub in SAFE_AUTO_APPROVE_REVIEW_SUBCOMMANDS
+    return False

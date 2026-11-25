@@ -1,6 +1,6 @@
 {
   "name": "craftsman",
-  "version": "5.1.0",
+  "version": "5.2.0",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
   "author": {
     "name": "Rafał Buczyński",
@@ -9,6 +9,7 @@
   "homepage": "https://github.com/BuczynskiRafal/craftsman",
   "repository": "https://github.com/BuczynskiRafal/craftsman",
   "license": "MIT",
+  "icon": "./assets/icon.png",
   "keywords": [
     "ai-agents",
     "claude-code",

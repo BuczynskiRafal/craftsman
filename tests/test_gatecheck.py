@@ -1074,9 +1074,9 @@ def hunt_snap(count: int = 4) -> DiffSnapshot:
     return make_snap(*(make_hunk(f"H{n}", f"f{n}.py") for n in range(1, count + 1)))
 
 
-def hunt(*slot_ids: str, count: int = 4, enforced: bool = True) -> Ledger:
+def hunt(*slot_ids: str, count: int = 4, enforced: bool = True, deep: bool = False) -> Ledger:
     """Round 1, prepared at `T0`, with a plan of `slot_ids`: slot n owns hunk Hn (a fresh set owns them all)."""
-    ledger, _ = prepared(hunt_snap(count))
+    ledger, _ = prepared(hunt_snap(count), deep=deep)
     ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=T0, enforced=enforced),))
     slots = [
         make_slot(
@@ -1503,7 +1503,7 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertFalse(report.self_reviewed)
 
     def due_wave_ledger(self) -> Ledger:
-        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = with_findings(hunted(hunt("W1-1", count=1, deep=True), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         return with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
 
@@ -1542,7 +1542,7 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertEqual(len(required_slots(ledger, ledger.rounds[0])), 1)
 
     def test_planned_variants_and_fresh_sets_are_wave_slots_with_their_own_issue(self) -> None:
-        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = with_findings(hunted(hunt("W1-1", count=1, deep=True), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
         ledger = plan_due_waves(ledger, moment(80))
@@ -1555,7 +1555,7 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertEqual({item.slot.id: item.state for item in report.slots}["W2-F1"], "unlaunched")
 
     def test_a_planned_wave_slot_stays_pending_after_its_finding_is_dismissed(self) -> None:
-        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = with_findings(hunted(hunt("W1-1", count=1, deep=True), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
         ledger = plan_due_waves(ledger, moment(80))  # once planned, it runs
@@ -1567,7 +1567,7 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertEqual([item.slot.id for item in report.slots if item.state != "done"], ["W2-X1", "W2-F1"])
 
     def test_a_wave_hunter_that_finished_after_the_trigger_clears_the_wave(self) -> None:
-        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = with_findings(hunted(hunt("W1-1", count=1, deep=True), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(70)))
         ledger = with_agents(ledger, *run_events("v1", 65, 75, agent=VERIFIER, records=("V1",)))
         ledger = plan_due_waves(ledger, moment(80))
@@ -1577,7 +1577,7 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertTrue(check(ledger, 300).passed, render_report(check(ledger, 300)))
 
     def test_a_wave_hunter_that_began_before_the_trigger_does_not_count(self) -> None:
-        ledger = with_findings(hunted(hunt("W1-1", count=1), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
+        ledger = with_findings(hunted(hunt("W1-1", count=1, deep=True), "W1-1", "h1", 10, 60), ("major", "f1.py", "failure"))
         ledger = judged(ledger, "F1", VerdictEvent("V1", "probable", at(120)))
         ledger = with_agents(ledger, *run_events("v1", 115, 125, agent=VERIFIER, records=("V1",)))
         ledger = plan_due_waves(ledger, moment(130))
@@ -2227,9 +2227,19 @@ class VerificationTests(unittest.TestCase):
 
         self.assertEqual((issue.code, issue.missing), ("no-verdict", 3))
         self.assertIn("3 findings without a verdict: F1, F2, F3.", issue.message)
-        self.assertIn("one per cluster: [F1,F2]; [F3].", issue.message)
+        self.assertIn("one per cluster: [F1,F2,F3].", issue.message)
         self.assertIn("Run craftsman review brief --verifier <IDS> and follow it exactly.", issue.message)
         self.assertIn("A verdict you record yourself does not count.", issue.message)
+
+    def test_cross_file_packing_keeps_minor_clusters_separate_from_serious(self) -> None:
+        ledger = self.base(
+            ("major", "f1.py", "intent"),
+            ("nit", "f2.py", "craft"),
+            ("major", "f3.py", "failure"),
+            ("minor", "f4.py", "tests"),
+        )
+
+        self.assertEqual(verifier_clusters(ledger, ledger.findings), (("F1", "F3"), ("F2", "F4")))
 
     def test_clusters_hold_at_most_six_findings_of_a_file(self) -> None:
         lenses = ("intent", "contracts", "failure", "ripple", "tests", "state", "trust", "platform")
@@ -2268,27 +2278,30 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(verifier_clusters(ledger, ledger.findings), (("F1", "F2"),))
 
     def test_long_lists_of_findings_and_clusters_are_cut_with_a_count(self) -> None:
-        ledger = with_findings(hunt("W1-1", count=19), *(("minor", f"f{n}.py", "intent") for n in range(1, 20)))
+        # 9 files x 4 minor findings = 36 findings: 4 + 4 > 6 so each file is its own cluster (9 clusters > limit 8).
+        specs = [("minor", f"f{n}.py", lens) for n in range(1, 10) for lens in ("intent", "contracts", "failure", "ripple")]
+        ledger = with_findings(hunt("W1-1", count=9), *specs)
 
-        issue = next(i for i in check(ledger, snap=hunt_snap(19)).issues if i.code == "no-verdict")
+        issue = next(i for i in check(ledger, snap=hunt_snap(9)).issues if i.code == "no-verdict")
 
-        self.assertIn("19 findings without a verdict: F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12 (+7 more).", issue.message)
-        self.assertIn("[F7] [Claude Code: model haiku]; [F8] [Claude Code: model haiku] (+11 more clusters).", issue.message)
-        self.assertNotIn("F13", issue.message)
+        self.assertIn("36 findings without a verdict: F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12 (+24 more).", issue.message)
+        self.assertIn("[F29,F30,F31,F32] [Claude Code: model haiku] (+1 more clusters).", issue.message)
+        self.assertNotIn("F13,", issue.message.split("Launch verifiers", 1)[0])
         self.assertLessEqual(len(issue.message), MAX_HUNT_ISSUE_CHARS)
 
     def test_lists_exactly_at_their_limits_are_not_cut(self) -> None:
-        ledger = with_findings(hunt("W1-1", count=12), *(("minor", f"f{n}.py", "intent") for n in range(1, 13)))
+        # 12 findings fit without cutting; 8 clusters of 4 (32 findings across 8 files) fit without cluster cut.
+        twelve = with_findings(hunt("W1-1", count=12), *(("minor", f"f{n}.py", "intent") for n in range(1, 13)))
+        issue = next(i for i in check(twelve, snap=hunt_snap(12)).issues if i.code == "no-verdict")
+        self.assertIn("12 findings without a verdict: F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12.", issue.message)
+        self.assertNotIn("more)", issue.message)
 
-        issue = next(i for i in check(ledger, snap=hunt_snap(12)).issues if i.code == "no-verdict")
-
-        self.assertIn("F11, F12.", issue.message)
-        self.assertIn("[F8] [Claude Code: model haiku]", issue.message)
-        self.assertNotIn("[F9]", issue.message)  # eight clusters fit; the ninth is counted
-        self.assertIn("(+4 more clusters)", issue.message)
-        eight = with_findings(hunt("W1-1", count=8), *(("minor", f"f{n}.py", "intent") for n in range(1, 9)))
-        issue = next(i for i in check(eight, snap=hunt_snap(8)).issues if i.code == "no-verdict")
-        self.assertIn("[F8] [Claude Code: model haiku].", issue.message)
+        eight_clusters = with_findings(
+            hunt("W1-1", count=8),
+            *(("minor", f"f{n}.py", lens) for n in range(1, 9) for lens in ("intent", "contracts", "failure", "ripple")),
+        )
+        issue = next(i for i in check(eight_clusters, snap=hunt_snap(8)).issues if i.code == "no-verdict")
+        self.assertIn("[F29,F30,F31,F32] [Claude Code: model haiku].", issue.message)
         self.assertNotIn("more cluster", issue.message)
 
     def test_a_verdict_the_orchestrator_recorded_is_unverified(self) -> None:
@@ -2415,11 +2428,11 @@ class VerificationTests(unittest.TestCase):
         self.assertNotIn("craftsman review brief --verifier", issue.message)
 
     def test_fewer_verifiers_than_clusters_still_launch(self) -> None:
-        ledger = self.open_verifier(self.base(("major", "f1.py", "intent"), ("major", "f2.py", "intent")))
+        ledger = self.open_verifier(self.base(("minor", "f1.py", "intent"), ("major", "f2.py", "intent")))
 
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
-        self.assertIn("Launch verifiers, one per cluster: [F1]; [F2].", issue.message)
+        self.assertIn("Launch verifiers, one per cluster: [F1] [Claude Code: model haiku]; [F2].", issue.message)
         self.assertNotIn("Verifiers running", issue.message)
 
     def test_clusters_of_minor_and_nit_findings_carry_the_cheaper_model_note(self) -> None:
@@ -2427,9 +2440,7 @@ class VerificationTests(unittest.TestCase):
 
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
-        self.assertIn(
-            "one per cluster: [F1,F2] [Claude Code: model haiku]; [F3] [Claude Code: model haiku].", issue.message
-        )
+        self.assertIn("one per cluster: [F1,F2,F3] [Claude Code: model haiku].", issue.message)
 
     def test_a_cluster_with_a_blocker_or_major_finding_runs_on_the_full_model(self) -> None:
         ledger = self.base(
@@ -2441,7 +2452,7 @@ class VerificationTests(unittest.TestCase):
 
         (issue,) = check(ledger, snap=hunt_snap(1)).issues
 
-        self.assertIn("one per cluster: [F1,F2]; [F3] [Claude Code: model haiku]; [F4].", issue.message)
+        self.assertIn("one per cluster: [F1,F2,F4]; [F3] [Claude Code: model haiku].", issue.message)
 
     def test_the_note_cannot_be_read_as_marking_the_cluster_after_it(self) -> None:
         # The shape of an end-to-end run: a minor finding alone, then nits clustered with a major one. With spaces

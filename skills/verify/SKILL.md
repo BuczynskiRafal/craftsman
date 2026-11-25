@@ -4,6 +4,11 @@ description: >-
   Runtime verification of a change: run the checks, exercise the changed
   behavior for real and record every run in the ledger. Use for /verify or as
   the verification step of /craftsman.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI to record verification runs in the ledger.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Verify (`/verify [target]`)
@@ -17,7 +22,8 @@ diff it ran on.
 craftsman run --kind <test|e2e|lint|build|repro|other> -- <command and arguments>
 ```
 
-A run only counts for the gate when it happened **after the last code change**, and only if the
+If the `craftsman` CLI is not installed, run each check and end-to-end command directly in the
+shell (ungated). A run only counts for the gate when it happened **after the last code change**, and only if the
 command itself left the files unchanged (a formatter or code generator run does not verify
 anything — run the checks again after it). If you edit code afterwards, run again. A failing
 command that can no longer pass (a typo, a renamed test) is retired with
@@ -30,8 +36,9 @@ list, and read only inside it (prefer `git ls-files`, `git grep`, and editor sea
 folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
 directory you created, CI logs for this branch/PR, or Craftsman's own data via `craftsman …` CLI
 commands. Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (run
-`craftsman skill show craftsman --file scope.md` for the full contract).
+repositories, other projects' packets/ledgers/reports, or assistant session stores (when the
+`craftsman` CLI is installed, run `craftsman skill show craftsman --file scope.md` for the full
+contract).
 
 ## 1. Find the runtime surface
 

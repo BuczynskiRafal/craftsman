@@ -14,15 +14,25 @@ pipx install craftsman-gate
 uv tool install craftsman-gate
 ```
 
-Upgrading from a `pip install .` of a checkout older than 4.0, which installed the distribution under the
-name `craftsman`? Run `pip uninstall craftsman` first: both names install the same files, and uninstalling
-the old one later would delete them from under `craftsman-gate`. `craftsman doctor` reports the leftover.
-
 Then run the installer to automatically configure your active environments:
 
 ```bash
 craftsman install                  # auto-detects Copilot, Claude Code, Antigravity
 ```
+
+---
+
+## Agent Skills (`npx skills add` / skills.sh)
+
+All 13 Craftsman skills follow the [Agent Skills](https://agentskills.io) format and install without Python:
+
+```bash
+npx skills add BuczynskiRafal/craftsman
+# or pick individual skills:
+npx skills add BuczynskiRafal/craftsman --skill audit-security --skill audit-errors
+```
+
+Eleven workflow and audit skills run standalone (using bundled `references/<lens>-lens.md` playbooks and direct shell checks), and `/craft-review` falls back to standalone **UNGATED** mode using `skills/craft-review/lenses.md`. Install `craftsman-gate` above for deterministic hunt plans, the `.git` evidence ledger, and Stop hooks required by `/craftsman`. Full list: [Bundled Skills Catalog](skills.md).
 
 ---
 
@@ -74,6 +84,16 @@ VS Code Copilot and GitHub Copilot CLI scan multiple directories simultaneously 
 
 - Installing both `--copilot` (user) and `--copilot-workspace` (workspace) in the same project displays duplicate agents and commands in VS Code; `craftsman install` refuses by default unless `--allow-duplicate-scopes` is specified.
 - If both GitHub Copilot and Claude Code are present on the same system, VS Code scans `~/.claude/agents` by default. `craftsman doctor` detects this collision and suggests adding `"chat.agentFilesLocations": {"~/.claude/agents": false}` to VS Code `settings.json`.
+
+### Copilot Zero-Prompt Automation
+
+When Craftsman's Copilot hooks are installed (`--copilot` or `--copilot-workspace`), the `PreToolUse` hook automatically approves launching `craftsman-reviewer` and `craftsman-verifier` custom agents, running safe `craftsman` review/gate/status/doctor/skill CLI commands, and in-scope subagent reads during an active Craftsman session — so hunts and verifiers run without confirmation prompts.
+
+`craftsman doctor` inspects VS Code `Code/User/settings.json` and `Code/User/profiles/*/settings.json` for settings that block this automation:
+- `"chat.customAgentInSubagent.enabled": false` — blocks invoking custom agents (`craftsman-reviewer`, `craftsman-verifier`) as subagents; keep it unset (`true` by default) or `true`.
+- `"chat.tools.eligibleForAutoApproval": {"runSubagent": false}` (or `"agent/runSubagent": false`) — forces manual confirmation prompts on every subagent launch even when hooks allow it; remove `false` or set those entries to `true`.
+
+`craftsman run` executes arbitrary project test, e2e, and reproduction commands and intentionally stays outside Craftsman's `PreToolUse` auto-approval. If you want hands-off test runs in VS Code Copilot, you can optionally add a narrow rule to `chat.tools.terminal.autoApprove` in VS Code settings (knowing that `craftsman run` executes the command after `--`).
 
 ---
 
@@ -152,6 +172,7 @@ Doctor checks:
 - Git identity and hook paths
 - Platform hooks configuration (Copilot, Claude Code, Antigravity)
 - Hook collisions between user-level settings and Claude Code plugins
+- VS Code Copilot settings that block subagent invocation or auto-approval (`chat.customAgentInSubagent.enabled`, `chat.tools.eligibleForAutoApproval`)
 
 When `craftsman review prepare` prints `Advisory:` instead of `Enforced:`, no Craftsman hook saw the session: run `craftsman doctor` to find the missing or duplicate hooks. The hooks also write what they could not do to `<git-dir>/craftsman/hook-errors.log`, and `craftsman review check` reports it.
 
@@ -175,6 +196,9 @@ craftsman uninstall --dry-run                      # preview changes without rem
 
 Uninstall cleans only paths registered in `.craftsman-install.json` and restores original configuration files.
 
-Running `craftsman install` again also removes what an earlier install created and this version no longer ships (for example the `code-quality`, `extreme-optimizer`, `high-level-commit-message` and `leetcode-style-code-reviewer` skills, which 5.0 still shipped). Only paths the manifest records are removed; a skill or command of the same name that you wrote yourself stays. A folder Craftsman created is Craftsman's with everything in it: every install replaces it and an upgrade that drops it deletes it, so keep your own skills beside it, not inside it.
+---
 
-A manifest written by Craftsman before 4.0 (it records global git hooks) is no longer migrated: `install`, `uninstall` and `doctor` stop with a message that asks you to delete that file and run `craftsman install` again. If `git config --global core.hooksPath` still points to a Craftsman `git-hooks` folder, unset it with `git config --global --unset core.hooksPath`; `craftsman doctor` reports that setting when it points to `~/.craftsman/git-hooks` or `~/.gemini/config/git-hooks`.
+## Upgrading from Older Versions
+
+- **From `5.0` or `4.x`:** Re-running `craftsman install` removes skills shipped in earlier versions that are no longer bundled (such as `code-quality`, `extreme-optimizer`, `high-level-commit-message`, and `leetcode-style-code-reviewer`), keeping any files you wrote outside Craftsman-managed folders. The first CLI command also archives any pre-5.0 gate state (`craftsman_state.json.v4.bak`) or schema 2 ledger (`ledger.v2.<UTC stamp>.bak.json`), so neither `gate --init --takeover` nor `review reset` is needed.
+- **From pre-`4.0` checkouts:** If you previously ran `pip install .` when the distribution was named `craftsman`, run `pip uninstall craftsman` before installing `craftsman-gate` (`doctor` flags leftovers). Pre-4.0 global git-hook manifests are no longer migrated: delete the stale manifest, run `git config --global --unset core.hooksPath` if it still points to `~/.craftsman/git-hooks` or `~/.gemini/config/git-hooks`, and re-run `craftsman install`.

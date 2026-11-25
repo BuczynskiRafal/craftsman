@@ -16,10 +16,12 @@ from unittest import mock
 
 from craftsman import diffscan, hook_errors, hooks
 from craftsman.command_policy import (
+    BRIEFS_ARE_FOR_SUBAGENTS,
     HOOKS_ARE_THE_PLATFORMS,
     IDENTITY_IS_THE_PLATFORMS,
     LEAD_ONLY,
     LEDGER_IS_WRITTEN_BY_THE_CLI,
+    NO_RESTART,
     OWNER_CANNOT_TAKE_OVER,
     TRANSCRIPTS_ARE_THE_PLATFORMS,
 )
@@ -75,7 +77,11 @@ class PreToolCase(th.HookTestCase):
     def assertAllowedEverywhere(self, payloads: list[tuple[str, dict[str, Any]]]) -> None:
         for platform, payload in payloads:
             with self.subTest(platform=platform, tool=payload.get("tool_name") or payload.get("toolName")):
-                self.assertEqual(th.call_hook("pre-tool", platform, payload)[0], {})
+                out, _ = th.call_hook("pre-tool", platform, payload)
+                if platform == "claude":
+                    self.assertEqual(out, {})
+                else:
+                    self.assertEqual(decision(out), "allow")
 
 
 class HookForgeryTests(PreToolCase):
@@ -725,6 +731,120 @@ class FeedbackTests(th.HookTestCase):
         self.assertIn("This checkout has an active /craftsman gate", out)
         self.assertIn(TAKEOVER_NOTE, out)
         self.assertEqual(TAKEOVER_NOTE, "If that session is gone, take its gate over with `craftsman gate --init --takeover`.")
+
+
+class CopilotAutoApproveTests(PreToolCase):
+    def assert_copilot_allow(self, payload: dict[str, Any]) -> None:
+        out, _ = th.call_hook("pre-tool", "copilot", payload)
+        self.assertEqual(decision(out), "allow", out)
+        self.assertEqual(out.get("permissionDecision"), "allow", out)
+        self.assertEqual(out.get("hookSpecificOutput", {}).get("permissionDecision"), "allow", out)
+
+    def assert_copilot_unapproved(self, payload: dict[str, Any]) -> None:
+        out, _ = th.call_hook("pre-tool", "copilot", payload)
+        self.assertEqual(out, {})
+
+    def test_subagent_launches_and_spoofing_protection_end_to_end(self) -> None:
+        self.init()
+        for tool_name, key, target in (
+            ("runSubagent", "agentName", "craftsman-reviewer"),
+            ("agent/runSubagent", "agentName", "craftsman-verifier"),
+            ("agent", "subagent_type", "craftsman:craftsman-reviewer"),
+            ("Task", "subagent_type", "craftsman-verifier"),
+        ):
+            with self.subTest(tool=tool_name, target=target):
+                self.assert_copilot_allow(
+                    th.vscode("PreToolUse", self.root, tool_name=tool_name, tool_input={key: target})
+                )
+
+        for tool_name, key, target in (
+            ("runSubagent", "agentName", "Explore"),
+            ("runSubagent", "agentName", "other:craftsman-reviewer"),
+            ("runSubagent", "agentName", "craftsman"),
+            ("mcp__x__agent", "agentName", "craftsman-reviewer"),
+            ("mcp__x__runSubagent", "agentName", "craftsman-verifier"),
+        ):
+            with self.subTest(tool=tool_name, target=target):
+                self.assert_copilot_unapproved(
+                    th.vscode("PreToolUse", self.root, tool_name=tool_name, tool_input={key: target})
+                )
+
+    def test_safe_and_unsafe_cli_calls_through_copilot_hook(self) -> None:
+        self.init()
+        self.repo.write("cart.py", th.CHANGE)
+        self.repo.cli("review", "prepare")
+
+        for command in (
+            "craftsman status",
+            "craftsman doctor",
+            "craftsman gate --complete",
+            "craftsman review check --review-only",
+            "craftsman review add --from-json - <<'EOF'\n[]\nEOF",
+            "@'\n[{\"hunks\": \"H1\", \"note\": \"checked safely\"}]\n'@ | craftsman review cover --from-json -",
+        ):
+            with self.subTest(safe=command):
+                self.assert_copilot_allow(
+                    th.copilot_cli(self.root, toolName="bash", toolArgs=json.dumps({"command": command}))
+                )
+
+        for command in (
+            "craftsman run --kind test -- pytest",
+            "craftsman review reset",
+            "craftsman review check && rm -rf /",
+            "craftsman status > out.txt",
+            "craftsman status $(id)",
+            "craftsman review add --from-json - <<EOF\n[]\nEOF",
+            '@"\n[]\n"@ | craftsman review cover --from-json -',
+        ):
+            with self.subTest(unapproved=command):
+                self.assert_copilot_unapproved(
+                    th.copilot_cli(self.root, toolName="bash", toolArgs=json.dumps({"command": command}))
+                )
+
+    def test_policy_and_scope_denials_always_beat_auto_approval(self) -> None:
+        self.init()
+        self.repo.write("cart.py", th.CHANGE)
+        self.repo.cli("review", "prepare")
+
+        self.assertDeniedEverywhere(self.shell("craftsman review prepare", **REVIEWER), NO_RESTART)
+        self.assertDeniedEverywhere(self.shell("craftsman review brief W1-1"), BRIEFS_ARE_FOR_SUBAGENTS)
+        self.assertDeniedEverywhere(
+            self.shell("craftsman review cover --hunter W1-1 --hunks H1 --note x"), LEAD_ONLY
+        )
+        self.assertDeniedEverywhere(self.shell("craftsman hook stop --platform copilot"), HOOKS_ARE_THE_PLATFORMS)
+
+        out, _ = th.call_hook(
+            "pre-tool",
+            "copilot",
+            th.vscode(
+                "PreToolUse",
+                self.root,
+                agent_id="r1",
+                agent_type="craftsman-reviewer",
+                tool_name="read_file",
+                tool_input={"filePath": str(self.transcripts / "agent-h1.jsonl")},
+            ),
+        )
+        self.assertEqual(decision(out), "deny")
+
+        in_scope = th.vscode(
+            "PreToolUse",
+            self.root,
+            agent_id="r1",
+            agent_type="craftsman-reviewer",
+            tool_name="read_file",
+            tool_input={"filePath": str(self.root / "cart.py")},
+        )
+        self.assert_copilot_allow(in_scope)
+        claude_in_scope = th.claude(
+            "PreToolUse",
+            self.root,
+            agent_id="r1",
+            agent_type="craftsman-reviewer",
+            tool_name="Read",
+            tool_input={"file_path": str(self.root / "cart.py")},
+        )
+        self.assertEqual(th.call_hook("pre-tool", "claude", claude_in_scope)[0], {})
 
 
 if __name__ == "__main__":

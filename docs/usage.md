@@ -6,7 +6,7 @@ You describe the work in plain words. The agent infers the rest.
 
 ## Ask in Plain Words
 
-In Claude Code, Copilot Chat, or Google Antigravity:
+In Claude Code, Copilot Chat, Google Antigravity, or Codex (`$craftsman:craftsman`, `$craftsman:craft-review`):
 
 ```text
 /craftsman add pagination to the catalog search
@@ -25,6 +25,9 @@ ultracraft rewrite the token refresh logic
   you find").
 - `ultracraft` in a request starts `/craftsman` at full depth. Inside `/craft-review` it means a deep
   review; it never opens a gate.
+- For standalone workflows or single-concern audits without opening a gate (`/feature-dev`, `/modernize`,
+  `/batch`, `/simplify`, `/verify`, `/audit-*`), see the [Bundled Skills Catalog](skills.md). To try
+  `/craftsman` safely on a disposable repository, see the [catalog pagination demo](../examples/demo/README.md).
 
 To mention a trigger word without starting a session, put it in backticks or quotes.
 
@@ -39,8 +42,17 @@ You never have to choose these. The agent reads the request and the repository.
 | **Target** | Nothing named: the working tree against the gate's base commit, else `HEAD`. A branch or commit: that ref. A PR number or URL: it checks the PR out and reviews against its merge base. "Staged changes", "tracked files", or a path freezes that scope for the review. |
 | **Fixing** | `/craftsman` always fixes. `/craft-review` fixes when the words ask for it; otherwise it only reports. |
 | **Depth** | One adaptive depth, `deep`: every lens on every production hunk, a fresh second look, an end-to-end run in addition to the tests. `review prepare` goes deep by itself when a security or concurrency signal fires in a production hunk or the change is large (over 250 changed production lines); the agent adds its own judgment, and goes deep when you ask for care ("critical", "be thorough", `ultracraft`). The list is under **Depth** in the [`craft-review` skill](../skills/craft-review/SKILL.md). Depth never goes down within a session. |
-| **Hunt plan** | Not a decision of the agent: `review prepare` computes it from the diff. How many hunters, which lenses each gets and how the diff is split between them follow from the kinds of hunks and their risk signals; findings that are proven call for further waves, up to three generations. The agent launches every slot and cannot skip one. |
+| **Hunt plan** | Not a decision of the agent: `review prepare` computes it from the diff. How many hunters, which lenses each gets and how the diff is split between them follow from the kinds of hunks and their risk signals; findings that are proven call for further waves, up to three generations. Follow-up fix rounds adapt automatically: unchanged hunks carry over, reopened callers re-check cross-boundary lenses only, and small fixes pack into a single bug slot. The agent launches every slot and cannot skip one. |
 | **When to ask you** | Only for an ambiguity that changes what gets built, to accept a `major` finding instead of fixing it, and when the round cap is reached. |
+
+---
+
+## Zero-Prompt Copilot Automation
+
+During an active `/craftsman` or `/craft-review` session on GitHub Copilot (VS Code or Copilot CLI), Craftsman's `PreToolUse` hook automatically approves launching `craftsman-reviewer` and `craftsman-verifier` subagents, running safe `craftsman` review/CLI commands, and in-scope subagent reads. Copilot launches hunters and verifiers directly without confirmation prompts and receives their results synchronously in the same turn.
+
+- **Blocking VS Code settings.** Run `craftsman doctor` to check `settings.json` (and VS Code profiles) for `"chat.customAgentInSubagent.enabled": false` or `"chat.tools.eligibleForAutoApproval"` disabling `runSubagent` / `agent/runSubagent`. Details: [Copilot Zero-Prompt Automation](installation.md#copilot-zero-prompt-automation).
+- **Running project tests (`craftsman run`).** Because `craftsman run` executes project test/e2e/repro commands, Craftsman's hook leaves it unapproved. In VS Code, you can optionally configure a narrow `chat.tools.terminal.autoApprove` rule if you also want test runs to proceed without a terminal prompt.
 
 ---
 
@@ -73,9 +85,7 @@ that the review guard let the agent leave after six reminders without progress.
   the agent extends the scope with `--add-paths`.
 - **Archives.** Packets, views, and ledger snapshots live in `.git/craftsman/`. Superseded packets
   are pruned on every `review prepare`; archives keep the newest `CRAFTSMAN_KEEP_ARCHIVES` entries
-  (default `5`). `craftsman review reset` archives the current ledger before an independent review. A
-  pre-5.0 gate state or schema 2 ledger is archived automatically, so there is nothing to reset when
-  upgrading.
+  (default `5`). `craftsman review reset` archives the current ledger before an independent review.
 - **Initial commit.** In a repository with no commits, the empty tree is the base, so the first
   bootstrap can be reviewed too.
 
@@ -92,20 +102,7 @@ craftsman review report                # the final report, with agent usage per 
 craftsman skill show craft-review --lenses trust,state   # lens playbooks
 ```
 
-`craftsman run` prints a command's output as it arrives, unchanged, up to 6,000 characters. When the
-output passes that limit, printing stops and a line names the log that holds the full output:
-`[craftsman run: output continues; its end prints when the command exits; full output, written as it arrives: PATH]`.
-`PATH` is `run-output.log` in a directory of the `craftsman review scratch` area, which is pruned when
-the review ends; it holds everything from the first byte, grows while the command runs (so
-`tail PATH` shows where a slow or hung command is) and keeps its name. When the command exits, the
-rest prints whole if it is at most 6,000 characters; otherwise a line
-`[craftsman run: N characters omitted; full output: PATH]` and the last 6,000 characters print. Cuts
-move to a line boundary where that costs at most 200 characters. If the log cannot be written, the
-line says `full output not saved: <reason>` and all of the output prints as it arrives. `--full`
-prints everything as it arrives, with no log. The ledger record, test count and exit code are the
-same either way. On POSIX, SIGTERM or SIGHUP to `craftsman run` stops the command as Ctrl-C does:
-its process group is stopped, the run is recorded as interrupted, the end of the output prints, and
-`craftsman run` exits with 128 plus the signal number (143 or 129).
+`craftsman run` streams live output up to 6,000 characters, then appends the full log to `run-output.log` in the `craftsman review scratch` area (pruned when the review ends) and prints the last 6,000 characters on exit (adjusting cuts by up to 200 chars to stay on line boundaries; `full output not saved: <reason>` prints full output if the log cannot be written; `--full` skips truncation). On POSIX, `SIGTERM`/`SIGHUP` stops the process group, marks the run interrupted, and exits `128 + signal` (`143`/`129`).
 
 `craftsman review check --json` (and `report --json`) print the verdict of the gate for scripts: `passed`,
 `partial`, `self_reviewed`, `enforced`, `platform`, `abandoned`, `slots` (each with `id`, `state` of `done`,

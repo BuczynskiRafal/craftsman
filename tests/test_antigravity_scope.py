@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -551,6 +552,40 @@ class HooksJsonTests(unittest.TestCase):
         self.assertEqual(stop, 30)
         self.assertEqual(git_budget_s("antigravity-stop"), 25)
         self.assertEqual(git_budget_s("antigravity-pre-tool"), 25)
+
+    def test_hook_commands_are_cross_platform_and_run_under_the_os_shell(self) -> None:
+        pre_commands = [
+            hook["command"]
+            for group in self.config["craftsman-scope-guard"]["PreToolUse"]
+            for hook in group["hooks"]
+        ]
+        stop_commands = [hook["command"] for hook in self.config["craftsman-stop-gate"]["Stop"]]
+        self.assertTrue(pre_commands)
+        self.assertTrue(stop_commands)
+        for cmd in pre_commands:
+            self.assertIn("scripts/craftsman-scope-guard.py", cmd)
+        for cmd in stop_commands:
+            self.assertIn("scripts/craftsman-stop-gate.py", cmd)
+
+        unique_commands = list(dict.fromkeys([*pre_commands, *stop_commands]))
+        for cmd in unique_commands:
+            with self.subTest(command=cmd):
+                self.assertFalse(cmd.startswith("./"))
+                self.assertTrue(cmd.startswith("python "))
+                self.assertIn("python3 ", cmd)
+                self.assertIn("py -3 ", cmd)
+                proc = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=REPO_ROOT,
+                    input="{}",
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=30,
+                )
+                self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+                self.assertEqual(json.loads(proc.stdout), {"decision": "allow"})
 
 
 if __name__ == "__main__":

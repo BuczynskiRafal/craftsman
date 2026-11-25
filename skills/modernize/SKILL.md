@@ -4,6 +4,11 @@ description: >-
   Change legacy or poorly understood code safely with characterization tests
   and small proven steps. Use for /modernize or as the legacy track of
   /craftsman.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI for ledger-recorded test runs.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Modernize (`/modernize <module or area> [goal]`)
@@ -19,7 +24,7 @@ list, and read only inside it (prefer `git ls-files`, `git grep`, and editor sea
 folder). Outside the work tree you may read only an exact file cited by a stack trace/error, a temp
 directory you created, or Craftsman's own data via `craftsman …` CLI commands. Never run recursive
 searches of `~`, `/`, or parent directories, and never open other repositories, other projects'
-packets/ledgers/reports, or assistant session stores (run
+packets/ledgers/reports, or assistant session stores (when the `craftsman` CLI is installed, run
 `craftsman skill show craftsman --file scope.md` for the full contract).
 
 ## 1. Survey and agree on the goal
@@ -47,9 +52,10 @@ pass before you change anything. Add golden-output tests for complex outputs (re
 numeric results) using representative inputs.
 
 ## 4. Transform in small steps
-Each step keeps the characterization tests green (`craftsman run --kind test`). Give every
-recovered rule an explicit home in the new code — a named constant, a function, a validated
-type — instead of leaving it implicit.
+Each step keeps the characterization tests green (`craftsman run --kind test`). If the `craftsman`
+CLI is not installed, run the test command directly in the shell (ungated). Give every recovered
+rule an explicit home in the new code — a named constant, a function, a validated type — instead of
+leaving it implicit.
 
 ## 5. Prove equivalence
 Run the characterization and golden tests on the result, compare outputs, error behavior and

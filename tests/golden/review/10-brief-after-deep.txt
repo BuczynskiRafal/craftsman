@@ -3,7 +3,7 @@ $ craftsman review brief W1-1
 --- stdout
 Brief issued (B3) for W1-1, round 2.
 
-You are Craftsman hunter W1-1 (bug slot, generation 1): one of 4 hunters of this round. Cover only your slot; the other slots belong to other hunters.
+You are Craftsman hunter W1-1 (bug slot, generation 1): one of 5 hunters of this round. Cover only your slot; the other slots belong to other hunters.
 Hunt for real defects with your lenses; a candidate needs a nameable trigger and a wrong outcome.
 
 Task: Average the prices of a cart and name items nicely

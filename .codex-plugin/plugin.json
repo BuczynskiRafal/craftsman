@@ -1,6 +1,6 @@
 {
   "name": "craftsman",
-  "version": "5.1.0",
+  "version": "5.2.0",
   "description": "Make AI coding agents prove they reviewed and tested their change.",
   "author": {
     "name": "Rafał Buczyński",
@@ -34,6 +34,9 @@
       "Use $craftsman:craftsman to add pagination to the catalog search",
       "Use $craftsman:craft-review to review my staged changes and fix what you find",
       "Use $craftsman:craft-review to review this branch, be thorough"
-    ]
+    ],
+    "brandColor": "#0F766E",
+    "composerIcon": "./assets/logo.svg",
+    "logo": "./assets/icon.png"
   }
 }

@@ -143,7 +143,7 @@ def full_review(root: Path) -> Review:
 
     W1-1 (bug) is launched twice: its first hunter dies after the brief. F1 (W1-1, bug) and F4 (W1-3,
     simplicity) both point at cart-1, F1 first. F2 and F3 (W1-2) match no seeded defect and F3 is merged
-    into F2; F5 (W1-3) is on the decoy. The wave's variant slot W2-F1 finds cart-2 (F6). Verifier v2
+    into F2; F5 (W1-3) is on the decoy. The wave's fresh slot W2-X1 finds cart-2 (F6). Verifier v2
     only judges F1 again: a second opinion; v3 judges F6 first and F4 again, which is none. Hunter
     cache writes are 900..1300, verifier ones 500..700.
     """
@@ -161,7 +161,7 @@ def full_review(root: Path) -> Review:
         judged("F5", "dismissed"),
         used=usage(500),
     )
-    review.hunter("h5", "W2-F1", 29, used=usage(1300))
+    review.hunter("h5", "W2-X1", 29, used=usage(1300))
     review.verifier("v2", judged("F1", "probable", 5), used=usage(600))
     review.verifier("v3", judged("F6", "probable", 29), judged("F4", "probable", 6), used=usage(700))
     return review
@@ -304,10 +304,10 @@ class FixtureTests(ReviewFixture):
         ledger = load(self.full)
         plan = ledger.rounds[-1].plan
         assert plan is not None
-        self.assertEqual([c.slot for c in ledger.claims], ["W1-1", "W1-1", "W1-2", "W1-3", "W2-F1"])
-        self.assertEqual(next(s.kind for s in plan.slots if s.id == "W2-F1"), "variant")
+        self.assertEqual([c.slot for c in ledger.claims], ["W1-1", "W1-1", "W1-2", "W1-3", "W2-X1"])
+        self.assertEqual(next(s.kind for s in plan.slots if s.id == "W2-X1"), "fresh")
         self.assertEqual(
-            [f.hunter for f in ledger.findings], ["W1-1", "W1-2", "W1-2", "W1-3", "W1-3", "W2-F1"]
+            [f.hunter for f in ledger.findings], ["W1-1", "W1-2", "W1-2", "W1-3", "W1-3", "W2-X1"]
         )
         self.assertEqual(next(f.merged_into for f in ledger.findings if f.id == "F3"), "F2")
         self.assertEqual(len(next(f for f in ledger.findings if f.id == "F1").verdict_log), 2)
@@ -369,7 +369,7 @@ class BreakdownTests(ReviewFixture):
         agents = self.group(self.breakdown(), "a")["subagents"]
         self.assertEqual((agents["hunters"], agents["verifiers"]), (5, 3))
         self.assertEqual(
-            (agents["bug"], agents["simplicity"], agents["variant"], agents["fresh"]), (3, 1, 1, 0)
+            (agents["bug"], agents["simplicity"], agents["variant"], agents["fresh"]), (3, 1, 0, 1)
         )
         self.assertEqual((agents["gen 1"], agents["gen 2"], agents["none"]), (4, 1, 0))
         self.assertEqual(agents["relaunched slots"], 1)  # W1-1, whose first hunter died after its brief
@@ -441,9 +441,9 @@ class BreakdownTests(ReviewFixture):
     def test_each_defect_found_goes_to_the_slot_that_recorded_it_first(self) -> None:
         a = self.group(self.breakdown(), "a")
         found = a["found_first_by"]
-        # cart-1 twice, by F1 of W1-1 (bug) and then F4 of W1-3 (simplicity); cart-2 by F6 of W2-F1
+        # cart-1 twice, by F1 of W1-1 (bug) and then F4 of W1-3 (simplicity); cart-2 by F6 of W2-X1
         self.assertEqual(found["found"], 2)
-        self.assertEqual((found["bug"], found["simplicity"], found["variant"]), (1, 0, 1))
+        self.assertEqual((found["bug"], found["simplicity"], found["fresh"]), (1, 0, 1))
         self.assertEqual((found["gen 1"], found["gen 2"]), (1, 1))
         noise = a["noise_by"]
         # F2 (unmatched, W1-2) and F5 (the decoy, W1-3); F3 was merged into F2

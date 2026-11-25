@@ -3,20 +3,27 @@ name: audit-errors
 description: >-
   Audit error handling: where failures happen, where each error ends up and
   what stays hidden. Use for /audit-errors or /audit errors.
+license: MIT
+compatibility: Works standalone with Git; optionally uses the craftsman-gate CLI to query bundled lens playbooks.
+metadata:
+  author: BuczynskiRafal
+  repository: https://github.com/BuczynskiRafal/craftsman
 ---
 
 # Error-handling audit (`/audit-errors [target]`)
 
 Deepens the `failure` lens (run `craftsman skill show craft-review --lenses failure` to read that
-playbook first; never search the file system for `lenses.md`).
+playbook first, or if the `craftsman` CLI is not installed, read `references/failure-lens.md`
+inside this skill directory; never search the file system for `lenses.md`).
 
 ## Search scope
 
 Your workspace is the git work tree you were started in (`git rev-parse --show-toplevel`): search,
 list, and read only inside it (prefer `git ls-files`, `git grep`, and editor search scoped to this
 folder). Never run recursive searches of `~`, `/`, or parent directories, and never open other
-repositories, other projects' packets/ledgers/reports, or assistant session stores (run
-`craftsman skill show craftsman --file scope.md` for the full contract).
+repositories, other projects' packets/ledgers/reports, or assistant session stores (when the
+`craftsman` CLI is installed, run `craftsman skill show craftsman --file scope.md` for the full
+contract).
 
 The question for every failure site: **when this goes wrong, who finds out, and can they act on
 it?** An error that ends in a log nobody reads, a default value that looks like real data, or a

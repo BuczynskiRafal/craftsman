@@ -99,6 +99,31 @@ These guards stop low-effort shortcuts; they are not a sandbox. A script file wr
 name or path built by command substitution, and an interpreter that assembles the path at run time pass a shell parser
 unseen.
 
+### Copilot PreToolUse Auto-Approval
+
+On GitHub Copilot (`--platform copilot`), once `command_policy.decide`, `_enforce_scope`, and `_arm_for_review_command`
+finish with no denial or ask, `hooks.on_pre_tool` returns explicit `permissionDecision: "allow"` (`Reply.approve`) to
+eliminate confirmation prompts during active Craftsman sessions (`_copilot_session_active`: an active gate state, a
+`/craft-review` guarding marker, or a round prepared within the last 12 hours, checked with zero git subprocesses):
+
+- **Craftsman subagent launches.** `tool_kind` matches exact lowercased `SUBAGENT_TOOL_NAMES` (excluding MCP-prefixed
+  tools such as `mcp__x__agent`) and checks `subagent_target`: only `craftsman-reviewer` and `craftsman-verifier`
+  launches inside an active session are approved.
+- **Safe `craftsman` CLI calls.** `is_safe_auto_approve_shell` approves a single simple `craftsman` CLI command with no
+  output redirections, no unclosed quotes, no double-quoted PowerShell here-strings (`@"..."@`), no unquoted or
+  double-quoted bash heredocs (`<<EOF` / `<<"EOF"`), and no unquoted shell expansions (`$(`, `` ` ``, `<(`, `>(` outside
+  single-quoted `'...'` literals or single-quoted bash heredoc bodies `<<'EOF'` / `<<-'EOF'`; single-quoted PowerShell
+  here-string pipe prefixes `@'...'@ |` are normalized first). Allowed top commands are `skill`, `gate`, `status`, and
+  `doctor`; allowed `review` subcommands are `prepare`, `view`, `scout`, `cover`, `brief`, `add`, `move`, `merge`,
+  `verdict`, `resolve`, `waive-run`, `show`, `check`, `report`, `inbox`, and `scratch`. Applies when an active session
+  exists or the caller is a `craftsman-reviewer` / `craftsman-verifier` subagent.
+- **In-scope subagent reads.** `read` calls by `craftsman-reviewer` or `craftsman-verifier` inside an active session
+  after the search-scope guard passes.
+
+Everything else stays unapproved (returns `{}` so normal prompts apply, or is denied by policy): `craftsman run`,
+`craftsman review reset`, `craftsman hook`, `craftsman install`, `craftsman uninstall`, `craftsman export`, chained or
+redirected shell commands, inline scripts, non-Craftsman subagents, main-session edits, and all Claude Code calls.
+
 ---
 
 ## Work-tree Mutation Guard

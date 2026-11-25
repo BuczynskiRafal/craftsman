@@ -1297,7 +1297,9 @@ class PreToolTests(HookTestCase):
             "PreToolUse", self.root, tool_name="run_in_terminal",
             tool_input={"command": "craftsman gate --complete"},
         )  # fmt: skip
-        self.assertEqual(call_hook("pre-tool", "copilot", payload)[0], {})
+        out, _ = call_hook("pre-tool", "copilot", payload)
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "allow")
         self.assertEqual(self.state()["isolation_evidence"], "hooks")
 
     def test_guard_failure_asks_the_user(self) -> None:
@@ -1556,7 +1558,11 @@ class ArmingTests(HookTestCase):
             with self.subTest(platform=platform):
                 self.marker_file().unlink(missing_ok=True)
 
-                self.assertEqual(self.pre_tool("craftsman review prepare", platform), {})
+                out = self.pre_tool("craftsman review prepare", platform)
+                if platform == "claude":
+                    self.assertEqual(out, {})
+                else:
+                    self.assertEqual(out["permissionDecision"], "allow")
 
                 marker = self.marker()
                 self.assertEqual((marker["platform"], marker["session_id"]), (platform, session))
@@ -1753,7 +1759,7 @@ class ArmingTests(HookTestCase):
         mine = self.marker()
 
         out = self.pre_tool("craftsman review prepare", "copilot")  # vscode-session
-        self.assertEqual(out, {})
+        self.assertEqual(out["permissionDecision"], "allow")
         self.assertEqual(self.marker(), mine)
 
         stale = {**mine, "at": "2020-01-01T00:00:00.000Z", "touched_at": "2020-01-01T00:00:00.000Z"}
@@ -2602,6 +2608,209 @@ class LaunchStaggerTests(HookTestCase):
 
         self.assertIn("boom", json.dumps(failed))
         self.stagger_sleep.assert_not_called()
+
+
+class CopilotAutoApproveTests(HookTestCase):
+    def assert_approved(self, out: dict[str, Any], substring: str = "") -> None:
+        self.assertEqual(out.get("permissionDecision"), "allow", out)
+        nested = out.get("hookSpecificOutput", {})
+        self.assertEqual(nested.get("hookEventName"), "PreToolUse")
+        self.assertEqual(nested.get("permissionDecision"), "allow")
+        if substring:
+            self.assertIn(substring, out.get("permissionDecisionReason", ""))
+
+    def test_reply_approve_formats_both_permission_fields_for_copilot(self) -> None:
+        out = hooks.Reply("copilot", "pre-tool").approve("ok")
+        self.assertEqual(
+            out,
+            {
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "ok",
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": "ok",
+                },
+            },
+        )
+
+    def test_copilot_session_active_runs_no_git_subprocesses_and_checks_all_sources(self) -> None:
+        session = hooks.Session(self.root, self.root / ".git")
+
+        def check_active(expected: bool) -> None:
+            with mock.patch("craftsman.diffscan.subprocess.run", side_effect=AssertionError("git ran")):
+                self.assertIs(hooks._copilot_session_active(session), expected)
+
+        with mock.patch("craftsman.diffscan.subprocess.run", side_effect=AssertionError("git ran")):
+            self.assertFalse(hooks._copilot_session_active(None))
+        check_active(False)
+
+        self.init()
+        check_active(True)
+
+        self.update_state(active=False)
+        check_active(False)
+
+        call_hook("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="/craft-review"))
+        check_active(True)
+
+        call_hook("prompt", "copilot", vscode("UserPromptSubmit", self.root, prompt="moved on"))
+        check_active(False)
+
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+        check_active(True)
+
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=13)).isoformat().replace("+00:00", "Z")
+        ledger = self.ledger()
+        ledger["rounds"][-1]["prepared_at"] = old_time
+        (self.repo.ledger_dir / "ledger.json").write_text(json.dumps(ledger), encoding="utf-8")
+        check_active(False)
+
+        (self.repo.ledger_dir / "ledger.json").write_text(json.dumps({"schema": 5}), encoding="utf-8")
+        check_active(False)
+
+    def test_copilot_subagent_launches_are_auto_approved_only_for_hunters_when_active(self) -> None:
+        for tool_name, key in (
+            ("runSubagent", "agentName"),
+            ("agent/runSubagent", "agentName"),
+            ("agent", "subagent_type"),
+            ("Task", "subagent_type"),
+        ):
+            payload = vscode("PreToolUse", self.root, tool_name=tool_name, tool_input={key: "craftsman-reviewer"})
+            self.assertEqual(call_hook("pre-tool", "copilot", payload)[0], {})
+
+        self.init()
+        for tool_name, key, agent_name in (
+            ("runSubagent", "agentName", "craftsman-reviewer"),
+            ("agent/runSubagent", "agentName", "craftsman-verifier"),
+            ("agent", "subagent_type", "craftsman:craftsman-reviewer"),
+            ("Task", "subagent_type", "craftsman-verifier"),
+        ):
+            with self.subTest(tool_name=tool_name, agent=agent_name):
+                payload = vscode("PreToolUse", self.root, tool_name=tool_name, tool_input={key: agent_name})
+                out, _ = call_hook("pre-tool", "copilot", payload)
+                self.assert_approved(out, "subagent")
+
+        for non_hunter_tool, non_hunter_input in (
+            ("runSubagent", {"agentName": "Explore"}),
+            ("runSubagent", {"agentName": "craftsman"}),
+            ("runSubagent", {"agentName": "other:craftsman-reviewer"}),
+            ("mcp__x__agent", {"agentName": "craftsman-reviewer"}),
+        ):
+            with self.subTest(tool=non_hunter_tool, input=non_hunter_input):
+                payload = vscode("PreToolUse", self.root, tool_name=non_hunter_tool, tool_input=non_hunter_input)
+                self.assertEqual(call_hook("pre-tool", "copilot", payload)[0], {})
+
+        claude_payload = claude(
+            "PreToolUse", self.root, tool_name="Agent", tool_input={"subagent_type": "craftsman-reviewer"}
+        )
+        self.assertEqual(call_hook("pre-tool", "claude", claude_payload)[0], {})
+
+    def test_copilot_safe_cli_and_subagent_reads_are_auto_approved_while_denials_and_claude_stay_intact(self) -> None:
+        self.init()
+        self.repo.write("cart.py", CHANGE)
+        self.repo.cli("review", "prepare")
+
+        for command in (
+            "craftsman review check --review-only",
+            "craftsman status --json",
+            "craftsman doctor",
+            "craftsman gate --complete",
+            "@'\n[{\"hunks\": \"H1\", \"note\": \"checked everything\"}]\n'@ | craftsman review cover --from-json -",
+        ):
+            with self.subTest(command=command):
+                out = self.pre_tool(command, "copilot")
+                self.assert_approved(out, "Craftsman CLI review command")
+
+        for unapproved in (
+            "craftsman run --kind test -- pytest",
+            "craftsman review reset",
+            "craftsman status && git status",
+            "craftsman status > out.txt",
+            "pytest -q",
+        ):
+            with self.subTest(unapproved=unapproved):
+                self.assertEqual(self.pre_tool(unapproved, "copilot"), {})
+
+        reviewer_brief = self.pre_tool(
+            "craftsman review brief W1-1", "copilot", agent_id="r1", agent_type="craftsman-reviewer"
+        )
+        self.assert_approved(reviewer_brief, "Craftsman CLI review command")
+
+        reviewer_read = call_hook(
+            "pre-tool",
+            "copilot",
+            vscode(
+                "PreToolUse",
+                self.root,
+                agent_id="r1",
+                agent_type="craftsman-reviewer",
+                tool_name="read_file",
+                tool_input={"filePath": str(self.root / "cart.py")},
+            ),
+        )[0]
+        self.assert_approved(reviewer_read, "in-scope read")
+
+        outside_search = call_hook(
+            "pre-tool",
+            "copilot",
+            vscode(
+                "PreToolUse",
+                self.root,
+                agent_id="r1",
+                agent_type="craftsman-reviewer",
+                tool_name="grep_search",
+                tool_input={"path": str(self.tmp)},
+            ),
+        )[0]
+        self.assertEqual(outside_search["permissionDecision"], "deny")
+
+        self.repo.git("config", "craftsman.scope", "warn")
+        warned_search = call_hook(
+            "pre-tool",
+            "copilot",
+            vscode(
+                "PreToolUse",
+                self.root,
+                agent_id="r1",
+                agent_type="craftsman-reviewer",
+                tool_name="grep_search",
+                tool_input={"path": str(self.tmp)},
+            ),
+        )[0]
+        self.assertIn("additionalContext", warned_search)
+        self.assertNotIn("permissionDecision", warned_search)
+        self.repo.git("config", "--unset", "craftsman.scope")
+
+        forbidden_read = call_hook(
+            "pre-tool",
+            "copilot",
+            vscode(
+                "PreToolUse",
+                self.root,
+                agent_id="r1",
+                agent_type="craftsman-reviewer",
+                tool_name="read_file",
+                tool_input={"filePath": str(Path.home() / ".copilot" / "session-state" / "x.jsonl")},
+            ),
+        )[0]
+        self.assertEqual(forbidden_read["permissionDecision"], "deny")
+
+        self.assertEqual(self.pre_tool("craftsman review check --review-only", "claude"), {})
+        claude_read = call_hook(
+            "pre-tool",
+            "claude",
+            claude(
+                "PreToolUse",
+                self.root,
+                agent_id="r1",
+                agent_type="craftsman-reviewer",
+                tool_name="Read",
+                tool_input={"file_path": str(self.root / "cart.py")},
+            ),
+        )[0]
+        self.assertEqual(claude_read, {})
 
 
 if __name__ == "__main__":

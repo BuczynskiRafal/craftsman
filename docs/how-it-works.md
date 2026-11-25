@@ -29,40 +29,45 @@ The README and the [usage guide](usage.md) only summarize it.
    hints, warnings, and the **hunt plan**: one slot per hunter, each with its hunks and lenses. The
    plan comes from the diff alone (see [The hunt plan](#the-hunt-plan)); the orchestrator cannot drop
    a slot.
-4. **Hunt.** The orchestrator launches every slot together, each as a fresh-context
+4. **Hunt.** The orchestrator launches every slot together without asking the user for confirmation, each as a fresh-context
    `craftsman-reviewer` subagent whose whole prompt is one line:
    `You are Craftsman hunter W1-2. Run craftsman review brief W1-2 and follow it exactly.` `review brief`
    records that the slot was taken and prints the task, the base ref, the slice, the lenses and the
    recording commands, which carry `--hunter W1-2`. Every review launches at least one hunter, even for
-   a one-line change, wherever the platform has subagents.
-5. **Check and verify.** When the hunters report, `review check` says what is missing, in order:
-   slots to launch or relaunch, then findings without a verdict, grouped into clusters (one per file,
-   at most 6 findings each). One `craftsman-verifier` per cluster, with the prompt `You are a Craftsman
-   verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.`, merges duplicates,
-   tries to disprove each finding, reproduces it where the code is runnable, and records a verdict. A
-   `blocker` or `major` finding dismissed without a run needs a second, independent verifier. On Claude
-   Code, the simplicity slots and the verifiers of clusters that hold only `minor` or `nit` findings run
-   on the cheaper model (`haiku`) and `check` marks these launches; everything else, and a verifier
-   resumed to confirm a fix, does not.
-6. **Saturate.** Waves are planned, not derived: `check`, `report`, `brief` and `prepare` store a wave
-   in the plan when a `proven`, or serious `probable`, bug finding outside documentation calls for it.
-   A wave is one **variant** slot per root cause (`W2-F3`, which hunts the siblings of finding F3, at
-   most 3 per wave) plus one **fresh** set (`W2-X1`, an unanchored look at the hunks with the lenses
-   nobody applied there). Waves count as generations, at most 3: a variant of a variant of a variant
-   spawns nothing. The hunt stops at the first wave that adds nothing. A deep round plans its fresh
-   set up front.
+   a one-line change, wherever the platform has subagents. On Claude Code and Antigravity, subagents
+   run asynchronously (the orchestrator ends its turn while they run); on GitHub Copilot, subagent calls
+   return synchronously in the same turn, so the orchestrator runs `craftsman review check` right away.
+5. **Check and verify.** After the hunters of the current wave report, `review check` lists what is missing in order:
+   slots to launch or relaunch, then findings without a verdict, grouped into verifier clusters (up to 6 findings each,
+   packed across files separately for `minor`/`nit` vs. serious findings). Wait for all hunters of the current wave
+   before launching verifiers so cross-hunter duplicates share a cluster. One `craftsman-verifier` per cluster, launched
+   directly without asking the user and with the prompt
+   `You are a Craftsman verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.`, merges
+   duplicates, tries to disprove each finding, reproduces it where runnable, and records a verdict. A `blocker` or
+   `major` finding dismissed without a run needs a second, independent verifier. On Claude Code, simplicity slots and
+   `minor`/`nit`-only verifier clusters run on `haiku`; everything else uses the full model.
+6. **Saturate.** Waves are planned, not derived: `check`, `report`, `brief`, and `prepare` store a wave when a `proven`
+   or `probable` `blocker`/`major` bug finding outside documentation calls for it. Normal depth plans one `fresh` set
+   (`W2-X1`) and stops after generation 2. Deep depth plans its static `fresh` set up front, allows up to 1 `variant`
+   slot per wave (`W<g>-F<n>`), and spawns generation 3 only for a generation-2 `blocker`. The hunt stops at the first
+   wave that adds nothing.
 7. **Fix, confirm, re-check.** Three separate jobs.
    - *Fix.* Every `proven` or `probable` finding is fixed at the root cause, with a regression test
      where the project has tests.
    - *Is it fixed?* A `proven` finding is confirmed by its regression test: it fails before the fix
      and passes after, through `craftsman run`. A `probable` one (no repro) goes back to the verifier
      that judged it, resumed with only the fix diff, where the platform can resume an agent;
-     otherwise a fresh verifier gets the finding and the diff. Then `review resolve --as fixed`, with
-     a note that cites the run or the confirmation.
+     otherwise a fresh verifier gets the finding and the diff, batching multiple `probable` findings into
+     a single `craftsman-verifier` confirmation run instead of launching separate verifiers one by one.
+     Then `review resolve --as fixed`, with a note that cites the run or the confirmation.
    - *Did the fix break anything?* `review prepare` opens the next round: the changed hunks plus the
-     hunks that reference a changed symbol. If they are few and quiet (at most 40 changed lines, no
-     deep signal), the plan is one bug slot with every owed bug lens, plus a simplicity slot. Fresh hunters take its slots (never the finder or its
-     verifier, who are anchored), and the round cap bounds the loop.
+     unchanged hunks that reference a changed symbol (**reopened** hunks). After a prior reviewed round,
+     follow-up planning is adaptive: unchanged hunks carry over, reopened hunks re-check only
+     cross-boundary lenses, small edits (`<= 40` lines) to already-reviewed files and test/config edits
+     skip simplicity, already-deep-reviewed files keep only signal-triggered and previously flagged
+     conditional lenses, and quiet fixes pack into a single bug slot (up to 80 new production lines, or
+     40 with a deep signal). Fresh hunters take its slots (never the finder or its verifier, who are
+     anchored), and the round cap bounds the loop.
 8. **Test.** `craftsman run --kind test -- <cmd>` on the final code; deep also `--kind e2e`. A test run
    counts only when its runner reported at least `--min-tests` tests (default 1); a command that matched
    no tests is recorded but is no evidence. Output prints as it arrives up to 6,000 characters; past
@@ -87,11 +92,13 @@ slots, and the CLI stores them in the round.
 | Rule | What it does |
 | :--- | :--- |
 | **Required lenses** | By hunk kind. Prose owes `intent` and `craft`. Tests and configuration owe the core lenses (`intent`, `contracts`, `failure`, `ripple`, `tests`) and the simplicity lenses (`craft`, `design`). Production code owes those plus every conditional lens (`state`, `trust`, `platform`, `model`) whose risk signal fired in that very hunk, or all of them when the round is deep. |
+| **Follow-up adaptive lenses** | In rounds >= 2 after an earlier reviewed round (and not the first deep round), tests and configuration omit `craft` and `design`. Already-reviewed production files also omit `craft` and `design` when edited by at most 40 changed lines (unless a simplicity finding was fixed in that file). Already-deep-reviewed production files require only signal-triggered conditional lenses plus any conditional lens with a confirmed (`proven`/`probable`) bug finding in that file; unreviewed or not-yet-deep files keep full requirements. |
 | **Owed lenses** | Required minus *credited*: the lenses that accepted coverage of the same hunk digest already applied, from this round or an earlier one. A hunk with nothing owed is carried into the next round. |
+| **Reopened hunks** | Unchanged hunks that reference a modified symbol are reopened (`reopened = True`) rather than carried over. Prior coverage keeps local lenses (`state`, `trust`, `platform`, `model`, `craft`, `design`), so reopened hunks re-check only the cross-boundary lenses (`intent`, `contracts`, `failure`, `ripple`, `tests`). |
 | **Generation 1 slots** (`W1-<n>`) | Owed hunks are cut into slices of about 400 changed lines, whole files first. Each slice becomes up to four bug slots, one per group of related lenses (`intent`/`ripple`/`tests`, `contracts`/`failure`, `state`/`platform`, `trust`/`model`), plus a simplicity slot for `craft` and `design`. Prose-only slices get one slot. |
 | **Sweep** | When the plan has two or more bug slots, one whole-diff slot (or a core slot with room) also applies `sweep`: hunks that are each correct but disagree. |
-| **Delta rounds** | A later round with at most 40 owed changed lines and no deep signal is one bug slot with every owed bug lens, a simplicity slot when `craft` or `design` is owed, and no new sweep (a sweep an earlier round left unfinished is still carried). |
-| **Later generations** | `W<g>-F<n>` variant slots and `W<g>-X<j>` fresh slots, from proven or probable bug findings, up to generation 3. |
+| **Delta rounds** | A follow-up round after an earlier reviewed round (and not the first deep round) whose non-reopened changes fit in 400 total changed lines and either at most 80 production lines with no deep signal or at most 40 production lines with a deep signal — and whose owed hunks all fit in 400 lines — packs into one bug slot with every owed bug lens, a simplicity slot only when `craft` or `design` is owed, and no new sweep (a carried unfinished sweep still runs). |
+| **Later generations** | `W<g>-X<j>` fresh sets (gen 2 at normal depth; `gen 3` and up to 1 `W<g>-F<n>` variant per wave on deep rounds, triggered by `blocker`/`major` bug findings; gen 3 for gen-2 blockers only). On rounds >= 2 with triggers from the latest round, fresh wave slots focus on changed open hunks plus any reopened hunks in a trigger finding's file. |
 
 Plans are append-only: re-running `prepare` on the same diff, or raising the round to deep, adds the
 slots newly owed and keeps every slot and wave already stored, so the same finding never triggers the
@@ -146,11 +153,7 @@ A review costs agents times turns times context, so the inputs are kept small.
   hunks. A verifier's brief (`review brief --verifier F1,F2`) lists its findings with their scenarios
   and the verdict commands, and records nothing. On Antigravity and on platforms without agent definitions (Codex, Cursor) the brief ends with the
   role text of the agent template, because the reader did not load it itself.
-- **Pipelining.** Where agents run in the background (Claude Code, Antigravity async subagents), the
-  orchestrator runs `review check` after every report and launches what is ready: the verifiers of a
-  finished hunter's findings while other hunters still run, then the slots of a wave as soon as a
-  finding is judged. Slots that are running are waited for, never launched twice. Where parallel
-  subagents are a barrier (Copilot), the waves stay as they are.
+- **Wave batching.** Wait for all hunters of the current generation/wave to finish before launching verifiers so `review check` packs up to 6 findings across files into one verifier cluster and lets a single verifier merge duplicates across hunters. Slots that are already running are waited for, never launched twice.
 - **Launch stagger.** On Claude Code a subagent's request reads the prompt cache only once the
   response that wrote it has begun, so hunters launched together would each write their whole
   starting context (6,917 tokens per reviewer, measured on Claude Code 2.1.322 with Sonnet, where one
@@ -192,8 +195,8 @@ matter when reading the ledger:
 - **Hunk ids are stable and never reused.** A carried hunk keeps its id, so ids can be sparse (`H1`,
   `H4`, `H9`). Do not assume `H1..Hn`; `review show --hunks` lists what is left.
 - **A hunk stays covered across rounds by its digest**, which ignores line numbers and CRLF, so the
-  next round re-reviews only changed hunks and hunks that reference a changed symbol. `cover` skips
-  carried hunks.
+  next round re-reviews only changed hunks and hunks that reference a changed symbol (re-checking only
+  cross-boundary lenses on unchanged reopened hunks). `cover` skips carried hunks.
 - **`cover --files` is forgiving.** It accepts `./x`, backslashes, absolute paths inside the
   repository, and the old path of a renamed file.
 - Generated files (`__pycache__`, build caches, `node_modules`, ...) are skipped; custom patterns go
@@ -252,23 +255,8 @@ The gate reports an issue list. It passes when the list is empty:
   call out of budget, a ledger set aside) is appended to `<git-dir>/craftsman/hook-errors.log`, and
   `review check`, `review report`, `gate --complete` and `status` print `Hook errors since round N was
   prepared: K (see <path>)`.
-- **What a passing gate proves, and what it does not.** It proves that coverage and verdicts were recorded
-  by separate subagent runs (attributed by identity on Antigravity, by transcript token on Claude Code, by
-  time window on Copilot), that hook commands cannot be run from the agent's shell, that the ledger cannot
-  be edited by the agent's tools, and that the tests passed on the final code. It does not prove that the
-  review was good: a passing gate is no evidence that the hunters looked hard or found everything.
-- **What it does not assess.** Business-requirement fit, naming quality, and architecture outside the
-  files touched by the diff. Every report lists these under `Not assessed by the gate`. The gate also
-  does not judge how hard the hunters looked beyond the plan: it checks that every slot of the plan is
-  done, that fresh hunters covered every hunk of the frozen diff and that every finding has checkable
-  evidence. A very large diff produces a warning in `prepare` and in the report; it does not hand off
-  to the user.
-
-### Upgrading from Craftsman 4.x
-
-Nothing to run. The first command that reads a pre-5.0 gate state or a schema 2 ledger archives it
-(`craftsman_state.json.v4.bak`, `ledger.v2.<UTC stamp>.bak.json`) and starts fresh, so neither `gate --init
---takeover` nor `review reset` is needed. Re-run `craftsman install` to refresh the skills and agents.
+- **What a passing gate proves.** Coverage and verdicts were recorded by separate subagent runs (attributed by identity on Antigravity, transcript token on Claude Code, or time window on Copilot), forged hook calls from the shell and direct edits to the ledger were blocked, and the tests passed on the final code.
+- **What the gate does not judge or assess.** Hunt thoroughness beyond completing every planned slot, business-requirement fit, naming quality, and architecture outside the diff (listed under `Not assessed by the gate`). Very large diffs emit a warning in `prepare` and the report without pausing for confirmation.
 
 ---
 
@@ -314,8 +302,14 @@ mechanism that blocks completion.
 | Codex, Cursor, and others | `craftsman gate --complete` refuses completion until the ledger passes validation | None (the review is advisory: complete when every hunk is covered, `SELF-REVIEWED`) | None |
 
 The Stop gate runs only in a `/craftsman` session. A `/craft-review` session is held to the review by the
-review guard instead, and the command policy and the search scope guard run on every tool call. Outside a
-Craftsman session the hooks allow everything. After six forced
+review guard instead, and the command policy and the search scope guard run on every tool call. On GitHub Copilot
+(VS Code and Copilot CLI), `PreToolUse` also returns an explicit `"allow"` during an active Craftsman session for
+`craftsman-reviewer` and `craftsman-verifier` subagent launches, safe single-invocation `craftsman` CLI calls without
+expansions or redirections (`skill`, `gate`, `status`, `doctor`, and review subcommands excluding `reset`), and in-scope
+reads by Craftsman subagents — enabling zero-prompt hunter and verifier execution while leaving `craftsman run`,
+`craftsman review reset`, `craftsman hook`, `craftsman install`, arbitrary shell commands, and non-Craftsman subagents
+unapproved. `craftsman doctor` also flags VS Code settings that disable or force prompts on subagents. Outside a
+Craftsman session the hooks allow everything (without auto-approving Copilot tool calls). After six forced
 continuations in a row without fewer open issues (`MAX_CONTINUATIONS`), the stop hook lets the agent
 through and tells the user the gate was not satisfied; the review guard of a `/craft-review` does the same and marks the review `REVIEW ABANDONED - NOT COMPLETE`.
 When a hook fails, the agent continues with a warning that the gate was not checked, and the failure goes to
