@@ -47,17 +47,14 @@ def extract_headings(content: str) -> set[str]:
 
 
 class TestDocsLinks(unittest.TestCase):
-    """Verify link integrity across README files (English and Polish) and all docs/*.md files."""
+    """Verify link integrity across README files and all docs/*.md files."""
 
     def setUp(self) -> None:
         self.repo_root = Path(__file__).resolve().parent.parent
         self.doc_files = [
             self.repo_root / "README.md",
-            self.repo_root / "README.pl.md",
             self.repo_root / "evals" / "README.md",
-            self.repo_root / "evals" / "README.pl.md",
             self.repo_root / "examples" / "demo" / "README.md",
-            self.repo_root / "examples" / "demo" / "README.pl.md",
         ] + sorted((self.repo_root / "docs").rglob("*.md"))
 
     def test_all_links_and_images_valid(self) -> None:

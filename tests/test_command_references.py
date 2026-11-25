@@ -25,7 +25,7 @@ IGNORED_SUBCOMMANDS: frozenset[str] = frozenset()
 IGNORED_FLAGS: frozenset[str] = frozenset()
 
 SCANNED = ("skills", "templates", "rules")
-SCANNED_FILES = ("README.md", "README.pl.md")
+SCANNED_FILES = ("README.md",)
 SCANNED_GLOBS = (("docs", "*.md"),)
 
 _INLINE_RE = re.compile(r"`([^`\n]+)`")
