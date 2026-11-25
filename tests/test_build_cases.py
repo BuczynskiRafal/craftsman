@@ -24,6 +24,7 @@ class BuildCasesIntegrityTests(unittest.TestCase):
         self.assertEqual(build_bench.case_ids(), sorted(EXPECTED_CASES))
 
     def test_all_build_bench_files_use_lf_and_no_bom(self) -> None:
+        assert build_bench.__file__ is not None
         files = [
             Path(build_bench.__file__),
             Path(__file__),
