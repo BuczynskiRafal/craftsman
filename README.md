@@ -1,3 +1,5 @@
+<div align="center">
+
 ![Craftsman](https://raw.githubusercontent.com/BuczynskiRafal/craftsman/main/assets/logo.svg)
 
 # Craftsman
@@ -9,6 +11,8 @@
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/LICENSE)
+
+</div>
 
 Craftsman locks an AI coding agent in a quality loop: **build freely, review hard**. The agent codes normally, and only when it thinks it is done does Craftsman freeze the diff, send fresh-context bug hunters and disproof-oriented verifiers over the change, record verdicts and real test runs under `.git/`, and block completion in platform hooks until confirmed bugs are fixed and tests pass.
 
