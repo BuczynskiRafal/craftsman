@@ -12,7 +12,10 @@ from craftsman.gatecheck import CHEAPER_MODEL_NOTE, SlotState, SlotStatus
 from craftsman.records import Finding, Round, Slot
 from craftsman.text import defang_tokens
 
-LAUNCH_PROMPT = "You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly."
+LAUNCH_PROMPT = (
+    "You are Craftsman hunter <ID>. Execute the CLI shell command `craftsman review brief <ID>` "
+    "(not a file; do not inspect parent session transcripts) and follow it exactly."
+)
 LAUNCH_MECHANICS = (
     "Claude Code: Agent tool, subagent_type craftsman-reviewer. Copilot: custom agent craftsman-reviewer (launch directly without asking).",
     "Antigravity: invoke_subagent with TypeName self and Role craftsman-reviewer.",
@@ -199,10 +202,10 @@ def hunter_brief(
         f'- A candidate defect: craftsman review add --hunter {slot.id} --lens <one of your lenses> --file <path>'
         ' --line <n> --severity <blocker|major|minor|nit> --title "<one line>"'
         ' --scenario "<trigger -> wrong outcome>" --suggestion "<fix>"',
-        f'  Several at once: craftsman review add --from-json - (JSON entries with "hunter": "{slot.id}").',
+        f'  Batch / Windows PowerShell (recommended for multiple records): write JSON to `craftsman review inbox add` path and run `craftsman review add --hunter {slot.id} --from-json <path>` (or include "hunter": "{slot.id}" in each entry; severity: "blocker"|"major"|"minor"|"nit").',
         f'- What you examined: craftsman review cover --hunter {slot.id} --hunks <ids you examined> --note "<what you'
         ' examined and which values you tried, one line>"',
-        f'  Several at once: craftsman review cover --from-json - (entries with "hunter": "{slot.id}").',
+        f'  Batch / Windows PowerShell: write JSON to `craftsman review inbox cover` path and run `craftsman review cover --hunter {slot.id} --from-json <path>` (or `--from-json -`, entries may omit or specify "hunter": "{slot.id}").',
         f"- Every hunk of your slot ({ranges}) must be covered before you finish.",
         "- Never run `craftsman review verdict`, `merge`, `prepare` or `reset`: verifiers judge, the orchestrator"
         " plans. Never change the work tree or the index.",
@@ -301,8 +304,8 @@ def verifier_brief(
         '  craftsman review verdict <ID> --as probable --evidence "static: <file:line chain>" (or "no-repro: <why>; <chain>")',
         '  craftsman review verdict <ID> --as question --evidence "intent: <source says X>; <file:line>"',
         '  craftsman review verdict <ID> --as dismissed --evidence "<guard quoted, file:line>" [--run <R#>]',
-        '  Several at once: craftsman review verdict --from-json - (entries {"id","as","evidence","run"}).',
-        "- If the severity is wrong, start the evidence with `[severity: <new>]` and say why.",
+        '  Batch / Windows PowerShell (recommended for multiple records): write JSON to `craftsman review inbox verdict` path and run `craftsman review verdict --from-json <path>` (entries {"id","as","evidence","run"?,"severity"?}).',
+        "- If the severity is wrong, pass `--severity <blocker|major|minor|nit>` (or JSON `\"severity\"`, or start `--evidence` with `[severity: <new>]`) and explain why in `--evidence`.",
         "- Never edit the work tree or the index; reproductions live in a `craftsman review scratch` directory."
         " Never run `prepare`, `reset`, `add` or `cover`.",
         "",
