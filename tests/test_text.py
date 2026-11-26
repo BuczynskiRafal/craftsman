@@ -343,6 +343,7 @@ RAW_FIELDS: frozenset[str] = frozenset(
         "Finding.by",
         "Finding.verdict_log",
         "Finding.merged_into",
+        "Finding.original_severity",
         "HuntPlan.reasons",
         "HuntPlan.slots",
         "HuntPlan.waves",

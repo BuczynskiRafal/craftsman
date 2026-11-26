@@ -55,6 +55,7 @@ from craftsman.records import (
     VerdictEvent,
     format_timestamp,
     next_id,
+    parse_severity_marker,
     scope_contains,
 )
 from craftsman.text import one_line
@@ -790,23 +791,33 @@ def merge_findings(
     suggestion: str | None = None,
     by: str | None = None,
 ) -> tuple[Ledger, Finding, tuple[Finding, ...]]:
-    """Fold duplicate findings that share a root cause into `target_id` before verification.
+    """Fold unjudged duplicate findings that share a root cause into `target_id`.
 
-    Each duplicate is dismissed with a verdict event of its own, so the merge has a token (`V<k>`)
-    that a verifier run can be shown to have printed. Merges do not chain, so a duplicate that already
-    has duplicates folded into it takes them along: they are re-pointed at `target_id`, each with a new
-    event of its own, and returned after the named duplicates.
+    `target_id` may be unjudged or already judged `proven`/`probable` (if judged, its text and
+    severity stay untouched, so `--title`, `--scenario`, and `--suggestion` are rejected). Each
+    duplicate is dismissed with a verdict event of its own (`V<k>`) so a verifier run can vouch for
+    it. Merges do not chain, so a duplicate that already has duplicates folded into it takes them
+    along: they are re-pointed at `target_id`, each with a new event of its own, and returned after
+    the named duplicates.
     """
     target, duplicates = _mergeable(ledger, target_id, duplicate_ids)
+    if target.verdict is not None and any(val is not None for val in (title, scenario, suggestion)):
+        raise LedgerError(
+            f"cannot rewrite {target.id}'s title, scenario, or suggestion because it already has the "
+            f"verdict {target.verdict}; omit those flags to fold duplicates into it"
+        )
     now = _now()
-    updated_target = replace(
-        target,
-        severity=min((item.severity for item in (target, *duplicates)), key=SEVERITIES.index),
-        title=target.title if title is None else one_line(title),
-        scenario=_merged_scenario(target, duplicates) if scenario is None else one_line(scenario),
-        suggestion=_merged_suggestion(target, duplicates) if suggestion is None else one_line(suggestion),
-        updated_at=now,
-    )
+    if target.verdict is None:
+        updated_target = replace(
+            target,
+            severity=min((item.severity for item in (target, *duplicates)), key=SEVERITIES.index),
+            title=target.title if title is None else one_line(title),
+            scenario=_merged_scenario(target, duplicates) if scenario is None else one_line(scenario),
+            suggestion=_merged_suggestion(target, duplicates) if suggestion is None else one_line(suggestion),
+            updated_at=now,
+        )
+    else:
+        updated_target = target
     evidence = f"{GROUPED_EVIDENCE_PREFIX}{target.id} ({target.path}:{target.line}): same root cause."
     first_token = int(next_verdict_token(ledger)[1:])
     # Duplicates already folded into a duplicate follow it to the new target: merges do not chain.
@@ -862,8 +873,11 @@ def _mergeable(
             f"{target_id} was merged into {target.merged_into}; merge into {target.merged_into} instead "
             "(merges do not chain)"
         )
-    if target.verdict is not None:
-        raise LedgerError(_not_mergeable(target))
+    if target.verdict not in (None, "proven", "probable"):
+        raise LedgerError(
+            f"cannot merge into {target.id}: target has verdict {target.verdict} "
+            "(only unjudged, proven, or probable findings can be merge targets)"
+        )
     for dup in duplicates:
         # Recording a merge again is allowed so that a verifier can vouch for a merge someone else made.
         if dup.verdict is not None and dup.merged_into != target_id:
@@ -873,7 +887,7 @@ def _mergeable(
 
 def _not_mergeable(item: Finding) -> str:
     return (
-        "merge only works on findings without a verdict (before verification); "
+        "merge only folds duplicate findings without a verdict; "
         f"{item.id} already has the verdict {item.verdict}"
     )
 
@@ -921,13 +935,15 @@ def set_verdict(
     evidence: str,
     run_id: str | None,
     *,
+    severity: Severity | None = None,
     by: str | None = None,
 ) -> tuple[Ledger, Finding]:
     """Record an independent verdict; the latest verdict wins and a non-defect verdict drops any resolution.
 
     Every call appends a `VerdictEvent`; its token is `finding.verdict_log[-1].token`. A merged
     duplicate stays merged when it is dismissed; any other verdict un-merges it, because whoever
-    judged it found it is not a duplicate.
+    judged it found it is not a duplicate. A leading `[severity: <level>]` marker in `evidence` or an
+    explicit `severity` updates `finding.severity` and preserves `finding.original_severity`.
     """
     flat = one_line(evidence)  # what is stored, so the reservation holds for any spelling of the space
     if flat.startswith(GROUPED_EVIDENCE_PREFIX):
@@ -936,7 +952,16 @@ def set_verdict(
             f"must not start with '{GROUPED_EVIDENCE_PREFIX}': that wording is reserved for "
             "`craftsman review merge`",
         )
+    marker_severity = parse_severity_marker(flat)
+    if severity is not None and marker_severity is not None and severity != marker_severity:
+        raise FieldError(
+            "severity",
+            f"--severity {severity} conflicts with [severity: {marker_severity}] in evidence",
+        )
     finding = _find(ledger, finding_id)
+    effective_severity: Severity = severity or marker_severity or finding.severity
+    baseline = finding.original_severity if finding.original_severity is not None else finding.severity
+    new_original: Severity | None = None if effective_severity == baseline else baseline
     if run_id is not None:
         run = _find_run(ledger, run_id)
         if is_trivial_run(run.argv, run.kind):
@@ -950,6 +975,8 @@ def set_verdict(
     event = VerdictEvent(next_verdict_token(ledger), verdict, now, by)
     updated = replace(
         finding,
+        severity=effective_severity,
+        original_severity=new_original,
         verdict=verdict,
         verdict_log=(*finding.verdict_log, event),
         verdict_evidence=flat,
