@@ -20,6 +20,7 @@ from craftsman.agy_sync import (
     observe_runs,
     start_time,
     sync_antigravity_runs,
+    sync_floor,
     sync_from_stop,
 )
 from craftsman.attribution import agent_runs
@@ -559,6 +560,39 @@ class CommandSyncTests(SyncTestCase):
         save(self.ledger_path, load(self.ledger_path))
 
         self.assertEqual(len(agent_runs(load(self.ledger_path))), 1)
+
+    def test_sync_floor_and_observe_runs_skip_pre_round_launches(self) -> None:
+        self.assertIsNone(sync_floor(Ledger()))
+        ledger = hunt_ledger()
+        ledger = replace(ledger, rounds=(replace(ledger.rounds[0], prepared_at=at(2)),))
+        self.assertEqual(sync_floor(ledger), parse_timestamp(at(2)).replace(microsecond=0))
+
+        self.app.write_transcript(
+            MAIN,
+            user_input(0, "/craft-review", 0),
+            *launch_reviewers(1, "old-sub", at=1),
+            *launch_reviewers(2, "same-sec", at=2),
+            *launch_reviewers(3, "new-sub", at=5),
+        )
+        self.app.write_subagent(MAIN, "old-sub", planner(1, at=1))
+        self.app.write_subagent(MAIN, "same-sec", planner(1, at=3))
+        self.app.write_subagent(MAIN, "new-sub", planner(1, at=6))
+
+        with unittest.mock.patch(
+            "craftsman.agy_sync.subagent_finish", wraps=agy_sync.subagent_finish
+        ) as finish_spy:
+            observed = observe_runs(
+                self.app.root, MAIN, since=sync_floor(ledger), keep_ids={"kept-sub"}
+            )
+        self.assertEqual([run.launch.conversation_id for run in observed], ["same-sec", "new-sub"])
+        called_ids = [call.args[1] for call in finish_spy.call_args_list]
+        self.assertEqual(called_ids, ["same-sec", "new-sub"])
+
+        # Pre-round launches are also filtered in apply_runs even when passed directly; same-second kept.
+        unfiltered = observe_runs(self.app.root, MAIN)
+        applied = apply_runs(ledger, unfiltered)
+        recorded_ids = sorted({event.agent_id for event in applied.agents})
+        self.assertEqual(recorded_ids, ["new-sub", "same-sec"])
 
 
 class TimeAxisTests(unittest.TestCase):

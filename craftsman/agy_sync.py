@@ -22,13 +22,14 @@ tell, the nudge has milliseconds and the transcript whole seconds) or when it wa
 from __future__ import annotations
 
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Final
 
-from craftsman.ledger import ledger_path_for, mutate
+from craftsman.ledger import ledger_path_for, load, mutate
 from craftsman.records import (
     REVIEWER_AGENT,
     VERIFIER_AGENT,
@@ -93,16 +94,40 @@ def main_conversation(app_dir: Path, conversation_id: str, transcript: Path | No
     return current
 
 
-def observe_runs(app_dir: Path, main_id: str, transcript: Path | None = None) -> tuple[ObservedRun, ...]:
+def sync_floor(ledger: Ledger) -> datetime | None:
+    """Earliest whole-second launch timestamp that can belong to `ledger`, or None before round 1."""
+    if not ledger.rounds:
+        return None
+    return parse_timestamp(ledger.rounds[0].prepared_at).replace(microsecond=0)
+
+
+def observe_runs(
+    app_dir: Path,
+    main_id: str,
+    transcript: Path | None = None,
+    *,
+    since: datetime | None = None,
+    keep_ids: AbstractSet[str] = frozenset(),
+) -> tuple[ObservedRun, ...]:
     """The Craftsman subagents `main_id` launched and where each stands. Reads transcripts only; raises
     `TranscriptError` when the main transcript cannot be read, or when a step that may hold a launch was cut from
     its compact form and `transcript_full.jsonl` cannot give it back (a missing, oversized or unreadable full file):
-    a launch that cannot be seen is a problem for the caller to report, never "no launch"."""
+    a launch that cannot be seen is a problem for the caller to report, never "no launch".
+
+    When `since` is given, launches strictly before `since` whose conversation id is not in `keep_ids` are
+    skipped without reading their subagent transcripts.
+    """
     entries = read_transcript_entries(transcript or conversation_transcript(app_dir, main_id), restore=True)
-    return tuple(
-        ObservedRun(launch, subagent_finish(app_dir, launch.conversation_id, main_id))
-        for launch in subagent_launches(entries)
-    )
+    runs: list[ObservedRun] = []
+    for launch in subagent_launches(entries):
+        if (
+            since is not None
+            and launch.conversation_id not in keep_ids
+            and parse_timestamp(launch.launched_at) < since
+        ):
+            continue
+        runs.append(ObservedRun(launch, subagent_finish(app_dir, launch.conversation_id, main_id)))
+    return tuple(runs)
 
 
 # --- the events of a run ------------------------------------------------------------------------------
@@ -166,15 +191,21 @@ def _is_run_event(event: AgentEvent, conversation_id: str) -> bool:
     return event.platform == PLATFORM and event.agent_id == conversation_id and event.event in ("start", "stop")
 
 
-def apply_runs(ledger: Ledger, runs: tuple[ObservedRun, ...]) -> Ledger:
+def apply_runs(ledger: Ledger, runs: Sequence[ObservedRun]) -> Ledger:
     """`ledger` with the start and stop events of `runs` as the transcripts show them.
 
     The earlier start and stop events of a run are replaced (a resumed subagent stops later); a run whose events
-    are already as they should be is left where it is. A `nudge` is never touched.
+    are already as they should be is left where it is. Runs launched before round 1 was prepared (and not already
+    recorded in the ledger) are ignored so older runs from the same conversation do not pollute a new campaign.
+    A `nudge` is never touched.
     """
+    floor = parse_timestamp(ledger.rounds[0].prepared_at) if ledger.rounds else None
+    known_ids = {event.agent_id for event in ledger.agents if event.agent_id}
     for run in runs:
-        wanted = events_of(ledger, run)
         id_ = run.launch.conversation_id
+        if floor is not None and id_ not in known_ids and start_time(ledger, run.launch.launched_at) < floor:
+            continue
+        wanted = events_of(ledger, run)
         recorded = tuple(event for event in ledger.agents if _is_run_event(event, id_))
         if recorded != wanted:
             others = tuple(event for event in ledger.agents if not _is_run_event(event, id_))
@@ -188,10 +219,19 @@ def apply_runs(ledger: Ledger, runs: tuple[ObservedRun, ...]) -> Ledger:
 def sync_from_stop(root: Path, app_dir: Path, conversation_id: str, transcript: Path | None = None) -> None:
     """Record the runs the conversation of `conversation_id` (or the main one it belongs to) launched, in one
     ledger update. Raises on a transcript or a ledger that cannot be read: the Stop hook reports and goes on."""
+    ledger_path = ledger_path_for(root)
+    current = load(ledger_path)
+    keep_ids = {event.agent_id for event in current.agents if event.agent_id}
     main_id = main_conversation(app_dir, conversation_id, transcript)
-    runs = observe_runs(app_dir, main_id, transcript if main_id == conversation_id else None)
+    runs = observe_runs(
+        app_dir,
+        main_id,
+        transcript if main_id == conversation_id else None,
+        since=sync_floor(current),
+        keep_ids=keep_ids,
+    )
     if runs:
-        mutate(ledger_path_for(root), lambda ledger: (apply_runs(ledger, runs), None))
+        mutate(ledger_path, lambda ledger: (apply_runs(ledger, runs), None))
 
 
 def sync_antigravity_runs(ws: Workspace, env: Mapping[str, str]) -> None:
