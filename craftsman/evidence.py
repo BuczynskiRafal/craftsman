@@ -7,12 +7,14 @@ so that `craftsman.gate` can depend on it.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import secrets
 import shutil
 import stat
 import sys
+import tempfile
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -29,6 +31,7 @@ from craftsman.records import IsolationEvidence, Ledger, LedgerError
 PACKET_GLOB = "packet-*.md"
 INBOX_DIRNAME = "inbox"
 SCRATCH_DIRNAME = "scratch"
+SCRATCH_ROOT_ENV = "CRAFTSMAN_SCRATCH_ROOT"
 InboxKind = Literal["cover", "add", "verdict"]
 INBOX_KINDS: tuple[InboxKind, ...] = get_args(InboxKind)
 KEEP_ARCHIVES_ENV = "CRAFTSMAN_KEEP_ARCHIVES"
@@ -216,24 +219,68 @@ def prune_inbox_files(craftsman_dir: Path) -> tuple[Path, ...]:
     return tuple(pruned)
 
 
+def _posix_uid() -> int | None:
+    """Current POSIX user ID, or `None` on Windows (`mypy` narrows platforms only on `sys.platform`)."""
+    return None if sys.platform == "win32" else os.getuid()
+
+
+def _scratch_base() -> Path:
+    override = os.environ.get(SCRATCH_ROOT_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    uid = _posix_uid()
+    if uid is not None:
+        tag = str(uid)
+    else:
+        raw = os.environ.get("USERNAME") or os.environ.get("USER") or "user"
+        tag = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-") or "user"
+    return Path(tempfile.gettempdir()) / f"craftsman-scratch-{tag}"
+
+
+def _scratch_bucket(craftsman_dir: Path) -> str:
+    try:
+        resolved = craftsman_dir.resolve()
+    except OSError:
+        resolved = craftsman_dir
+    key = os.path.normcase(str(resolved))
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
 def scratch_dir_for(craftsman_dir: Path) -> Path:
-    return craftsman_dir / SCRATCH_DIRNAME
+    """The external managed scratch root for `craftsman_dir` (outside the repository tree)."""
+    return _scratch_base() / _scratch_bucket(craftsman_dir)
+
+
+def _require_safe_scratch_dir(path: Path, *, action: str = "use") -> None:
+    _require_real_folder(path, action=action)
+    uid = _posix_uid()
+    if uid is not None and path.exists():
+        try:
+            st = os.lstat(path)
+        except OSError as exc:
+            raise LedgerError(f"cannot inspect scratch directory {path}: {exc}") from exc
+        if st.st_uid != uid:
+            raise LedgerError(f"refusing to {action} scratch directory {path}: owned by another user")
 
 
 def _prepare_scratch_dir(craftsman_dir: Path) -> Path:
     _require_real_folder(craftsman_dir, action="use")
-    scratch_dir = scratch_dir_for(craftsman_dir)
-    _require_real_folder(scratch_dir, action="use")
+    base = _scratch_base()
+    scratch_dir = base / _scratch_bucket(craftsman_dir)
+    _require_safe_scratch_dir(base)
     try:
-        craftsman_dir.mkdir(parents=True, exist_ok=True)
-        scratch_dir.mkdir(exist_ok=True)
+        base.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _require_safe_scratch_dir(base)
+        _require_safe_scratch_dir(scratch_dir)
+        scratch_dir.mkdir(mode=0o700, exist_ok=True)
+        _require_safe_scratch_dir(scratch_dir)
     except OSError as exc:
         raise LedgerError(f"cannot create scratch directory {scratch_dir}: {exc}") from exc
     return scratch_dir
 
 
 def create_scratch_dir(craftsman_dir: Path) -> Path:
-    """Create a unique managed scratch directory under `craftsman_dir/scratch/<id>/`."""
+    """Create a unique managed scratch directory outside the repository for repro scripts."""
     scratch_dir = _prepare_scratch_dir(craftsman_dir)
     for _ in range(_MAX_SCRATCH_ATTEMPTS):
         token = secrets.token_hex(6)
@@ -294,25 +341,24 @@ def _retry_writable(func: Callable[..., Any], path: str, error: Any) -> None:
     func(path)
 
 
-def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
-    """Delete all scratch directories under `craftsman_dir/scratch` and remove the folder if empty."""
-    if _is_symlink_or_junction(craftsman_dir):
-        _warn_scratch(f"could not prune symlinked directory {craftsman_dir}")
-        return ()
-    scratch_dir = craftsman_dir / SCRATCH_DIRNAME
+def _prune_scratch_root(scratch_dir: Path, *, check_owner: bool) -> list[Path]:
     if _is_symlink_or_junction(scratch_dir):
         _warn_scratch(f"could not prune symlinked scratch directory {scratch_dir}")
-        return ()
+        return []
     try:
         if not scratch_dir.exists():
-            return ()
+            return []
         if not scratch_dir.is_dir():
             _warn_scratch(f"could not prune scratch {scratch_dir}: not a directory")
-            return ()
+            return []
+        uid = _posix_uid()
+        if check_owner and uid is not None and os.lstat(scratch_dir).st_uid != uid:
+            _warn_scratch(f"could not prune scratch {scratch_dir}: owned by another user")
+            return []
         entries = sorted(scratch_dir.iterdir(), key=lambda item: item.name)
     except OSError as exc:
         _warn_scratch(f"could not prune scratch {scratch_dir}: {exc}")
-        return ()
+        return []
     pruned: list[Path] = []
     for entry in entries:
         try:
@@ -335,6 +381,16 @@ def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
         pruned.append(entry)
     with suppress(OSError):
         scratch_dir.rmdir()
+    return pruned
+
+
+def prune_scratch_dirs(craftsman_dir: Path) -> tuple[Path, ...]:
+    """Delete external and legacy scratch directories associated with `craftsman_dir`."""
+    pruned = _prune_scratch_root(scratch_dir_for(craftsman_dir), check_owner=True)
+    if _is_symlink_or_junction(craftsman_dir):
+        _warn_scratch(f"could not prune symlinked directory {craftsman_dir}")
+        return tuple(pruned)
+    pruned.extend(_prune_scratch_root(craftsman_dir / SCRATCH_DIRNAME, check_owner=False))
     return tuple(pruned)
 
 

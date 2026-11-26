@@ -34,6 +34,7 @@ from craftsman.agy_sync import main_conversation
 from craftsman.antigravity import app_dir, session_id, sync_marker_from_user_input
 from craftsman.command_policy import PolicyContext, decide, default_transcript_roots, tool_call
 from craftsman.diffscan import DiffScanError, git_time_left, note_git_timeout, worktree_root
+from craftsman.evidence import scratch_dir_for
 from craftsman.gate import GateOwner, GateStateError, load_state, owns_active_gate, state_path_for
 from craftsman.ledger import ledger_path_for
 from craftsman.paths import user_home
@@ -290,7 +291,14 @@ def _check_target(
     resolved_extras = tuple(d.resolve() for d in policy.allowed_dirs)
     git_scope = _worktree_git_scope(resolved_repo)
     resolved = candidate.resolve()
+    own_scratch = (
+        scratch_dir_for(git_scope.own_craftsman_dir).resolve()
+        if git_scope.own_craftsman_dir is not None
+        else None
+    )
     if git_scope.own_craftsman_dir is not None and _is_within(resolved, git_scope.own_craftsman_dir):
+        return ScopeDecision("allow")
+    if own_scratch is not None and _is_within(resolved, own_scratch):
         return ScopeDecision("allow")
     if any(_is_within(resolved, d) for d in git_scope.forbidden_git_dirs):
         return _deny(label, "belongs to another git worktree")
@@ -307,6 +315,7 @@ def _check_target(
         resolved_repo,
         *resolved_extras,
         *((git_scope.own_craftsman_dir,) if git_scope.own_craftsman_dir else ()),
+        *((own_scratch,) if own_scratch is not None else ()),
     )
     if _is_in_other_git_repo(resolved, allowed_roots):
         return _deny(label, "belongs to another git repository")

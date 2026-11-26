@@ -1244,5 +1244,30 @@ class ScopeEnforcementTests(unittest.TestCase):
         self.assertIn("[CRAFTSMAN SCOPE-GUARD]", script_out["reason"])
 
 
+class ExternalScratchScopeTests(unittest.TestCase):
+    def test_managed_external_scratch_dir_is_allowed_for_reads_and_recursive_searches(self) -> None:
+        from craftsman.evidence import create_scratch_dir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+            craftsman_dir = repo / ".git" / "craftsman"
+            craftsman_dir.mkdir(parents=True, exist_ok=True)
+            scratch_root = root / "external-scratch"
+            with mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(scratch_root)}):
+                scratch_dir = create_scratch_dir(craftsman_dir)
+                script = scratch_dir / "repro.py"
+                script.write_text("print('ok')\n", encoding="utf-8")
+                policy = ScopePolicy(mode="deny")
+                read_dec = evaluate_scope("Read", {"file_path": str(script)}, repo, repo, policy)
+                search_dec = evaluate_scope(
+                    "Bash", {"command": f"grep -rn ok {scratch_dir}"}, repo, repo, policy
+                )
+                self.assertEqual(read_dec.decision, "allow", read_dec.reason)
+                self.assertEqual(search_dec.decision, "allow", search_dec.reason)
+
+
 if __name__ == "__main__":
     unittest.main()
