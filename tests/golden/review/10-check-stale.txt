@@ -15,4 +15,5 @@ Runs: 2 recorded; latest: R1 repro `<PY> …` exit 0 (stale), R2 test `<PY> …`
 **Warnings**
 - 1 finding for the author: F1.
 - Accepted without a fix: F3; tell the user about them.
+- Advisory dismissal(s) of blocker/major findings without a second opinion or run: F2.
 --- stderr

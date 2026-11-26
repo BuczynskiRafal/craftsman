@@ -76,6 +76,8 @@ from craftsman.records import (
 
 DEEP_MIN_PRODUCTION_LINES = 251
 SLICE_MAX_CHANGED_LINES = 400
+LARGE_DIFF_LINES = 1200
+LARGE_SLICE_MAX_CHANGED_LINES = 600
 DELTA_MAX_CHANGED_LINES = 40
 DELTA_MAX_PRODUCTION_LINES = 80
 MAX_GENERATION_NORMAL = 2
@@ -96,6 +98,10 @@ AFFINITY_GROUPS = (
     ("contracts", "failure"),
     ("state", "platform"),
     ("trust", "model"),
+)
+LARGE_DIFF_AFFINITY_GROUPS = (
+    ("intent", "contracts", "failure", "ripple", "tests"),
+    ("state", "trust", "platform", "model"),
 )
 FRESH_DEFAULT_LENSES = ("intent", "contracts", "failure")
 _SWEEP_HOST_MAX_LENSES = 3  # a core slot with fewer lenses than this takes the sweep along
@@ -378,8 +384,10 @@ def _unit_refs(refs: Sequence[HunkRef]) -> list[_Unit]:
     ]
 
 
-def _slices(units: Sequence[_Unit], *, reverse: bool = False) -> list[list[_Unit]]:
-    """Pack hunks into slices of at most `SLICE_MAX_CHANGED_LINES` changed lines, whole files first.
+def _slices(
+    units: Sequence[_Unit], *, reverse: bool = False, max_lines: int = SLICE_MAX_CHANGED_LINES
+) -> list[list[_Unit]]:
+    """Pack hunks into slices of at most `max_lines` changed lines, whole files first.
 
     A file that fits stays in one slice; a file over the budget is split between its hunks; one hunk
     over the budget is a slice of its own; a hunk with no changed lines joins whichever slice it falls
@@ -401,18 +409,18 @@ def _slices(units: Sequence[_Unit], *, reverse: bool = False) -> list[list[_Unit
 
     for members in files.values():
         total = sum(unit.weight for unit in members)
-        if total <= SLICE_MAX_CHANGED_LINES:
-            if used + total > SLICE_MAX_CHANGED_LINES:
+        if total <= max_lines:
+            if used + total > max_lines:
                 close()
             current.extend(members)
             used += total
             continue
         for unit in members:
-            if unit.weight > SLICE_MAX_CHANGED_LINES:
+            if unit.weight > max_lines:
                 close()
                 slices.append([unit])
                 continue
-            if used + unit.weight > SLICE_MAX_CHANGED_LINES:
+            if used + unit.weight > max_lines:
                 close()
             current.append(unit)
             used += unit.weight
@@ -452,6 +460,7 @@ def _fresh_set(
     lenses_for: Callable[[int, frozenset[str]], tuple[str, ...]],
     *,
     first: int = 1,
+    max_lines: int = SLICE_MAX_CHANGED_LINES,
 ) -> list[Slot]:
     """The fresh slots `W<generation>-X<j>`: the same packing as the plan, walked from the other end.
 
@@ -460,7 +469,7 @@ def _fresh_set(
     `first` (a top-up continues after the slots a set already has).
     """
     slots: list[Slot] = []
-    for j, part in enumerate(_slices(units, reverse=True), first):
+    for j, part in enumerate(_slices(units, reverse=True, max_lines=max_lines), first):
         ids = tuple(unit.id for unit in part)
         slots.append(
             Slot(
@@ -557,13 +566,17 @@ def build_plan(
         for slot in pending
     ]
     fresh: list[Slot] = []
+    scope_prod_lines = sum(weight[hunk.id] for hunk in scope if is_production_hunk(hunk))
+    fresh_max_lines = LARGE_SLICE_MAX_CHANGED_LINES if scope_prod_lines > LARGE_DIFF_LINES else SLICE_MAX_CHANGED_LINES
     if depth.deep and first_deep_round:
         held = [slot for slot in (*kept, *pending) if slot.kind == "fresh" and slot.generation == 2]
         listed = {hunk_id for slot in held for hunk_id in slot.hunks}
         uncovered = [unit for unit in _units(scope) if not unit.docs and unit.id not in listed]
         if uncovered:  # the static set spans the whole scope, whatever a wave stored before it
             first = max((_slot_number(slot.id) for slot in held), default=0) + 1
-            fresh = _fresh_set(uncovered, 2, "deep", None, lambda _, ids: complement(ids), first=first)
+            fresh = _fresh_set(
+                uncovered, 2, "deep", None, lambda _, ids: complement(ids), first=first, max_lines=fresh_max_lines
+            )
     reasons = tuple(dict.fromkeys((*(existing.reasons if existing is not None else ()), *depth.reasons)))
     waves = existing.waves if existing is not None else ()
     return HuntPlan(reasons=reasons, slots=(*kept, *new, *fresh, *pending), waves=waves)
@@ -626,11 +639,14 @@ def _generation_one(
             or (new_prod_lines <= DELTA_MAX_CHANGED_LINES and bool(new_deep_signals))
         )
     )
+    taking_prod_lines = sum(weight[hunk.id] for hunk in taking if is_production_hunk(hunk))
+    large_diff = not delta and taking_prod_lines > LARGE_DIFF_LINES
+    slice_budget = LARGE_SLICE_MAX_CHANGED_LINES if large_diff else SLICE_MAX_CHANGED_LINES
     if delta and sum(weight[hunk.id] for hunk in taking) <= SLICE_MAX_CHANGED_LINES:
         parts = [list(taking)]
     else:
         by_id = {hunk.id: hunk for hunk in taking}
-        parts = [[by_id[unit.id] for unit in part] for part in _slices(_units(taking))]
+        parts = [[by_id[unit.id] for unit in part] for part in _slices(_units(taking), max_lines=slice_budget)]
     for part in parts:
         if all(docs[hunk.id] for hunk in part):
             lenses = listed(part, DOCS_LENSES)
@@ -638,6 +654,8 @@ def _generation_one(
             continue
         if delta:
             groups: Sequence[Sequence[str]] = (BUG_LENSES,)
+        elif large_diff:
+            groups = LARGE_DIFF_AFFINITY_GROUPS
         else:
             groups = AFFINITY_GROUPS
         for group in groups:
@@ -1057,6 +1075,10 @@ def _store_wave(ledger: Ledger, state: _WaveState, g: int, triggers: Sequence[Fi
     return _with_wave(ledger, latest, Wave(target, planned_at, considered, tuple(slot.id for slot in adding)), adding)
 
 
+def _fresh_budget(units: Sequence[_Unit]) -> int:
+    return LARGE_SLICE_MAX_CHANGED_LINES if sum(unit.weight for unit in units) > LARGE_DIFF_LINES else SLICE_MAX_CHANGED_LINES
+
+
 def _fresh_slots(
     state: _WaveState,
     plan: HuntPlan,
@@ -1104,6 +1126,7 @@ def _fresh_slots(
         planned_at,
         lambda _, ids: _complement(ids, generation_one, examined),
         first=max((_slot_number(slot.id) for slot in stored), default=0) + 1,
+        max_lines=_fresh_budget(units),
     )
 
 
@@ -1245,6 +1268,7 @@ def _rebuild_waves(
                 originals[0].trigger or "deep",
                 _latest_since(originals),
                 lambda _, __: FRESH_DEFAULT_LENSES,  # a placeholder: `build_plan` complements the new round's lenses
+                max_lines=_fresh_budget(code_round),
             )
         )
     return sorted(rebuilt, key=_wave_order)

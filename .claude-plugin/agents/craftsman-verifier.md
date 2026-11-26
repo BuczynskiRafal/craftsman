@@ -17,8 +17,8 @@ or `cover`: you judge, the orchestrator plans, hunters hunt.
 
 ## Assignment
 
-The message that started you gives the finding ids to judge, for example `F1,F2`. **Run
-`craftsman review brief --verifier <IDS>` first and follow it exactly** (if you read this inside its
+The message that started you gives the finding ids to judge, for example `F1,F2`. **Execute the CLI shell command
+`craftsman review brief --verifier <IDS>` first (not a file; do not inspect parent session transcripts) and follow it exactly** (if you read this inside its
 output, you already did). It records nothing and prints the task (what the change must do), the base
 ref `<base>`, each finding with `file:line`, severity, lens and scenario, and the verdict commands.
 This definition holds the standing rules for judging; the brief wins wherever they differ.
@@ -43,8 +43,9 @@ the fix diff: say fixed or not, with evidence (a `--run` or a quoted line).
 1. **Merge duplicates first**, only when one fix removes every consequence; different fixes are
    separate findings even on the same line:
    `craftsman review merge F1 F4 --scenario "<root cause -> (1) effect A; (2) effect B>"`
-   (works only before a verdict). A duplicate of an already judged finding is `dismissed` with a
-   reference to its `file:line`.
+   (works for unjudged targets, and without `--title`/`--scenario`/`--suggestion` also folds
+   unjudged duplicates into an already `proven` or `probable` finding). A duplicate of a
+   `dismissed` or `question` finding stays `dismissed` with a reference to its `file:line`.
 2. **Re-read the code yourself** for each finding; do not trust its description. Then try to break
    it: a guard that makes the trigger impossible (caller check, type, validation on load,
    framework guarantee), unreachability (no real caller produces the input or state), a misreading
@@ -60,8 +61,9 @@ the fix diff: say fixed or not, with evidence (a `--run` or a quoted line).
    not disproved by one pass on this machine. Dismiss only with a deterministic guard quoted with
    `file:line`, or a run that forces the condition and passes; otherwise `probable` with
    `no-repro:`.
-5. If the severity is wrong, start the evidence with `[severity: <new>]` and say why; the
-   orchestrator decides.
+5. If the severity is wrong, pass `--severity <blocker|major|minor|nit>` (or `"severity"` in `--from-json`,
+   or start `--evidence` with `[severity: <new>]`) and explain why in `--evidence`; `finding.severity`
+   is updated and the original severity is kept as `original_severity`.
 
 ## Verdicts
 

@@ -17,11 +17,15 @@ from craftsman.diffscan import Hunk
 from craftsman.diffscan_paths import is_config_path
 from craftsman.gatecheck import slot_statuses
 from craftsman.huntplan import (
+    AFFINITY_GROUPS,
     BUG_LENSES,
     DEEP_MIN_PRODUCTION_LINES,
     DELTA_MAX_CHANGED_LINES,
     DELTA_MAX_PRODUCTION_LINES,
     FRESH_DEFAULT_LENSES,
+    LARGE_DIFF_AFFINITY_GROUPS,
+    LARGE_DIFF_LINES,
+    LARGE_SLICE_MAX_CHANGED_LINES,
     MAX_GENERATION_NORMAL,
     MAX_VARIANTS_PER_WAVE,
     MAX_VARIANTS_PER_WAVE_NORMAL,
@@ -3722,6 +3726,46 @@ class ReopenedWaveScopingTests(unittest.TestCase):
         fresh = plan.slot("W2-X1")
         assert fresh is not None
         self.assertEqual(fresh.hunks, ("H2",))
+
+
+class LargeDiffScalingTests(unittest.TestCase):
+    def test_large_diff_affinity_groups_cover_all_bug_lenses(self) -> None:
+        flat = [lens for group in LARGE_DIFF_AFFINITY_GROUPS for lens in group]
+        self.assertEqual(len(flat), len(set(flat)))
+        self.assertEqual(set(flat), set(BUG_LENSES))
+        self.assertEqual(len(AFFINITY_GROUPS), 4)
+        self.assertEqual(len(LARGE_DIFF_AFFINITY_GROUPS), 2)
+
+    def test_diffs_at_or_below_threshold_keep_four_groups_and_400_line_slices(self) -> None:
+        hunks = [code("H1", "a.py", 500), code("H2", "b.py", 500)]
+        plan = plan_of(hunks, deep=True)
+        gen1_bug = [slot for slot in plan.slots if slot.generation == 1 and slot.kind == "bug"]
+        # 2 slices x 4 affinity groups = 8 bug slots
+        self.assertEqual(len(gen1_bug), 8)
+        self.assertLessEqual(len(hunks) * 500, LARGE_DIFF_LINES)
+
+    def test_diffs_over_threshold_scale_to_600_line_slices_and_two_affinity_groups(self) -> None:
+        # 1350 production lines total across 3 files of 450 lines each -> 3 slices at 600-line budget,
+        # 2 affinity groups per slice = 6 bug slots (instead of 3 x 4 = 12) + simplicity + sweep + fresh.
+        hunks = [code("H1", "a.py", 450), code("H2", "b.py", 450), code("H3", "c.py", 450)]
+        plan = plan_of(hunks, deep=True, first_deep=True)
+        gen1_bug = [slot for slot in plan.slots if slot.generation == 1 and slot.kind == "bug"]
+        self.assertEqual(len(gen1_bug), 6)
+        covered_lenses = {lens for slot in gen1_bug for lens in slot.lenses}
+        self.assertTrue(set(BUG_LENSES) <= covered_lenses)
+        # Paired two files of 280 lines each should fit in a single 600-line slice when >1200 total.
+        packed = [
+            code("H1", "f1.py", 280),
+            code("H2", "f2.py", 280),
+            code("H3", "f3.py", 280),
+            code("H4", "f4.py", 280),
+            code("H5", "f5.py", 280),
+        ]  # 1400 > LARGE_DIFF_LINES
+        packed_plan = plan_of(packed, deep=True, first_deep=True)
+        bug_slices = {slot.hunks for slot in packed_plan.slots if slot.generation == 1 and slot.kind == "bug"}
+        self.assertEqual(bug_slices, {("H1", "H2"), ("H3", "H4"), ("H5",)})
+        self.assertEqual(max(slot.changed_lines for slot in packed_plan.slots if slot.kind == "fresh"), 560)
+        self.assertLessEqual(560, LARGE_SLICE_MAX_CHANGED_LINES)
 
 
 if __name__ == "__main__":

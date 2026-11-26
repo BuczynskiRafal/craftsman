@@ -78,6 +78,11 @@ def _add_prepare_parser(sub: Any, common: argparse.ArgumentParser, handlers: Map
         action="store_true",
         help="Freeze the review scope to tracked files changed since the base (omit untracked files)",
     )
+    prepare.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview scope, depth, and hunt plan without writing to the ledger or packets",
+    )
     prepare.set_defaults(handler=handlers["prepare"])
 
 
@@ -97,7 +102,12 @@ def _add_view_and_cover_parsers(sub: Any, common: argparse.ArgumentParser, handl
             "it defines and up to 3 tests; for a symbol name, its definitions, references and tests."
         ),
     )
-    scout.add_argument("target", metavar="TARGET", help="H3, H3-H5, H3,H7, path:line or a symbol name")
+    scout.add_argument(
+        "targets",
+        nargs="+",
+        metavar="TARGET",
+        help="Hunk ids (H3, H3-H5, H3,H7, or H3 H4 H5), path:line or a symbol name",
+    )
     scout.add_argument(
         "--base", help="Revision the base version comes from (default: the round's base, else HEAD)"
     )
@@ -177,9 +187,9 @@ def _add_merge_and_verdict_parsers(sub: Any, common: argparse.ArgumentParser, ha
         parents=[common],
         help="Group duplicate findings into one root-cause finding (only when one fix removes every consequence)",
         description=(
-            "Combine unjudged findings that share a root cause into a single finding "
-            "(listing all consequences in its scenario) and dismiss the duplicates. "
-            "Merge only when ONE fix removes every consequence. Different fixes are separate "
+            "Combine unjudged duplicate findings that share a root cause into a single target finding "
+            "(either unjudged, or already proven/probable without changing its text) and dismiss the "
+            "duplicates. Merge only when ONE fix removes every consequence. Different fixes are separate "
             "findings, even on the same line, file, or category (for example, a missing `--json` "
             "flag in `craftsman status` and a stale README example are two separate findings, not "
             "one 'housekeeping' finding)."
@@ -189,9 +199,9 @@ def _add_merge_and_verdict_parsers(sub: Any, common: argparse.ArgumentParser, ha
     merge.add_argument(
         "duplicate_ids", metavar="DUP_ID", nargs="+", help="Duplicate finding ids to fold into TARGET_ID"
     )
-    merge.add_argument("--title", help="Updated title for the grouped finding")
-    merge.add_argument("--scenario", help="Combined root-cause -> consequences scenario")
-    merge.add_argument("--suggestion", help="Updated suggestion for the grouped finding")
+    merge.add_argument("--title", help="Updated title for an unjudged grouped finding")
+    merge.add_argument("--scenario", help="Combined root-cause -> consequences scenario (unjudged target only)")
+    merge.add_argument("--suggestion", help="Updated suggestion for an unjudged grouped finding")
     merge.set_defaults(handler=handlers["merge"])
 
     verdict = sub.add_parser("verdict", parents=[common], help="Record a verdict on a finding")
@@ -200,9 +210,14 @@ def _add_merge_and_verdict_parsers(sub: Any, common: argparse.ArgumentParser, ha
     verdict.add_argument("--evidence")
     verdict.add_argument("--run", help="Id of a recorded run that supports the verdict")
     verdict.add_argument(
+        "--severity",
+        type=literal_choice(SEVERITIES),
+        help="Reclassify finding severity during verification (blocker, major, minor, nit)",
+    )
+    verdict.add_argument(
         "--from-json",
         metavar="PATH",
-        help='Bulk JSON list of {"id", "as", "evidence", "run"?} objects (use - for stdin)',
+        help='Bulk JSON list of {"id", "as", "evidence", "run"?, "severity"?} objects (use - for stdin)',
     )
     verdict.set_defaults(handler=handlers["verdict"], subparser=verdict)
 
@@ -238,14 +253,28 @@ def _add_inspection_parsers(sub: Any, common: argparse.ArgumentParser, handlers:
         command.add_argument("--json", action="store_true")
         command.set_defaults(handler=handlers[name])
     sub.choices["show"].add_argument(
+        "finding_ids",
+        nargs="*",
+        metavar="ID",
+        help="Finding ids to show (e.g. F1 F2)",
+    )
+    sub.choices["show"].add_argument(
+        "--ids",
+        metavar="IDS",
+        help="Comma-separated finding ids to show (e.g. F1,F2)",
+    )
+    sub.choices["show"].add_argument(
         "--packet-path",
         action="store_true",
         help="Print only the resolved absolute path of the current review packet",
     )
     sub.choices["show"].add_argument(
         "--hunks",
-        action="store_true",
-        help="Print the hunks still to cover (H# -> file:lines and scope or status) and how many are left",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="SPEC",
+        help="Print the hunks still to cover (optionally filtered to a hunk spec such as H1-H5,H9)",
     )
     for name in ("check", "report"):
         sub.choices[name].add_argument(
@@ -301,7 +330,7 @@ def build_parser(handlers: Mapping[str, Handler]) -> argparse.ArgumentParser:
     scratch = sub.add_parser(
         "scratch",
         parents=[common],
-        help="Create a unique managed scratch directory in <git-dir>/craftsman/scratch/ for repro scripts",
+        help="Create a unique managed scratch directory outside the repository for repro scripts",
     )
     scratch.set_defaults(handler=handlers["scratch"])
     # Prefix matching would let `--lens` stand in for `--lenses` and similar near-misses.

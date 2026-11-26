@@ -236,17 +236,23 @@ def _depth_floor(
 def _prepare(args: argparse.Namespace) -> int:
     env = os.environ
     now = datetime.now(timezone.utc)
+    dry_run = bool(args.dry_run)
     ws = open_workspace(args.cwd)
     explicit_task = _explicit_task(args)
-    sync_antigravity_runs(ws, env)
     ledger = load(ws.ledger_path)
+    if not dry_run and ledger.rounds:
+        sync_antigravity_runs(ws, env)
+        ledger = load(ws.ledger_path)
     base_sha = ws.base_sha(ledger, args.base)
     full_snap = snapshot_at(ws.root, base_sha)
     scope, snap, allow_scope_expansion = prepare_scope_and_snapshot(
         ws, ledger, args, base_sha, full_snap
     )
     if snap.is_empty:
-        end_review_guard(ws.ledger_path)  # nothing to review is a review outcome
+        if dry_run:
+            print("Dry run — nothing was written to the ledger or packets.")
+        else:
+            end_review_guard(ws.ledger_path)  # nothing to review is a review outcome
         return print_empty_prepare(scope, snap, full_snap)
     snap = stable_hunk_ids(ledger, snap)
     owned = _owns_gate(ws, env)
@@ -259,8 +265,11 @@ def _prepare(args: argparse.Namespace) -> int:
     floor, floor_reason = _depth_floor(args, ws, ledger, marker is not None and marker.deep, owned=owned)
     depth = huntplan.decide_depth(snap, floor=floor, floor_reason=floor_reason)
     if ws.state is not None and owned and depth.deep and not ws.state.deep:
-        update_state(ws.state_path, lambda current: (_raised_to_deep(current), None))
-        print("Gate raised to deep: a passing end-to-end run is now required.")
+        if dry_run:
+            print("Dry run: gate would be raised to deep (a passing end-to-end run would be required).")
+        else:
+            update_state(ws.state_path, lambda current: (_raised_to_deep(current), None))
+            print("Gate raised to deep: a passing end-to-end run is now required.")
     index = WorktreeIndex(ws.root)
     symbols = {hunk.id: index.symbols(hunk) for hunk in snap.hunks}
     ctx = _PrepareContext(
@@ -295,6 +304,23 @@ def _prepare(args: argparse.Namespace) -> int:
         stamped, round_ = stamp_prepared(result.ledger)  # the review guard counts a prepare that got this far
         return stamped, replace(result, ledger=stamped, round=round_)
 
+    if dry_run:
+        result = _plan_round(ledger, ctx, signals_for)
+        ledger, round_ = result.ledger, result.round
+        packet = Path(round_.packet_path)
+        print("Dry run — nothing was written to the ledger or packets.")
+        if ws.state is not None and not owned:
+            print(_foreign_gate_note(ws.state))
+        via_transcript = (
+            round_.enforced and round_.platform == "antigravity" and ws.state is None and marker is None
+        )
+        print_prepare_summary(
+            result, packet, snap, depth, now, check=_check_command(ws), via_transcript=via_transcript
+        )
+        print_unscanned_files(snap)
+        print_scope_summary(ws, ledger, round_, snap, full_snap)
+        return 0
+
     result = mutate(ws.ledger_path, open_next)
     ledger, round_ = result.ledger, result.round
     packet = Path(round_.packet_path)
@@ -303,7 +329,10 @@ def _prepare(args: argparse.Namespace) -> int:
         _write_text(packet, render_packet(pctx))
     if ws.state is not None and not owned:
         print(_foreign_gate_note(ws.state))
-    print_prepare_summary(result, packet, snap, depth, now, check=_check_command(ws))
+    via_transcript = round_.enforced and round_.platform == "antigravity" and ws.state is None and marker is None
+    print_prepare_summary(
+        result, packet, snap, depth, now, check=_check_command(ws), via_transcript=via_transcript
+    )
     print_unscanned_files(snap)
     print_scope_summary(ws, ledger, round_, snap, full_snap)
     if result.created and not result.raised:

@@ -413,6 +413,10 @@ class Fields:
             return None
         return self.choice(key, choices)
 
+    def optional_choice_if_present(self, key: str, choices: tuple[S, ...]) -> S | None:
+        """A choice or null field; None when it is left out."""
+        return None if self._absent(key) else self.optional_choice(key, choices)
+
     def member(self, key: str, enum: type[E]) -> E:
         value = self.text(key)
         try:
@@ -903,7 +907,22 @@ class Coverage:
         )
 
 
-_SEVERITY_MARKER_RE = re.compile(r"\s*\[severity:\s*[a-z]+\]\s*", re.IGNORECASE)
+_SEVERITY_MARKER_RE = re.compile(r"\s*\[severity:\s*([a-z]+)\]\s*", re.IGNORECASE)
+
+
+def parse_severity_marker(evidence: str) -> Severity | None:
+    """Return the validated severity named in a leading `[severity: <level>]` marker, or None."""
+    marker = _SEVERITY_MARKER_RE.match(evidence)
+    if marker is None:
+        return None
+    raw = marker.group(1)
+    chosen = as_choice(raw.lower(), SEVERITIES)
+    if chosen is None:
+        raise FieldError(
+            "severity",
+            f"invalid [severity: {raw}] marker; expected one of {', '.join(SEVERITIES)}",
+        )
+    return chosen
 
 
 def _check_verdict_evidence(verdict: Verdict, evidence: str, run_id: str | None) -> None:
@@ -1027,6 +1046,7 @@ class Finding:
     # Every verdict ever recorded, oldest first; `verdict` is the last one. Empty before 5.1.
     verdict_log: tuple[VerdictEvent, ...] = ()
     merged_into: str | None = None  # the finding this duplicate was folded into
+    original_severity: Severity | None = None  # set when verification reclassified `severity`
 
     def __post_init__(self) -> None:
         _require_id(self.id, "F", "id")
@@ -1035,6 +1055,8 @@ class Finding:
         _require_text(self.path, "path")
         _require(self.line >= 1, "line", f"must be >= 1 (got {self.line})")
         _require_choice(self.severity, SEVERITIES, "severity")
+        if self.original_severity is not None:
+            _require_choice(self.original_severity, SEVERITIES, "original_severity")
         _require_text(self.title, "title", min_chars=MIN_TITLE_CHARS, max_chars=MAX_TITLE_CHARS)
         _require_text(self.scenario, "scenario", min_chars=MIN_SCENARIO_CHARS)
         _require_text(self.fingerprint, "fingerprint")
@@ -1088,7 +1110,10 @@ class Finding:
             )
 
     def to_json(self) -> dict[str, Any]:
-        return _record_json(self)
+        data = _record_json(self)
+        if self.original_severity is None:
+            del data["original_severity"]
+        return data
 
     @classmethod
     def from_json(cls, raw: Any) -> Finding:
@@ -1125,6 +1150,7 @@ class Finding:
                 by=f.optional_text_if_present("by"),
                 verdict_log=f.records_or_empty("verdict_log", VerdictEvent.from_json),
                 merged_into=merged_into,
+                original_severity=f.optional_choice_if_present("original_severity", SEVERITIES),
             )
         )
 

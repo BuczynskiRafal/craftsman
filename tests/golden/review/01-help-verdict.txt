@@ -3,7 +3,8 @@ $ craftsman review verdict --help
 --- stdout
 usage: craftsman review verdict [-h] [--cwd CWD] [--as VERDICT]
                                 [--evidence EVIDENCE] [--run RUN]
-                                [--from-json PATH] [--check]
+                                [--severity SEVERITY] [--from-json PATH]
+                                [--check]
                                 [ID]
 
 positional arguments:
@@ -15,8 +16,10 @@ options:
   --as VERDICT
   --evidence EVIDENCE
   --run RUN            Id of a recorded run that supports the verdict
-  --from-json PATH     Bulk JSON list of {"id", "as", "evidence", "run"?}
-                       objects (use - for stdin)
+  --severity SEVERITY  Reclassify finding severity during verification
+                       (blocker, major, minor, nit)
+  --from-json PATH     Bulk JSON list of {"id", "as", "evidence", "run"?,
+                       "severity"?} objects (use - for stdin)
   --check              Validate without recording to the ledger or consuming
                        an inbox file
 --- stderr

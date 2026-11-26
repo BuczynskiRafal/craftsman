@@ -30,6 +30,7 @@ from craftsman.records import (
     VerdictEvent,
     Wave,
     format_timestamp,
+    parse_severity_marker,
     parse_timestamp,
     slot_generation,
 )
@@ -742,6 +743,25 @@ class VerdictEventAndClaimTests(unittest.TestCase):
             replace(ledger, claims=(replace(claim, round=2),))
         with self.assertRaisesRegex(LedgerError, "claims must not repeat an id"):
             replace(ledger, claims=(claim, replace(claim, slot="W1-2")))
+
+    def test_severity_marker_and_original_severity_round_trip(self) -> None:
+        self.assertIsNone(parse_severity_marker("static: cart.py:3 divides by zero"))
+        self.assertEqual(parse_severity_marker("[severity: MAJOR] static: cart.py:3 divides by zero"), "major")
+        with self.assertRaisesRegex(LedgerError, r"invalid \[severity: urgent\] marker"):
+            parse_severity_marker("[severity: urgent] static: cart.py:3")
+
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py")))
+        finding = record_finding(ledger, severity="blocker").findings[0]
+        self.assertNotIn("original_severity", finding.to_json())
+        self.assertEqual(Finding.from_json(finding.to_json()).original_severity, None)
+
+        downgraded = replace(finding, severity="major", original_severity="blocker")
+        raw = json.loads(json.dumps(downgraded.to_json()))
+        self.assertEqual(raw["original_severity"], "blocker")
+        self.assertEqual(Finding.from_json(raw), downgraded)
+
+        with self.assertRaisesRegex(LedgerError, "original_severity"):
+            replace(finding, original_severity="bogus")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

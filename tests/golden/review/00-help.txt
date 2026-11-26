@@ -28,8 +28,8 @@ positional arguments:
     reset               Archive the ledger and packets
     inbox               Create a unique managed JSON file in <git-
                         dir>/craftsman/inbox/ for --from-json
-    scratch             Create a unique managed scratch directory in <git-
-                        dir>/craftsman/scratch/ for repro scripts
+    scratch             Create a unique managed scratch directory outside the
+                        repository for repro scripts
 
 options:
   -h, --help            show this help message and exit

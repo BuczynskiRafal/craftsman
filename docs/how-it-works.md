@@ -31,7 +31,7 @@ The README and the [usage guide](usage.md) only summarize it.
    a slot.
 4. **Hunt.** The orchestrator launches every slot together without asking the user for confirmation, each as a fresh-context
    `craftsman-reviewer` subagent whose whole prompt is one line:
-   `You are Craftsman hunter W1-2. Run craftsman review brief W1-2 and follow it exactly.` `review brief`
+   `You are Craftsman hunter W1-2. Execute the CLI shell command craftsman review brief W1-2 (not a file; do not inspect parent session transcripts) and follow it exactly.` `review brief`
    records that the slot was taken and prints the task, the base ref, the slice, the lenses and the
    recording commands, which carry `--hunter W1-2`. Every review launches at least one hunter, even for
    a one-line change, wherever the platform has subagents. On Claude Code and Antigravity, subagents
@@ -42,7 +42,7 @@ The README and the [usage guide](usage.md) only summarize it.
    packed across files separately for `minor`/`nit` vs. serious findings). Wait for all hunters of the current wave
    before launching verifiers so cross-hunter duplicates share a cluster. One `craftsman-verifier` per cluster, launched
    directly without asking the user and with the prompt
-   `You are a Craftsman verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.`, merges
+   `You are a Craftsman verifier. Execute the CLI shell command craftsman review brief --verifier F1,F2 (not a file; do not inspect parent session transcripts) and follow it exactly.`, merges
    duplicates, tries to disprove each finding, reproduces it where runnable, and records a verdict. A `blocker` or
    `major` finding dismissed without a run needs a second, independent verifier. On Claude Code, simplicity slots and
    `minor`/`nit`-only verifier clusters run on `haiku`; everything else uses the full model.

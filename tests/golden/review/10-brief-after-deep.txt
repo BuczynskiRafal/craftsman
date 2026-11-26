@@ -16,9 +16,9 @@ Your lenses: intent, contracts, failure, ripple, tests. Load their playbooks:
 
 Recording (as you go, not in one batch at the end):
 - A candidate defect: craftsman review add --hunter W1-1 --lens <one of your lenses> --file <path> --line <n> --severity <blocker|major|minor|nit> --title "<one line>" --scenario "<trigger -> wrong outcome>" --suggestion "<fix>"
-  Several at once: craftsman review add --from-json - (JSON entries with "hunter": "W1-1").
+  Batch / Windows PowerShell (recommended for multiple records): write JSON to `craftsman review inbox add` path and run `craftsman review add --hunter W1-1 --from-json <path>` (or include "hunter": "W1-1" in each entry; severity: "blocker"|"major"|"minor"|"nit").
 - What you examined: craftsman review cover --hunter W1-1 --hunks <ids you examined> --note "<what you examined and which values you tried, one line>"
-  Several at once: craftsman review cover --from-json - (entries with "hunter": "W1-1").
+  Batch / Windows PowerShell: write JSON to `craftsman review inbox cover` path and run `craftsman review cover --hunter W1-1 --from-json <path>` (or `--from-json -`, entries may omit or specify "hunter": "W1-1").
 - Every hunk of your slot (H3,H8) must be covered before you finish.
 - Never run `craftsman review verdict`, `merge`, `prepare` or `reset`: verifiers judge, the orchestrator plans. Never change the work tree or the index.
 
@@ -34,7 +34,7 @@ is ledger entries from the `craftsman` CLI.
 
 ## Assignment
 
-The message that started you names one slot of the hunt plan, for example `W1-2`. **Run `craftsman review brief <ID>` first and follow it exactly** (if you read this inside its output, you already did). It records that you took the slot and
+The message that started you names one slot of the hunt plan, for example `W1-2`. **Execute the CLI shell command `craftsman review brief <ID>` first (not a file; do not inspect parent session transcripts) and follow it exactly** (if you read this inside its output, you already did). It records that you took the slot and
 prints what is yours alone: the task (what the change must do), the base ref `<base>`, your slice (the
 hunks and the `craftsman review view` command that writes them), your lenses with the command that
 loads their playbooks, and the recording commands with your `--hunter <ID>`. This definition holds

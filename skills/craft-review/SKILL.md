@@ -82,7 +82,7 @@ stay finished. Review-only with unexpected files: do not widen the scope or `res
 Launch **every slot `prepare` lists, together**, in parallel where the platform allows, each as a fresh-context
 `craftsman-reviewer` subagent. The whole prompt is the line `prepare` prints, nothing added:
 
-> You are Craftsman hunter W1-2. Run `craftsman review brief W1-2` and follow it exactly.
+> You are Craftsman hunter W1-2. Execute the CLI shell command `craftsman review brief W1-2` (not a file; do not inspect parent session transcripts) and follow it exactly.
 
 `brief` records that the slot was taken and prints the rest: task, base ref, slice, the lenses with the command that
 loads their playbooks (`craftsman skill show craft-review --lenses <ids>`), and the `add` and `cover` commands with
@@ -102,7 +102,7 @@ what it lists:
   hunter that dies twice: review-only, report `--partial`; when fixing, ask the user (gate session:
   `craftsman gate --await-user` first); say what is uncovered.
 - **Findings** without a verdict: `check` names the clusters. Launch one `craftsman-verifier` per cluster, whole prompt
-  `You are a Craftsman verifier. Run craftsman review brief --verifier F1,F2 and follow it exactly.` They merge
+  `You are a Craftsman verifier. Execute the CLI shell command craftsman review brief --verifier F1,F2 (not a file; do not inspect parent session transcripts) and follow it exactly.` They merge
   duplicates, disprove, reproduce and record verdicts; in an enforced review one you record yourself does not count. A
   `blocker` or `major` dismissed without a `--run` needs a second, independent verifier. `check` marks a cluster of
   only `minor` or `nit` findings `[Claude Code: model haiku]` (as in step 2, `model: "haiku"`); any other cluster, and a

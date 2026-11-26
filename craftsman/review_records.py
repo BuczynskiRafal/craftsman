@@ -125,8 +125,20 @@ def _cover_entry_label(raw: Any) -> str | None:
     return None
 
 
+def _batch_hunter(entry_hunter: str | None, default_hunter: str | None) -> str | None:
+    if entry_hunter is not None and default_hunter is not None and entry_hunter != default_hunter:
+        raise FieldError("hunter", f"conflicts with --hunter {default_hunter} (got {entry_hunter!r})")
+    return entry_hunter if entry_hunter is not None else default_hunter
+
+
 def _cover_one_from_json(
-    state: Ledger, round_: Round, raw: Any, files: Callable[[str], list[str]], by: str | None
+    state: Ledger,
+    round_: Round,
+    raw: Any,
+    files: Callable[[str], list[str]],
+    by: str | None,
+    *,
+    default_hunter: str | None = None,
 ) -> tuple[Ledger, str]:
     reader = EntryReader(raw)
     present = [key for key in ("hunks", "files") if key in raw]
@@ -141,12 +153,14 @@ def _cover_one_from_json(
     else:
         reader.errors.append(FieldError("hunks", "is missing; pass 'hunks' or 'files'"))
     note = reader.read("note", lambda f: f.text("note"), "")
-    hunter = reader.read("hunter", lambda f: f.text_if_present("hunter"), None)
+    entry_hunter = reader.read("hunter", lambda f: f.text_if_present("hunter"), None)
     reader.reject_unknown()
 
     def record(sink: list[LedgerError]) -> tuple[Ledger, str] | None:
         if reader.failed(kind, "hunter") or not present:
             return None
+        resolved_hunter = attempt(sink, lambda: _batch_hunter(entry_hunter, default_hunter), None)
+        hunter_ok = resolved_hunter is not None or (entry_hunter is None and default_hunter is None)
         targets = attempt(
             sink, lambda: _cover_targets(round_, kind, ",".join(listed), files), None
         )
@@ -154,9 +168,13 @@ def _cover_one_from_json(
             if not reader.failed("note"):
                 check_coverage_note(one_line(note, warn=False))
             return None
+        if not hunter_ok:
+            return None
         return attempt(
             sink,
-            lambda: record_coverage(state, round_, targets, note, target_kind=kind, hunter=hunter, by=by),
+            lambda: record_coverage(
+                state, round_, targets, note, target_kind=kind, hunter=resolved_hunter, by=by
+            ),
             None,
         )
 
@@ -165,7 +183,7 @@ def _cover_one_from_json(
 
 def _cover_from_json(args: argparse.Namespace) -> int:
     reject_flags_with_from_json(
-        {"--hunks": args.hunks, "--files": args.files, "--note": args.note, "--hunter": args.hunter}
+        {"--hunks": args.hunks, "--files": args.files, "--note": args.note}
     )
     raw_entries = load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
@@ -186,6 +204,7 @@ def _cover_from_json(args: argparse.Namespace) -> int:
                 raw,
                 lambda value: normalize_round_files(ws.root, cwd_of(args), value, round_, snap),
                 by,
+                default_hunter=args.hunter,
             ),
         )
         return store_due_waves(updated), messages
@@ -358,7 +377,6 @@ def _add_from_json(args: argparse.Namespace) -> int:
     reject_flags_with_from_json(
         {**_required_finding_flags(args), "--suggestion": args.suggestion}
     )
-    reject_flags_with_from_json({"--hunter": args.hunter})
     raw_entries = load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)
     snap = ws.snapshot()
@@ -373,7 +391,9 @@ def _add_from_json(args: argparse.Namespace) -> int:
             raw_entries,
             store_due_waves(current),
             lambda index, _raw: f"F{base_number + index - 1}",
-            lambda _index, state, raw: _add_one_from_json(ws, cwd, snap, state, raw, by),
+            lambda _index, state, raw: _add_one_from_json(
+                ws, cwd, snap, state, raw, by, default_hunter=args.hunter
+            ),
         )
         return store_due_waves(updated), recorded
 
@@ -381,7 +401,14 @@ def _add_from_json(args: argparse.Namespace) -> int:
 
 
 def _add_one_from_json(
-    ws: Workspace, cwd: Path, snap: DiffSnapshot, current: Ledger, raw: Any, by: str | None
+    ws: Workspace,
+    cwd: Path,
+    snap: DiffSnapshot,
+    current: Ledger,
+    raw: Any,
+    by: str | None,
+    *,
+    default_hunter: str | None = None,
 ) -> tuple[Ledger, tuple[Finding, list[str] | None]]:
     reader = EntryReader(raw)
     lens = reader.read("lens", lambda f: f.choice("lens", tuple(sorted(LENS_IDS))), "intent")
@@ -405,7 +432,11 @@ def _add_one_from_json(
                     lines = attempt(sink, lambda: source_lines(ws.root, found, line), None)
         hunter: str | None = None
         if not reader.failed("hunter"):
-            hunter = attempt(sink, lambda: _finding_hunter(current, current.rounds[-1], named_hunter), None)
+            hunter = attempt(
+                sink,
+                lambda: _finding_hunter(current, current.rounds[-1], _batch_hunter(named_hunter, default_hunter)),
+                None,
+            )
         updated, finding = add_finding(
             current,
             lens=lens,
@@ -525,7 +556,15 @@ def _verdict_one(args: argparse.Namespace) -> int:
     by = caller_identity(os.environ)
 
     def record(current: Ledger) -> tuple[Ledger, Finding]:
-        updated, finding = set_verdict(current, args.finding_id, args.verdict, args.evidence, args.run, by=by)
+        updated, finding = set_verdict(
+            current,
+            args.finding_id,
+            args.verdict,
+            args.evidence,
+            args.run,
+            severity=args.severity,
+            by=by,
+        )
         return store_due_waves(updated), finding  # the verdict may be the one that calls for a wave
 
     return run_single(ws, bool(args.check), record, print_verdict)
@@ -537,19 +576,28 @@ def _verdict_one_from_json(state: Ledger, raw: Any, by: str | None) -> tuple[Led
     verdict: Verdict = reader.read("as", lambda f: f.choice("as", VERDICTS), "dismissed")
     evidence = reader.read("evidence", lambda f: f.text("evidence"), "")
     run_id = reader.read("run", lambda f: f.text_if_present("run"), None)
+    severity: Severity | None = reader.read(
+        "severity", lambda f: f.optional_choice_if_present("severity", SEVERITIES), None
+    )
     reader.reject_unknown()
 
     def record(sink: list[LedgerError]) -> tuple[Ledger, Finding] | None:
-        if reader.failed("id", "as", "evidence", "run"):
+        if reader.failed("id", "as", "evidence", "run", "severity"):
             return None
-        return set_verdict(state, finding_id, verdict, evidence, run_id, by=by)
+        return set_verdict(state, finding_id, verdict, evidence, run_id, severity=severity, by=by)
 
     return reader.finish(record)
 
 
 def _verdict_from_json(args: argparse.Namespace) -> int:
     reject_flags_with_from_json(
-        {"ID": args.finding_id, "--as": args.verdict, "--evidence": args.evidence, "--run": args.run}
+        {
+            "ID": args.finding_id,
+            "--as": args.verdict,
+            "--evidence": args.evidence,
+            "--run": args.run,
+            "--severity": args.severity,
+        }
     )
     raw_entries = load_json_entries(args.from_json)
     ws = open_workspace(args.cwd)

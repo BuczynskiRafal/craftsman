@@ -11,7 +11,14 @@ from typing import Any
 from unittest import mock
 
 from craftsman import evidence
-from craftsman.evidence import archive_ledger, archive_ledger_if_rebased, packet_path
+from craftsman.evidence import (
+    archive_ledger,
+    archive_ledger_if_rebased,
+    create_scratch_dir,
+    packet_path,
+    prune_scratch_dirs,
+    scratch_dir_for,
+)
 from craftsman.ledger import ledger_path_for, save
 from craftsman.records import LEDGER_FILENAME, Ledger
 
@@ -83,6 +90,32 @@ class RebaseArchiveTests(unittest.TestCase):
 
             self.assertTrue(archived.name.startswith("ledger-"))
             self.assertFalse(path.exists())
+
+
+class ExternalScratchLocationTests(unittest.TestCase):
+    def test_scratch_dir_lives_outside_repo_and_prunes_external_and_legacy_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            craftsman_dir = root / "repo" / ".git" / "craftsman"
+            craftsman_dir.mkdir(parents=True)
+            scratch_root = root / "external-scratch"
+            with mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(scratch_root)}):
+                created = create_scratch_dir(craftsman_dir)
+                self.assertTrue(created.is_dir())
+                self.assertTrue(created.is_relative_to(scratch_root))
+                self.assertFalse(created.is_relative_to(root / "repo"))
+                self.assertEqual(created.parent, scratch_dir_for(craftsman_dir))
+
+                legacy_entry = craftsman_dir / "scratch" / "legacy-1"
+                legacy_entry.mkdir(parents=True)
+                (legacy_entry / "old.txt").write_text("legacy", encoding="utf-8")
+
+                pruned = prune_scratch_dirs(craftsman_dir)
+                self.assertIn(created, pruned)
+                self.assertIn(legacy_entry, pruned)
+                self.assertFalse(created.exists())
+                self.assertFalse(legacy_entry.exists())
+                self.assertFalse((craftsman_dir / "scratch").exists())
 
 
 if __name__ == "__main__":

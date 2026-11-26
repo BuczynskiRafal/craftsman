@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 from craftsman import runner
+from craftsman.evidence import scratch_dir_for
 from craftsman.gatecheck import passing_runs
 from craftsman.ledger import load
 from craftsman.records import OUTPUT_TAIL_CHARS, LedgerError
@@ -36,6 +37,10 @@ class RunTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
         self.repo = EvidenceRepo(self.tmp / "repo")
+        scratch_root = self.tmp / "scratch-root"
+        patcher = mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(scratch_root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def runs(self) -> list[dict[str, object]]:
         runs = self.repo.show()["runs"]
@@ -228,7 +233,7 @@ class RunTests(unittest.TestCase):
 
     def test_a_closed_output_pipe_does_not_stall_the_command(self) -> None:
         script = "import sys; sys.stdout.write('x' * 1000000); print('done')"
-        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT), "CRAFTSMAN_SCRATCH_ROOT": str(self.tmp / "scratch-root")}
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -369,13 +374,17 @@ class LongOutputTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
         self.repo = EvidenceRepo(self.tmp / "repo")
+        scratch_root = self.tmp / "scratch-root"
+        patcher = mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(scratch_root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_bytes(self, data: bytes, *flags: str, exit_code: int = 0) -> tuple[bytes, str, int]:
         """Run a test command that writes `data` and exits with `exit_code`: its stdout, stderr and exit code."""
         source = self.tmp / "output.bin"  # outside the work tree; too long for an argument
         source.write_bytes(data)
         script = f"import sys; sys.stdout.buffer.write(open({str(source)!r}, 'rb').read()); sys.exit({exit_code})"
-        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT), "CRAFTSMAN_SCRATCH_ROOT": str(self.tmp / "scratch-root")}
         proc = subprocess.run(
             [sys.executable, "-B", "-m", "craftsman.cli", "run", "--kind", "test", *flags, "--",
              sys.executable, "-c", script],
@@ -396,7 +405,7 @@ class LongOutputTests(unittest.TestCase):
         return path_in(found(LIVE_MARKER, printed)).read_bytes()
 
     def scratch_dir(self) -> Path:
-        return self.repo.ledger_dir / "scratch"
+        return scratch_dir_for(self.repo.ledger_dir)
 
     def test_output_up_to_the_live_limit_prints_unchanged_and_writes_no_log(self) -> None:
         for text in (blocks(LIVE), numbered_lines(1000)[:LIVE], "é" * LIVE):
@@ -611,6 +620,10 @@ class WhileTheCommandRunsTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name).resolve()
         self.repo = EvidenceRepo(self.tmp / "repo")
+        scratch_root = self.tmp / "scratch-root"
+        patcher = mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(scratch_root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.pid_file = self.tmp / "child.pid"
 
     def start(self) -> subprocess.Popen[bytes]:
@@ -748,7 +761,11 @@ class OutputEchoTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.dir = Path(tmp.name).resolve() / "craftsman"
+        self.tmp = Path(tmp.name).resolve()
+        self.dir = self.tmp / "craftsman"
+        patcher = mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(self.tmp / "scratch-root")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_output_prints_as_it_arrives_and_the_log_is_current(self) -> None:
         stdout = _Stdout()
@@ -814,7 +831,7 @@ class OutputEchoTests(unittest.TestCase):
 
         self.assertLessEqual(held, LIVE + SLACK + TAIL)
         self.assertLess(len(stdout.buffer.getvalue()), LIVE + SLACK + TAIL + 1000)
-        (log,) = self.dir.glob("scratch/*/run-output.log")
+        (log,) = scratch_dir_for(self.dir).glob("*/run-output.log")
         self.assertEqual(log.stat().st_size, 200 * 4000 * len(line))
 
     def test_a_log_that_cannot_be_started_hides_nothing(self) -> None:
@@ -844,7 +861,7 @@ class OutputEchoTests(unittest.TestCase):
         marker = found(NOT_SAVED, printed)
         self.assertEqual((marker.group("why"), marker.group("omitted")), (b"disk full", None))
         self.assertTrue(reassembles(printed, data))
-        self.assertEqual(list(self.dir.glob("scratch/*/*")), [])
+        self.assertEqual(list(scratch_dir_for(self.dir).glob("*/*")), [])
         self.assertIsNone(echo.log_path)
 
     def test_a_log_that_fails_after_much_output_says_what_was_omitted(self) -> None:
@@ -892,7 +909,7 @@ class OutputEchoTests(unittest.TestCase):
             echo.feed(b"x\n" * 20_000)
             echo.finish()
 
-        (log,) = self.dir.glob("scratch/*/run-output.log")
+        (log,) = scratch_dir_for(self.dir).glob("*/run-output.log")
         self.assertEqual(log.read_bytes(), b"x\n" * 20_000)
 
     def test_random_output_keeps_its_head_its_tail_and_its_log(self) -> None:

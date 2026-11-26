@@ -42,6 +42,7 @@ from craftsman.ledger import (
 from craftsman.records import (
     AgentEvent,
     Coverage,
+    HuntPlan,
     Ledger,
     QualitySignal,
     SignalKind,
@@ -1456,7 +1457,11 @@ class EnforcedIssueTests(unittest.TestCase):
         self.assertEqual((issue.code, issue.missing), ("hunt-pending", 3))
         self.assertIn("Running: W1-2 - do not launch these again; end your turn and wait for their reports.", issue.message)
         self.assertIn("Launch now, all in one step: W1-3, W1-4.", issue.message)
-        self.assertIn("You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.", issue.message)
+        self.assertIn(
+            "You are Craftsman hunter <ID>. Execute the CLI shell command `craftsman review brief <ID>` "
+            "(not a file; do not inspect parent session transcripts) and follow it exactly.",
+            issue.message,
+        )
         self.assertIn("Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer", issue.message)
 
     def test_dead_hunters_are_listed_as_stopped_with_the_launch_instruction(self) -> None:
@@ -2228,7 +2233,11 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual((issue.code, issue.missing), ("no-verdict", 3))
         self.assertIn("3 findings without a verdict: F1, F2, F3.", issue.message)
         self.assertIn("one per cluster: [F1,F2,F3].", issue.message)
-        self.assertIn("Run craftsman review brief --verifier <IDS> and follow it exactly.", issue.message)
+        self.assertIn(
+            "Execute the CLI shell command `craftsman review brief --verifier <IDS>` "
+            "(not a file; do not inspect parent session transcripts) and follow it exactly.",
+            issue.message,
+        )
         self.assertIn("A verdict you record yourself does not count.", issue.message)
 
     def test_cross_file_packing_keeps_minor_clusters_separate_from_serious(self) -> None:
@@ -3023,6 +3032,48 @@ class StartingShareTests(unittest.TestCase):
 
         self.assertIn("Launch now, all in one step: W1-1, W1-2", issues["hunt-pending"])
         self.assertIn("Launch now, all in one step: W2-X1", issues["wave-pending"])
+
+
+class AdvisoryWarningsTests(unittest.TestCase):
+    def test_advisory_round_warns_on_uncovered_waves_and_single_serious_dismissals(self) -> None:
+        hunks = [make_hunk("H1", "a.py")]
+        snap = make_snap(*hunks)
+        plan = HuntPlan(
+            reasons=(),
+            slots=(
+                Slot("W1-1", 1, "bug", ("H1",), ("intent", "contracts"), 5),
+                Slot("W2-X1", 2, "fresh", ("H1",), ("failure",), 5, trigger="F1", since=at(20)),
+            ),
+        )
+        ledger, round_ = prepared(snap)
+        ledger = replace(ledger, rounds=(replace(round_, plan=plan, enforced=False),))
+        ledger = with_findings(ledger, ("major", "a.py", "intent"), ("blocker", "a.py", "contracts"))
+        ledger, _ = set_verdict(ledger, "F1", "dismissed", "a.py:3 has caller guard check", None)
+        # F2 dismissed citing a repro run should NOT trigger second-opinion warning.
+        ledger = record_run(ledger, kind="repro", exit_code=0)
+        ledger, _ = set_verdict(ledger, "F2", "dismissed", "Reproduced no issue under guard", "R1")
+
+        report = evaluate(ledger, snap, GatePolicy(isolation_evidence="none"))
+        self.assertEqual(report.slots, ())
+        joined = "\n".join(report.warnings)
+        self.assertIn("Advisory wave slot(s) not yet covered: W2-X1.", joined)
+        self.assertIn(
+            "Advisory dismissal(s) of blocker/major findings without a second opinion or run: F1.",
+            joined,
+        )
+
+        # Covering W2-X1 with hunter="W2-X1" and recording a second opinion clears both warnings.
+        ledger, _ = add_coverage(ledger, ["H1"], coverage_note(["H1"]), hunter="W2-X1")
+        ledger, _ = set_verdict(ledger, "F1", "dismissed", "a.py:3 guard verified independently", None)
+        cleared = evaluate(ledger, snap, GatePolicy(isolation_evidence="none"))
+        self.assertNotIn("Advisory wave slot(s)", "\n".join(cleared.warnings))
+        self.assertNotIn("Advisory dismissal(s)", "\n".join(cleared.warnings))
+
+    def test_enforced_round_does_not_emit_advisory_warnings(self) -> None:
+        ledger = with_findings(one_slot_done(), ("major", "f1.py", "intent"))
+        ledger, _ = set_verdict(ledger, "F1", "dismissed", "f1.py:3 has caller guard", None)
+        report = evaluate(ledger, hunt_snap(1), GatePolicy(isolation_evidence="hooks"))
+        self.assertNotIn("Advisory", "\n".join(report.warnings))
 
 
 if __name__ == "__main__":

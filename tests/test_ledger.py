@@ -14,7 +14,7 @@ from contextlib import contextmanager, redirect_stderr
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest import mock
 
 from craftsman import ledger as ledger_module
@@ -591,14 +591,35 @@ class MergeTests(unittest.TestCase):
 
         self.assertEqual(target.scenario.count(shared), 1)
 
-    def test_judged_findings_are_not_merged(self) -> None:
-        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
-        ledger = self.finding(ledger, "An empty cart shows an error page.")
-        for judged in ("F1", "F2"):
-            with self.subTest(judged=judged):
-                verdict, _ = set_verdict(ledger, judged, "probable", PROBABLE, None)
-                with self.assertRaisesRegex(LedgerError, f"{judged} already has the verdict probable"):
-                    merge_findings(verdict, "F1", ["F2"])
+    def test_judged_findings_merge_rules(self) -> None:
+        ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.", severity="minor")
+        ledger = self.finding(ledger, "An empty cart shows an error page.", severity="major")
+
+        # Duplicate with a verdict still cannot be merged.
+        judged_dup, _ = set_verdict(ledger, "F2", "probable", PROBABLE, None)
+        with self.assertRaisesRegex(LedgerError, "F2 already has the verdict probable"):
+            merge_findings(judged_dup, "F1", ["F2"])
+
+        # Target that is dismissed or question cannot be a merge target.
+        bad_cases: tuple[tuple[Literal["dismissed", "question"], str], ...] = (
+            ("dismissed", "cart.py:3 is guarded cleanly before division"),
+            ("question", "intent: task says averages are fine at cart.py:3"),
+        )
+        for bad_verdict, evidence in bad_cases:
+            with self.subTest(bad_verdict=bad_verdict):
+                bad_target, _ = set_verdict(ledger, "F1", bad_verdict, evidence, None)
+                with self.assertRaisesRegex(LedgerError, f"target has verdict {bad_verdict}"):
+                    merge_findings(bad_target, "F1", ["F2"])
+
+        # Target that is proven or probable accepts unjudged duplicates, leaving target untouched.
+        confirmed, orig_target = set_verdict(ledger, "F1", "probable", PROBABLE, None)
+        with self.assertRaisesRegex(LedgerError, "cannot rewrite F1's title, scenario, or suggestion"):
+            merge_findings(confirmed, "F1", ["F2"], title="Changed")
+        merged, target, duplicates = merge_findings(confirmed, "F1", ["F2"])
+        self.assertEqual(target, orig_target)
+        self.assertEqual(duplicates[0].merged_into, "F1")
+        self.assertEqual(duplicates[0].verdict, "dismissed")
+        self.assertEqual(merged.findings[0], orig_target)
 
     def test_a_merged_finding_cannot_be_a_target(self) -> None:
         ledger = self.finding(self.ledger, "Calling total([]) raises ZeroDivisionError.")
@@ -1294,6 +1315,25 @@ class LensAwareCarryOverTests(unittest.TestCase):
         self.assertFalse(round_unchanged(ledger, same, ["a.py"]))  # a different scope is a new round
         self.assertFalse(round_unchanged(Ledger(), same, None))
         self.assertIs(open_round(ledger, same, False, "p.md", {})[0], ledger)
+
+    def test_set_verdict_severity_updates_and_validates(self) -> None:
+        ledger, _ = prepared(make_snap(make_hunk("H1", "a.py")))
+        ledger = record_finding(ledger, severity="blocker")
+
+        with self.assertRaisesRegex(LedgerError, "conflicts with"):
+            set_verdict(ledger, "F1", "probable", "[severity: minor] " + PROBABLE, None, severity="major")
+        with self.assertRaisesRegex(LedgerError, r"invalid \[severity: urgent\]"):
+            set_verdict(ledger, "F1", "probable", "[severity: urgent] " + PROBABLE, None)
+
+        downgraded, finding = set_verdict(ledger, "F1", "probable", "[severity: major] " + PROBABLE, None)
+        self.assertEqual((finding.severity, finding.original_severity), ("major", "blocker"))
+
+        further, finding = set_verdict(downgraded, "F1", "probable", PROBABLE, None, severity="minor")
+        self.assertEqual((finding.severity, finding.original_severity), ("minor", "blocker"))
+
+        restored, finding = set_verdict(further, "F1", "probable", PROBABLE, None, severity="blocker")
+        self.assertEqual((finding.severity, finding.original_severity), ("blocker", None))
+        self.assertEqual(restored.findings[0].severity, "blocker")
 
     def test_a_first_round_has_nothing_to_carry(self) -> None:
         h1 = make_hunk("H1")

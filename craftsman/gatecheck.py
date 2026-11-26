@@ -29,7 +29,7 @@ from craftsman.attribution import (
 )
 from craftsman.diffscan import DiffSnapshot
 from craftsman.huntplan import plan_due_waves, required_slots, slot_order, slots_missing, window_slots
-from craftsman.ledger import uncovered_hunks
+from craftsman.ledger import uncovered_hunks, verdict_streak
 from craftsman.records import (
     MIN_TESTS_HINT,
     REVIEWER_AGENT,
@@ -92,7 +92,7 @@ MAX_CLUSTER_FINDINGS = 6
 CHEAPER_MODEL_NOTE = "[Claude Code: model haiku]"
 _CHEAPER_MODEL_SEVERITIES: tuple[Severity, ...] = ("minor", "nit")
 # What one hunt issue message may take, so that the stop hooks can show several of them in full.
-MAX_HUNT_ISSUE_CHARS = 900
+MAX_HUNT_ISSUE_CHARS = 1000
 
 
 # --- gate evaluation ------------------------------------------------------------------------
@@ -787,13 +787,15 @@ def _stopped(run: AgentRun) -> datetime:
 _SLOT_ID = re.compile(r"(W\d-[A-Z]?)(\d+)")
 _LAUNCH_HOW = (
     "For each, start a craftsman-reviewer subagent without asking, prompt: "
-    "`You are Craftsman hunter <ID>. Run craftsman review brief <ID> and follow it exactly.` "
+    '"You are Craftsman hunter <ID>. Execute the CLI shell command `craftsman review brief <ID>` '
+    '(not a file; do not inspect parent session transcripts) and follow it exactly." '
     "(Claude Code: Agent tool, subagent_type craftsman-reviewer; Copilot: custom agent, same-turn return; "
     "Antigravity: invoke_subagent, TypeName self, Role craftsman-reviewer.)"
 )
 _VERIFIER_HOW = (
     "For each cluster, start a craftsman-verifier subagent without asking, prompt: "
-    "`You are a Craftsman verifier. Run craftsman review brief --verifier <IDS> and follow it exactly.` "
+    '"You are a Craftsman verifier. Execute the CLI shell command `craftsman review brief --verifier <IDS>` '
+    '(not a file; do not inspect parent session transcripts) and follow it exactly." '
     "(Copilot: custom agent, same-turn return.) A verdict you record yourself does not count."
 )
 
@@ -1471,6 +1473,7 @@ def _warnings(ledger: Ledger, *, review_only: bool = False) -> tuple[str, ...]:
     if waived:
         warnings.append(f"Waived failing runs: {', '.join(waived)}; tell the user about them.")
     warnings.extend(_large_diff_warnings(ledger))
+    warnings.extend(_advisory_warnings(ledger))
     warnings.extend(
         f"{run.id} (`{run.command}`) is trivial and does not count as verification."
         for run in ledger.runs
@@ -1488,6 +1491,51 @@ def _warnings(ledger: Ledger, *, review_only: bool = False) -> tuple[str, ...]:
     )
     warnings.extend(_process_anomaly_warnings(ledger))
     return tuple(warnings)
+
+
+def _advisory_warnings(ledger: Ledger) -> list[str]:
+    """Visibility warnings for advisory rounds whose wave slots or second-opinion checks are non-gating."""
+    if not ledger.rounds:
+        return []
+    latest = ledger.rounds[-1]
+    if latest.plan is None or latest.enforced:
+        return []
+    warnings: list[str] = []
+    digest_of = {ref.id: ref.digest for ref in latest.hunks}
+    uncovered_waves: list[str] = []
+    for slot in latest.plan.slots:
+        if slot.generation < 2:
+            continue
+        needed = {digest_of[hunk_id] for hunk_id in slot.hunks if hunk_id in digest_of}
+        since = parse_timestamp(slot.since) if slot.since is not None else None
+        covered_digests = {
+            digest
+            for record in ledger.coverage
+            if record.round == latest.number
+            and record.hunter == slot.id
+            and (since is None or parse_timestamp(record.recorded_at) >= since)
+            for digest in record.digests
+        }
+        if needed - covered_digests:
+            uncovered_waves.append(slot.id)
+    if uncovered_waves:
+        warnings.append(f"Advisory wave slot(s) not yet covered: {', '.join(uncovered_waves)}.")
+    single_dismissed = [
+        finding.id
+        for finding in ledger.findings
+        if finding.merged_into is None
+        and finding.severity in ("blocker", "major")
+        and finding.verdict == "dismissed"
+        and finding.verdict_run is None
+        and finding.verdict_log
+        and len(verdict_streak(finding)) < 2
+    ]
+    if single_dismissed:
+        warnings.append(
+            "Advisory dismissal(s) of blocker/major findings without a second opinion or run: "
+            f"{', '.join(single_dismissed)}."
+        )
+    return warnings
 
 
 def large_diff_warning(round_: Round) -> str | None:

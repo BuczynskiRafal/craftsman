@@ -73,7 +73,11 @@ class LaunchLinesTests(unittest.TestCase):
         text = "\n".join(huntview.launch_lines(["W1-1", "W1-2"], check=self.CHECK))
 
         self.assertIn("Launch all 2 hunters now, in one step.", text)
-        self.assertIn("Run `craftsman review brief <ID>` and follow it exactly.", text)
+        self.assertIn(
+            "Execute the CLI shell command `craftsman review brief <ID>` "
+            "(not a file; do not inspect parent session transcripts) and follow it exactly.",
+            text,
+        )
         self.assertIn("Copilot: custom agent craftsman-reviewer (launch directly without asking).", text)
         self.assertIn("Claude Code / Antigravity: end your turn while they run", text)
         self.assertIn("Copilot: subagents return in the same turn", text)
@@ -123,7 +127,10 @@ class BriefTests(unittest.TestCase):
         self.assertIn("craftsman review view --hunks H1-H2,H4", text)
         self.assertIn("craftsman skill show craft-review --lenses intent,ripple", text)
         self.assertIn("craftsman review add --hunter W1-1 --lens <one of your lenses>", text)
-        self.assertIn('craftsman review cover --hunter W1-1 --hunks <ids you examined> --note "', text)
+        self.assertIn("craftsman review cover --hunter W1-1 --hunks <ids you examined> --note \"", text)
+        self.assertIn("craftsman review inbox add", text)
+        self.assertIn("craftsman review inbox cover", text)
+        self.assertIn('"blocker"|"major"|"minor"|"nit"', text)
         self.assertIn('"hunter": "W1-1"', text)
         self.assertIn("Every hunk of your slot (H1-H2,H4) must be covered", text)
         self.assertIn("Never run `craftsman review verdict`, `merge`, `prepare` or `reset`", text)
@@ -196,6 +203,8 @@ class VerifierBriefTests(unittest.TestCase):
         self.assertIn("Scenario: total([]) divides by zero on an empty list", text)
         self.assertIn("craftsman review merge <TARGET> <DUPLICATES...>", text)
         self.assertIn("craftsman review verdict <ID> --as proven --run <R#>", text)
+        self.assertIn("craftsman review inbox verdict", text)
+        self.assertIn("--severity <blocker|major|minor|nit>", text)
         self.assertIn("Base ref: abc123 (round 1)", text)
         self.assertIsNone(_FINDING_TOKEN_RE.search(text))
 

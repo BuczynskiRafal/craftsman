@@ -15,7 +15,7 @@ is ledger entries from the `craftsman` CLI.
 
 ## Assignment
 
-The message that started you names one slot of the hunt plan, for example `W1-2`. **Run `craftsman review brief <ID>` first and follow it exactly** (if you read this inside its output, you already did). It records that you took the slot and
+The message that started you names one slot of the hunt plan, for example `W1-2`. **Execute the CLI shell command `craftsman review brief <ID>` first (not a file; do not inspect parent session transcripts) and follow it exactly** (if you read this inside its output, you already did). It records that you took the slot and
 prints what is yours alone: the task (what the change must do), the base ref `<base>`, your slice (the
 hunks and the `craftsman review view` command that writes them), your lenses with the command that
 loads their playbooks, and the recording commands with your `--hunter <ID>`. This definition holds

@@ -21,6 +21,7 @@ No passing test or e2e run at the final code.
 ## Warnings
 - 1 finding for the author: F1.
 - Accepted without a fix: F3; tell the user about them.
+- Advisory dismissal(s) of blocker/major findings without a second opinion or run: F2.
 
 ## Not assessed by the gate
 - Business requirements fit and domain behavior not exercised by recorded runs.

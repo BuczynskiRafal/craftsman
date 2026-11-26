@@ -32,6 +32,9 @@ class ScratchDirectoryTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.craftsman_dir = Path(tmp.name) / "craftsman"
         self.craftsman_dir.mkdir(parents=True, exist_ok=True)
+        patcher = mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(Path(tmp.name) / "scratch-root")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_scratch_dir_creation_and_pruning(self) -> None:
         s1 = create_scratch_dir(self.craftsman_dir)
@@ -217,13 +220,19 @@ class WorkingTreeHygieneE2ETests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.repo = EvidenceRepo(Path(tmp.name) / "repo")
+        patcher = mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(Path(tmp.name) / "scratch-root")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_cli_review_scratch_creates_valid_directory(self) -> None:
-        proc = self.repo.cli("review", "scratch")
+        scratch_root = self.repo.root.parent / "scratch-root"
+        with mock.patch.dict(os.environ, {"CRAFTSMAN_SCRATCH_ROOT": str(scratch_root)}):
+            proc = self.repo.cli("review", "scratch")
         created_path = Path(proc.stdout.strip()).resolve()
-        expected_parent = (self.repo.ledger_dir / "scratch").resolve()
         self.assertTrue(created_path.is_dir())
-        self.assertTrue(str(created_path).startswith(str(expected_parent)))
+        self.assertTrue(str(created_path).startswith(str(scratch_root.resolve())))
+        self.assertFalse(created_path.is_relative_to(self.repo.root.resolve()))
+        self.assertFalse((self.repo.ledger_dir / "scratch").exists())
 
     def test_full_gate_session_leaves_working_tree_clean(self) -> None:
         baseline_status = self.repo.git("status", "--porcelain", "--ignored").strip()
