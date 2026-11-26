@@ -341,6 +341,19 @@ class ScoutCommandTests(unittest.TestCase):
         self.assertIn(f"base {self.repo.base_sha[:7]}", symbol)
         self.assertIn("## Definition of `compute_total`", symbol)
 
+    def test_multiple_hunk_arguments_are_accepted_and_mixed_args_rejected(self) -> None:
+        self.repo.write("pricing.py", PRICING_ADD)
+        self.repo.write("app.py", "result = compute_total([1, 2])\n")
+        self.repo.cli("review", "prepare")
+
+        multi = self.repo.cli("review", "scout", "H1", "H2").stdout
+        self.assertIn("## H1", multi)
+        self.assertIn("## H2", multi)
+
+        bad = self.repo.cli("review", "scout", "H1", "compute_total", check=False)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("multiple arguments are only supported for hunk ids", bad.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,7 +4,7 @@ $ craftsman review prepare --help
 usage: craftsman review prepare [-h] [--cwd CWD] [--deep] [--base BASE]
                                 [--task TASK] [--task-file PATH]
                                 [--paths PATHS] [--add-paths ADD_PATHS]
-                                [--staged] [--tracked]
+                                [--staged] [--tracked] [--dry-run]
 
 Snapshot the diff since the base commit and open a review round.
 
@@ -26,6 +26,8 @@ options:
                         (content still comes from the work tree)
   --tracked             Freeze the review scope to tracked files changed since
                         the base (omit untracked files)
+  --dry-run             Preview scope, depth, and hunt plan without writing to
+                        the ledger or packets
 
 Tool caches (__pycache__, .pytest_cache, node_modules, ...) never enter the
 diff. List further paths to leave out, in .gitignore syntax, in a

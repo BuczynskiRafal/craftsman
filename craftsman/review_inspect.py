@@ -28,6 +28,7 @@ from craftsman.packet import (
     expand_hunk_spec,
 )
 from craftsman.records import (
+    FieldError,
     LedgerError,
     Round,
 )
@@ -44,7 +45,7 @@ from craftsman.review_present import (
     run_lines,
     slots_json,
 )
-from craftsman.scout import Scout, parse_target
+from craftsman.scout import Scout, Target, parse_target
 from craftsman.workspace import (
     open_workspace,
 )
@@ -53,8 +54,32 @@ from craftsman.worktree_index import WorktreeIndex
 SHOW_RECENT_RUNS = 5
 
 
+def _parse_scout_targets(raw_targets: Sequence[str]) -> Target:
+    if len(raw_targets) == 1:
+        return parse_target(raw_targets[0])
+    parsed = [parse_target(raw) for raw in raw_targets]
+    if all(item.kind == "hunks" for item in parsed):
+        return Target("hunks", ",".join(item.raw for item in parsed))
+    raise FieldError("target", "multiple arguments are only supported for hunk ids (e.g. H3 H4 H5)")
+
+
+def _parse_selected_finding_ids(raw_ids: str | None, positional_ids: Sequence[str]) -> list[str]:
+    selected: list[str] = []
+    if raw_ids is not None:
+        parts = [part.strip() for part in raw_ids.split(",")]
+        if not parts or any(not part for part in parts):
+            raise LedgerError("pass comma-separated finding ids to --ids (e.g. F1,F2)")
+        selected.extend(parts)
+    for raw in positional_ids:
+        cleaned = raw.strip()
+        if not cleaned:
+            raise LedgerError("finding id must not be blank")
+        selected.append(cleaned)
+    return list(dict.fromkeys(selected))
+
+
 def handle_scout(args: argparse.Namespace) -> int:
-    target = parse_target(args.target)
+    target = _parse_scout_targets(args.targets)
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
     if target.kind == "hunks":
@@ -82,10 +107,29 @@ def handle_scratch(args: argparse.Namespace) -> int:
 
 
 def handle_show(args: argparse.Namespace) -> int:
-    if args.packet_path and args.hunks:
+    hunks_mode = args.hunks is not None
+    selected_ids = _parse_selected_finding_ids(args.ids, args.finding_ids)
+    if args.packet_path and hunks_mode:
         raise LedgerError("pass either --packet-path or --hunks, not both")
+    if (args.packet_path or hunks_mode) and selected_ids:
+        raise LedgerError("finding ids cannot be combined with --packet-path or --hunks")
     ws = open_workspace(args.cwd)
     ledger = load(ws.ledger_path)
+    if selected_ids:
+        by_id = {finding.id: finding for finding in ledger.findings}
+        unknown = [finding_id for finding_id in selected_ids if finding_id not in by_id]
+        if unknown:
+            raise LedgerError(f"unknown finding id(s): {', '.join(unknown)}")
+        selected = [by_id[finding_id] for finding_id in selected_ids]
+        if args.json:
+            print(json.dumps({"findings": [finding.to_json() for finding in selected]}, indent=2, ensure_ascii=False))
+            return 0
+        print("\n".join(findings_table(selected)))
+        details = finding_details(selected)
+        if details:
+            print()
+            print("\n".join(details))
+        return 0
     snap = ws.snapshot(ledger)
     latest = ledger.rounds[-1] if ledger.rounds else None
     if args.packet_path:
@@ -94,8 +138,24 @@ def handle_show(args: argparse.Namespace) -> int:
         print(str(Path(latest.packet_path).resolve()))
         return 0
     slots = hunt_slots(ledger)
-    if args.hunks:
-        return _show_hunks(ws.root, latest, snap, not_covered(ledger, slots), slots, as_json=args.json)
+    if hunks_mode:
+        only_ids: set[str] | None = None
+        hunks_spec: str | None = None
+        if args.hunks != "":
+            if latest is None:
+                raise LedgerError("no review round yet; run `craftsman review prepare`")
+            only_ids = set(expand_hunk_spec(args.hunks, [hunk.id for hunk in latest.hunks]))
+            hunks_spec = args.hunks.strip()
+        return _show_hunks(
+            ws.root,
+            latest,
+            snap,
+            not_covered(ledger, slots),
+            slots,
+            as_json=args.json,
+            only_ids=only_ids,
+            hunks_spec=hunks_spec,
+        )
     if args.json:
         payload = {
             "round": round_json(latest, snap) if latest else None,
@@ -133,12 +193,17 @@ def _show_hunks(
     slots: Sequence[SlotStatus] | None,
     *,
     as_json: bool,
+    only_ids: set[str] | None = None,
+    hunks_spec: str | None = None,
 ) -> int:
     if as_json:
+        hunks_list = hunks_json(root, latest, snap, missing) if latest else []
+        if only_ids is not None:
+            hunks_list = [item for item in hunks_list if item["id"] in only_ids]
         payload = {
             "round": round_json(latest, snap) if latest else None,
             "stale": bool(latest is not None and latest.fingerprint != snap.fingerprint),
-            "hunks": hunks_json(root, latest, snap, missing) if latest else [],
+            "hunks": hunks_list,
             **({} if slots is None else {"slots": slots_json(slots)}),
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -146,7 +211,9 @@ def _show_hunks(
     if latest is None:
         print("No review round yet; run `craftsman review prepare`.")
         return 0
-    print("\n".join(hunk_map_lines(root, latest, snap, missing, slots)))
+    print("\n".join(hunk_map_lines(root, latest, snap, missing, slots, only_ids=only_ids)))
+    if hunks_spec:
+        print(f"Tip: run `craftsman review view --hunks {hunks_spec}` to inspect the diff body.")
     return 0
 
 

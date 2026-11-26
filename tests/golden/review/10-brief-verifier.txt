@@ -21,8 +21,8 @@ How to judge:
   craftsman review verdict <ID> --as probable --evidence "static: <file:line chain>" (or "no-repro: <why>; <chain>")
   craftsman review verdict <ID> --as question --evidence "intent: <source says X>; <file:line>"
   craftsman review verdict <ID> --as dismissed --evidence "<guard quoted, file:line>" [--run <R#>]
-  Several at once: craftsman review verdict --from-json - (entries {"id","as","evidence","run"}).
-- If the severity is wrong, start the evidence with `[severity: <new>]` and say why.
+  Batch / Windows PowerShell (recommended for multiple records): write JSON to `craftsman review inbox verdict` path and run `craftsman review verdict --from-json <path>` (entries {"id","as","evidence","run"?,"severity"?}).
+- If the severity is wrong, pass `--severity <blocker|major|minor|nit>` (or JSON `"severity"`, or start `--evidence` with `[severity: <new>]`) and explain why in `--evidence`.
 - Never edit the work tree or the index; reproductions live in a `craftsman review scratch` directory. Never run `prepare`, `reset`, `add` or `cover`.
 
 Finish with a table: finding id, verdict, one-line reason.

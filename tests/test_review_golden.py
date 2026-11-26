@@ -92,24 +92,44 @@ class Session:
 
     def env(self, extra: dict[str, str] | None) -> dict[str, str]:
         env = {k: v for k, v in os.environ.items() if k not in AMBIENT_PLATFORM_ENV_VARS}
-        env.update({"PYTHONPATH": str(SOURCE), "COLUMNS": "80", "LC_ALL": "C.UTF-8", "TZ": "UTC"})
+        env.update(
+            {
+                "PYTHONPATH": str(SOURCE),
+                "COLUMNS": "80",
+                "LC_ALL": "C.UTF-8",
+                "TZ": "UTC",
+                "CRAFTSMAN_SCRATCH_ROOT": str(self.root.parent / "craftsman-scratch"),
+            }
+        )
         env.pop("CRAFTSMAN_GOLDEN_RECORD", None)
         if extra:
             env.update(extra)
         return env
 
     def normalize(self, text: str) -> str:
-        for path, token in ((sys.executable, "<PY>"), (str(self.root.resolve()), "<REPO>"), (str(self.root), "<REPO>")):
+        scratch_root = self.root.parent / "craftsman-scratch"
+        for path, token in (
+            (sys.executable, "<PY>"),
+            (str(scratch_root.resolve()), "<SCRATCH>"),
+            (str(scratch_root), "<SCRATCH>"),
+            (str(self.root.resolve()), "<REPO>"),
+            (str(self.root), "<REPO>"),
+        ):
             # Raw and as a JSON string escapes it (they differ where the path has backslashes, as on Windows).
             text = text.replace(json.dumps(path)[1:-1], token).replace(path, token)
         if os.sep == "\\":
-            text = re.sub(r"<REPO>[^\s\"'`]*", lambda m: m.group(0).replace("\\\\", "/").replace("\\", "/"), text)
+            text = re.sub(
+                r"<(?:REPO|SCRATCH)>[^\s\"'`]*",
+                lambda m: m.group(0).replace("\\\\", "/").replace("\\", "/"),
+                text,
+            )
         for length in (40, 12, 7):
             text = text.replace(self.base[:length], f"<BASE{length}>")
         text = re.sub(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?", "<TIME>", text)
         text = re.sub(r"\d{8}T\d{6}\.\d+Z", "<STAMP>", text)
         text = re.sub(r"\b(cover|add|verdict)-\d+-[0-9a-f]+\.json", r"\1-<PID>-<ID>.json", text)
         text = re.sub(r"\b\d+\.\d+s\b", "<SECONDS>s", text)
+        text = re.sub(r"(<SCRATCH>/)[0-9a-f]{16}/[A-Za-z0-9_.-]+", r"\1<BUCKET>/<NAME>", text)
         text = re.sub(r"(/craftsman/scratch/)[A-Za-z0-9_.-]+", r"\1<NAME>", text)
         # A recorded command is shortened before `<PY>` replaces the interpreter path, so how much of it is shown (if
         # it is cut at all, and whether the path is quoted) depends on the path on the machine.
@@ -369,7 +389,7 @@ class GoldenReviewTests(unittest.TestCase):
             target = Path(RECORD)
             target.mkdir(parents=True, exist_ok=True)
             for name, text in session.steps.items():
-                (target / f"{name}.txt").write_text(text, encoding="utf-8")
+                (target / f"{name}.txt").write_text(text.replace("\r\n", "\n"), encoding="utf-8", newline="\n")
             return
         expected = sorted(path.stem for path in GOLDEN_DIR.glob("*.txt"))
         self.assertEqual(sorted(session.steps), expected, "the session and the golden files list different steps")

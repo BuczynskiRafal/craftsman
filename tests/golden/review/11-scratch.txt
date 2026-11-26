@@ -1,5 +1,5 @@
 $ craftsman review scratch
 [exit 0]
 --- stdout
-<REPO>/.git/craftsman/scratch/<NAME>
+<SCRATCH>/<BUCKET>/<NAME>
 --- stderr

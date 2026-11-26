@@ -972,23 +972,30 @@ class CoverHunterTests(HuntTestCase):
         self.assertIn("name your hunter slot with --hunter", proc.stderr)
         self.assertEqual(self.ledger().coverage, ())
 
-    def test_flags_and_json_cannot_be_combined(self) -> None:
-        self.prepare_enforced()
+    def test_the_hunter_flag_supplies_a_default_for_json_entries(self) -> None:
+        self.review("prepare")  # advisory
 
-        proc = self.review("cover", "--from-json", "-", "--hunter", "W1-1", stdin="[]", check=False)
+        out = self.review(
+            "cover",
+            "--from-json",
+            "-",
+            "--hunter",
+            "W1-1",
+            stdin=json.dumps([{"hunks": ["H1"], "note": NOTE}, {"hunks": ["H2"], "note": NOTE, "hunter": "W1-1"}]),
+        ).stdout
+        self.assertIn("Coverage recorded (C1) for W1-1", out)
+        self.assertEqual([item.hunter for item in self.ledger().coverage], ["W1-1", "W1-1"])
 
-        self.assertNotEqual(proc.returncode, 0)
-
-    def test_the_hunter_flag_is_refused_with_json_entries_in_any_round(self) -> None:
-        entries = [{"hunks": ["H1"], "note": NOTE}]
-        self.review("prepare")  # advisory: the entries would have been recorded untagged without a word
-
-        proc = self.review(
-            "cover", "--from-json", "-", "--hunter", "W1-1", stdin=json.dumps(entries), check=False
+        conflict = self.review(
+            "cover",
+            "--from-json",
+            "-",
+            "--hunter",
+            "W1-1",
+            stdin=json.dumps([{"hunks": ["H1"], "note": NOTE, "hunter": "W1-2"}]),
+            check=False,
         )
-
-        self.assert_error(proc, 1, "--from-json cannot be combined with --hunter")
-        self.assertEqual(self.ledger().coverage, ())
+        self.assert_error(conflict, 1, "conflicts with --hunter W1-1")
 
     def test_an_advisory_round_needs_no_slot_but_checks_one_when_given(self) -> None:
         self.review("prepare")
@@ -1112,10 +1119,16 @@ class AddHunterTests(HuntTestCase):
         self.assertIn("name your hunter slot with --hunter", proc.stderr)
         self.assertEqual(len(self.ledger().findings), 2)
 
-        mixed = self.review(
-            "add", "--from-json", "-", "--hunter", "W1-1", stdin=json.dumps([entry]), check=False
+        defaulted = self.review(
+            "add", "--from-json", "-", "--hunter", "W1-1", stdin=json.dumps([entry])
         )
-        self.assert_error(mixed, 1, "--from-json cannot be combined with --hunter")
+        self.assertIn("F3 recorded", defaulted.stdout)
+        self.assertEqual(self.ledger().findings[-1].hunter, "W1-1")
+
+        conflict = self.review(
+            "add", "--from-json", "-", "--hunter", "W1-2", stdin=json.dumps([{**entry, "hunter": "W1-1"}]), check=False
+        )
+        self.assert_error(conflict, 1, "conflicts with --hunter W1-2")
 
     def test_the_caller_identity_is_stored(self) -> None:
         self.review("prepare")
@@ -2423,6 +2436,31 @@ class AntigravitySyncTests(HuntTestCase):
                 root, env = calls[0]
                 self.assertEqual(root.resolve(), self.repo.root.resolve())
                 self.assertTrue(AMBIENT_PLATFORM_ENV_VARS.isdisjoint(env), sorted(AMBIENT_PLATFORM_ENV_VARS & env.keys()))
+
+    def test_prepare_skips_sync_before_round_one_even_after_reset(self) -> None:
+        self.write_cart()
+        self.review("prepare")
+        self.review("reset")
+
+        _, calls = self.run_in_process("prepare")
+        self.assertEqual(calls, [])
+
+    def test_prepare_enforces_via_antigravity_transcript_without_hooks(self) -> None:
+        self.write_cart()
+        app_dir = Path(self.repo.root).parent / "agy-app"
+        transcript = app_dir / "brain" / "conv-live" / ".system_generated" / "logs" / "transcript.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text('{"step_index": 0, "type": "USER_INPUT", "content": "/craft-review"}\n', encoding="utf-8")
+
+        out = self.review(
+            "prepare",
+            env={"ANTIGRAVITY_CONVERSATION_ID": "conv-live", "ANTIGRAVITY_APP_DATA_DIR": str(app_dir)},
+        ).stdout
+
+        self.assertIn("Enforced: Antigravity transcript tracking serves this review", out)
+        latest = self.ledger().rounds[-1]
+        self.assertTrue(latest.enforced)
+        self.assertEqual(latest.platform, "antigravity")
 
 
 if __name__ == "__main__":

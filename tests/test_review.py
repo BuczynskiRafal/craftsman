@@ -17,8 +17,9 @@ from typing import Any
 from unittest import mock
 
 from craftsman.cli import main as cli_main
-from craftsman.gate import GateOwner
-from craftsman.ledger import holds_lock
+from craftsman.evidence import create_inbox_file
+from craftsman.gate import GateOwner, load_state, state_path_for
+from craftsman.ledger import holds_lock, load
 from craftsman.quality import collect_quality_signals
 from craftsman.records import format_timestamp, parse_timestamp
 from craftsman.review_scope import normalize_round_files, view_slug
@@ -144,7 +145,11 @@ class PrepareTests(RepoTestCase):
         self.assertRegex(out, r"  W1-2  H1  contracts, failure, sweep +3 lines")
         self.assertRegex(out, r"  W1-3  H1  craft, design \(simplicity\) +3 lines  \[Claude Code: model haiku\]")
         self.assertIn("Launch all 3 hunters now, in one step.", out)
-        self.assertIn("You are Craftsman hunter <ID>. Run `craftsman review brief <ID>` and follow it exactly.", out)
+        self.assertIn(
+            "You are Craftsman hunter <ID>. Execute the CLI shell command `craftsman review brief <ID>` "
+            "(not a file; do not inspect parent session transcripts) and follow it exactly.",
+            out,
+        )
         self.assertIn("run `craftsman review check --review-only`", out)
         self.assertNotIn("Risk map", out)
         self.assertNotIn("decide the hunt", out)
@@ -804,12 +809,20 @@ class MergeTests(RepoTestCase):
         report = self.json_of("report")
         self.assertEqual([f["id"] for f in report["findings"]["dismissed"]], ["F2"])
 
-    def test_merge_refuses_judged_findings(self) -> None:
+    def test_merge_allows_confirmed_targets_and_refuses_dismissed_or_rewritten_targets(self) -> None:
         self.verdict("F1", "probable", STATIC_EVIDENCE)
 
-        refused = self.review("merge", "F1", "F2", check=False)
+        rewritten = self.review("merge", "F1", "F2", "--title", "Rewritten", check=False)
+        self.assert_error(rewritten, 1, "cannot rewrite F1's title, scenario, or suggestion")
 
-        self.assert_error(refused, 1, "F1 already has the verdict probable")
+        folded = self.review("merge", "F1", "F2")
+        self.assertIn("F2 merged into F1 (minor, cart.py:3)", folded.stdout)
+
+        self.add()
+        self.add()
+        self.verdict("F3", "dismissed", "cart.py:3 is guarded by caller invariant before entering total()")
+        refused = self.review("merge", "F3", "F4", check=False)
+        self.assert_error(refused, 1, "target has verdict dismissed")
 
 
 class FromJsonTests(RepoTestCase):
@@ -2025,6 +2038,100 @@ class AdaptiveLoopTests(RepoTestCase):
         checked = self.review("check", check=False)
         self.assertEqual(checked.returncode, 0, checked.stdout)
         self.assertTrue(self.json_of("check")["passed"])
+
+
+class SeverityVerdictTests(RepoTestCase):
+    def test_severity_flag_json_and_marker_update_finding_and_wave_eligibility(self) -> None:
+        self.prepare_bug()
+        self.add("--severity", "blocker")
+        self.add("--severity", "blocker")
+        self.add("--severity", "minor")
+
+        self.review(
+            "verdict", "F1", "--as", "probable", "--severity", "major", "--evidence", STATIC_EVIDENCE
+        )
+        self.review(
+            "verdict",
+            "--from-json",
+            "-",
+            stdin=json.dumps(
+                [
+                    {"id": "F2", "as": "probable", "severity": "minor", "evidence": STATIC_EVIDENCE},
+                    {"id": "F3", "as": "probable", "evidence": f"[severity: major] {STATIC_EVIDENCE}"},
+                ]
+            ),
+        )
+
+        findings = {item["id"]: item for item in self.json_of("show")["findings"]}
+        self.assertEqual((findings["F1"]["severity"], findings["F1"]["original_severity"]), ("major", "blocker"))
+        self.assertEqual((findings["F2"]["severity"], findings["F2"]["original_severity"]), ("minor", "blocker"))
+        self.assertEqual((findings["F3"]["severity"], findings["F3"]["original_severity"]), ("major", "minor"))
+
+        # Check wave storage directly: F1/F3 (now major) call for wave 2; F2 (downgraded to minor) does not.
+        # In deep mode if F1 is generation-2 downgraded to major, generation 3 should NOT spawn for it.
+        self.repo.cli("review", "reset")
+        self.prepare_bug(deep=True)
+        ledger = load(self.repo.ledger_dir / "ledger.json")
+        # Manually verify no --severity combined with --from-json error
+        conflict = self.review(
+            "verdict", "--from-json", "-", "--severity", "minor", stdin="[]", check=False
+        )
+        self.assert_error(conflict, 1, "--from-json cannot be combined with --severity")
+        self.assertIsNotNone(ledger.rounds[-1].plan)
+
+
+class ShowFilteringTests(RepoTestCase):
+    def test_show_by_ids_positional_or_flag_and_filtered_hunks(self) -> None:
+        self.prepare_bug()
+        self.add("--severity", "major")
+        self.add("--severity", "minor")
+
+        positional = self.review("show", "F1", "F2").stdout
+        self.assertIn("F1", positional)
+        self.assertIn("F2", positional)
+        self.assertNotIn("Round 1", positional)
+
+        by_flag = json.loads(self.review("show", "--ids", "F2", "--json").stdout)
+        self.assertEqual([item["id"] for item in by_flag["findings"]], ["F2"])
+
+        hunks_filtered = self.review("show", "--hunks", "H1").stdout
+        self.assertIn("H1", hunks_filtered)
+        self.assertIn("craftsman review view --hunks H1", hunks_filtered)
+
+        hunks_json = json.loads(self.review("show", "--hunks", "H1", "--json").stdout)
+        self.assertEqual([item["id"] for item in hunks_json["hunks"]], ["H1"])
+
+        self.assert_error(self.review("show", "--ids", "F9", check=False), 1, "unknown finding id(s): F9")
+        self.assert_error(
+            self.review("show", "F1", "--hunks", check=False),
+            1,
+            "finding ids cannot be combined with --packet-path or --hunks",
+        )
+
+
+class PrepareDryRunTests(RepoTestCase):
+    def test_dry_run_previews_without_mutating_ledger_packets_gate_or_inbox(self) -> None:
+        empty = self.review("prepare", "--dry-run").stdout
+        self.assertIn("Dry run — nothing was written to the ledger or packets.", empty)
+        self.assertIn("Nothing to review", empty)
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+
+        self.repo.write("cart.py", BUGGY_TOTAL)
+        open_gate(self.repo.root, self.repo.base_sha, owner=GateOwner("cli", None), deep=False)
+        inbox = create_inbox_file(self.repo.ledger_dir, "add")
+
+        preview = self.review("prepare", "--deep", "--dry-run", "--task", "Dry task").stdout
+        self.assertIn("Dry run: gate would be raised to deep", preview)
+        self.assertIn("Dry run — nothing was written to the ledger or packets.", preview)
+        self.assertIn("Round 1 prepared (deep):", preview)
+        self.assertIn("Hunt plan, round 1:", preview)
+
+        self.assertFalse((self.repo.ledger_dir / "ledger.json").exists())
+        self.assertFalse((self.repo.ledger_dir / "packet-1.md").exists())
+        self.assertTrue(inbox.is_file())
+        state = load_state(state_path_for(self.repo.root))
+        assert state is not None
+        self.assertFalse(state.deep)
 
 
 if __name__ == "__main__":

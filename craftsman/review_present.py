@@ -121,8 +121,10 @@ def _depth_line(depth: huntplan.Depth, snap: DiffSnapshot) -> str:
     )
 
 
-def _enforcement_line(round_: Round) -> str:
+def _enforcement_line(round_: Round, *, via_transcript: bool = False) -> str:
     if round_.enforced:
+        if via_transcript:
+            return "Enforced: Antigravity transcript tracking serves this review; finishing requires every slot below."
         who = huntview.PLATFORM_LABELS.get(round_.platform, "Craftsman")
         return f"Enforced: {who} hooks serve this review; finishing requires every slot below."
     return (
@@ -132,7 +134,14 @@ def _enforcement_line(round_: Round) -> str:
 
 
 def print_prepare_summary(
-    result: _Prepared, packet: Path, snap: DiffSnapshot, depth: huntplan.Depth, now: datetime, *, check: str
+    result: _Prepared,
+    packet: Path,
+    snap: DiffSnapshot,
+    depth: huntplan.Depth,
+    now: datetime,
+    *,
+    check: str,
+    via_transcript: bool = False,
 ) -> None:
     round_ = result.round
     carried = len(round_.hunks) - len(round_.open_hunk_ids)
@@ -151,7 +160,7 @@ def print_prepare_summary(
     )
     print(f"Packet: {packet}")
     print(_depth_line(depth, snap))
-    print(_enforcement_line(round_))
+    print(_enforcement_line(round_, via_transcript=via_transcript))
     if round_.signals:
         listed, summary = bound_hints(round_.signals)
         print(f"Quality hints: {summary}")
@@ -258,12 +267,19 @@ def _format_span(path: str, start: int, end: int, has_range: bool, *, bare_zero:
 
 
 def hunk_map_lines(
-    root: Path, round_: Round, snap: DiffSnapshot, missing: Sequence[str], slots: Sequence[SlotStatus] | None = None
+    root: Path,
+    round_: Round,
+    snap: DiffSnapshot,
+    missing: Sequence[str],
+    slots: Sequence[SlotStatus] | None = None,
+    *,
+    only_ids: set[str] | None = None,
 ) -> list[str]:
     """One compact `H#  path:start-end  scope|status` line per hunk still to cover, then `N left`.
 
     A stale round lists its HunkRef fields instead: its coverage no longer matches the code. A round judged
     by slots (`slots` is given) lists, per slot that is not done, the hunks that slot still misses.
+    When `only_ids` is set, restricts the output to hunks in `only_ids`.
     """
     entries = hunks_json(root, round_, snap)
     if round_.fingerprint != snap.fingerprint:
@@ -272,6 +288,7 @@ def hunk_map_lines(
             f"{e['id']}  {_format_span(e['path'], e['new_start'], e['end_line'], e['new_len'] > 0)}  "
             f"[{'carried' if e['carried'] else f'round {round_.number}'}]"
             for e in entries
+            if only_ids is None or e["id"] in only_ids
         ]
         lines.append(huntview.STALE_NOTE)
         return lines
@@ -288,16 +305,35 @@ def hunk_map_lines(
 
     if slots is not None:
         pending = [status for status in slots if status.state != "done"]
-        lines = [
-            line
-            for status in pending
-            for line in (
+        slot_lines: list[str] = []
+        matched_slots = 0
+        for status in pending:
+            slot_missing = [
+                hunk_id
+                for hunk_id in status.missing
+                if only_ids is None or hunk_id in only_ids
+            ]
+            if not slot_missing:
+                continue
+            matched_slots += 1
+            slot_lines.append(
                 f"{status.slot.id} [{huntview.STATE_LABELS[status.state]}] still misses "
-                f"{huntview.hunk_ranges(status.missing)}:",
-                *(f"  {hunk_line(hunk_id)}" for hunk_id in sorted(status.missing, key=lambda item: int(item[1:]))),
+                f"{huntview.hunk_ranges(slot_missing)}:"
             )
+            for hunk_id in sorted(slot_missing, key=lambda item: int(item[1:])):
+                slot_lines.append(f"  {hunk_line(hunk_id)}")
+        if only_ids is not None:
+            if not slot_lines:
+                return ["(matching hunks are already covered by their slots)"]
+            return [*slot_lines, f"{matched_slots} slot(s) still miss matching hunk(s)"]
+        return [*slot_lines, f"{len(pending)} slot(s) left to cover" if pending else "0 left to cover: every slot is done"]
+    if only_ids is not None:
+        missing_set = set(missing)
+        return [
+            f"{hunk_line(e['id'])}{'' if e['id'] in missing_set else '  [covered]'}"
+            for e in entries
+            if e["id"] in only_ids
         ]
-        return [*lines, f"{len(pending)} slot(s) left to cover" if pending else "0 left to cover: every slot is done"]
     lines = [hunk_line(e["id"]) for e in entries if e["id"] in missing]
     if not entries:
         return ["(no open hunks)"]
