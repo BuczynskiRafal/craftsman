@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml/badge.svg)](https://github.com/BuczynskiRafal/craftsman/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/craftsman-gate)](https://pypi.org/project/craftsman-gate/)
-[![Version](https://img.shields.io/badge/version-5.2.0-emerald.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/plugin.json)
+[![Version](https://img.shields.io/badge/version-5.3.0-emerald.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/plugin.json)
 [![Agent Skills](https://img.shields.io/badge/Agent_Skills-skills.sh-0F766E.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/docs/skills.md)
 [![Python 3.10–3.13](https://img.shields.io/badge/python-3.10--3.13-blue.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
 [![Dependencies: stdlib only](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](https://github.com/BuczynskiRafal/craftsman/blob/main/pyproject.toml)
