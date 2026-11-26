@@ -220,8 +220,10 @@ def prune_inbox_files(craftsman_dir: Path) -> tuple[Path, ...]:
 
 
 def _posix_uid() -> int | None:
-    """Current POSIX user ID, or `None` on Windows (`mypy` narrows platforms only on `sys.platform`)."""
-    return None if sys.platform == "win32" else os.getuid()
+    """Current POSIX user ID, or `None` on Windows (`mypy` narrows platforms only on `if sys.platform`)."""
+    if sys.platform == "win32":
+        return None
+    return os.getuid()
 
 
 def _scratch_base() -> Path:

@@ -14,7 +14,7 @@ from contextlib import contextmanager, redirect_stderr
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest import mock
 
 from craftsman import ledger as ledger_module
@@ -601,10 +601,11 @@ class MergeTests(unittest.TestCase):
             merge_findings(judged_dup, "F1", ["F2"])
 
         # Target that is dismissed or question cannot be a merge target.
-        for bad_verdict, evidence in (
+        bad_cases: tuple[tuple[Literal["dismissed", "question"], str], ...] = (
             ("dismissed", "cart.py:3 is guarded cleanly before division"),
             ("question", "intent: task says averages are fine at cart.py:3"),
-        ):
+        )
+        for bad_verdict, evidence in bad_cases:
             with self.subTest(bad_verdict=bad_verdict):
                 bad_target, _ = set_verdict(ledger, "F1", bad_verdict, evidence, None)
                 with self.assertRaisesRegex(LedgerError, f"target has verdict {bad_verdict}"):

@@ -26,7 +26,7 @@ from craftsman.agy_sync import (
 from craftsman.attribution import agent_runs
 from craftsman.ledger import ledger_path_for, load, save
 from craftsman.records import AgentEvent, Ledger, parse_timestamp
-from craftsman.transcript import TranscriptError
+from craftsman.transcript import TranscriptError, subagent_finish
 from craftsman.workspace import Workspace
 
 from tests.support import (
@@ -579,7 +579,7 @@ class CommandSyncTests(SyncTestCase):
         self.app.write_subagent(MAIN, "new-sub", planner(1, at=6))
 
         with unittest.mock.patch(
-            "craftsman.agy_sync.subagent_finish", wraps=agy_sync.subagent_finish
+            "craftsman.agy_sync.subagent_finish", wraps=subagent_finish
         ) as finish_spy:
             observed = observe_runs(
                 self.app.root, MAIN, since=sync_floor(ledger), keep_ids={"kept-sub"}
