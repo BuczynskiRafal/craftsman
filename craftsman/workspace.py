@@ -14,6 +14,7 @@ from craftsman.files import write_text_atomic
 from craftsman.gate import STATE_FILENAME, GateOwner, GateState, cli_caller, load_state, state_path_for
 from craftsman.ledger import ledger_path_for, load, stable_hunk_ids
 from craftsman.records import IsolationEvidence, Ledger, format_timestamp, parse_timestamp
+from craftsman.transcript import conversation_transcript
 
 HOOKS_MARKER = "review_hooks.json"
 # A marker touched within this long ago was touched by the very command that is running now: the
@@ -245,13 +246,18 @@ class Workspace:
 
         A gate knows what its platform proved. Without a gate (review-only), hooks serve this review
         when the prompt hook saw `caller` (default: the session this command runs in) invoke the
-        review command, or when a subagent event arrived after the current round was prepared. An
-        event of an earlier session or platform proves nothing about this one.
+        review command, or when a subagent event arrived after the current round was prepared; on
+        Antigravity with a readable conversation transcript, transcript tracking serves it even
+        without hooks. An event of an earlier session or platform proves nothing about this one.
         """
         if self.state is not None:
             return self.state.required_isolation
         if self._hooks_saw(caller or cli_caller(None, os.environ)) or self._agent_event_since_round(ledger):
             return "hooks"
+        if _has_antigravity_transcript(os.environ) or (
+            bool(ledger.rounds) and ledger.rounds[-1].enforced and ledger.rounds[-1].platform == "antigravity"
+        ):
+            return "transcript"
         return "none"
 
     def _hooks_saw(self, caller: GateOwner) -> bool:
@@ -294,17 +300,28 @@ def open_workspace(cwd: str | None) -> Workspace:
     return Workspace(root=root, state=active, ledger_path=ledger_path)
 
 
+def _has_antigravity_transcript(env: Mapping[str, str]) -> bool:
+    """Whether `env` points to an existing Antigravity conversation transcript on disk."""
+    conversation = env.get("ANTIGRAVITY_CONVERSATION_ID", "").strip()
+    app_dir = env.get("ANTIGRAVITY_APP_DATA_DIR", "").strip()
+    if not conversation or not app_dir:
+        return False
+    return conversation_transcript(Path(app_dir).expanduser(), conversation) is not None
+
+
 def review_enforcement(
     ws: Workspace, ledger: Ledger, env: Mapping[str, str], now: datetime
 ) -> tuple[bool, str]:
-    """Whether the hooks hold this review to its hunt plan, and the platform that serves it.
+    """Whether the hooks or transcripts hold this review to its hunt plan, and the platform that serves it.
 
     Enforced when (a) the checkout has an active gate whose platform proved isolation, whoever runs the
     command: one gate governs the review of its checkout (the ledger is shared), and on Antigravity every
     hunter is a conversation of its own and never the gate's owner; the platform is the owner's. Or (b) a
     guarding review marker was touched within `MARKER_FRESH_FOR` of `now` (by the PreToolUse hook of this
     very command), or (c) the latest round was enforced, which is sticky: a review does not become
-    advisory because a later command ran without a hook. Otherwise the round is advisory: `(False, "cli")`.
+    advisory because a later command ran without a hook, or (d) an Antigravity conversation transcript
+    exists for the calling session, so subagent runs are tracked even without PreToolUse hooks. Otherwise
+    the round is advisory: `(False, "cli")`.
     """
     if ws.state is not None and ws.state.required_isolation != "none":
         return True, ws.state.owner.platform
@@ -313,6 +330,8 @@ def review_enforcement(
         return True, marker.platform
     if ledger.rounds and ledger.rounds[-1].enforced:
         return True, ledger.rounds[-1].platform
+    if _has_antigravity_transcript(env):
+        return True, "antigravity"
     return False, "cli"
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+import unittest.mock
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -434,6 +435,27 @@ class EnforcementTests(WorkspaceTestCase):
         ledger, _ = prepared(make_snap(make_hunk("H1", "app.py")))
 
         self.assertEqual(self.enforcement(ledger), (False, "cli"))
+
+    def test_an_antigravity_transcript_on_disk_enforces_without_hooks_or_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as app_tmp:
+            app_dir = Path(app_tmp)
+            transcript = app_dir / "brain" / "conv-1" / ".system_generated" / "logs" / "transcript.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text('{"step_index": 0, "type": "USER_INPUT", "content": "hi"}\n', encoding="utf-8")
+            env = {
+                "ANTIGRAVITY_CONVERSATION_ID": "conv-1",
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+            }
+            self.assertEqual(self.enforcement(env=env), (True, "antigravity"))
+            with unittest.mock.patch.dict("os.environ", env, clear=False):
+                ws = open_workspace(str(self.repo.root))
+                self.assertEqual(ws.isolation_evidence(Ledger()), "transcript")
+
+            missing_env = {
+                "ANTIGRAVITY_CONVERSATION_ID": "missing-conv",
+                "ANTIGRAVITY_APP_DATA_DIR": str(app_dir),
+            }
+            self.assertEqual(self.enforcement(env=missing_env), (False, "cli"))
 
 
 if __name__ == "__main__":
